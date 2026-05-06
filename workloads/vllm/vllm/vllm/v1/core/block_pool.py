@@ -176,6 +176,8 @@ class BlockPool:
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
         self.uvm_kv_runtime_policy = uvm_kv_runtime_policy
+        if self.uvm_kv_runtime_policy is not None:
+            self.uvm_kv_runtime_policy.register_stage_l5_kv_blocks(self)
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -315,6 +317,11 @@ class BlockPool:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+        if self.uvm_kv_runtime_policy is not None:
+            self.uvm_kv_runtime_policy.on_blocks_allocated(
+                blocks=ret,
+                reason="get_new_blocks",
+            )
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -388,6 +395,11 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for blocks_per_group in blocks:
+            if self.uvm_kv_runtime_policy is not None:
+                self.uvm_kv_runtime_policy.on_blocks_allocated(
+                    blocks=list(blocks_per_group),
+                    reason="prefix_cache_touch",
+                )
             for block in blocks_per_group:
                 # ref_cnt=0 means this block is in the free list (i.e. eviction
                 # candidate), so remove it.
@@ -410,6 +422,11 @@ class BlockPool:
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
+        if self.uvm_kv_runtime_policy is not None:
+            self.uvm_kv_runtime_policy.on_blocks_freed(
+                blocks=blocks_list,
+                reason="free_blocks",
+            )
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF

@@ -19,6 +19,19 @@ from vllm.device_allocator.uvm_pool_coordinator import (
     record_uvm_pool_pressure,
     request_uvm_pool_action,
 )
+from vllm.device_allocator.uvm import (
+    prefetch_range_to_cpu,
+    prefetch_range_to_device,
+)
+from vllm.device_allocator.uvm_pool_residency import (
+    get_uvm_residency_region_snapshot,
+    get_uvm_pool_residency_manager,
+    mark_uvm_residency_state,
+    record_uvm_residency_kv_metadata_candidate,
+    record_uvm_residency_action,
+    register_uvm_residency_region,
+    request_uvm_gpu_residency,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
@@ -54,6 +67,14 @@ def _read_mode_env() -> str:
     return mode
 
 
+def _read_action_mode_env(name: str, default: str, choices: set[str]) -> str:
+    mode = os.environ.get(name, default).strip().lower()
+    if mode not in choices:
+        logger.warning("Ignoring invalid %s=%r; using %s.", name, mode, default)
+        return default
+    return mode
+
+
 def _block_hash_to_text(block_hash: Any) -> str | None:
     if block_hash is None:
         return None
@@ -81,16 +102,61 @@ class UvmKvRuntimePolicy:
         self.prefix_evict_max_blocks = _read_int_env(
             "VLLM_UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS", 0
         )
+        self.stage_l5_metadata_enable = _read_bool_env(
+            "VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE",
+            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") in ("stage_l5", "stage_l6"),
+        )
+        self.stage_l6_data_offload_enable = _read_bool_env(
+            "VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE",
+            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l6",
+        )
+        self.stage_l6_prefetch_back_enable = _read_bool_env(
+            "VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_ENABLE",
+            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l6",
+        )
+        self.stage_l6_data_offload_mode = _read_action_mode_env(
+            "VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE",
+            "trace_only",
+            {"trace_only", "prefetch_cpu"},
+        )
+        self.stage_l6_prefetch_back_mode = _read_action_mode_env(
+            "VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_MODE",
+            "trace_only",
+            {"trace_only", "prefetch"},
+        )
+        try:
+            self.stage_l6_device = int(
+                os.environ.get("VLLM_UVM_RESIDENCY_KV_PREFETCH_DEVICE", "0") or 0
+            )
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid VLLM_UVM_RESIDENCY_KV_PREFETCH_DEVICE; using 0."
+            )
+            self.stage_l6_device = 0
+        self.stage_l6_max_offload_blocks = _read_int_env(
+            "VLLM_UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP", 0
+        )
+        self.stage_l6_pointer_map_file = os.environ.get(
+            "VLLM_UVM_RESIDENCY_KV_POINTER_MAP_FILE", ""
+        )
+        self._stage_l6_pointer_map_loaded = False
+        self._stage_l6_pointer_ranges: dict[str, list[tuple[int, int]]] = {}
         self.budget_bytes = _read_int_env("VLLM_UVM_KV_RUNTIME_BUDGET_BYTES", 0)
         budget_blocks_override = _read_int_env(
             "VLLM_UVM_KV_RUNTIME_BUDGET_BLOCKS", 0
         )
         self.total_bytes = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
         self.total_blocks = max(kv_cache_config.num_blocks - 1, 0)
+        self.num_kv_cache_groups = max(len(kv_cache_config.kv_cache_groups), 1)
         self.bytes_per_block = (
             self.total_bytes // kv_cache_config.num_blocks
             if kv_cache_config.num_blocks > 0 and self.total_bytes > 0
             else 0
+        )
+        self.bytes_per_group_block = (
+            self.bytes_per_block // self.num_kv_cache_groups
+            if self.num_kv_cache_groups > 0
+            else self.bytes_per_block
         )
         if budget_blocks_override > 0:
             self.budget_blocks = budget_blocks_override
@@ -121,6 +187,17 @@ class UvmKvRuntimePolicy:
             "prefix_cache_eviction_records": 0,
             "unsafe_prefix_cache_eviction_records": 0,
             "reuse_failure_records": 0,
+            "stage_l5_kv_region_register_records": 0,
+            "stage_l5_residency_request_records": 0,
+            "stage_l5_safe_candidate_records": 0,
+            "stage_l5_unsafe_candidate_records": 0,
+            "stage_l5_data_offload_records": 0,
+            "stage_l6_data_offload_attempt_records": 0,
+            "stage_l6_data_offload_issued_records": 0,
+            "stage_l6_data_offload_fallback_records": 0,
+            "stage_l6_prefetch_back_issued_records": 0,
+            "stage_l6_prefetch_back_fallback_records": 0,
+            "stage_l6_unsafe_offload_records": 0,
         }
 
     @property
@@ -145,8 +222,220 @@ class UvmKvRuntimePolicy:
                 "candidate_limit": self.candidate_limit,
                 "prefix_evict_enable": self.prefix_evict_enable,
                 "prefix_evict_max_blocks": self.prefix_evict_max_blocks,
+                "stage_l5_metadata_enable": self.stage_l5_metadata_enable,
+                "stage_l6_data_offload_enable": self.stage_l6_data_offload_enable,
+                "stage_l6_prefetch_back_enable": self.stage_l6_prefetch_back_enable,
+                "stage_l6_data_offload_mode": self.stage_l6_data_offload_mode,
+                "stage_l6_prefetch_back_mode": self.stage_l6_prefetch_back_mode,
+                "stage_l6_max_offload_blocks": self.stage_l6_max_offload_blocks,
+                "stage_l6_pointer_map_file": self.stage_l6_pointer_map_file,
+                "num_kv_cache_groups": self.num_kv_cache_groups,
             }
         )
+
+    def register_stage_l5_kv_blocks(self, block_pool: Any) -> None:
+        """Register KV block metadata in Stage L residency.
+
+        L6 reuses the same block metadata registration and upgrades individual
+        regions to offload_capable later if raw KV pointers become available.
+        """
+        if not self.active or not self.stage_l5_metadata_enable:
+            return
+        if not get_uvm_pool_residency_manager().active:
+            return
+        bytes_per_region = max(self.bytes_per_group_block, 1)
+        total_registered = 0
+        for group_id in range(self.num_kv_cache_groups):
+            for block in getattr(block_pool, "blocks", []):
+                if getattr(block, "is_null", False):
+                    continue
+                block_id = int(getattr(block, "block_id", -1))
+                if block_id < 0:
+                    continue
+                register_uvm_residency_region(
+                    pool="kv",
+                    region_id=f"kv:{group_id}:{block_id}",
+                    ptr=None,
+                    bytes=bytes_per_region,
+                    state="gpu",
+                    evictable=True,
+                    active=False,
+                    metadata={
+                        "stage": "stage_l5",
+                        "source": "kv_block_metadata",
+                        "group_id": group_id,
+                        "block_id": block_id,
+                        "bytes_per_block": bytes_per_region,
+                        "ref_cnt": getattr(block, "ref_cnt", None),
+                        "is_prefix_cache": getattr(block, "block_hash", None)
+                        is not None,
+                        "in_free_queue": True,
+                        "block_hash": _block_hash_to_text(
+                            getattr(block, "block_hash", None)
+                        ),
+                        "offload_capable": False,
+                        "metadata_only": not self.stage_l6_data_offload_enable,
+                    },
+                )
+                total_registered += 1
+        self._summary["stage_l5_kv_region_register_records"] += total_registered
+        self._write(
+            {
+                "action": "stage_l5_kv_metadata_registered",
+                "registered_regions": total_registered,
+                "bytes_per_region": bytes_per_region,
+                "num_kv_cache_groups": self.num_kv_cache_groups,
+                "metadata_only": True,
+                "data_offload_issued": False,
+            }
+        )
+
+    def register_stage_l6_kv_pointer_map(
+        self, kv_pointer_map: dict[tuple[int, int], tuple[int, int]]
+    ) -> None:
+        """Upgrade registered KV regions with raw pointer ranges when available."""
+        if not self.active or not self.stage_l6_data_offload_enable:
+            return
+        if not get_uvm_pool_residency_manager().active:
+            return
+        registered = 0
+        for (group_id, block_id), (ptr, size_bytes) in kv_pointer_map.items():
+            if ptr <= 0 or size_bytes <= 0:
+                continue
+            self._stage_l6_pointer_ranges[f"kv:{group_id}:{block_id}"] = [
+                (int(ptr), int(size_bytes))
+            ]
+            register_uvm_residency_region(
+                pool="kv",
+                region_id=f"kv:{group_id}:{block_id}",
+                ptr=int(ptr),
+                bytes=int(size_bytes),
+                state="gpu",
+                evictable=True,
+                active=False,
+                metadata={
+                    "stage": "stage_l6",
+                    "source": "kv_pointer_map",
+                    "group_id": group_id,
+                    "block_id": block_id,
+                    "bytes_per_block": int(size_bytes),
+                    "offload_capable": True,
+                    "metadata_only": False,
+                    "range_count": 1,
+                },
+            )
+            registered += 1
+        self._write(
+            {
+                "action": "stage_l6_kv_pointer_map_registered",
+                "registered_regions": registered,
+                "data_offload_capable": registered > 0,
+            }
+        )
+
+    def _maybe_load_stage_l6_pointer_map(self) -> None:
+        if self._stage_l6_pointer_map_loaded:
+            return
+        self._stage_l6_pointer_map_loaded = True
+        if (
+            not self.active
+            or not self.stage_l6_data_offload_enable
+            or not self.stage_l6_pointer_map_file
+        ):
+            return
+        path = self.stage_l6_pointer_map_file
+        pointer_map: dict[tuple[int, int], tuple[int, int]] = {}
+        range_map: dict[str, list[tuple[int, int]]] = {}
+        bytes_map: dict[str, int] = {}
+        records_seen = 0
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if record.get("action") != "stage_l6_kv_pointer_map":
+                        continue
+                    records_seen += 1
+                    for item in record.get("blocks") or []:
+                        try:
+                            group_id = int(item["group_id"])
+                            block_id = int(item["block_id"])
+                            size_bytes = int(item["bytes"])
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        ranges: list[tuple[int, int]] = []
+                        for raw_range in item.get("ranges") or []:
+                            try:
+                                ptr = int(raw_range["ptr"])
+                                range_bytes = int(raw_range["bytes"])
+                            except (KeyError, TypeError, ValueError):
+                                continue
+                            if ptr > 0 and range_bytes > 0:
+                                ranges.append((ptr, range_bytes))
+                        if not ranges:
+                            try:
+                                ptr = int(item["ptr"])
+                            except (KeyError, TypeError, ValueError):
+                                ptr = 0
+                            if ptr > 0 and size_bytes > 0:
+                                ranges.append((ptr, size_bytes))
+                        if group_id >= 0 and block_id >= 0 and ranges:
+                            region_id = f"kv:{group_id}:{block_id}"
+                            first_ptr = ranges[0][0]
+                            total_bytes = sum(size for _, size in ranges)
+                            pointer_map[(group_id, block_id)] = (first_ptr, total_bytes)
+                            range_map[region_id] = ranges
+                            bytes_map[region_id] = total_bytes
+        except OSError as exc:
+            self._write(
+                {
+                    "action": "stage_l6_kv_pointer_map_load_failed",
+                    "path": path,
+                    "error": repr(exc),
+                }
+            )
+            return
+        self._write(
+            {
+                "action": "stage_l6_kv_pointer_map_loaded",
+                "path": path,
+                "records_seen": records_seen,
+                "entries": len(pointer_map),
+            }
+        )
+        if pointer_map:
+            self.register_stage_l6_kv_pointer_map(pointer_map)
+            self._stage_l6_pointer_ranges.update(range_map)
+            for region_id, ranges in range_map.items():
+                try:
+                    _, group_id_text, block_id_text = region_id.split(":", 2)
+                    group_id = int(group_id_text)
+                    block_id = int(block_id_text)
+                except ValueError:
+                    continue
+                first_ptr = ranges[0][0]
+                total_bytes = bytes_map.get(region_id, sum(size for _, size in ranges))
+                register_uvm_residency_region(
+                    pool="kv",
+                    region_id=region_id,
+                    ptr=first_ptr,
+                    bytes=total_bytes,
+                    state="gpu",
+                    evictable=True,
+                    active=False,
+                    metadata={
+                        "stage": "stage_l6",
+                        "source": "kv_pointer_map_ranges",
+                        "group_id": group_id,
+                        "block_id": block_id,
+                        "bytes_per_block": total_bytes,
+                        "offload_capable": True,
+                        "metadata_only": False,
+                        "range_count": len(ranges),
+                    },
+                )
 
     def should_allow_allocation(
         self,
@@ -179,6 +468,24 @@ class UvmKvRuntimePolicy:
                 "over_budget": over_budget,
             },
         )
+        if self.stage_l5_metadata_enable:
+            request_uvm_gpu_residency(
+                pool="kv",
+                region_id=f"kv:allocation:{request_id}",
+                bytes=max(num_blocks_to_allocate, 0)
+                * max(self.bytes_per_block, 0),
+                scope_key=f"kv_request:{request_id}",
+                metadata={
+                    "stage": "stage_l5",
+                    "source": "kv_runtime_admission",
+                    "request_id": request_id,
+                    "num_blocks_to_allocate": num_blocks_to_allocate,
+                    "metadata_only": True,
+                    "data_offload_issued": False,
+                    **pressure,
+                },
+            )
+            self._summary["stage_l5_residency_request_records"] += 1
         self._write(
             {
                 "action": "allocation_pressure",
@@ -193,6 +500,12 @@ class UvmKvRuntimePolicy:
             self._trace_candidates(
                 request_id=request_id,
                 block_pool=block_pool,
+                reason="runtime_budget_pressure",
+            )
+            self._maybe_execute_stage_l6_safe_offload(
+                request_id=request_id,
+                block_pool=block_pool,
+                pressure=pressure,
                 reason="runtime_budget_pressure",
             )
             self._maybe_execute_prefix_eviction(
@@ -321,6 +634,40 @@ class UvmKvRuntimePolicy:
             return
         for index, block in enumerate(free_blocks[: self.candidate_limit]):
             block_hash = getattr(block, "block_hash", None)
+            block_id = int(getattr(block, "block_id", -1))
+            safe = (
+                block_id >= 0
+                and not bool(getattr(block, "is_null", False))
+                and getattr(block, "ref_cnt", None) == 0
+            )
+            if self.stage_l5_metadata_enable and block_id >= 0:
+                for group_id in range(self.num_kv_cache_groups):
+                    record_uvm_residency_kv_metadata_candidate(
+                        region_id=f"kv:{group_id}:{block_id}",
+                        block_id=block_id,
+                        group_id=group_id,
+                        bytes_per_block=max(self.bytes_per_group_block, 1),
+                        safe=safe,
+                        reason=reason,
+                        metadata={
+                            "stage": "stage_l5",
+                            "source": "free_queue_candidate_snapshot",
+                            "candidate_index": index,
+                            "ref_cnt": getattr(block, "ref_cnt", None),
+                            "is_null": getattr(block, "is_null", None),
+                            "is_prefix_cache": block_hash is not None,
+                            "in_free_queue": True,
+                            "block_hash": _block_hash_to_text(block_hash),
+                            "offload_capable": self._kv_region_offload_capable(
+                                group_id, block_id
+                            ),
+                            "metadata_only": not self.stage_l6_data_offload_enable,
+                        },
+                    )
+                    if safe:
+                        self._summary["stage_l5_safe_candidate_records"] += 1
+                    else:
+                        self._summary["stage_l5_unsafe_candidate_records"] += 1
             self._write(
                 {
                     "action": "would_evict_candidate"
@@ -334,10 +681,406 @@ class UvmKvRuntimePolicy:
                     "is_null": getattr(block, "is_null", None),
                     "has_block_hash": block_hash is not None,
                     "block_hash": _block_hash_to_text(block_hash),
-                    "safe_ref_cnt_zero": getattr(block, "ref_cnt", None) == 0,
+                    "safe_ref_cnt_zero": safe,
                 }
             )
             self._summary["candidate_records"] += 1
+
+    def on_blocks_allocated(
+        self,
+        *,
+        blocks: list[Any],
+        reason: str,
+    ) -> None:
+        """Prefetch CPU-resident KV blocks before they are reused."""
+        if not self.active or not self.stage_l6_prefetch_back_enable:
+            return
+        for block in blocks:
+            block_id = int(getattr(block, "block_id", -1))
+            if block_id < 0 or bool(getattr(block, "is_null", False)):
+                continue
+            for group_id in range(self.num_kv_cache_groups):
+                self._maybe_prefetch_back_region(
+                    region_id=f"kv:{group_id}:{block_id}",
+                    block_id=block_id,
+                    group_id=group_id,
+                    reason=reason,
+                    ref_cnt=getattr(block, "ref_cnt", None),
+                )
+
+    def on_blocks_freed(self, *, blocks: list[Any], reason: str) -> None:
+        if not self.active or not self.stage_l5_metadata_enable:
+            return
+        for block in blocks:
+            block_id = int(getattr(block, "block_id", -1))
+            if block_id < 0 or bool(getattr(block, "is_null", False)):
+                continue
+            safe = getattr(block, "ref_cnt", None) == 0
+            for group_id in range(self.num_kv_cache_groups):
+                record_uvm_residency_kv_metadata_candidate(
+                    region_id=f"kv:{group_id}:{block_id}",
+                    block_id=block_id,
+                    group_id=group_id,
+                    bytes_per_block=max(self.bytes_per_group_block, 1),
+                    safe=safe,
+                    reason=reason,
+                    metadata={
+                        "stage": "stage_l6" if self.stage_l6_data_offload_enable else "stage_l5",
+                        "source": "block_free_lifecycle",
+                        "ref_cnt": getattr(block, "ref_cnt", None),
+                        "is_null": getattr(block, "is_null", None),
+                        "is_prefix_cache": getattr(block, "block_hash", None) is not None,
+                        "in_free_queue": safe,
+                        "block_hash": _block_hash_to_text(getattr(block, "block_hash", None)),
+                        "offload_capable": self._kv_region_offload_capable(group_id, block_id),
+                        "metadata_only": not self.stage_l6_data_offload_enable,
+                    },
+                )
+
+    def _kv_region_offload_capable(self, group_id: int, block_id: int) -> bool:
+        snapshot = get_uvm_residency_region_snapshot(f"kv:{group_id}:{block_id}")
+        if not snapshot:
+            return False
+        metadata = snapshot.get("metadata") or {}
+        return bool(snapshot.get("ptr")) and bool(metadata.get("offload_capable"))
+
+    def _maybe_execute_stage_l6_safe_offload(
+        self,
+        *,
+        request_id: str,
+        block_pool: Any,
+        pressure: dict[str, Any],
+        reason: str,
+    ) -> None:
+        if not self.stage_l6_data_offload_enable:
+            return
+        self._maybe_load_stage_l6_pointer_map()
+        try:
+            free_blocks = block_pool.free_block_queue.get_all_free_blocks()
+        except Exception as exc:  # pragma: no cover - defensive trace path.
+            self._write(
+                {
+                    "action": "stage_l6_kv_safe_offload_snapshot_failed",
+                    "request_id": request_id,
+                    "reason": reason,
+                    "error": repr(exc),
+                }
+            )
+            return
+        pressure_blocks = int(pressure.get("pressure_blocks") or 0)
+        max_blocks = self.stage_l6_max_offload_blocks or pressure_blocks
+        if max_blocks <= 0:
+            max_blocks = self.candidate_limit
+        attempted_blocks = 0
+        issued_blocks = 0
+        for block in free_blocks:
+            if attempted_blocks >= max_blocks:
+                break
+            block_id = int(getattr(block, "block_id", -1))
+            safe = (
+                block_id >= 0
+                and not bool(getattr(block, "is_null", False))
+                and getattr(block, "ref_cnt", None) == 0
+            )
+            for group_id in range(self.num_kv_cache_groups):
+                if attempted_blocks >= max_blocks:
+                    break
+                attempted_blocks += 1
+                did_issue = self._maybe_offload_region(
+                    region_id=f"kv:{group_id}:{block_id}",
+                    block_id=block_id,
+                    group_id=group_id,
+                    safe=safe,
+                    request_id=request_id,
+                    reason=reason,
+                    block=block,
+                    pressure=pressure,
+                )
+                if did_issue:
+                    issued_blocks += 1
+
+    def _maybe_offload_region(
+        self,
+        *,
+        region_id: str,
+        block_id: int,
+        group_id: int,
+        safe: bool,
+        request_id: str,
+        reason: str,
+        block: Any,
+        pressure: dict[str, Any],
+    ) -> bool:
+        snapshot = get_uvm_residency_region_snapshot(region_id)
+        metadata = dict((snapshot or {}).get("metadata") or {})
+        ptr = int((snapshot or {}).get("ptr") or 0)
+        size_bytes = int((snapshot or {}).get("bytes") or self.bytes_per_group_block)
+        state = str((snapshot or {}).get("state") or "unknown")
+        ranges = self._stage_l6_pointer_ranges.get(region_id)
+        offload_capable = bool(metadata.get("offload_capable")) and bool(ranges)
+        attempt_metadata = {
+            "stage": "stage_l6",
+            "source": "kv_safe_block_offload",
+            "request_id": request_id,
+            "reason": reason,
+            "block_id": block_id,
+            "group_id": group_id,
+            "ref_cnt": getattr(block, "ref_cnt", None),
+            "is_null": getattr(block, "is_null", None),
+            "is_prefix_cache": getattr(block, "block_hash", None) is not None,
+            "in_free_queue": True,
+            "block_hash": _block_hash_to_text(getattr(block, "block_hash", None)),
+            "safe": safe,
+            "offload_capable": offload_capable,
+            "ptr_present": ptr > 0,
+            "range_count": len(ranges or ()),
+            **pressure,
+        }
+        self._summary["stage_l6_data_offload_attempt_records"] += 1
+        record_uvm_residency_action(
+            action="residency_kv_data_offload_attempt",
+            pool="kv",
+            region_id=region_id,
+            bytes=size_bytes,
+            metadata=attempt_metadata,
+        )
+        if not safe:
+            self._summary["stage_l6_unsafe_offload_records"] += 1
+            self._summary["stage_l6_data_offload_fallback_records"] += 1
+            record_uvm_residency_action(
+                action="residency_kv_data_offload_fallback",
+                pool="kv",
+                region_id=region_id,
+                bytes=size_bytes,
+                fallback_reason="unsafe_block",
+                metadata=attempt_metadata,
+            )
+            return False
+        if state == "cpu":
+            return True
+        if not offload_capable:
+            self._summary["stage_l6_data_offload_fallback_records"] += 1
+            record_uvm_residency_action(
+                action="residency_kv_data_offload_fallback",
+                pool="kv",
+                region_id=region_id,
+                bytes=size_bytes,
+                fallback_reason="missing_ptr_or_not_offload_capable",
+                metadata=attempt_metadata,
+            )
+            return False
+        coordinator_decision = request_uvm_pool_action(
+            pool="kv",
+            action="kv_safe_block_prefetch_cpu",
+            requested_bytes=size_bytes,
+            scope_key=f"kv_request:{request_id}",
+            metadata={
+                "stage": "stage_l7",
+                "source": "kv_safe_block_offload",
+                "request_id": request_id,
+                "region_id": region_id,
+                "block_id": block_id,
+                "group_id": group_id,
+                "range_count": len(ranges or ()),
+                "mode": self.stage_l6_data_offload_mode,
+            },
+        )
+        if not coordinator_decision.allowed:
+            self._summary["stage_l6_data_offload_fallback_records"] += 1
+            record_uvm_residency_action(
+                action="residency_kv_data_offload_fallback",
+                pool="kv",
+                region_id=region_id,
+                bytes=size_bytes,
+                fallback_reason="stage_k_coordinator_reject",
+                coordinator_mode=coordinator_decision.mode,
+                coordinator_reason=coordinator_decision.reason,
+                metadata=attempt_metadata,
+            )
+            self._write(
+                {
+                    "action": "stage_l7_kv_offload_coordinator_reject",
+                    "request_id": request_id,
+                    "region_id": region_id,
+                    "requested_bytes": size_bytes,
+                    "coordinator_mode": coordinator_decision.mode,
+                    "coordinator_reason": coordinator_decision.reason,
+                    "scope_key": coordinator_decision.scope_key,
+                }
+            )
+            return False
+        mark_uvm_residency_state(
+            region_id=region_id,
+            state="prefetching_cpu",
+            metadata=attempt_metadata,
+        )
+        issued = self.stage_l6_data_offload_mode == "trace_only"
+        if self.stage_l6_data_offload_mode == "prefetch_cpu":
+            issued = all(
+                prefetch_range_to_cpu(range_ptr, range_bytes)
+                for range_ptr, range_bytes in (ranges or ())
+            )
+        if issued:
+            mark_uvm_residency_state(
+                region_id=region_id,
+                state="cpu",
+                metadata=attempt_metadata,
+            )
+            self._summary["stage_l6_data_offload_issued_records"] += 1
+            record_uvm_residency_action(
+                action="residency_kv_data_offload_issued",
+                pool="kv",
+                region_id=region_id,
+                bytes=size_bytes,
+                mode=self.stage_l6_data_offload_mode,
+                ptr=f"0x{ptr:x}",
+                range_count=len(ranges or ()),
+                coordinator_mode=coordinator_decision.mode,
+                coordinator_reason=coordinator_decision.reason,
+                metadata=attempt_metadata,
+            )
+            return True
+        mark_uvm_residency_state(
+            region_id=region_id,
+            state="gpu",
+            metadata=attempt_metadata,
+        )
+        self._summary["stage_l6_data_offload_fallback_records"] += 1
+        record_uvm_residency_action(
+            action="residency_kv_data_offload_fallback",
+            pool="kv",
+            region_id=region_id,
+            bytes=size_bytes,
+            fallback_reason="prefetch_cpu_not_issued",
+            metadata=attempt_metadata,
+        )
+        return False
+
+    def _maybe_prefetch_back_region(
+        self,
+        *,
+        region_id: str,
+        block_id: int,
+        group_id: int,
+        reason: str,
+        ref_cnt: Any,
+    ) -> None:
+        snapshot = get_uvm_residency_region_snapshot(region_id)
+        if not snapshot:
+            return
+        state = str(snapshot.get("state") or "unknown")
+        if state not in ("cpu", "prefetching_cpu"):
+            return
+        ptr = int(snapshot.get("ptr") or 0)
+        size_bytes = int(snapshot.get("bytes") or self.bytes_per_group_block)
+        metadata = dict(snapshot.get("metadata") or {})
+        ranges = self._stage_l6_pointer_ranges.get(region_id)
+        prefetch_metadata = {
+            "stage": "stage_l6",
+            "source": "kv_prefetch_back_before_reuse",
+            "reason": reason,
+            "block_id": block_id,
+            "group_id": group_id,
+            "ref_cnt": ref_cnt,
+            "previous_state": state,
+            "offload_capable": bool(metadata.get("offload_capable")),
+            "ptr_present": ptr > 0,
+            "range_count": len(ranges or ()),
+        }
+        if not ranges or not bool(metadata.get("offload_capable")):
+            self._summary["stage_l6_prefetch_back_fallback_records"] += 1
+            record_uvm_residency_action(
+                action="residency_kv_prefetch_back_fallback",
+                pool="kv",
+                region_id=region_id,
+                bytes=size_bytes,
+                fallback_reason="missing_ptr_or_not_offload_capable",
+                metadata=prefetch_metadata,
+            )
+            return
+        coordinator_decision = request_uvm_pool_action(
+            pool="kv",
+            action="kv_block_prefetch_gpu",
+            requested_bytes=size_bytes,
+            scope_key=f"kv_prefetch_back:{region_id}",
+            metadata={
+                "stage": "stage_l7",
+                "source": "kv_prefetch_back_before_reuse",
+                "region_id": region_id,
+                "block_id": block_id,
+                "group_id": group_id,
+                "range_count": len(ranges),
+                "mode": self.stage_l6_prefetch_back_mode,
+            },
+        )
+        if not coordinator_decision.allowed:
+            self._summary["stage_l6_prefetch_back_fallback_records"] += 1
+            record_uvm_residency_action(
+                action="residency_kv_prefetch_back_fallback",
+                pool="kv",
+                region_id=region_id,
+                bytes=size_bytes,
+                fallback_reason="stage_k_coordinator_reject",
+                coordinator_mode=coordinator_decision.mode,
+                coordinator_reason=coordinator_decision.reason,
+                metadata=prefetch_metadata,
+            )
+            self._write(
+                {
+                    "action": "stage_l7_kv_prefetch_back_coordinator_reject",
+                    "region_id": region_id,
+                    "requested_bytes": size_bytes,
+                    "coordinator_mode": coordinator_decision.mode,
+                    "coordinator_reason": coordinator_decision.reason,
+                    "scope_key": coordinator_decision.scope_key,
+                }
+            )
+            return
+        mark_uvm_residency_state(
+            region_id=region_id,
+            state="prefetching_gpu",
+            metadata=prefetch_metadata,
+        )
+        issued = self.stage_l6_prefetch_back_mode == "trace_only"
+        if self.stage_l6_prefetch_back_mode == "prefetch":
+            issued = all(
+                prefetch_range_to_device(range_ptr, range_bytes, self.stage_l6_device)
+                for range_ptr, range_bytes in ranges
+            )
+        if issued:
+            mark_uvm_residency_state(
+                region_id=region_id,
+                state="gpu",
+                metadata=prefetch_metadata,
+            )
+            self._summary["stage_l6_prefetch_back_issued_records"] += 1
+            record_uvm_residency_action(
+                action="residency_kv_prefetch_back_issued",
+                pool="kv",
+                region_id=region_id,
+                bytes=size_bytes,
+                mode=self.stage_l6_prefetch_back_mode,
+                ptr=f"0x{ptr:x}",
+                range_count=len(ranges),
+                coordinator_mode=coordinator_decision.mode,
+                coordinator_reason=coordinator_decision.reason,
+                metadata=prefetch_metadata,
+            )
+            return
+        mark_uvm_residency_state(
+            region_id=region_id,
+            state="cpu",
+            metadata=prefetch_metadata,
+        )
+        self._summary["stage_l6_prefetch_back_fallback_records"] += 1
+        record_uvm_residency_action(
+            action="residency_kv_prefetch_back_fallback",
+            pool="kv",
+            region_id=region_id,
+            bytes=size_bytes,
+            fallback_reason="prefetch_gpu_not_issued",
+            metadata=prefetch_metadata,
+        )
 
     def _maybe_execute_prefix_eviction(
         self,

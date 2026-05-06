@@ -94,6 +94,11 @@ class UvmPoolCoordinator:
         self.priority = os.environ.get(
             "VLLM_UVM_POOL_COORDINATOR_PRIORITY", "kv,weights,scratch"
         )
+        self.priority_order = [
+            item.strip().lower()
+            for item in self.priority.split(",")
+            if item.strip()
+        ]
         self._lock = threading.Lock()
         self._config_recorded = False
         self._scope_used: dict[str, dict[str, int]] = {}
@@ -253,6 +258,8 @@ class UvmPoolCoordinator:
                 "global_budget_bytes": self.global_budget_bytes,
                 "pool_budgets": self.pool_budgets,
                 "priority": self.priority,
+                "priority_semantics": "global_action_order_only",
+                "per_pool_safety_semantics": "budget_and_callsite_rules_are_independent",
             }
         )
 
@@ -294,6 +301,20 @@ class UvmPoolCoordinator:
             "global_budget_bytes": decision.global_budget_bytes,
             "global_used_bytes": decision.global_used_bytes,
             "global_remaining_bytes": decision.global_remaining_bytes,
+            "priority": self.priority,
+            "priority_index": (
+                self.priority_order.index(decision.pool)
+                if decision.pool in self.priority_order
+                else None
+            ),
+            "priority_rank": (
+                self.priority_order.index(decision.pool) + 1
+                if decision.pool in self.priority_order
+                else None
+            ),
+            "priority_semantics": "global_action_order_only",
+            "per_pool_safety_semantics": "budget_and_callsite_rules_are_independent",
+            "global_budget_considered": self.global_budget_bytes > 0,
             "metadata": metadata,
         }
         self._write_locked(record)

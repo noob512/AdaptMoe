@@ -1,0 +1,1142 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Stage L0 UVM pool residency accounting.
+
+This module is intentionally trace/accounting-only.  It maintains an
+application-level estimate of GPU residency intent for weights, KV, and scratch
+pools.  It does not query CUDA driver page residency and does not migrate,
+evict, or prefetch memory by itself.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+VALID_POOLS = {"weights", "kv", "scratch"}
+VALID_STATES = {
+    "unknown",
+    "gpu",
+    "cpu",
+    "prefetching_gpu",
+    "prefetching_cpu",
+    "released",
+}
+
+
+def _read_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _read_int_env(name: str, default: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; expected non-negative integer.", name, raw)
+        return default
+
+
+def _read_mode_env() -> str:
+    mode = os.environ.get("VLLM_UVM_RESIDENCY_MODE", "trace_only")
+    mode = mode.strip().lower()
+    if mode not in ("trace_only", "enforce"):
+        logger.warning(
+            "Ignoring invalid VLLM_UVM_RESIDENCY_MODE=%r; using trace_only.",
+            mode,
+        )
+        return "trace_only"
+    return mode
+
+
+def _normalize_pool(pool: str) -> str:
+    pool = (pool or "unknown").strip().lower()
+    return pool if pool in VALID_POOLS else "unknown"
+
+
+def _normalize_state(state: str) -> str:
+    state = (state or "unknown").strip().lower()
+    return state if state in VALID_STATES else "unknown"
+
+
+def _state_counts_as_gpu(state: str, previous_estimated: bool = False) -> bool:
+    state = _normalize_state(state)
+    if state in ("gpu", "prefetching_gpu"):
+        return True
+    if state == "prefetching_cpu":
+        # Conservative accounting: a GPU -> CPU prefetch still counts until it
+        # is confirmed as CPU.  This avoids releasing budget too early.
+        return previous_estimated
+    return False
+
+
+@dataclass
+class UvmResidencyRegion:
+    region_id: str
+    pool: str
+    ptr: int | None
+    bytes: int
+    state: str = "unknown"
+    estimated_gpu_resident: bool = False
+    evictable: bool = False
+    active: bool = False
+    last_access_step: int | None = None
+    last_state_update_ts: float = field(default_factory=time.time)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class UvmResidencyDecision:
+    enabled: bool
+    mode: str
+    pool: str
+    region_id: str
+    requested_bytes: int
+    incremental_bytes: int
+    allowed: bool
+    would_deny: bool
+    reason: str
+    scope_key: str
+    pool_budget_bytes: int
+    pool_estimated_gpu_resident_bytes: int
+    pool_remaining_bytes: int | None
+    global_budget_bytes: int
+    global_estimated_gpu_resident_bytes: int
+    global_remaining_bytes: int | None
+    victims: tuple[str, ...] = ()
+
+
+class UvmPoolResidencyManager:
+    """Stage L0 estimated residency ledger for UVM memory pools."""
+
+    def __init__(self) -> None:
+        self.enabled = _read_bool_env("VLLM_UVM_RESIDENCY_ENABLE", False)
+        self.mode = _read_mode_env()
+        self.trace_file = os.environ.get(
+            "VLLM_UVM_RESIDENCY_TRACE_FILE",
+            "vllm_uvm_pool_residency_stage_l.jsonl",
+        )
+        self.global_budget_bytes = _read_int_env(
+            "VLLM_UVM_RESIDENCY_GLOBAL_GPU_BYTES", 0
+        )
+        self.pool_budgets = {
+            "weights": _read_int_env("VLLM_UVM_RESIDENCY_WEIGHT_GPU_BYTES", 0),
+            "kv": _read_int_env("VLLM_UVM_RESIDENCY_KV_GPU_BYTES", 0),
+            "scratch": _read_int_env("VLLM_UVM_RESIDENCY_SCRATCH_GPU_BYTES", 0),
+        }
+        self.safety_margin_bytes = _read_int_env(
+            "VLLM_UVM_RESIDENCY_SAFETY_MARGIN_BYTES", 0
+        )
+        self.scratch_reserved_bytes = _read_int_env(
+            "VLLM_UVM_RESIDENCY_SCRATCH_RESERVED_BYTES", 0
+        )
+        self.scratch_margin_bytes = _read_int_env(
+            "VLLM_UVM_RESIDENCY_SCRATCH_MARGIN_BYTES", 0
+        )
+        self.kv_sizing_enable = _read_bool_env(
+            "VLLM_UVM_RESIDENCY_KV_SIZING_ENABLE", False
+        )
+        self.kv_sizing_policy = os.environ.get(
+            "VLLM_UVM_RESIDENCY_KV_SIZING_POLICY", "report_only"
+        ).strip().lower()
+        self.kv_sizing_max_blocks = _read_int_env(
+            "VLLM_UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS", 0
+        )
+        self.kv_metadata_enable = _read_bool_env(
+            "VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE",
+            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") in ("stage_l5", "stage_l6"),
+        )
+        self.kv_data_offload_enable = _read_bool_env(
+            "VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE",
+            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l6",
+        )
+        self.kv_prefetch_back_enable = _read_bool_env(
+            "VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_ENABLE",
+            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l6",
+        )
+        self.priority = os.environ.get(
+            "VLLM_UVM_RESIDENCY_PRIORITY", "kv,scratch,weights"
+        )
+        self.stage_label = os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "stage_l0")
+        self.weight_initial_state = _normalize_state(
+            os.environ.get("VLLM_UVM_RESIDENCY_WEIGHT_INITIAL_STATE", "cpu")
+        )
+        self.weight_enforce_hot_set = _read_bool_env(
+            "VLLM_UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET", False
+        )
+        self.weight_sync_offload = _read_bool_env(
+            "VLLM_UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD", True
+        )
+        self.weight_max_victims_per_step = _read_int_env(
+            "VLLM_UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP", 0
+        )
+        self.weight_victim_policy = os.environ.get(
+            "VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_POLICY", "cold_plan_lru"
+        )
+        self._lock = threading.Lock()
+        self._config_recorded = False
+        self._regions: dict[str, UvmResidencyRegion] = {}
+        self._pool_estimated_bytes = {"weights": 0, "kv": 0, "scratch": 0}
+        self._scratch_summary: dict[str, Any] = {
+            "scratch_peak_bytes": 0,
+            "scratch_live_bytes": 0,
+            "scratch_reserved_bytes": self.scratch_reserved_bytes,
+            "scratch_margin_bytes": self.scratch_margin_bytes,
+            "scratch_pool_enabled": False,
+            "scratch_pool_mode": None,
+            "scratch_trace_records": 0,
+            "scratch_eligible_records": 0,
+            "scratch_device_direct_records": 0,
+            "scratch_budget_over_records": 0,
+            "scratch_budget_reject_records": 0,
+            "scratch_eviction_records": 0,
+            "scratch_stage_g_summary_present": False,
+        }
+        self._kv_sizing_summary: dict[str, Any] = {
+            "kv_sizing_records": 0,
+            "kv_sizing_config_present": False,
+            "kv_sizing_policy": self.kv_sizing_policy,
+            "kv_sizing_max_blocks": self.kv_sizing_max_blocks,
+            "kv_sizing_mode": "explicit" if self.pool_budgets["kv"] > 0 else "derived",
+            "kv_sizing_applied": False,
+            "kv_sizing_report_only": True,
+            "kv_sizing_fallback_reason": None,
+            "kv_sizing_explicit_budget_bytes": self.pool_budgets["kv"],
+            "kv_sizing_derived_budget_bytes": 0,
+            "kv_sizing_budget_bytes": 0,
+            "kv_sizing_budget_blocks": 0,
+            "kv_sizing_bytes_per_block": 0,
+            "kv_sizing_original_num_gpu_blocks": 0,
+            "kv_sizing_final_num_gpu_blocks": 0,
+            "kv_sizing_original_kv_bytes": 0,
+            "kv_sizing_final_kv_bytes": 0,
+        }
+        self._summary = {
+            "register_region_records": 0,
+            "requests": 0,
+            "grants": 0,
+            "denies": 0,
+            "would_denies": 0,
+            "state_updates": 0,
+            "access_records": 0,
+            "would_evict_candidates": 0,
+            "real_action_records": 0,
+            "scratch_summary_records": 0,
+            "kv_sizing_records": 0,
+            "kv_metadata_records": 0,
+            "kv_safe_candidate_records": 0,
+            "kv_unsafe_candidate_records": 0,
+            "kv_data_offload_records": 0,
+            "kv_data_offload_attempt_records": 0,
+            "kv_data_offload_issued_records": 0,
+            "kv_data_offload_fallback_records": 0,
+            "kv_prefetch_back_records": 0,
+            "kv_prefetch_back_issued_records": 0,
+            "kv_prefetch_back_fallback_records": 0,
+        }
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and bool(self.trace_file)
+
+    def register_region(
+        self,
+        *,
+        pool: str,
+        region_id: str,
+        ptr: int | None,
+        bytes: int,
+        state: str = "unknown",
+        evictable: bool = False,
+        active: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> UvmResidencyRegion:
+        pool = _normalize_pool(pool)
+        state = _normalize_state(state)
+        bytes = max(int(bytes or 0), 0)
+        metadata = metadata or {}
+        with self._lock:
+            self._record_config_locked()
+            existing = self._regions.get(region_id)
+            if existing is not None:
+                old_bytes = existing.bytes
+                old_estimated = existing.estimated_gpu_resident
+                if old_estimated and existing.pool in self._pool_estimated_bytes:
+                    self._pool_estimated_bytes[existing.pool] = max(
+                        self._pool_estimated_bytes[existing.pool] - old_bytes, 0
+                    )
+                existing.pool = pool
+                existing.ptr = ptr
+                existing.bytes = bytes
+                existing.state = state
+                existing.evictable = evictable
+                existing.active = active
+                existing.metadata.update(metadata)
+                existing.estimated_gpu_resident = _state_counts_as_gpu(state)
+                existing.last_state_update_ts = time.time()
+                region = existing
+            else:
+                region = UvmResidencyRegion(
+                    region_id=region_id,
+                    pool=pool,
+                    ptr=ptr,
+                    bytes=bytes,
+                    state=state,
+                    estimated_gpu_resident=_state_counts_as_gpu(state),
+                    evictable=evictable,
+                    active=active,
+                    metadata=dict(metadata),
+                )
+                self._regions[region_id] = region
+
+            if region.estimated_gpu_resident and pool in self._pool_estimated_bytes:
+                self._pool_estimated_bytes[pool] += bytes
+
+            self._summary["register_region_records"] += 1
+            self._write_locked(
+                {
+                    "action": "residency_register_region",
+                    "pool": pool,
+                    "region_id": region_id,
+                    "ptr": f"0x{ptr:x}" if isinstance(ptr, int) else None,
+                    "bytes": bytes,
+                    "state": state,
+                    "estimated_gpu_resident": region.estimated_gpu_resident,
+                    "evictable": evictable,
+                    "active": active,
+                    "metadata": metadata,
+                }
+            )
+            self._record_summary_locked()
+            return region
+
+    def request_gpu_residency(
+        self,
+        *,
+        pool: str,
+        region_id: str,
+        bytes: int,
+        scope_key: str | None = None,
+        active_region_ids: set[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> UvmResidencyDecision:
+        pool = _normalize_pool(pool)
+        bytes = max(int(bytes or 0), 0)
+        scope_key = scope_key or "global"
+        metadata = metadata or {}
+        active_region_ids = active_region_ids or set()
+        if not self.active or bytes <= 0:
+            return UvmResidencyDecision(
+                enabled=self.enabled,
+                mode=self.mode,
+                pool=pool,
+                region_id=region_id,
+                requested_bytes=bytes,
+                incremental_bytes=0,
+                allowed=True,
+                would_deny=False,
+                reason="residency_disabled_or_zero_bytes",
+                scope_key=scope_key,
+                pool_budget_bytes=0,
+                pool_estimated_gpu_resident_bytes=0,
+                pool_remaining_bytes=None,
+                global_budget_bytes=0,
+                global_estimated_gpu_resident_bytes=0,
+                global_remaining_bytes=None,
+            )
+
+        with self._lock:
+            self._record_config_locked()
+            region = self._regions.get(region_id)
+            already_gpu = bool(region and region.estimated_gpu_resident)
+            incremental_bytes = 0 if already_gpu else bytes
+            pool_used = self._pool_estimated_bytes.get(pool, 0)
+            global_used = self._global_estimated_bytes_locked()
+            pool_budget = self.pool_budgets.get(pool, 0)
+            global_budget = self.global_budget_bytes
+            if global_budget > 0 and self.safety_margin_bytes > 0:
+                global_budget = max(global_budget - self.safety_margin_bytes, 0)
+            pool_remaining = (
+                max(pool_budget - pool_used, 0) if pool_budget > 0 else None
+            )
+            global_remaining = (
+                max(global_budget - global_used, 0) if global_budget > 0 else None
+            )
+            pool_over = (
+                pool_budget > 0 and incremental_bytes > (pool_remaining or 0)
+            )
+            global_over = (
+                global_budget > 0 and incremental_bytes > (global_remaining or 0)
+            )
+            would_deny = pool_over or global_over
+            # L0 is trace/accounting-only.  Even in enforce mode it does not
+            # execute reclaim; callers can inspect would_deny before later stages
+            # opt into real action handling.
+            allowed = self.mode != "enforce" or not would_deny
+            if already_gpu:
+                reason = "already_estimated_gpu_resident"
+            elif global_over:
+                reason = "global_residency_budget_exceeded"
+            elif pool_over:
+                reason = f"{pool}_residency_budget_exceeded"
+            else:
+                reason = "granted"
+
+            victims = self._candidate_victims_locked(
+                pool=pool,
+                required_bytes=incremental_bytes,
+                active_region_ids=active_region_ids,
+                scope_key=scope_key,
+                request_region_id=region_id,
+            ) if would_deny else []
+
+            decision = UvmResidencyDecision(
+                enabled=True,
+                mode=self.mode,
+                pool=pool,
+                region_id=region_id,
+                requested_bytes=bytes,
+                incremental_bytes=incremental_bytes,
+                allowed=allowed,
+                would_deny=would_deny,
+                reason=reason,
+                scope_key=scope_key,
+                pool_budget_bytes=pool_budget,
+                pool_estimated_gpu_resident_bytes=pool_used,
+                pool_remaining_bytes=pool_remaining,
+                global_budget_bytes=global_budget,
+                global_estimated_gpu_resident_bytes=global_used,
+                global_remaining_bytes=global_remaining,
+                victims=tuple(victims),
+            )
+            self._record_request_locked(decision, metadata)
+            return decision
+
+    def mark_state(
+        self,
+        *,
+        region_id: str,
+        state: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        state = _normalize_state(state)
+        metadata = metadata or {}
+        if not self.active:
+            return
+        with self._lock:
+            self._record_config_locked()
+            region = self._regions.get(region_id)
+            if region is None:
+                self._write_locked(
+                    {
+                        "action": "residency_state_update_failed",
+                        "region_id": region_id,
+                        "new_state": state,
+                        "reason": "unknown_region",
+                        "metadata": metadata,
+                    }
+                )
+                return
+            old_state = region.state
+            old_estimated = region.estimated_gpu_resident
+            new_estimated = _state_counts_as_gpu(state, old_estimated)
+            before_pool = self._pool_estimated_bytes.get(region.pool, 0)
+            before_global = self._global_estimated_bytes_locked()
+            if old_estimated and not new_estimated:
+                self._pool_estimated_bytes[region.pool] = max(
+                    before_pool - region.bytes, 0
+                )
+            elif not old_estimated and new_estimated:
+                self._pool_estimated_bytes[region.pool] = before_pool + region.bytes
+            after_pool = self._pool_estimated_bytes.get(region.pool, 0)
+            region.state = state
+            region.estimated_gpu_resident = new_estimated
+            region.last_state_update_ts = time.time()
+            self._summary["state_updates"] += 1
+            self._write_locked(
+                {
+                    "action": "residency_state_update",
+                    "pool": region.pool,
+                    "region_id": region_id,
+                    "old_state": old_state,
+                    "new_state": state,
+                    "bytes": region.bytes,
+                    "old_estimated_gpu_resident": old_estimated,
+                    "new_estimated_gpu_resident": new_estimated,
+                    "pool_estimated_gpu_resident_bytes_before": before_pool,
+                    "pool_estimated_gpu_resident_bytes_after": after_pool,
+                    "global_estimated_gpu_resident_bytes_before": before_global,
+                    "global_estimated_gpu_resident_bytes_after": (
+                        self._global_estimated_bytes_locked()
+                    ),
+                    "metadata": metadata,
+                }
+            )
+            self._record_summary_locked()
+
+    def record_access(
+        self,
+        *,
+        region_id: str,
+        step: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.active:
+            return
+        metadata = metadata or {}
+        with self._lock:
+            self._record_config_locked()
+            region = self._regions.get(region_id)
+            if region is None:
+                return
+            region.last_access_step = int(step)
+            self._summary["access_records"] += 1
+            self._write_locked(
+                {
+                    "action": "residency_access",
+                    "pool": region.pool,
+                    "region_id": region_id,
+                    "step": int(step),
+                    "metadata": metadata,
+                }
+            )
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return self._summary_record_locked()
+
+    def region_snapshot(self, region_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            region = self._regions.get(region_id)
+            if region is None:
+                return None
+            return {
+                "region_id": region.region_id,
+                "pool": region.pool,
+                "ptr": region.ptr,
+                "bytes": region.bytes,
+                "state": region.state,
+                "estimated_gpu_resident": region.estimated_gpu_resident,
+                "evictable": region.evictable,
+                "active": region.active,
+                "last_access_step": region.last_access_step,
+                "last_state_update_ts": region.last_state_update_ts,
+                "metadata": dict(region.metadata),
+            }
+
+    def record_action(
+        self,
+        *,
+        action: str,
+        pool: str,
+        region_id: str | None = None,
+        bytes: int = 0,
+        metadata: dict[str, Any] | None = None,
+        **extra: Any,
+    ) -> None:
+        if not self.active:
+            return
+        pool = _normalize_pool(pool)
+        metadata = metadata or {}
+        with self._lock:
+            self._record_config_locked()
+            self._summary["real_action_records"] += 1
+            if pool == "kv":
+                if action == "residency_kv_data_offload_attempt":
+                    self._summary["kv_data_offload_attempt_records"] += 1
+                elif action == "residency_kv_data_offload_issued":
+                    self._summary["kv_data_offload_records"] += 1
+                    self._summary["kv_data_offload_issued_records"] += 1
+                elif action == "residency_kv_data_offload_fallback":
+                    self._summary["kv_data_offload_records"] += 1
+                    self._summary["kv_data_offload_fallback_records"] += 1
+                elif action == "residency_kv_prefetch_back_issued":
+                    self._summary["kv_prefetch_back_records"] += 1
+                    self._summary["kv_prefetch_back_issued_records"] += 1
+                elif action == "residency_kv_prefetch_back_fallback":
+                    self._summary["kv_prefetch_back_records"] += 1
+                    self._summary["kv_prefetch_back_fallback_records"] += 1
+            record: dict[str, Any] = {
+                "action": action,
+                "pool": pool,
+                "region_id": region_id,
+                "bytes": max(int(bytes or 0), 0),
+                "metadata": metadata,
+            }
+            record.update(extra)
+            self._write_locked(record)
+            self._record_summary_locked()
+
+    def record_scratch_summary(
+        self,
+        *,
+        scratch_live_bytes: int = 0,
+        scratch_peak_bytes: int = 0,
+        scratch_reserved_bytes: int | None = None,
+        scratch_margin_bytes: int | None = None,
+        scratch_pool_enabled: bool | None = None,
+        scratch_pool_mode: str | None = None,
+        scratch_trace_records: int = 0,
+        scratch_eligible_records: int = 0,
+        scratch_device_direct_records: int = 0,
+        scratch_budget_over_records: int = 0,
+        scratch_budget_reject_records: int = 0,
+        scratch_eviction_records: int = 0,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.active:
+            return
+        metadata = metadata or {}
+        with self._lock:
+            self._record_config_locked()
+            if scratch_reserved_bytes is None:
+                scratch_reserved_bytes = self.scratch_reserved_bytes
+            if scratch_margin_bytes is None:
+                scratch_margin_bytes = self.scratch_margin_bytes
+            scratch_summary = {
+                "scratch_peak_bytes": max(int(scratch_peak_bytes or 0), 0),
+                "scratch_live_bytes": max(int(scratch_live_bytes or 0), 0),
+                "scratch_reserved_bytes": max(int(scratch_reserved_bytes or 0), 0),
+                "scratch_margin_bytes": max(int(scratch_margin_bytes or 0), 0),
+                "scratch_pool_enabled": bool(scratch_pool_enabled),
+                "scratch_pool_mode": scratch_pool_mode,
+                "scratch_trace_records": max(int(scratch_trace_records or 0), 0),
+                "scratch_eligible_records": max(int(scratch_eligible_records or 0), 0),
+                "scratch_device_direct_records": max(
+                    int(scratch_device_direct_records or 0), 0
+                ),
+                "scratch_budget_over_records": max(
+                    int(scratch_budget_over_records or 0), 0
+                ),
+                "scratch_budget_reject_records": max(
+                    int(scratch_budget_reject_records or 0), 0
+                ),
+                "scratch_eviction_records": max(
+                    int(scratch_eviction_records or 0), 0
+                ),
+                "scratch_stage_g_summary_present": True,
+            }
+            self._scratch_summary.update(scratch_summary)
+            self._summary["scratch_summary_records"] += 1
+            self._write_locked(
+                {
+                    "action": "residency_scratch_summary",
+                    "pool": "scratch",
+                    **scratch_summary,
+                    "scratch_gpu_budget_bytes": self.pool_budgets["scratch"],
+                    "metadata": metadata,
+                }
+            )
+            self._record_summary_locked()
+
+    def record_kv_sizing(
+        self,
+        *,
+        bytes_per_block: int,
+        original_num_gpu_blocks: int,
+        final_num_gpu_blocks: int | None = None,
+        original_kv_bytes: int | None = None,
+        final_kv_bytes: int | None = None,
+        explicit_kv_budget_bytes: int | None = None,
+        applied: bool | None = None,
+        policy: str | None = None,
+        max_blocks: int | None = None,
+        fallback_reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.active:
+            return
+        metadata = metadata or {}
+        bytes_per_block = max(int(bytes_per_block or 0), 0)
+        original_num_gpu_blocks = max(int(original_num_gpu_blocks or 0), 0)
+        if final_num_gpu_blocks is None:
+            final_num_gpu_blocks = original_num_gpu_blocks
+        final_num_gpu_blocks = max(int(final_num_gpu_blocks or 0), 0)
+        if original_kv_bytes is None:
+            original_kv_bytes = bytes_per_block * original_num_gpu_blocks
+        if final_kv_bytes is None:
+            final_kv_bytes = bytes_per_block * final_num_gpu_blocks
+        original_kv_bytes = max(int(original_kv_bytes or 0), 0)
+        final_kv_bytes = max(int(final_kv_bytes or 0), 0)
+        if explicit_kv_budget_bytes is None:
+            explicit_kv_budget_bytes = self.pool_budgets["kv"]
+        explicit_kv_budget_bytes = max(int(explicit_kv_budget_bytes or 0), 0)
+        policy = (policy or self.kv_sizing_policy).strip().lower()
+        if max_blocks is None:
+            max_blocks = self.kv_sizing_max_blocks
+        max_blocks = max(int(max_blocks or 0), 0)
+        if applied is None:
+            applied = final_num_gpu_blocks != original_num_gpu_blocks
+
+        derived_budget = max(
+            self.global_budget_bytes
+            - self.pool_budgets["weights"]
+            - self.pool_budgets["scratch"]
+            - self.safety_margin_bytes,
+            0,
+        )
+        if explicit_kv_budget_bytes > 0:
+            budget_mode = "explicit"
+            kv_budget_bytes = explicit_kv_budget_bytes
+        else:
+            budget_mode = "derived"
+            kv_budget_bytes = derived_budget
+        kv_budget_blocks = (
+            kv_budget_bytes // bytes_per_block if bytes_per_block > 0 else 0
+        )
+        kv_sizing_summary = {
+            "kv_sizing_config_present": True,
+            "kv_sizing_policy": policy,
+            "kv_sizing_max_blocks": max_blocks,
+            "kv_sizing_mode": budget_mode,
+            "kv_sizing_applied": bool(applied),
+            "kv_sizing_report_only": policy == "report_only",
+            "kv_sizing_fallback_reason": fallback_reason,
+            "kv_sizing_explicit_budget_bytes": explicit_kv_budget_bytes,
+            "kv_sizing_derived_budget_bytes": derived_budget,
+            "kv_sizing_budget_bytes": kv_budget_bytes,
+            "kv_sizing_budget_blocks": kv_budget_blocks,
+            "kv_sizing_bytes_per_block": bytes_per_block,
+            "kv_sizing_original_num_gpu_blocks": original_num_gpu_blocks,
+            "kv_sizing_final_num_gpu_blocks": final_num_gpu_blocks,
+            "kv_sizing_original_kv_bytes": original_kv_bytes,
+            "kv_sizing_final_kv_bytes": final_kv_bytes,
+        }
+        with self._lock:
+            self._record_config_locked()
+            self._kv_sizing_summary.update(kv_sizing_summary)
+            self._kv_sizing_summary["kv_sizing_records"] = (
+                int(self._kv_sizing_summary.get("kv_sizing_records") or 0) + 1
+            )
+            self._summary["kv_sizing_records"] += 1
+            self._write_locked(
+                {
+                    "action": "residency_kv_sizing",
+                    "pool": "kv",
+                    **kv_sizing_summary,
+                    "weight_gpu_budget_bytes": self.pool_budgets["weights"],
+                    "scratch_gpu_budget_bytes": self.pool_budgets["scratch"],
+                    "safety_margin_bytes": self.safety_margin_bytes,
+                    "global_gpu_budget_bytes": self.global_budget_bytes,
+                    "metadata": metadata,
+                }
+            )
+            self._record_summary_locked()
+
+    def record_kv_metadata_candidate(
+        self,
+        *,
+        region_id: str,
+        block_id: int,
+        group_id: int,
+        bytes_per_block: int,
+        safe: bool,
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.active:
+            return
+        metadata = metadata or {}
+        bytes_per_block = max(int(bytes_per_block or 0), 0)
+        with self._lock:
+            self._record_config_locked()
+            if safe:
+                self._summary["kv_safe_candidate_records"] += 1
+                action = "residency_kv_safe_candidate"
+            else:
+                self._summary["kv_unsafe_candidate_records"] += 1
+                action = "residency_kv_unsafe_candidate"
+            self._summary["kv_metadata_records"] += 1
+            self._write_locked(
+                {
+                    "action": action,
+                    "pool": "kv",
+                    "region_id": region_id,
+                    "block_id": int(block_id),
+                    "group_id": int(group_id),
+                    "bytes_per_block": bytes_per_block,
+                    "safe": bool(safe),
+                    "reason": reason,
+                    "data_offload_issued": False,
+                    "metadata": metadata,
+                }
+            )
+            self._record_summary_locked()
+
+    def _candidate_victims_locked(
+        self,
+        *,
+        pool: str,
+        required_bytes: int,
+        active_region_ids: set[str],
+        scope_key: str,
+        request_region_id: str,
+    ) -> list[str]:
+        if required_bytes <= 0:
+            return []
+        candidates = [
+            region for region in self._regions.values()
+            if region.pool == pool
+            and region.estimated_gpu_resident
+            and region.evictable
+            and not region.active
+            and region.region_id not in active_region_ids
+            and region.state in ("gpu", "prefetching_gpu")
+        ]
+        candidates.sort(
+            key=lambda item: (
+                item.last_access_step if item.last_access_step is not None else -1,
+                -item.bytes,
+                item.region_id,
+            )
+        )
+        victims: list[str] = []
+        reclaimed = 0
+        for region in candidates:
+            victims.append(region.region_id)
+            reclaimed += region.bytes
+            self._summary["would_evict_candidates"] += 1
+            self._write_locked(
+                {
+                    "action": "residency_would_evict_candidate",
+                    "pool": region.pool,
+                    "region_id": region.region_id,
+                    "bytes": region.bytes,
+                    "state": region.state,
+                    "evictable": region.evictable,
+                    "active": region.active,
+                    "last_access_step": region.last_access_step,
+                    "scope_key": scope_key,
+                    "request_region_id": request_region_id,
+                    "reason": "same_pool_budget_pressure",
+                }
+            )
+            if reclaimed >= required_bytes:
+                break
+        return victims
+
+    def _record_request_locked(
+        self,
+        decision: UvmResidencyDecision,
+        metadata: dict[str, Any],
+    ) -> None:
+        self._summary["requests"] += 1
+        if decision.would_deny:
+            self._summary["would_denies"] += 1
+        if decision.allowed:
+            self._summary["grants"] += 1
+            outcome = "residency_grant"
+        else:
+            self._summary["denies"] += 1
+            outcome = "residency_deny"
+        self._write_locked(
+            {
+                "action": "residency_request",
+                "outcome": outcome,
+                "pool": decision.pool,
+                "region_id": decision.region_id,
+                "requested_bytes": decision.requested_bytes,
+                "incremental_bytes": decision.incremental_bytes,
+                "scope_key": decision.scope_key,
+                "allowed": decision.allowed,
+                "would_deny": decision.would_deny,
+                "reason": decision.reason,
+                "mode": decision.mode,
+                "pool_budget_bytes": decision.pool_budget_bytes,
+                "pool_estimated_gpu_resident_bytes": (
+                    decision.pool_estimated_gpu_resident_bytes
+                ),
+                "pool_remaining_bytes": decision.pool_remaining_bytes,
+                "global_budget_bytes": decision.global_budget_bytes,
+                "global_estimated_gpu_resident_bytes": (
+                    decision.global_estimated_gpu_resident_bytes
+                ),
+                "global_remaining_bytes": decision.global_remaining_bytes,
+                "victims": list(decision.victims),
+                "metadata": metadata,
+            }
+        )
+        self._record_summary_locked()
+
+    def _record_config_locked(self) -> None:
+        if self._config_recorded or not self.trace_file:
+            return
+        self._config_recorded = True
+        self._write_locked(
+            {
+                "action": "residency_config",
+                "enabled": self.enabled,
+                "mode": self.mode,
+                "trace_file": self.trace_file,
+                "global_budget_bytes": self.global_budget_bytes,
+                "pool_budgets": self.pool_budgets,
+                "safety_margin_bytes": self.safety_margin_bytes,
+                "priority": self.priority,
+                "estimated_residency_semantics": (
+                    "application_managed_intent_not_driver_page_residency"
+                ),
+                "l0_trace_only_no_real_reclaim": True,
+                "stage_label": self.stage_label,
+                "weight_initial_state": self.weight_initial_state,
+                "weight_enforce_hot_set": self.weight_enforce_hot_set,
+                "weight_sync_offload": self.weight_sync_offload,
+                "weight_max_victims_per_step": self.weight_max_victims_per_step,
+                "weight_victim_policy": self.weight_victim_policy,
+                "scratch_reserved_bytes": self.scratch_reserved_bytes,
+                "scratch_margin_bytes": self.scratch_margin_bytes,
+                "kv_sizing_enable": self.kv_sizing_enable,
+                "kv_sizing_policy": self.kv_sizing_policy,
+                "kv_sizing_max_blocks": self.kv_sizing_max_blocks,
+                "kv_metadata_enable": self.kv_metadata_enable,
+                "kv_data_offload_enable": self.kv_data_offload_enable,
+                "kv_prefetch_back_enable": self.kv_prefetch_back_enable,
+            }
+        )
+
+    def _record_summary_locked(self) -> None:
+        self._write_locked(self._summary_record_locked())
+
+    def _summary_record_locked(self) -> dict[str, Any]:
+        pool_region_counts = {pool: 0 for pool in VALID_POOLS}
+        for region in self._regions.values():
+            if region.pool in pool_region_counts:
+                pool_region_counts[region.pool] += 1
+        return {
+            "action": "residency_summary",
+            "weights_estimated_gpu_resident_bytes": (
+                self._pool_estimated_bytes["weights"]
+            ),
+            "kv_estimated_gpu_resident_bytes": self._pool_estimated_bytes["kv"],
+            "scratch_estimated_gpu_resident_bytes": (
+                self._pool_estimated_bytes["scratch"]
+            ),
+            "global_estimated_gpu_resident_bytes": (
+                self._global_estimated_bytes_locked()
+            ),
+            "weight_gpu_budget_bytes": self.pool_budgets["weights"],
+            "kv_gpu_budget_bytes": self.pool_budgets["kv"],
+            "scratch_gpu_budget_bytes": self.pool_budgets["scratch"],
+            "global_gpu_budget_bytes": self.global_budget_bytes,
+            "pool_region_counts": pool_region_counts,
+            "region_records": len(self._regions),
+            **self._scratch_summary,
+            **self._kv_sizing_summary,
+            **self._summary,
+        }
+
+    def _global_estimated_bytes_locked(self) -> int:
+        return sum(self._pool_estimated_bytes.values())
+
+    def _write_locked(self, record: dict[str, Any]) -> None:
+        if not self.trace_file:
+            return
+        record.setdefault("ts", time.time())
+        record.setdefault("stage", self.stage_label)
+        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        os.makedirs(os.path.dirname(self.trace_file) or ".", exist_ok=True)
+        with open(self.trace_file, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+
+_RESIDENCY_MANAGER: UvmPoolResidencyManager | None = None
+_RESIDENCY_MANAGER_LOCK = threading.Lock()
+
+
+def get_uvm_pool_residency_manager() -> UvmPoolResidencyManager:
+    global _RESIDENCY_MANAGER
+    if _RESIDENCY_MANAGER is None:
+        with _RESIDENCY_MANAGER_LOCK:
+            if _RESIDENCY_MANAGER is None:
+                _RESIDENCY_MANAGER = UvmPoolResidencyManager()
+    return _RESIDENCY_MANAGER
+
+
+def register_uvm_residency_region(
+    *,
+    pool: str,
+    region_id: str,
+    ptr: int | None,
+    bytes: int,
+    state: str = "unknown",
+    evictable: bool = False,
+    active: bool = False,
+    metadata: dict[str, Any] | None = None,
+) -> UvmResidencyRegion:
+    return get_uvm_pool_residency_manager().register_region(
+        pool=pool,
+        region_id=region_id,
+        ptr=ptr,
+        bytes=bytes,
+        state=state,
+        evictable=evictable,
+        active=active,
+        metadata=metadata,
+    )
+
+
+def request_uvm_gpu_residency(
+    *,
+    pool: str,
+    region_id: str,
+    bytes: int,
+    scope_key: str | None = None,
+    active_region_ids: set[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> UvmResidencyDecision:
+    return get_uvm_pool_residency_manager().request_gpu_residency(
+        pool=pool,
+        region_id=region_id,
+        bytes=bytes,
+        scope_key=scope_key,
+        active_region_ids=active_region_ids,
+        metadata=metadata,
+    )
+
+
+def mark_uvm_residency_state(
+    *,
+    region_id: str,
+    state: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    get_uvm_pool_residency_manager().mark_state(
+        region_id=region_id,
+        state=state,
+        metadata=metadata,
+    )
+
+
+def record_uvm_residency_access(
+    *,
+    region_id: str,
+    step: int,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    get_uvm_pool_residency_manager().record_access(
+        region_id=region_id,
+        step=step,
+        metadata=metadata,
+    )
+
+
+def get_uvm_residency_snapshot() -> dict[str, Any]:
+    return get_uvm_pool_residency_manager().snapshot()
+
+
+def get_uvm_residency_region_snapshot(region_id: str) -> dict[str, Any] | None:
+    return get_uvm_pool_residency_manager().region_snapshot(region_id)
+
+
+def record_uvm_residency_action(
+    *,
+    action: str,
+    pool: str,
+    region_id: str | None = None,
+    bytes: int = 0,
+    metadata: dict[str, Any] | None = None,
+    **extra: Any,
+) -> None:
+    get_uvm_pool_residency_manager().record_action(
+        action=action,
+        pool=pool,
+        region_id=region_id,
+        bytes=bytes,
+        metadata=metadata,
+        **extra,
+    )
+
+
+def record_uvm_residency_scratch_summary(
+    *,
+    scratch_live_bytes: int = 0,
+    scratch_peak_bytes: int = 0,
+    scratch_reserved_bytes: int | None = None,
+    scratch_margin_bytes: int | None = None,
+    scratch_pool_enabled: bool | None = None,
+    scratch_pool_mode: str | None = None,
+    scratch_trace_records: int = 0,
+    scratch_eligible_records: int = 0,
+    scratch_device_direct_records: int = 0,
+    scratch_budget_over_records: int = 0,
+    scratch_budget_reject_records: int = 0,
+    scratch_eviction_records: int = 0,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    get_uvm_pool_residency_manager().record_scratch_summary(
+        scratch_live_bytes=scratch_live_bytes,
+        scratch_peak_bytes=scratch_peak_bytes,
+        scratch_reserved_bytes=scratch_reserved_bytes,
+        scratch_margin_bytes=scratch_margin_bytes,
+        scratch_pool_enabled=scratch_pool_enabled,
+        scratch_pool_mode=scratch_pool_mode,
+        scratch_trace_records=scratch_trace_records,
+        scratch_eligible_records=scratch_eligible_records,
+        scratch_device_direct_records=scratch_device_direct_records,
+        scratch_budget_over_records=scratch_budget_over_records,
+        scratch_budget_reject_records=scratch_budget_reject_records,
+        scratch_eviction_records=scratch_eviction_records,
+        metadata=metadata,
+    )
+
+
+def record_uvm_residency_kv_sizing(
+    *,
+    bytes_per_block: int,
+    original_num_gpu_blocks: int,
+    final_num_gpu_blocks: int | None = None,
+    original_kv_bytes: int | None = None,
+    final_kv_bytes: int | None = None,
+    explicit_kv_budget_bytes: int | None = None,
+    applied: bool | None = None,
+    policy: str | None = None,
+    max_blocks: int | None = None,
+    fallback_reason: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    get_uvm_pool_residency_manager().record_kv_sizing(
+        bytes_per_block=bytes_per_block,
+        original_num_gpu_blocks=original_num_gpu_blocks,
+        final_num_gpu_blocks=final_num_gpu_blocks,
+        original_kv_bytes=original_kv_bytes,
+        final_kv_bytes=final_kv_bytes,
+        explicit_kv_budget_bytes=explicit_kv_budget_bytes,
+        applied=applied,
+        policy=policy,
+        max_blocks=max_blocks,
+        fallback_reason=fallback_reason,
+        metadata=metadata,
+    )
+
+
+def record_uvm_residency_kv_metadata_candidate(
+    *,
+    region_id: str,
+    block_id: int,
+    group_id: int,
+    bytes_per_block: int,
+    safe: bool,
+    reason: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    get_uvm_pool_residency_manager().record_kv_metadata_candidate(
+        region_id=region_id,
+        block_id=block_id,
+        group_id=group_id,
+        bytes_per_block=bytes_per_block,
+        safe=safe,
+        reason=reason,
+        metadata=metadata,
+    )

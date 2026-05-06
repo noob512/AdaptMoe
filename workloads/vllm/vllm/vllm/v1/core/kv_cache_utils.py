@@ -104,6 +104,61 @@ def _kv_cache_config_total_bytes(kv_cache_config: KVCacheConfig) -> int:
     return sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
 
 
+def _read_residency_kv_sizing_policy() -> str:
+    policy = os.environ.get(
+        "VLLM_UVM_RESIDENCY_KV_SIZING_POLICY", "report_only"
+    ).strip().lower()
+    if policy not in ("report_only", "clamp", "override"):
+        logger.warning(
+            "Ignoring invalid VLLM_UVM_RESIDENCY_KV_SIZING_POLICY=%r; "
+            "expected report_only, clamp, or override.",
+            policy,
+        )
+        return "report_only"
+    return policy
+
+
+def _read_residency_kv_sizing_int_env(name: str) -> int:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return 0
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; expected integer bytes.", name, raw)
+        return 0
+    return max(parsed, 0)
+
+
+def _residency_kv_sizing_enabled() -> bool:
+    return os.environ.get("VLLM_UVM_RESIDENCY_KV_SIZING_ENABLE", "0") == "1"
+
+
+def _residency_kv_sizing_budget_bytes() -> tuple[int, int, str]:
+    explicit_kv_budget = _read_residency_kv_sizing_int_env(
+        "VLLM_UVM_RESIDENCY_KV_GPU_BYTES"
+    )
+    global_budget = _read_residency_kv_sizing_int_env(
+        "VLLM_UVM_RESIDENCY_GLOBAL_GPU_BYTES"
+    )
+    weight_budget = _read_residency_kv_sizing_int_env(
+        "VLLM_UVM_RESIDENCY_WEIGHT_GPU_BYTES"
+    )
+    scratch_budget = _read_residency_kv_sizing_int_env(
+        "VLLM_UVM_RESIDENCY_SCRATCH_GPU_BYTES"
+    )
+    safety_margin = _read_residency_kv_sizing_int_env(
+        "VLLM_UVM_RESIDENCY_SAFETY_MARGIN_BYTES"
+    )
+    derived_budget = max(
+        global_budget - weight_budget - scratch_budget - safety_margin,
+        0,
+    )
+    if explicit_kv_budget > 0:
+        return explicit_kv_budget, derived_budget, "explicit"
+    return derived_budget, derived_budget, "derived"
+
+
 def _apply_uvm_kv_budget_to_available_memory(
     available_memory: list[int],
 ) -> list[int]:
@@ -203,6 +258,108 @@ def _enforce_uvm_kv_budget_on_config(
         kv_cache_config.uvm_kv_budget_final_bytes / GiB_bytes,
         budget_bytes / GiB_bytes,
     )
+    return kv_cache_config
+
+
+def _apply_stage_l4_residency_kv_sizing(
+    kv_cache_config: KVCacheConfig,
+    *,
+    worker_index: int,
+) -> KVCacheConfig:
+    """Apply Stage L4 KV block sizing after vLLM has built a valid config."""
+    if not _residency_kv_sizing_enabled():
+        return kv_cache_config
+
+    policy = _read_residency_kv_sizing_policy()
+    current_bytes = _kv_cache_config_total_bytes(kv_cache_config)
+    original_num_blocks = kv_cache_config.num_blocks
+    max_blocks_guard = _read_residency_kv_sizing_int_env(
+        "VLLM_UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS"
+    )
+    kv_budget_bytes, _, _ = _residency_kv_sizing_budget_bytes()
+    bytes_per_block = (
+        current_bytes // original_num_blocks if original_num_blocks > 0 else 0
+    )
+    budget_blocks = kv_budget_bytes // bytes_per_block if bytes_per_block > 0 else 0
+    fallback_reason: str | None = None
+    target_num_blocks = original_num_blocks
+
+    if not kv_cache_config.kv_cache_tensors:
+        fallback_reason = "no_kv_tensors"
+    elif original_num_blocks <= 0:
+        fallback_reason = "invalid_original_num_blocks"
+    elif bytes_per_block <= 0:
+        fallback_reason = "invalid_bytes_per_block"
+    elif kv_budget_bytes <= 0 or budget_blocks <= 0:
+        fallback_reason = "budget_too_small"
+    elif policy == "report_only":
+        fallback_reason = "report_only"
+    elif policy == "clamp":
+        target_num_blocks = min(original_num_blocks, budget_blocks)
+    elif policy == "override":
+        target_num_blocks = budget_blocks
+        if max_blocks_guard > 0:
+            target_num_blocks = min(target_num_blocks, max_blocks_guard)
+    else:
+        fallback_reason = "invalid_policy"
+
+    if fallback_reason is None and target_num_blocks <= 0:
+        fallback_reason = "target_blocks_zero"
+        target_num_blocks = original_num_blocks
+
+    if fallback_reason is None and target_num_blocks != original_num_blocks:
+        original_tensor_sizes = [
+            tensor.size for tensor in kv_cache_config.kv_cache_tensors
+        ]
+        try:
+            for tensor in kv_cache_config.kv_cache_tensors:
+                assert tensor.size % original_num_blocks == 0
+                tensor.size = tensor.size // original_num_blocks * target_num_blocks
+            kv_cache_config.num_blocks = target_num_blocks
+            logger.warning(
+                "Stage L4 KV sizing %s: changed worker %d KV blocks from %d "
+                "to %d (budget %.2f GiB, bytes_per_block=%d).",
+                policy,
+                worker_index,
+                original_num_blocks,
+                target_num_blocks,
+                kv_budget_bytes / GiB_bytes,
+                bytes_per_block,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Stage L4 KV sizing failed for worker %d; falling back to "
+                "original num_blocks=%d: %s",
+                worker_index,
+                original_num_blocks,
+                exc,
+            )
+            fallback_reason = "apply_failed"
+            kv_cache_config.num_blocks = original_num_blocks
+            for tensor, size in zip(
+                kv_cache_config.kv_cache_tensors,
+                original_tensor_sizes,
+            ):
+                tensor.size = size
+
+    final_bytes = _kv_cache_config_total_bytes(kv_cache_config)
+    kv_cache_config.uvm_residency_kv_sizing_enabled = True
+    kv_cache_config.uvm_residency_kv_sizing_policy = policy
+    kv_cache_config.uvm_residency_kv_sizing_applied = (
+        fallback_reason is None and kv_cache_config.num_blocks != original_num_blocks
+    )
+    kv_cache_config.uvm_residency_kv_sizing_fallback_reason = fallback_reason
+    kv_cache_config.uvm_residency_kv_sizing_original_num_blocks = original_num_blocks
+    kv_cache_config.uvm_residency_kv_sizing_final_num_blocks = (
+        kv_cache_config.num_blocks
+    )
+    kv_cache_config.uvm_residency_kv_sizing_original_bytes = current_bytes
+    kv_cache_config.uvm_residency_kv_sizing_final_bytes = final_bytes
+    kv_cache_config.uvm_residency_kv_sizing_budget_bytes = kv_budget_bytes
+    kv_cache_config.uvm_residency_kv_sizing_budget_blocks = budget_blocks
+    kv_cache_config.uvm_residency_kv_sizing_bytes_per_block = bytes_per_block
+    kv_cache_config.uvm_residency_kv_sizing_max_blocks = max_blocks_guard
+    kv_cache_config.uvm_kv_budget_final_bytes = final_bytes
     return kv_cache_config
 
 # The hash seed for the first block of any prefix block sequence.
@@ -1435,6 +1592,59 @@ def _report_kv_cache_config(
         max_concurrency,
         scope="local",
     )
+    if _residency_kv_sizing_enabled():
+        try:
+            from vllm.device_allocator.uvm_pool_residency import (
+                record_uvm_residency_kv_sizing,
+            )
+
+            total_kv_bytes = _kv_cache_config_total_bytes(kv_cache_config)
+            bytes_per_block = (
+                kv_cache_config.uvm_residency_kv_sizing_bytes_per_block
+                or (
+                    total_kv_bytes // kv_cache_config.num_blocks
+                    if kv_cache_config.num_blocks > 0
+                    else 0
+                )
+            )
+            record_uvm_residency_kv_sizing(
+                bytes_per_block=bytes_per_block,
+                original_num_gpu_blocks=(
+                    kv_cache_config.uvm_residency_kv_sizing_original_num_blocks
+                    or kv_cache_config.uvm_kv_budget_original_num_blocks
+                    or kv_cache_config.num_blocks
+                ),
+                final_num_gpu_blocks=kv_cache_config.num_blocks,
+                original_kv_bytes=(
+                    kv_cache_config.uvm_residency_kv_sizing_original_bytes
+                    or kv_cache_config.uvm_kv_budget_original_bytes
+                    or total_kv_bytes
+                ),
+                final_kv_bytes=total_kv_bytes,
+                explicit_kv_budget_bytes=_read_residency_kv_sizing_int_env(
+                    "VLLM_UVM_RESIDENCY_KV_GPU_BYTES"
+                ),
+                applied=kv_cache_config.uvm_residency_kv_sizing_applied,
+                policy=(
+                    kv_cache_config.uvm_residency_kv_sizing_policy
+                    or _read_residency_kv_sizing_policy()
+                ),
+                max_blocks=kv_cache_config.uvm_residency_kv_sizing_max_blocks,
+                fallback_reason=(
+                    kv_cache_config.uvm_residency_kv_sizing_fallback_reason
+                ),
+                metadata={
+                    "source": "vllm_kv_cache_config",
+                    "stage": "stage_l4",
+                    "block_size_tokens": min_block_size,
+                    "kv_cache_groups": len(kv_cache_config.kv_cache_groups),
+                    "report_only_no_num_gpu_blocks_change": (
+                        not kv_cache_config.uvm_residency_kv_sizing_applied
+                    ),
+                },
+            )
+        except Exception:
+            logger.debug("Failed to record Stage L4 KV sizing report", exc_info=True)
     if kv_cache_config.uvm_kv_budget_bytes is not None:
         logger.info_once(
             "Stage D2 UVM KV budget: mode=%s budget=%.2f GiB enforced=%s "
@@ -1561,6 +1771,13 @@ def get_kv_cache_configs(
             kv_cache_config
         )
 
+    for worker_index, kv_cache_config in enumerate(kv_cache_configs):
+        _apply_stage_l4_residency_kv_sizing(
+            kv_cache_config,
+            worker_index=worker_index,
+        )
+
+    for kv_cache_config in kv_cache_configs:
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
 

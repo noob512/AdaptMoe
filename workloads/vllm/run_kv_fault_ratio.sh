@@ -98,6 +98,35 @@ UVM_POOL_COORDINATOR_WEIGHT_BYTES_PER_STEP="${VLLM_UVM_POOL_COORDINATOR_WEIGHT_B
 UVM_POOL_COORDINATOR_KV_BYTES_PER_STEP="${VLLM_UVM_POOL_COORDINATOR_KV_BYTES_PER_STEP:-0}"
 UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP="${VLLM_UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP:-0}"
 UVM_POOL_COORDINATOR_PRIORITY="${VLLM_UVM_POOL_COORDINATOR_PRIORITY:-kv,weights,scratch}"
+UVM_RESIDENCY_ENABLE="${VLLM_UVM_RESIDENCY_ENABLE:-0}"
+UVM_RESIDENCY_STAGE="${VLLM_UVM_RESIDENCY_STAGE:-stage_l0}"
+UVM_RESIDENCY_MODE="${VLLM_UVM_RESIDENCY_MODE:-trace_only}"
+UVM_RESIDENCY_TRACE_FILE="${VLLM_UVM_RESIDENCY_TRACE_FILE:-}"
+UVM_RESIDENCY_GLOBAL_GPU_BYTES="${VLLM_UVM_RESIDENCY_GLOBAL_GPU_BYTES:-0}"
+UVM_RESIDENCY_WEIGHT_GPU_BYTES="${VLLM_UVM_RESIDENCY_WEIGHT_GPU_BYTES:-0}"
+UVM_RESIDENCY_KV_GPU_BYTES="${VLLM_UVM_RESIDENCY_KV_GPU_BYTES:-0}"
+UVM_RESIDENCY_SCRATCH_GPU_BYTES="${VLLM_UVM_RESIDENCY_SCRATCH_GPU_BYTES:-0}"
+UVM_RESIDENCY_SAFETY_MARGIN_BYTES="${VLLM_UVM_RESIDENCY_SAFETY_MARGIN_BYTES:-0}"
+UVM_RESIDENCY_SCRATCH_RESERVED_BYTES="${VLLM_UVM_RESIDENCY_SCRATCH_RESERVED_BYTES:-0}"
+UVM_RESIDENCY_SCRATCH_MARGIN_BYTES="${VLLM_UVM_RESIDENCY_SCRATCH_MARGIN_BYTES:-0}"
+UVM_RESIDENCY_KV_SIZING_ENABLE="${VLLM_UVM_RESIDENCY_KV_SIZING_ENABLE:-0}"
+UVM_RESIDENCY_KV_SIZING_POLICY="${VLLM_UVM_RESIDENCY_KV_SIZING_POLICY:-report_only}"
+UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS="${VLLM_UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS:-0}"
+UVM_RESIDENCY_KV_METADATA_ENABLE="${VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE:-0}"
+UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE="${VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE:-0}"
+UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE="${VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE:-trace_only}"
+UVM_RESIDENCY_KV_PREFETCH_BACK_ENABLE="${VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_ENABLE:-0}"
+UVM_RESIDENCY_KV_PREFETCH_BACK_MODE="${VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_MODE:-trace_only}"
+UVM_RESIDENCY_KV_PREFETCH_DEVICE="${VLLM_UVM_RESIDENCY_KV_PREFETCH_DEVICE:-0}"
+UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP="${VLLM_UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP:-0}"
+UVM_RESIDENCY_KV_POINTER_MAP_FILE="${VLLM_UVM_RESIDENCY_KV_POINTER_MAP_FILE:-}"
+UVM_RESIDENCY_PRIORITY="${VLLM_UVM_RESIDENCY_PRIORITY:-kv,scratch,weights}"
+UVM_RESIDENCY_WEIGHT_INITIAL_STATE="${VLLM_UVM_RESIDENCY_WEIGHT_INITIAL_STATE:-cpu}"
+UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET="${VLLM_UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET:-0}"
+UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD="${VLLM_UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD:-1}"
+UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP="${VLLM_UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP:-0}"
+UVM_RESIDENCY_WEIGHT_VICTIM_POLICY="${VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_POLICY:-cold_plan_lru}"
+UVM_RESIDENCY_WEIGHT_VICTIM_ACTION="${VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_ACTION:-advise_cpu}"
 UVM_POOL_REGISTRY_ENABLE="${VLLM_UVM_POOL_REGISTRY_ENABLE:-0}"
 UVM_SCRATCH_POOL_ENABLE="${VLLM_UVM_SCRATCH_POOL_ENABLE:-0}"
 UVM_SCRATCH_POOL_BUDGET_BYTES="${VLLM_UVM_SCRATCH_POOL_BUDGET_BYTES:-1048576}"
@@ -317,6 +346,75 @@ Options:
   --uvm-pool-coordinator-priority <csv>
                              Pool priority label for reports
                              (default: kv,weights,scratch)
+  --uvm-residency-enable <0|1>
+                             Stage L0 estimated GPU residency ledger gate.
+  --uvm-residency-stage <label>
+                             Stage label written into residency JSONL records.
+                             (default: stage_l0)
+  --uvm-residency-mode <mode>
+                             Stage L0 mode: trace_only|enforce. L0 only
+                             records accounting decisions; no real reclaim.
+  --uvm-residency-trace-file <path>
+                             Stage L0 residency JSONL trace path.
+  --uvm-residency-global-gpu-bytes <n>
+                             Global estimated GPU residency budget.
+                             0 means unlimited.
+  --uvm-residency-weight-gpu-bytes <n>
+                             Weights estimated GPU residency budget.
+  --uvm-residency-kv-gpu-bytes <n>
+                             KV estimated GPU residency budget.
+  --uvm-residency-scratch-gpu-bytes <n>
+                             Scratch estimated GPU residency budget.
+  --uvm-residency-safety-margin-bytes <n>
+                             Safety margin subtracted from global budget.
+  --uvm-residency-scratch-reserved-bytes <n>
+                             Stage L3 scratch reserve reported alongside
+                             Stage G observed scratch peak.
+  --uvm-residency-scratch-margin-bytes <n>
+                             Stage L3 extra scratch margin for reports.
+  --uvm-residency-kv-sizing-enable <0|1>
+                             Stage L4 KV cache sizing report gate.
+  --uvm-residency-kv-sizing-policy <name>
+                             Stage L4 KV sizing policy:
+                             report_only|clamp|override.
+  --uvm-residency-kv-sizing-max-blocks <n>
+                             Stage L4 optional max block guard for override.
+                             0 means no extra guard.
+  --uvm-residency-kv-metadata-enable <0|1>
+                             Stage L5 KV block metadata-only residency gate.
+  --uvm-residency-kv-data-offload-enable <0|1>
+                             Stage L6 safe KV block data offload gate.
+  --uvm-residency-kv-data-offload-mode <mode>
+                             Stage L6 offload mode: trace_only|prefetch_cpu.
+  --uvm-residency-kv-prefetch-back-enable <0|1>
+                             Stage L6 prefetch-back-before-reuse gate.
+  --uvm-residency-kv-prefetch-back-mode <mode>
+                             Stage L6 prefetch-back mode: trace_only|prefetch.
+  --uvm-residency-kv-prefetch-device <n>
+                             Stage L6 target CUDA device for prefetch-back.
+  --uvm-residency-kv-max-offload-blocks-per-step <n>
+                             Stage L6 max safe KV offload blocks per pressure
+                             event. 0 derives from runtime pressure.
+  --uvm-residency-kv-pointer-map-file <path>
+                             Stage L6 raw KV block pointer map sidecar.
+  --uvm-residency-priority <csv>
+                             Stage L priority label for reports
+                             (default: kv,scratch,weights)
+  --uvm-residency-weight-initial-state <state>
+                             Initial expert weight residency state:
+                             unknown|cpu|gpu (default: cpu)
+  --uvm-residency-weight-enforce-hot-set <0|1>
+                             Stage L2 weights hot/cold residency enforce gate.
+  --uvm-residency-weight-sync-offload <0|1>
+                             If 1, L2 victim offload releases estimated bytes
+                             immediately after action success.
+  --uvm-residency-weight-max-victims-per-step <n>
+                             Max L2 weight victims per hot prefetch request.
+                             0 means unlimited.
+  --uvm-residency-weight-victim-policy <name>
+                             L2 weight victim policy label.
+  --uvm-residency-weight-victim-action <mode>
+                             L2 victim action: advise_cpu|prefetch_cpu.
   --uvm-pool-registry-enable <0|1>
                              Stage F unified pool registry telemetry.
                              Records kv_cache/weights/runtime_scratch objects
@@ -501,6 +599,9 @@ start_server() {
     if [ -z "$UVM_POOL_COORDINATOR_TRACE_FILE" ]; then
       UVM_POOL_COORDINATOR_TRACE_FILE="$uvm_stage_e_log_dir/vllm_uvm_pool_coordinator_stage_k.jsonl"
     fi
+    if [ -z "$UVM_RESIDENCY_TRACE_FILE" ]; then
+      UVM_RESIDENCY_TRACE_FILE="$uvm_stage_e_log_dir/vllm_uvm_pool_residency_stage_l.jsonl"
+    fi
     policy_env="VLLM_UVM_POLICY_ENABLE='$UVM_POLICY_ENABLE' \
                 VLLM_UVM_POLICY_MODE='$UVM_POLICY_MODE' \
                 VLLM_UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES='$UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES' \
@@ -564,6 +665,35 @@ start_server() {
                 VLLM_UVM_POOL_COORDINATOR_KV_BYTES_PER_STEP='$UVM_POOL_COORDINATOR_KV_BYTES_PER_STEP' \
                 VLLM_UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP='$UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP' \
                 VLLM_UVM_POOL_COORDINATOR_PRIORITY='$UVM_POOL_COORDINATOR_PRIORITY' \
+                VLLM_UVM_RESIDENCY_ENABLE='$UVM_RESIDENCY_ENABLE' \
+                VLLM_UVM_RESIDENCY_STAGE='$UVM_RESIDENCY_STAGE' \
+                VLLM_UVM_RESIDENCY_MODE='$UVM_RESIDENCY_MODE' \
+                VLLM_UVM_RESIDENCY_TRACE_FILE='$UVM_RESIDENCY_TRACE_FILE' \
+                VLLM_UVM_RESIDENCY_GLOBAL_GPU_BYTES='$UVM_RESIDENCY_GLOBAL_GPU_BYTES' \
+                VLLM_UVM_RESIDENCY_WEIGHT_GPU_BYTES='$UVM_RESIDENCY_WEIGHT_GPU_BYTES' \
+                VLLM_UVM_RESIDENCY_KV_GPU_BYTES='$UVM_RESIDENCY_KV_GPU_BYTES' \
+                VLLM_UVM_RESIDENCY_SCRATCH_GPU_BYTES='$UVM_RESIDENCY_SCRATCH_GPU_BYTES' \
+                VLLM_UVM_RESIDENCY_SAFETY_MARGIN_BYTES='$UVM_RESIDENCY_SAFETY_MARGIN_BYTES' \
+                VLLM_UVM_RESIDENCY_SCRATCH_RESERVED_BYTES='$UVM_RESIDENCY_SCRATCH_RESERVED_BYTES' \
+                VLLM_UVM_RESIDENCY_SCRATCH_MARGIN_BYTES='$UVM_RESIDENCY_SCRATCH_MARGIN_BYTES' \
+                VLLM_UVM_RESIDENCY_KV_SIZING_ENABLE='$UVM_RESIDENCY_KV_SIZING_ENABLE' \
+                VLLM_UVM_RESIDENCY_KV_SIZING_POLICY='$UVM_RESIDENCY_KV_SIZING_POLICY' \
+                VLLM_UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS='$UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS' \
+                VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE='$UVM_RESIDENCY_KV_METADATA_ENABLE' \
+                VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE='$UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE' \
+                VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE='$UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE' \
+                VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_ENABLE='$UVM_RESIDENCY_KV_PREFETCH_BACK_ENABLE' \
+                VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_MODE='$UVM_RESIDENCY_KV_PREFETCH_BACK_MODE' \
+                VLLM_UVM_RESIDENCY_KV_PREFETCH_DEVICE='$UVM_RESIDENCY_KV_PREFETCH_DEVICE' \
+                VLLM_UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP='$UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP' \
+                VLLM_UVM_RESIDENCY_KV_POINTER_MAP_FILE='$UVM_RESIDENCY_KV_POINTER_MAP_FILE' \
+                VLLM_UVM_RESIDENCY_PRIORITY='$UVM_RESIDENCY_PRIORITY' \
+                VLLM_UVM_RESIDENCY_WEIGHT_INITIAL_STATE='$UVM_RESIDENCY_WEIGHT_INITIAL_STATE' \
+                VLLM_UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET='$UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET' \
+                VLLM_UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD='$UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD' \
+                VLLM_UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP='$UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP' \
+                VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_POLICY='$UVM_RESIDENCY_WEIGHT_VICTIM_POLICY' \
+                VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_ACTION='$UVM_RESIDENCY_WEIGHT_VICTIM_ACTION' \
                 VLLM_UVM_POOL_REGISTRY_ENABLE='$UVM_POOL_REGISTRY_ENABLE' \
                 VLLM_UVM_SCRATCH_POOL_ENABLE='$UVM_SCRATCH_POOL_ENABLE' \
                 VLLM_UVM_SCRATCH_POOL_BUDGET_BYTES='$UVM_SCRATCH_POOL_BUDGET_BYTES' \
@@ -974,6 +1104,35 @@ parse_args() {
       --uvm-pool-coordinator-kv-bytes-per-step) UVM_POOL_COORDINATOR_KV_BYTES_PER_STEP="$2"; shift 2 ;; # Stage K KV action budget
       --uvm-pool-coordinator-scratch-bytes-per-step) UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP="$2"; shift 2 ;; # Stage K scratch action budget
       --uvm-pool-coordinator-priority) UVM_POOL_COORDINATOR_PRIORITY="$2"; shift 2 ;; # Stage K report priority label
+      --uvm-residency-enable) UVM_RESIDENCY_ENABLE="$2"; shift 2 ;; # Stage L0 estimated residency ledger
+      --uvm-residency-stage) UVM_RESIDENCY_STAGE="$2"; shift 2 ;; # Stage L JSONL label
+      --uvm-residency-mode) UVM_RESIDENCY_MODE="$2"; shift 2 ;; # Stage L0 mode trace_only/enforce
+      --uvm-residency-trace-file) UVM_RESIDENCY_TRACE_FILE="$2"; shift 2 ;; # Stage L0 JSONL trace
+      --uvm-residency-global-gpu-bytes) UVM_RESIDENCY_GLOBAL_GPU_BYTES="$2"; shift 2 ;; # Stage L0 global estimated GPU budget
+      --uvm-residency-weight-gpu-bytes) UVM_RESIDENCY_WEIGHT_GPU_BYTES="$2"; shift 2 ;; # Stage L0 weights estimated GPU budget
+      --uvm-residency-kv-gpu-bytes) UVM_RESIDENCY_KV_GPU_BYTES="$2"; shift 2 ;; # Stage L0 KV estimated GPU budget
+      --uvm-residency-scratch-gpu-bytes) UVM_RESIDENCY_SCRATCH_GPU_BYTES="$2"; shift 2 ;; # Stage L0 scratch estimated GPU budget
+      --uvm-residency-safety-margin-bytes) UVM_RESIDENCY_SAFETY_MARGIN_BYTES="$2"; shift 2 ;; # Stage L0 global safety margin
+      --uvm-residency-scratch-reserved-bytes) UVM_RESIDENCY_SCRATCH_RESERVED_BYTES="$2"; shift 2 ;; # Stage L3 scratch reserve report
+      --uvm-residency-scratch-margin-bytes) UVM_RESIDENCY_SCRATCH_MARGIN_BYTES="$2"; shift 2 ;; # Stage L3 scratch reserve margin
+      --uvm-residency-kv-sizing-enable) UVM_RESIDENCY_KV_SIZING_ENABLE="$2"; shift 2 ;; # Stage L4 KV sizing report gate
+      --uvm-residency-kv-sizing-policy) UVM_RESIDENCY_KV_SIZING_POLICY="$2"; shift 2 ;; # Stage L4 KV sizing policy label
+      --uvm-residency-kv-sizing-max-blocks) UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS="$2"; shift 2 ;; # Stage L4 override max block guard
+      --uvm-residency-kv-metadata-enable) UVM_RESIDENCY_KV_METADATA_ENABLE="$2"; shift 2 ;; # Stage L5 KV metadata-only residency
+      --uvm-residency-kv-data-offload-enable) UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE="$2"; shift 2 ;; # Stage L6 safe KV offload gate
+      --uvm-residency-kv-data-offload-mode) UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE="$2"; shift 2 ;; # Stage L6 offload mode trace_only/prefetch_cpu
+      --uvm-residency-kv-prefetch-back-enable) UVM_RESIDENCY_KV_PREFETCH_BACK_ENABLE="$2"; shift 2 ;; # Stage L6 prefetch-back gate
+      --uvm-residency-kv-prefetch-back-mode) UVM_RESIDENCY_KV_PREFETCH_BACK_MODE="$2"; shift 2 ;; # Stage L6 prefetch-back mode trace_only/prefetch
+      --uvm-residency-kv-prefetch-device) UVM_RESIDENCY_KV_PREFETCH_DEVICE="$2"; shift 2 ;; # Stage L6 prefetch-back target device
+      --uvm-residency-kv-max-offload-blocks-per-step) UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP="$2"; shift 2 ;; # Stage L6 max safe offload blocks
+      --uvm-residency-kv-pointer-map-file) UVM_RESIDENCY_KV_POINTER_MAP_FILE="$2"; shift 2 ;; # Stage L6 raw pointer map sidecar
+      --uvm-residency-priority) UVM_RESIDENCY_PRIORITY="$2"; shift 2 ;; # Stage L0 report priority label
+      --uvm-residency-weight-initial-state) UVM_RESIDENCY_WEIGHT_INITIAL_STATE="$2"; shift 2 ;; # Stage L2 initial expert state
+      --uvm-residency-weight-enforce-hot-set) UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET="$2"; shift 2 ;; # Stage L2 weights enforce gate
+      --uvm-residency-weight-sync-offload) UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD="$2"; shift 2 ;; # Stage L2 immediate release on successful victim action
+      --uvm-residency-weight-max-victims-per-step) UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP="$2"; shift 2 ;; # Stage L2 victim cap
+      --uvm-residency-weight-victim-policy) UVM_RESIDENCY_WEIGHT_VICTIM_POLICY="$2"; shift 2 ;; # Stage L2 victim policy label
+      --uvm-residency-weight-victim-action) UVM_RESIDENCY_WEIGHT_VICTIM_ACTION="$2"; shift 2 ;; # Stage L2 victim action
       --uvm-pool-registry-enable) UVM_POOL_REGISTRY_ENABLE="$2"; shift 2 ;; # Stage F unified pool registry telemetry
       --uvm-scratch-pool-enable) UVM_SCRATCH_POOL_ENABLE="$2"; shift 2 ;; # Stage G scratch pool admission control
       --uvm-scratch-pool-budget-bytes) UVM_SCRATCH_POOL_BUDGET_BYTES="$2"; shift 2 ;; # Stage G scratch pool device-direct live bytes budget
@@ -1117,6 +1276,33 @@ validate_inputs() {
     [[ "$UVM_POOL_COORDINATOR_KV_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-pool-coordinator-kv-bytes-per-step must be a non-negative integer"
     [[ "$UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-pool-coordinator-scratch-bytes-per-step must be a non-negative integer"
     [ -n "$UVM_POOL_COORDINATOR_PRIORITY" ] || die "--uvm-pool-coordinator-priority must not be empty"
+    [[ "$UVM_RESIDENCY_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-enable must be 0 or 1"
+    [ -n "$UVM_RESIDENCY_STAGE" ] || die "--uvm-residency-stage must not be empty"
+    [[ "$UVM_RESIDENCY_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-residency-mode must be trace_only or enforce"
+    [[ "$UVM_RESIDENCY_GLOBAL_GPU_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-residency-global-gpu-bytes must be a non-negative integer"
+    [[ "$UVM_RESIDENCY_WEIGHT_GPU_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-residency-weight-gpu-bytes must be a non-negative integer"
+    [[ "$UVM_RESIDENCY_KV_GPU_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-residency-kv-gpu-bytes must be a non-negative integer"
+    [[ "$UVM_RESIDENCY_SCRATCH_GPU_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-residency-scratch-gpu-bytes must be a non-negative integer"
+    [[ "$UVM_RESIDENCY_SAFETY_MARGIN_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-residency-safety-margin-bytes must be a non-negative integer"
+    [[ "$UVM_RESIDENCY_SCRATCH_RESERVED_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-residency-scratch-reserved-bytes must be a non-negative integer"
+    [[ "$UVM_RESIDENCY_SCRATCH_MARGIN_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-residency-scratch-margin-bytes must be a non-negative integer"
+    [[ "$UVM_RESIDENCY_KV_SIZING_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-kv-sizing-enable must be 0 or 1"
+    [[ "$UVM_RESIDENCY_KV_SIZING_POLICY" =~ ^(report_only|clamp|override)$ ]] || die "--uvm-residency-kv-sizing-policy must be report_only, clamp, or override"
+    [[ "$UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS" =~ ^[0-9]+$ ]] || die "--uvm-residency-kv-sizing-max-blocks must be a non-negative integer"
+    [[ "$UVM_RESIDENCY_KV_METADATA_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-kv-metadata-enable must be 0 or 1"
+    [[ "$UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-kv-data-offload-enable must be 0 or 1"
+    [[ "$UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE" =~ ^(trace_only|prefetch_cpu)$ ]] || die "--uvm-residency-kv-data-offload-mode must be trace_only or prefetch_cpu"
+    [[ "$UVM_RESIDENCY_KV_PREFETCH_BACK_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-kv-prefetch-back-enable must be 0 or 1"
+    [[ "$UVM_RESIDENCY_KV_PREFETCH_BACK_MODE" =~ ^(trace_only|prefetch)$ ]] || die "--uvm-residency-kv-prefetch-back-mode must be trace_only or prefetch"
+    [[ "$UVM_RESIDENCY_KV_PREFETCH_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-residency-kv-prefetch-device must be an integer"
+    [[ "$UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-residency-kv-max-offload-blocks-per-step must be a non-negative integer"
+    [ -n "$UVM_RESIDENCY_PRIORITY" ] || die "--uvm-residency-priority must not be empty"
+    [[ "$UVM_RESIDENCY_WEIGHT_INITIAL_STATE" =~ ^(unknown|cpu|gpu)$ ]] || die "--uvm-residency-weight-initial-state must be unknown, cpu, or gpu"
+    [[ "$UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET" =~ ^[01]$ ]] || die "--uvm-residency-weight-enforce-hot-set must be 0 or 1"
+    [[ "$UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD" =~ ^[01]$ ]] || die "--uvm-residency-weight-sync-offload must be 0 or 1"
+    [[ "$UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-residency-weight-max-victims-per-step must be a non-negative integer"
+    [ -n "$UVM_RESIDENCY_WEIGHT_VICTIM_POLICY" ] || die "--uvm-residency-weight-victim-policy must not be empty"
+    [[ "$UVM_RESIDENCY_WEIGHT_VICTIM_ACTION" =~ ^(advise_cpu|prefetch_cpu)$ ]] || die "--uvm-residency-weight-victim-action must be advise_cpu or prefetch_cpu"
     [[ "$UVM_POOL_REGISTRY_ENABLE" =~ ^[01]$ ]] || die "--uvm-pool-registry-enable must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_ENABLE" =~ ^[01]$ ]] || die "--uvm-scratch-pool-enable must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-scratch-pool-budget-bytes must be a non-negative integer"

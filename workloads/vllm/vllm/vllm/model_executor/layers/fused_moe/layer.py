@@ -25,6 +25,14 @@ from vllm.device_allocator.uvm import (
     uvm_enabled_allocation_phase,
 )
 from vllm.device_allocator.uvm_pool_coordinator import request_uvm_pool_action
+from vllm.device_allocator.uvm_pool_residency import (
+    get_uvm_residency_region_snapshot,
+    mark_uvm_residency_state,
+    record_uvm_residency_action,
+    record_uvm_residency_access,
+    register_uvm_residency_region,
+    request_uvm_gpu_residency,
+)
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -735,6 +743,52 @@ class FusedMoE(CustomOp):
         self._uvm_weight_offload_plan_loaded = bool(
             self.uvm_weight_offload_plan_keys
         )
+        self.uvm_residency_mode = os.environ.get(
+            "VLLM_UVM_RESIDENCY_MODE", "trace_only"
+        )
+        self.uvm_residency_weight_initial_state = os.environ.get(
+            "VLLM_UVM_RESIDENCY_WEIGHT_INITIAL_STATE", "cpu"
+        )
+        if self.uvm_residency_weight_initial_state not in (
+            "unknown",
+            "cpu",
+            "gpu",
+        ):
+            logger.warning(
+                "Unknown VLLM_UVM_RESIDENCY_WEIGHT_INITIAL_STATE=%s; using cpu",
+                self.uvm_residency_weight_initial_state,
+            )
+            self.uvm_residency_weight_initial_state = "cpu"
+        self.uvm_residency_weight_enforce_hot_set = _env_flag_enabled(
+            "VLLM_UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET",
+            default=False,
+        )
+        self.uvm_residency_weight_sync_offload = _env_flag_enabled(
+            "VLLM_UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD",
+            default=True,
+        )
+        self.uvm_residency_weight_max_victims_per_step = _env_int(
+            "VLLM_UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP",
+            default=0,
+        )
+        self.uvm_residency_weight_victim_policy = os.environ.get(
+            "VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_POLICY",
+            "cold_plan_lru",
+        )
+        self.uvm_residency_weight_victim_action = os.environ.get(
+            "VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_ACTION",
+            "advise_cpu",
+        )
+        if self.uvm_residency_weight_victim_action not in (
+            "advise_cpu",
+            "prefetch_cpu",
+        ):
+            logger.warning(
+                "Unknown VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_ACTION=%s; "
+                "using advise_cpu",
+                self.uvm_residency_weight_victim_action,
+            )
+            self.uvm_residency_weight_victim_action = "advise_cpu"
 
         self.quant_config = quant_config
 
@@ -1970,6 +2024,222 @@ class FusedMoE(CustomOp):
             slices.append((role, ptr, slice_bytes))
         return slices
 
+    def _uvm_expert_weight_region_id(
+        self,
+        layer_id: int | None,
+        global_expert_id: int,
+        role: str,
+    ) -> str:
+        layer_label = "unknown" if layer_id is None else str(layer_id)
+        return f"weights:{layer_label}:{global_expert_id}:{role}"
+
+    def _uvm_expert_weight_residency_metadata(
+        self,
+        *,
+        layer_id: int | None,
+        global_expert_id: int,
+        local_expert_id: int,
+        role: str,
+        ptr: int,
+        size_bytes: int,
+        active_this_step: bool,
+        source_action: str,
+    ) -> dict[str, object]:
+        return {
+            "source": "stage_i",
+            "stage": "stage_l1",
+            "layer_name": self.layer_name,
+            "layer_id": layer_id,
+            "global_expert_id": global_expert_id,
+            "local_expert_id": local_expert_id,
+            "role": role,
+            "ptr": f"0x{ptr:x}",
+            "bytes": size_bytes,
+            "plan_hot": (
+                layer_id is not None
+                and (layer_id, global_expert_id)
+                in self.uvm_weight_prefetch_plan_keys
+            ),
+            "plan_cold": (
+                layer_id is not None
+                and (layer_id, global_expert_id)
+                in self.uvm_weight_offload_plan_keys
+            ),
+            "active_this_step": active_this_step,
+            "source_action": source_action,
+        }
+
+    def _register_uvm_residency_cold_weight_candidates(
+        self,
+        *,
+        layer_id: int | None,
+        active_global_experts: set[int],
+        active_region_ids: set[str],
+    ) -> None:
+        if layer_id is None or not self.uvm_weight_offload_plan_keys:
+            return
+        try:
+            expert_pairs = [
+                (global_expert_id, local_expert_id)
+                for global_expert_id, local_expert_id in self._uvm_plan_local_experts(
+                    self.uvm_weight_offload_plan_keys
+                )
+                if global_expert_id not in active_global_experts
+            ]
+            if self.uvm_weight_offload_max_experts_per_layer > 0:
+                expert_pairs = expert_pairs[
+                    : self.uvm_weight_offload_max_experts_per_layer
+                ]
+            for global_expert_id, local_expert_id in expert_pairs:
+                for role, ptr, size_bytes in self._uvm_expert_weight_slices(
+                    local_expert_id,
+                    self.uvm_weight_offload_target_roles,
+                ):
+                    region_id = self._uvm_expert_weight_region_id(
+                        layer_id,
+                        global_expert_id,
+                        role,
+                    )
+                    if region_id in active_region_ids:
+                        continue
+                    metadata = self._uvm_expert_weight_residency_metadata(
+                        layer_id=layer_id,
+                        global_expert_id=global_expert_id,
+                        local_expert_id=local_expert_id,
+                        role=role,
+                        ptr=ptr,
+                        size_bytes=size_bytes,
+                        active_this_step=False,
+                        source_action="l2_cold_candidate",
+                    )
+                    existing_region = get_uvm_residency_region_snapshot(region_id)
+                    register_uvm_residency_region(
+                        pool="weights",
+                        region_id=region_id,
+                        ptr=ptr,
+                        bytes=size_bytes,
+                        state=(
+                            str(existing_region.get("state"))
+                            if existing_region is not None
+                            else "gpu"
+                        ),
+                        evictable=True,
+                        active=False,
+                        metadata=metadata,
+                    )
+        except Exception:
+            logger.debug("Failed to register Stage L2 cold candidates", exc_info=True)
+
+    def _offload_uvm_residency_weight_victims(
+        self,
+        *,
+        victims: tuple[str, ...],
+        active_region_ids: set[str],
+        reason_region_id: str,
+        scope_key: str,
+    ) -> int:
+        if not victims:
+            return 0
+        max_victims = self.uvm_residency_weight_max_victims_per_step
+        selected_victims = list(victims)
+        if max_victims > 0:
+            selected_victims = selected_victims[:max_victims]
+
+        issued = 0
+        for victim_region_id in selected_victims:
+            if victim_region_id in active_region_ids:
+                record_uvm_residency_action(
+                    action="residency_weight_victim_skip_active",
+                    pool="weights",
+                    region_id=victim_region_id,
+                    metadata={
+                        "stage": "stage_l2",
+                        "reason_region_id": reason_region_id,
+                        "scope_key": scope_key,
+                    },
+                )
+                continue
+            snapshot = get_uvm_residency_region_snapshot(victim_region_id)
+            if not snapshot:
+                continue
+            snapshot_metadata = snapshot.get("metadata")
+            if not isinstance(snapshot_metadata, dict):
+                snapshot_metadata = {}
+            if (
+                snapshot.get("active") is True
+                or snapshot_metadata.get("active_this_step") is True
+            ):
+                record_uvm_residency_action(
+                    action="residency_weight_victim_skip_active",
+                    pool="weights",
+                    region_id=victim_region_id,
+                    bytes=int(snapshot.get("bytes") or 0),
+                    metadata={
+                        "stage": "stage_l2",
+                        "reason_region_id": reason_region_id,
+                        "scope_key": scope_key,
+                        "snapshot_active": snapshot.get("active") is True,
+                        "snapshot_active_this_step": (
+                            snapshot_metadata.get("active_this_step") is True
+                        ),
+                    },
+                )
+                continue
+            ptr = snapshot.get("ptr")
+            size_bytes = int(snapshot.get("bytes") or 0)
+            if not isinstance(ptr, int) or size_bytes <= 0:
+                record_uvm_residency_action(
+                    action="residency_weight_victim_skip_no_ptr",
+                    pool="weights",
+                    region_id=victim_region_id,
+                    bytes=size_bytes,
+                    metadata={
+                        "stage": "stage_l2",
+                        "reason_region_id": reason_region_id,
+                        "scope_key": scope_key,
+                    },
+                )
+                continue
+
+            success = False
+            if self.uvm_residency_weight_victim_action == "prefetch_cpu":
+                success = prefetch_range_to_cpu(ptr, size_bytes)
+            else:
+                success = advise_range_preferred_location(ptr, size_bytes, -1)
+            if success:
+                issued += 1
+                mark_uvm_residency_state(
+                    region_id=victim_region_id,
+                    state="cpu"
+                    if self.uvm_residency_weight_sync_offload
+                    else "prefetching_cpu",
+                    metadata={
+                        "stage": "stage_l2",
+                        "reason_region_id": reason_region_id,
+                        "scope_key": scope_key,
+                        "victim_action": self.uvm_residency_weight_victim_action,
+                    },
+                )
+            record_uvm_residency_action(
+                action=(
+                    "residency_weight_victim_offload_issued"
+                    if success
+                    else "residency_weight_victim_offload_failed"
+                ),
+                pool="weights",
+                region_id=victim_region_id,
+                bytes=size_bytes,
+                metadata={
+                    "stage": "stage_l2",
+                    "reason_region_id": reason_region_id,
+                    "scope_key": scope_key,
+                    "victim_action": self.uvm_residency_weight_victim_action,
+                    "sync_offload": self.uvm_residency_weight_sync_offload,
+                },
+                success=success,
+            )
+        return issued
+
     def _append_uvm_weight_prefetch_trace(self, record: dict[str, object]) -> None:
         try:
             with open(self.uvm_weight_prefetch_trace_file, "a", encoding="utf-8") as handle:
@@ -1983,7 +2253,12 @@ class FusedMoE(CustomOp):
         try:
             self._refresh_uvm_weight_action_plans()
             layer_id = self._uvm_layer_id()
-            expert_pairs = self._uvm_active_expert_pairs(topk_ids)
+            all_active_expert_pairs = self._uvm_active_expert_pairs(topk_ids)
+            all_active_global_experts = {
+                global_expert_id
+                for global_expert_id, _ in all_active_expert_pairs
+            }
+            expert_pairs = all_active_expert_pairs
             if self.uvm_weight_prefetch_plan_keys:
                 expert_pairs = [
                     (global_expert_id, local_expert_id)
@@ -1998,6 +2273,20 @@ class FusedMoE(CustomOp):
                 expert_pairs = expert_pairs[
                     : self.uvm_weight_prefetch_max_experts_per_layer
                 ]
+            active_region_ids = {
+                self._uvm_expert_weight_region_id(layer_id, global_expert_id, role)
+                for global_expert_id, local_expert_id in all_active_expert_pairs
+                for role, _, _ in self._uvm_expert_weight_slices(
+                    local_expert_id,
+                    self.uvm_weight_prefetch_target_roles,
+                )
+            }
+            if self.uvm_residency_weight_enforce_hot_set:
+                self._register_uvm_residency_cold_weight_candidates(
+                    layer_id=layer_id,
+                    active_global_experts=all_active_global_experts,
+                    active_region_ids=active_region_ids,
+                )
 
             issued_records = 0
             attempted_bytes = 0
@@ -2014,6 +2303,120 @@ class FusedMoE(CustomOp):
                     local_expert_id,
                     self.uvm_weight_prefetch_target_roles,
                 ):
+                    region_id = self._uvm_expert_weight_region_id(
+                        layer_id,
+                        global_expert_id,
+                        role,
+                    )
+                    residency_metadata = (
+                        self._uvm_expert_weight_residency_metadata(
+                            layer_id=layer_id,
+                            global_expert_id=global_expert_id,
+                            local_expert_id=local_expert_id,
+                            role=role,
+                            ptr=ptr,
+                            size_bytes=size_bytes,
+                            active_this_step=True,
+                            source_action="prefetch",
+                        )
+                    )
+                    existing_region = get_uvm_residency_region_snapshot(region_id)
+                    register_uvm_residency_region(
+                        pool="weights",
+                        region_id=region_id,
+                        ptr=ptr,
+                        bytes=size_bytes,
+                        state=(
+                            str(existing_region.get("state"))
+                            if existing_region is not None
+                            else self.uvm_residency_weight_initial_state
+                        ),
+                        evictable=False,
+                        active=True,
+                        metadata=residency_metadata,
+                    )
+                    record_uvm_residency_access(
+                        region_id=region_id,
+                        step=self._uvm_moe_trace_step,
+                        metadata=residency_metadata,
+                    )
+                    residency_decision = request_uvm_gpu_residency(
+                        pool="weights",
+                        region_id=region_id,
+                        bytes=size_bytes,
+                        scope_key=(
+                            f"moe_step:{os.getpid()}:"
+                            f"{self._uvm_moe_trace_step}"
+                        ),
+                        active_region_ids=active_region_ids,
+                        metadata=residency_metadata,
+                    )
+                    if (
+                        self.uvm_residency_weight_enforce_hot_set
+                        and not residency_decision.allowed
+                    ):
+                        self._offload_uvm_residency_weight_victims(
+                            victims=residency_decision.victims,
+                            active_region_ids=active_region_ids,
+                            reason_region_id=region_id,
+                            scope_key=residency_decision.scope_key,
+                        )
+                        residency_decision = request_uvm_gpu_residency(
+                            pool="weights",
+                            region_id=region_id,
+                            bytes=size_bytes,
+                            scope_key=(
+                                f"moe_step:{os.getpid()}:"
+                                f"{self._uvm_moe_trace_step}:retry"
+                            ),
+                            active_region_ids=active_region_ids,
+                            metadata={
+                                **residency_metadata,
+                                "retry_after_victim_offload": True,
+                            },
+                        )
+                    if (
+                        self.uvm_residency_weight_enforce_hot_set
+                        and not residency_decision.allowed
+                    ):
+                        rejected_records += 1
+                        record_uvm_residency_action(
+                            action="residency_weight_hot_prefetch_skipped",
+                            pool="weights",
+                            region_id=region_id,
+                            bytes=size_bytes,
+                            metadata={
+                                **residency_metadata,
+                                "reason": residency_decision.reason,
+                            },
+                            would_deny=residency_decision.would_deny,
+                            victims=list(residency_decision.victims),
+                        )
+                        self._append_uvm_weight_prefetch_trace(
+                            {
+                                "timestamp": time.time(),
+                                "pid": os.getpid(),
+                                "layer_name": self.layer_name,
+                                "step": self._uvm_moe_trace_step,
+                                "mode": self.uvm_weight_prefetch_mode,
+                                "action": "residency_deny_skip_prefetch",
+                                "role": role,
+                                "residency_region_id": region_id,
+                                "residency_allowed": residency_decision.allowed,
+                                "residency_would_deny": (
+                                    residency_decision.would_deny
+                                ),
+                                "residency_reason": residency_decision.reason,
+                                "residency_victims": list(
+                                    residency_decision.victims
+                                ),
+                                "global_expert_id": global_expert_id,
+                                "local_expert_id": local_expert_id,
+                                "ptr": f"0x{ptr:x}",
+                                "bytes": size_bytes,
+                            }
+                        )
+                        continue
                     attempted_bytes += size_bytes
                     if (
                         self.uvm_weight_prefetch_max_bytes_per_step > 0
@@ -2030,6 +2433,15 @@ class FusedMoE(CustomOp):
                                 "mode": self.uvm_weight_prefetch_mode,
                                 "action": "budget_reject",
                                 "role": role,
+                                "residency_region_id": region_id,
+                                "residency_allowed": residency_decision.allowed,
+                                "residency_would_deny": (
+                                    residency_decision.would_deny
+                                ),
+                                "residency_reason": residency_decision.reason,
+                                "residency_victims": list(
+                                    residency_decision.victims
+                                ),
                                 "global_expert_id": global_expert_id,
                                 "local_expert_id": local_expert_id,
                                 "ptr": f"0x{ptr:x}",
@@ -2051,6 +2463,7 @@ class FusedMoE(CustomOp):
                         scope_key=f"moe_step:{os.getpid()}:{self._uvm_moe_trace_step}",
                         metadata={
                             "stage": "stage_i",
+                            "stage_l1_residency_region_id": region_id,
                             "layer_name": self.layer_name,
                             "role": role,
                             "global_expert_id": global_expert_id,
@@ -2069,6 +2482,15 @@ class FusedMoE(CustomOp):
                                 "mode": self.uvm_weight_prefetch_mode,
                                 "action": "coordinator_reject",
                                 "role": role,
+                                "residency_region_id": region_id,
+                                "residency_allowed": residency_decision.allowed,
+                                "residency_would_deny": (
+                                    residency_decision.would_deny
+                                ),
+                                "residency_reason": residency_decision.reason,
+                                "residency_victims": list(
+                                    residency_decision.victims
+                                ),
                                 "global_expert_id": global_expert_id,
                                 "local_expert_id": local_expert_id,
                                 "ptr": f"0x{ptr:x}",
@@ -2082,6 +2504,12 @@ class FusedMoE(CustomOp):
                     if self.uvm_weight_prefetch_mode == "prefetch":
                         success = prefetch_range_to_device(ptr, size_bytes, device)
                         action = "prefetch_issued" if success else "prefetch_skipped"
+                        if success:
+                            mark_uvm_residency_state(
+                                region_id=region_id,
+                                state="prefetching_gpu",
+                                metadata=residency_metadata,
+                            )
 
                     issued_records += 1
                     issued_bytes += size_bytes
@@ -2094,6 +2522,15 @@ class FusedMoE(CustomOp):
                             "mode": self.uvm_weight_prefetch_mode,
                             "action": action,
                             "role": role,
+                            "residency_region_id": region_id,
+                            "residency_allowed": residency_decision.allowed,
+                            "residency_would_deny": (
+                                residency_decision.would_deny
+                            ),
+                            "residency_reason": residency_decision.reason,
+                            "residency_victims": list(
+                                residency_decision.victims
+                            ),
                             "global_expert_id": global_expert_id,
                             "local_expert_id": local_expert_id,
                             "ptr": f"0x{ptr:x}",
@@ -2176,6 +2613,38 @@ class FusedMoE(CustomOp):
                     local_expert_id,
                     self.uvm_weight_offload_target_roles,
                 ):
+                    region_id = self._uvm_expert_weight_region_id(
+                        layer_id,
+                        global_expert_id,
+                        role,
+                    )
+                    residency_metadata = (
+                        self._uvm_expert_weight_residency_metadata(
+                            layer_id=layer_id,
+                            global_expert_id=global_expert_id,
+                            local_expert_id=local_expert_id,
+                            role=role,
+                            ptr=ptr,
+                            size_bytes=size_bytes,
+                            active_this_step=False,
+                            source_action="offload",
+                        )
+                    )
+                    existing_region = get_uvm_residency_region_snapshot(region_id)
+                    register_uvm_residency_region(
+                        pool="weights",
+                        region_id=region_id,
+                        ptr=ptr,
+                        bytes=size_bytes,
+                        state=(
+                            str(existing_region.get("state"))
+                            if existing_region is not None
+                            else "gpu"
+                        ),
+                        evictable=True,
+                        active=False,
+                        metadata=residency_metadata,
+                    )
                     attempted_bytes += size_bytes
                     if (
                         self.uvm_weight_offload_max_bytes_per_step > 0
@@ -2192,6 +2661,7 @@ class FusedMoE(CustomOp):
                                 "mode": self.uvm_weight_offload_mode,
                                 "action": "offload_budget_reject",
                                 "role": role,
+                                "residency_region_id": region_id,
                                 "global_expert_id": global_expert_id,
                                 "local_expert_id": local_expert_id,
                                 "ptr": f"0x{ptr:x}",
@@ -2213,6 +2683,7 @@ class FusedMoE(CustomOp):
                         scope_key=f"moe_step:{os.getpid()}:{self._uvm_moe_trace_step}",
                         metadata={
                             "stage": "stage_i",
+                            "stage_l1_residency_region_id": region_id,
                             "layer_name": self.layer_name,
                             "role": role,
                             "global_expert_id": global_expert_id,
@@ -2231,6 +2702,7 @@ class FusedMoE(CustomOp):
                                 "mode": self.uvm_weight_offload_mode,
                                 "action": "offload_coordinator_reject",
                                 "role": role,
+                                "residency_region_id": region_id,
                                 "global_expert_id": global_expert_id,
                                 "local_expert_id": local_expert_id,
                                 "ptr": f"0x{ptr:x}",
@@ -2255,6 +2727,12 @@ class FusedMoE(CustomOp):
                             if success
                             else "offload_skipped"
                         )
+                    if success:
+                        mark_uvm_residency_state(
+                            region_id=region_id,
+                            state="prefetching_cpu",
+                            metadata=residency_metadata,
+                        )
 
                     issued_records += 1
                     issued_bytes += size_bytes
@@ -2268,6 +2746,7 @@ class FusedMoE(CustomOp):
                             "mode": self.uvm_weight_offload_mode,
                             "action": action,
                             "role": role,
+                            "residency_region_id": region_id,
                             "global_expert_id": global_expert_id,
                             "local_expert_id": local_expert_id,
                             "ptr": f"0x{ptr:x}",

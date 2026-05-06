@@ -3860,6 +3860,122 @@ class GPUModelRunner(
         # 这一步对于监控长文本生成时显存池的碎片化 (fragmentation) 或页面换入换出 (swapping) 非常关键。
         self._append_uvm_address_log(phase, rows)
 
+    def _write_stage_l6_kv_pointer_map(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_caches: dict[str, Any],
+    ) -> None:
+        """Write a conservative raw KV block pointer map for Stage L6.
+
+        This first version only maps simple CUDA tensors by slicing each unique
+        backing allocation into equal logical KV block ranges. Complex layouts
+        remain safe because the runtime policy falls back unless a region has a
+        positive ptr and offload_capable=True.
+        """
+        pointer_map_file = os.environ.get("VLLM_UVM_RESIDENCY_KV_POINTER_MAP_FILE", "")
+        if not pointer_map_file:
+            return
+        if os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") != "stage_l6":
+            return
+        total_bytes = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+        num_blocks = int(kv_cache_config.num_blocks or 0)
+        num_groups = max(len(kv_cache_config.kv_cache_groups), 1)
+        if total_bytes <= 0 or num_blocks <= 0:
+            return
+        bytes_per_block = total_bytes // num_blocks
+        if bytes_per_block <= 0:
+            return
+
+        unique_tensors: list[tuple[str, torch.Tensor]] = []
+        seen_ptrs: set[int] = set()
+
+        def add_tensor(name: str, tensor: torch.Tensor) -> None:
+            if not tensor.is_cuda:
+                return
+            if not tensor.is_contiguous():
+                return
+            ptr = int(tensor.data_ptr())
+            size_bytes = int(tensor.numel() * tensor.element_size())
+            if ptr <= 0 or size_bytes <= 0 or ptr in seen_ptrs:
+                return
+            seen_ptrs.add(ptr)
+            unique_tensors.append((name, tensor))
+
+        for layer_name, cache_tensor in kv_caches.items():
+            if isinstance(cache_tensor, torch.Tensor):
+                add_tensor(layer_name, cache_tensor)
+            elif isinstance(cache_tensor, list):
+                for idx, tensor in enumerate(cache_tensor):
+                    if isinstance(tensor, torch.Tensor):
+                        add_tensor(f"{layer_name}[{idx}]", tensor)
+        if isinstance(getattr(self, "cross_layers_kv_cache", None), torch.Tensor):
+            add_tensor("cross_layers_kv_cache", self.cross_layers_kv_cache)
+
+        page_size_by_group = [
+            int(group.kv_cache_spec.page_size_bytes)
+            for group in kv_cache_config.kv_cache_groups
+        ] or [bytes_per_block]
+        blocks: list[dict[str, Any]] = []
+        fallback_reasons: list[str] = []
+        max_block_id = max(num_blocks - 1, 0)
+        for group_id in range(num_groups):
+            page_size = page_size_by_group[group_id]
+            if page_size <= 0:
+                fallback_reasons.append(f"group_{group_id}:invalid_page_size")
+                continue
+            group_ranges_by_block: dict[int, list[dict[str, int | str]]] = {
+                block_id: [] for block_id in range(1, max_block_id + 1)
+            }
+            for name, tensor in unique_tensors:
+                ptr = int(tensor.data_ptr())
+                size_bytes = int(tensor.numel() * tensor.element_size())
+                available_blocks = min(max_block_id, size_bytes // page_size)
+                if available_blocks <= 0:
+                    continue
+                for block_id in range(1, available_blocks + 1):
+                    group_ranges_by_block[block_id].append(
+                        {
+                            "ptr": ptr + block_id * page_size,
+                            "bytes": page_size,
+                            "tensor_name": name,
+                        }
+                    )
+            for block_id, ranges in group_ranges_by_block.items():
+                if not ranges:
+                    continue
+                blocks.append(
+                    {
+                        "group_id": group_id,
+                        "block_id": block_id,
+                        "ptr": ranges[0]["ptr"],
+                        "bytes": sum(int(item["bytes"]) for item in ranges),
+                        "ranges": ranges,
+                    }
+                )
+        if not blocks:
+            fallback_reasons.append("no_simple_contiguous_tensor_ranges_mapped")
+
+        record = {
+            "action": "stage_l6_kv_pointer_map",
+            "stage": "stage_l6",
+            "pid": os.getpid(),
+            "ts": time.time(),
+            "num_blocks": num_blocks,
+            "num_kv_cache_groups": num_groups,
+            "bytes_per_block": bytes_per_block,
+            "page_size_by_group": page_size_by_group,
+            "unique_tensor_count": len(unique_tensors),
+            "mapped_blocks": len(blocks),
+            "fallback_reasons": fallback_reasons,
+            "blocks": blocks,
+        }
+        try:
+            os.makedirs(os.path.dirname(pointer_map_file) or ".", exist_ok=True)
+            with open(pointer_map_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError as exc:
+            logger.warning("Failed to write Stage L6 KV pointer map %s: %s", pointer_map_file, exc)
+
     def load_model(self, eep_scale_up: bool = False) -> None:
             """
             Args:
@@ -5665,6 +5781,7 @@ class GPUModelRunner(
             num_attn_module,
         )
         self._log_kv_cache_addresses(kv_caches, "initialize_kv_cache")
+        self._write_stage_l6_kv_pointer_map(kv_cache_config, kv_caches)
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

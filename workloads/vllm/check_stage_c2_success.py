@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompts", type=int, default=5)
     parser.add_argument("--request-rate", default="5")
     parser.add_argument("--output-len", default="512")
+    parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B-FP8")
     parser.add_argument("--budget-bytes", type=int, default=1048576)
     parser.add_argument(
         "--pool-release-threshold",
@@ -121,6 +122,7 @@ def run_experiment(args: argparse.Namespace, out_dir: Path) -> tuple[Path, Path]
             "PROMPTS": str(args.prompts),
             "REQUEST_RATE": str(args.request_rate),
             "OUTPUT_LEN": str(args.output_len),
+            "MODEL": str(args.model),
             "DEVICE_DIRECT_MAX_TOTAL_BYTES": str(args.budget_bytes),
             "ASYNC_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD": str(
                 args.pool_release_threshold
@@ -133,6 +135,7 @@ def run_experiment(args: argparse.Namespace, out_dir: Path) -> tuple[Path, Path]
     print("===========================================================")
     print(" Stage C2 Success Check: running backend A/B experiment")
     print(f" Output dir: {out_dir}")
+    print(f" Model: {args.model}")
     print(f" Prompts: {args.prompts}")
     print(f" Budget bytes: {args.budget_bytes}")
     print(" Sync backend: cuda_malloc")

@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--priority", default="kv,scratch,weights")
     parser.add_argument("--prompts", type=int, default=2)
     parser.add_argument("--plan-prompts", type=int, default=1)
+    parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B-FP8")
     parser.add_argument("--request-rate", default="5")
     parser.add_argument("--output-len", default="128")
     parser.add_argument("--runtime-budget-blocks", type=int, default=1)
@@ -127,6 +128,7 @@ def run_gpu_probe(args: argparse.Namespace, run_dir: Path) -> dict[str, Path]:
 
     planning_cmd = [
         "./run_kv_fault_ratio.sh",
+        "--model", args.model,
         "--mode", "trace",
         "--allocator-log", str(run_dir / "vllm_uvm_allocator_trace_stage_l7_planning.log"),
         "--trace-log", str(run_dir / "uvm_kv_fault_stats_stage_l7_planning.log"),
@@ -166,6 +168,7 @@ def run_gpu_probe(args: argparse.Namespace, run_dir: Path) -> dict[str, Path]:
 
     main_cmd = [
         "./run_kv_fault_ratio.sh",
+        "--model", args.model,
         "--mode", "trace",
         "--allocator-log", str(run_dir / "vllm_uvm_allocator_trace_stage_l7_cross_pool.log"),
         "--trace-log", str(run_dir / "uvm_kv_fault_stats_stage_l7_cross_pool.log"),

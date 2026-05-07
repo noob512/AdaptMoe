@@ -12,6 +12,7 @@ cd "$SCRIPT_DIR"
 PROMPTS="${PROMPTS:-10}"
 REQUEST_RATE="${REQUEST_RATE:-5}"
 OUTPUT_LEN="${OUTPUT_LEN:-512}"
+MODEL="${MODEL:-Qwen/Qwen3-30B-A3B-FP8}"
 DEVICE_DIRECT_MAX_TOTAL_BYTES="${DEVICE_DIRECT_MAX_TOTAL_BYTES:-1048576}"
 ASYNC_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD="${ASYNC_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD:-${DEVICE_DIRECT_POOL_RELEASE_THRESHOLD:-}}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
@@ -28,6 +29,7 @@ mkdir -p "$ROOT_OUT_DIR"
 echo "==========================================================="
 echo " Stage C Attention Backend A/B"
 echo " Root output dir: $ROOT_OUT_DIR"
+echo " Model: $MODEL"
 echo " Prompts: $PROMPTS"
 echo " Request rate: $REQUEST_RATE"
 echo " Output len: $OUTPUT_LEN"
@@ -42,6 +44,7 @@ echo "==========================================================="
 PROMPTS="$PROMPTS" \
 REQUEST_RATE="$REQUEST_RATE" \
 OUTPUT_LEN="$OUTPUT_LEN" \
+MODEL="$MODEL" \
 DEVICE_DIRECT_MAX_TOTAL_BYTES="$DEVICE_DIRECT_MAX_TOTAL_BYTES" \
 DEVICE_DIRECT_BACKEND="cuda_malloc" \
 DEVICE_DIRECT_POOL_RELEASE_THRESHOLD="" \
@@ -56,6 +59,7 @@ echo "==========================================================="
 PROMPTS="$PROMPTS" \
 REQUEST_RATE="$REQUEST_RATE" \
 OUTPUT_LEN="$OUTPUT_LEN" \
+MODEL="$MODEL" \
 DEVICE_DIRECT_MAX_TOTAL_BYTES="$DEVICE_DIRECT_MAX_TOTAL_BYTES" \
 DEVICE_DIRECT_BACKEND="cuda_malloc_async" \
 DEVICE_DIRECT_POOL_RELEASE_THRESHOLD="$ASYNC_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD" \

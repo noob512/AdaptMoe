@@ -23,8 +23,132 @@
 #include <cstring>
 #include <cctype>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 #include <string>
 #include <unordered_map>
+
+namespace {
+
+constexpr unsigned int UVM_INITIALIZE_IOCTL = 0x30000001;
+constexpr unsigned int UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL =
+    200 + 110;
+constexpr size_t UVM_TEST_PHASE_F_MAX_RANGES = 64;
+
+constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU = 1;
+constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU = 2;
+constexpr uint32_t UVM_TEST_PHASE_F_ACTION_ADVISE_CPU = 3;
+constexpr uint32_t UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY = 4;
+
+struct PhaseFUuid {
+    uint8_t uuid[16];
+};
+
+struct UvmInitializeParams {
+    uint64_t flags;
+    uint32_t rmStatus;
+};
+
+struct PhaseFRange {
+    uint64_t base;
+    uint64_t length;
+};
+
+struct PhaseFRangeResult {
+    uint32_t status;
+    uint32_t resident_on_count;
+    uint8_t resident_on_cpu;
+    uint8_t resident_on_gpu;
+};
+
+struct PhaseFBatchExecutorParams {
+    uint32_t action;
+    uint32_t count;
+    PhaseFUuid gpu_uuid;
+    uint8_t async;
+    uint32_t success_count;
+    uint32_t failure_count;
+    PhaseFRange ranges[UVM_TEST_PHASE_F_MAX_RANGES];
+    PhaseFRangeResult results[UVM_TEST_PHASE_F_MAX_RANGES];
+    uint32_t rmStatus;
+};
+
+constexpr PhaseFUuid CPU_UUID = {{
+    0xa6, 0x5e, 0x0f, 0x4e, 0xd7, 0xd4, 0x7b, 0xa2,
+    0x50, 0x47, 0x41, 0x2c, 0x14, 0x2a, 0x77, 0x73
+}};
+
+bool get_cuda_device_uuid(int device, PhaseFUuid* uuid) {
+    if (uuid == nullptr) return false;
+    if (device < 0) {
+        cudaError_t current_err = cudaGetDevice(&device);
+        if (current_err != cudaSuccess) return false;
+    }
+
+    cudaDeviceProp prop;
+    cudaError_t err = cudaGetDeviceProperties(&prop, device);
+    if (err != cudaSuccess) return false;
+
+#if CUDART_VERSION >= 10000
+    static_assert(sizeof(prop.uuid.bytes) == sizeof(uuid->uuid),
+                  "Unexpected CUDA UUID size");
+    memcpy(uuid->uuid, prop.uuid.bytes, sizeof(uuid->uuid));
+    return true;
+#else
+    (void)prop;
+    return false;
+#endif
+}
+
+int uvm_driver_batch_execute_internal(const uintptr_t* ptrs,
+                                      const size_t* sizes,
+                                      size_t count,
+                                      uint32_t action,
+                                      int device,
+                                      int async,
+                                      uint32_t* failure_count_out) {
+    if (failure_count_out != nullptr) *failure_count_out = 0;
+    if (ptrs == nullptr || sizes == nullptr || count == 0) return 0;
+    if (count > UVM_TEST_PHASE_F_MAX_RANGES) return -2;
+
+    PhaseFBatchExecutorParams params{};
+    params.action = action;
+    params.count = static_cast<uint32_t>(count);
+    params.async = async ? 1 : 0;
+    params.gpu_uuid = CPU_UUID;
+    if ((action == UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU ||
+         action == UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY) &&
+        !get_cuda_device_uuid(device, &params.gpu_uuid)) {
+        return -3;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        params.ranges[i].base = static_cast<uint64_t>(ptrs[i]);
+        params.ranges[i].length = static_cast<uint64_t>(sizes[i]);
+    }
+
+    int fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
+    if (fd < 0) return -4;
+
+    UvmInitializeParams init_params{};
+    if (ioctl(fd, UVM_INITIALIZE_IOCTL, &init_params) != 0 ||
+        init_params.rmStatus != 0) {
+        close(fd);
+        return -5;
+    }
+
+    int ret = ioctl(fd, UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL, &params);
+    close(fd);
+    if (ret != 0) return -6;
+    if (failure_count_out != nullptr) *failure_count_out = params.failure_count;
+    if (params.rmStatus != 0 && params.success_count == 0) {
+        return -static_cast<int>(params.rmStatus);
+    }
+    return static_cast<int>(params.success_count);
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -4097,6 +4221,34 @@ void uvm_prefetch(void* ptr, size_t size, int device, cudaStream_t stream) {
 }
 
 /**
+ * Batch prefetch memory regions to a specific device.
+ *
+ * Returns the number of ranges whose CUDA prefetch call was accepted. The
+ * caller still owns stream synchronization and end-to-end migration checks.
+ */
+int uvm_batch_prefetch(const uintptr_t* ptrs,
+                       const size_t* sizes,
+                       size_t count,
+                       int device,
+                       cudaStream_t stream) {
+    if (ptrs == NULL || sizes == NULL || count == 0) return 0;
+
+    int successes = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (ptrs[i] == 0 || sizes[i] == 0) continue;
+        cudaError_t err = cudaMemPrefetchAsync(
+            reinterpret_cast<void*>(ptrs[i]), sizes[i], device, stream);
+        if (err == cudaSuccess) {
+            ++successes;
+        } else {
+            fprintf(stderr, "[vLLM UVM] cudaMemPrefetchAsync batch[%zu] failed: %s\n",
+                    i, cudaGetErrorString(err));
+        }
+    }
+    return successes;
+}
+
+/**
  * Set memory advice for a region
  *
  * @param ptr Pointer to memory region
@@ -4128,6 +4280,105 @@ void uvm_advise(void* ptr, size_t size, int advice, int device) {
         fprintf(stderr, "[vLLM UVM] cudaMemAdvise failed: %s\n",
                 cudaGetErrorString(err));
     }
+}
+
+/**
+ * Batch set memory advice for multiple regions.
+ *
+ * Returns the number of ranges whose CUDA advise call succeeded.
+ */
+int uvm_batch_advise(const uintptr_t* ptrs,
+                     const size_t* sizes,
+                     size_t count,
+                     int advice,
+                     int device) {
+    if (ptrs == NULL || sizes == NULL || count == 0) return 0;
+
+    cudaMemoryAdvise cuda_advice;
+    switch (advice) {
+        case 1:
+            cuda_advice = cudaMemAdviseSetReadMostly;
+            break;
+        case 2:
+            cuda_advice = cudaMemAdviseSetPreferredLocation;
+            break;
+        case 3:
+            cuda_advice = cudaMemAdviseSetAccessedBy;
+            break;
+        default:
+            fprintf(stderr, "[vLLM UVM] Unknown batch advice type: %d\n", advice);
+            return 0;
+    }
+
+    int successes = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (ptrs[i] == 0 || sizes[i] == 0) continue;
+        cudaError_t err = cudaMemAdvise(
+            reinterpret_cast<void*>(ptrs[i]), sizes[i], cuda_advice, device);
+        if (err == cudaSuccess) {
+            ++successes;
+        } else {
+            fprintf(stderr, "[vLLM UVM] cudaMemAdvise batch[%zu] failed: %s\n",
+                    i, cudaGetErrorString(err));
+        }
+    }
+    return successes;
+}
+
+int uvm_driver_batch_prefetch_cpu(const uintptr_t* ptrs,
+                                  const size_t* sizes,
+                                  size_t count,
+                                  int async) {
+    return uvm_driver_batch_execute_internal(
+        ptrs,
+        sizes,
+        count,
+        UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU,
+        -1,
+        async,
+        nullptr);
+}
+
+int uvm_driver_batch_prefetch_gpu(const uintptr_t* ptrs,
+                                  const size_t* sizes,
+                                  size_t count,
+                                  int device,
+                                  int async) {
+    return uvm_driver_batch_execute_internal(
+        ptrs,
+        sizes,
+        count,
+        UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU,
+        device,
+        async,
+        nullptr);
+}
+
+int uvm_driver_batch_advise_cpu(const uintptr_t* ptrs,
+                                const size_t* sizes,
+                                size_t count) {
+    return uvm_driver_batch_execute_internal(
+        ptrs,
+        sizes,
+        count,
+        UVM_TEST_PHASE_F_ACTION_ADVISE_CPU,
+        -1,
+        0,
+        nullptr);
+}
+
+int uvm_driver_batch_query_residency(const uintptr_t* ptrs,
+                                     const size_t* sizes,
+                                     size_t count,
+                                     int device) {
+    return uvm_driver_batch_execute_internal(
+        ptrs,
+        sizes,
+        count,
+        UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY,
+        device,
+        0,
+        nullptr);
 }
 
 }  // extern "C"

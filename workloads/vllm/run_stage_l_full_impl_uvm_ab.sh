@@ -46,6 +46,8 @@ KV_MAX_OFFLOAD_BLOCKS="${KV_MAX_OFFLOAD_BLOCKS:-16}"
 
 WEIGHT_PLAN_LAYERS="${WEIGHT_PLAN_LAYERS:-48}"
 WEIGHT_PLAN_EXPERTS="${WEIGHT_PLAN_EXPERTS:-128}"
+WEIGHT_PLAN_FILE="${WEIGHT_PLAN_FILE:-}"
+WEIGHT_PLAN_IS_EXTERNAL=0
 WEIGHT_PREFETCH_MAX_BYTES_PER_STEP="${WEIGHT_PREFETCH_MAX_BYTES_PER_STEP:-33554432}"
 WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER="${WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER:-2}"
 WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP="${WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP:-268435456}"
@@ -122,6 +124,8 @@ Runtime enforcement controls:
   --kv-max-offload-blocks <n>            default: 16
   --weight-plan-layers <n>               default: 48
   --weight-plan-experts <n>              default: 128
+  --weight-plan-file <path>              optional external prefetch/offload plan
+  --weight-executor <mode>               cpp_batch|driver_batch|auto (default: cpp_batch)
   --init-kv-min-blocks <n>               default: 128
   --init-weight-max-bytes <n>            default: 8GiB
   --init-weight-max-experts-per-layer <n> default: 16
@@ -167,6 +171,8 @@ while [ $# -gt 0 ]; do
     --kv-max-offload-blocks) KV_MAX_OFFLOAD_BLOCKS="$2"; shift 2 ;;
     --weight-plan-layers) WEIGHT_PLAN_LAYERS="$2"; shift 2 ;;
     --weight-plan-experts) WEIGHT_PLAN_EXPERTS="$2"; shift 2 ;;
+    --weight-plan-file) WEIGHT_PLAN_FILE="$2"; shift 2 ;;
+    --weight-executor) WEIGHT_EXECUTOR="$2"; shift 2 ;;
     --init-kv-min-blocks) INIT_KV_MIN_BLOCKS="$2"; shift 2 ;;
     --init-weight-max-bytes) INIT_WEIGHT_MAX_BYTES="$2"; shift 2 ;;
     --init-weight-max-experts-per-layer) INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;;
@@ -202,6 +208,11 @@ esac
 
 if ! [[ "$WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE" =~ ^[01]$ ]]; then
   echo "--weight-budget-cpu-offload-enable must be 0 or 1" >&2
+  exit 2
+fi
+WEIGHT_EXECUTOR="${WEIGHT_EXECUTOR:-cpp_batch}"
+if ! [[ "$WEIGHT_EXECUTOR" =~ ^(cpp_batch|driver_batch|auto)$ ]]; then
+  echo "--weight-executor must be cpp_batch, driver_batch, or auto" >&2
   exit 2
 fi
 
@@ -244,9 +255,12 @@ echo " kv_runtime_budget_blocks: $KV_RUNTIME_BUDGET_BLOCKS"
 echo " kv_max_offload_blocks: $KV_MAX_OFFLOAD_BLOCKS"
 echo " weight_plan_layers: $WEIGHT_PLAN_LAYERS"
 echo " weight_plan_experts: $WEIGHT_PLAN_EXPERTS"
+echo " weight_plan_file: ${WEIGHT_PLAN_FILE:-<generated_broad_cold_plan>}"
 echo " weight_max_victims_per_step: $WEIGHT_MAX_VICTIMS_PER_STEP"
 echo " weight_victim_action: $WEIGHT_VICTIM_ACTION"
 echo " weight_budget_cpu_offload_enable: $WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE"
+echo " weight_batch_executor_enable: ${WEIGHT_BATCH_EXECUTOR_ENABLE:-1}"
+echo " weight_executor: $WEIGHT_EXECUTOR"
 echo " init_kv_min_blocks: $INIT_KV_MIN_BLOCKS"
 echo " init_weight_max_bytes: $INIT_WEIGHT_MAX_BYTES"
 echo " init_weight_max_experts_per_layer: $INIT_WEIGHT_MAX_EXPERTS_PER_LAYER"
@@ -368,7 +382,13 @@ run_one() {
       ;;
     full_impl_enforce)
       local plan_json="$run_dir/weight_broad_cold_plan.json"
-      write_weight_plan "$plan_json"
+      local require_routing_plan=0
+      if [ -n "$WEIGHT_PLAN_FILE" ]; then
+        cp "$WEIGHT_PLAN_FILE" "$plan_json"
+        require_routing_plan=1
+      else
+        write_weight_plan "$plan_json"
+      fi
       args+=(
         --uvm-policy-enable 1
         --uvm-device-direct-enable 1
@@ -406,10 +426,13 @@ run_one() {
         --uvm-weight-prefetch-trace-file "$run_dir/vllm_uvm_weight_prefetch_${label}.jsonl"
         --uvm-weight-prefetch-plan-file "$plan_json"
         --uvm-weight-prefetch-require-plan 0
+        --uvm-weight-prefetch-source router_topk
+        --uvm-weight-batch-executor-enable "${WEIGHT_BATCH_EXECUTOR_ENABLE:-1}"
+        --uvm-weight-executor "$WEIGHT_EXECUTOR"
         --uvm-weight-prefetch-max-bytes-per-step "$WEIGHT_PREFETCH_MAX_BYTES_PER_STEP"
         --uvm-weight-prefetch-max-experts-per-layer "$WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER"
         --uvm-weight-prefetch-target-roles moe_gate_up,moe_down
-        --uvm-weight-offload-enable 1
+        --uvm-weight-offload-enable 0
         --uvm-weight-offload-mode prefetch_cpu
         --uvm-weight-offload-plan-file "$plan_json"
         --uvm-weight-offload-max-bytes-per-step "$WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP"
@@ -427,6 +450,7 @@ run_one() {
         --uvm-init-weight-max-bytes "$INIT_WEIGHT_MAX_BYTES"
         --uvm-init-weight-max-experts-per-layer "$INIT_WEIGHT_MAX_EXPERTS_PER_LAYER"
         --uvm-init-weight-sync 1
+        --uvm-init-weight-require-routing-plan "$require_routing_plan"
         --uvm-init-weight-trace-file "$run_dir/vllm_uvm_init_weight_offload_${label}.jsonl"
         --uvm-residency-weight-initial-state gpu
         --uvm-residency-weight-enforce-hot-set 1

@@ -85,6 +85,9 @@ UVM_WEIGHT_PREFETCH_TARGET_ROLES="${VLLM_UVM_WEIGHT_PREFETCH_TARGET_ROLES:-moe_g
 UVM_WEIGHT_PREFETCH_DEVICE="${VLLM_UVM_WEIGHT_PREFETCH_DEVICE:--1}"
 UVM_WEIGHT_PREFETCH_PLAN_FILE="${VLLM_UVM_WEIGHT_PREFETCH_PLAN_FILE:-}"
 UVM_WEIGHT_PREFETCH_REQUIRE_PLAN="${VLLM_UVM_WEIGHT_PREFETCH_REQUIRE_PLAN:-0}"
+UVM_WEIGHT_PREFETCH_SOURCE="${VLLM_UVM_WEIGHT_PREFETCH_SOURCE:-router_topk}"
+UVM_WEIGHT_BATCH_EXECUTOR_ENABLE="${VLLM_UVM_WEIGHT_BATCH_EXECUTOR_ENABLE:-1}"
+UVM_WEIGHT_EXECUTOR="${VLLM_UVM_WEIGHT_EXECUTOR:-cpp_batch}"
 UVM_WEIGHT_OFFLOAD_ENABLE="${VLLM_UVM_WEIGHT_OFFLOAD_ENABLE:-0}"
 UVM_WEIGHT_OFFLOAD_MODE="${VLLM_UVM_WEIGHT_OFFLOAD_MODE:-trace_only}"
 UVM_WEIGHT_OFFLOAD_PLAN_FILE="${VLLM_UVM_WEIGHT_OFFLOAD_PLAN_FILE:-}"
@@ -105,6 +108,7 @@ UVM_INIT_WEIGHT_MAX_BYTES="${VLLM_UVM_INIT_WEIGHT_MAX_BYTES:-0}"
 UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="${VLLM_UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER:-0}"
 UVM_INIT_WEIGHT_SYNC="${VLLM_UVM_INIT_WEIGHT_SYNC:-1}"
 UVM_INIT_WEIGHT_TRACE_FILE="${VLLM_UVM_INIT_WEIGHT_TRACE_FILE:-}"
+UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN="${VLLM_UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN:-0}"
 UVM_POOL_COORDINATOR_ENABLE="${VLLM_UVM_POOL_COORDINATOR_ENABLE:-0}"
 UVM_POOL_COORDINATOR_MODE="${VLLM_UVM_POOL_COORDINATOR_MODE:-trace_only}"
 UVM_POOL_COORDINATOR_TRACE_FILE="${VLLM_UVM_POOL_COORDINATOR_TRACE_FILE:-}"
@@ -328,6 +332,9 @@ Options:
   --uvm-weight-prefetch-require-plan <0|1>
                              Require a Stage H prefetch plan before issuing
                              active-expert prefetch actions (default: 0).
+  --uvm-weight-executor <mode>
+                             Stage M/F weight action executor:
+                             cpp_batch|driver_batch|auto (default: cpp_batch).
   --uvm-weight-offload-enable <0|1>
                              Stage I optional cold expert offload/advise gate.
   --uvm-weight-offload-mode <mode>
@@ -676,6 +683,9 @@ start_server() {
                 VLLM_UVM_WEIGHT_PREFETCH_DEVICE='$UVM_WEIGHT_PREFETCH_DEVICE' \
                 VLLM_UVM_WEIGHT_PREFETCH_PLAN_FILE='$UVM_WEIGHT_PREFETCH_PLAN_FILE' \
                 VLLM_UVM_WEIGHT_PREFETCH_REQUIRE_PLAN='$UVM_WEIGHT_PREFETCH_REQUIRE_PLAN' \
+                VLLM_UVM_WEIGHT_PREFETCH_SOURCE='$UVM_WEIGHT_PREFETCH_SOURCE' \
+                VLLM_UVM_WEIGHT_BATCH_EXECUTOR_ENABLE='$UVM_WEIGHT_BATCH_EXECUTOR_ENABLE' \
+                VLLM_UVM_WEIGHT_EXECUTOR='$UVM_WEIGHT_EXECUTOR' \
                 VLLM_UVM_WEIGHT_OFFLOAD_ENABLE='$UVM_WEIGHT_OFFLOAD_ENABLE' \
                 VLLM_UVM_WEIGHT_OFFLOAD_MODE='$UVM_WEIGHT_OFFLOAD_MODE' \
                 VLLM_UVM_WEIGHT_OFFLOAD_PLAN_FILE='$UVM_WEIGHT_OFFLOAD_PLAN_FILE' \
@@ -696,6 +706,7 @@ start_server() {
                 VLLM_UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER='$UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER' \
                 VLLM_UVM_INIT_WEIGHT_SYNC='$UVM_INIT_WEIGHT_SYNC' \
                 VLLM_UVM_INIT_WEIGHT_TRACE_FILE='$UVM_INIT_WEIGHT_TRACE_FILE' \
+                VLLM_UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN='$UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN' \
                 VLLM_UVM_POOL_COORDINATOR_ENABLE='$UVM_POOL_COORDINATOR_ENABLE' \
                 VLLM_UVM_POOL_COORDINATOR_MODE='$UVM_POOL_COORDINATOR_MODE' \
                 VLLM_UVM_POOL_COORDINATOR_TRACE_FILE='$UVM_POOL_COORDINATOR_TRACE_FILE' \
@@ -1130,6 +1141,9 @@ parse_args() {
       --uvm-weight-prefetch-device) UVM_WEIGHT_PREFETCH_DEVICE="$2"; shift 2 ;; # Stage I target device
       --uvm-weight-prefetch-plan-file) UVM_WEIGHT_PREFETCH_PLAN_FILE="$2"; shift 2 ;; # Stage I Stage H prefetch plan JSON
       --uvm-weight-prefetch-require-plan) UVM_WEIGHT_PREFETCH_REQUIRE_PLAN="$2"; shift 2 ;; # Stage I 是否要求 prefetch_plan 命中
+      --uvm-weight-prefetch-source) UVM_WEIGHT_PREFETCH_SOURCE="$2"; shift 2 ;; # Stage I source router_topk/plan_intersection
+      --uvm-weight-batch-executor-enable) UVM_WEIGHT_BATCH_EXECUTOR_ENABLE="$2"; shift 2 ;; # Stage M/E C++ batch executor gate
+      --uvm-weight-executor) UVM_WEIGHT_EXECUTOR="$2"; shift 2 ;; # Stage M/F executor cpp_batch/driver_batch/auto
       --uvm-weight-offload-enable) UVM_WEIGHT_OFFLOAD_ENABLE="$2"; shift 2 ;; # Stage I cold expert offload/advise 开关
       --uvm-weight-offload-mode) UVM_WEIGHT_OFFLOAD_MODE="$2"; shift 2 ;; # Stage I cold expert mode trace_only/advise_cpu/prefetch_cpu
       --uvm-weight-offload-plan-file) UVM_WEIGHT_OFFLOAD_PLAN_FILE="$2"; shift 2 ;; # Stage I Stage H offload plan JSON
@@ -1150,6 +1164,7 @@ parse_args() {
       --uvm-init-weight-max-experts-per-layer) UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;; # Stage M per-layer cold expert cap
       --uvm-init-weight-sync) UVM_INIT_WEIGHT_SYNC="$2"; shift 2 ;; # Stage M synchronize after pre-offload
       --uvm-init-weight-trace-file) UVM_INIT_WEIGHT_TRACE_FILE="$2"; shift 2 ;; # Stage M weight JSONL trace
+      --uvm-init-weight-require-routing-plan) UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN="$2"; shift 2 ;; # Stage M require routing_heatmap_v1 plan
       --uvm-pool-coordinator-enable) UVM_POOL_COORDINATOR_ENABLE="$2"; shift 2 ;; # Stage K global coordinator gate
       --uvm-pool-coordinator-mode) UVM_POOL_COORDINATOR_MODE="$2"; shift 2 ;; # Stage K mode trace_only/enforce
       --uvm-pool-coordinator-trace-file) UVM_POOL_COORDINATOR_TRACE_FILE="$2"; shift 2 ;; # Stage K JSONL trace
@@ -1319,6 +1334,9 @@ validate_inputs() {
     [ -n "$UVM_WEIGHT_PREFETCH_TARGET_ROLES" ] || die "--uvm-weight-prefetch-target-roles must not be empty"
     [[ "$UVM_WEIGHT_PREFETCH_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-weight-prefetch-device must be an integer"
     [[ "$UVM_WEIGHT_PREFETCH_REQUIRE_PLAN" =~ ^[01]$ ]] || die "--uvm-weight-prefetch-require-plan must be 0 or 1"
+    [[ "$UVM_WEIGHT_PREFETCH_SOURCE" =~ ^(router_topk|plan_intersection)$ ]] || die "--uvm-weight-prefetch-source must be router_topk or plan_intersection"
+    [[ "$UVM_WEIGHT_BATCH_EXECUTOR_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-batch-executor-enable must be 0 or 1"
+    [[ "$UVM_WEIGHT_EXECUTOR" =~ ^(cpp_batch|driver_batch|auto)$ ]] || die "--uvm-weight-executor must be cpp_batch, driver_batch, or auto"
     [[ "$UVM_WEIGHT_OFFLOAD_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-offload-enable must be 0 or 1"
     [[ "$UVM_WEIGHT_OFFLOAD_MODE" =~ ^(trace_only|advise_cpu|prefetch_cpu)$ ]] || die "--uvm-weight-offload-mode must be trace_only, advise_cpu, or prefetch_cpu"
     [[ "$UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-weight-offload-max-bytes-per-step must be a non-negative integer"
@@ -1335,6 +1353,7 @@ validate_inputs() {
     [[ "$UVM_INIT_WEIGHT_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-init-weight-max-bytes must be a non-negative integer"
     [[ "$UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-init-weight-max-experts-per-layer must be a non-negative integer"
     [[ "$UVM_INIT_WEIGHT_SYNC" =~ ^[01]$ ]] || die "--uvm-init-weight-sync must be 0 or 1"
+    [[ "$UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN" =~ ^[01]$ ]] || die "--uvm-init-weight-require-routing-plan must be 0 or 1"
     [[ "$UVM_POOL_COORDINATOR_ENABLE" =~ ^[01]$ ]] || die "--uvm-pool-coordinator-enable must be 0 or 1"
     [[ "$UVM_POOL_COORDINATOR_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-pool-coordinator-mode must be trace_only or enforce"
     [[ "$UVM_POOL_COORDINATOR_GLOBAL_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-pool-coordinator-global-bytes-per-step must be a non-negative integer"

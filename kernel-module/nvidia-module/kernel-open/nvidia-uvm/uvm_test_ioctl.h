@@ -1560,6 +1560,44 @@ typedef struct
     NV_STATUS rmStatus;                     // Out
 } UVM_TEST_QUERY_ACCESS_COUNTERS_PARAMS;
 
+#define UVM_TEST_PHASE_F_MAX_RANGES                      64
+
+typedef enum
+{
+    UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU = 1,
+    UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU = 2,
+    UVM_TEST_PHASE_F_ACTION_ADVISE_CPU = 3,
+    UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY = 4,
+} UVM_TEST_PHASE_F_ACTION;
+
+typedef struct
+{
+    NvU64 base   NV_ALIGN_BYTES(8); // In
+    NvU64 length NV_ALIGN_BYTES(8); // In
+} UVM_TEST_PHASE_F_RANGE;
+
+typedef struct
+{
+    NV_STATUS status;              // Out
+    NvU32     resident_on_count;   // Out, query only
+    NvBool    resident_on_cpu;     // Out, query only
+    NvBool    resident_on_gpu;     // Out, query only
+} UVM_TEST_PHASE_F_RANGE_RESULT;
+
+#define UVM_TEST_PHASE_F_BATCH_EXECUTOR                   UVM_TEST_IOCTL_BASE(110)
+typedef struct
+{
+    NvU32                         action;                                      // In
+    NvU32                         count;                                       // In
+    NvProcessorUuid               gpu_uuid;                                    // In, GPU prefetch/query classification
+    NvBool                        async;                                       // In, migrate only
+    NvU32                         success_count;                               // Out
+    NvU32                         failure_count;                               // Out
+    UVM_TEST_PHASE_F_RANGE        ranges[UVM_TEST_PHASE_F_MAX_RANGES];         // In
+    UVM_TEST_PHASE_F_RANGE_RESULT results[UVM_TEST_PHASE_F_MAX_RANGES];        // Out
+    NV_STATUS                     rmStatus;                                    // Out
+} UVM_TEST_PHASE_F_BATCH_EXECUTOR_PARAMS;
+
 #ifdef __cplusplus
 }
 #endif

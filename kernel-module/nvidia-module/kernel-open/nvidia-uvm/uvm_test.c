@@ -238,6 +238,93 @@ static NV_STATUS uvm_test_inject_nvlink_error(UVM_TEST_INJECT_NVLINK_ERROR_PARAM
     return status;
 }
 
+static NV_STATUS uvm_test_phase_f_batch_executor(UVM_TEST_PHASE_F_BATCH_EXECUTOR_PARAMS *params, struct file *filp)
+{
+    NvU32 i;
+    NV_STATUS first_error = NV_OK;
+
+    if (params->count > UVM_TEST_PHASE_F_MAX_RANGES)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    params->success_count = 0;
+    params->failure_count = 0;
+
+    for (i = 0; i < params->count; ++i) {
+        NV_STATUS status = NV_OK;
+        NvU64 base = params->ranges[i].base;
+        NvU64 length = params->ranges[i].length;
+
+        params->results[i].status = NV_OK;
+        params->results[i].resident_on_count = 0;
+        params->results[i].resident_on_cpu = NV_FALSE;
+        params->results[i].resident_on_gpu = NV_FALSE;
+
+        if (base == 0 || length == 0) {
+            status = NV_ERR_INVALID_ARGUMENT;
+        }
+        else if (params->action == UVM_TEST_PHASE_F_ACTION_ADVISE_CPU) {
+            UVM_SET_PREFERRED_LOCATION_PARAMS advise_params = {0};
+
+            advise_params.requestedBase = base;
+            advise_params.length = length;
+            advise_params.preferredLocation = NV_PROCESSOR_UUID_CPU_DEFAULT;
+            advise_params.preferredCpuNumaNode = NUMA_NO_NODE;
+            status = uvm_api_set_preferred_location(&advise_params, filp);
+        }
+        else if (params->action == UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU ||
+                 params->action == UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU) {
+            UVM_MIGRATE_PARAMS migrate_params = {0};
+
+            migrate_params.base = base;
+            migrate_params.length = length;
+            migrate_params.destinationUuid =
+                params->action == UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU ?
+                    NV_PROCESSOR_UUID_CPU_DEFAULT : params->gpu_uuid;
+            migrate_params.flags = params->async ? UVM_MIGRATE_FLAG_ASYNC : 0;
+            migrate_params.semaphoreAddress = 0;
+            migrate_params.semaphorePayload = 0;
+            migrate_params.cpuNumaNode = NUMA_NO_NODE;
+            status = uvm_api_migrate(&migrate_params, filp);
+        }
+        else if (params->action == UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY) {
+            UVM_TEST_VA_RESIDENCY_INFO_PARAMS query_params = {0};
+            NvU32 resident_index;
+
+            query_params.lookup_address = base;
+            query_params.is_async = params->async;
+            status = uvm_test_va_residency_info(&query_params, filp);
+            if (status == NV_OK) {
+                params->results[i].resident_on_count = query_params.resident_on_count;
+                for (resident_index = 0;
+                     resident_index < query_params.resident_on_count && resident_index < UVM_MAX_PROCESSORS;
+                     ++resident_index) {
+                    if (uvm_uuid_eq(&query_params.resident_on[resident_index],
+                                    &NV_PROCESSOR_UUID_CPU_DEFAULT))
+                        params->results[i].resident_on_cpu = NV_TRUE;
+                    if (uvm_uuid_eq(&query_params.resident_on[resident_index],
+                                    &params->gpu_uuid))
+                        params->results[i].resident_on_gpu = NV_TRUE;
+                }
+            }
+        }
+        else {
+            status = NV_ERR_INVALID_ARGUMENT;
+        }
+
+        params->results[i].status = status;
+        if (status == NV_OK) {
+            ++params->success_count;
+        }
+        else {
+            ++params->failure_count;
+            if (first_error == NV_OK)
+                first_error = status;
+        }
+    }
+
+    return first_error;
+}
+
 long uvm_test_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     // Disable all test entry points if the module parameter wasn't provided.
@@ -358,6 +445,7 @@ long uvm_test_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_TEST_FILE_INITIALIZE,           uvm_test_file_initialize);
         UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_TEST_FILE_UNMAP,                uvm_test_file_unmap);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_TEST_QUERY_ACCESS_COUNTERS,        uvm_test_query_access_counters);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_TEST_PHASE_F_BATCH_EXECUTOR,       uvm_test_phase_f_batch_executor);
     }
 
     return -EINVAL;

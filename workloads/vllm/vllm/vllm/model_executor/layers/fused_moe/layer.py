@@ -20,6 +20,12 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.device_allocator.uvm import (
     advise_range_preferred_location,
+    batch_advise_ranges_preferred_location,
+    batch_advise_ranges_cpu_with_executor,
+    batch_offload_ranges_to_cpu,
+    batch_offload_ranges_to_cpu_with_executor,
+    batch_prefetch_ranges_to_device,
+    batch_prefetch_ranges_to_device_with_executor,
     offload_range_to_cpu,
     prefetch_range_to_device,
     uvm_enabled_allocation_phase,
@@ -160,6 +166,30 @@ def _parse_plan_expert_keys(path: str, plan_key: str) -> set[tuple[int, int]]:
             continue
         keys.add((layer_id, expert_id))
     return keys
+
+
+def _load_uvm_weight_plan(path: str) -> dict[str, object]:
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            plan = json.load(handle)
+    except OSError:
+        logger.warning("Failed to read UVM weight plan file: %s", path, exc_info=True)
+        return {}
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse UVM weight plan file: %s", path, exc_info=True)
+        return {}
+    return plan if isinstance(plan, dict) else {}
+
+
+def _uvm_weight_plan_policy(path: str) -> str:
+    plan = _load_uvm_weight_plan(path)
+    metadata = plan.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    policy = metadata.get("policy")
+    return str(policy) if policy is not None else ""
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -694,10 +724,37 @@ class FusedMoE(CustomOp):
             "VLLM_UVM_WEIGHT_PREFETCH_REQUIRE_PLAN",
             default=False,
         )
+        self.uvm_weight_prefetch_source = os.environ.get(
+            "VLLM_UVM_WEIGHT_PREFETCH_SOURCE",
+            "router_topk",
+        )
+        if self.uvm_weight_prefetch_source not in (
+            "router_topk",
+            "plan_intersection",
+        ):
+            logger.warning(
+                "Unknown VLLM_UVM_WEIGHT_PREFETCH_SOURCE=%s; using router_topk",
+                self.uvm_weight_prefetch_source,
+            )
+            self.uvm_weight_prefetch_source = "router_topk"
         self.uvm_weight_prefetch_plan_keys = _parse_plan_expert_keys(
             self.uvm_weight_prefetch_plan_file,
             "prefetch_plan",
         )
+        self.uvm_weight_batch_executor_enable = _env_flag_enabled(
+            "VLLM_UVM_WEIGHT_BATCH_EXECUTOR_ENABLE",
+            default=True,
+        )
+        self.uvm_weight_executor = os.environ.get(
+            "VLLM_UVM_WEIGHT_EXECUTOR",
+            "cpp_batch",
+        )
+        if self.uvm_weight_executor not in ("cpp_batch", "driver_batch", "auto"):
+            logger.warning(
+                "Unknown VLLM_UVM_WEIGHT_EXECUTOR=%s; using cpp_batch",
+                self.uvm_weight_executor,
+            )
+            self.uvm_weight_executor = "cpp_batch"
         self.uvm_weight_offload_enable = _env_flag_enabled(
             "VLLM_UVM_WEIGHT_OFFLOAD_ENABLE",
             default=False,
@@ -766,6 +823,10 @@ class FusedMoE(CustomOp):
             "VLLM_UVM_INIT_WEIGHT_PLAN_FILE",
             self.uvm_weight_offload_plan_file,
         )
+        self.uvm_init_weight_require_routing_plan = _env_flag_enabled(
+            "VLLM_UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN",
+            default=False,
+        )
         self.uvm_init_weight_offload_target_roles = {
             role.strip()
             for role in os.environ.get(
@@ -793,6 +854,13 @@ class FusedMoE(CustomOp):
         self.uvm_init_weight_offload_plan_keys = _parse_plan_expert_keys(
             self.uvm_init_weight_offload_plan_file,
             "offload_plan",
+        )
+        self.uvm_init_weight_hot_plan_keys = _parse_plan_expert_keys(
+            self.uvm_init_weight_offload_plan_file,
+            "prefetch_plan",
+        )
+        self.uvm_init_weight_plan_policy = _uvm_weight_plan_policy(
+            self.uvm_init_weight_offload_plan_file,
         )
         self._uvm_init_weight_offload_plan_loaded = bool(
             self.uvm_init_weight_offload_plan_keys
@@ -2060,6 +2128,13 @@ class FusedMoE(CustomOp):
                 self.uvm_init_weight_offload_plan_file,
                 "offload_plan",
             )
+            self.uvm_init_weight_hot_plan_keys = _parse_plan_expert_keys(
+                self.uvm_init_weight_offload_plan_file,
+                "prefetch_plan",
+            )
+            self.uvm_init_weight_plan_policy = _uvm_weight_plan_policy(
+                self.uvm_init_weight_offload_plan_file,
+            )
             self._uvm_init_weight_offload_plan_loaded = True
 
     def _uvm_expert_weight_slices(
@@ -2348,6 +2423,62 @@ class FusedMoE(CustomOp):
         except OSError:
             logger.debug("Failed to write Stage M weight offload trace", exc_info=True)
 
+    def _register_uvm_init_hot_weight_regions(self, layer_id: int) -> int:
+        """Register routing-plan hot experts as GPU/protected before offload."""
+        hot_pairs = self._uvm_plan_local_experts(self.uvm_init_weight_hot_plan_keys)
+        registered_records = 0
+        for global_expert_id, local_expert_id in hot_pairs:
+            for role, ptr, size_bytes in self._uvm_expert_weight_slices(
+                local_expert_id,
+                self.uvm_init_weight_offload_target_roles,
+            ):
+                region_id = self._uvm_expert_weight_region_id(
+                    layer_id,
+                    global_expert_id,
+                    role,
+                )
+                metadata = self._uvm_expert_weight_residency_metadata(
+                    layer_id=layer_id,
+                    global_expert_id=global_expert_id,
+                    local_expert_id=local_expert_id,
+                    role=role,
+                    ptr=ptr,
+                    size_bytes=size_bytes,
+                    active_this_step=False,
+                    source_action="stage_m_init_hot_register",
+                )
+                register_uvm_residency_region(
+                    pool="weights",
+                    region_id=region_id,
+                    ptr=ptr,
+                    bytes=size_bytes,
+                    state="gpu",
+                    evictable=False,
+                    active=False,
+                    metadata={
+                        **metadata,
+                        "source": "stage_m",
+                        "stage": "stage_m",
+                        "init_hot": True,
+                        "protected": True,
+                        "plan_policy": self.uvm_init_weight_plan_policy,
+                    },
+                )
+                mark_uvm_residency_state(
+                    region_id=region_id,
+                    state="gpu",
+                    metadata={
+                        **metadata,
+                        "source": "stage_m",
+                        "stage": "stage_m",
+                        "init_hot": True,
+                        "protected": True,
+                        "plan_policy": self.uvm_init_weight_plan_policy,
+                    },
+                )
+                registered_records += 1
+        return registered_records
+
     def run_uvm_init_weight_offload(self) -> None:
         """Stage M: offload planned cold MoE expert weights before warmup."""
         if not self.uvm_init_weight_offload_enable:
@@ -2356,6 +2487,23 @@ class FusedMoE(CustomOp):
             return
         self._uvm_init_weight_offload_done = True
         self._refresh_uvm_weight_action_plans()
+        if (
+            self.uvm_init_weight_require_routing_plan
+            and self.uvm_init_weight_plan_policy != "routing_heatmap_v1"
+        ):
+            self._append_uvm_init_weight_trace(
+                {
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "layer_name": self.layer_name,
+                    "action": "init_weight_offload_reject_non_routing_plan",
+                    "mode": self.uvm_init_weight_offload_mode,
+                    "plan_file": self.uvm_init_weight_offload_plan_file,
+                    "plan_policy": self.uvm_init_weight_plan_policy,
+                    "required_policy": "routing_heatmap_v1",
+                }
+            )
+            return
         if not self.uvm_init_weight_offload_plan_keys:
             self._append_uvm_init_weight_trace(
                 {
@@ -2373,6 +2521,9 @@ class FusedMoE(CustomOp):
             layer_id = self._uvm_layer_id()
             if layer_id is None:
                 return
+            hot_registered_records = self._register_uvm_init_hot_weight_regions(
+                layer_id
+            )
             expert_pairs = self._uvm_plan_local_experts(
                 self.uvm_init_weight_offload_plan_keys
             )
@@ -2385,6 +2536,7 @@ class FusedMoE(CustomOp):
             issued_bytes = 0
             issued_records = 0
             rejected_records = 0
+            batch_items: list[dict[str, object]] = []
             for global_expert_id, local_expert_id in expert_pairs:
                 for role, ptr, size_bytes in self._uvm_expert_weight_slices(
                     local_expert_id,
@@ -2422,6 +2574,8 @@ class FusedMoE(CustomOp):
                             **residency_metadata,
                             "source": "stage_m",
                             "stage": "stage_m",
+                            "init_cold": True,
+                            "plan_policy": self.uvm_init_weight_plan_policy,
                         },
                     )
 
@@ -2447,6 +2601,33 @@ class FusedMoE(CustomOp):
                                 "bytes": size_bytes,
                                 "issued_bytes_before": issued_bytes,
                                 "max_bytes": self.uvm_init_weight_offload_max_bytes,
+                            }
+                        )
+                        continue
+
+                    if (
+                        self.uvm_weight_batch_executor_enable
+                        and self.uvm_init_weight_offload_mode
+                        in ("advise_cpu", "prefetch_cpu", "offload_cpu")
+                    ):
+                        issued_records += 1
+                        issued_bytes += size_bytes
+                        batch_items.append(
+                            {
+                                "timestamp": time.time(),
+                                "pid": os.getpid(),
+                                "layer_name": self.layer_name,
+                                "mode": self.uvm_init_weight_offload_mode,
+                                "role": role,
+                                "residency_region_id": region_id,
+                                "global_expert_id": global_expert_id,
+                                "local_expert_id": local_expert_id,
+                                "ptr": ptr,
+                                "bytes": size_bytes,
+                                "device": -1,
+                                "sync_offload": self.uvm_init_weight_offload_sync,
+                                "plan_policy": self.uvm_init_weight_plan_policy,
+                                "residency_metadata": residency_metadata,
                             }
                         )
                         continue
@@ -2495,6 +2676,8 @@ class FusedMoE(CustomOp):
                                 **residency_metadata,
                                 "source": "stage_m",
                                 "stage": "stage_m",
+                                "init_cold": True,
+                                "plan_policy": self.uvm_init_weight_plan_policy,
                                 "sync_offload": self.uvm_init_weight_offload_sync,
                             },
                         )
@@ -2530,6 +2713,93 @@ class FusedMoE(CustomOp):
                                 else False
                             ),
                             "sync_offload": self.uvm_init_weight_offload_sync,
+                            "plan_policy": self.uvm_init_weight_plan_policy,
+                        }
+                    )
+
+            if batch_items:
+                ranges = [
+                    (int(item["ptr"]), int(item["bytes"])) for item in batch_items
+                ]
+                if self.uvm_init_weight_offload_mode == "advise_cpu":
+                    (
+                        batch_successes,
+                        executor_used,
+                        driver_result,
+                    ) = batch_advise_ranges_cpu_with_executor(
+                        ranges,
+                        executor=self.uvm_weight_executor,
+                    )
+                    driver_advise_result = driver_result
+                    driver_prefetch_result = 0
+                else:
+                    (
+                        batch_successes,
+                        executor_used,
+                        driver_advise_result,
+                        driver_prefetch_result,
+                    ) = batch_offload_ranges_to_cpu_with_executor(
+                        ranges,
+                        sync=self.uvm_init_weight_offload_sync,
+                        executor=self.uvm_weight_executor,
+                    )
+                for batch_index, item in enumerate(batch_items):
+                    success = batch_index < batch_successes
+                    if self.uvm_init_weight_offload_mode == "advise_cpu":
+                        action = (
+                            "init_weight_offload_advise_cpu_issued"
+                            if success
+                            else "init_weight_offload_skipped"
+                        )
+                        advise_success = success
+                        prefetch_success = False
+                    else:
+                        action = (
+                            "init_weight_offload_offload_cpu_issued"
+                            if self.uvm_init_weight_offload_mode == "offload_cpu"
+                            else "init_weight_offload_prefetch_cpu_issued"
+                        )
+                        if not success:
+                            action = "init_weight_offload_skipped"
+                        advise_success = success
+                        prefetch_success = success
+                    if success:
+                        mark_uvm_residency_state(
+                            region_id=str(item["residency_region_id"]),
+                            state=(
+                                "cpu"
+                                if self.uvm_init_weight_offload_sync
+                                else "prefetching_cpu"
+                            ),
+                            metadata={
+                                **cast(dict[str, object], item["residency_metadata"]),
+                                "source": "stage_m",
+                                "stage": "stage_m",
+                                "init_cold": True,
+                                "plan_policy": self.uvm_init_weight_plan_policy,
+                                "sync_offload": self.uvm_init_weight_offload_sync,
+                                "executor": executor_used,
+                            },
+                        )
+                    self._append_uvm_init_weight_trace(
+                        {
+                            **{
+                                key: value
+                                for key, value in item.items()
+                                if key != "residency_metadata"
+                            },
+                            "action": action,
+                            "ptr": f"0x{int(item['ptr']):x}",
+                            "success": success,
+                            "advise_cpu_success": advise_success,
+                            "prefetch_cpu_success": prefetch_success,
+                            "executor": executor_used,
+                            "requested_executor": self.uvm_weight_executor,
+                            "driver_advise_result": driver_advise_result,
+                            "driver_prefetch_result": driver_prefetch_result,
+                            "batch_index": batch_index,
+                            "batch_size": len(batch_items),
+                            "batch_successes": batch_successes,
                         }
                     )
 
@@ -2545,6 +2815,9 @@ class FusedMoE(CustomOp):
                             global_expert_id
                             for global_expert_id, _ in expert_pairs
                         ],
+                        "hot_plan_records": len(self.uvm_init_weight_hot_plan_keys),
+                        "hot_registered_records": hot_registered_records,
+                        "plan_policy": self.uvm_init_weight_plan_policy,
                         "issued_records": issued_records,
                         "issued_bytes": issued_bytes,
                         "attempted_bytes": attempted_bytes,
@@ -2570,7 +2843,10 @@ class FusedMoE(CustomOp):
                 for global_expert_id, _ in all_active_expert_pairs
             }
             expert_pairs = all_active_expert_pairs
-            if self.uvm_weight_prefetch_plan_keys:
+            if (
+                self.uvm_weight_prefetch_source == "plan_intersection"
+                and self.uvm_weight_prefetch_plan_keys
+            ):
                 expert_pairs = [
                     (global_expert_id, local_expert_id)
                     for global_expert_id, local_expert_id in expert_pairs
@@ -2578,7 +2854,10 @@ class FusedMoE(CustomOp):
                     and (layer_id, global_expert_id)
                     in self.uvm_weight_prefetch_plan_keys
                 ]
-            elif self.uvm_weight_prefetch_require_plan:
+            elif (
+                self.uvm_weight_prefetch_source == "plan_intersection"
+                and self.uvm_weight_prefetch_require_plan
+            ):
                 expert_pairs = []
             if self.uvm_weight_prefetch_max_experts_per_layer > 0:
                 expert_pairs = expert_pairs[
@@ -2603,6 +2882,7 @@ class FusedMoE(CustomOp):
             attempted_bytes = 0
             issued_bytes = 0
             rejected_records = 0
+            batch_prefetch_items: list[dict[str, object]] = []
             device = (
                 int(torch.cuda.current_device())
                 if self.uvm_weight_prefetch_device < 0
@@ -2709,8 +2989,9 @@ class FusedMoE(CustomOp):
                                 "pid": os.getpid(),
                                 "layer_name": self.layer_name,
                                 "step": self._uvm_moe_trace_step,
-                                "mode": self.uvm_weight_prefetch_mode,
-                                "action": "residency_deny_skip_prefetch",
+                            "mode": self.uvm_weight_prefetch_mode,
+                            "prefetch_source": self.uvm_weight_prefetch_source,
+                            "action": "residency_deny_skip_prefetch",
                                 "role": role,
                                 "residency_region_id": region_id,
                                 "residency_allowed": residency_decision.allowed,
@@ -2741,8 +3022,9 @@ class FusedMoE(CustomOp):
                                 "pid": os.getpid(),
                                 "layer_name": self.layer_name,
                                 "step": self._uvm_moe_trace_step,
-                                "mode": self.uvm_weight_prefetch_mode,
-                                "action": "budget_reject",
+                            "mode": self.uvm_weight_prefetch_mode,
+                            "prefetch_source": self.uvm_weight_prefetch_source,
+                            "action": "budget_reject",
                                 "role": role,
                                 "residency_region_id": region_id,
                                 "residency_allowed": residency_decision.allowed,
@@ -2780,6 +3062,7 @@ class FusedMoE(CustomOp):
                             "global_expert_id": global_expert_id,
                             "local_expert_id": local_expert_id,
                             "mode": self.uvm_weight_prefetch_mode,
+                            "prefetch_source": self.uvm_weight_prefetch_source,
                         },
                     )
                     if not coordinator_decision.allowed:
@@ -2791,6 +3074,7 @@ class FusedMoE(CustomOp):
                                 "layer_name": self.layer_name,
                                 "step": self._uvm_moe_trace_step,
                                 "mode": self.uvm_weight_prefetch_mode,
+                                "prefetch_source": self.uvm_weight_prefetch_source,
                                 "action": "coordinator_reject",
                                 "role": role,
                                 "residency_region_id": region_id,
@@ -2809,6 +3093,54 @@ class FusedMoE(CustomOp):
                                 "pool": coordinator_decision.pool,
                                 "coordinator_mode": coordinator_decision.mode,
                                 "coordinator_reason": coordinator_decision.reason,
+                            }
+                        )
+                        continue
+                    if (
+                        self.uvm_weight_batch_executor_enable
+                        and self.uvm_weight_prefetch_mode == "prefetch"
+                    ):
+                        issued_records += 1
+                        issued_bytes += size_bytes
+                        batch_prefetch_items.append(
+                            {
+                                "timestamp": time.time(),
+                                "pid": os.getpid(),
+                                "layer_name": self.layer_name,
+                                "step": self._uvm_moe_trace_step,
+                                "mode": self.uvm_weight_prefetch_mode,
+                                "prefetch_source": (
+                                    self.uvm_weight_prefetch_source
+                                ),
+                                "role": role,
+                                "residency_region_id": region_id,
+                                "residency_allowed": (
+                                    residency_decision.allowed
+                                ),
+                                "residency_would_deny": (
+                                    residency_decision.would_deny
+                                ),
+                                "residency_reason": (
+                                    residency_decision.reason
+                                ),
+                                "residency_victims": list(
+                                    residency_decision.victims
+                                ),
+                                "global_expert_id": global_expert_id,
+                                "local_expert_id": local_expert_id,
+                                "ptr": ptr,
+                                "bytes": size_bytes,
+                                "device": device,
+                                "coordinator_allowed": (
+                                    coordinator_decision.allowed
+                                ),
+                                "coordinator_would_deny": (
+                                    coordinator_decision.would_deny
+                                ),
+                                "coordinator_reason": (
+                                    coordinator_decision.reason
+                                ),
+                                "residency_metadata": residency_metadata,
                             }
                         )
                         continue
@@ -2831,6 +3163,7 @@ class FusedMoE(CustomOp):
                             "layer_name": self.layer_name,
                             "step": self._uvm_moe_trace_step,
                             "mode": self.uvm_weight_prefetch_mode,
+                            "prefetch_source": self.uvm_weight_prefetch_source,
                             "action": action,
                             "role": role,
                             "residency_region_id": region_id,
@@ -2856,6 +3189,51 @@ class FusedMoE(CustomOp):
                         }
                     )
 
+            if batch_prefetch_items:
+                ranges = [
+                    (int(item["ptr"]), int(item["bytes"]))
+                    for item in batch_prefetch_items
+                ]
+                (
+                    batch_successes,
+                    executor_used,
+                    driver_result,
+                ) = batch_prefetch_ranges_to_device_with_executor(
+                    ranges,
+                    device,
+                    executor=self.uvm_weight_executor,
+                )
+                for batch_index, item in enumerate(batch_prefetch_items):
+                    success = batch_index < batch_successes
+                    action = "prefetch_issued" if success else "prefetch_skipped"
+                    if success:
+                        mark_uvm_residency_state(
+                            region_id=str(item["residency_region_id"]),
+                            state="prefetching_gpu",
+                            metadata={
+                                **cast(dict[str, object], item["residency_metadata"]),
+                                "executor": executor_used,
+                            },
+                        )
+                    self._append_uvm_weight_prefetch_trace(
+                        {
+                            **{
+                                key: value
+                                for key, value in item.items()
+                                if key != "residency_metadata"
+                            },
+                            "action": action,
+                            "ptr": f"0x{int(item['ptr']):x}",
+                            "success": success,
+                            "executor": executor_used,
+                            "requested_executor": self.uvm_weight_executor,
+                            "driver_result": driver_result,
+                            "batch_index": batch_index,
+                            "batch_size": len(batch_prefetch_items),
+                            "batch_successes": batch_successes,
+                        }
+                    )
+
             if issued_records or rejected_records:
                 self._append_uvm_weight_prefetch_trace(
                     {
@@ -2864,6 +3242,7 @@ class FusedMoE(CustomOp):
                         "layer_name": self.layer_name,
                         "step": self._uvm_moe_trace_step,
                         "mode": self.uvm_weight_prefetch_mode,
+                        "prefetch_source": self.uvm_weight_prefetch_source,
                         "action": "step_summary",
                         "active_global_experts": [
                             global_expert_id for global_expert_id, _ in expert_pairs

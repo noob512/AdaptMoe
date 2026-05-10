@@ -161,6 +161,114 @@ UVM driver executor
 
 ## 5. 实施阶段
 
+## 5.0 当前实现状态
+
+截至 2026-05-10，当前项目状态如下：
+
+```text
+Phase A: 功能已验证
+Phase B: 已实现独立 plan generator
+Phase C: 已实现 routing-aware plan 的强约束接入，已通过 GPU check
+Phase D: 已实现 router_topk-only runtime prefetch，已通过 GPU check
+Phase E: 已实现 C++ fast path batch executor，已通过 GPU check
+Phase F: 已实现最小 UVM driver batch executor plumbing，待新驱动重编译/重载后验证物理执行
+```
+
+Phase A 已经通过 `run_stage_m_routing_plan_diagnosis.sh` 的 profile 阶段验证。该阶段可以在 pure UVM 下打开 MoE routing trace，并生成：
+
+```text
+profile_pure_uvm/vllm_uvm_moe_routing_trace.jsonl
+```
+
+最近一次诊断实验中，profile 阶段成功收集：
+
+```text
+routing_records = 12576
+layers = 48
+experts_per_layer = 128
+```
+
+Phase B 已经实现为独立脚本：
+
+```text
+workloads/vllm/build_stage_m_hot_cold_weight_plan.py
+```
+
+该脚本读取 routing trace，生成：
+
+```text
+routing_aware_weight_plan.json
+routing_aware_weight_plan_report.md
+```
+
+并输出 Stage H/M 兼容的：
+
+```text
+prefetch_plan
+offload_plan
+metadata.policy = routing_heatmap_v1
+```
+
+Phase C 已接入以下机制：
+
+```text
+VLLM_UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN=1
+--uvm-init-weight-require-routing-plan 1
+```
+
+当 full implementation 使用外部 `--weight-plan-file` 时，Stage M init weight offload 会要求：
+
+```text
+metadata.policy == routing_heatmap_v1
+```
+
+并在 init 阶段执行：
+
+```text
+prefetch_plan experts -> 注册为 GPU / protected / non-evictable
+offload_plan experts  -> 执行 cold init offload
+unknown experts       -> 不默认 offload
+```
+
+新增验证脚本：
+
+```text
+workloads/vllm/run_stage_m_phase_c_check.sh
+```
+
+Phase D 已接入以下机制：
+
+```text
+VLLM_UVM_WEIGHT_PREFETCH_SOURCE=router_topk|plan_intersection
+--uvm-weight-prefetch-source router_topk|plan_intersection
+```
+
+默认和 full implementation 路径使用：
+
+```text
+router_topk
+```
+
+也就是说，runtime prefetch 的候选 expert 只来自当前 MoE router 的 `topk_ids`。`prefetch_plan` 不再作为 runtime broad plan 过滤器，除非显式切换为：
+
+```text
+plan_intersection
+```
+
+同时 full implementation 默认关闭 runtime cold weight offload：
+
+```text
+--uvm-weight-offload-enable 0
+```
+
+Stage M init-time cold offload 仍然保留，运行期只负责即将访问 expert 的 GPU prefetch。
+
+新增验证脚本：
+
+```text
+workloads/vllm/run_stage_m_phase_d_check.sh
+```
+
 ## 5.1 Phase A: Routing-aware profile run
 
 先新增一个 profile 模式，用 pure UVM 或 trace_control 运行小负载，收集 MoE routing trace。
@@ -368,9 +476,123 @@ cudaStreamSynchronize
 
 目标是降低 Python 循环、JSONL 查询和逐 region API 调用成本。
 
+当前已落地的 Phase E 第一版：
+
+```text
+uvm_allocator.cpp:
+  uvm_batch_prefetch(ptrs, sizes, count, device, stream)
+  uvm_batch_advise(ptrs, sizes, count, advice, device)
+
+vllm.device_allocator.uvm:
+  batch_prefetch_ranges_to_device(...)
+  batch_advise_ranges_preferred_location(...)
+  batch_offload_ranges_to_cpu(...)
+
+MoE weight path:
+  Stage M init cold offload 标记 executor=cpp_batch
+  runtime router_topk prefetch 标记 executor=cpp_batch
+```
+
+检验脚本：
+
+```bash
+./run_stage_m_phase_e_check.sh \
+  --log-file log/stage_m_phase_e_check.log
+```
+
 ## 5.6 Phase F: UVM driver executor
 
 当用户态策略准确性验证通过后，再把执行层迁到驱动。
+
+当前已落地的最小 Phase F 版本遵循一个边界：
+
+```text
+用户态仍然决定 hot/cold expert
+用户态仍然提交 ptr/bytes/action list
+驱动层只批量执行 action
+驱动层不做任何超预算自动 offload 或 cold expert 选择
+```
+
+已新增驱动 test ioctl：
+
+```text
+UVM_TEST_PHASE_F_BATCH_EXECUTOR
+```
+
+支持 action：
+
+```text
+UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU
+UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU
+UVM_TEST_PHASE_F_ACTION_ADVISE_CPU
+UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY
+```
+
+驱动内部复用现有 UVM API：
+
+```text
+prefetch_cpu/gpu -> uvm_api_migrate
+advise_cpu       -> uvm_api_set_preferred_location
+query_residency  -> uvm_test_va_residency_info
+```
+
+用户态 C++ shim 新增：
+
+```text
+uvm_driver_batch_prefetch_cpu
+uvm_driver_batch_prefetch_gpu
+uvm_driver_batch_advise_cpu
+uvm_driver_batch_query_residency
+```
+
+Python / MoE 路径新增 executor 选择：
+
+```text
+VLLM_UVM_WEIGHT_EXECUTOR=cpp_batch|driver_batch|auto
+--uvm-weight-executor cpp_batch|driver_batch|auto
+```
+
+语义：
+
+```text
+cpp_batch    使用 Phase E C++ CUDA executor
+driver_batch 强制使用 Phase F driver executor
+auto         优先尝试 driver executor，失败时显式 fallback 到 cpp_batch
+```
+
+trace 中会记录：
+
+```text
+executor=driver_batch
+executor=cpp_batch_fallback
+requested_executor=auto|driver_batch|cpp_batch
+driver_result / driver_advise_result / driver_prefetch_result
+```
+
+注意：
+
+```text
+修改源码不等于当前运行中的 nvidia_uvm.ko 已经具备该 ioctl。
+要真正看到 executor=driver_batch，需要重编译并重载 nvidia_uvm，
+且加载时启用 uvm_enable_builtin_tests=1。
+在未加载新驱动时，auto 模式会记录 cpp_batch_fallback。
+```
+
+验证脚本：
+
+```bash
+./run_stage_m_phase_f_check.sh \
+  --log-file log/stage_m_phase_f_check.log
+```
+
+若要强制确认 driver 物理生效：
+
+```bash
+./run_stage_m_phase_f_check.sh \
+  --log-file log/stage_m_phase_f_check_driver_required.log \
+  --weight-executor driver_batch \
+  --require-driver
+```
 
 接口形式可以是 procfs 或 ioctl。推荐 ioctl，procfs 只用于 debug。
 
@@ -666,4 +888,3 @@ fault 只作为解释指标
 routing-aware semantic policy first
 driver-level executor second
 ```
-

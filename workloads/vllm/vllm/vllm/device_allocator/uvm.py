@@ -163,11 +163,61 @@ def load_uvm_library() -> ctypes.CDLL:
         ctypes.c_void_p,
     ]
 
+    lib.uvm_batch_prefetch.restype = ctypes.c_int
+    lib.uvm_batch_prefetch.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+
     lib.uvm_advise.restype = None
     lib.uvm_advise.argtypes = [
         ctypes.c_void_p,
         ctypes.c_size_t,
         ctypes.c_int,
+        ctypes.c_int,
+    ]
+
+    lib.uvm_batch_advise.restype = ctypes.c_int
+    lib.uvm_batch_advise.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+
+    lib.uvm_driver_batch_prefetch_cpu.restype = ctypes.c_int
+    lib.uvm_driver_batch_prefetch_cpu.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_int,
+    ]
+
+    lib.uvm_driver_batch_prefetch_gpu.restype = ctypes.c_int
+    lib.uvm_driver_batch_prefetch_gpu.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+
+    lib.uvm_driver_batch_advise_cpu.restype = ctypes.c_int
+    lib.uvm_driver_batch_advise_cpu.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+    ]
+
+    lib.uvm_driver_batch_query_residency.restype = ctypes.c_int
+    lib.uvm_driver_batch_query_residency.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
         ctypes.c_int,
     ]
 
@@ -410,6 +460,56 @@ def prefetch_range_to_cpu(ptr: int, size: int) -> bool:
     return prefetch_range_to_device(ptr, size, device=-1)
 
 
+def _prepare_uvm_range_arrays(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+) -> tuple[ctypes.Array[ctypes.c_uint64], ctypes.Array[ctypes.c_size_t], int]:
+    valid_ranges = [
+        (int(ptr), int(size))
+        for ptr, size in ranges
+        if int(ptr) > 0 and int(size) > 0
+    ]
+    count = len(valid_ranges)
+    ptr_array = (ctypes.c_uint64 * count)(
+        *(ptr for ptr, _ in valid_ranges)
+    )
+    size_array = (ctypes.c_size_t * count)(
+        *(size for _, size in valid_ranges)
+    )
+    return ptr_array, size_array, count
+
+
+def batch_prefetch_ranges_to_device(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    device: int = 0,
+) -> int:
+    """Batch prefetch raw UVM ranges to a GPU or CPU device.
+
+    Returns the number of CUDA prefetch calls accepted by the allocator shim.
+    """
+    if not _uvm_enabled or _uvm_lib is None:
+        return 0
+    ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
+    if count <= 0:
+        return 0
+    stream = torch.cuda.current_stream().cuda_stream
+    return int(
+        _uvm_lib.uvm_batch_prefetch(
+            ptr_array,
+            size_array,
+            ctypes.c_size_t(count),
+            ctypes.c_int(device),
+            ctypes.c_void_p(stream),
+        )
+    )
+
+
+def batch_prefetch_ranges_to_cpu(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+) -> int:
+    """Batch prefetch raw UVM ranges to CPU memory."""
+    return batch_prefetch_ranges_to_device(ranges, device=-1)
+
+
 def advise_range_preferred_location(ptr: int, size: int, device: int) -> bool:
     """
     Set cudaMemAdviseSetPreferredLocation for a raw UVM address range.
@@ -429,6 +529,187 @@ def advise_range_preferred_location(ptr: int, size: int, device: int) -> bool:
         ctypes.c_int(device),
     )
     return True
+
+
+def batch_advise_ranges_preferred_location(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    device: int,
+) -> int:
+    """Batch set cudaMemAdviseSetPreferredLocation for raw UVM ranges."""
+    if not _uvm_enabled or _uvm_lib is None:
+        return 0
+    ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
+    if count <= 0:
+        return 0
+    return int(
+        _uvm_lib.uvm_batch_advise(
+            ptr_array,
+            size_array,
+            ctypes.c_size_t(count),
+            ctypes.c_int(2),  # cudaMemAdviseSetPreferredLocation
+            ctypes.c_int(device),
+        )
+    )
+
+
+def driver_batch_prefetch_ranges_to_device(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    device: int = 0,
+    *,
+    async_: bool = False,
+) -> int:
+    """Try Phase F driver batch prefetch. Negative return means unavailable."""
+    if not _uvm_enabled or _uvm_lib is None:
+        return -1
+    ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
+    if count <= 0:
+        return 0
+    if device < 0:
+        return int(
+            _uvm_lib.uvm_driver_batch_prefetch_cpu(
+                ptr_array,
+                size_array,
+                ctypes.c_size_t(count),
+                ctypes.c_int(1 if async_ else 0),
+            )
+        )
+    return int(
+        _uvm_lib.uvm_driver_batch_prefetch_gpu(
+            ptr_array,
+            size_array,
+            ctypes.c_size_t(count),
+            ctypes.c_int(device),
+            ctypes.c_int(1 if async_ else 0),
+        )
+    )
+
+
+def driver_batch_advise_ranges_cpu(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+) -> int:
+    """Try Phase F driver batch CPU preferred-location advise."""
+    if not _uvm_enabled or _uvm_lib is None:
+        return -1
+    ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
+    if count <= 0:
+        return 0
+    return int(
+        _uvm_lib.uvm_driver_batch_advise_cpu(
+            ptr_array,
+            size_array,
+            ctypes.c_size_t(count),
+        )
+    )
+
+
+def driver_batch_query_ranges_residency(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    device: int = 0,
+) -> int:
+    """Try Phase F driver batch residency query. Returns successes or negative."""
+    if not _uvm_enabled or _uvm_lib is None:
+        return -1
+    ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
+    if count <= 0:
+        return 0
+    return int(
+        _uvm_lib.uvm_driver_batch_query_residency(
+            ptr_array,
+            size_array,
+            ctypes.c_size_t(count),
+            ctypes.c_int(device),
+        )
+    )
+
+
+def batch_prefetch_ranges_to_device_with_executor(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    device: int = 0,
+    *,
+    executor: str = "cpp_batch",
+) -> tuple[int, str, int]:
+    """Batch prefetch using cpp_batch, driver_batch, or auto fallback.
+
+    Returns (successes, executor_used, driver_result). driver_result is negative
+    when the Phase F driver path was unavailable or failed.
+    """
+    if executor == "driver_batch":
+        driver_result = driver_batch_prefetch_ranges_to_device(ranges, device)
+        return max(driver_result, 0), "driver_batch", driver_result
+    if executor == "auto":
+        driver_result = driver_batch_prefetch_ranges_to_device(ranges, device)
+        if driver_result >= 0:
+            return driver_result, "driver_batch", driver_result
+        return (
+            batch_prefetch_ranges_to_device(ranges, device),
+            "cpp_batch_fallback",
+            driver_result,
+        )
+    return batch_prefetch_ranges_to_device(ranges, device), "cpp_batch", 0
+
+
+def batch_offload_ranges_to_cpu_with_executor(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    sync: bool = False,
+    executor: str = "cpp_batch",
+) -> tuple[int, str, int, int]:
+    """Batch CPU offload using cpp_batch, driver_batch, or auto fallback.
+
+    Returns (successes, executor_used, driver_advise_result,
+    driver_prefetch_result).
+    """
+    if executor == "driver_batch":
+        advise_result = driver_batch_advise_ranges_cpu(ranges)
+        prefetch_result = driver_batch_prefetch_ranges_to_device(ranges, -1)
+        successes = min(max(advise_result, 0), max(prefetch_result, 0))
+        if successes > 0 and sync:
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                logger.debug("Failed to synchronize after driver CPU offload",
+                             exc_info=True)
+        return successes, "driver_batch", advise_result, prefetch_result
+    if executor == "auto":
+        advise_result = driver_batch_advise_ranges_cpu(ranges)
+        prefetch_result = driver_batch_prefetch_ranges_to_device(ranges, -1)
+        if advise_result >= 0 and prefetch_result >= 0:
+            successes = min(advise_result, prefetch_result)
+            if successes > 0 and sync:
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    logger.debug("Failed to synchronize after driver CPU offload",
+                                 exc_info=True)
+            return successes, "driver_batch", advise_result, prefetch_result
+        return (
+            batch_offload_ranges_to_cpu(ranges, sync=sync),
+            "cpp_batch_fallback",
+            advise_result,
+            prefetch_result,
+        )
+    return batch_offload_ranges_to_cpu(ranges, sync=sync), "cpp_batch", 0, 0
+
+
+def batch_advise_ranges_cpu_with_executor(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    executor: str = "cpp_batch",
+) -> tuple[int, str, int]:
+    """Batch CPU preferred-location advise with optional Phase F driver path."""
+    if executor == "driver_batch":
+        driver_result = driver_batch_advise_ranges_cpu(ranges)
+        return max(driver_result, 0), "driver_batch", driver_result
+    if executor == "auto":
+        driver_result = driver_batch_advise_ranges_cpu(ranges)
+        if driver_result >= 0:
+            return driver_result, "driver_batch", driver_result
+        return (
+            batch_advise_ranges_preferred_location(ranges, -1),
+            "cpp_batch_fallback",
+            driver_result,
+        )
+    return batch_advise_ranges_preferred_location(ranges, -1), "cpp_batch", 0
 
 
 def offload_range_to_cpu(
@@ -452,6 +733,26 @@ def offload_range_to_cpu(
             logger.debug("Failed to synchronize after UVM CPU offload",
                          exc_info=True)
     return success
+
+
+def batch_offload_ranges_to_cpu(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    sync: bool = False,
+) -> int:
+    """Batch set CPU preferred location and prefetch UVM ranges to CPU."""
+    if not ranges:
+        return 0
+    advise_successes = batch_advise_ranges_preferred_location(ranges, -1)
+    prefetch_successes = batch_prefetch_ranges_to_cpu(ranges)
+    successes = min(advise_successes, prefetch_successes)
+    if successes > 0 and sync:
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            logger.debug("Failed to synchronize after batch UVM CPU offload",
+                         exc_info=True)
+    return successes
 
 
 def set_preferred_location(tensor: torch.Tensor, device: int) -> None:

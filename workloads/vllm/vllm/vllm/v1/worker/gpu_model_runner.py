@@ -4863,7 +4863,8 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
-        with uvm_allocation_phase("profile_run"):
+        with uvm_allocation_phase("enabled:warmup"):
+            self.run_uvm_init_time_weight_placement()
             # Profile with multimodal encoder & encoder cache.
             if self.supports_mm_inputs:
                 mm_config = self.model_config.multimodal_config
@@ -4936,9 +4937,10 @@ class GPUModelRunner(
                         self.encoder_cache["tmp"] = dict(enumerate(dummy_encoder_outputs))
 
             # Add `is_profile` here to pre-allocate communication buffers
-            hidden_states, last_hidden_states = self._dummy_run(
-                self.max_num_tokens, is_profile=True
-            )
+            with uvm_enabled_allocation_phase("enabled:dummy_run"):
+                hidden_states, last_hidden_states = self._dummy_run(
+                    self.max_num_tokens, is_profile=True
+                )
             if get_pp_group().is_last_rank:
                 if self.is_pooling_model:
                     output = self._dummy_pooler_run(hidden_states)
@@ -4950,6 +4952,32 @@ class GPUModelRunner(
             del hidden_states, output
             self.encoder_cache.clear()
             gc.collect()
+
+    def run_uvm_init_time_weight_placement(self) -> None:
+        if os.environ.get("VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE", "0") != "1":
+            return
+        if getattr(self, "_uvm_init_weight_placement_done", False):
+            return
+        self._uvm_init_weight_placement_done = True
+        model = self.get_model()
+        issued_modules = 0
+        with uvm_enabled_allocation_phase("enabled:init_weight_offload"):
+            for module in model.modules():
+                init_offload = getattr(module, "run_uvm_init_weight_offload", None)
+                if callable(init_offload):
+                    init_offload()
+                    issued_modules += 1
+        if os.environ.get("VLLM_UVM_INIT_WEIGHT_SYNC", "1") == "1":
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                logger.debug("Failed to synchronize after Stage M weight offload",
+                             exc_info=True)
+        if issued_modules:
+            logger.info(
+                "Stage M init-time weight placement visited %d MoE modules.",
+                issued_modules,
+            )
 
     def capture_model(self) -> int:
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
@@ -5099,26 +5127,28 @@ class GPUModelRunner(
                 # different from the case where `FULL` implies capture
                 # attention while `PIECEWISE` implies no attention.
                 force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                with uvm_allocation_phase("enabled:dummy_run"):
+                    self._dummy_run(
+                        num_tokens,
+                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                        force_attention=force_attention,
+                        uniform_decode=uniform_decode,
+                        allow_microbatching=allow_microbatching,
+                        skip_eplb=True,
+                        remove_lora=False,
+                        activate_lora=activate_lora,
+                    )
+            with uvm_allocation_phase("enabled:dummy_run"):
                 self._dummy_run(
                     num_tokens,
-                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                    force_attention=force_attention,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
                     uniform_decode=uniform_decode,
                     allow_microbatching=allow_microbatching,
                     skip_eplb=True,
                     remove_lora=False,
                     activate_lora=activate_lora,
+                    is_graph_capturing=True,
                 )
-            self._dummy_run(
-                num_tokens,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                uniform_decode=uniform_decode,
-                allow_microbatching=allow_microbatching,
-                skip_eplb=True,
-                remove_lora=False,
-                activate_lora=activate_lora,
-                is_graph_capturing=True,
-            )
         self.maybe_remove_all_loras(self.lora_config)
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:

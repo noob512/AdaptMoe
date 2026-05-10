@@ -536,6 +536,12 @@ class Worker(WorkerBase):
             except Exception as e:
                 # 非阻塞式容错：如果与内核的通信失败，仅仅打印警告，保证模型正常对外提供推理服务。
                 logger.warning("Score bridge KV init update failed: %s", e)
+
+        # Stage M init-time placement must run on the UVM fast path too.
+        # determine_available_memory() skips profile_run() when UVM is enabled,
+        # so this is the first common point after model weights and KV cache
+        # metadata exist but before compile/kernel/sampler warmup touches MoE.
+        self.model_runner.run_uvm_init_time_weight_placement()
     
     def compile_or_warm_up_model(self) -> None:
         # warm up sizes that are not in cudagraph capture sizes,

@@ -72,6 +72,7 @@ static size_t kv_budget_bytes = 0;
 static std::string kv_budget_mode = "trace_only";
 static size_t weight_budget_bytes = 0;
 static std::string weight_budget_mode = "trace_only";
+static int weight_budget_cpu_offload_enable = 0;
 static int pool_registry_enabled = 0;
 static int scratch_pool_enable = 0;
 static size_t scratch_pool_budget_bytes = 1 * 1024 * 1024;
@@ -212,6 +213,15 @@ static std::atomic<size_t> weight_budget_over_allocs{0};
 /// @brief Stage E：weight budget enforce 模式下产生的软拒绝信号次数。
 static std::atomic<size_t> weight_budget_reject_allocs{0};
 
+/// @brief Stage G：weight budget enforce 模式下真实触发 CPU offload 的次数。
+static std::atomic<size_t> weight_budget_cpu_offload_allocs{0};
+
+/// @brief Stage G：weight budget enforce 模式下真实触发 CPU offload 的累计字节数。
+static std::atomic<size_t> weight_budget_cpu_offload_bytes{0};
+
+/// @brief Stage G：weight budget enforce CPU offload 执行失败次数。
+static std::atomic<size_t> weight_budget_cpu_offload_failures{0};
+
 /// @brief Stage E：模型权重分配在 free 阶段成功释放的次数。
 static std::atomic<size_t> weight_free_success_allocs{0};
 
@@ -334,6 +344,9 @@ struct AllocationInfo {
     bool weight_budget_tracked;      ///< Stage E：此分配是否纳入 weights 独立预算遥测。
     bool weight_budget_over_budget;  ///< Stage E：记录分配完成后 weight live bytes 是否超过预算。
     std::string weight_budget_reason;///< Stage E：weight budget 判定原因。
+    bool weight_budget_cpu_offload_issued; ///< Stage G：越界 weight 是否已请求迁到 CPU。
+    bool weight_budget_cpu_offload_success; ///< Stage G：CPU offload CUDA API 是否成功。
+    std::string weight_budget_cpu_offload_error; ///< Stage G：CPU offload 失败原因。
     bool pool_registry_tracked;      ///< Stage F：此分配是否纳入统一 pool registry。
     std::string pool_kind_name;      ///< Stage F：统一 pool 名称，如 kv_cache/weights/runtime_scratch。
     std::string pool_object_state;   ///< Stage F：对象状态，当前仅 telemetry active/freed。
@@ -1020,6 +1033,49 @@ static void release_weight_budget(size_t size) {
             return;
         }
     }
+}
+
+static bool offload_managed_range_to_cpu(void* ptr,
+                                         size_t size,
+                                         cudaStream_t stream,
+                                         const char** error_out) {
+    if (error_out) {
+        *error_out = "none";
+    }
+    if (ptr == nullptr || size == 0) {
+        if (error_out) {
+            *error_out = "empty_range";
+        }
+        return false;
+    }
+
+    cudaError_t advise_err = cudaMemAdvise(
+        ptr,
+        size,
+        cudaMemAdviseSetPreferredLocation,
+        cudaCpuDeviceId
+    );
+    if (advise_err != cudaSuccess) {
+        if (error_out) {
+            *error_out = cudaGetErrorString(advise_err);
+        }
+        return false;
+    }
+
+    cudaError_t prefetch_err = cudaMemPrefetchAsync(
+        ptr,
+        size,
+        cudaCpuDeviceId,
+        stream
+    );
+    if (prefetch_err != cudaSuccess) {
+        if (error_out) {
+            *error_out = cudaGetErrorString(prefetch_err);
+        }
+        return false;
+    }
+
+    return true;
 }
 
 static void update_pool_peak_live(std::atomic<size_t>& peak_counter,
@@ -1850,6 +1906,11 @@ static void init_log_file() {
                 weight_budget_mode.c_str()
             )
         );
+        weight_budget_cpu_offload_enable =
+            read_bool_from_env(
+                "VLLM_UVM_WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE",
+                false
+            ) ? 1 : 0;
         pool_registry_enabled =
             read_bool_from_env("VLLM_UVM_POOL_REGISTRY_ENABLE", false) ? 1 : 0;
         scratch_pool_enable =
@@ -1919,6 +1980,7 @@ static void init_log_file() {
                 "device_direct_target_phases=%s "
                 "kv_budget_bytes=%zu kv_budget_mode=%s "
                 "weight_budget_bytes=%zu weight_budget_mode=%s "
+                "weight_budget_cpu_offload_enable=%d "
                 "pool_registry_enabled=%d "
                 "scratch_pool_enable=%d scratch_pool_budget_bytes=%zu "
                 "scratch_pool_mode=%s scratch_pool_target_phases=%s\n",
@@ -1949,6 +2011,7 @@ static void init_log_file() {
                 kv_budget_mode.c_str(),
                 weight_budget_bytes,
                 weight_budget_mode.c_str(),
+                weight_budget_cpu_offload_enable,
                 pool_registry_enabled,
                 scratch_pool_enable,
                 scratch_pool_budget_bytes,
@@ -2899,6 +2962,9 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     bool weight_budget_tracked = is_weight_allocation(alloc_class);
     bool weight_budget_over_budget = false;
     const char* weight_budget_reason = "not_weight";
+    bool weight_budget_cpu_offload_issued = false;
+    bool weight_budget_cpu_offload_success = false;
+    const char* weight_budget_cpu_offload_error = "not_issued";
 
     if (kv_budget_tracked) {
         record_kv_allocation(static_cast<size_t>(size), &kv_budget_over_budget, &kv_budget_reason);
@@ -3193,6 +3259,28 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         }
     }
 
+    if (weight_budget_tracked &&
+            weight_budget_over_budget &&
+            weight_budget_mode == "enforce" &&
+            weight_budget_cpu_offload_enable != 0 &&
+            ptr != NULL) {
+        weight_budget_cpu_offload_issued = true;
+        weight_budget_cpu_offload_success = offload_managed_range_to_cpu(
+            ptr,
+            static_cast<size_t>(size),
+            stream,
+            &weight_budget_cpu_offload_error
+        );
+        if (weight_budget_cpu_offload_success) {
+            weight_budget_cpu_offload_allocs.fetch_add(1);
+            weight_budget_cpu_offload_bytes.fetch_add(static_cast<size_t>(size));
+            weight_budget_reason = "weight_budget_exceeded_offloaded_cpu";
+        } else {
+            weight_budget_cpu_offload_failures.fetch_add(1);
+            weight_budget_reason = "weight_budget_exceeded_offload_cpu_failed";
+        }
+    }
+
     // 结构化的详细追踪日志，用于后续的离线分析或 eBPF 性能重放关联
     if (size >= trace_min_bytes) {
         trace_allocation_event(
@@ -3250,6 +3338,9 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             weight_budget_tracked,
             weight_budget_over_budget,
             weight_budget_reason,
+            weight_budget_cpu_offload_issued,
+            weight_budget_cpu_offload_success,
+            weight_budget_cpu_offload_error,
             pool_registry_tracked,
             pool_kind_to_string(pool_kind),
             pool_object_state,
@@ -3382,6 +3473,12 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             it->second.weight_budget_tracked = weight_budget_tracked;
             it->second.weight_budget_over_budget = weight_budget_over_budget;
             it->second.weight_budget_reason = weight_budget_reason;
+            it->second.weight_budget_cpu_offload_issued =
+                weight_budget_cpu_offload_issued;
+            it->second.weight_budget_cpu_offload_success =
+                weight_budget_cpu_offload_success;
+            it->second.weight_budget_cpu_offload_error =
+                weight_budget_cpu_offload_error;
             it->second.pool_registry_tracked = pool_registry_tracked;
             it->second.pool_kind_name = pool_kind_to_string(pool_kind);
             it->second.pool_object_state = pool_object_state;
@@ -3766,6 +3863,9 @@ void uvm_reset_all_stats(void) {
     weight_peak_live_bytes.store(0);
     weight_budget_over_allocs.store(0);
     weight_budget_reject_allocs.store(0);
+    weight_budget_cpu_offload_allocs.store(0);
+    weight_budget_cpu_offload_bytes.store(0);
+    weight_budget_cpu_offload_failures.store(0);
     weight_free_success_allocs.store(0);
     pool_registry_tracked_allocs.store(0);
     pool_registry_free_success_allocs.store(0);
@@ -3876,6 +3976,8 @@ void uvm_close_log(void) {
     fprintf(log_file, "  KV free success: %zu\n", kv_free_success_allocs.load());
     fprintf(log_file, "  Weight budget bytes: %zu\n", weight_budget_bytes);
     fprintf(log_file, "  Weight budget mode: %s\n", weight_budget_mode.c_str());
+    fprintf(log_file, "  Weight budget CPU offload enable: %d\n",
+            weight_budget_cpu_offload_enable);
     fprintf(log_file, "  Weight trace allocations: %zu\n", weight_trace_allocs.load());
     fprintf(log_file, "  Weight requested bytes: %zu\n", weight_requested_bytes.load());
     fprintf(log_file, "  Weight live bytes: %zu\n", weight_live_bytes.load());
@@ -3884,6 +3986,12 @@ void uvm_close_log(void) {
             weight_budget_remaining_snapshot(weight_live_bytes.load()));
     fprintf(log_file, "  Weight budget over allocations: %zu\n", weight_budget_over_allocs.load());
     fprintf(log_file, "  Weight budget reject allocations: %zu\n", weight_budget_reject_allocs.load());
+    fprintf(log_file, "  Weight budget CPU offload allocations: %zu\n",
+            weight_budget_cpu_offload_allocs.load());
+    fprintf(log_file, "  Weight budget CPU offload bytes: %zu\n",
+            weight_budget_cpu_offload_bytes.load());
+    fprintf(log_file, "  Weight budget CPU offload failures: %zu\n",
+            weight_budget_cpu_offload_failures.load());
     fprintf(log_file, "  Weight free success: %zu\n", weight_free_success_allocs.load());
     fprintf(log_file, "  Pool registry enabled: %d\n", pool_registry_enabled);
     fprintf(log_file, "  Pool registry tracked allocations: %zu\n",

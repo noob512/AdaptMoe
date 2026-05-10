@@ -3,7 +3,9 @@
 """KV-Cache Utilities."""
 
 import copy
+import json
 import os
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -132,6 +134,196 @@ def _read_residency_kv_sizing_int_env(name: str) -> int:
 
 def _residency_kv_sizing_enabled() -> bool:
     return os.environ.get("VLLM_UVM_RESIDENCY_KV_SIZING_ENABLE", "0") == "1"
+
+
+def _init_kv_sizing_enabled() -> bool:
+    return os.environ.get("VLLM_UVM_INIT_KV_SIZING_ENABLE", "0") == "1"
+
+
+def _read_init_kv_sizing_policy() -> str:
+    policy = os.environ.get(
+        "VLLM_UVM_INIT_KV_SIZING_POLICY", "report_only"
+    ).strip().lower()
+    if policy not in ("report_only", "clamp", "override"):
+        logger.warning(
+            "Ignoring invalid VLLM_UVM_INIT_KV_SIZING_POLICY=%r; "
+            "expected report_only, clamp, or override.",
+            policy,
+        )
+        return "report_only"
+    return policy
+
+
+def _read_init_kv_int_env(name: str) -> int:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return 0
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; expected integer.", name, raw)
+        return 0
+    return max(parsed, 0)
+
+
+def _append_init_kv_sizing_trace(record: dict[str, object]) -> None:
+    trace_file = os.environ.get("VLLM_UVM_INIT_KV_TRACE_FILE", "")
+    if not trace_file:
+        return
+    try:
+        os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
+        with open(trace_file, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError:
+        logger.debug("Failed to write Stage M KV sizing trace", exc_info=True)
+
+
+def _apply_stage_m_init_kv_sizing(
+    kv_cache_configs: list[KVCacheConfig],
+) -> None:
+    """Apply Stage M KV cache sizing before KV tensors are allocated."""
+    if not _init_kv_sizing_enabled() or not kv_cache_configs:
+        return
+
+    policy = _read_init_kv_sizing_policy()
+    max_bytes = _read_init_kv_int_env("VLLM_UVM_INIT_KV_MAX_BYTES")
+    max_blocks = _read_init_kv_int_env("VLLM_UVM_INIT_KV_MAX_BLOCKS")
+    min_blocks = _read_init_kv_int_env("VLLM_UVM_INIT_KV_MIN_BLOCKS")
+
+    candidates: list[int] = []
+    worker_records: list[dict[str, object]] = []
+    for worker_index, kv_cache_config in enumerate(kv_cache_configs):
+        original_num_blocks = kv_cache_config.num_blocks
+        original_bytes = _kv_cache_config_total_bytes(kv_cache_config)
+        bytes_per_block = (
+            original_bytes // original_num_blocks if original_num_blocks > 0 else 0
+        )
+        blocks_by_bytes = (
+            max_bytes // bytes_per_block
+            if max_bytes > 0 and bytes_per_block > 0
+            else 0
+        )
+
+        nonzero_limits = [
+            limit for limit in (blocks_by_bytes, max_blocks) if limit > 0
+        ]
+        budget_blocks = min(nonzero_limits) if nonzero_limits else 0
+        fallback_reason: str | None = None
+        target_num_blocks = original_num_blocks
+
+        if not kv_cache_config.kv_cache_tensors:
+            fallback_reason = "no_kv_tensors"
+        elif original_num_blocks <= 0:
+            fallback_reason = "invalid_original_num_blocks"
+        elif bytes_per_block <= 0:
+            fallback_reason = "invalid_bytes_per_block"
+        elif budget_blocks <= 0:
+            fallback_reason = "budget_too_small"
+        elif policy == "report_only":
+            fallback_reason = "report_only"
+        elif policy == "clamp":
+            target_num_blocks = min(original_num_blocks, budget_blocks)
+        elif policy == "override":
+            target_num_blocks = budget_blocks
+        else:
+            fallback_reason = "invalid_policy"
+
+        if fallback_reason is None and min_blocks > 0:
+            target_num_blocks = max(target_num_blocks, min_blocks)
+        if fallback_reason is None and target_num_blocks <= 0:
+            fallback_reason = "target_blocks_zero"
+            target_num_blocks = original_num_blocks
+
+        candidates.append(target_num_blocks)
+        worker_records.append(
+            {
+                "worker_index": worker_index,
+                "original_num_blocks": original_num_blocks,
+                "original_bytes": original_bytes,
+                "bytes_per_block": bytes_per_block,
+                "blocks_by_bytes": blocks_by_bytes,
+                "budget_blocks": budget_blocks,
+                "candidate_num_blocks": target_num_blocks,
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+    final_num_blocks = min(candidates) if candidates else 0
+    final_num_blocks = max(final_num_blocks, min_blocks) if min_blocks > 0 else final_num_blocks
+
+    for worker_index, kv_cache_config in enumerate(kv_cache_configs):
+        original_num_blocks = int(worker_records[worker_index]["original_num_blocks"])
+        original_bytes = int(worker_records[worker_index]["original_bytes"])
+        fallback_reason = worker_records[worker_index]["fallback_reason"]
+        applied = (
+            fallback_reason is None
+            and final_num_blocks > 0
+            and final_num_blocks != original_num_blocks
+        )
+
+        if applied:
+            original_tensor_sizes = [
+                tensor.size for tensor in kv_cache_config.kv_cache_tensors
+            ]
+            try:
+                for tensor in kv_cache_config.kv_cache_tensors:
+                    assert tensor.size % original_num_blocks == 0
+                    tensor.size = tensor.size // original_num_blocks * final_num_blocks
+                kv_cache_config.num_blocks = final_num_blocks
+            except Exception as exc:
+                logger.warning(
+                    "Stage M KV init sizing failed for worker %d; keeping "
+                    "original num_blocks=%d: %s",
+                    worker_index,
+                    original_num_blocks,
+                    exc,
+                )
+                for tensor, size in zip(
+                    kv_cache_config.kv_cache_tensors,
+                    original_tensor_sizes,
+                ):
+                    tensor.size = size
+                kv_cache_config.num_blocks = original_num_blocks
+                applied = False
+                fallback_reason = "apply_failed"
+
+        final_bytes = _kv_cache_config_total_bytes(kv_cache_config)
+        kv_cache_config.uvm_kv_budget_final_bytes = final_bytes
+        worker_records[worker_index].update(
+            {
+                "final_num_blocks": kv_cache_config.num_blocks,
+                "final_bytes": final_bytes,
+                "applied": applied,
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+        if applied:
+            logger.warning(
+                "Stage M KV init sizing %s: changed worker %d KV blocks "
+                "from %d to %d and KV bytes from %.2f GiB to %.2f GiB.",
+                policy,
+                worker_index,
+                original_num_blocks,
+                kv_cache_config.num_blocks,
+                original_bytes / GiB_bytes,
+                final_bytes / GiB_bytes,
+            )
+
+    _append_init_kv_sizing_trace(
+        {
+            "ts": time.time(),
+            "pid": os.getpid(),
+            "action": "stage_m_init_kv_sizing",
+            "enabled": True,
+            "policy": policy,
+            "max_bytes": max_bytes,
+            "max_blocks": max_blocks,
+            "min_blocks": min_blocks,
+            "final_common_num_blocks": final_num_blocks,
+            "workers": worker_records,
+        }
+    )
 
 
 def _residency_kv_sizing_budget_bytes() -> tuple[int, int, str]:
@@ -1776,6 +1968,8 @@ def get_kv_cache_configs(
             kv_cache_config,
             worker_index=worker_index,
         )
+
+    _apply_stage_m_init_kv_sizing(kv_cache_configs)
 
     for kv_cache_config in kv_cache_configs:
         if len(kv_cache_config.kv_cache_groups) > 0:

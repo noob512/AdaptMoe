@@ -59,10 +59,12 @@ def find_uvm_allocator_library() -> Optional[str]:
     Returns:
         Path to the library if found, None otherwise.
     """
-    # Try to find the library in common locations
-    import vllm
-
-    vllm_path = os.path.dirname(vllm.__file__)
+    # Try to find the library in common locations. In local editable layouts,
+    # ``import vllm`` may resolve as a namespace package with ``__file__`` set
+    # to None, so derive the package path from this module first.
+    vllm_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), os.pardir)
+    )
 
     # Possible library names and locations
     lib_names = [
@@ -71,6 +73,7 @@ def find_uvm_allocator_library() -> Optional[str]:
         "libuvm_allocator.so",
     ]
     search_paths = [
+        os.path.join(vllm_path, "..", "uvm_test"),  # Local development build
         vllm_path,  # Installed location
         os.path.join(vllm_path, ".."),  # Development location
         os.path.dirname(os.path.abspath(__file__)),  # Same directory
@@ -426,6 +429,29 @@ def advise_range_preferred_location(ptr: int, size: int, device: int) -> bool:
         ctypes.c_int(device),
     )
     return True
+
+
+def offload_range_to_cpu(
+    ptr: int,
+    size: int,
+    *,
+    sync: bool = False,
+) -> bool:
+    """Set CPU preferred location and prefetch a raw UVM range to CPU.
+
+    This is the common Stage G/M weight enforcement primitive. It still uses
+    CUDA/UVM as the execution layer, but keeps the semantic decision in vLLM.
+    """
+    advise_success = advise_range_preferred_location(ptr, size, -1)
+    prefetch_success = prefetch_range_to_cpu(ptr, size)
+    success = advise_success and prefetch_success
+    if success and sync:
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            logger.debug("Failed to synchronize after UVM CPU offload",
+                         exc_info=True)
+    return success
 
 
 def set_preferred_location(tensor: torch.Tensor, device: int) -> None:

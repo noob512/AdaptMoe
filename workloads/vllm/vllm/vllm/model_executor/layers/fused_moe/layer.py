@@ -20,7 +20,7 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.device_allocator.uvm import (
     advise_range_preferred_location,
-    prefetch_range_to_cpu,
+    offload_range_to_cpu,
     prefetch_range_to_device,
     uvm_enabled_allocation_phase,
 )
@@ -743,6 +743,61 @@ class FusedMoE(CustomOp):
         self._uvm_weight_offload_plan_loaded = bool(
             self.uvm_weight_offload_plan_keys
         )
+        self.uvm_init_weight_offload_enable = _env_flag_enabled(
+            "VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE",
+            default=False,
+        )
+        self.uvm_init_weight_offload_mode = os.environ.get(
+            "VLLM_UVM_INIT_WEIGHT_OFFLOAD_MODE",
+            "trace_only",
+        )
+        if self.uvm_init_weight_offload_mode not in (
+            "trace_only",
+            "advise_cpu",
+            "prefetch_cpu",
+            "offload_cpu",
+        ):
+            logger.warning(
+                "Unknown VLLM_UVM_INIT_WEIGHT_OFFLOAD_MODE=%s; using trace_only",
+                self.uvm_init_weight_offload_mode,
+            )
+            self.uvm_init_weight_offload_mode = "trace_only"
+        self.uvm_init_weight_offload_plan_file = os.environ.get(
+            "VLLM_UVM_INIT_WEIGHT_PLAN_FILE",
+            self.uvm_weight_offload_plan_file,
+        )
+        self.uvm_init_weight_offload_target_roles = {
+            role.strip()
+            for role in os.environ.get(
+                "VLLM_UVM_INIT_WEIGHT_TARGET_ROLES",
+                ",".join(sorted(self.uvm_weight_offload_target_roles)),
+            ).split(",")
+            if role.strip()
+        }
+        self.uvm_init_weight_offload_max_bytes = _env_int(
+            "VLLM_UVM_INIT_WEIGHT_MAX_BYTES",
+            default=0,
+        )
+        self.uvm_init_weight_offload_max_experts_per_layer = _env_int(
+            "VLLM_UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER",
+            default=0,
+        )
+        self.uvm_init_weight_offload_sync = _env_flag_enabled(
+            "VLLM_UVM_INIT_WEIGHT_SYNC",
+            default=True,
+        )
+        self.uvm_init_weight_offload_trace_file = os.environ.get(
+            "VLLM_UVM_INIT_WEIGHT_TRACE_FILE",
+            self.uvm_weight_prefetch_trace_file,
+        )
+        self.uvm_init_weight_offload_plan_keys = _parse_plan_expert_keys(
+            self.uvm_init_weight_offload_plan_file,
+            "offload_plan",
+        )
+        self._uvm_init_weight_offload_plan_loaded = bool(
+            self.uvm_init_weight_offload_plan_keys
+        )
+        self._uvm_init_weight_offload_done = False
         self.uvm_residency_mode = os.environ.get(
             "VLLM_UVM_RESIDENCY_MODE", "trace_only"
         )
@@ -777,18 +832,19 @@ class FusedMoE(CustomOp):
         )
         self.uvm_residency_weight_victim_action = os.environ.get(
             "VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_ACTION",
-            "advise_cpu",
+            "offload_cpu",
         )
         if self.uvm_residency_weight_victim_action not in (
             "advise_cpu",
             "prefetch_cpu",
+            "offload_cpu",
         ):
             logger.warning(
                 "Unknown VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_ACTION=%s; "
-                "using advise_cpu",
+                "using offload_cpu",
                 self.uvm_residency_weight_victim_action,
             )
-            self.uvm_residency_weight_victim_action = "advise_cpu"
+            self.uvm_residency_weight_victim_action = "offload_cpu"
 
         self.quant_config = quant_config
 
@@ -1995,6 +2051,16 @@ class FusedMoE(CustomOp):
                 "offload_plan",
             )
             self._uvm_weight_offload_plan_loaded = True
+        if (
+            not self._uvm_init_weight_offload_plan_loaded
+            and self.uvm_init_weight_offload_plan_file
+            and os.path.isfile(self.uvm_init_weight_offload_plan_file)
+        ):
+            self.uvm_init_weight_offload_plan_keys = _parse_plan_expert_keys(
+                self.uvm_init_weight_offload_plan_file,
+                "offload_plan",
+            )
+            self._uvm_init_weight_offload_plan_loaded = True
 
     def _uvm_expert_weight_slices(
         self,
@@ -2068,6 +2134,25 @@ class FusedMoE(CustomOp):
             "active_this_step": active_this_step,
             "source_action": source_action,
         }
+
+    def _uvm_weight_region_is_estimated_gpu(self, region_id: str) -> bool:
+        snapshot = get_uvm_residency_region_snapshot(region_id)
+        return bool(snapshot and snapshot.get("estimated_gpu_resident"))
+
+    def _execute_uvm_weight_cpu_offload(
+        self,
+        *,
+        ptr: int,
+        size_bytes: int,
+        mode: str,
+        sync: bool,
+    ) -> bool:
+        if mode == "advise_cpu":
+            return advise_range_preferred_location(ptr, size_bytes, -1)
+        # prefetch_cpu historically meant "move to CPU"; for weight budget
+        # enforcement it must also set preferred location to prevent immediate
+        # drift back into the GPU working set.
+        return offload_range_to_cpu(ptr, size_bytes, sync=sync)
 
     def _register_uvm_residency_cold_weight_candidates(
         self,
@@ -2202,10 +2287,12 @@ class FusedMoE(CustomOp):
                 continue
 
             success = False
-            if self.uvm_residency_weight_victim_action == "prefetch_cpu":
-                success = prefetch_range_to_cpu(ptr, size_bytes)
-            else:
-                success = advise_range_preferred_location(ptr, size_bytes, -1)
+            success = self._execute_uvm_weight_cpu_offload(
+                ptr=ptr,
+                size_bytes=size_bytes,
+                mode=self.uvm_residency_weight_victim_action,
+                sync=self.uvm_residency_weight_sync_offload,
+            )
             if success:
                 issued += 1
                 mark_uvm_residency_state(
@@ -2246,6 +2333,230 @@ class FusedMoE(CustomOp):
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
         except OSError:
             logger.debug("Failed to write UVM weight prefetch trace", exc_info=True)
+
+    def _append_uvm_init_weight_trace(self, record: dict[str, object]) -> None:
+        try:
+            trace_dir = os.path.dirname(self.uvm_init_weight_offload_trace_file)
+            if trace_dir:
+                os.makedirs(trace_dir, exist_ok=True)
+            with open(
+                self.uvm_init_weight_offload_trace_file,
+                "a",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError:
+            logger.debug("Failed to write Stage M weight offload trace", exc_info=True)
+
+    def run_uvm_init_weight_offload(self) -> None:
+        """Stage M: offload planned cold MoE expert weights before warmup."""
+        if not self.uvm_init_weight_offload_enable:
+            return
+        if self._uvm_init_weight_offload_done:
+            return
+        self._uvm_init_weight_offload_done = True
+        self._refresh_uvm_weight_action_plans()
+        if not self.uvm_init_weight_offload_plan_keys:
+            self._append_uvm_init_weight_trace(
+                {
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "layer_name": self.layer_name,
+                    "action": "init_weight_offload_no_plan",
+                    "mode": self.uvm_init_weight_offload_mode,
+                    "plan_file": self.uvm_init_weight_offload_plan_file,
+                }
+            )
+            return
+
+        try:
+            layer_id = self._uvm_layer_id()
+            if layer_id is None:
+                return
+            expert_pairs = self._uvm_plan_local_experts(
+                self.uvm_init_weight_offload_plan_keys
+            )
+            if self.uvm_init_weight_offload_max_experts_per_layer > 0:
+                expert_pairs = expert_pairs[
+                    : self.uvm_init_weight_offload_max_experts_per_layer
+                ]
+
+            attempted_bytes = 0
+            issued_bytes = 0
+            issued_records = 0
+            rejected_records = 0
+            for global_expert_id, local_expert_id in expert_pairs:
+                for role, ptr, size_bytes in self._uvm_expert_weight_slices(
+                    local_expert_id,
+                    self.uvm_init_weight_offload_target_roles,
+                ):
+                    region_id = self._uvm_expert_weight_region_id(
+                        layer_id,
+                        global_expert_id,
+                        role,
+                    )
+                    residency_metadata = self._uvm_expert_weight_residency_metadata(
+                        layer_id=layer_id,
+                        global_expert_id=global_expert_id,
+                        local_expert_id=local_expert_id,
+                        role=role,
+                        ptr=ptr,
+                        size_bytes=size_bytes,
+                        active_this_step=False,
+                        source_action="stage_m_init_offload",
+                    )
+                    existing_region = get_uvm_residency_region_snapshot(region_id)
+                    register_uvm_residency_region(
+                        pool="weights",
+                        region_id=region_id,
+                        ptr=ptr,
+                        bytes=size_bytes,
+                        state=(
+                            str(existing_region.get("state"))
+                            if existing_region is not None
+                            else "gpu"
+                        ),
+                        evictable=True,
+                        active=False,
+                        metadata={
+                            **residency_metadata,
+                            "source": "stage_m",
+                            "stage": "stage_m",
+                        },
+                    )
+
+                    attempted_bytes += size_bytes
+                    if (
+                        self.uvm_init_weight_offload_max_bytes > 0
+                        and issued_bytes + size_bytes
+                        > self.uvm_init_weight_offload_max_bytes
+                    ):
+                        rejected_records += 1
+                        self._append_uvm_init_weight_trace(
+                            {
+                                "timestamp": time.time(),
+                                "pid": os.getpid(),
+                                "layer_name": self.layer_name,
+                                "action": "init_weight_offload_budget_reject",
+                                "mode": self.uvm_init_weight_offload_mode,
+                                "role": role,
+                                "residency_region_id": region_id,
+                                "global_expert_id": global_expert_id,
+                                "local_expert_id": local_expert_id,
+                                "ptr": f"0x{ptr:x}",
+                                "bytes": size_bytes,
+                                "issued_bytes_before": issued_bytes,
+                                "max_bytes": self.uvm_init_weight_offload_max_bytes,
+                            }
+                        )
+                        continue
+
+                    action = "init_weight_offload_trace_candidate"
+                    success = False
+                    if self.uvm_init_weight_offload_mode == "advise_cpu":
+                        success = advise_range_preferred_location(ptr, size_bytes, -1)
+                        action = (
+                            "init_weight_offload_advise_cpu_issued"
+                            if success
+                            else "init_weight_offload_skipped"
+                        )
+                    elif self.uvm_init_weight_offload_mode in (
+                        "prefetch_cpu",
+                        "offload_cpu",
+                    ):
+                        success = offload_range_to_cpu(
+                            ptr,
+                            size_bytes,
+                            sync=self.uvm_init_weight_offload_sync,
+                        )
+                        advise_success = success
+                        prefetch_success = success
+                        if success:
+                            action = (
+                                "init_weight_offload_offload_cpu_issued"
+                                if self.uvm_init_weight_offload_mode
+                                == "offload_cpu"
+                                else "init_weight_offload_prefetch_cpu_issued"
+                            )
+                        else:
+                            action = "init_weight_offload_skipped"
+
+                    if success:
+                        issued_records += 1
+                        issued_bytes += size_bytes
+                        mark_uvm_residency_state(
+                            region_id=region_id,
+                            state=(
+                                "cpu"
+                                if self.uvm_init_weight_offload_sync
+                                else "prefetching_cpu"
+                            ),
+                            metadata={
+                                **residency_metadata,
+                                "source": "stage_m",
+                                "stage": "stage_m",
+                                "sync_offload": self.uvm_init_weight_offload_sync,
+                            },
+                        )
+                    elif self.uvm_init_weight_offload_mode == "trace_only":
+                        issued_records += 1
+                        issued_bytes += size_bytes
+
+                    self._append_uvm_init_weight_trace(
+                        {
+                            "timestamp": time.time(),
+                            "pid": os.getpid(),
+                            "layer_name": self.layer_name,
+                            "action": action,
+                            "mode": self.uvm_init_weight_offload_mode,
+                            "role": role,
+                            "residency_region_id": region_id,
+                            "global_expert_id": global_expert_id,
+                            "local_expert_id": local_expert_id,
+                            "ptr": f"0x{ptr:x}",
+                            "bytes": size_bytes,
+                            "device": -1,
+                            "success": success,
+                            "advise_cpu_success": (
+                                advise_success
+                                if self.uvm_init_weight_offload_mode
+                                in ("prefetch_cpu", "offload_cpu")
+                                else success
+                            ),
+                            "prefetch_cpu_success": (
+                                prefetch_success
+                                if self.uvm_init_weight_offload_mode
+                                in ("prefetch_cpu", "offload_cpu")
+                                else False
+                            ),
+                            "sync_offload": self.uvm_init_weight_offload_sync,
+                        }
+                    )
+
+            if issued_records or rejected_records:
+                self._append_uvm_init_weight_trace(
+                    {
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "layer_name": self.layer_name,
+                        "action": "init_weight_offload_summary",
+                        "mode": self.uvm_init_weight_offload_mode,
+                        "planned_experts": [
+                            global_expert_id
+                            for global_expert_id, _ in expert_pairs
+                        ],
+                        "issued_records": issued_records,
+                        "issued_bytes": issued_bytes,
+                        "attempted_bytes": attempted_bytes,
+                        "budget_reject_records": rejected_records,
+                        "max_bytes": self.uvm_init_weight_offload_max_bytes,
+                        "max_experts_per_layer": (
+                            self.uvm_init_weight_offload_max_experts_per_layer
+                        ),
+                    }
+                )
+        except Exception:
+            logger.debug("Failed to run Stage M init weight offload", exc_info=True)
 
     def _maybe_prefetch_uvm_expert_weights(self, topk_ids: torch.Tensor) -> None:
         if not self.uvm_weight_prefetch_enabled:
@@ -2721,7 +3032,11 @@ class FusedMoE(CustomOp):
                             else "offload_skipped"
                         )
                     elif self.uvm_weight_offload_mode == "prefetch_cpu":
-                        success = prefetch_range_to_cpu(ptr, size_bytes)
+                        success = offload_range_to_cpu(
+                            ptr,
+                            size_bytes,
+                            sync=False,
+                        )
                         action = (
                             "offload_prefetch_cpu_issued"
                             if success
@@ -2730,7 +3045,11 @@ class FusedMoE(CustomOp):
                     if success:
                         mark_uvm_residency_state(
                             region_id=region_id,
-                            state="prefetching_cpu",
+                            state=(
+                                "cpu"
+                                if self.uvm_residency_weight_sync_offload
+                                else "prefetching_cpu"
+                            ),
                             metadata=residency_metadata,
                         )
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2010-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2010-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -71,6 +71,7 @@
  */
 
 #define NV_MEMORY_MULTICAST_FABRIC_PAGE_SIZE_512M                0x20000000
+#define NV_MEMORY_MULTICAST_FABRIC_PAGE_SIZE_256G                0x1000000000000
 
 /*
  * This flag must be passed if the object is created using export packet. Note
@@ -90,7 +91,7 @@ typedef struct NV00FD_ALLOCATION_PARAMETERS {
 
     NV_DECLARE_ALIGNED(NvU64 alignment, 8);
     NV_DECLARE_ALIGNED(NvU64 allocSize, 8);
-    NvU32                pageSize;
+    NV_DECLARE_ALIGNED(NvU64 pageSize, 8);
     NvU32                allocFlags;
     NvU32                numGpus;
     NV_DECLARE_ALIGNED(NvP64 pOsEvent, 8);

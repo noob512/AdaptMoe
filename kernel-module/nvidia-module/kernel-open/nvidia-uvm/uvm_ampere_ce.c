@@ -73,6 +73,7 @@ static NvU32 ce_aperture(uvm_aperture_t aperture)
         return HWCONST(C6B5, SET_SRC_PHYS_MODE, TARGET, LOCAL_FB);
     }
     else {
+        UVM_ASSERT(uvm_aperture_is_peer(aperture));
         return HWCONST(C6B5, SET_SRC_PHYS_MODE, TARGET, PEERMEM) |
                HWVALUE(C6B5, SET_SRC_PHYS_MODE, FLA, 0) |
                HWVALUE(C6B5, SET_SRC_PHYS_MODE, PEER_ID, UVM_APERTURE_PEER_ID(aperture));

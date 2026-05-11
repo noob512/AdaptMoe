@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -24,6 +24,8 @@
 #ifndef __DETECT_SELF_HOSTED_H__
 #define __DETECT_SELF_HOSTED_H__
 
+
+
 static inline int pci_devid_is_self_hosted_hopper(unsigned short devid)
 {
     return devid >= 0x2340 && devid <= 0x237f;       // GH100 Self-Hosted
@@ -32,13 +34,15 @@ static inline int pci_devid_is_self_hosted_hopper(unsigned short devid)
 static inline int pci_devid_is_self_hosted_blackwell(unsigned short devid)
 {
     return (devid >= 0x2940 && devid <= 0x297f)      // GB100 Self-Hosted
-           || (devid >= 0x31c0 && devid <= 0x31ff);  // GB110 Self-Hosted
+           || (devid >= 0x31c0 && devid <= 0x31ff)   // GB110 Self-Hosted
+           || (devid == 0x31a1);                     //
 }
 
 static inline int pci_devid_is_self_hosted(unsigned short devid)
 {
     return pci_devid_is_self_hosted_hopper(devid) ||
-           pci_devid_is_self_hosted_blackwell(devid);
+           pci_devid_is_self_hosted_blackwell(devid)
+           ;
 }
 
 #endif

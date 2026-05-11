@@ -58,6 +58,8 @@ _out/Linux_x86_64/dp_discovery.o: \
  ../common/displayport/inc/../../modeset/timing/nvtiming.h \
  ../common/displayport/inc/dp_crc.h \
  ../common/displayport/inc/dp_messagecodings.h \
+ ../common/displayport/inc/dp_edid.h \
+ ../common/displayport/inc/dp_displayid2.h \
  ../common/displayport/inc/dp_messages.h \
  ../common/displayport/inc/dp_tracing.h \
  ../common/displayport/inc/dp_printf.h
@@ -125,6 +127,8 @@ _out/Linux_x86_64/dp_discovery.o: \
 ../common/displayport/inc/../../modeset/timing/nvtiming.h:
 ../common/displayport/inc/dp_crc.h:
 ../common/displayport/inc/dp_messagecodings.h:
+../common/displayport/inc/dp_edid.h:
+../common/displayport/inc/dp_displayid2.h:
 ../common/displayport/inc/dp_messages.h:
 ../common/displayport/inc/dp_tracing.h:
 ../common/displayport/inc/dp_printf.h:

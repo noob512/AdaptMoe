@@ -33,6 +33,9 @@ NV_STATUS kcrashcatEngineConfigure_IMPL
     KernelCrashCatEngineConfig *pEngConfig
 )
 {
+    // dynamicCast is needed because Object isn't a superclass of KernelCrashCatEngine 
+    Object* pObject = dynamicCast(pKernelCrashCatEng, Object);
+
     if (!pEngConfig->bEnable)
         return NV_OK;
 
@@ -42,9 +45,10 @@ NV_STATUS kcrashcatEngineConfigure_IMPL
     pKernelCrashCatEng->bConfigured = NV_TRUE;
     pKernelCrashCatEng->pName = pEngConfig->pName;
     pKernelCrashCatEng->errorId = pEngConfig->errorId;
-    pKernelCrashCatEng->pGpu = ENG_GET_GPU(pKernelCrashCatEng);
+    pKernelCrashCatEng->pGpu = ENG_GET_GPU(pObject);
     pKernelCrashCatEng->dmemPort = pEngConfig->dmemPort;
-
+    pKernelCrashCatEng->bReportStart = NV_TRUE;
+    
     if (pEngConfig->allocQueueSize > 0)
     {
         const NvU32 CRASHCAT_QUEUE_ALIGNMENT = 1u << 10;
@@ -127,35 +131,51 @@ void kcrashcatEnginePriWrite_IMPL
     kcrashcatEngineRegWrite(pKernelCrashCatEng->pGpu, pKernelCrashCatEng, offset, data);
 }
 
+void kcrashcatEngineResetLog_IMPL(KernelCrashCatEngine *pKernelCrashCatEng)
+{
+    pKernelCrashCatEng->bReportStart = NV_TRUE;
+}
+
 void kcrashcatEngineVprintf_IMPL
 (
     KernelCrashCatEngine *pKernelCrashCatEng,
-    NvBool bReportStart,
+    NvU64 errorId,
     const char *fmt,
     va_list args
 )
-{
-    //
-    // The first line logs an Xid - subsequent crash report lines are printed via
-    // portDbgPrintString() so that they are in dmesg, but don't cause additional Xid "events".
-    //
-    if (bReportStart)
+{    
+    // if this is the start of the report and there is an 
+    // XID associated with this report, send it over to NvLogBuffer
+    // otherwise just print it regularly
+    if (pKernelCrashCatEng->bReportStart)
     {
-        va_list argsCopy;
-
         //
         // Prefix the engine name to the format string.
         // nvErrorLog() appends a newline, so we don't add one here.
         //
-        nvDbgSnprintf(pKernelCrashCatEng->fmtBuffer, MAX_ERROR_STRING, "%s %s",
-                      pKernelCrashCatEng->pName, fmt);
 
-        va_copy(argsCopy, args);
-        nvErrorLog(pKernelCrashCatEng->pGpu,
-                   (XidContext){.xid = pKernelCrashCatEng->errorId},
-                   pKernelCrashCatEng->fmtBuffer,
-                   argsCopy);
-        va_end(argsCopy);
+        if (errorId)
+        {
+            nvDbgSnprintf(pKernelCrashCatEng->fmtBuffer, MAX_ERROR_STRING, "%s %s",
+                pKernelCrashCatEng->pName, fmt);
+
+            nvErrorLog(pKernelCrashCatEng->pGpu,
+                       (XidContext){.xid = errorId},
+                       pKernelCrashCatEng->fmtBuffer,
+                       args);
+        }
+        else 
+        {
+            nvDbgSnprintf(pKernelCrashCatEng->fmtBuffer, MAX_ERROR_STRING, "%s %s\n",
+                pKernelCrashCatEng->pName, fmt);
+            nvDbgVsnprintf(pKernelCrashCatEng->printBuffer, MAX_ERROR_STRING,
+                           pKernelCrashCatEng->fmtBuffer, args);
+
+            portDbgPrintString(pKernelCrashCatEng->printBuffer, MAX_ERROR_STRING);
+        }
+
+        pKernelCrashCatEng->bReportStart = NV_FALSE;
+        return;
     }
 
     // portDbgPrintString/NVLOG_PRINTF don't add a newline, so add one here
@@ -164,14 +184,12 @@ void kcrashcatEngineVprintf_IMPL
     const NvLength newlineSize = 3; // Two chars plus terminating null
     const NvLength newFmtSize = fmtSize + newlineSize - 1; // terminating null is shared
 
-    portMemCopy(pKernelCrashCatEng->fmtBuffer, MAX_ERROR_STRING, fmt, fmtSize);
+    
     portStringCat(pKernelCrashCatEng->fmtBuffer, newFmtSize, newline, newlineSize);
     nvDbgVsnprintf(pKernelCrashCatEng->printBuffer, MAX_ERROR_STRING,
                     pKernelCrashCatEng->fmtBuffer, args);
 
-    // The report-starting line was already printed by nvErrorLog above
-    if (!bReportStart)
-        portDbgPrintString(pKernelCrashCatEng->printBuffer, MAX_ERROR_STRING);
+    portDbgPrintString(pKernelCrashCatEng->printBuffer, MAX_ERROR_STRING);
 }
 
 static NV_INLINE
@@ -281,7 +299,7 @@ void kcrashcatEngineUnmapBufferDescriptor_IMPL
     NvP64 pBuf = memdescGetKernelMapping(pMemDesc);
     NvP64 pPriv = memdescGetKernelMappingPriv(pMemDesc);
 
-    memdescUnmap(pMemDesc, NV_TRUE, 0, pBuf, pPriv);
+    memdescUnmap(pMemDesc, NV_TRUE, pBuf, pPriv);
     memdescSetKernelMapping(pMemDesc, NULL);
     memdescSetKernelMappingPriv(pMemDesc, NULL);
 
@@ -321,4 +339,13 @@ void kcrashcatEngineSyncBufferDescriptor_IMPL
         default:
             NV_ASSERT_CHECKED(0);
     }
+}
+
+void kcrashcatEngineSetErrorId_IMPL
+(
+    KernelCrashCatEngine *pKernelCrashCatEng,
+    NvU32 errorId
+)
+{
+    pKernelCrashCatEng->errorId = errorId;
 }

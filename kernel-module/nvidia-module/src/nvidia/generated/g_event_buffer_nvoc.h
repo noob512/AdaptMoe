@@ -45,21 +45,16 @@ extern "C" {
 
 #include "resserv/resserv.h"
 #include "nvoc/prelude.h"
-#include "rmapi/event.h"
+#include "rmapi/event_api.h"
 #include "rmapi/resource.h"
 #include "ctrl/ctrl90cd.h"
 #include "eventbufferproducer.h"
 
-
 struct Memory;
 
-#ifndef __NVOC_CLASS_Memory_TYPEDEF__
-#define __NVOC_CLASS_Memory_TYPEDEF__
-typedef struct Memory Memory;
-#endif /* __NVOC_CLASS_Memory_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_Memory
-#define __nvoc_class_id_Memory 0x4789f2
+#define __nvoc_class_id_Memory 0x4789f2u
+typedef struct Memory Memory;
 #endif /* __nvoc_class_id_Memory */
 
 
@@ -113,12 +108,6 @@ struct EventBuffer {
     struct RmResourceCommon *__nvoc_pbase_RmResourceCommon;    // rmrescmn super^2
     struct RmResource *__nvoc_pbase_RmResource;    // rmres super
     struct EventBuffer *__nvoc_pbase_EventBuffer;    // eventbuffer
-
-    // Vtable with 4 per-object function pointers
-    NV_STATUS (*__eventbuffertBufferCtrlCmdEnableEvent__)(struct EventBuffer * /*this*/, NV_EVENT_BUFFER_CTRL_CMD_ENABLE_EVENTS_PARAMS *);  // exported (id=0x90cd0101)
-    NV_STATUS (*__eventbuffertBufferCtrlCmdUpdateGet__)(struct EventBuffer * /*this*/, NV_EVENT_BUFFER_CTRL_CMD_UPDATE_GET_PARAMS *);  // exported (id=0x90cd0102)
-    NV_STATUS (*__eventbuffertBufferCtrlCmdFlush__)(struct EventBuffer * /*this*/);  // exported (id=0x90cd0104)
-    NV_STATUS (*__eventbuffertBufferCtrlCmdPostTelemetryEvent__)(struct EventBuffer * /*this*/, NV_EVENT_BUFFER_CTRL_CMD_POST_TELEMETRY_EVENT_PARAMS *);  // exported (id=0x90cd0105)
 
     // Data members
     struct MEMORY_DESCRIPTOR *pHeaderDesc;
@@ -176,13 +165,9 @@ struct NVOC_METADATA__EventBuffer {
     const struct NVOC_VTABLE__EventBuffer vtable;
 };
 
-#ifndef __NVOC_CLASS_EventBuffer_TYPEDEF__
-#define __NVOC_CLASS_EventBuffer_TYPEDEF__
-typedef struct EventBuffer EventBuffer;
-#endif /* __NVOC_CLASS_EventBuffer_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_EventBuffer
-#define __nvoc_class_id_EventBuffer 0x63502b
+#define __nvoc_class_id_EventBuffer 0x63502bu
+typedef struct EventBuffer EventBuffer;
 #endif /* __nvoc_class_id_EventBuffer */
 
 // Casting support
@@ -200,20 +185,60 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_EventBuffer;
 
 NV_STATUS __nvoc_objCreateDynamic_EventBuffer(EventBuffer**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_EventBuffer(EventBuffer**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_EventBuffer(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_EventBuffer((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_EventBuffer(EventBuffer**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_EventBuffer(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_EventBuffer((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
-#define eventbuffertBufferCtrlCmdEnableEvent_FNPTR(pEventBuffer) pEventBuffer->__eventbuffertBufferCtrlCmdEnableEvent__
-#define eventbuffertBufferCtrlCmdEnableEvent(pEventBuffer, pEnableParams) eventbuffertBufferCtrlCmdEnableEvent_DISPATCH(pEventBuffer, pEnableParams)
-#define eventbuffertBufferCtrlCmdUpdateGet_FNPTR(pEventBuffer) pEventBuffer->__eventbuffertBufferCtrlCmdUpdateGet__
-#define eventbuffertBufferCtrlCmdUpdateGet(pEventBuffer, pUpdateParams) eventbuffertBufferCtrlCmdUpdateGet_DISPATCH(pEventBuffer, pUpdateParams)
-#define eventbuffertBufferCtrlCmdFlush_FNPTR(pEventBuffer) pEventBuffer->__eventbuffertBufferCtrlCmdFlush__
-#define eventbuffertBufferCtrlCmdFlush(pEventBuffer) eventbuffertBufferCtrlCmdFlush_DISPATCH(pEventBuffer)
-#define eventbuffertBufferCtrlCmdPostTelemetryEvent_FNPTR(pEventBuffer) pEventBuffer->__eventbuffertBufferCtrlCmdPostTelemetryEvent__
-#define eventbuffertBufferCtrlCmdPostTelemetryEvent(pEventBuffer, pPostTelemetryEvent) eventbuffertBufferCtrlCmdPostTelemetryEvent_DISPATCH(pEventBuffer, pPostTelemetryEvent)
+// Wrapper macros for implementation functions
+NV_STATUS eventbufferConstruct_IMPL(struct EventBuffer *pEventBuffer, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_eventbufferConstruct(pEventBuffer, pCallContext, pParams) eventbufferConstruct_IMPL(pEventBuffer, pCallContext, pParams)
+
+void eventbufferDestruct_IMPL(struct EventBuffer *pEventBuffer);
+#define __nvoc_eventbufferDestruct(pEventBuffer) eventbufferDestruct_IMPL(pEventBuffer)
+
+NV_STATUS eventbuffertBufferCtrlCmdEnableEvent_IMPL(struct EventBuffer *pEventBuffer, NV_EVENT_BUFFER_CTRL_CMD_ENABLE_EVENTS_PARAMS *pEnableParams);
+#ifdef __nvoc_event_buffer_h_disabled
+static inline NV_STATUS eventbuffertBufferCtrlCmdEnableEvent(struct EventBuffer *pEventBuffer, NV_EVENT_BUFFER_CTRL_CMD_ENABLE_EVENTS_PARAMS *pEnableParams) {
+    NV_ASSERT_FAILED_PRECOMP("EventBuffer was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_event_buffer_h_disabled
+#define eventbuffertBufferCtrlCmdEnableEvent(pEventBuffer, pEnableParams) eventbuffertBufferCtrlCmdEnableEvent_IMPL(pEventBuffer, pEnableParams)
+#endif // __nvoc_event_buffer_h_disabled
+
+NV_STATUS eventbuffertBufferCtrlCmdUpdateGet_IMPL(struct EventBuffer *pEventBuffer, NV_EVENT_BUFFER_CTRL_CMD_UPDATE_GET_PARAMS *pUpdateParams);
+#ifdef __nvoc_event_buffer_h_disabled
+static inline NV_STATUS eventbuffertBufferCtrlCmdUpdateGet(struct EventBuffer *pEventBuffer, NV_EVENT_BUFFER_CTRL_CMD_UPDATE_GET_PARAMS *pUpdateParams) {
+    NV_ASSERT_FAILED_PRECOMP("EventBuffer was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_event_buffer_h_disabled
+#define eventbuffertBufferCtrlCmdUpdateGet(pEventBuffer, pUpdateParams) eventbuffertBufferCtrlCmdUpdateGet_IMPL(pEventBuffer, pUpdateParams)
+#endif // __nvoc_event_buffer_h_disabled
+
+NV_STATUS eventbuffertBufferCtrlCmdFlush_IMPL(struct EventBuffer *pEventBuffer);
+#ifdef __nvoc_event_buffer_h_disabled
+static inline NV_STATUS eventbuffertBufferCtrlCmdFlush(struct EventBuffer *pEventBuffer) {
+    NV_ASSERT_FAILED_PRECOMP("EventBuffer was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_event_buffer_h_disabled
+#define eventbuffertBufferCtrlCmdFlush(pEventBuffer) eventbuffertBufferCtrlCmdFlush_IMPL(pEventBuffer)
+#endif // __nvoc_event_buffer_h_disabled
+
+NV_STATUS eventbuffertBufferCtrlCmdPostTelemetryEvent_IMPL(struct EventBuffer *pEventBuffer, NV_EVENT_BUFFER_CTRL_CMD_POST_TELEMETRY_EVENT_PARAMS *pPostTelemetryEvent);
+#ifdef __nvoc_event_buffer_h_disabled
+static inline NV_STATUS eventbuffertBufferCtrlCmdPostTelemetryEvent(struct EventBuffer *pEventBuffer, NV_EVENT_BUFFER_CTRL_CMD_POST_TELEMETRY_EVENT_PARAMS *pPostTelemetryEvent) {
+    NV_ASSERT_FAILED_PRECOMP("EventBuffer was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_event_buffer_h_disabled
+#define eventbuffertBufferCtrlCmdPostTelemetryEvent(pEventBuffer, pPostTelemetryEvent) eventbuffertBufferCtrlCmdPostTelemetryEvent_IMPL(pEventBuffer, pPostTelemetryEvent)
+#endif // __nvoc_event_buffer_h_disabled
+
+
+// Wrapper macros for halified functions
 #define eventbufferAccessCallback_FNPTR(pResource) pResource->__nvoc_base_RmResource.__nvoc_metadata_ptr->vtable.__rmresAccessCallback__
 #define eventbufferAccessCallback(pResource, pInvokingClient, pAllocParams, accessRight) eventbufferAccessCallback_DISPATCH(pResource, pInvokingClient, pAllocParams, accessRight)
 #define eventbufferShareCallback_FNPTR(pResource) pResource->__nvoc_base_RmResource.__nvoc_metadata_ptr->vtable.__rmresShareCallback__
@@ -258,22 +283,6 @@ NV_STATUS __nvoc_objCreate_EventBuffer(EventBuffer**, Dynamic*, NvU32, struct CA
 #define eventbufferAddAdditionalDependants(pClient, pResource, pReference) eventbufferAddAdditionalDependants_DISPATCH(pClient, pResource, pReference)
 
 // Dispatch functions
-static inline NV_STATUS eventbuffertBufferCtrlCmdEnableEvent_DISPATCH(struct EventBuffer *pEventBuffer, NV_EVENT_BUFFER_CTRL_CMD_ENABLE_EVENTS_PARAMS *pEnableParams) {
-    return pEventBuffer->__eventbuffertBufferCtrlCmdEnableEvent__(pEventBuffer, pEnableParams);
-}
-
-static inline NV_STATUS eventbuffertBufferCtrlCmdUpdateGet_DISPATCH(struct EventBuffer *pEventBuffer, NV_EVENT_BUFFER_CTRL_CMD_UPDATE_GET_PARAMS *pUpdateParams) {
-    return pEventBuffer->__eventbuffertBufferCtrlCmdUpdateGet__(pEventBuffer, pUpdateParams);
-}
-
-static inline NV_STATUS eventbuffertBufferCtrlCmdFlush_DISPATCH(struct EventBuffer *pEventBuffer) {
-    return pEventBuffer->__eventbuffertBufferCtrlCmdFlush__(pEventBuffer);
-}
-
-static inline NV_STATUS eventbuffertBufferCtrlCmdPostTelemetryEvent_DISPATCH(struct EventBuffer *pEventBuffer, NV_EVENT_BUFFER_CTRL_CMD_POST_TELEMETRY_EVENT_PARAMS *pPostTelemetryEvent) {
-    return pEventBuffer->__eventbuffertBufferCtrlCmdPostTelemetryEvent__(pEventBuffer, pPostTelemetryEvent);
-}
-
 static inline NvBool eventbufferAccessCallback_DISPATCH(struct EventBuffer *pResource, struct RsClient *pInvokingClient, void *pAllocParams, RsAccessRight accessRight) {
     return pResource->__nvoc_metadata_ptr->vtable.__eventbufferAccessCallback__(pResource, pInvokingClient, pAllocParams, accessRight);
 }
@@ -358,6 +367,8 @@ static inline void eventbufferAddAdditionalDependants_DISPATCH(struct RsClient *
     pResource->__nvoc_metadata_ptr->vtable.__eventbufferAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
 NV_STATUS eventbuffertBufferCtrlCmdEnableEvent_IMPL(struct EventBuffer *pEventBuffer, NV_EVENT_BUFFER_CTRL_CMD_ENABLE_EVENTS_PARAMS *pEnableParams);
 
 NV_STATUS eventbuffertBufferCtrlCmdUpdateGet_IMPL(struct EventBuffer *pEventBuffer, NV_EVENT_BUFFER_CTRL_CMD_UPDATE_GET_PARAMS *pUpdateParams);
@@ -366,16 +377,16 @@ NV_STATUS eventbuffertBufferCtrlCmdFlush_IMPL(struct EventBuffer *pEventBuffer);
 
 NV_STATUS eventbuffertBufferCtrlCmdPostTelemetryEvent_IMPL(struct EventBuffer *pEventBuffer, NV_EVENT_BUFFER_CTRL_CMD_POST_TELEMETRY_EVENT_PARAMS *pPostTelemetryEvent);
 
-NV_STATUS eventbufferConstruct_IMPL(struct EventBuffer *arg_pEventBuffer, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_eventbufferConstruct(arg_pEventBuffer, arg_pCallContext, arg_pParams) eventbufferConstruct_IMPL(arg_pEventBuffer, arg_pCallContext, arg_pParams)
-void eventbufferDestruct_IMPL(struct EventBuffer *pEventBuffer);
-
-#define __nvoc_eventbufferDestruct(pEventBuffer) eventbufferDestruct_IMPL(pEventBuffer)
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 
 NV_STATUS eventBufferAdd(struct EventBuffer *pEventBuffer, void* pEventData, NvU32 recordType, NvBool* bNotify, NvP64 *pHandle);
+
+NvBool eventBufferIsEmpty(struct EventBuffer *pEventBuffer);
 
 #endif
 

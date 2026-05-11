@@ -289,14 +289,6 @@ NvBool nv3dInitChannel(Nv3dChannelPtr p3dChannel)
         DRF_DEF(9097, _INVALIDATE_SHADER_CACHES, _INSTRUCTION, _TRUE) |
         DRF_DEF(9097, _INVALIDATE_SHADER_CACHES, _CONSTANT, _TRUE));
 
-    if (pCaps->hasProgramRegion) {
-        gpuAddress = nv3dGetProgramGpuAddress(p3dChannel);
-
-        nvAssert((gpuAddress & 255) == 0);
-        nvPushMethod(p, NVA06F_SUBCHANNEL_3D, NV9097_SET_PROGRAM_REGION_A, 2);
-        nvPushSetMethodDataU64(p, gpuAddress);
-    }
-
     // Initialize the texture header and sampler area.
     //
     // To update these things, we upload data through the pushbuffer.  The
@@ -383,18 +375,6 @@ void nv3dLoadProgram(
     }
 
     p3dChannel->currentProgramIndex[pgm->stage] = programIndex;
-}
-
-void _nv3dSetProgramOffsetFermi(
-    Nv3dChannelRec *p3dChannel,
-    NvU32 stage,
-    NvU32 offset)
-{
-    NvPushChannelPtr p = p3dChannel->pPushChannel;
-
-    nvPushMethod(p, NVA06F_SUBCHANNEL_3D,
-        NV9097_SET_PIPELINE_PROGRAM(stage), 1);
-    nvPushSetMethodData(p, offset);
 }
 
 void _nv3dInvalidateTexturesFermi(
@@ -542,16 +522,4 @@ void nv3dSetBlend(
     nvPushImmedVal(p, NVA06F_SUBCHANNEL_3D, NV9097_SET_BLEND(0),
         NV3D_C(9097, SET_BLEND, ENABLE, TRUE));
 
-}
-
-void _nv3dSetVertexStreamEndFermi(
-    Nv3dChannelPtr p3dChannel,
-    enum Nv3dVertexAttributeStreamType stream,
-    const Nv3dVertexAttributeStreamRec *pStream)
-{
-    NvPushChannelPtr p = p3dChannel->pPushChannel;
-
-    nvPushMethod(p, NVA06F_SUBCHANNEL_3D,
-        NV9097_SET_VERTEX_STREAM_LIMIT_A_A(stream), 2);
-    nvPushSetMethodDataU64(p, pStream->end - 1);
 }

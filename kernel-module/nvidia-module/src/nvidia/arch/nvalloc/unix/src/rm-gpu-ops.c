@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -603,6 +603,43 @@ NV_STATUS  NV_API_CALL rm_gpu_ops_toggle_prefetch_faults(nvidia_stack_t *sp,
     void *fp;
     NV_ENTER_RM_RUNTIME(sp,fp);
     rmStatus = nvGpuOpsTogglePrefetchFaults(pFaultInfo, bEnable);
+    NV_EXIT_RM_RUNTIME(sp,fp);
+    return rmStatus;
+}
+
+NV_STATUS  NV_API_CALL  rm_gpu_ops_access_bits_buffer_alloc(nvidia_stack_t *sp,
+                                                            gpuDeviceHandle device,
+                                                            gpuAccessBitsBufferAlloc *accessBitsInfo)
+{
+    NV_STATUS rmStatus;
+    void* fp;
+    NV_ENTER_RM_RUNTIME(sp,fp);
+    rmStatus = nvGpuOpsAccessBitsBufAlloc(device, accessBitsInfo);
+    NV_EXIT_RM_RUNTIME(sp,fp);
+    return rmStatus;
+}
+
+NV_STATUS  NV_API_CALL  rm_gpu_ops_access_bits_buffer_free(nvidia_stack_t *sp,
+                                                           gpuDeviceHandle device,
+                                                           gpuAccessBitsBufferAlloc *accessBitsInfo)
+{
+    NV_STATUS rmStatus;
+    void* fp;
+    NV_ENTER_RM_RUNTIME(sp,fp);
+    rmStatus = nvGpuOpsAccessBitsBufFree(device, accessBitsInfo);
+    NV_EXIT_RM_RUNTIME(sp,fp);
+    return rmStatus;
+}
+
+NV_STATUS  NV_API_CALL  rm_gpu_ops_access_bits_dump(nvidia_stack_t *sp,
+                                                    gpuDeviceHandle device,
+                                                    gpuAccessBitsBufferAlloc *accessBitsInfo,
+                                                    UVM_ACCESS_BITS_DUMP_MODE mode)
+{
+    NV_STATUS rmStatus;
+    void *fp;
+    NV_ENTER_RM_RUNTIME(sp,fp);
+    rmStatus = nvGpuOpsAccessBitsDump(device, accessBitsInfo, mode);
     NV_EXIT_RM_RUNTIME(sp,fp);
     return rmStatus;
 }

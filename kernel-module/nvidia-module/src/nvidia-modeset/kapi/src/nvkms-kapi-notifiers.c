@@ -200,8 +200,7 @@ failed:
 
 #define NVKMS_KAPI_NOTIFIERS_SURFACE_SIZE 0x1000
 
-NvBool nvKmsKapiAllocateNotifiers(struct NvKmsKapiDevice *device,
-                                  NvBool inVideoMemory)
+NvBool nvKmsKapiAllocateNotifiers(struct NvKmsKapiDevice *device)
 {
     ct_assert((NVKMS_KAPI_MAX_NOTIFIERS * NVKMS_KAPI_NOTIFIER_SIZE) <=
               NVKMS_KAPI_NOTIFIERS_SURFACE_SIZE);
@@ -215,7 +214,7 @@ NvBool nvKmsKapiAllocateNotifiers(struct NvKmsKapiDevice *device,
     if (!AllocateNisoSurface(device,
                              &device->notifier,
                              NVKMS_KAPI_NOTIFIERS_SURFACE_SIZE,
-                             inVideoMemory)) {
+                             NV_FALSE /* inVideoMemory */)) {
         return NV_FALSE;
     }
 

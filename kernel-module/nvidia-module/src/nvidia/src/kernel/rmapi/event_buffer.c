@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2017-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2017-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -195,7 +195,8 @@ eventbufferConstruct_IMPL
         NvU32 flags = 0;
 
         // Allow the mapping to succeed when HCC is enabled in devtools mode
-        if (kbusIsBarAccessBlocked(GPU_GET_KERNEL_BUS(pGpu)) &&
+        KernelBus *pKernelBus = GPU_GET_KERNEL_BUS(pGpu);
+        if (pKernelBus != NULL && kbusIsBarAccessBlocked(pKernelBus) &&
             gpuIsCCDevToolsModeEnabled(pGpu))
         {
             flags = FLD_SET_DRF(OS33, _FLAGS, _ALLOW_MAPPING_ON_HCC, _YES, flags);
@@ -553,7 +554,7 @@ _allocAndMapMemory
         pGpu = GPU_RES_GET_GPU(pSubdevice);
 
     NV_ASSERT_OR_RETURN(pSubdevice != NULL && pGpu != NULL, NV_ERR_INVALID_STATE);
- 
+
     status = memdescCreate(ppMemDesc, pGpu, size, 0, NV_MEMORY_CONTIGUOUS,
             ADDR_SYSMEM, NV_MEMORY_WRITECOMBINED, MEMDESC_FLAGS_CPU_ONLY);
     if (status != NV_OK)
@@ -603,10 +604,10 @@ _unmapAndFreeMemory
         return;
 
     if (userAddr)
-        memdescUnmap(pMemDesc, bKernel, osGetCurrentProcess(), userAddr, userPriv);
+        memdescUnmap(pMemDesc, bKernel, userAddr, userPriv);
 
     if (kernelAddr)
-        memdescUnmap(pMemDesc, NV_TRUE, osGetCurrentProcess(), kernelAddr, kernelPriv);
+        memdescUnmap(pMemDesc, NV_TRUE, kernelAddr, kernelPriv);
 
     memdescFree(pMemDesc);
     memdescDestroy(pMemDesc);
@@ -749,4 +750,9 @@ eventBufferAdd(EventBuffer* pEventBuffer, void *pEventData, NvU32 recordType, Nv
                 (eventBufferIsNotifyThresholdMet(&pEventBuffer->producerInfo));
     *pHandle  = pEventBuffer->producerInfo.notificationHandle;
     return NV_OK;
+}
+
+NvBool eventBufferIsEmpty(EventBuffer *pEventBuffer)
+{
+    return pEventBuffer->producerInfo.recordBuffer.pHeader->recordCount == 0;
 }

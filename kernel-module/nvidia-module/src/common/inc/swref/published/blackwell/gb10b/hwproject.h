@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -24,6 +24,7 @@
 #ifndef __gb10b_hwproject_h__
 #define __gb10b_hwproject_h__
 
+#define NV_XAL_BASE_ADDRESS                    1110016
 #define NV_CHIP_EXTENDED_SYSTEM_PHYSICAL_ADDRESS_BITS              41
 
 #endif // __gb10b_hwproject_h__

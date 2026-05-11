@@ -48,42 +48,27 @@ extern "C" {
 
 #include "rmapi/resource.h"
 
-
 struct OBJGPU;
 
-#ifndef __NVOC_CLASS_OBJGPU_TYPEDEF__
-#define __NVOC_CLASS_OBJGPU_TYPEDEF__
-typedef struct OBJGPU OBJGPU;
-#endif /* __NVOC_CLASS_OBJGPU_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_OBJGPU
-#define __nvoc_class_id_OBJGPU 0x7ef3cb
+#define __nvoc_class_id_OBJGPU 0x7ef3cbu
+typedef struct OBJGPU OBJGPU;
 #endif /* __nvoc_class_id_OBJGPU */
-
 
 
 struct Device;
 
-#ifndef __NVOC_CLASS_Device_TYPEDEF__
-#define __NVOC_CLASS_Device_TYPEDEF__
-typedef struct Device Device;
-#endif /* __NVOC_CLASS_Device_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_Device
-#define __nvoc_class_id_Device 0xe0ac20
+#define __nvoc_class_id_Device 0xe0ac20u
+typedef struct Device Device;
 #endif /* __nvoc_class_id_Device */
-
 
 
 struct Subdevice;
 
-#ifndef __NVOC_CLASS_Subdevice_TYPEDEF__
-#define __NVOC_CLASS_Subdevice_TYPEDEF__
-typedef struct Subdevice Subdevice;
-#endif /* __NVOC_CLASS_Subdevice_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_Subdevice
-#define __nvoc_class_id_Subdevice 0x4b01b3
+#define __nvoc_class_id_Subdevice 0x4b01b3u
+typedef struct Subdevice Subdevice;
 #endif /* __nvoc_class_id_Subdevice */
 
 
@@ -178,13 +163,9 @@ struct NVOC_METADATA__GpuResource {
     const struct NVOC_VTABLE__GpuResource vtable;
 };
 
-#ifndef __NVOC_CLASS_GpuResource_TYPEDEF__
-#define __NVOC_CLASS_GpuResource_TYPEDEF__
-typedef struct GpuResource GpuResource;
-#endif /* __NVOC_CLASS_GpuResource_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_GpuResource
-#define __nvoc_class_id_GpuResource 0x5d5d9f
+#define __nvoc_class_id_GpuResource 0x5d5d9fu
+typedef struct GpuResource GpuResource;
 #endif /* __nvoc_class_id_GpuResource */
 
 // Casting support
@@ -202,12 +183,51 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_GpuResource;
 
 NV_STATUS __nvoc_objCreateDynamic_GpuResource(GpuResource**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_GpuResource(GpuResource**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_GpuResource(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_GpuResource((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_GpuResource(GpuResource**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_GpuResource(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_GpuResource((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS gpuresConstruct_IMPL(struct GpuResource *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_gpuresConstruct(pGpuResource, pCallContext, pParams) gpuresConstruct_IMPL(pGpuResource, pCallContext, pParams)
+
+NV_STATUS gpuresCopyConstruct_IMPL(struct GpuResource *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#ifdef __nvoc_gpu_resource_h_disabled
+static inline NV_STATUS gpuresCopyConstruct(struct GpuResource *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("GpuResource was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_gpu_resource_h_disabled
+#define gpuresCopyConstruct(pGpuResource, pCallContext, pParams) gpuresCopyConstruct_IMPL(pGpuResource, pCallContext, pParams)
+#endif // __nvoc_gpu_resource_h_disabled
+
+void gpuresSetGpu_IMPL(struct GpuResource *pGpuResource, struct OBJGPU *pGpu, NvBool bBcResource);
+#ifdef __nvoc_gpu_resource_h_disabled
+static inline void gpuresSetGpu(struct GpuResource *pGpuResource, struct OBJGPU *pGpu, NvBool bBcResource) {
+    NV_ASSERT_FAILED_PRECOMP("GpuResource was disabled!");
+}
+#else // __nvoc_gpu_resource_h_disabled
+#define gpuresSetGpu(pGpuResource, pGpu, bBcResource) gpuresSetGpu_IMPL(pGpuResource, pGpu, bBcResource)
+#endif // __nvoc_gpu_resource_h_disabled
+
+void gpuresControlSetup_IMPL(struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams, struct GpuResource *pGpuResource);
+#ifdef __nvoc_gpu_resource_h_disabled
+static inline void gpuresControlSetup(struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams, struct GpuResource *pGpuResource) {
+    NV_ASSERT_FAILED_PRECOMP("GpuResource was disabled!");
+}
+#else // __nvoc_gpu_resource_h_disabled
+#define gpuresControlSetup(pParams, pGpuResource) gpuresControlSetup_IMPL(pParams, pGpuResource)
+#endif // __nvoc_gpu_resource_h_disabled
+
+NV_STATUS gpuresGetByHandle_IMPL(struct RsClient *pClient, NvHandle hResource, struct GpuResource **ppGpuResource);
+#define gpuresGetByHandle(pClient, hResource, ppGpuResource) gpuresGetByHandle_IMPL(pClient, hResource, ppGpuResource)
+
+NV_STATUS gpuresGetByDeviceOrSubdeviceHandle_IMPL(struct RsClient *pClient, NvHandle hResource, struct GpuResource **ppGpuResource);
+#define gpuresGetByDeviceOrSubdeviceHandle(pClient, hResource, ppGpuResource) gpuresGetByDeviceOrSubdeviceHandle_IMPL(pClient, hResource, ppGpuResource)
+
+
+// Wrapper macros for halified functions
 #define gpuresControl_FNPTR(pGpuResource) pGpuResource->__nvoc_metadata_ptr->vtable.__gpuresControl__
 #define gpuresControl(pGpuResource, pCallContext, pParams) gpuresControl_DISPATCH(pGpuResource, pCallContext, pParams)
 #define gpuresMap_FNPTR(pGpuResource) pGpuResource->__nvoc_metadata_ptr->vtable.__gpuresMap__
@@ -360,6 +380,7 @@ static inline void gpuresAddAdditionalDependants_DISPATCH(struct RsClient *pClie
     pResource->__nvoc_metadata_ptr->vtable.__gpuresAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
+// Virtual method declarations and/or inline definitions
 NV_STATUS gpuresControl_IMPL(struct GpuResource *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams);
 
 NV_STATUS gpuresMap_IMPL(struct GpuResource *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_CPU_MAP_PARAMS *pParams, struct RsCpuMapping *pCpuMapping);
@@ -376,46 +397,11 @@ NV_STATUS gpuresInternalControlForward_IMPL(struct GpuResource *pGpuResource, Nv
 
 NvHandle gpuresGetInternalObjectHandle_IMPL(struct GpuResource *pGpuResource);
 
-NV_STATUS gpuresConstruct_IMPL(struct GpuResource *arg_pGpuResource, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_gpuresConstruct(arg_pGpuResource, arg_pCallContext, arg_pParams) gpuresConstruct_IMPL(arg_pGpuResource, arg_pCallContext, arg_pParams)
-NV_STATUS gpuresCopyConstruct_IMPL(struct GpuResource *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
-
-#ifdef __nvoc_gpu_resource_h_disabled
-static inline NV_STATUS gpuresCopyConstruct(struct GpuResource *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {
-    NV_ASSERT_FAILED_PRECOMP("GpuResource was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_gpu_resource_h_disabled
-#define gpuresCopyConstruct(pGpuResource, pCallContext, pParams) gpuresCopyConstruct_IMPL(pGpuResource, pCallContext, pParams)
-#endif //__nvoc_gpu_resource_h_disabled
-
-void gpuresSetGpu_IMPL(struct GpuResource *pGpuResource, struct OBJGPU *pGpu, NvBool bBcResource);
-
-#ifdef __nvoc_gpu_resource_h_disabled
-static inline void gpuresSetGpu(struct GpuResource *pGpuResource, struct OBJGPU *pGpu, NvBool bBcResource) {
-    NV_ASSERT_FAILED_PRECOMP("GpuResource was disabled!");
-}
-#else //__nvoc_gpu_resource_h_disabled
-#define gpuresSetGpu(pGpuResource, pGpu, bBcResource) gpuresSetGpu_IMPL(pGpuResource, pGpu, bBcResource)
-#endif //__nvoc_gpu_resource_h_disabled
-
-void gpuresControlSetup_IMPL(struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams, struct GpuResource *pGpuResource);
-
-#ifdef __nvoc_gpu_resource_h_disabled
-static inline void gpuresControlSetup(struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams, struct GpuResource *pGpuResource) {
-    NV_ASSERT_FAILED_PRECOMP("GpuResource was disabled!");
-}
-#else //__nvoc_gpu_resource_h_disabled
-#define gpuresControlSetup(pParams, pGpuResource) gpuresControlSetup_IMPL(pParams, pGpuResource)
-#endif //__nvoc_gpu_resource_h_disabled
-
-NV_STATUS gpuresGetByHandle_IMPL(struct RsClient *pClient, NvHandle hResource, struct GpuResource **ppGpuResource);
-
-#define gpuresGetByHandle(pClient, hResource, ppGpuResource) gpuresGetByHandle_IMPL(pClient, hResource, ppGpuResource)
-NV_STATUS gpuresGetByDeviceOrSubdeviceHandle_IMPL(struct RsClient *pClient, NvHandle hResource, struct GpuResource **ppGpuResource);
-
-#define gpuresGetByDeviceOrSubdeviceHandle(pClient, hResource, ppGpuResource) gpuresGetByDeviceOrSubdeviceHandle_IMPL(pClient, hResource, ppGpuResource)
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

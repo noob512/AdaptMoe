@@ -31,14 +31,12 @@
 NvBool nvCheckLayerPermissions(
     const struct NvKmsPerOpenDev *pOpenDev,
     const NVDevEvoRec *pDevEvo,
-    const NvU32 sd,
     const NvU32 apiHead,
     const NvU8 changedLayersMask);
 
 NvBool nvCheckFlipPermissions(
     const struct NvKmsPerOpenDev *pOpenDev,
     const NVDevEvoRec *pDevEvo,
-    const NvU32 sd,
     const NvU32 apiHead,
     const struct NvKmsFlipCommonParams *pParams);
 
@@ -102,7 +100,8 @@ void nvIdleLayerChannels(NVDevEvoRec *pDevEvo,
     NvU32 layerMaskPerSdApiHead[NVKMS_MAX_SUBDEVICES][NVKMS_MAX_HEADS_PER_DISP]);
 
 void nvEvoClearSurfaceUsage(NVDevEvoRec *pDevEvo,
-                            NVSurfaceEvoPtr pSurfaceEvo);
+                            NVSurfaceEvoPtr pSurfaceEvo,
+                            const NvBool skipSync);
 
 NvBool nvIdleBaseChannelOneApiHead(NVDispEvoRec *pDispEvo, NvU32 apiHead,
                                    NvBool *pStoppedBase);

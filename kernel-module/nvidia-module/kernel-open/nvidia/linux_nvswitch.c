@@ -119,11 +119,12 @@ static struct pci_device_id nvswitch_pci_table[] =
 
 static struct pci_driver nvswitch_pci_driver =
 {
-    .name           = NVSWITCH_DRIVER_NAME,
-    .id_table       = nvswitch_pci_table,
-    .probe          = nvswitch_probe,
-    .remove         = nvswitch_remove,
-    .shutdown       = nvswitch_remove
+    .name              = NVSWITCH_DRIVER_NAME,
+    .id_table          = nvswitch_pci_table,
+    .probe             = nvswitch_probe,
+    .remove            = nvswitch_remove,
+    .shutdown          = nvswitch_remove,
+    .driver.probe_type = PROBE_FORCE_SYNCHRONOUS,
 };
 
 //

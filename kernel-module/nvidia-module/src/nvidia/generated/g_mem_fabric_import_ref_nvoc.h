@@ -97,9 +97,6 @@ struct MemoryFabricImportedRef {
     struct RmResource *__nvoc_pbase_RmResource;    // rmres super
     struct MemoryFabricImportedRef *__nvoc_pbase_MemoryFabricImportedRef;    // memoryfabricimportedref
 
-    // Vtable with 1 per-object function pointer
-    NV_STATUS (*__memoryfabricimportedrefCtrlValidate__)(struct MemoryFabricImportedRef * /*this*/, NV00FB_CTRL_VALIDATE_PARAMS *);  // exported (id=0xfb0101)
-
     // Data members
     NvU64 PRIVATE_FIELD(numUpdatedPfns);
     MEMORY_DESCRIPTOR *PRIVATE_FIELD(pTempMemDesc);
@@ -139,13 +136,9 @@ struct NVOC_METADATA__MemoryFabricImportedRef {
     const struct NVOC_VTABLE__MemoryFabricImportedRef vtable;
 };
 
-#ifndef __NVOC_CLASS_MemoryFabricImportedRef_TYPEDEF__
-#define __NVOC_CLASS_MemoryFabricImportedRef_TYPEDEF__
-typedef struct MemoryFabricImportedRef MemoryFabricImportedRef;
-#endif /* __NVOC_CLASS_MemoryFabricImportedRef_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_MemoryFabricImportedRef
-#define __nvoc_class_id_MemoryFabricImportedRef 0x189bad
+#define __nvoc_class_id_MemoryFabricImportedRef 0x189badu
+typedef struct MemoryFabricImportedRef MemoryFabricImportedRef;
 #endif /* __nvoc_class_id_MemoryFabricImportedRef */
 
 // Casting support
@@ -163,16 +156,32 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_MemoryFabricImportedRef;
 
 NV_STATUS __nvoc_objCreateDynamic_MemoryFabricImportedRef(MemoryFabricImportedRef**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_MemoryFabricImportedRef(MemoryFabricImportedRef**, Dynamic*, NvU32, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_MemoryFabricImportedRef(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_MemoryFabricImportedRef((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_MemoryFabricImportedRef(MemoryFabricImportedRef**, Dynamic*, NvU32, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_MemoryFabricImportedRef(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_MemoryFabricImportedRef((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS memoryfabricimportedrefConstruct_IMPL(struct MemoryFabricImportedRef *pMemoryFabricImportedRef, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_memoryfabricimportedrefConstruct(pMemoryFabricImportedRef, pCallContext, pParams) memoryfabricimportedrefConstruct_IMPL(pMemoryFabricImportedRef, pCallContext, pParams)
+
+void memoryfabricimportedrefDestruct_IMPL(struct MemoryFabricImportedRef *pMemoryFabricImportedRef);
+#define __nvoc_memoryfabricimportedrefDestruct(pMemoryFabricImportedRef) memoryfabricimportedrefDestruct_IMPL(pMemoryFabricImportedRef)
+
+NV_STATUS memoryfabricimportedrefCtrlValidate_IMPL(struct MemoryFabricImportedRef *pMemoryFabricImportedRef, NV00FB_CTRL_VALIDATE_PARAMS *pParams);
+#ifdef __nvoc_mem_fabric_import_ref_h_disabled
+static inline NV_STATUS memoryfabricimportedrefCtrlValidate(struct MemoryFabricImportedRef *pMemoryFabricImportedRef, NV00FB_CTRL_VALIDATE_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("MemoryFabricImportedRef was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_mem_fabric_import_ref_h_disabled
+#define memoryfabricimportedrefCtrlValidate(pMemoryFabricImportedRef, pParams) memoryfabricimportedrefCtrlValidate_IMPL(pMemoryFabricImportedRef, pParams)
+#endif // __nvoc_mem_fabric_import_ref_h_disabled
+
+
+// Wrapper macros for halified functions
 #define memoryfabricimportedrefCanCopy_FNPTR(pMemoryFabricImportedRef) pMemoryFabricImportedRef->__nvoc_metadata_ptr->vtable.__memoryfabricimportedrefCanCopy__
 #define memoryfabricimportedrefCanCopy(pMemoryFabricImportedRef) memoryfabricimportedrefCanCopy_DISPATCH(pMemoryFabricImportedRef)
-#define memoryfabricimportedrefCtrlValidate_FNPTR(pMemoryFabricImportedRef) pMemoryFabricImportedRef->__memoryfabricimportedrefCtrlValidate__
-#define memoryfabricimportedrefCtrlValidate(pMemoryFabricImportedRef, pParams) memoryfabricimportedrefCtrlValidate_DISPATCH(pMemoryFabricImportedRef, pParams)
 #define memoryfabricimportedrefAccessCallback_FNPTR(pResource) pResource->__nvoc_base_RmResource.__nvoc_metadata_ptr->vtable.__rmresAccessCallback__
 #define memoryfabricimportedrefAccessCallback(pResource, pInvokingClient, pAllocParams, accessRight) memoryfabricimportedrefAccessCallback_DISPATCH(pResource, pInvokingClient, pAllocParams, accessRight)
 #define memoryfabricimportedrefShareCallback_FNPTR(pResource) pResource->__nvoc_base_RmResource.__nvoc_metadata_ptr->vtable.__rmresShareCallback__
@@ -217,10 +226,6 @@ NV_STATUS __nvoc_objCreate_MemoryFabricImportedRef(MemoryFabricImportedRef**, Dy
 // Dispatch functions
 static inline NvBool memoryfabricimportedrefCanCopy_DISPATCH(struct MemoryFabricImportedRef *pMemoryFabricImportedRef) {
     return pMemoryFabricImportedRef->__nvoc_metadata_ptr->vtable.__memoryfabricimportedrefCanCopy__(pMemoryFabricImportedRef);
-}
-
-static inline NV_STATUS memoryfabricimportedrefCtrlValidate_DISPATCH(struct MemoryFabricImportedRef *pMemoryFabricImportedRef, NV00FB_CTRL_VALIDATE_PARAMS *pParams) {
-    return pMemoryFabricImportedRef->__memoryfabricimportedrefCtrlValidate__(pMemoryFabricImportedRef, pParams);
 }
 
 static inline NvBool memoryfabricimportedrefAccessCallback_DISPATCH(struct MemoryFabricImportedRef *pResource, struct RsClient *pInvokingClient, void *pAllocParams, RsAccessRight accessRight) {
@@ -303,16 +308,16 @@ static inline void memoryfabricimportedrefAddAdditionalDependants_DISPATCH(struc
     pResource->__nvoc_metadata_ptr->vtable.__memoryfabricimportedrefAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
+// Virtual method declarations and/or inline definitions
 NvBool memoryfabricimportedrefCanCopy_IMPL(struct MemoryFabricImportedRef *pMemoryFabricImportedRef);
 
+// Exported method declarations and/or inline definitions
 NV_STATUS memoryfabricimportedrefCtrlValidate_IMPL(struct MemoryFabricImportedRef *pMemoryFabricImportedRef, NV00FB_CTRL_VALIDATE_PARAMS *pParams);
 
-NV_STATUS memoryfabricimportedrefConstruct_IMPL(struct MemoryFabricImportedRef *arg_pMemoryFabricImportedRef, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_memoryfabricimportedrefConstruct(arg_pMemoryFabricImportedRef, arg_pCallContext, arg_pParams) memoryfabricimportedrefConstruct_IMPL(arg_pMemoryFabricImportedRef, arg_pCallContext, arg_pParams)
-void memoryfabricimportedrefDestruct_IMPL(struct MemoryFabricImportedRef *pMemoryFabricImportedRef);
-
-#define __nvoc_memoryfabricimportedrefDestruct(pMemoryFabricImportedRef) memoryfabricimportedrefDestruct_IMPL(pMemoryFabricImportedRef)
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

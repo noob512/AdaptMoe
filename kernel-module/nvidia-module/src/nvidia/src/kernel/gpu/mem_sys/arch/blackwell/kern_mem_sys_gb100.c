@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -24,12 +24,19 @@
 #include "core/core.h"
 #include "gpu/gpu.h"
 #include "kernel/gpu/mem_sys/kern_mem_sys.h"
+#include "kernel/gpu/bus/kern_bus.h"
 #include "gpu/mem_mgr/mem_desc.h"
 
-#include "published/blackwell/gb100/pri_nv_xal_ep.h"
+#include "published/blackwell/gb100/dev_nv_xal_ep_zb.h"
+#include "published/blackwell/gb100/dev_ltc_zb.h"
+#include "published/blackwell/gb100/dev_hshub.h"
+#include "published/blackwell/gb100/dev_hshub_zb.h"
+#include "published/blackwell/gb100/dev_fuse_zb.h"
+#include "published/blackwell/gb100/hwproject.h"
 
-#include "published/blackwell/gb100/dev_top.h"
-#include "published/blackwell/gb100/dev_hshub_base.h"
+#include "published/blackwell/gb100/dev_fb.h"
+#include "published/blackwell/gb100/dev_gc6_island.h"
+#include "published/blackwell/gb100/dev_gc6_island_addendum.h"
 
 /*!
  * @brief Function used to return the HSHUB0 IoAperture
@@ -48,16 +55,12 @@ kmemsysInitHshub0Aperture_GB100
     KernelMemorySystem *pKernelMemorySystem
 )
 {
-    NvU64 hshub0PriBaseAddress;
     IoAperture *pHshub0IoAperture = NULL;
     NV_STATUS status;
 
-// TODO Remove this hardcoded value by fixing bug 4313915
-#define NV_PFB_HSHUB0      0x00870fff:0x00870000
-    hshub0PriBaseAddress = DRF_BASE(NV_PFB_HSHUB0);
     status = objCreate(&pHshub0IoAperture, pGpu, IoAperture,
-                         pGpu->pIOApertures[DEVICE_INDEX_GPU], NULL, 0, 0,
-                         NULL, 0, hshub0PriBaseAddress, DRF_SIZE(NV_PFB_HSHUB));
+                       pGpu->pIOApertures[DEVICE_INDEX_GPU], NULL, 0, 0,
+                       NULL, 0, NV_HSHUB0_PRIV_BASE, DRF_SIZE(NV_PFB_HSHUB_ZB));
     if (status != NV_OK)
     {
         return NULL;
@@ -91,47 +94,37 @@ kmemsysDestroyHshub0Aperture_GB100
  * @brief Validate the sysmemFlushBuffer val and assert
  *
  * @param[in] pGpu                OBJGPU pointer
- * @param[in[ pKernelMemorySystem KernelMemorySystem pointer
+ * @param[in] pKernelMemorySystem KernelMemorySystem pointer
  *
- * @returns void
+ * @returns NV_STATUS - NV_OK if sysmemFlushBuffer is valid otherwise NV_ERR_INVALID_STATE
  */
-void
+NV_STATUS
 kmemsysAssertSysmemFlushBufferValid_GB100
 (
     OBJGPU *pGpu,
     KernelMemorySystem *pKernelMemorySystem
 )
 {
-    NvU32       regHshubPcieFlushSysmemAddrValHi = 0;
-    NvU32       regHshubPcieFlushSysmemAddrValLo = 0;
     NvU32       regHshubEgPcieFlushSysmemAddrValHi = 0;
     NvU32       regHshubEgPcieFlushSysmemAddrValLo = 0;
     IoAperture *pHshub0IoAperture = kmemsysInitHshub0Aperture_HAL(pGpu, pKernelMemorySystem);
+    NV_STATUS   status = NV_OK;
 
-    NV_ASSERT_OR_RETURN_VOID(pHshub0IoAperture != NULL);
-
-    regHshubPcieFlushSysmemAddrValLo = REG_RD32(pHshub0IoAperture,
-                                             NV_PFB_HSHUB_PCIE_FLUSH_SYSMEM_ADDR_LO);
-    regHshubPcieFlushSysmemAddrValHi = REG_RD32(pHshub0IoAperture,
-                                             NV_PFB_HSHUB_PCIE_FLUSH_SYSMEM_ADDR_HI);
-
-    NV_ASSERT((regHshubPcieFlushSysmemAddrValLo != 0) || (regHshubPcieFlushSysmemAddrValHi != 0));
+    NV_ASSERT_OR_RETURN(pHshub0IoAperture != NULL, NV_ERR_INVALID_POINTER);
 
     regHshubEgPcieFlushSysmemAddrValLo = REG_RD32(pHshub0IoAperture,
-                                               NV_PFB_HSHUB_EG_PCIE_FLUSH_SYSMEM_ADDR_LO);
+                                               NV_PFB_HSHUB_ZB_EG_PCIE_FLUSH_SYSMEM_ADDR_LO);
     regHshubEgPcieFlushSysmemAddrValHi = REG_RD32(pHshub0IoAperture,
-                                               NV_PFB_HSHUB_EG_PCIE_FLUSH_SYSMEM_ADDR_HI);
+                                               NV_PFB_HSHUB_ZB_EG_PCIE_FLUSH_SYSMEM_ADDR_HI);
 
-    NV_ASSERT((regHshubEgPcieFlushSysmemAddrValLo != 0) || (regHshubEgPcieFlushSysmemAddrValHi != 0));
-
-    //
-    // In addition to a non-zero address, both NV_PFB_HSHUB_PCIE_FLUSH_SYSMEM_ADDR_<> and 
-    // NV_PFB_HSHUB_EG_PCIE_FLUSH_SYSMEM_ADDR_<> must program same value.
-    //
-    NV_ASSERT((regHshubPcieFlushSysmemAddrValLo == regHshubEgPcieFlushSysmemAddrValLo) &&
-        (regHshubPcieFlushSysmemAddrValHi == regHshubEgPcieFlushSysmemAddrValHi));
-
+    if (regHshubEgPcieFlushSysmemAddrValLo == 0 && regHshubEgPcieFlushSysmemAddrValHi == 0)
+    {
+        status = NV_ERR_INVALID_STATE;
+    }
+    
     kmemsysDestroyHshub0Aperture_HAL(pGpu, pKernelMemorySystem, pHshub0IoAperture);
+    
+    return status;
 }
 
 /*!
@@ -165,19 +158,19 @@ kmemsysProgramSysmemFlushBuffer_GB100
     alignedSysmemFlushBufferAddrHi = NvU64_HI32(pKernelMemorySystem->sysmemFlushBuffer);
 
     // Assert when Sysmem Flush buffer has more than 52-bit address
-    NV_ASSERT((alignedSysmemFlushBufferAddrHi & (~NV_PFB_HSHUB_PCIE_FLUSH_SYSMEM_ADDR_HI_ADR_MASK)) == 0);
+    NV_ASSERT((alignedSysmemFlushBufferAddrHi & (~NV_PFB_HSHUB_ZB_PCIE_FLUSH_SYSMEM_ADDR_HI_ADR_MASK)) == 0);
 
-    alignedSysmemFlushBufferAddrHi &= NV_PFB_HSHUB_PCIE_FLUSH_SYSMEM_ADDR_HI_ADR_MASK;
+    alignedSysmemFlushBufferAddrHi &= NV_PFB_HSHUB_ZB_PCIE_FLUSH_SYSMEM_ADDR_HI_ADR_MASK;
 
-    regValHi = DRF_NUM(_PFB, _HSHUB_PCIE_FLUSH_SYSMEM_ADDR_HI, _ADR, alignedSysmemFlushBufferAddrHi);
-    regValLo = DRF_NUM(_PFB, _HSHUB_PCIE_FLUSH_SYSMEM_ADDR_LO, _ADR, alignedSysmemFlushBufferAddr);
+    regValHi = DRF_NUM(_PFB_HSHUB_ZB, _PCIE_FLUSH_SYSMEM_ADDR_HI, _ADR, alignedSysmemFlushBufferAddrHi);
+    regValLo = DRF_NUM(_PFB_HSHUB_ZB, _PCIE_FLUSH_SYSMEM_ADDR_LO, _ADR, alignedSysmemFlushBufferAddr);
 
-    REG_WR32(pHshub0IoAperture, NV_PFB_HSHUB_PCIE_FLUSH_SYSMEM_ADDR_HI, ((NvU32)regValHi));
-    REG_WR32(pHshub0IoAperture, NV_PFB_HSHUB_PCIE_FLUSH_SYSMEM_ADDR_LO, ((NvU32)regValLo));
+    REG_WR32(pHshub0IoAperture, NV_PFB_HSHUB_ZB_PCIE_FLUSH_SYSMEM_ADDR_HI, ((NvU32)regValHi));
+    REG_WR32(pHshub0IoAperture, NV_PFB_HSHUB_ZB_PCIE_FLUSH_SYSMEM_ADDR_LO, ((NvU32)regValLo));
 
     // See bug 4503681 comment 47
-    REG_WR32(pHshub0IoAperture, NV_PFB_HSHUB_EG_PCIE_FLUSH_SYSMEM_ADDR_HI, ((NvU32)regValHi));
-    REG_WR32(pHshub0IoAperture, NV_PFB_HSHUB_EG_PCIE_FLUSH_SYSMEM_ADDR_LO, ((NvU32)regValLo));
+    REG_WR32(pHshub0IoAperture, NV_PFB_HSHUB_ZB_EG_PCIE_FLUSH_SYSMEM_ADDR_HI, ((NvU32)regValHi));
+    REG_WR32(pHshub0IoAperture, NV_PFB_HSHUB_ZB_EG_PCIE_FLUSH_SYSMEM_ADDR_LO, ((NvU32)regValLo));
 
     kmemsysDestroyHshub0Aperture_HAL(pGpu, pKernelMemorySystem, pHshub0IoAperture);
 }
@@ -197,7 +190,7 @@ kmemsysGetFlushSysmemBufferAddrShift_GB100
     KernelMemorySystem *pKernelMemorySystem
 )
 {
-    return portUtilCountTrailingZeros32(NV_PFB_HSHUB_PCIE_FLUSH_SYSMEM_ADDR_LO_ADR_MASK);
+    return portUtilCountTrailingZeros32(NV_PFB_HSHUB_ZB_PCIE_FLUSH_SYSMEM_ADDR_LO_ADR_MASK);
 }
 
 /*
@@ -211,9 +204,83 @@ kmemsysAssertFbAckTimeoutPending_GB100
 )
 {
 #ifdef DEBUG
-    NvU32 intr0 = GPU_REG_RD32(pGpu, NV_XAL_EP_INTR_0);
-    return DRF_VAL(_XAL_EP, _INTR_0, _TRS_TIMEOUT, intr0) == NV_XAL_EP_INTR_0_TRS_TIMEOUT_PENDING;
+    IoAperture *pXalAperture = kbusGetXalAperture_HAL(pGpu, GPU_GET_KERNEL_BUS(pGpu), XAL_BASE);
+    NvU32 intr0 = REG_RD32(pXalAperture, NV_XAL_EP_ZB_INTR_0);
+    return DRF_VAL(_XAL_EP_ZB, _INTR_0, _TRS_TIMEOUT, intr0) == NV_XAL_EP_ZB_INTR_0_TRS_TIMEOUT_PENDING;
 #else
     return NV_FALSE;
 #endif
+}
+
+/*!
+ * @brief Extract FB offset from LOCAL_MEMORY_RANGE register value
+ */
+static inline NvU64 _kmemsysGetFbOffsetFromLocalMemoryRangeRegVal_GB100(NvU32 regVal)
+{
+    NvU32 lowerRangeMag   = DRF_VAL(_PFB, _PRI_MMU_LOCAL_MEMORY_RANGE, _LOWER_MAG, regVal);
+    NvU32 lowerRangeScale = DRF_VAL(_PFB, _PRI_MMU_LOCAL_MEMORY_RANGE, _LOWER_SCALE, regVal);
+    return ((NvU64) lowerRangeMag << (lowerRangeScale + 20));
+}
+
+/*!
+ * @brief Read HDM top address from VBIOS (or 0 if not supported)
+ */
+NV_STATUS
+kmemsysReadHdmTopFromVbios_GB100
+(
+    OBJGPU *pGpu,
+    KernelMemorySystem *pKernelMemorySystem,
+    NvU64 *pHdmTopOut
+)
+{
+    /*
+     * On GB100, some VBIOS versions emulate an HDM top by setting
+     * LOCAL_MEMORY_RANGE to a smaller value after reset, then restoring
+     * the true LOCAL_MEMORY_RANGE value after FSP boot commands. VBIOS then
+     * stores the emulated HDM top value in a secure scratch register.
+     *
+     * Compare secure scratch vs. local memory range to determine if emulated
+     * HDM top is present.
+     */
+
+    NvU64 localMemoryRange = _kmemsysGetFbOffsetFromLocalMemoryRangeRegVal_GB100(
+        GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE));
+
+    NvU64 scratchHdmTop = _kmemsysGetFbOffsetFromLocalMemoryRangeRegVal_GB100(
+        GPU_REG_RD32(pGpu, NV_PGC6_BSI_SECURE_SCRATCH_MMU_LOCAL_MEMORY_RANGE));
+
+    if (localMemoryRange != scratchHdmTop)
+    {
+        *pHdmTopOut = scratchHdmTop;
+    }
+    else
+    {
+        *pHdmTopOut = 0;
+    }
+
+    return NV_OK;
+}
+
+NvBool
+kmemsysCheckReadoutEccEnablement_GB100
+(
+    OBJGPU *pGpu,
+    KernelMemorySystem *pKernelMemorySystem
+)
+{
+    NvU32 fuse = GPU_REG_RD32(pGpu, gpuGetPrimaryFuseBaseAddr_HAL(pGpu) + NV_FUSE_ZB_FEATURE_READOUT);
+    return FLD_TEST_DRF(_FUSE_ZB, _FEATURE_READOUT, _ECC_DRAM, _ENABLED, fuse);
+}
+
+NvU32
+kmemsysGetL2EccDedCountRegAddr_GB100
+(
+    OBJGPU             *pGpu,
+    KernelMemorySystem *pKernelMemorySystem,
+    NvU32               fbpa,
+    NvU32               subp
+)
+{
+    return (NV_LTC_PRI_BASE + NV_PLTC_LTS0_L2_CACHE_ECC_UNCORRECTED_ERR_COUNT +
+            (fbpa * NV_LTC_PRI_STRIDE) + (subp * NV_LTS_PRI_STRIDE));
 }

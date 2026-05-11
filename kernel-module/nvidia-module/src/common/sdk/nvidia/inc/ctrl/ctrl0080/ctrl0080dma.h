@@ -716,36 +716,6 @@ typedef struct NV0080_CTRL_DMA_UPDATE_PDE_2_PARAMS {
 #define NV0080_CTRL_DMA_UPDATE_PDE_2_FLAGS_SPARSE_TRUE           (0x00000001U)
 
 /*
- * NV0080_CTRL_DMA_ENABLE_PRIVILEGED_RANGE
- * This interface will create a corresponding privileged
- * kernel address space that will mirror user space allocations in this
- * VASPACE.
- * The user can either pass a FERMI_VASPACE_A handle or RM will use the 
- * vaspace associated with the client/device if hVaspace is passed as 
- * NULL.
- * Once this property is set, the user will not be able to make allocations
- * from  the top most PDE of this address space.
- *
- * The user is expected to call this function as soon as he has created 
- * the device/Vaspace object. If the user has already made VA allocations 
- * in this vaspace then this call will return a failure 
- * (NV_ERR_INVALID_STATE). 
- * The Vaspace should have no VA allocations when this call is made.
- *
- * Possible status values returned are:
- *   NV_OK
- *   NV_ERR_INVALID_ARGUMENT
- *   NV_ERR_INVALID_STATE
-*/
-#define NV0080_CTRL_DMA_ENABLE_PRIVILEGED_RANGE                  (0x801810U) /* finn: Evaluated from "(FINN_NV01_DEVICE_0_DMA_INTERFACE_ID << 8) | NV0080_CTRL_DMA_ENABLE_PRIVILEGED_RANGE_PARAMS_MESSAGE_ID" */
-
-#define NV0080_CTRL_DMA_ENABLE_PRIVILEGED_RANGE_PARAMS_MESSAGE_ID (0x10U)
-
-typedef struct NV0080_CTRL_DMA_ENABLE_PRIVILEGED_RANGE_PARAMS {
-    NvHandle hVASpace;
-} NV0080_CTRL_DMA_ENABLE_PRIVILEGED_RANGE_PARAMS;
-
-/*
  * NV0080_CTRL_DMA_SET_DEFAULT_VASPACE
  * This is a special control call provided for KMD to use. 
  * It will associate an allocated Address Space Object as the 
@@ -769,7 +739,7 @@ typedef struct NV0080_CTRL_DMA_ENABLE_PRIVILEGED_RANGE_PARAMS {
  *   NV_ERR_INVALID_STATE
  *  
  */
-#define NV0080_CTRL_DMA_SET_DEFAULT_VASPACE (0x801812U) /* finn: Evaluated from "(FINN_NV01_DEVICE_0_DMA_INTERFACE_ID << 8) | NV0080_CTRL_DMA_SET_DEFAULT_VASPACE_PARAMS_MESSAGE_ID" */
+#define NV0080_CTRL_DMA_SET_DEFAULT_VASPACE                      (0x801812U) /* finn: Evaluated from "(FINN_NV01_DEVICE_0_DMA_INTERFACE_ID << 8) | NV0080_CTRL_DMA_SET_DEFAULT_VASPACE_PARAMS_MESSAGE_ID" */
 
 #define NV0080_CTRL_DMA_SET_DEFAULT_VASPACE_PARAMS_MESSAGE_ID (0x12U)
 

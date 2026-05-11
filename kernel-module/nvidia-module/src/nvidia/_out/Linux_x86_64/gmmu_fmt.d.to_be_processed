@@ -5,12 +5,13 @@ _out/Linux_x86_64/gmmu_fmt.o: src/libraries/mmu/gmmu_fmt.c \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
  ../common/sdk/nvidia/inc/mmu_fmt_types.h \
  ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/nvcfg_sdk.h \
- inc/libraries/field_desc.h ../common/sdk/nvidia/inc/nvmisc.h \
- ../common/shared/inc/compat.h ../common/sdk/nvidia/inc/nvstatus.h \
+ generated/rmconfig.h inc/libraries/field_desc.h \
+ ../common/sdk/nvidia/inc/nvmisc.h ../common/shared/inc/compat.h \
+ ../common/sdk/nvidia/inc/nvstatus.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h inc/libraries/utils/nvassert.h \
  inc/libraries/utils/nvmacro.h inc/libraries/nvport/nvport.h \
  inc/libraries/nvport/core.h inc/libraries/nvport/atomic.h \
- inc/libraries/nvport/inline/atomic_gcc.h inc/libraries/nvport/debug.h \
+ inc/libraries/nvport/inline/atomic_c11.h inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
  inc/libraries/nvport/util.h inc/libraries/nvport/inline/util_generic.h \
@@ -34,6 +35,7 @@ inc/libraries/mmu/gmmu_fmt.h:
 ../common/sdk/nvidia/inc/mmu_fmt_types.h:
 ../common/sdk/nvidia/inc/nvtypes.h:
 ../common/sdk/nvidia/inc/nvcfg_sdk.h:
+generated/rmconfig.h:
 inc/libraries/field_desc.h:
 ../common/sdk/nvidia/inc/nvmisc.h:
 ../common/shared/inc/compat.h:
@@ -44,7 +46,7 @@ inc/libraries/utils/nvmacro.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:

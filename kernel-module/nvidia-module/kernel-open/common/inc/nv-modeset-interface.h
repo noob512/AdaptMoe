@@ -58,6 +58,12 @@ typedef struct {
      */
     void (*suspend)(NvU32 gpu_id);
     void (*resume)(NvU32 gpu_id);
+
+    /* Remove callback, called when a device is going away completely. */
+    void (*remove)(NvU32 gpu_id);
+
+    /* Probe callback, called when a device is being hotplugged. */
+    void (*probe)(const nv_gpu_info_t *gpu_info);
 } nvidia_modeset_callbacks_t;
 
 /*
@@ -108,8 +114,8 @@ typedef struct {
      * specified GPU.  This is equivalent to opening and closing a
      * /dev/nvidiaN device file from user-space.
      */
-    int (*open_gpu)(NvU32 gpu_id, nvidia_modeset_stack_ptr sp);
-    void (*close_gpu)(NvU32 gpu_id, nvidia_modeset_stack_ptr sp);
+    int (*open_gpu)(NvU32 gpu_id, nvidia_modeset_stack_ptr sp, NvBool reset_aware);
+    void (*close_gpu)(NvU32 gpu_id, nvidia_modeset_stack_ptr sp, NvBool reset_aware);
 
     void (*op)(nvidia_modeset_stack_ptr sp, void *ops_cmd);
 

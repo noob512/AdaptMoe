@@ -88,11 +88,6 @@ knvlinkValidateFabricBaseAddress_GH100
     NvU64         fabricBaseAddr
 )
 {
-    MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
-    NvU64          fbSizeBytes;
-
-    fbSizeBytes = pMemoryManager->Ram.fbTotalMemSizeMb << 20;
-
     //
     // Hopper SKUs will be paired with NVSwitches (Limerock-next) supporting 2K
     // mapslots that can cover 512GB each. Make sure that the fabric base
@@ -104,9 +99,6 @@ knvlinkValidateFabricBaseAddress_GH100
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
-
-    // Align fbSize to mapslot size.
-    fbSizeBytes = RM_ALIGN_UP(fbSizeBytes, NVBIT64(39));
 
     return NV_OK;
 }
@@ -248,7 +240,7 @@ knvlinkDiscoverPostRxDetLinks_GH100
     // Initialize Mask of links that have made it past RxDet to 0 then
     // request to get all links from the given GPU that have gotted past RxDet
     //
-    pKernelNvlink0->postRxDetLinkMask = 0;
+    bitVectorClrAll(&pKernelNvlink0->postRxDetLinkMask);
     status = knvlinkUpdatePostRxDetectLinkMask(pGpu0, pKernelNvlink0);
     if(status != NV_OK)
     {
@@ -260,7 +252,7 @@ knvlinkDiscoverPostRxDetLinks_GH100
     // Only query if we are not in loopback
     if (pKernelNvlink0 != pKernelNvlink1)
     {
-        pKernelNvlink1->postRxDetLinkMask = 0;
+        bitVectorClrAll(&pKernelNvlink1->postRxDetLinkMask);
         status = knvlinkUpdatePostRxDetectLinkMask(pGpu1, pKernelNvlink1);
         if(status != NV_OK)
         {
@@ -277,8 +269,8 @@ knvlinkDiscoverPostRxDetLinks_GH100
     // there is no chance that we will find links connecting the devices
     // further into discovery.
     //
-    if(pKernelNvlink0->postRxDetLinkMask == 0 ||
-       pKernelNvlink1->postRxDetLinkMask == 0)
+    if(bitVectorTestAllCleared(&pKernelNvlink0->postRxDetLinkMask) ||
+       bitVectorTestAllCleared(&pKernelNvlink1->postRxDetLinkMask))
     {
         NV_PRINTF(LEVEL_INFO, "Got 0 post RxDet Links on GPU %d or GPU %d!\n",
                 gpuGetInstance(pGpu0), gpuGetInstance(pGpu1));
@@ -305,6 +297,8 @@ ioctrlFaultUpTmrHandler
                  = portMemAllocNonPaged(sizeof(NV2080_CTRL_NVLINK_POST_FAULT_UP_PARAMS));
     PNVLINK_ID   pFaultLink;
     pFaultLink = listHead(&pKernelNvlink->faultUpLinks);
+
+    NV_ASSERT_OR_RETURN(nvlinkPostFaultUpParams != NULL, NV_ERR_NO_MEMORY);
 
     nvlinkPostFaultUpParams->linkId = pFaultLink->linkId;
     status = knvlinkExecGspRmRpc(pGpu, pKernelNvlink,
@@ -367,6 +361,9 @@ knvlinkLogAliDebugMessages_GH100
         return NV_OK;
 
     nvlinkErrInfoParams = portMemAllocNonPaged(sizeof(NV2080_CTRL_NVLINK_GET_ERR_INFO_PARAMS));
+
+    NV_ASSERT_OR_RETURN(nvlinkErrInfoParams != NULL, NV_ERR_NO_MEMORY);
+
     portMemSet(nvlinkErrInfoParams, 0, sizeof(NV2080_CTRL_NVLINK_GET_ERR_INFO_PARAMS));
     nvlinkErrInfoParams->ErrInfoFlags |= NV2080_CTRL_NVLINK_ERR_INFO_FLAGS_ALI_STATUS;
 
@@ -381,7 +378,7 @@ knvlinkLogAliDebugMessages_GH100
         return status;
     }
 
-    FOR_EACH_INDEX_IN_MASK(32, i, KNVLINK_GET_MASK(pKernelNvlink, postRxDetLinkMask, 32))
+    FOR_EACH_IN_BITVECTOR(&pKernelNvlink->postRxDetLinkMask, i)
     {
         nvErrorLog_va((void *)pGpu, ALI_TRAINING_FAIL,
                 "NVLink: Link training failed for link %u"
@@ -413,7 +410,7 @@ knvlinkLogAliDebugMessages_GH100
                     nvlinkErrInfoParams->linkErrInfo[i].DLStatUC01,
                     nvlinkErrInfoParams->linkErrInfo[i].MinionNvlinkLinkIntr);
     }
-    FOR_EACH_INDEX_IN_MASK_END;
+    FOR_EACH_IN_BITVECTOR_END();
     portMemFree(nvlinkErrInfoParams);
     return NV_OK;
 }
@@ -494,7 +491,7 @@ knvlinkGetEffectivePeerLinkMask_GH100
     OBJGPU *pGpu,
     KernelNvlink *pKernelNvlink,
     OBJGPU *pRemoteGpu,
-    NvU64  *pPeerLinkMask
+    NVLINK_BIT_VECTOR *pPeerLinkMask
 )
 {
     NvU32 peerLinkMask, remotePeerLinkMask, effectivePeerLinkMask, peerLinkMaskPerIoctrl;
@@ -505,6 +502,7 @@ knvlinkGetEffectivePeerLinkMask_GH100
     NvU32 numLinksToBeReduced;
     NvU32 linkMaskToBeReduced;
     NvU32 linkId, count, i;
+    NV_STATUS status = NV_OK;
 
     gpuInstance = gpuGetInstance(pGpu);
     remoteGpuInstance = gpuGetInstance(pRemoteGpu);
@@ -514,7 +512,17 @@ knvlinkGetEffectivePeerLinkMask_GH100
         if (gpuFabricProbeGetlinkMaskToBeReduced(pGpu->pGpuFabricProbeInfoKernel,
                                                  &linkMaskToBeReduced) == NV_OK)
         {
-            *pPeerLinkMask &= (~linkMaskToBeReduced);
+            NVLINK_BIT_VECTOR linkMaskToBeReducedVec;
+            NVLINK_BIT_VECTOR complementLinkMaskToBeReducedVec;
+            NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+                convertMaskToBitVector(linkMaskToBeReduced, &linkMaskToBeReducedVec),
+                return; );
+            NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+                bitVectorComplement(&complementLinkMaskToBeReducedVec, &linkMaskToBeReducedVec),
+                return; );
+            NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+                bitVectorAnd(pPeerLinkMask, pPeerLinkMask, &complementLinkMaskToBeReducedVec),
+                return; );
         }
 
         return;
@@ -608,7 +616,18 @@ knvlinkGetEffectivePeerLinkMask_GH100
     //
     // So, if not enough NVLinks are present, then drop effectivePeerLinkMask.
     //
-    *pPeerLinkMask = (effectivePeerLinkMask > 0) ? effectivePeerLinkMask : peerLinkMask;
+    if (effectivePeerLinkMask > 0)
+    {
+        NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+            convertMaskToBitVector(effectivePeerLinkMask, pPeerLinkMask),
+            return; );
+    }
+    else
+    {
+        NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+            convertMaskToBitVector(peerLinkMask, pPeerLinkMask),
+            return; );
+    }
 }
 
 /*!
@@ -619,11 +638,13 @@ knvlinkIsBwModeSupported_GH100
 (
     OBJGPU *pGpu,
     KernelNvlink *pKernelNvlink,
-    NvU8    mode
+    NvU16    mode
 )
 {
+    NvU8 modeType = DRF_VAL(_GPU, _NVLINK, _BW_MODE, mode);
+
     // _LINK_COUNT BW modes are not supported on HOPPER
-    if (mode > GPU_NVLINK_BW_MODE_3QUARTER)
+    if (modeType > GPU_NVLINK_BW_MODE_3QUARTER)
     {
         return NV_FALSE;
     }
@@ -635,13 +656,13 @@ knvlinkIsBwModeSupported_GH100
     }
 
     // Nvswitch supports _MIN and _FULL only
-    if (mode == GPU_NVLINK_BW_MODE_MIN || mode == GPU_NVLINK_BW_MODE_FULL)
+    if (modeType == GPU_NVLINK_BW_MODE_MIN || modeType == GPU_NVLINK_BW_MODE_FULL)
     {
         return NV_TRUE;
     }
 
     NV_PRINTF(LEVEL_ERROR, "BW mode requested is not supported. Mode: %d\n",
-              mode);
+              modeType);
     return NV_FALSE;
 }
 
@@ -874,7 +895,7 @@ knvlinkDirectConnectCheck_GH100
                         (void *)&params,
                         sizeof(params)) != NV_OK)
     {
-        NV_PRINTF(LEVEL_ERROR, "Fail to call direct conect check command\n"); 
+        NV_PRINTF(LEVEL_ERROR, "Fail to call direct conect check command\n");
     }
 }
 

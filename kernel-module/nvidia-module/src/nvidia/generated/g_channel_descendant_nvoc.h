@@ -45,7 +45,7 @@ extern "C" {
 #define _CHANNEL_DESCENDANT_H_
 
 #include "core/core.h"
-#include "rmapi/event.h"
+#include "rmapi/event_api.h"
 
 #include "containers/btree.h"
 #include "resserv/rs_resource.h"
@@ -53,42 +53,27 @@ extern "C" {
 #include "gpu/gpu_resource_desc.h"
 #include "kernel/gpu/gpu_halspec.h"
 
-
 struct ChannelDescendant;
 
-#ifndef __NVOC_CLASS_ChannelDescendant_TYPEDEF__
-#define __NVOC_CLASS_ChannelDescendant_TYPEDEF__
-typedef struct ChannelDescendant ChannelDescendant;
-#endif /* __NVOC_CLASS_ChannelDescendant_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_ChannelDescendant
-#define __nvoc_class_id_ChannelDescendant 0x43d7c4
+#define __nvoc_class_id_ChannelDescendant 0x43d7c4u
+typedef struct ChannelDescendant ChannelDescendant;
 #endif /* __nvoc_class_id_ChannelDescendant */
-
 
 
 struct ContextDma;
 
-#ifndef __NVOC_CLASS_ContextDma_TYPEDEF__
-#define __NVOC_CLASS_ContextDma_TYPEDEF__
-typedef struct ContextDma ContextDma;
-#endif /* __NVOC_CLASS_ContextDma_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_ContextDma
-#define __nvoc_class_id_ContextDma 0x88441b
+#define __nvoc_class_id_ContextDma 0x88441bu
+typedef struct ContextDma ContextDma;
 #endif /* __nvoc_class_id_ContextDma */
-
 
 
 struct KernelChannel;
 
-#ifndef __NVOC_CLASS_KernelChannel_TYPEDEF__
-#define __NVOC_CLASS_KernelChannel_TYPEDEF__
-typedef struct KernelChannel KernelChannel;
-#endif /* __NVOC_CLASS_KernelChannel_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_KernelChannel
-#define __nvoc_class_id_KernelChannel 0x5d8d70
+#define __nvoc_class_id_KernelChannel 0x5d8d70u
+typedef struct KernelChannel KernelChannel;
 #endif /* __nvoc_class_id_KernelChannel */
 
 
@@ -211,13 +196,9 @@ struct NVOC_METADATA__ChannelDescendant {
     const struct NVOC_VTABLE__ChannelDescendant vtable;
 };
 
-#ifndef __NVOC_CLASS_ChannelDescendant_TYPEDEF__
-#define __NVOC_CLASS_ChannelDescendant_TYPEDEF__
-typedef struct ChannelDescendant ChannelDescendant;
-#endif /* __NVOC_CLASS_ChannelDescendant_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_ChannelDescendant
-#define __nvoc_class_id_ChannelDescendant 0x43d7c4
+#define __nvoc_class_id_ChannelDescendant 0x43d7c4u
+typedef struct ChannelDescendant ChannelDescendant;
 #endif /* __nvoc_class_id_ChannelDescendant */
 
 // Casting support
@@ -235,12 +216,38 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_ChannelDescendant;
 
 NV_STATUS __nvoc_objCreateDynamic_ChannelDescendant(ChannelDescendant**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_ChannelDescendant(ChannelDescendant**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams, PARAM_TO_ENGDESC_FUNCTION *arg_pParamToEngDescFn);
-#define __objCreate_ChannelDescendant(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams, arg_pParamToEngDescFn) \
-    __nvoc_objCreate_ChannelDescendant((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams, arg_pParamToEngDescFn)
+NV_STATUS __nvoc_objCreate_ChannelDescendant(ChannelDescendant**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams, PARAM_TO_ENGDESC_FUNCTION *pParamToEngDescFn);
+#define __objCreate_ChannelDescendant(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams, pParamToEngDescFn) \
+    __nvoc_objCreate_ChannelDescendant((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams, pParamToEngDescFn)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS chandesConstruct_IMPL(struct ChannelDescendant *pChannelDescendant, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams, PARAM_TO_ENGDESC_FUNCTION *pParamToEngDescFn);
+#define __nvoc_chandesConstruct(pChannelDescendant, pCallContext, pParams, pParamToEngDescFn) chandesConstruct_IMPL(pChannelDescendant, pCallContext, pParams, pParamToEngDescFn)
+
+void chandesDestruct_IMPL(struct ChannelDescendant *pChannelDescendant);
+#define __nvoc_chandesDestruct(pChannelDescendant) chandesDestruct_IMPL(pChannelDescendant)
+
+#ifdef __nvoc_channel_descendant_h_disabled
+static inline void chandesIsolateOnDestruct(struct ChannelDescendant *pChannelDescendant) {
+    NV_ASSERT_FAILED_PRECOMP("ChannelDescendant was disabled!");
+}
+#else // __nvoc_channel_descendant_h_disabled
+#define chandesIsolateOnDestruct(pChannelDescendant) chandesIsolateOnDestruct_d44104(pChannelDescendant)
+#endif // __nvoc_channel_descendant_h_disabled
+
+#ifdef __nvoc_channel_descendant_h_disabled
+static inline void chandesDestroy(struct ChannelDescendant *pChannelDescendant) {
+    NV_ASSERT_FAILED_PRECOMP("ChannelDescendant was disabled!");
+}
+#else // __nvoc_channel_descendant_h_disabled
+#define chandesDestroy(pChannelDescendant) chandesDestroy_d44104(pChannelDescendant)
+#endif // __nvoc_channel_descendant_h_disabled
+
+
+// Wrapper macros for halified functions
+#define chandesIsolateOnDestruct_HAL(pChannelDescendant) chandesIsolateOnDestruct(pChannelDescendant)
+#define chandesDestroy_HAL(pChannelDescendant) chandesDestroy(pChannelDescendant)
 #define chandesGetSwMethods_FNPTR(pChannelDescendant) pChannelDescendant->__nvoc_metadata_ptr->vtable.__chandesGetSwMethods__
 #define chandesGetSwMethods(pChannelDescendant, ppMethods, pNumMethods) chandesGetSwMethods_DISPATCH(pChannelDescendant, ppMethods, pNumMethods)
 #define chandesIsSwMethodStalling_FNPTR(pChannelDescendant) pChannelDescendant->__nvoc_metadata_ptr->vtable.__chandesIsSwMethodStalling__
@@ -435,48 +442,26 @@ static inline NV_STATUS chandesGetOrAllocNotifShare_DISPATCH(struct ChannelDesce
     return pNotifier->__nvoc_metadata_ptr->vtable.__chandesGetOrAllocNotifShare__(pNotifier, hNotifierClient, hNotifierResource, ppNotifShare);
 }
 
-static inline void chandesIsolateOnDestruct_b3696a(struct ChannelDescendant *pChannelDescendant) {
-    return;
-}
-
-
-#ifdef __nvoc_channel_descendant_h_disabled
-static inline void chandesIsolateOnDestruct(struct ChannelDescendant *pChannelDescendant) {
-    NV_ASSERT_FAILED_PRECOMP("ChannelDescendant was disabled!");
-}
-#else //__nvoc_channel_descendant_h_disabled
-#define chandesIsolateOnDestruct(pChannelDescendant) chandesIsolateOnDestruct_b3696a(pChannelDescendant)
-#endif //__nvoc_channel_descendant_h_disabled
-
-#define chandesIsolateOnDestruct_HAL(pChannelDescendant) chandesIsolateOnDestruct(pChannelDescendant)
-
-static inline void chandesDestroy_b3696a(struct ChannelDescendant *pChannelDescendant) {
-    return;
-}
-
-
-#ifdef __nvoc_channel_descendant_h_disabled
-static inline void chandesDestroy(struct ChannelDescendant *pChannelDescendant) {
-    NV_ASSERT_FAILED_PRECOMP("ChannelDescendant was disabled!");
-}
-#else //__nvoc_channel_descendant_h_disabled
-#define chandesDestroy(pChannelDescendant) chandesDestroy_b3696a(pChannelDescendant)
-#endif //__nvoc_channel_descendant_h_disabled
-
-#define chandesDestroy_HAL(pChannelDescendant) chandesDestroy(pChannelDescendant)
-
+// Virtual method declarations and/or inline definitions
 NV_STATUS chandesGetSwMethods_IMPL(struct ChannelDescendant *pChannelDescendant, const METHOD **ppMethods, NvU32 *pNumMethods);
 
 NvBool chandesIsSwMethodStalling_IMPL(struct ChannelDescendant *pChannelDescendant, NvU32 hHandle);
 
 NV_STATUS chandesCheckMemInterUnmap_IMPL(struct ChannelDescendant *pChannelDescendant, NvBool bSubdeviceHandleProvided);
 
-NV_STATUS chandesConstruct_IMPL(struct ChannelDescendant *arg_pChannelDescendant, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams, PARAM_TO_ENGDESC_FUNCTION *arg_pParamToEngDescFn);
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+static inline void chandesIsolateOnDestruct_d44104(struct ChannelDescendant *pChannelDescendant){
+    return;
+}
 
-#define __nvoc_chandesConstruct(arg_pChannelDescendant, arg_pCallContext, arg_pParams, arg_pParamToEngDescFn) chandesConstruct_IMPL(arg_pChannelDescendant, arg_pCallContext, arg_pParams, arg_pParamToEngDescFn)
-void chandesDestruct_IMPL(struct ChannelDescendant *pChannelDescendant);
+static inline void chandesDestroy_d44104(struct ChannelDescendant *pChannelDescendant){
+    return;
+}
 
-#define __nvoc_chandesDestruct(pChannelDescendant) chandesDestruct_IMPL(pChannelDescendant)
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

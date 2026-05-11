@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -216,6 +216,8 @@ knvlinkCoreAddDevice_IMPL
     dev->numActiveLinksPerIoctrl  = knvlinkGetNumActiveLinksPerIoctrl(pGpu, pKernelNvlink);
     dev->numLinksPerIoctrl        = knvlinkGetTotalNumLinksPerIoctrl(pGpu, pKernelNvlink);
     dev->bReducedNvlinkConfig     = knvlinkIsGpuReducedNvlinkConfig_HAL(pGpu, pKernelNvlink);
+    dev->linkStateSupportedMask   = knvlinkGetSupportedCoreLinkStateMask_HAL(pGpu, pKernelNvlink);
+    dev->bLinkStatesSymmetric     = pKernelNvlink->getProperty(pKernelNvlink, PDB_PROP_KNVLINK_UNILATERAL_LINK_STATE_CHANGE_SUPPORTED);
 
     // Register the GPU in nvlink core
     if (nvlink_lib_register_device(dev) != 0)
@@ -301,9 +303,8 @@ knvlinkCoreUpdateDeviceUUID_IMPL
         //
 
         portMemSet((void *)pKernelNvlink->deviceName, 0, NVLINK_DEVICE_NAME_LENGTH);
-        gpuGetNameString(pGpu,
-                         NV2080_CTRL_GPU_GET_NAME_STRING_FLAGS_TYPE_ASCII,
-                         pKernelNvlink->deviceName);
+        ct_assert(NVLINK_DEVICE_NAME_LENGTH >= NV2080_GPU_MAX_NAME_STRING_LENGTH);
+        gpuGetNameString(pGpu, pKernelNvlink->deviceName);
 
         devIdx = pKernelNvlink->deviceName;
         while (*devIdx != '\0') devIdx++;
@@ -588,7 +589,7 @@ knvlinkIsGpuConnectedToNvswitch_IMPL
     NvU32 i;
     KNVLINK_CONN_INFO remoteEndInfo;
 
-    FOR_EACH_INDEX_IN_MASK(32, i, KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 32))
+    FOR_EACH_IN_BITVECTOR(&pKernelNvlink->enabledLinks, i)
     {
         remoteEndInfo = pKernelNvlink->nvlinkLinks[i].remoteEndInfo;
 
@@ -603,7 +604,7 @@ knvlinkIsGpuConnectedToNvswitch_IMPL
             return NV_FALSE;
         }
     }
-    FOR_EACH_INDEX_IN_MASK_END;
+    FOR_EACH_IN_BITVECTOR_END();
 
 #endif
 
@@ -667,7 +668,7 @@ _knvlinkUpdateRemoteEndUuidInfo
     unsigned      remoteLinkId;
     unsigned      i, j;
 
-    FOR_EACH_INDEX_IN_MASK(32, i, KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 32))
+    FOR_EACH_IN_BITVECTOR(&pKernelNvlink->enabledLinks, i)
     {
         if (pKernelNvlink->nvlinkLinks[i].remoteEndInfo.bConnected &&
             (pKernelNvlink->nvlinkLinks[i].remoteEndInfo.deviceType == NVLINK_DEVICE_TYPE_GPU))
@@ -702,7 +703,7 @@ _knvlinkUpdateRemoteEndUuidInfo
             }
         }
     }
-    FOR_EACH_INDEX_IN_MASK_END;
+    FOR_EACH_IN_BITVECTOR_END();
 }
 
 #endif

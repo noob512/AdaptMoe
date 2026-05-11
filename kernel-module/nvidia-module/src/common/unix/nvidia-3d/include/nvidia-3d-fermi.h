@@ -26,16 +26,8 @@
 
 #include "nvidia-3d-types.h"
 
-void _nv3dSetProgramOffsetFermi(
-    Nv3dChannelRec *p3dChannel,
-    NvU32 stage,
-    NvU32 offset);
 void _nv3dInvalidateTexturesFermi(
     Nv3dChannelRec *p3dChannel);
-void _nv3dSetVertexStreamEndFermi(
-    Nv3dChannelPtr p3dChannel,
-    enum Nv3dVertexAttributeStreamType stream,
-    const Nv3dVertexAttributeStreamRec *pStream);
 
 #endif /* __NVIDIA_3D_FERMI__ */
 

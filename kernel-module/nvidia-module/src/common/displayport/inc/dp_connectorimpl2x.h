@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -33,6 +33,7 @@
 
 #include "dp_connector.h"
 #include "ctrl/ctrl0073/ctrl0073dp.h"
+#include "dp_hashmap.h"
 
 namespace DisplayPort
 {
@@ -95,6 +96,21 @@ namespace DisplayPort
 
         bool    bMstTimeslotBug4968411;
         bool    bApplyManualTimeslotBug4968411;
+        //
+        //  Set the policy of reading DID2x on MST devices.
+        //  Valid values are 0-1.
+        //  0 - DID2X then EDID.     (Read DID2x first, then read EDID regardless of DID2x availability before reporting device to client.)
+        //  1 - DID2X only.          (Read DID2x first, then read EDID only if DID2x is not available.)
+        //  Default value is 0.
+        //
+        DISPLAYID2_MST_POLICY displayId2MSTPolicy;
+        void discoveryNewDevice(const DiscoveryManager::Device &device) override;
+
+        bool    bApplyStuffDummySymbolsWAR;
+        bool    bStuffDummySymbolsFor128b132b;
+        bool    bStuffDummySymbolsFor8b10b;
+        bool    bDisableWatermarkCaching;
+        bool    bEnableClearMSAWhenNotUsed;
 
         // Do not enable downspread while link training.
         bool    bDisableDownspread;
@@ -106,6 +122,67 @@ namespace DisplayPort
         virtual bool getDownspreadDisabled()
         {
             return this->bDisableDownspread;
+        }
+
+    private:
+        class WatermarkCacheElement : public HashMapElement
+        {
+        public:
+            LinkConfiguration m_linkConfig;
+            ModesetInfo m_modesetInfo;
+            bool m_forcedDscParamsValid;
+            DSC_INFO::FORCED_DSC_PARAMS m_forcedDscParams;
+            NV0073_CTRL_DP_IMP_WATERMARK m_watermark;
+
+            WatermarkCacheElement(
+                const LinkConfiguration &linkConfig, const ModesetInfo &modesetInfo,
+                const DscParams *pDscParams) :
+                m_linkConfig(linkConfig), m_modesetInfo(modesetInfo), m_forcedDscParamsValid(false),
+                m_forcedDscParams{}, m_watermark{}
+            {
+                if (pDscParams != NULL && pDscParams->forcedParams != NULL)
+                {
+                    m_forcedDscParamsValid = true;
+                    m_forcedDscParams = *(pDscParams->forcedParams);
+                }
+            }
+            WatermarkCacheElement(
+                const LinkConfiguration &linkConfig, const ModesetInfo &modesetInfo,
+                const DscParams *pDscParams, const NV0073_CTRL_DP_IMP_WATERMARK &watermark) :
+                m_linkConfig(linkConfig), m_modesetInfo(modesetInfo), m_forcedDscParamsValid(false),
+                m_forcedDscParams{}, m_watermark(watermark)
+            {
+                if (pDscParams != NULL && pDscParams->forcedParams != NULL)
+                {
+                    m_forcedDscParamsValid = true;
+                    m_forcedDscParams = *(pDscParams->forcedParams);
+                }
+            }
+            virtual ~WatermarkCacheElement() = default;
+
+            unsigned int hash() const override;
+            bool isEqual(const HashMapElement *other) const override;
+        };
+
+        HashMap m_watermarkCache;
+    };
+    //
+    //  New devices may not get a DeviceImpl created until after the Did2 read has completed.
+    //   This object is used to track the necessary state.
+    //
+    struct DevicePendingDID2Read : protected DID2ReadMultistream::DID2ReadMultistreamEventSink, public ListElement
+    {
+        ConnectorImpl2x *           parent;
+        DiscoveryManager::Device    device;
+        DID2ReadMultistream         reader;
+
+        void mstDid2Completed(DID2ReadMultistream * from);
+        void mstDid2ReadFailed(DID2ReadMultistream * from);
+
+    public:
+        DevicePendingDID2Read(ConnectorImpl2x *  _parent, MessageManager * manager, DiscoveryManager::Device dev)
+            : parent(_parent), device(dev), reader(_parent->timer, manager, this, dev.address)
+        {
         }
     };
 }

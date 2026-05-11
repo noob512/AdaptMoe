@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1999-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1999-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -54,6 +54,7 @@ static struct proc_dir_entry *proc_nvidia_warnings;
 static struct proc_dir_entry *proc_nvidia_patches;
 static struct proc_dir_entry *proc_nvidia_gpus;
 
+extern char *NVreg_CoherentGPUMemoryMode;
 extern char *NVreg_RegistryDwords;
 extern char *NVreg_RegistryDwordsPerDevice;
 extern char *NVreg_RmMsg;
@@ -64,7 +65,7 @@ extern char *NVreg_ExcludedGpus;
 static char nv_registry_keys[NV_MAX_REGISTRY_KEYS_LENGTH];
 
 #if defined(CONFIG_PM)
-static nv_pm_action_depth_t nv_pm_action_depth = NV_PM_ACTION_DEPTH_DEFAULT;
+nv_pm_action_depth_t nv_procfs_pm_action_depth = NV_PM_ACTION_DEPTH_DEFAULT;
 #endif
 
 static int nv_procfs_read_registry(struct seq_file *s, void *v);
@@ -109,18 +110,10 @@ nv_procfs_read_gpu_info(
     char *type;
     const char *name;
     char *uuid;
-    char vbios_version[15];
     nvidia_stack_t *sp = NULL;
-    char firmware_version[64] = { 0 };
 
     if (nv_kmem_cache_alloc_stack(&sp) != 0)
     {
-        return 0;
-    }
-
-    if (rm_ref_dynamic_power(sp, nv, NV_DYNAMIC_PM_COARSE) != NV_OK)
-    {
-        nv_kmem_cache_free_stack(sp);
         return 0;
     }
 
@@ -131,18 +124,23 @@ nv_procfs_read_gpu_info(
     seq_printf(s, "Model: \t\t %s\n", name);
     seq_printf(s, "IRQ:   \t\t %d\n", nv->interrupt_line);
 
-    uuid = rm_get_gpu_uuid(sp, nv);
-
-    if (uuid != NULL)
+    if (nv->nv_uuid_cache.valid)
     {
-        seq_printf(s, "GPU UUID: \t %s\n", uuid);
-        os_free_mem(uuid);
-        uuid = NULL;
+        uuid = rm_get_gpu_uuid(sp, nv);
+
+        if (uuid != NULL)
+        {
+            seq_printf(s, "GPU UUID: \t %s\n", uuid);
+            os_free_mem(uuid);
+            uuid = NULL;
+        }
+    }
+    else
+    {
+        nv_printf(NV_DBG_ERRORS, "GPU UUID cache not valid!\n");
     }
 
-    rm_get_vbios_version(sp, nv, vbios_version);
-
-    seq_printf(s, "Video BIOS: \t %s\n", vbios_version);
+    seq_printf(s, "Video BIOS: \t %s\n", nv->cached_gpu_info.vbios_version);
 
     if (nv_find_pci_capability(pci_dev, PCI_CAP_ID_EXP))
         type = "PCIe";
@@ -158,10 +156,13 @@ nv_procfs_read_gpu_info(
                    nv->pci_info.slot, PCI_FUNC(pci_dev->devfn));
     seq_printf(s, "Device Minor: \t %u\n", nvl->minor_num);
 
-    rm_get_firmware_version(sp, nv, firmware_version, sizeof(firmware_version));
-    if (firmware_version[0] != '\0')
+    if (nv->cached_gpu_info.firmware_version[0] == '\0')
     {
-        seq_printf(s, "GPU Firmware: \t %s\n", firmware_version);
+        seq_printf(s, "GPU Firmware: \t N/A\n");
+    }
+    else
+    {
+        seq_printf(s, "GPU Firmware: \t %s\n", nv->cached_gpu_info.firmware_version);
     }
 
 #if defined(DEBUG)
@@ -179,7 +180,6 @@ nv_procfs_read_gpu_info(
     seq_printf(s, "GPU Excluded:\t %s\n",
                ((nv->flags & NV_FLAG_EXCLUDE) != 0) ? "Yes" : "No");
 
-    rm_unref_dynamic_power(sp, nv, NV_DYNAMIC_PM_COARSE);
 
     nv_kmem_cache_free_stack(sp);
 
@@ -205,6 +205,8 @@ nv_procfs_read_power(
 
     rm_get_power_info(sp, nv, &power_info);
     seq_printf(s, "Runtime D3 status:          %s\n", power_info.dynamic_power_status);
+    seq_printf(s, "Tegra iGPU Rail-Gating:     %s\n",
+                    nv->is_tegra_pci_igpu_rg_enabled ? "Enabled" : "Disabled");
     seq_printf(s, "Video Memory:               %s\n\n", power_info.vidmem_power_status);
 
     seq_printf(s, "GPU Hardware Support:\n");
@@ -429,6 +431,8 @@ nv_procfs_read_params(
     for (i = 0; (entry = &nv_parms[i])->name != NULL; i++)
         seq_printf(s, "%s: %u\n", entry->name, *entry->data);
 
+    seq_printf(s, "CoherentGPUMemoryMode: \"%s\"\n",
+               (NVreg_CoherentGPUMemoryMode != NULL) ? NVreg_CoherentGPUMemoryMode : "");
     seq_printf(s, "RegistryDwords: \"%s\"\n",
                (NVreg_RegistryDwords != NULL) ? NVreg_RegistryDwords : "");
     seq_printf(s, "RegistryDwordsPerDevice: \"%s\"\n",
@@ -568,15 +572,15 @@ nv_procfs_write_suspend_depth(
 
     if (strcasecmp(kbuf, "uvm") == 0)
     {
-        nv_pm_action_depth = NV_PM_ACTION_DEPTH_UVM;
+        nv_procfs_pm_action_depth = NV_PM_ACTION_DEPTH_UVM;
     }
     else if (strcasecmp(kbuf, "modeset") == 0)
     {
-        nv_pm_action_depth = NV_PM_ACTION_DEPTH_MODESET;
+        nv_procfs_pm_action_depth = NV_PM_ACTION_DEPTH_MODESET;
     }
     else if (strcasecmp(kbuf, "default") == 0)
     {
-        nv_pm_action_depth = NV_PM_ACTION_DEPTH_DEFAULT;
+        nv_procfs_pm_action_depth = NV_PM_ACTION_DEPTH_DEFAULT;
     }
     else
     {
@@ -663,7 +667,7 @@ nv_procfs_write_suspend(
         return -EINVAL;
     }
 
-    status = nv_set_system_power_state(power_state, nv_pm_action_depth);
+    status = nv_set_system_power_state(power_state, nv_procfs_pm_action_depth);
 
     return (status != NV_OK) ? -EIO : count;
 }
@@ -886,7 +890,7 @@ nv_procfs_close_unbind_lock(
         down(&nvl->ldata_lock);
         if ((value == 1) && !(nv->flags & NV_FLAG_UNBIND_LOCK))
         {
-            if (NV_ATOMIC_READ(nvl->usage_count) == 0)
+            if (atomic64_read(&nvl->usage_count) == 0)
                 rm_unbind_lock(sp, nv);
 
             if (nv->flags & NV_FLAG_UNBIND_LOCK)
@@ -989,7 +993,7 @@ numa_status_read(
      * NUMA node ID and status. Memory range and offline addresses cannot
      * be read at this point so fill in dummy values.
      */
-    if (!(nv->flags & NV_FLAG_OPEN))
+    if (!(nv->flags & NV_FLAG_INITIALIZED))
     {
         if (nv_platform_supports_numa(nvl))
         {
@@ -1311,6 +1315,9 @@ int nv_procfs_init(void)
     NvU32 i = 0;
     char nv_dir_name[20];
     struct proc_dir_entry *entry;
+#if defined(CONFIG_PM)
+    NvBool create_suspend_file = NV_TRUE;
+#endif
 
     snprintf(nv_dir_name, sizeof(nv_dir_name), "driver/%s", nv_device_name);
 
@@ -1334,9 +1341,17 @@ int nv_procfs_init(void)
     if (!entry)
         goto failed;
 
-    entry = NV_CREATE_PROC_FILE("suspend", proc_nvidia, suspend, NULL);
-    if (!entry)
-        goto failed;
+    if (NVreg_UseKernelSuspendNotifiers)
+    {
+        create_suspend_file = NV_FALSE;
+    }
+
+    if (create_suspend_file)
+    {
+        entry = NV_CREATE_PROC_FILE("suspend", proc_nvidia, suspend, NULL);
+        if (!entry)
+            goto failed;
+    }
 #endif
 
     proc_nvidia_warnings = NV_CREATE_PROC_DIR("warnings", proc_nvidia);

@@ -169,6 +169,7 @@ NO_BENCH=0
 RESET_COUNTERS=1
 UVM_KO_PATH="$REPO_ROOT/kernel-module/nvidia-module/kernel-open/nvidia-uvm.ko"
 UVM_ENABLE_DEBUG_PROCFS=1
+UVM_ENABLE_BUILTIN_TESTS="${VLLM_UVM_ENABLE_BUILTIN_TESTS:-0}"
 
 KV_START=""
 KV_END=""
@@ -487,6 +488,9 @@ Options:
   --no-reset-counters        Do not reload nvidia_uvm before run
   --uvm-ko-path <path>       nvidia-uvm.ko path for --reset-counters
   --uvm-enable-debug-procfs <0|1>  Set at insmod time (default: 1)
+  --uvm-enable-builtin-tests <0|1>
+                             Set uvm_enable_builtin_tests at insmod time.
+                             Required for Phase F test ioctl driver executor.
   --keep                     Keep UVM params on exit (no rollback)
   -h, --help                 Show help
 
@@ -935,6 +939,8 @@ reload_uvm_module_for_counter_reset() {
   need_file "$UVM_KO_PATH"
   [ "$UVM_ENABLE_DEBUG_PROCFS" = "0" ] || [ "$UVM_ENABLE_DEBUG_PROCFS" = "1" ] \
     || die "--uvm-enable-debug-procfs must be 0 or 1"
+  [ "$UVM_ENABLE_BUILTIN_TESTS" = "0" ] || [ "$UVM_ENABLE_BUILTIN_TESTS" = "1" ] \
+    || die "--uvm-enable-builtin-tests must be 0 or 1"
 
   echo "Resetting UVM total counters by reloading nvidia_uvm..."
 
@@ -944,6 +950,7 @@ reload_uvm_module_for_counter_reset() {
 
   sudo insmod "$UVM_KO_PATH" \
     uvm_enable_debug_procfs="$UVM_ENABLE_DEBUG_PROCFS" \
+    uvm_enable_builtin_tests="$UVM_ENABLE_BUILTIN_TESTS" \
     uvm_perf_fault_log_destination=0 \
     uvm_perf_fault_log_counters=0 \
     uvm_perf_fault_log_addresses=0 \
@@ -955,6 +962,12 @@ reload_uvm_module_for_counter_reset() {
     debug_val="$(cat "$PARAM_DIR/uvm_enable_debug_procfs" 2>/dev/null || true)"
     [ "$debug_val" = "$UVM_ENABLE_DEBUG_PROCFS" ] \
       || die "uvm_enable_debug_procfs expected $UVM_ENABLE_DEBUG_PROCFS, got $debug_val"
+  fi
+  if [ -r "$PARAM_DIR/uvm_enable_builtin_tests" ]; then
+    local tests_val
+    tests_val="$(cat "$PARAM_DIR/uvm_enable_builtin_tests" 2>/dev/null || true)"
+    [ "$tests_val" = "$UVM_ENABLE_BUILTIN_TESTS" ] \
+      || die "uvm_enable_builtin_tests expected $UVM_ENABLE_BUILTIN_TESTS, got $tests_val"
   fi
 
   # Optional: clear old kernel ring lines so dmesg mode only shows this run.
@@ -1233,6 +1246,7 @@ parse_args() {
       --no-reset-counters) RESET_COUNTERS=0; shift ;;          # 不重载模块，保留累计计数
       --uvm-ko-path) UVM_KO_PATH="$2"; shift 2 ;;              # 指定 nvidia-uvm.ko 的绝对路径
       --uvm-enable-debug-procfs) UVM_ENABLE_DEBUG_PROCFS="$2"; shift 2 ;; # insmod 时的 debug procfs 开关
+      --uvm-enable-builtin-tests) UVM_ENABLE_BUILTIN_TESTS="$2"; shift 2 ;; # insmod 时开启 builtin tests
       --keep) KEEP_ON_EXIT=1; shift ;;                         # 退出时不重置内核状态
 
       # ==========================================

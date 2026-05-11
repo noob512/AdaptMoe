@@ -4,7 +4,7 @@ _out/Linux_x86_64/g_gpu_mgr_nvoc.o: \
  ../common/sdk/nvidia/inc/cpuopsys.h ../common/sdk/nvidia/inc/nvstatus.h \
  ../common/sdk/nvidia/inc/nvtypes.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
@@ -57,13 +57,19 @@ _out/Linux_x86_64/g_gpu_mgr_nvoc.o: \
  inc/kernel/gpu/gpu_uuid.h inc/kernel/gpu/gpu_device_mapping.h \
  inc/kernel/gpu/gpu_access.h generated/g_gpu_access_nvoc.h \
  inc/libraries/ioaccess/ioaccess.h generated/g_ioaccess_nvoc.h \
+ inc/kernel/gpu/gpu_arch.h generated/g_gpu_arch_nvoc.h \
+ inc/kernel/gpu/gpu_halspec.h generated/g_gpu_halspec_nvoc.h \
+ generated/g_chips2halspec.h generated/g_chips2halspec_nvoc.h \
+ generated/rmconfig.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080ce.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080internal.h \
  ../common/sdk/nvidia/inc/nvimpshared.h ../common/sdk/nvidia/inc/cc_drv.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080msenc.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080bsp.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fifo.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080mc.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl90f1.h \
@@ -86,7 +92,7 @@ inc/libraries/nvport/nvport.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -170,7 +176,15 @@ inc/kernel/gpu/gpu_access.h:
 generated/g_gpu_access_nvoc.h:
 inc/libraries/ioaccess/ioaccess.h:
 generated/g_ioaccess_nvoc.h:
+inc/kernel/gpu/gpu_arch.h:
+generated/g_gpu_arch_nvoc.h:
+inc/kernel/gpu/gpu_halspec.h:
+generated/g_gpu_halspec_nvoc.h:
+generated/g_chips2halspec.h:
+generated/g_chips2halspec_nvoc.h:
+generated/rmconfig.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080ce.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080internal.h:
 ../common/sdk/nvidia/inc/nvimpshared.h:
@@ -178,6 +192,7 @@ generated/g_ioaccess_nvoc.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080msenc.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080bsp.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fifo.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080mc.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl90f1.h:

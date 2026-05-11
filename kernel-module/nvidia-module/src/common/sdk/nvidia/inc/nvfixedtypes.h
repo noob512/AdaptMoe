@@ -36,6 +36,7 @@
 typedef NvS16                                                         NvSFXP16;
 typedef NvS32                                                         NvSFXP32;
 typedef NvS64                                                         NvSFXP64;
+typedef NvU8                                                          NvUFXP8;
 typedef NvU16                                                         NvUFXP16;
 typedef NvU32                                                         NvUFXP32;
 typedef NvU64                                                         NvUFXP64;
@@ -66,6 +67,7 @@ typedef NvSFXP32                                                    NvSFXP29_3;
 typedef NvSFXP32                                                    NvSFXP31_1;
 typedef NvSFXP64                                                   NvSFXP52_12;
 
+typedef NvUFXP8                                                     NvUFXP0_8;
 typedef NvUFXP16                                                    NvUFXP0_16;
 typedef NvUFXP16                                                    NvUFXP4_12;
 typedef NvUFXP16                                                     NvUFXP8_8;
@@ -90,7 +92,7 @@ typedef NvUFXP64                                                   NvUFXP48_16;
 typedef NvUFXP64                                                   NvUFXP52_12;
 typedef NvUFXP64                                                   NvUFXP54_10;
 typedef NvUFXP64                                                    NvUFXP60_4;
-
+typedef NvUFXP64                                                   NvUFXP36_28;
 /*!
  * Utility macros used in converting between signed integers and fixed-point
  * notation.

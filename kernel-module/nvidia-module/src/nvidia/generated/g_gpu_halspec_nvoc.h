@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -73,9 +73,7 @@ struct RmHalspecOwner {
     struct RmHalspecOwner *__nvoc_pbase_RmHalspecOwner;    // rmhalspecowner
 
     // Data members
-    struct ChipHal chipHal;
     struct RmVariantHal rmVariantHal;
-    struct TegraChipHal tegraChipHal;
     struct DispIpHal dispIpHal;
 };
 
@@ -85,13 +83,9 @@ struct NVOC_METADATA__RmHalspecOwner {
     const struct NVOC_RTTI rtti;
 };
 
-#ifndef __NVOC_CLASS_RmHalspecOwner_TYPEDEF__
-#define __NVOC_CLASS_RmHalspecOwner_TYPEDEF__
-typedef struct RmHalspecOwner RmHalspecOwner;
-#endif /* __NVOC_CLASS_RmHalspecOwner_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_RmHalspecOwner
-#define __nvoc_class_id_RmHalspecOwner 0x34a6d6
+#define __nvoc_class_id_RmHalspecOwner 0x34a6d6u
+typedef struct RmHalspecOwner RmHalspecOwner;
 #endif /* __nvoc_class_id_RmHalspecOwner */
 
 // Casting support
@@ -110,13 +104,89 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_RmHalspecOwner;
 NV_STATUS __nvoc_objCreateDynamic_RmHalspecOwner(RmHalspecOwner**, Dynamic*, NvU32, va_list);
 
 NV_STATUS __nvoc_objCreate_RmHalspecOwner(RmHalspecOwner**, Dynamic*, NvU32,
-        NvU32 ChipHal_arch, NvU32 ChipHal_impl, NvU32 ChipHal_hidrev,
         RM_RUNTIME_VARIANT RmVariantHal_rmVariant,
-        TEGRA_CHIP_TYPE TegraChipHal_tegraType,
         NvU32 DispIpHal_ipver);
-#define __objCreate_RmHalspecOwner(ppNewObj, pParent, createFlags, ChipHal_arch, ChipHal_impl, ChipHal_hidrev, RmVariantHal_rmVariant, TegraChipHal_tegraType, DispIpHal_ipver) \
-    __nvoc_objCreate_RmHalspecOwner((ppNewObj), staticCast((pParent), Dynamic), (createFlags), ChipHal_arch, ChipHal_impl, ChipHal_hidrev, RmVariantHal_rmVariant, TegraChipHal_tegraType, DispIpHal_ipver)
+#define __objCreate_RmHalspecOwner(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, RmVariantHal_rmVariant, DispIpHal_ipver) \
+    __nvoc_objCreate_RmHalspecOwner((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), RmVariantHal_rmVariant, DispIpHal_ipver)
 
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
+#undef PRIVATE_FIELD
+
+
+
+// Private field names are wrapped in PRIVATE_FIELD, which does nothing for
+// the matching C source file, but causes diagnostics to be issued if another
+// source file references the field.
+#ifdef NVOC_GPU_HALSPEC_H_PRIVATE_ACCESS_ALLOWED
+#define PRIVATE_FIELD(x) x
+#else
+#define PRIVATE_FIELD(x) NVOC_PRIVATE_FIELD(x)
+#endif
+
+
+// Metadata with per-class RTTI
+struct NVOC_METADATA__GpuHalspecOwner;
+
+
+struct GpuHalspecOwner {
+
+    // Metadata starts with RTTI structure.
+    union {
+         const struct NVOC_METADATA__GpuHalspecOwner *__nvoc_metadata_ptr;
+         const struct NVOC_RTTI *__nvoc_rtti;
+    };
+
+    // Ancestor object pointers for `staticCast` feature
+    struct GpuHalspecOwner *__nvoc_pbase_GpuHalspecOwner;    // gpuhalspecowner
+
+    // Data members
+    struct ChipHal chipHal;
+    struct TegraChipHal tegraChipHal;
+};
+
+
+// Metadata with per-class RTTI
+struct NVOC_METADATA__GpuHalspecOwner {
+    const struct NVOC_RTTI rtti;
+};
+
+#ifndef __nvoc_class_id_GpuHalspecOwner
+#define __nvoc_class_id_GpuHalspecOwner 0x74bc71u
+typedef struct GpuHalspecOwner GpuHalspecOwner;
+#endif /* __nvoc_class_id_GpuHalspecOwner */
+
+// Casting support
+extern const struct NVOC_CLASS_DEF __nvoc_class_def_GpuHalspecOwner;
+
+#define __staticCast_GpuHalspecOwner(pThis) \
+    ((pThis)->__nvoc_pbase_GpuHalspecOwner)
+
+#ifdef __nvoc_gpu_halspec_h_disabled
+#define __dynamicCast_GpuHalspecOwner(pThis) ((GpuHalspecOwner*) NULL)
+#else //__nvoc_gpu_halspec_h_disabled
+#define __dynamicCast_GpuHalspecOwner(pThis) \
+    ((GpuHalspecOwner*) __nvoc_dynamicCast(staticCast((pThis), Dynamic), classInfo(GpuHalspecOwner)))
+#endif //__nvoc_gpu_halspec_h_disabled
+
+NV_STATUS __nvoc_objCreateDynamic_GpuHalspecOwner(GpuHalspecOwner**, Dynamic*, NvU32, va_list);
+
+NV_STATUS __nvoc_objCreate_GpuHalspecOwner(GpuHalspecOwner**, Dynamic*, NvU32,
+        NvU32 ChipHal_arch, NvU32 ChipHal_impl, NvU32 ChipHal_hidrev,
+        TEGRA_CHIP_TYPE TegraChipHal_tegraType);
+#define __objCreate_GpuHalspecOwner(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, ChipHal_arch, ChipHal_impl, ChipHal_hidrev, TegraChipHal_tegraType) \
+    __nvoc_objCreate_GpuHalspecOwner((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), ChipHal_arch, ChipHal_impl, ChipHal_hidrev, TegraChipHal_tegraType)
+
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

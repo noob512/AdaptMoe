@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -52,25 +52,17 @@ typedef struct MEMORY_ALLOCATION_REQUEST MEMORY_ALLOCATION_REQUEST;
 
 struct MemoryManager;
 
-#ifndef __NVOC_CLASS_MemoryManager_TYPEDEF__
-#define __NVOC_CLASS_MemoryManager_TYPEDEF__
-typedef struct MemoryManager MemoryManager;
-#endif /* __NVOC_CLASS_MemoryManager_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_MemoryManager
-#define __nvoc_class_id_MemoryManager 0x22ad47
+#define __nvoc_class_id_MemoryManager 0x22ad47u
+typedef struct MemoryManager MemoryManager;
 #endif /* __nvoc_class_id_MemoryManager */
 
 
 struct RmClient;
 
-#ifndef __NVOC_CLASS_RmClient_TYPEDEF__
-#define __NVOC_CLASS_RmClient_TYPEDEF__
-typedef struct RmClient RmClient;
-#endif /* __NVOC_CLASS_RmClient_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_RmClient
-#define __nvoc_class_id_RmClient 0xb23d83
+#define __nvoc_class_id_RmClient 0xb23d83u
+typedef struct RmClient RmClient;
 #endif /* __nvoc_class_id_RmClient */
 
 
@@ -153,13 +145,9 @@ struct NVOC_METADATA__StandardMemory {
     const struct NVOC_VTABLE__StandardMemory vtable;
 };
 
-#ifndef __NVOC_CLASS_StandardMemory_TYPEDEF__
-#define __NVOC_CLASS_StandardMemory_TYPEDEF__
-typedef struct StandardMemory StandardMemory;
-#endif /* __NVOC_CLASS_StandardMemory_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_StandardMemory
-#define __nvoc_class_id_StandardMemory 0x897bf7
+#define __nvoc_class_id_StandardMemory 0x897bf7u
+typedef struct StandardMemory StandardMemory;
 #endif /* __nvoc_class_id_StandardMemory */
 
 // Casting support
@@ -177,12 +165,29 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_StandardMemory;
 
 NV_STATUS __nvoc_objCreateDynamic_StandardMemory(StandardMemory**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_StandardMemory(StandardMemory**, Dynamic*, NvU32, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_StandardMemory(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_StandardMemory((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_StandardMemory(StandardMemory**, Dynamic*, NvU32, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_StandardMemory(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_StandardMemory((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS stdmemConstruct_IMPL(struct StandardMemory *pStandardMemory, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_stdmemConstruct(pStandardMemory, pCallContext, pParams) stdmemConstruct_IMPL(pStandardMemory, pCallContext, pParams)
+
+NV_STATUS stdmemValidateParams_IMPL(struct OBJGPU *pGpu, struct RmClient *pRmClient, NV_MEMORY_ALLOCATION_PARAMS *pAllocData);
+#define stdmemValidateParams(pGpu, pRmClient, pAllocData) stdmemValidateParams_IMPL(pGpu, pRmClient, pAllocData)
+
+void stdmemDumpInputAllocParams_IMPL(NV_MEMORY_ALLOCATION_PARAMS *pAllocData, CALL_CONTEXT *pCallContext);
+#define stdmemDumpInputAllocParams(pAllocData, pCallContext) stdmemDumpInputAllocParams_IMPL(pAllocData, pCallContext)
+
+void stdmemDumpOutputAllocParams_IMPL(NV_MEMORY_ALLOCATION_PARAMS *pAllocData);
+#define stdmemDumpOutputAllocParams(pAllocData) stdmemDumpOutputAllocParams_IMPL(pAllocData)
+
+NvU64 stdmemQueryPageSize_IMPL(struct MemoryManager *pMemoryManager, NvHandle hClient, NV_MEMORY_ALLOCATION_PARAMS *pAllocData);
+#define stdmemQueryPageSize(pMemoryManager, hClient, pAllocData) stdmemQueryPageSize_IMPL(pMemoryManager, hClient, pAllocData)
+
+
+// Wrapper macros for halified functions
 #define stdmemCanCopy_FNPTR(pStandardMemory) pStandardMemory->__nvoc_metadata_ptr->vtable.__stdmemCanCopy__
 #define stdmemCanCopy(pStandardMemory) stdmemCanCopy_DISPATCH(pStandardMemory)
 #define stdmemIsDuplicate_FNPTR(pMemory) pMemory->__nvoc_base_Memory.__nvoc_metadata_ptr->vtable.__memIsDuplicate__
@@ -341,37 +346,14 @@ static inline void stdmemAddAdditionalDependants_DISPATCH(struct RsClient *pClie
     pResource->__nvoc_metadata_ptr->vtable.__stdmemAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
-NvU64 stdmemGetSysmemPageSize_IMPL(struct OBJGPU *pGpu, struct StandardMemory *pMemory);
-
-
-#ifdef __nvoc_standard_mem_h_disabled
-static inline NvU64 stdmemGetSysmemPageSize(struct OBJGPU *pGpu, struct StandardMemory *pMemory) {
-    NV_ASSERT_FAILED_PRECOMP("StandardMemory was disabled!");
-    return 0;
-}
-#else //__nvoc_standard_mem_h_disabled
-#define stdmemGetSysmemPageSize(pGpu, pMemory) stdmemGetSysmemPageSize_IMPL(pGpu, pMemory)
-#endif //__nvoc_standard_mem_h_disabled
-
-#define stdmemGetSysmemPageSize_HAL(pGpu, pMemory) stdmemGetSysmemPageSize(pGpu, pMemory)
-
+// Virtual method declarations and/or inline definitions
 NvBool stdmemCanCopy_IMPL(struct StandardMemory *pStandardMemory);
 
-NV_STATUS stdmemConstruct_IMPL(struct StandardMemory *arg_pStandardMemory, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_stdmemConstruct(arg_pStandardMemory, arg_pCallContext, arg_pParams) stdmemConstruct_IMPL(arg_pStandardMemory, arg_pCallContext, arg_pParams)
-NV_STATUS stdmemValidateParams_IMPL(struct OBJGPU *pGpu, struct RmClient *pRmClient, NV_MEMORY_ALLOCATION_PARAMS *pAllocData);
-
-#define stdmemValidateParams(pGpu, pRmClient, pAllocData) stdmemValidateParams_IMPL(pGpu, pRmClient, pAllocData)
-void stdmemDumpInputAllocParams_IMPL(NV_MEMORY_ALLOCATION_PARAMS *pAllocData, CALL_CONTEXT *pCallContext);
-
-#define stdmemDumpInputAllocParams(pAllocData, pCallContext) stdmemDumpInputAllocParams_IMPL(pAllocData, pCallContext)
-void stdmemDumpOutputAllocParams_IMPL(NV_MEMORY_ALLOCATION_PARAMS *pAllocData);
-
-#define stdmemDumpOutputAllocParams(pAllocData) stdmemDumpOutputAllocParams_IMPL(pAllocData)
-NvU64 stdmemQueryPageSize_IMPL(struct MemoryManager *pMemoryManager, NvHandle hClient, NV_MEMORY_ALLOCATION_PARAMS *pAllocData);
-
-#define stdmemQueryPageSize(pMemoryManager, hClient, pAllocData) stdmemQueryPageSize_IMPL(pMemoryManager, hClient, pAllocData)
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

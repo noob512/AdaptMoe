@@ -25,7 +25,7 @@
 
 #include "nvidia-drm-conftest.h"
 
-#if defined(NV_DRM_ATOMIC_MODESET_AVAILABLE)
+#if defined(NV_DRM_AVAILABLE)
 
 #include "nvidia-drm-gem.h"
 
@@ -34,15 +34,16 @@ struct nv_drm_gem_nvkms_memory {
 
     /*
      * Lock to protect concurrent writes to physically_mapped, pPhysicalAddress,
-     * and pWriteCombinedIORemapAddress.
+     * pWriteCombinedIORemapAddress, and was_mmapped.
      *
-     * __nv_drm_gem_nvkms_map(), the sole writer, is structured such that
-     * readers are not required to hold the lock.
+     * __nv_drm_gem_nvkms_map() and __nv_drm_gem_nvkms_mmap are structured such
+     * that readers are not required to hold the lock.
      */
     struct mutex map_lock;
     bool physically_mapped;
     void *pPhysicalAddress;
     void *pWriteCombinedIORemapAddress;
+    bool was_mmapped;
 
     struct page **pages;
     unsigned long pages_count;
@@ -72,12 +73,11 @@ static inline struct nv_drm_gem_nvkms_memory *to_nv_nvkms_memory_const(
 
 static inline
 struct nv_drm_gem_nvkms_memory *nv_drm_gem_object_nvkms_memory_lookup(
-    struct drm_device *dev,
     struct drm_file *filp,
     u32 handle)
 {
     struct nv_drm_gem_object *nv_gem =
-            nv_drm_gem_object_lookup(dev, filp, handle);
+            nv_drm_gem_object_lookup(filp, handle);
 
     if (nv_gem != NULL && nv_gem->ops != &nv_gem_nvkms_memory_ops) {
         nv_drm_gem_object_unreference_unlocked(nv_gem);

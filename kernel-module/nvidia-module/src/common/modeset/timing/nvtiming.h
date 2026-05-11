@@ -1,31 +1,29 @@
-//****************************************************************************
-//
-//  SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-//  SPDX-License-Identifier: MIT
-//
-//  Permission is hereby granted, free of charge, to any person obtaining a
-//  copy of this software and associated documentation files (the "Software"),
-//  to deal in the Software without restriction, including without limitation
-//  the rights to use, copy, modify, merge, publish, distribute, sublicense,
-//  and/or sell copies of the Software, and to permit persons to whom the
-//  Software is furnished to do so, subject to the following conditions:
-//
-//  The above copyright notice and this permission notice shall be included in
-//  all copies or substantial portions of the Software.
-//
-//  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-//  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-//  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-//  THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-//  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-//  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-//  DEALINGS IN THE SOFTWARE.
-//
-//  File:       nvtiming.h
-//
-//  Purpose:    This file is the common header all nv timing library clients.
-//
-//*****************************************************************************
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2006-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: MIT
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+/** @file  nvtiming.h
+ *  @brief This file is the common header all NV timing library clients.
+ */
 
 #ifndef __NVTIMING_H__
 #define __NVTIMING_H__
@@ -558,7 +556,7 @@ typedef enum NVT_TV_FORMAT
 #define NVT_CTA861_VIDEO_VIC_MASK            0xFF  //the VIC mask of the short video descriptor
 #define NVT_CTA861_7BIT_VIDEO_VIC_MASK       0x7F  //the 7 bits VIC mask of the short video descriptor
 #define NVT_CTA861_VIDEO_NATIVE_MASK         0x80  //the Native mask of the short video descriptor
-#define NVT_HDMI_YUV_420_PCLK_SUPPORTED_MIN  59000 //the vale shall equal or larger than 590MHz to support YCbCr in HDMI2.1
+#define NVT_HDMI_YUV_420_PCLK_SUPPORTED_MIN  590000//the vale shall equal or larger than 590MHz to support YCbCr in HDMI2.1 , unit of 1khz
 
 // CTA-861G supports more SVDs which is over 0x7F index
 // All value below 192 will be treated as 7 bit VIC. Value 128~192 shall be forbidden.
@@ -935,7 +933,7 @@ typedef struct tagNVT_RID_CODES
     NvU8  rid;        // Resolution Identification (RID)
 } NVT_RID_CODES;
 
-#pragma pack(1)
+#pragma pack(push, 1)
 typedef struct tagVFD_ONE_BYTE
 {
     NvU8 rid          : 6;
@@ -1126,7 +1124,7 @@ typedef struct tagNVT_HDR10PLUS_INFO
     NvU8 full_frame_peak_luminance_index    : 2;
     NvU8 peak_luminance_index               : 4;
 } NVT_HDR10PLUS_INFO;
-#pragma pack()
+#pragma pack(pop)
 
 //***************************
 // colorimetry data block
@@ -1261,7 +1259,7 @@ typedef struct tagNVT_2BYTES
     NvU8   byte2;
 } NVT_2BYTES;
 
-#pragma pack(1)
+#pragma pack(push, 1)
 #define NVT_CTA861_DID_MAX_DATA_BLOCK           4
 //***********************
 // DisplayID VII Video Timing Data Block (T7VDB)
@@ -1346,7 +1344,7 @@ typedef struct tagNATIVE_VIDEO_RESOLUTION_DATA
     NvU8 image_size[4];
 } NATIVE_VIDEO_RESOLUTION_DATA;
 
-#pragma pack()
+#pragma pack(pop)
 
 // See CEA-861E, Table 42, 43 Extended Tags; indicates that the corresponding CEA extended data block value is valid,
 // e.g. if colorimetry is set, then NVT_EDID_CEA861_INFO::colorimetry is valid
@@ -2112,6 +2110,13 @@ typedef struct tagNVT_EDID_18BYTE_DESCRIPTOR
 #define NVT_EDID_DISPLAY_DESCRIPTOR_CVT      0xF8   // CVT 3-byte timing code
 #define NVT_EDID_DISPLAY_DESCRIPTOR_ESTIII   0xF7   // establishied timing III
 #define NVT_EDID_DISPLAY_DESCRIPTOR_DUMMY    0x10   // dummy descriptor
+// NVT_EDID_DISPLAY_DESCRIPTOR_MANUF_SPECIFIC: Generic tag for E-EDID manufacturer-specific
+// display descriptors (0x00-0x0F per E-EDID spec). Used to preserve and pass through
+// proprietary panel/display data (e.g. Barco medical devices) in Long Display Descriptors
+// without interpretation. Customer: Barco medical devices. Bug reference: 5571067.
+#define NVT_EDID_DISPLAY_DESCRIPTOR_MANUF_SPECIFIC     0x0E   // generic tag for manufacturer-specific descriptors (range 0x00-0x0F)
+#define NVT_EDID_DISPLAY_DESCRIPTOR_MANUF_SPECIFIC_MIN 0x00   // manufacturer-specific descriptor range minimum
+#define NVT_EDID_DISPLAY_DESCRIPTOR_MANUF_SPECIFIC_MAX 0x0F   // manufacturer-specific descriptor range maximum
 
 //*******************
 // Raw EDID offsets and info
@@ -2189,6 +2194,7 @@ typedef struct tagNVT_EDID_18BYTE_DESCRIPTOR
 #define NVT_EDID_VER_1_2                     0x102
 #define NVT_EDID_VER_1_3                     0x103
 #define NVT_EDID_VER_1_4                     0x104
+#define NVT_EDID_MANUFACTURER_ID_CID         0x240D
 //
 // byte 0x14, Digital
 //    bits 0-3
@@ -3103,6 +3109,7 @@ typedef struct tagNVT_ADAPTIVE_SYNC_SDP_CTRL
     NvU32   srCoastingVTotal;
     NvBool  bFixedVTotal;
     NvBool  bRefreshRateDivider;
+    NvBool  bDisableSourceSinkSync;
 }NVT_ADAPTIVE_SYNC_SDP_CTRL;
 
 //***********************************
@@ -3363,7 +3370,7 @@ typedef struct tagNVT_VIDEO_INFOFRAME
 #define NVT_VIDEO_INFOFRAME_CONTENT_GAME                  4
 #define NVT_VIDEO_INFOFRAME_CONTENT_LAST                  4
 
-#pragma pack(1)
+#pragma pack(push, 1)
 typedef struct
 {
     // byte 1
@@ -3427,7 +3434,7 @@ typedef struct
         NvU8 rsvd_bits_byte15        : 1;
     }byte15;
 } NVT_VIDEO_INFOFRAME_OVERRIDE;
-#pragma pack()
+#pragma pack(pop)
 
 typedef struct
 {
@@ -3807,6 +3814,11 @@ typedef struct tagNVT_VENDOR_SPECIFIC_INFOFRAME
 #define NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_NONE         0x00
 #define NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_EXT          0x01
 #define NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_3D           0x02
+
+#define NVT_HDMI_HF_VS_BYTE4_VER_MASK               0xff
+#define NVT_HDMI_HF_VS_BYTE4_VER_SHIFT              0x00
+#define NVT_HDMI_HF_VS_BYTE4_VER_1_0                0x01
+
 // 0x03-0x07 reserved
 //
 #define NVT_HDMI_VS_BYTE5_HDMI_VIC_MASK             0xff    // HDMI_VID_FMT = HDMI_VID_FMT_EXT
@@ -4336,13 +4348,13 @@ typedef struct tagNVT_HDR_INFOFRAME_PAYLOAD
     NVT_HDR_INFOFRAME_MASTERING_DATA type1;
 } NVT_HDR_INFOFRAME_PAYLOAD;
 
-#pragma pack(1)
+#pragma pack(push, 1)
 typedef struct tagNVT_HDR_INFOFRAME
 {
     NVT_INFOFRAME_HEADER            header;
     NVT_HDR_INFOFRAME_PAYLOAD       payload;
 } NVT_HDR_INFOFRAME;
-#pragma pack()
+#pragma pack(pop)
 
 //
 //
@@ -5782,7 +5794,7 @@ typedef enum
 #define NVT_FLAG_CEA_4X3_TIMING                  0x00000400
 #define NVT_FLAG_CEA_16X9_TIMING                 0x00000800
 #define NVT_FLAG_OS_ADDED_TIMING                 0x00001000
-#define NVT_FLAG_SPECTRUM_SPREAD                 0x00002000
+#define NVT_FLAG_SPECTRUM_SPREAD                 0x00002000 // TODO: remove this
 #define NVT_FLAG_EDID_TIMING_RR_MATCH            0x00004000
 #define NVT_FLAG_EDID_861_ST                     0x00008000
 #define NVT_FLAG_EDID_DTD_EIZO_SPLIT             0x00010000
@@ -5805,13 +5817,14 @@ extern "C" {
 #endif
 
 // Generic timing parameter calculation
-NvU16 NvTiming_CalcRR(NvU32 pclk, NvU16 interlaced, NvU16 HTotal, NvU16 VTotal);
-NvU32 NvTiming_CalcRRx1k(NvU32 pclk, NvU16 interlaced, NvU16 HTotal, NvU16 VTotal);
+NvU16 NvTiming_CalcRR(NvU32 pclk1khz, NvU16 interlaced, NvU16 HTotal, NvU16 VTotal);
+NvU32 NvTiming_CalcRRx1k(NvU32 pclk1khz, NvU16 interlaced, NvU16 HTotal, NvU16 VTotal);
 
 NvU32 NvTiming_IsRoundedRREqual(NvU16 rr1, NvU32 rr1x1k, NvU16 rr2);
 NvU32 NvTiming_IsTimingExactEqual(const NVT_TIMING *pT1, const NVT_TIMING *pT2);
 NvU32 NvTiming_IsTimingExactEqualEx(const NVT_TIMING *pT1, const NVT_TIMING *pT2);
 NvU32 NvTiming_IsTimingRelaxedEqual(const NVT_TIMING *pT1, const NVT_TIMING *pT2);
+NvU32 NvTiming_IsTimingRelaxedEqualEx(const NVT_TIMING *pT1, const NVT_TIMING *pT2);
 NvU16 NvTiming_MaxFrameWidth(NvU16 HVisible, NvU16 rep);
 
 NvU32 NvTiming_GetVrrFmin(const NVT_EDID_INFO *pEdidInfo, const NVT_DISPLAYID_2_0_INFO *pDisplayIdInfo,
@@ -5837,6 +5850,9 @@ NVT_STATUS NvTiming_CalcCVT_RB(NvU32 width, NvU32 height, NvU32 rr, NvU32 flag, 
 NVT_STATUS NvTiming_CalcCVT_RB2(NvU32 width, NvU32 height, NvU32 rr, NvBool is1000div1001, NvBool isAltMiniVblankTiming, NVT_TIMING *pT);
 NVT_STATUS NvTiming_CalcCVT_RB3(NvU32 width, NvU32 height, NvU32 rr, NvU32 deltaHBlank, NvU32 vBlankMicroSec, NvBool isAltMiniVblankTiming, NvBool isEarlyVSync, NVT_TIMING *pT);
 NvBool NvTiming_IsTimingCVTRB(const NVT_TIMING *pTiming);
+
+NvU32 computeGCD(NvU32 a, NvU32 b);
+NvU32 computeLCM(NvU32 a, NvU32 b);
 
 // OVT timing calculation
 NVT_STATUS NvTiming_CalcOVT(NvU32 width, NvU32 height, NvU32 rr, NVT_TIMING *pT);
@@ -5895,8 +5911,10 @@ NvU32 a_div_b(NvU32 a, NvU32 b);
 NvU32 calculateCRC32(NvU8* pBuf, NvU32 bufsize);
 void  patchChecksum(NvU8* pBuf);
 NvBool isChecksumValid(NvU8* pBuf);
-NvU32 RRx1kToPclk (NVT_TIMING *pT);
+NvU32 RRx1kToPclk (const NVT_TIMING *pT);
+NvU32 RRx1kToPclk1khz (const NVT_TIMING *pT);
 
+NvU32      NvTiming_CalculateVBlankTimeInUs(const NVT_TIMING *pT);
 NVT_STATUS NvTiming_ComposeCustTimingString(NVT_TIMING *pT);
 
 // Infoframe/SDP composer

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -44,7 +44,7 @@
 
 #define WATCHDOG_RESET_QUEUE_SIZE (4)
 
-// KernelWatchdog.flags
+// KernelWatchdogState.flags
 #define WATCHDOG_FLAGS_INITIALIZED        NVBIT(0) // Fully initialized and ready
 #define WATCHDOG_FLAGS_DISABLED           NVBIT(1) // Disabled
 #define WATCHDOG_FLAGS_ALLOC_UNCACHED_PCI NVBIT(2) // Alloc cached / uncached pushbuffer
@@ -70,7 +70,7 @@ typedef struct {
     NvU32 thwapRepeatMask;
     NvU32 stompChannelMask;
     NvU32 stompRepeatMask;
-    /*! Mask of allocations to fail for testing RC. See nvcm.h */
+    /*! Mask of allocations to fail for testing RC */
     NvU32 allocFailMask;
     /*! Array of NvU32 to hold last vblank counter */
     NvU32 oldVblank[OBJ_MAX_HEADS];
@@ -80,7 +80,7 @@ typedef struct {
     NvNotification *errorContext;
     NvNotification *notifierToken;
     NvBool bHandleValid;
-} KernelWatchdog;
+} KernelWatchdogState;
 
 
 /*! Persistent watchdog state preserved across watchdog shutdowns */
@@ -110,7 +110,7 @@ typedef struct
     NvU32 gpEntry0[2];
     NvU32 gpEntry1[2];
     NvU32 pbBytes;
-    NvU32 class2dSubch;
+    NvU32 classSubch;
 } KernelWatchdogChannelInfo;
 
 #endif // ifndef KERNEL_RC_WATCHDOG_PRIVATE_H

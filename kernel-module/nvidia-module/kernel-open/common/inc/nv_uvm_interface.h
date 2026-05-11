@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2013-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2013-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -29,7 +29,7 @@
 #define _NV_UVM_INTERFACE_H_
 
 // Forward references, to break circular header file dependencies:
-struct UvmOpsUvmEvents;
+struct UvmEventsLinux;
 
 #if defined(NVIDIA_UVM_ENABLED)
 
@@ -46,6 +46,7 @@ struct UvmOpsUvmEvents;
 #include "nvgputypes.h"
 #include "nvstatus.h"
 #include "nv_uvm_types.h"
+#include "nv_uvm_user_types.h"
 
 
 // Define the type here as it's Linux specific, used only by the Linux specific
@@ -1007,6 +1008,65 @@ NV_STATUS nvUvmInterfaceFlushReplayableFaultBuffer(UvmGpuFaultInfo *pFaultInfo,
 */
 NV_STATUS nvUvmInterfaceTogglePrefetchFaults(UvmGpuFaultInfo *pFaultInfo,
                                              NvBool bEnable);
+/*******************************************************************************
+    nvUvmInterfaceAccessBitsBufAlloc
+
+    This function allocates a buffer for access bits.
+
+    Arguments:
+        device[IN]           - Device handle associated with the gpu
+        pAccessBitsInfo[OUT] - Information provided by RM for access bits handling
+
+    Error codes:
+      NV_ERR_INVALID_ARGUMENT   - If the parameter/s is invalid.
+      NV_ERR_NO_MEMORY          - If the memory allocation fails.
+      NV_ERR_GENERIC            - Unexpected error. We try hard to
+                                  avoid returning this error code, 
+                                  because it is not very informative.
+*/
+NV_STATUS nvUvmInterfaceAccessBitsBufAlloc(uvmGpuDeviceHandle device,
+                                           UvmGpuAccessBitsBufferAlloc* pAccessBitsInfo);
+
+/*******************************************************************************
+    nvUvmInterfaceAccessBitsBufFree
+
+    This function frees the buffer used for access bits.
+
+    Arguments:
+        device[IN]           - Device handle associated with the gpu
+        pAccessBitsInfo[IN]  - Information containing the access bits buffer handle to be freed
+
+    Error codes:
+      NV_ERR_INVALID_ARGUMENT   - If the parameter/s is invalid.
+      NV_ERR_GENERIC            - Unexpected error. We try hard to
+                                  avoid returning this error code, 
+                                  because it is not very informative.
+*/
+NV_STATUS nvUvmInterfaceAccessBitsBufFree(uvmGpuDeviceHandle device,
+                                          UvmGpuAccessBitsBufferAlloc* pAccessBitsInfo);
+
+/*******************************************************************************
+    nvUvmInterfaceAccessBitsDump
+
+    This function get the access bits information in accordance with the mode
+    requested and stores it in the buffer provided by the client.
+
+    Arguments:
+        device[IN]               - Device handle associated with the gpu
+        pAccessBitsInfo[IN/OUT]  - Information containing the access bits buffer 
+                                   handle to be used for dumping the access bits
+                                   and the buffer where the dumped data will be stored
+        mode[IN]                 - Mode in which the access bits are dumped
+
+    Error codes:
+      NV_ERR_INVALID_ARGUMENT   - If the parameter/s is invalid.
+      NV_ERR_GENERIC            - Unexpected error. We try hard to
+                                  avoid returning this error code, 
+                                  because it is not very informative.
+*/
+NV_STATUS nvUvmInterfaceAccessBitsDump(uvmGpuDeviceHandle device,
+                                       UvmGpuAccessBitsBufferAlloc* pAccessBitsInfo,
+                                       UVM_ACCESS_BITS_DUMP_MODE mode);
 
 /*******************************************************************************
     nvUvmInterfaceInitAccessCntrInfo
@@ -1085,20 +1145,20 @@ NV_STATUS nvUvmInterfaceDisableAccessCntr(uvmGpuDeviceHandle device,
                                           UvmGpuAccessCntrInfo *pAccessCntrInfo);
 
 //
-// Called by the UVM driver to register operations with RM. Only one set of
+// Called by the UVM driver to register event callbacks with RM. Only one set of
 // callbacks can be registered by any driver at a time. If another set of
 // callbacks was already registered, NV_ERR_IN_USE is returned.
 //
-NV_STATUS nvUvmInterfaceRegisterUvmCallbacks(struct UvmOpsUvmEvents *importedUvmOps);
+NV_STATUS nvUvmInterfaceRegisterUvmEvents(struct UvmEventsLinux *importedEvents);
 
 //
-// Counterpart to nvUvmInterfaceRegisterUvmCallbacks. This must only be called
-// if nvUvmInterfaceRegisterUvmCallbacks returned NV_OK.
+// Counterpart to nvUvmInterfaceRegisterUvmEvents. This must only be called if
+// nvUvmInterfaceRegisterUvmEvents returned NV_OK.
 //
 // Upon return, the caller is guaranteed that any outstanding callbacks are done
 // and no new ones will be invoked.
 //
-void nvUvmInterfaceDeRegisterUvmOps(void);
+void nvUvmInterfaceDeRegisterUvmEvents(void);
 
 /*******************************************************************************
     nvUvmInterfaceGetNvlinkInfo

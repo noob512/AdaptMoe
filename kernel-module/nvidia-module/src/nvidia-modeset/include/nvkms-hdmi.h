@@ -54,21 +54,24 @@ void nvHdmiDpEnableDisableAudio(const NVDispEvoRec *pDispEvo,
 
 void nvRemoveUnusedHdmiDpAudioDevice(const NVDispEvoRec *pDispEvo);
 
-void nvHdmiSetVRR(NVDispEvoPtr pDispEvo, NvU32 head, NvBool enable);
+void nvHdmiSetVRR(const NVDispEvoPtr pDispEvo,
+                  NvU32 head,
+                  NvBool enable,
+                  NVT_EXTENDED_METADATA_PACKET_INFOFRAME_CTRL *empCtrl);
 
 NvBool nvInitHdmiLibrary(NVDevEvoRec *pDevEvo);
 void nvTeardownHdmiLibrary(NVDevEvoRec *pDevEvo);
 
 NvBool nvHdmiFrlAssessLink(NVDpyEvoPtr pDpyEvo);
 NvBool nvHdmiDpySupportsFrl(const NVDpyEvoRec *pDpyEvo);
-NvBool nvHdmiFrlQueryConfig(const NVDpyEvoRec *pDpyEvo,
-                            const NvModeTimings *pModeTimings,
-                            const NVHwModeTimingsEvo *pHwTimings,
-                            NVDpyAttributeColor *pDpyColor,
-                            const NvBool b2Heads1Or,
-                            const struct NvKmsModeValidationParams *pValidationParams,
-                            HDMI_FRL_CONFIG *pConfig,
-                            NVDscInfoEvoRec *pDscInfo);
+NvBool nvHdmiFrlQueryConfigOneColorSpaceAndBpc(const NVDpyEvoRec *pDpyEvo,
+                                               const NvModeTimings *pModeTimings,
+                                               const NVHwModeTimingsEvo *pHwTimings,
+                                               const NVDpyAttributeColor *pDpyColor,
+                                               const NvBool b2Heads1Or,
+                                               const struct NvKmsModeValidationParams *pValidationParams,
+                                               HDMI_FRL_CONFIG *pConfig,
+                                               NVDscInfoEvoRec *pDscInfo);
 void nvHdmiFrlClearConfig(NVDispEvoRec *pDispEvo, NvU32 activeRmId);
 void nvHdmiFrlSetConfig(NVDispEvoRec *pDispEvo, NvU32 head);
 
@@ -76,9 +79,15 @@ void nvHdmiDpConstructHeadAudioState(const NvU32 displayId,
                                      const NVDpyEvoRec *pDpyEvo,
                                      NVDispHeadAudioStateEvoRec *pAudioState);
 
-NvU32 nvHdmiGetEffectivePixelClockKHz(const NVDpyEvoRec *pDpyEvo,
-                                      const NVHwModeTimingsEvo *pHwTimings,
-                                      const NVDpyAttributeColor *pDpyColor);
+NvBool nvHdmiIsTmdsPossible(const NVDpyEvoRec *pDpyEvo,
+                            const NVHwModeTimingsEvo *pHwTimings,
+                            const NVDpyAttributeColor *pDpyColor);
+
+static inline NvBool nvHdmiIsFrlPossible(const NVDpyEvoRec *pDpyEvo)
+{
+    return nvHdmiDpySupportsFrl(pDpyEvo) &&
+           (pDpyEvo->hdmi.sinkCaps.linkMaxFRLRate != HDMI_FRL_DATA_RATE_NONE);
+}
 
 static inline NvBool nvHdmiDpySupportsDsc(const NVDpyEvoRec *pDpyEvo)
 {

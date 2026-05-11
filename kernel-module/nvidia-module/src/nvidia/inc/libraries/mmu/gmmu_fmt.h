@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2014-2019 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2014-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -24,6 +24,14 @@
 #define _NV_GMMU_FMT_H_
 
 #include <ctrl/ctrl90f1.h>
+
+#if (defined(NVRM) || defined(RMCFG_FEATURE_PLATFORM_GSP)) && !defined(NVWATCH)
+#include <rmconfig.h>
+#else
+#if !defined(RMCFG_CHIP_ENABLED)
+#define RMCFG_CHIP_x 0
+#endif
+#endif //(defined(NVRM) || defined(RMCFG_FEATURE_PLATFORM_GSP)) && !defined(NVWATCH)
 
 #ifdef __cplusplus
 extern "C" {
@@ -614,12 +622,18 @@ NvBool gmmuFmtEntryIsPte(
             const MMU_FMT_LEVEL *pLevel,
             const NvU8          *pEntry);
 
+typedef enum
+{
+    GMMU_PEER_TYPE_LEGACY
+} GMMU_PEER_TYPE;
+
 /*!
  * Get the PTE physical address field format for a given aperture.
  */
 const GMMU_FIELD_ADDRESS *gmmuFmtPtePhysAddrFld(
                         const GMMU_FMT_PTE *pPte,
-                        const GMMU_APERTURE aperture);
+                        const GMMU_APERTURE aperture,
+                        const GMMU_PEER_TYPE peerType);
 
 /*!
  * GPU compression attributes for a physical surface.

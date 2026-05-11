@@ -46,7 +46,7 @@ extern "C" {
 
 #include "gpu/gpu_resource.h" // GpuResource
 #include "mem_mgr/mem.h"
-#include "rmapi/event.h"     // EVENTNOTIFICATION
+#include "rmapi/event_api.h"     // EVENTNOTIFICATION
 
 #include "class/cl00da.h"    // NV_SEMAPHORE_SURFACE
 #include "ctrl/ctrl00da.h"   // NV_SEMAPHORE_SURFACE_CTRL_*
@@ -193,14 +193,6 @@ struct SemaphoreSurface {
     struct GpuResource *__nvoc_pbase_GpuResource;    // gpures super
     struct SemaphoreSurface *__nvoc_pbase_SemaphoreSurface;    // semsurf
 
-    // Vtable with 6 per-object function pointers
-    NV_STATUS (*__semsurfCtrlCmdRefMemory__)(struct SemaphoreSurface * /*this*/, NV_SEMAPHORE_SURFACE_CTRL_REF_MEMORY_PARAMS *);  // exported (id=0xda0001)
-    NV_STATUS (*__semsurfCtrlCmdBindChannel__)(struct SemaphoreSurface * /*this*/, NV_SEMAPHORE_SURFACE_CTRL_BIND_CHANNEL_PARAMS *);  // exported (id=0xda0002)
-    NV_STATUS (*__semsurfCtrlCmdUnbindChannel__)(struct SemaphoreSurface * /*this*/, NV_SEMAPHORE_SURFACE_CTRL_UNBIND_CHANNEL_PARAMS *);  // exported (id=0xda0006)
-    NV_STATUS (*__semsurfCtrlCmdRegisterWaiter__)(struct SemaphoreSurface * /*this*/, NV_SEMAPHORE_SURFACE_CTRL_REGISTER_WAITER_PARAMS *);  // exported (id=0xda0003)
-    NV_STATUS (*__semsurfCtrlCmdSetValue__)(struct SemaphoreSurface * /*this*/, NV_SEMAPHORE_SURFACE_CTRL_SET_VALUE_PARAMS *);  // exported (id=0xda0004)
-    NV_STATUS (*__semsurfCtrlCmdUnregisterWaiter__)(struct SemaphoreSurface * /*this*/, NV_SEMAPHORE_SURFACE_CTRL_UNREGISTER_WAITER_PARAMS *);  // exported (id=0xda0005)
-
     // Data members
     SEM_SHARED_DATA *pShared;
     SEM_CHANNEL_BINDING boundChannelMap;
@@ -243,13 +235,9 @@ struct NVOC_METADATA__SemaphoreSurface {
     const struct NVOC_VTABLE__SemaphoreSurface vtable;
 };
 
-#ifndef __NVOC_CLASS_SemaphoreSurface_TYPEDEF__
-#define __NVOC_CLASS_SemaphoreSurface_TYPEDEF__
-typedef struct SemaphoreSurface SemaphoreSurface;
-#endif /* __NVOC_CLASS_SemaphoreSurface_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_SemaphoreSurface
-#define __nvoc_class_id_SemaphoreSurface 0xeabc69
+#define __nvoc_class_id_SemaphoreSurface 0xeabc69u
+typedef struct SemaphoreSurface SemaphoreSurface;
 #endif /* __nvoc_class_id_SemaphoreSurface */
 
 // Casting support
@@ -267,26 +255,102 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_SemaphoreSurface;
 
 NV_STATUS __nvoc_objCreateDynamic_SemaphoreSurface(SemaphoreSurface**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_SemaphoreSurface(SemaphoreSurface**, Dynamic*, NvU32, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_SemaphoreSurface(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_SemaphoreSurface((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_SemaphoreSurface(SemaphoreSurface**, Dynamic*, NvU32, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_SemaphoreSurface(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_SemaphoreSurface((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS semsurfConstruct_IMPL(struct SemaphoreSurface *semaphoreSurf, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_semsurfConstruct(semaphoreSurf, pCallContext, pParams) semsurfConstruct_IMPL(semaphoreSurf, pCallContext, pParams)
+
+void semsurfDestruct_IMPL(struct SemaphoreSurface *pSemSurf);
+#define __nvoc_semsurfDestruct(pSemSurf) semsurfDestruct_IMPL(pSemSurf)
+
+NV_STATUS semsurfCtrlCmdRefMemory_IMPL(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_REF_MEMORY_PARAMS *pParams);
+#ifdef __nvoc_sem_surf_h_disabled
+static inline NV_STATUS semsurfCtrlCmdRefMemory(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_REF_MEMORY_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("SemaphoreSurface was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_sem_surf_h_disabled
+#define semsurfCtrlCmdRefMemory(pSemaphoreSurf, pParams) semsurfCtrlCmdRefMemory_IMPL(pSemaphoreSurf, pParams)
+#endif // __nvoc_sem_surf_h_disabled
+
+NV_STATUS semsurfCtrlCmdBindChannel_IMPL(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_BIND_CHANNEL_PARAMS *pParams);
+#ifdef __nvoc_sem_surf_h_disabled
+static inline NV_STATUS semsurfCtrlCmdBindChannel(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_BIND_CHANNEL_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("SemaphoreSurface was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_sem_surf_h_disabled
+#define semsurfCtrlCmdBindChannel(pSemaphoreSurf, pParams) semsurfCtrlCmdBindChannel_IMPL(pSemaphoreSurf, pParams)
+#endif // __nvoc_sem_surf_h_disabled
+
+NV_STATUS semsurfCtrlCmdUnbindChannel_IMPL(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_UNBIND_CHANNEL_PARAMS *pParams);
+#ifdef __nvoc_sem_surf_h_disabled
+static inline NV_STATUS semsurfCtrlCmdUnbindChannel(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_UNBIND_CHANNEL_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("SemaphoreSurface was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_sem_surf_h_disabled
+#define semsurfCtrlCmdUnbindChannel(pSemaphoreSurf, pParams) semsurfCtrlCmdUnbindChannel_IMPL(pSemaphoreSurf, pParams)
+#endif // __nvoc_sem_surf_h_disabled
+
+NV_STATUS semsurfCtrlCmdRegisterWaiter_IMPL(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_REGISTER_WAITER_PARAMS *pParams);
+#ifdef __nvoc_sem_surf_h_disabled
+static inline NV_STATUS semsurfCtrlCmdRegisterWaiter(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_REGISTER_WAITER_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("SemaphoreSurface was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_sem_surf_h_disabled
+#define semsurfCtrlCmdRegisterWaiter(pSemaphoreSurf, pParams) semsurfCtrlCmdRegisterWaiter_IMPL(pSemaphoreSurf, pParams)
+#endif // __nvoc_sem_surf_h_disabled
+
+NV_STATUS semsurfCtrlCmdSetValue_IMPL(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_SET_VALUE_PARAMS *pParams);
+#ifdef __nvoc_sem_surf_h_disabled
+static inline NV_STATUS semsurfCtrlCmdSetValue(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_SET_VALUE_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("SemaphoreSurface was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_sem_surf_h_disabled
+#define semsurfCtrlCmdSetValue(pSemaphoreSurf, pParams) semsurfCtrlCmdSetValue_IMPL(pSemaphoreSurf, pParams)
+#endif // __nvoc_sem_surf_h_disabled
+
+NV_STATUS semsurfCtrlCmdUnregisterWaiter_IMPL(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_UNREGISTER_WAITER_PARAMS *pParams);
+#ifdef __nvoc_sem_surf_h_disabled
+static inline NV_STATUS semsurfCtrlCmdUnregisterWaiter(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_UNREGISTER_WAITER_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("SemaphoreSurface was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_sem_surf_h_disabled
+#define semsurfCtrlCmdUnregisterWaiter(pSemaphoreSurf, pParams) semsurfCtrlCmdUnregisterWaiter_IMPL(pSemaphoreSurf, pParams)
+#endif // __nvoc_sem_surf_h_disabled
+
+NvU64 semsurfGetValue_IMPL(struct SemaphoreSurface *pSemSurf, NvU64 index);
+#ifdef __nvoc_sem_surf_h_disabled
+static inline NvU64 semsurfGetValue(struct SemaphoreSurface *pSemSurf, NvU64 index) {
+    NV_ASSERT_FAILED_PRECOMP("SemaphoreSurface was disabled!");
+    return 0;
+}
+#else // __nvoc_sem_surf_h_disabled
+#define semsurfGetValue(pSemSurf, index) semsurfGetValue_IMPL(pSemSurf, index)
+#endif // __nvoc_sem_surf_h_disabled
+
+NvBool semsurfValidateIndex_IMPL(struct SemaphoreSurface *pSemSurf, NvU64 index);
+#ifdef __nvoc_sem_surf_h_disabled
+static inline NvBool semsurfValidateIndex(struct SemaphoreSurface *pSemSurf, NvU64 index) {
+    NV_ASSERT_FAILED_PRECOMP("SemaphoreSurface was disabled!");
+    return NV_FALSE;
+}
+#else // __nvoc_sem_surf_h_disabled
+#define semsurfValidateIndex(pSemSurf, index) semsurfValidateIndex_IMPL(pSemSurf, index)
+#endif // __nvoc_sem_surf_h_disabled
+
+
+// Wrapper macros for halified functions
 #define semsurfCanCopy_FNPTR(pSemSurf) pSemSurf->__nvoc_metadata_ptr->vtable.__semsurfCanCopy__
 #define semsurfCanCopy(pSemSurf) semsurfCanCopy_DISPATCH(pSemSurf)
-#define semsurfCtrlCmdRefMemory_FNPTR(pSemaphoreSurf) pSemaphoreSurf->__semsurfCtrlCmdRefMemory__
-#define semsurfCtrlCmdRefMemory(pSemaphoreSurf, pParams) semsurfCtrlCmdRefMemory_DISPATCH(pSemaphoreSurf, pParams)
-#define semsurfCtrlCmdBindChannel_FNPTR(pSemaphoreSurf) pSemaphoreSurf->__semsurfCtrlCmdBindChannel__
-#define semsurfCtrlCmdBindChannel(pSemaphoreSurf, pParams) semsurfCtrlCmdBindChannel_DISPATCH(pSemaphoreSurf, pParams)
-#define semsurfCtrlCmdUnbindChannel_FNPTR(pSemaphoreSurf) pSemaphoreSurf->__semsurfCtrlCmdUnbindChannel__
-#define semsurfCtrlCmdUnbindChannel(pSemaphoreSurf, pParams) semsurfCtrlCmdUnbindChannel_DISPATCH(pSemaphoreSurf, pParams)
-#define semsurfCtrlCmdRegisterWaiter_FNPTR(pSemaphoreSurf) pSemaphoreSurf->__semsurfCtrlCmdRegisterWaiter__
-#define semsurfCtrlCmdRegisterWaiter(pSemaphoreSurf, pParams) semsurfCtrlCmdRegisterWaiter_DISPATCH(pSemaphoreSurf, pParams)
-#define semsurfCtrlCmdSetValue_FNPTR(pSemaphoreSurf) pSemaphoreSurf->__semsurfCtrlCmdSetValue__
-#define semsurfCtrlCmdSetValue(pSemaphoreSurf, pParams) semsurfCtrlCmdSetValue_DISPATCH(pSemaphoreSurf, pParams)
-#define semsurfCtrlCmdUnregisterWaiter_FNPTR(pSemaphoreSurf) pSemaphoreSurf->__semsurfCtrlCmdUnregisterWaiter__
-#define semsurfCtrlCmdUnregisterWaiter(pSemaphoreSurf, pParams) semsurfCtrlCmdUnregisterWaiter_DISPATCH(pSemaphoreSurf, pParams)
 #define semsurfControl_FNPTR(pGpuResource) pGpuResource->__nvoc_base_GpuResource.__nvoc_metadata_ptr->vtable.__gpuresControl__
 #define semsurfControl(pGpuResource, pCallContext, pParams) semsurfControl_DISPATCH(pGpuResource, pCallContext, pParams)
 #define semsurfMap_FNPTR(pGpuResource) pGpuResource->__nvoc_base_GpuResource.__nvoc_metadata_ptr->vtable.__gpuresMap__
@@ -339,30 +403,6 @@ NV_STATUS __nvoc_objCreate_SemaphoreSurface(SemaphoreSurface**, Dynamic*, NvU32,
 // Dispatch functions
 static inline NvBool semsurfCanCopy_DISPATCH(struct SemaphoreSurface *pSemSurf) {
     return pSemSurf->__nvoc_metadata_ptr->vtable.__semsurfCanCopy__(pSemSurf);
-}
-
-static inline NV_STATUS semsurfCtrlCmdRefMemory_DISPATCH(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_REF_MEMORY_PARAMS *pParams) {
-    return pSemaphoreSurf->__semsurfCtrlCmdRefMemory__(pSemaphoreSurf, pParams);
-}
-
-static inline NV_STATUS semsurfCtrlCmdBindChannel_DISPATCH(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_BIND_CHANNEL_PARAMS *pParams) {
-    return pSemaphoreSurf->__semsurfCtrlCmdBindChannel__(pSemaphoreSurf, pParams);
-}
-
-static inline NV_STATUS semsurfCtrlCmdUnbindChannel_DISPATCH(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_UNBIND_CHANNEL_PARAMS *pParams) {
-    return pSemaphoreSurf->__semsurfCtrlCmdUnbindChannel__(pSemaphoreSurf, pParams);
-}
-
-static inline NV_STATUS semsurfCtrlCmdRegisterWaiter_DISPATCH(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_REGISTER_WAITER_PARAMS *pParams) {
-    return pSemaphoreSurf->__semsurfCtrlCmdRegisterWaiter__(pSemaphoreSurf, pParams);
-}
-
-static inline NV_STATUS semsurfCtrlCmdSetValue_DISPATCH(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_SET_VALUE_PARAMS *pParams) {
-    return pSemaphoreSurf->__semsurfCtrlCmdSetValue__(pSemaphoreSurf, pParams);
-}
-
-static inline NV_STATUS semsurfCtrlCmdUnregisterWaiter_DISPATCH(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_UNREGISTER_WAITER_PARAMS *pParams) {
-    return pSemaphoreSurf->__semsurfCtrlCmdUnregisterWaiter__(pSemaphoreSurf, pParams);
 }
 
 static inline NV_STATUS semsurfControl_DISPATCH(struct SemaphoreSurface *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams) {
@@ -461,10 +501,12 @@ static inline void semsurfAddAdditionalDependants_DISPATCH(struct RsClient *pCli
     pResource->__nvoc_metadata_ptr->vtable.__semsurfAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
-static inline NvBool semsurfCanCopy_e661f0(struct SemaphoreSurface *pSemSurf) {
+// Virtual method declarations and/or inline definitions
+static inline NvBool semsurfCanCopy_e661f0(struct SemaphoreSurface *pSemSurf){
     return NV_TRUE;
 }
 
+// Exported method declarations and/or inline definitions
 NV_STATUS semsurfCtrlCmdRefMemory_IMPL(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_REF_MEMORY_PARAMS *pParams);
 
 NV_STATUS semsurfCtrlCmdBindChannel_IMPL(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_BIND_CHANNEL_PARAMS *pParams);
@@ -477,34 +519,10 @@ NV_STATUS semsurfCtrlCmdSetValue_IMPL(struct SemaphoreSurface *pSemaphoreSurf, N
 
 NV_STATUS semsurfCtrlCmdUnregisterWaiter_IMPL(struct SemaphoreSurface *pSemaphoreSurf, NV_SEMAPHORE_SURFACE_CTRL_UNREGISTER_WAITER_PARAMS *pParams);
 
-NV_STATUS semsurfConstruct_IMPL(struct SemaphoreSurface *arg_semaphoreSurf, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_semsurfConstruct(arg_semaphoreSurf, arg_pCallContext, arg_pParams) semsurfConstruct_IMPL(arg_semaphoreSurf, arg_pCallContext, arg_pParams)
-void semsurfDestruct_IMPL(struct SemaphoreSurface *pSemSurf);
-
-#define __nvoc_semsurfDestruct(pSemSurf) semsurfDestruct_IMPL(pSemSurf)
-NvU64 semsurfGetValue_IMPL(struct SemaphoreSurface *pSemSurf, NvU64 index);
-
-#ifdef __nvoc_sem_surf_h_disabled
-static inline NvU64 semsurfGetValue(struct SemaphoreSurface *pSemSurf, NvU64 index) {
-    NV_ASSERT_FAILED_PRECOMP("SemaphoreSurface was disabled!");
-    return 0;
-}
-#else //__nvoc_sem_surf_h_disabled
-#define semsurfGetValue(pSemSurf, index) semsurfGetValue_IMPL(pSemSurf, index)
-#endif //__nvoc_sem_surf_h_disabled
-
-NvBool semsurfValidateIndex_IMPL(struct SemaphoreSurface *pSemSurf, NvU64 index);
-
-#ifdef __nvoc_sem_surf_h_disabled
-static inline NvBool semsurfValidateIndex(struct SemaphoreSurface *pSemSurf, NvU64 index) {
-    NV_ASSERT_FAILED_PRECOMP("SemaphoreSurface was disabled!");
-    return NV_FALSE;
-}
-#else //__nvoc_sem_surf_h_disabled
-#define semsurfValidateIndex(pSemSurf, index) semsurfValidateIndex_IMPL(pSemSurf, index)
-#endif //__nvoc_sem_surf_h_disabled
-
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

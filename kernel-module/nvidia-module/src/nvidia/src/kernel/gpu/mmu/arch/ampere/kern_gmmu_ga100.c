@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2018-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2018-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -32,6 +32,7 @@
 
 #include "published/ampere/ga100/dev_fault.h"
 #include "published/ampere/ga100/dev_top.h"
+#include "published/ampere/ga100/dev_top_addendum.h"
 #include "published/ampere/ga100/dev_vm.h"
 
 
@@ -166,7 +167,7 @@ kgmmuSetupWarForBug2720120FmtFamily_GA100
                                          kgmmuGetPTEAperture(pKernelGmmu),
                                          kgmmuGetPTEAttr(pKernelGmmu), 0));
 
-    memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_WAR_PT, 
+    memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_WAR_PT,
                     pKernelGmmu->pWarSmallPageTable);
     NV_ASSERT_OK_OR_GOTO(status, status, failed);
 
@@ -185,7 +186,7 @@ kgmmuSetupWarForBug2720120FmtFamily_GA100
                              pFam->bug2720120WarPde0.v8);
         gmmuFieldSetAddress(gmmuFmtPdePhysAddrFld(pPde0Fmt, aperture),
                              kgmmuEncodePhysAddr(pKernelGmmu, aperture,
-                                     memdescGetPhysAddr(pKernelGmmu->pWarSmallPageTable,
+                                     memdescGetPtePhysAddr(pKernelGmmu->pWarSmallPageTable,
                                                         AT_GPU, 0),
                                      NVLINK_INVALID_FABRIC_ADDR),
                              pFam->bug2720120WarPde0.v8);
@@ -201,7 +202,7 @@ kgmmuSetupWarForBug2720120FmtFamily_GA100
                                                kgmmuGetPTEAperture(pKernelGmmu),
                                                kgmmuGetPTEAttr(pKernelGmmu), 0), failed);
 
-    memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_WAR_PD, 
+    memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_WAR_PD,
                     pKernelGmmu->pWarPageDirectory0);
     NV_ASSERT_OK_OR_GOTO(status, status, failed);
 
@@ -227,7 +228,7 @@ kgmmuSetupWarForBug2720120FmtFamily_GA100
                              pFam->bug2720120WarPde1.v8);
         gmmuFieldSetAddress(gmmuFmtPdePhysAddrFld(pPde1Fmt, aperture),
                              kgmmuEncodePhysAddr(pKernelGmmu, aperture,
-                                     memdescGetPhysAddr(pKernelGmmu->pWarPageDirectory0,
+                                     memdescGetPtePhysAddr(pKernelGmmu->pWarPageDirectory0,
                                                         AT_GPU, 0),
                                      NVLINK_INVALID_FABRIC_ADDR),
                              pFam->bug2720120WarPde1.v8);
@@ -272,7 +273,7 @@ kgmmuInitCeMmuFaultIdRange_GA100
 
     for (i = 0; i < pGpu->numDeviceInfoEntries; i++)
     {
-        if (pGpu->pDeviceInfoTable[i].typeEnum == NV_PTOP_DEVICE_INFO2_DEV_TYPE_ENUM_LCE)
+        if (pGpu->pDeviceInfoTable[i].typeEnum == NV_PTOP_ZB_DEVICE_INFO_DEV_TYPE_ENUM_LCE)
         {
             minMmuFaultId = NV_MIN(minMmuFaultId, pGpu->pDeviceInfoTable[i].faultId);
             maxMmuFaultId = NV_MAX(maxMmuFaultId, pGpu->pDeviceInfoTable[i].faultId);
@@ -376,30 +377,26 @@ kgmmuServiceMmuFault_GA100
     FIFO_MMU_EXCEPTION_DATA *pMmuExceptionData
 )
 {
+    NV_STATUS status = NV_OK;
+
     MMU_FAULT_BUFFER_ENTRY *pParsedFaultEntry = KERNEL_POINTER_FROM_NvP64(MMU_FAULT_BUFFER_ENTRY *, pParsedFaultInfo);
 
     //  If FLA fault do not reset channel
     if (pParsedFaultEntry->mmuFaultEngineId == NV_PFAULT_MMU_ENG_ID_FLA)
     {
-        if (pKernelGmmu->bReportFlaTranslationXid)
-        {
-            nvErrorLog_va((void *)pGpu,
-                DESTINATION_FLA_TRANSLATION_ERROR,
-                "FLA Fault: inst:0x%x dev:0x%x subdev:0x%x, faulted @ 0x%x_%08x. Fault is of type %s %s",
-                gpuGetInstance(pGpu),
-                gpuGetDeviceInstance(pGpu),
-                pGpu->subdeviceInstance,
-                pMmuExceptionData->addrHi,
-                pMmuExceptionData->addrLo,
-                kgmmuGetFaultTypeString_HAL(pKernelGmmu, pMmuExceptionData->faultType),
-                kfifoGetFaultAccessTypeString_HAL(pGpu, GPU_GET_KERNEL_FIFO(pGpu),
-                    pMmuExceptionData->accessType));
-        }
-
-        return NV_OK;
+        nvErrorLog_va((void *)pGpu,
+            NVLINK_REMOTE_TRANSLATION_ERROR,
+            "NVLink remote translation error: faulted @ 0x%x_%08x. Fault is of type %s %s",
+            pMmuExceptionData->addrHi,
+            pMmuExceptionData->addrLo,
+            kgmmuGetFaultTypeString_HAL(pKernelGmmu, pMmuExceptionData->faultType),
+            kfifoGetFaultAccessTypeString_HAL(pGpu, GPU_GET_KERNEL_FIFO(pGpu),
+                pMmuExceptionData->accessType));
     }
     else
     {
-        return kgmmuServiceMmuFault_GV100(pGpu, pKernelGmmu, pParsedFaultInfo, pMmuExceptionData);
+        status = kgmmuServiceMmuFault_GV100(pGpu, pKernelGmmu, pParsedFaultInfo, pMmuExceptionData);
     }
+
+    return status;
 }

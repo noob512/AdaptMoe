@@ -62,6 +62,8 @@ _out/Linux_x86_64/dp_groupimpl.o: \
  ../common/displayport/inc/dp_configcaps.h \
  ../common/displayport/inc/dp_crc.h \
  ../common/displayport/inc/dp_messagecodings.h \
+ ../common/displayport/inc/dp_qse.h \
+ ../common/displayport/inc/dp_displayid2.h \
  ../common/displayport/inc/dp_groupimpl.h \
  ../common/displayport/inc/dp_deviceimpl.h \
  ../common/displayport/inc/dp_linkedlist.h \
@@ -69,7 +71,7 @@ _out/Linux_x86_64/dp_groupimpl.o: \
  ../common/displayport/inc/dp_discovery.h \
  ../common/displayport/inc/dp_groupimpl.h \
  ../common/displayport/inc/./dptestutil/dp_testmessage.h \
- ../common/displayport/inc/dp_printf.h
+ ../common/displayport/inc/dp_qse.h ../common/displayport/inc/dp_printf.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 ../common/displayport/inc/dp_internal.h:
 ../common/sdk/nvidia/inc/nvtypes.h:
@@ -139,6 +141,8 @@ _out/Linux_x86_64/dp_groupimpl.o: \
 ../common/displayport/inc/dp_configcaps.h:
 ../common/displayport/inc/dp_crc.h:
 ../common/displayport/inc/dp_messagecodings.h:
+../common/displayport/inc/dp_qse.h:
+../common/displayport/inc/dp_displayid2.h:
 ../common/displayport/inc/dp_groupimpl.h:
 ../common/displayport/inc/dp_deviceimpl.h:
 ../common/displayport/inc/dp_linkedlist.h:
@@ -146,4 +150,5 @@ _out/Linux_x86_64/dp_groupimpl.o: \
 ../common/displayport/inc/dp_discovery.h:
 ../common/displayport/inc/dp_groupimpl.h:
 ../common/displayport/inc/./dptestutil/dp_testmessage.h:
+../common/displayport/inc/dp_qse.h:
 ../common/displayport/inc/dp_printf.h:

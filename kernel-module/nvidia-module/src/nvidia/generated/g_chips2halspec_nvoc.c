@@ -99,62 +99,77 @@ void __nvoc_init_halspec_ChipHal(ChipHal *pChipHal, NvU32 arch, NvU32 impl, NvU3
     // GH100
     else if(arch == 0x18 && impl == 0x0)
     {
-        pChipHal->__nvoc_HalVarIdx = 60;
+        pChipHal->__nvoc_HalVarIdx = 58;
     }
     // GB100
     else if(arch == 0x1A && impl == 0x0)
     {
-        pChipHal->__nvoc_HalVarIdx = 61;
+        pChipHal->__nvoc_HalVarIdx = 59;
     }
     // GB102
     else if(arch == 0x1A && impl == 0x2)
     {
-        pChipHal->__nvoc_HalVarIdx = 62;
+        pChipHal->__nvoc_HalVarIdx = 60;
     }
     // GB10B
     else if(arch == 0x1A && impl == 0xB)
     {
-        pChipHal->__nvoc_HalVarIdx = 63;
+        pChipHal->__nvoc_HalVarIdx = 61;
     }
     // GB110
     else if(arch == 0x1A && impl == 0x3)
     {
-        pChipHal->__nvoc_HalVarIdx = 65;
+        pChipHal->__nvoc_HalVarIdx = 63;
     }
     // GB112
     else if(arch == 0x1A && impl == 0x4)
     {
-        pChipHal->__nvoc_HalVarIdx = 66;
+        pChipHal->__nvoc_HalVarIdx = 64;
     }
     // GB202
     else if(arch == 0x1B && impl == 0x2)
     {
-        pChipHal->__nvoc_HalVarIdx = 69;
+        pChipHal->__nvoc_HalVarIdx = 67;
     }
     // GB203
     else if(arch == 0x1B && impl == 0x3)
     {
-        pChipHal->__nvoc_HalVarIdx = 70;
+        pChipHal->__nvoc_HalVarIdx = 68;
     }
     // GB205
     else if(arch == 0x1B && impl == 0x5)
     {
-        pChipHal->__nvoc_HalVarIdx = 71;
+        pChipHal->__nvoc_HalVarIdx = 69;
     }
     // GB206
     else if(arch == 0x1B && impl == 0x6)
     {
-        pChipHal->__nvoc_HalVarIdx = 72;
+        pChipHal->__nvoc_HalVarIdx = 70;
     }
     // GB207
     else if(arch == 0x1B && impl == 0x7)
     {
-        pChipHal->__nvoc_HalVarIdx = 73;
+        pChipHal->__nvoc_HalVarIdx = 71;
     }
     // GB20B
     else if(arch == 0x1B && impl == 0xB)
     {
-        pChipHal->__nvoc_HalVarIdx = 74;
+        pChipHal->__nvoc_HalVarIdx = 72;
+    }
+    // GB20C
+    else if(arch == 0x1B && impl == 0xC)
+    {
+        pChipHal->__nvoc_HalVarIdx = 73;
+    }
+    // T234D
+    else if(arch == 0x0 && impl == 0x0 && hidrev == 0x235)
+    {
+        pChipHal->__nvoc_HalVarIdx = 109;
+    }
+    // T264D
+    else if(arch == 0x0 && impl == 0x0 && hidrev == 0x265)
+    {
+        pChipHal->__nvoc_HalVarIdx = 111;
     }
 }
 
@@ -198,6 +213,11 @@ void __nvoc_init_halspec_DispIpHal(DispIpHal *pDispIpHal, NvU32 ipver)
     {
         pDispIpHal->__nvoc_HalVarIdx = 11;
     }
+    // DISPv0402
+    else if(ipver == 0x4020000)
+    {
+        pDispIpHal->__nvoc_HalVarIdx = 12;
+    }
     // DISPv0404
     else if(ipver == 0x4040000)
     {
@@ -218,10 +238,15 @@ void __nvoc_init_halspec_DispIpHal(DispIpHal *pDispIpHal, NvU32 ipver)
     {
         pDispIpHal->__nvoc_HalVarIdx = 17;
     }
+    // DISPv0504
+    else if(ipver == 0x5040000)
+    {
+        pDispIpHal->__nvoc_HalVarIdx = 18;
+    }
     // DISPv0000
     else if(ipver == 0x0)
     {
-        pDispIpHal->__nvoc_HalVarIdx = 19;
+        pDispIpHal->__nvoc_HalVarIdx = 20;
     }
 }
 

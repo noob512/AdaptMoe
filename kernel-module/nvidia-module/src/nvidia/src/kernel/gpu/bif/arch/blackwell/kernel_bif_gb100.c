@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -31,6 +31,9 @@
 #include "platform/chipset/chipset.h"
 #include "ctrl/ctrl2080/ctrl2080bus.h"
 #include "os/os.h"
+
+#include "published/blackwell/gb100/hwproject.h"
+#include "published/blackwell/gb100/dev_boot_zb.h"
 
 /*!
  * @brief Check if MSIX is enabled in HW
@@ -71,35 +74,6 @@ kbifIsMSIXEnabledInHW_GB100
         return FLD_TEST_DRF_NUM(_PF0, _MSIX_CAPABILITY,
                                 _HEADR_AND_CONTROL_MSIX_ENABLE, 0x1, regVal);
     }
-}
-
-/*!
- * @brief Check if access to PCI config space is enabled or not
- *
- * @param[in] pGpu        GPU object pointer
- * @param[in] pKernelBif  Kernel BIF object pointer
- *
- * @return NV_TRUE Pci IO access is enabled
- */
-NvBool
-kbifIsPciIoAccessEnabled_GB100
-(
-    OBJGPU    *pGpu,
-    KernelBif *pKernelBif
-)
-{
-    NvU32   regVal ;
-
-    if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_STATUS_COMMAND, &regVal) == NV_OK)
-    {
-        if (FLD_TEST_DRF(_PF0, _STATUS, _COMMAND_IO_SPACE_ENABLE, _ENABLE,
-                         regVal))
-        {
-            return NV_TRUE;
-        }
-    }
-
-    return NV_FALSE;
 }
 
 /*!
@@ -504,6 +478,246 @@ kbifGetXveAerBits_GB100
 }
 
 /*!
+ * @brief Get IDE TLP encryption status
+ * 
+ * @param[in]  pGpu       Gpu object pointer
+ * @param[in]  pKernelBif KernelBif object pointer
+ * @param[out] pData      Data pointer for TLP encryption status 
+ * 
+ * @return NV_OK
+ */
+static void
+_kbifGetTlpEncryptionStatus_GB100
+(
+    OBJGPU    *pGpu,
+    KernelBif *pKernelBif, 
+    NvU32     *pData
+)
+{
+    NvU32 regVal;
+    NvU32 tlpTypeEnabled;
+
+    *pData = 0;
+
+    if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_LINK_IDE_STREAM_CONTROL_0, &regVal) != NV_OK)
+    {
+        NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_LINK_IDE_STREAM_CONTROL_0\n");
+        return;
+    }
+
+    tlpTypeEnabled = GPU_DRF_VAL(_PF0, _LINK_IDE_STREAM_CONTROL_0, _LINK_IDE_STREAM_ENABLE, regVal);
+    if (tlpTypeEnabled)
+    {
+        if(GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_LINK_IDE_STREAM_STATUS_0, &regVal) != NV_OK)
+        {
+            NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_LINK_IDE_STREAM_STATUS_0\n");
+            return;
+        }
+
+        *pData = GPU_DRF_VAL(_PF0, _LINK_IDE_STREAM_STATUS_0, _LINK_IDE_STREAM_STATE, regVal);
+    }
+    else
+    {
+        if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_SELECTIVE_IDE_STREAM_CONTROL(0), &regVal) != NV_OK)
+        {
+            NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_SELECTIVE_IDE_STREAM_CONTROL\n");
+            return;
+        }
+
+        tlpTypeEnabled = GPU_DRF_VAL(_PF0, _SELECTIVE_IDE_STREAM_CONTROL, _SELECTIVE_IDE_STREAM_ENABLE, regVal);
+        if(tlpTypeEnabled)
+        {
+            if(GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_SELECTIVE_IDE_STREAM_STATUS(0), &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_SELECTIVE_IDE_STREAM_STATUS\n");
+                return;
+            }
+
+            *pData = GPU_DRF_VAL(_PF0, _SELECTIVE_IDE_STREAM_STATUS, _SELECTIVE_IDE_STREAM_STATE, regVal);
+        }   
+    }
+}
+
+/*!
+ * @brief Get IDE (Integrity and Data Encryption) Related info.
+ * 
+ * @param[in] pGpu         Gpu object pointer
+ * @param[in] pKernelBif   KernelBif Object pointer
+ * @param[in] counterType  The type specifying the required counter type
+ * 
+ * @return NV_OK
+ */
+NvU32
+kbifGetIdeInfo_GB100
+(
+    OBJGPU    *pGpu,
+    KernelBif *pKernelBif,
+    NvU32      counterType
+)
+{
+    NvU32 regVal;
+    NvU32 data = 0;
+
+    switch(counterType)
+    {
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_CHECK_FAILED_STATUS:
+        {
+            if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_UNCORRECTABLE_ERROR_STATUS, &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_UNCORRECTABLE_ERROR_STATUS\n");
+                return data;
+            }
+
+            data = GPU_DRF_VAL(_PF0, _UNCORRECTABLE_ERROR_STATUS, _IDE_CHECK_FAILED_STATUS, regVal);
+
+            break;
+        }
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_MISROUTED_TLP_STATUS:
+        {
+            if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_UNCORRECTABLE_ERROR_STATUS, &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_UNCORRECTABLE_ERROR_STATUS\n");
+                return data;
+            }
+
+            data = GPU_DRF_VAL(_PF0, _UNCORRECTABLE_ERROR_STATUS, _MISROUTED_IDE_TLP_STATUS, regVal);
+
+            break;
+        }
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_PCRC_CHECK_FAILED_STATUS:
+        {
+            if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_UNCORRECTABLE_ERROR_STATUS, &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_UNCORRECTABLE_ERROR_STATUS\n");
+                return data;
+            }
+
+            data = GPU_DRF_VAL(_PF0, _UNCORRECTABLE_ERROR_STATUS, _PCRC_CHECK_FAILED_STATUS, regVal);
+
+            break;
+        }
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_CHECK_FAILED_MASK:
+        {
+            if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_UNCORRECTABLE_ERROR_MASK, &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_UNCORRECTABLE_ERROR_MASK\n");
+                return data;
+            } 
+
+            data = GPU_DRF_VAL(_PF0, _UNCORRECTABLE_ERROR_MASK, _IDE_CHECK_FAILED_MASK, regVal);
+
+            break;
+        }
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_MISROUTED_TLP_MASK:
+        {
+            if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_UNCORRECTABLE_ERROR_MASK, &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_UNCORRECTABLE_ERROR_MASK\n");
+                return data;
+            }
+
+            data = GPU_DRF_VAL(_PF0, _UNCORRECTABLE_ERROR_MASK, _MISROUTED_IDE_TLP_MASK, regVal);
+
+            break;
+        }
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_PCRC_CHECK_FAILED_MASK:
+        {
+            if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_UNCORRECTABLE_ERROR_MASK, &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_UNCORRECTABLE_ERROR_MASK\n");
+                return data;
+            }
+
+            data = GPU_DRF_VAL(_PF0, _UNCORRECTABLE_ERROR_MASK, _PCRC_CHECK_FAILED_MASK, regVal);
+
+            break;
+        }
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_CHECK_FAILED_SEVERITY:
+        {
+            if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_UNCORRECTABLE_ERROR_SEVERITY, &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_UNCORRECTABLE_ERROR_SEVERITY\n");
+                return data;
+            }
+
+            data = GPU_DRF_VAL(_PF0, _UNCORRECTABLE_ERROR_SEVERITY, _IDE_CHECK_FAILED_SEVERITY, regVal);
+
+            break;
+        }
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_MISROUTED_TLP_SEVERITY:
+        {
+            if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_UNCORRECTABLE_ERROR_SEVERITY, &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_UNCORRECTABLE_ERROR_SEVERITY\n");
+                return data;
+            }
+
+            data = GPU_DRF_VAL(_PF0, _UNCORRECTABLE_ERROR_SEVERITY, _MISROUTED_IDE_TLP_SEVERITY, regVal);
+
+            break;
+        }
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_PCRC_CHECK_FAILED_SEVERITY:
+        {
+            if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_UNCORRECTABLE_ERROR_SEVERITY, &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_UNCORRECTABLE_ERROR_SEVERITY\n");
+                return data;
+            }
+
+            data = GPU_DRF_VAL(_PF0, _UNCORRECTABLE_ERROR_SEVERITY, _PCRC_CHECK_FAILED_SEVERITY, regVal);
+
+            break;
+        }
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_TLP_ENCRYPTION_STATUS:
+        {
+            _kbifGetTlpEncryptionStatus_GB100(pGpu, pKernelBif, &data);
+            break;
+        }
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_TYPE_LINK_STREAM_ENABLED:
+        {
+            if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_LINK_IDE_STREAM_CONTROL_0, &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_LINK_IDE_STREAM_CONTROL_0\n");
+                return data;
+            }
+
+            data = GPU_DRF_VAL(_PF0, _LINK_IDE_STREAM_CONTROL_0, _LINK_IDE_STREAM_ENABLE, regVal);
+
+            break;
+        }
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_TYPE_SELECTIVE_STREAM_ENABLED:
+        {
+            if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_SELECTIVE_IDE_STREAM_CONTROL(0), &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_SELECTIVE_IDE_STREAM_CONTROL\n");
+                return data;
+            }
+
+            data = GPU_DRF_VAL(_PF0, _SELECTIVE_IDE_STREAM_CONTROL, _SELECTIVE_IDE_STREAM_ENABLE, regVal);
+
+            break;
+        }
+        case NV_BIF_PEX_CONFIG_REG_FN0_IDE_TYPE_FLOW_THROUGH_STREAM_ENABLED:
+        {
+            if (GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_IDE_CONTROL, &regVal) != NV_OK)
+            {
+                NV_PRINTF(LEVEL_WARNING, "Unable to read NV_PF0_IDE_CONTROL\n");
+                return data;
+            }
+
+            data = GPU_DRF_VAL(_PF0, _IDE_CONTROL, _FLOW_THROUGH_IDE_STREAM_ENABLED, regVal);
+
+            break;
+        }
+        default:
+            NV_PRINTF(LEVEL_ERROR, "Invalid IDE counterType\n");
+            data = 0;
+    }
+
+    return data;
+}
+
+/*!
  * @brief Clear XTL AER bits
  *
  * @param[in] pGpu        GPU object pointer
@@ -666,6 +880,48 @@ kbifEnablePcieAtomics_GB100
     }
 
     NV_PRINTF(LEVEL_INFO, "PCIe Requester atomics enabled.\n");
+}
+
+/*!
+ * @brief Try restoring BAR registers and command register using config cycles
+ *
+ * @param[in] pGpu       GPU object pointer
+ * @param[in] pKernelBif KernelBif object pointer
+ *
+ * @return    NV_OK on success
+ *            NV_ERR_INVALID_READ if the register read returns unexpected value
+ *            NV_ERR_OBJECT_NOT_FOUND if the object is not found
+ */
+NV_STATUS
+kbifRestoreBarsAndCommand_GB100
+(
+    OBJGPU    *pGpu,
+    KernelBif *pKernelBif
+)
+{
+    NvU32  *pBarRegOffsets = pKernelBif->barRegOffsets;
+    NvU32  barOffsetEntry;
+
+    // Restore all BAR registers
+    for (barOffsetEntry = 0; barOffsetEntry < KBIF_NUM_BAR_OFFSET_ENTRIES; barOffsetEntry++)
+    {
+        if (pBarRegOffsets[barOffsetEntry] != KBIF_INVALID_BAR_REG_OFFSET)
+        {
+            GPU_BUS_CFG_CYCLE_WR32(pGpu, pBarRegOffsets[barOffsetEntry],
+                                   pKernelBif->cacheData.gpuBootConfigSpace[pBarRegOffsets[barOffsetEntry]/sizeof(NvU32)]);
+        }
+    }
+
+    // Restore Device Control register
+    GPU_BUS_CFG_CYCLE_WR32(pGpu, NV_PF0_STATUS_COMMAND,
+                           pKernelBif->cacheData.gpuBootConfigSpace[NV_PF0_STATUS_COMMAND/sizeof(NvU32)]);
+
+    if (GPU_REG_RD32(pGpu, NV_PMC0_PRI_BASE + NV_PMC_ZB_BOOT_42) != pGpu->chipId0)
+    {
+        return NV_ERR_INVALID_READ;
+    }
+
+    return NV_OK;
 }
 
 /*!
@@ -1144,4 +1400,172 @@ kbifReadPcieCplCapsFromConfigSpace_GB100
     {
         *pBifAtomicsmask |= BIF_PCIE_CPL_ATOMICS_CAS_128;
     }
+}
+
+/*!
+ * @brief  Get the NV_PMC_ENABLE bit of the valid Engines to reset.
+ *
+ * @param[in]  pGpu       The GPU object
+ * @param[in]  pKernelBif KernelBif object pointer
+ * 
+ * @return All valid engines in NV_PMC_ENABLE.
+ */
+NvU32
+kbifGetValidEnginesToReset_GB100
+(
+    OBJGPU    *pGpu,
+    KernelBif *pKernelBif
+)
+{
+    return (DRF_DEF(_PMC_ZB, _ENABLE, _PDISP,   _ENABLED) |
+            DRF_DEF(_PMC_ZB, _ENABLE, _PERFMON, _ENABLED));
+}
+
+/*!
+ * @brief Initialize LTR settings from config space
+ *
+ * param[in]  pGpu        GPU object pointer
+ * param[in]  pKernelBif  Kernel BIF object pointer
+ */
+void
+kbifInitLtr_GB100
+(
+    OBJGPU    *pGpu,
+    KernelBif *pKernelBif
+)
+{
+    OBJSYS    *pSys   = SYS_GET_INSTANCE();
+    OBJCL     *pCl    = SYS_GET_CL(pSys);
+    NV_STATUS  status;
+    NvU32      regVal;
+
+    if (pCl->getProperty(pCl, PDB_PROP_CL_UPSTREAM_LTR_SUPPORTED))
+    {
+        status = GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_DEVICE_CONTROL_2, &regVal);
+        if (status != NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR, "Unable to read NV_PF0_DEVICE_CONTROL_2\n");
+            return;
+        }
+
+        regVal = FLD_SET_DRF_NUM(_PF0, _DEVICE_CONTROL_2, _LTR_MECHANISM_ENABLE, 0x1, regVal);
+
+        status = GPU_BUS_CFG_CYCLE_WR32(pGpu, NV_PF0_DEVICE_CONTROL_2, regVal);
+        if (status != NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR, "Unable to write NV_PF0_DEVICE_CONTROL_2\n");
+            return;
+        }
+    }
+    else
+    {
+        NV_PRINTF(LEVEL_WARNING, "LTR is disabled in the hierarchy\n");
+    }
+}
+
+/*!
+* @brief Get LTR enable state
+*
+* @param[in]  pGpu        GPU object pointer
+* @param[in]  pKernelBif  KernelBif object pointer
+* @param[out] pBEnable    True if LTR is enabled
+*
+* @return NV_OK
+*/
+NV_STATUS
+kbifGetLtrEnable_GB100
+(
+  OBJGPU    *pGpu,
+  KernelBif *pKernelBif,
+  NvBool    *pBEnable
+)
+{
+  NvU32     regVal = 0;
+  NV_STATUS status = NV_OK;
+
+  status = GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_DEVICE_CONTROL_2, &regVal);
+  if (status != NV_OK)
+  {
+      NV_PRINTF(LEVEL_ERROR, "Unable to read NV_PF0_DEVICE_CONTROL_2\n");
+      *pBEnable = NV_FALSE;
+      status    = NV_ERR_GENERIC;
+
+      return status;
+  }
+
+  *pBEnable = (NvBool) FLD_TEST_DRF_NUM(_PF0, _DEVICE_CONTROL_2, _LTR_MECHANISM_ENABLE, 0x1, regVal);
+
+  return status;
+}
+
+/*!
+* @brief Set LTR enable
+*
+* @param[in] pGpu        GPU object pointer
+* @param[in] pKernelBif  KernelBif object pointer
+* @param[in] bEnable     Enable/disable LTR
+*
+* @return NV_OK
+*/
+NV_STATUS
+kbifSetLtrEnable_GB100
+(
+  OBJGPU    *pGpu,
+  KernelBif *pKernelBif,
+  NvBool     bEnable
+)
+{
+    NV_STATUS status = NV_OK;
+    NvU32     regVal;
+
+    status = GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_DEVICE_CONTROL_2, &regVal);
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Unable to read NV_PF0_DEVICE_CONTROL_2\n");
+        return NV_ERR_GENERIC;
+    }
+
+    if (bEnable)
+    {
+        regVal = FLD_SET_DRF_NUM(_PF0, _DEVICE_CONTROL_2, _LTR_MECHANISM_ENABLE, 0x1, regVal);
+    }
+    else
+    {
+        regVal = FLD_SET_DRF(_PF0, _DEVICE_CONTROL_2, _LTR_MECHANISM_ENABLE, _DEFAULT, regVal);
+    }
+
+    status = GPU_BUS_CFG_CYCLE_WR32(pGpu, NV_PF0_DEVICE_CONTROL_2, regVal);
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Unable to write NV_PF0_DEVICE_CONTROL_2\n");
+        return NV_ERR_GENERIC;
+    }
+
+    return status;
+}
+
+/*!
+ * @brief Cache the device control status 2 register in the global variable.
+ *
+ * param[in]  pGpu        GPU object pointer
+ * param[in]  pKernelBif  Kernel BIF object pointer
+ */
+void
+kbifCacheDeviceControlStatus2Reg_GB100
+(
+    OBJGPU    *pGpu,
+    KernelBif *pKernelBif
+)
+{
+    NV_STATUS  status;
+    NvU32      regVal;
+
+    status = GPU_BUS_CFG_CYCLE_RD32(pGpu, NV_PF0_DEVICE_CONTROL_2, &regVal);
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Unable to read NV_PF0_DEVICE_CONTROL_2\n");
+        return;
+    }
+
+    pKernelBif->pf0DeviceControl2Reg = regVal;
 }

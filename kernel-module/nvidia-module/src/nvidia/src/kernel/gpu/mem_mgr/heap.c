@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -30,6 +30,7 @@
 #include "gpu/gpu.h"
 #include "gpu/mem_mgr/mem_mgr.h"
 #include "gpu/mem_mgr/heap.h"
+#include "gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.h"
 #include "gpu/mem_sys/kern_mem_sys.h"
 #include "mem_mgr/video_mem.h"
 #include "mem_mgr/vaspace.h"
@@ -531,26 +532,6 @@ NV_STATUS heapInitInternal_IMPL
     //
     if ((pMemoryManager->Ram.numFBRegions > 0) && (pHeap->bHasFbRegions))
     {
-        FB_REGION_DESCRIPTOR consoleFbRegion;
-        portMemSet(&consoleFbRegion, 0, sizeof(consoleFbRegion));
-
-        if (heapType != HEAP_TYPE_PARTITION_LOCAL)
-        {
-            //
-            // If a region of FB is actively being used for console display memory
-            // on this GPU, mark it reserved in-place.
-            // In case of legacy SLI on Linux, console size is only known at StateInit
-            //
-            memmgrReserveConsoleRegion_HAL(pGpu, pMemoryManager, &consoleFbRegion);
-            status = memmgrAllocateConsoleRegion_HAL(pGpu, pMemoryManager, &consoleFbRegion);
-            if (status != NV_OK)
-            {
-                NV_PRINTF(LEVEL_WARNING, "Squashing the error status after failing to allocate console region, status: %x\n",
-                            status);
-                status = NV_OK;
-            }
-        }
-
         //
         // Define PMA-managed regions
         // This will be moved to memmgr once we refactor SMC partitions
@@ -739,13 +720,6 @@ heapDestruct_IMPL
     } while (headptr_updated);
 
     //
-    // Now that the console region is no longer reserved, free the console
-    // memdesc.
-    //
-    if (pHeap->heapType != HEAP_TYPE_PARTITION_LOCAL)
-        memmgrReleaseConsoleRegion(pGpu, pMemoryManager);
-
-    //
     // Free the heap structure, if we freed everything
     // (the first block represents the entire free space of the heap).
     // this is only done if the "internal" interface is used.
@@ -777,8 +751,7 @@ heapDestruct_IMPL
         if (pHeap->heapType != HEAP_TYPE_PARTITION_LOCAL)
             memmgrSetPmaInitialized(pMemoryManager, NV_FALSE);
 
-        pmaDestroy(&pHeap->pmaObject);
-        portMemSet(&pHeap->pmaObject, 0, sizeof(pHeap->pmaObject));
+        // PMA already destroyed on heap's behalf by the manager of heap
     }
 }
 
@@ -804,6 +777,7 @@ static NV_STATUS _heapGetBankPlacement
         {
         case NVOS32_TYPE_IMAGE:
         case NVOS32_TYPE_NOTIFIER:
+        case NVOS32_TYPE_SYNCPOINT:
             bankPlacementType = BANK_PLACEMENT_IMAGE;
             break;
         case NVOS32_TYPE_DEPTH:
@@ -2795,16 +2769,6 @@ NV_STATUS heapAllocHint_IMPL
         alignment = memUtilsLeastCommonAlignment(alignment, hostPageSize);
     }
 
-    if (memmgrAllocGetAddrSpace(pMemoryManager, pAllocHint->flags, *pAllocHint->pAttr) == ADDR_FBMEM)
-    {
-        if (alignment >= pHeap->total)
-        {
-            status = NV_ERR_INVALID_ARGUMENT;
-            NV_PRINTF(LEVEL_ERROR, "heapAllocHint failed due to alignmend >= pHeap->total\n");
-            goto exit;
-        }
-    }
-
     *pAllocHint->pHeight = pFbAllocInfo->height;
     pAllocHint->pad = pFbAllocInfo->pad;
 
@@ -2817,266 +2781,6 @@ exit:
     return status;
 }
 
-NV_STATUS heapHwAlloc_IMPL
-(
-    OBJGPU         *pGpu,
-    Heap           *pHeap,
-    NvHandle        hClient,
-    NvHandle        hDevice,
-    NvHandle        hMemory,
-    MEMORY_HW_RESOURCES_ALLOCATION_REQUEST *pHwAlloc,
-    NvU32           *pAttr,
-    NvU32           *pAttr2
-)
-{
-    MemoryManager          *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
-    NV_STATUS               status = NV_OK;
-    FB_ALLOC_INFO          *pFbAllocInfo = NULL;
-    FB_ALLOC_PAGE_FORMAT   *pFbAllocPageFormat = NULL;
-    NvU64                   pageSize = 0;
-    NV_MEMORY_HW_RESOURCES_ALLOCATION_PARAMS *pUserParams = pHwAlloc->pUserParams;
-
-    // Ensure a valid allocation type was passed in
-    if (pUserParams->type > NVOS32_NUM_MEM_TYPES - 1)
-        return NV_ERR_GENERIC;
-
-    pFbAllocInfo = portMemAllocNonPaged(sizeof(FB_ALLOC_INFO));
-    if (NULL == pFbAllocInfo)
-    {
-        NV_PRINTF(LEVEL_ERROR, "No memory for Resource %p\n",
-                  pHwAlloc->pHandle);
-        status = NV_ERR_GENERIC;
-        goto failed;
-    }
-    pFbAllocPageFormat = portMemAllocNonPaged(sizeof(FB_ALLOC_PAGE_FORMAT));
-    if (NULL == pFbAllocPageFormat)
-    {
-        NV_PRINTF(LEVEL_ERROR, "No memory for Resource %p\n",
-                  pHwAlloc->pHandle);
-        status = NV_ERR_GENERIC;
-        goto failed;
-    }
-
-    portMemSet(pFbAllocInfo, 0x0, sizeof(FB_ALLOC_INFO));
-    portMemSet(pFbAllocPageFormat, 0x0, sizeof(FB_ALLOC_PAGE_FORMAT));
-    pFbAllocInfo->pageFormat        = pFbAllocPageFormat;
-    pFbAllocInfo->pageFormat->type  = pUserParams->type;
-    pFbAllocInfo->hwResId       = 0;
-    pFbAllocInfo->pad           = 0;
-    pFbAllocInfo->height        = pUserParams->height;
-    pFbAllocInfo->width         = pUserParams->width;
-    pFbAllocInfo->pitch         = pUserParams->pitch;
-    pFbAllocInfo->size          = pUserParams->size;
-    pFbAllocInfo->origSize      = pUserParams->size;
-    pFbAllocInfo->pageFormat->kind  = pUserParams->kind;
-    pFbAllocInfo->offset        = memmgrGetInvalidOffset_HAL(pGpu, pMemoryManager);
-    pFbAllocInfo->hClient       = hClient;
-    pFbAllocInfo->hDevice       = hDevice;
-    pFbAllocInfo->pageFormat->flags = pUserParams->flags;
-    pFbAllocInfo->pageFormat->attr  = pUserParams->attr;
-    pFbAllocInfo->pageFormat->attr2 = pUserParams->attr2;
-    pFbAllocInfo->retAttr       = pUserParams->attr;
-    pFbAllocInfo->retAttr2      = pUserParams->attr2;
-    pFbAllocInfo->comprCovg     = pUserParams->comprCovg;
-    pFbAllocInfo->zcullCovg     = 0;
-    pFbAllocInfo->internalflags = 0;
-
-    if ((pUserParams->flags & NVOS32_ALLOC_FLAGS_ALIGNMENT_HINT) ||
-        (pUserParams->flags & NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE))
-        pFbAllocInfo->align = pUserParams->alignment;
-    else
-        pFbAllocInfo->align = RM_PAGE_SIZE;
-
-    // Fetch RM page size
-    pageSize = memmgrDeterminePageSize(pMemoryManager, pFbAllocInfo->hClient, pFbAllocInfo->size,
-                                       pFbAllocInfo->format, pFbAllocInfo->pageFormat->flags,
-                                       &pFbAllocInfo->retAttr, &pFbAllocInfo->retAttr2);
-    if (pageSize == 0)
-    {
-        status = NV_ERR_INVALID_STATE;
-        NV_PRINTF(LEVEL_ERROR, "memmgrDeterminePageSize failed\n");
-    }
-
-    // Fetch memory alignment
-    status = memmgrAllocDetermineAlignment_HAL(pGpu, pMemoryManager, &pFbAllocInfo->size, &pFbAllocInfo->align,
-                                               pFbAllocInfo->alignPad, pFbAllocInfo->pageFormat->flags,
-                                               pFbAllocInfo->retAttr, pFbAllocInfo->retAttr2, 0);
-    if (status != NV_OK)
-    {
-        NV_PRINTF(LEVEL_ERROR, "memmgrAllocDetermineAlignment failed\n");
-    }
-
-    //
-    // vGPU:
-    //
-    // Since vGPU does all real hardware management in the
-    // host, if we are in guest OS (where IS_VIRTUAL(pGpu) is true),
-    // do an RPC to the host to do the hardware update.
-    //
-    if ((status == NV_OK) && IS_VIRTUAL(pGpu))
-    {
-        if (vgpuIsGuestManagedHwAlloc(pGpu) &&
-            (FLD_TEST_DRF(OS32, _ATTR, _COMPR, _NONE, pFbAllocInfo->pageFormat->attr)))
-        {
-            status = memmgrAllocHwResources(pGpu, pMemoryManager, pFbAllocInfo);
-            pHwAlloc->hwResource.isVgpuHostAllocated = NV_FALSE;
-            NV_ASSERT(status == NV_OK);
-        }
-        else
-        {
-            NV_RM_RPC_MANAGE_HW_RESOURCE_ALLOC(pGpu,
-                                               hClient,
-                                               hDevice,
-                                               hMemory,
-                                               pFbAllocInfo,
-                                               status);
-            pHwAlloc->hwResource.isVgpuHostAllocated = NV_TRUE;
-        }
-
-        pUserParams->uncompressedKind      = pFbAllocInfo->uncompressedKind;
-        pUserParams->compPageShift         = pFbAllocInfo->compPageShift;
-        pUserParams->compressedKind        = pFbAllocInfo->compressedKind;
-        pUserParams->compTagLineMin        = pFbAllocInfo->compTagLineMin;
-        pUserParams->compPageIndexLo       = pFbAllocInfo->compPageIndexLo;
-        pUserParams->compPageIndexHi       = pFbAllocInfo->compPageIndexHi;
-        pUserParams->compTagLineMultiplier = pFbAllocInfo->compTagLineMultiplier;
-    }
-    else
-    {
-        //
-        // Call into HAL to reserve any hardware resources for
-        // the specified memory type.
-        // If the alignment was changed due to a HW limitation, and the
-        // flag NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE is set, bad_argument
-        // will be passed back from the HAL
-        //
-        status = memmgrAllocHwResources(pGpu, pMemoryManager, pFbAllocInfo);
-    }
-
-    // Is status bad or did we request attributes and they failed
-    if ((status != NV_OK) || ((pUserParams->attr) && (0x0 == pFbAllocInfo->retAttr)))
-    {
-        //
-        // probably means we passed in a bogus type or no tiling resources available
-        // when tiled memory attribute was set to REQUIRED
-        //
-        if (status != NV_OK)
-        {
-            NV_PRINTF(LEVEL_ERROR,
-                      "nvHalFbAlloc failure status = 0x%x Requested Attr 0x%x!\n",
-                      status, pUserParams->attr);
-        }
-        else
-        {
-            NV_PRINTF(LEVEL_WARNING,
-                      "nvHalFbAlloc Out of Resources Requested=%x Returned=%x !\n",
-                      pUserParams->attr, pFbAllocInfo->retAttr);
-        }
-        goto failed;
-    }
-
-    //
-    // Refresh search parameters.
-    //
-    pUserParams->pitch  = pFbAllocInfo->pitch;
-
-    pUserParams->height = pFbAllocInfo->height;
-    pHwAlloc->pad = NvU64_LO32(pFbAllocInfo->pad);
-    pUserParams->kind = pFbAllocInfo->pageFormat->kind;
-    pHwAlloc->hwResId = pFbAllocInfo->hwResId;
-
-    pUserParams->size = pFbAllocInfo->size;           // returned to caller
-
-    pHwAlloc->hwResource.attr = pFbAllocInfo->retAttr;
-    pHwAlloc->hwResource.attr2 = pFbAllocInfo->retAttr2;
-    pHwAlloc->hwResource.comprCovg = pFbAllocInfo->comprCovg;
-    pHwAlloc->hwResource.ctagOffset = pFbAllocInfo->ctagOffset;
-    pHwAlloc->hwResource.hwResId = pFbAllocInfo->hwResId;
-
-    *pAttr  = pFbAllocInfo->retAttr;
-    *pAttr2 = pFbAllocInfo->retAttr2;
-
-failed:
-    portMemFree(pFbAllocPageFormat);
-    portMemFree(pFbAllocInfo);
-
-    return status;
-}
-
-void heapHwFree_IMPL
-(
-    OBJGPU   *pGpu,
-    Heap     *pHeap,
-    Memory   *pMemory,
-    NvU32     flags
-)
-{
-    MemoryManager        *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
-    FB_ALLOC_INFO        *pFbAllocInfo       = NULL;
-    FB_ALLOC_PAGE_FORMAT *pFbAllocPageFormat = NULL;
-
-    pFbAllocInfo = portMemAllocNonPaged(sizeof(FB_ALLOC_INFO));
-    if (pFbAllocInfo == NULL)
-    {
-        NV_ASSERT(0);
-        goto exit;
-    }
-
-    pFbAllocPageFormat = portMemAllocNonPaged(sizeof(FB_ALLOC_PAGE_FORMAT));
-    if (pFbAllocPageFormat == NULL) {
-        NV_ASSERT(0);
-        goto exit;
-    }
-
-    portMemSet(pFbAllocInfo, 0, sizeof(FB_ALLOC_INFO));
-    portMemSet(pFbAllocPageFormat, 0, sizeof(FB_ALLOC_PAGE_FORMAT));
-    pFbAllocInfo->pageFormat = pFbAllocPageFormat;
-
-    pFbAllocInfo->pageFormat->type = pMemory->Type;
-    pFbAllocInfo->pageFormat->attr  = pMemory->pHwResource->attr;
-    pFbAllocInfo->pageFormat->attr2 = pMemory->pHwResource->attr2;
-    pFbAllocInfo->hwResId = pMemory->pHwResource->hwResId;
-    pFbAllocInfo->size = pMemory->Length;
-    pFbAllocInfo->format = memdescGetPteKind(pMemory->pMemDesc);
-    pFbAllocInfo->offset = ~0;
-    pFbAllocInfo->hClient = RES_GET_CLIENT_HANDLE(pMemory);
-    pFbAllocInfo->hDevice = RES_GET_HANDLE(pMemory->pDevice);
-
-    //
-    // vGPU:
-    //
-    // Since vGPU does all real hardware management in the
-    // host, if we are in guest OS (where IS_VIRTUAL(pGpu) is true),
-    // do an RPC to the host to do the hardware update.
-    //
-
-    if (IS_VIRTUAL(pGpu))
-    {
-        if (vgpuIsGuestManagedHwAlloc(pGpu) && !pMemory->pHwResource->isVgpuHostAllocated)
-        {
-            memmgrFreeHwResources(pGpu, pMemoryManager, pFbAllocInfo);
-        }
-        else
-        {
-            NV_STATUS rmStatus = NV_OK;
-
-            NV_RM_RPC_MANAGE_HW_RESOURCE_FREE(pGpu,
-                    RES_GET_CLIENT_HANDLE(pMemory),
-                    RES_GET_HANDLE(pMemory->pDevice),
-                    RES_GET_HANDLE(pMemory),
-                    flags,
-                    rmStatus);
-        }
-    }
-    else
-    {
-        memmgrFreeHwResources(pGpu, pMemoryManager, pFbAllocInfo);
-    }
-
-exit:
-    portMemFree(pFbAllocPageFormat);
-    portMemFree(pFbAllocInfo);
-}
 
 /*!
  * @brief: Adjust heap free accounting
@@ -3560,6 +3264,7 @@ _heapAllocNoncontig
     NvU32       k, shuffleStride = 1;
     NvU64       addr, j, numPages;
     RM_ATTR_PAGE_SIZE pageSizeAttr = dmaNvos32ToPageSizeAttr(pFbAllocInfo->retAttr, pFbAllocInfo->retAttr2);
+    NvU64       pageArrayGranularity = RM_PAGE_SIZE;
     NvU64       alignedSize = NV_ALIGN_UP64(pMemDesc->Size, RM_PAGE_SIZE);
 
     switch (pageSizeAttr)
@@ -3591,6 +3296,12 @@ _heapAllocNoncontig
             pageSize = RM_PAGE_SIZE_512M;
             break;
         }
+    }
+
+    if (SYS_GET_INSTANCE()->bEnableDynamicGranularityPageArrays)
+    {
+        pageArrayGranularity = pageSize;
+        alignedSize = NV_ALIGN_UP64(pMemDesc->Size, pageArrayGranularity);
     }
 
     //
@@ -3642,7 +3353,7 @@ _heapAllocNoncontig
         //
         // Checks above should protect against underflow, but we might still
         // end up with a post-aligned block that is unusable.
-        // "end" should be RM_PAGE_SIZE-1 aligned.
+        // "end" should be pageSize-1 aligned.
         //
         blockBegin = RM_ALIGN_UP(blockBegin, pageSize);
         blockEnd = RM_ALIGN_DOWN(blockEnd+1, pageSize)-1;
@@ -3774,7 +3485,7 @@ _heapAllocNoncontig
 
         pteAddress = RM_PAGE_ALIGN_DOWN(pBlockNew->begin);
 
-        numPages = NV_MIN(blockSizeInPages, ((alignedSize - (((NvU64) pteIndexOffset) * RM_PAGE_SIZE)) / pageSize));
+        numPages = NV_MIN(blockSizeInPages, ((alignedSize - (((NvU64) pteIndexOffset) * pageArrayGranularity)) / pageSize));
 
         if (pHeap->getProperty(pHeap, PDB_PROP_HEAP_PAGE_SHUFFLE))
         {
@@ -3803,7 +3514,7 @@ _heapAllocNoncontig
             for(j = i; j < numPages; j = j + shuffleStride)
             {
                 addr = pteAddress + j * pageSize;
-                for (k = 0; k < pageSize/RM_PAGE_SIZE; k++)
+                for (k = 0; k < pageSize/pageArrayGranularity ; k++)
                 {
                     //
                     // The memDesc has everything in terms of 4k pages.
@@ -3815,7 +3526,7 @@ _heapAllocNoncontig
                     //
                     memdescSetPte(pMemDesc, AT_GPU, pteIndexOffset, addr);
                     pteIndexOffset++;
-                    addr += RM_PAGE_SIZE;
+                    addr += pageArrayGranularity;
                 }
             }
         }
@@ -3882,7 +3593,7 @@ unwind_and_exit:
         }
     }
 
-    NV_ASSERT_OK_OR_RETURN(memdescSetAllocSizeFields(pMemDesc, alignedSize, RM_PAGE_SIZE));
+    NV_ASSERT_OK_OR_RETURN(memdescSetAllocSizeFields(pMemDesc, alignedSize, pageArrayGranularity));
     return status;
 }
 
@@ -3991,7 +3702,6 @@ heapBlackListPages_IMPL
 {
     MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
     KernelMemorySystem *pKernelMemorySystem = GPU_GET_KERNEL_MEMORY_SYSTEM(pGpu);
-    PMA                 *pPma       = &pHeap->pmaObject;
     NvU32                i = 0, j = 0;
     NV_STATUS            status     = NV_OK;
     BLACKLIST           *pBlackList = &pHeap->blackList;
@@ -4117,9 +3827,15 @@ heapBlackListPages_IMPL
 
     pBlackList->count = j;
 
-    pmaGetBlacklistSize(pPma, &dynamicBlacklistSize, &staticBlacklistSize);
-    dynamicBlacklistSize = dynamicBlacklistSize >> 10;
-    staticBlacklistSize  = staticBlacklistSize  >> 10;
+    dynamicBlacklistSize = 0;
+    staticBlacklistSize = 0;
+
+    if (memmgrIsPmaInitialized(pMemoryManager))
+    {
+        pmaGetBlacklistSize(pHeap->pPmaObject, &dynamicBlacklistSize, &staticBlacklistSize);
+        dynamicBlacklistSize = dynamicBlacklistSize >> 10;
+        staticBlacklistSize  = staticBlacklistSize  >> 10;
+    }
 
     dynamicBlacklistSize += (dynamicRmBlackListedCount * _heapGetPageBlackListGranularity()) >> 10;
     staticBlacklistSize  += (staticRmBlackListedCount  * _heapGetPageBlackListGranularity()) >> 10;
@@ -4235,7 +3951,7 @@ heapStorePendingBlackList_IMPL
         if (heapIsPmaManaged(pGpu, pHeap, physicalAddress, physicalAddress))
         {
             NV_PRINTF(LEVEL_INFO, "Calling PMA helper function to blacklist page offset: %llx\n", physicalAddress);
-            status = pmaAddToBlacklistTracking(&pHeap->pmaObject, physicalAddress);
+            status = pmaAddToBlacklistTracking(pHeap->pPmaObject, physicalAddress);
             return status;
         }
         else
@@ -4385,7 +4101,7 @@ heapIsPmaManaged_IMPL
     {
         NV_ASSERT(offset <= limit);
 
-        return pmaIsPmaManaged(&pHeap->pmaObject, offset, limit);
+        return pmaIsPmaManaged(pHeap->pPmaObject, offset, limit);
     }
 
     return NV_FALSE;
@@ -4412,7 +4128,7 @@ heapAddRef_IMPL
 }
 
 /*!
- * @brief Increase the reference count
+ * @brief Decrease the reference count
  *
  * @param[in] pGpu     OBJGPU pointer
  * @param[in] pHeap    Heap pointer
@@ -4433,6 +4149,11 @@ heapRemoveRef_IMPL
     refCount = portAtomicExDecrementU64(&pHeap->refCount);
     if (refCount == 0)
     {
+        if (pHeap->pPmaObject != NULL)
+        {
+            pmaDestroy(pHeap->pPmaObject);
+        }
+
         objDelete(pHeap);
     }
 

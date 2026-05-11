@@ -107,7 +107,6 @@ namespace DisplayPort
         bool    bSupportUHBR2_50;               // Support UHBR2.5 for internal testing.
         bool    bSupportUHBR2_70;               // Support UHBR2.7 for internal testing.
         bool    bSupportUHBR5_00;               // Support UHBR5.0 for internal testing.
-        bool    bEnable5147205Fix;              // Enable 5147205 fix.
 
         bool    bConnectorIsUSBTypeC;
         bool    bCableVconnSourceUnknown;
@@ -186,6 +185,7 @@ namespace DisplayPort
             return bCableVconnSourceUnknown;
         }
         virtual void invalidateLinkRatesInFallbackTable(const LinkRate linkRate);
+
         virtual bool getUSBCCableIDInfo(NV0073_CTRL_DP_USBC_CABLEID_INFO *cableIDInfo);
     };
 

@@ -6,7 +6,7 @@ _out/Linux_x86_64/rs_access_rights.o: \
  ../common/sdk/nvidia/inc/nvtypes.h inc/libraries/utils/nvassert.h \
  inc/libraries/utils/nvmacro.h inc/libraries/nvport/nvport.h \
  inc/libraries/nvport/core.h inc/libraries/nvport/atomic.h \
- inc/libraries/nvport/inline/atomic_gcc.h inc/libraries/nvport/debug.h \
+ inc/libraries/nvport/inline/atomic_c11.h inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
  inc/libraries/nvport/util.h inc/libraries/nvport/inline/util_generic.h \
@@ -33,7 +33,7 @@ inc/libraries/utils/nvmacro.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:

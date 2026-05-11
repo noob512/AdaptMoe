@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -85,7 +85,6 @@ static SPDM_ALGO_CHECK_ENTRY g_SpdmAlgoCheckTable_GH100[] =
     { LIBSPDM_DATA_DHE_NAME_GROUP,         SPDM_ALGORITHMS_DHE_NAMED_GROUP_SECP_384_R1 },
     { LIBSPDM_DATA_AEAD_CIPHER_SUITE,      SPDM_ALGORITHMS_AEAD_CIPHER_SUITE_AES_256_GCM },
     { LIBSPDM_DATA_KEY_SCHEDULE,           SPDM_ALGORITHMS_KEY_SCHEDULE_HMAC_HASH },
-    { LIBSPDM_DATA_OTHER_PARAMS_SUPPORT,   0 },
     { LIBSPDM_DATA_REQ_BASE_ASYM_ALG,      SPDM_ALGORITHMS_BASE_ASYM_ALGO_TPM_ALG_RSAPSS_3072 }
 };
 
@@ -235,10 +234,13 @@ _spdmTriggerHeartbeat
     }
 
     // Some RM APIs call SPDM, ensure we do not conflict with them
-    status = osQueueWorkItemWithFlags(pGpu, _spdmSendHeartbeat, pTmrEvent->pUserData,
-                                        OS_QUEUE_WORKITEM_FLAGS_DONT_FREE_PARAMS |
-                                        OS_QUEUE_WORKITEM_FLAGS_LOCK_API_RW      |
-                                        OS_QUEUE_WORKITEM_FLAGS_LOCK_GPUS);
+    status = osQueueWorkItem(pGpu,
+                             _spdmSendHeartbeat,
+                             pTmrEvent->pUserData,
+                             (OsQueueWorkItemFlags){
+                                 .bDontFreeParams = NV_TRUE,
+                                 .apiLock = WORKITEM_FLAGS_API_LOCK_READ_WRITE,
+                                 .bLockGpus = NV_TRUE});
 
     ErrorExit:
     if (status != NV_OK && pGpu != NULL)
@@ -394,7 +396,7 @@ _spdmEncodeMessageGsp
     else
     {
         // The normal message is not encrypted, it will be sent as NV_SPDM_DESC_HEADER + Message.
-        payloadSize = sizeof(NV_SPDM_DESC_HEADER) + message_size;
+        payloadSize = sizeof(NV_SPDM_DESC_HEADER) + (NvU32)message_size;
 
         //
         // Check for large enough buffer for payload, as well as for overflow in
@@ -646,7 +648,7 @@ _spdmSendMessageGsp
     portMemCopy(pSpdm->pTransportBuffer, pSpdm->transportBufferSize, message, message_size);
 
     nvStatus = spdmMessageProcess_HAL(pGpu, pSpdm,
-                                      pSpdm->pTransportBuffer, message_size,
+                                      pSpdm->pTransportBuffer, (NvU32)message_size,
                                       pSpdm->pTransportBuffer, &pSpdm->pendingResponseSize);
     if (nvStatus != NV_OK)
     {
@@ -977,6 +979,7 @@ spdmCheckConnection_GH100
     libspdm_connection_state_t  connectionState;
     uint8_t                     ctExponent;
     size_t                      dataSize;
+    uint8_t                     spdmVersion;
     NvU32                       i;
     NvU32                       algoCheckCount;
     NvU32                       actualAlgo;
@@ -1005,8 +1008,21 @@ spdmCheckConnection_GH100
         return NV_ERR_NOT_READY;
     }
 
-    // Check version matches expected.
-    if (libspdm_get_connection_version(pContext) != SPDM_MESSAGE_VERSION_11)
+    // TODO: when we switch to 1.2 for all profiles, disallow 1.1.
+    spdmVersion = libspdm_get_connection_version(pContext);
+    if (spdmVersion == SPDM_MESSAGE_VERSION_12)
+    {
+        actualAlgo = 0;
+        dataSize   = sizeof(actualAlgo);
+        ret        = libspdm_get_data(pContext, LIBSPDM_DATA_OTHER_PARAMS_SUPPORT,
+                                      &dataParam, &actualAlgo, &dataSize);
+
+        if (ret != LIBSPDM_STATUS_SUCCESS || actualAlgo != SPDM_ALGORITHMS_OPAQUE_DATA_FORMAT_1)
+        {
+            return NV_ERR_INVALID_STATE;
+        }
+    }
+    else if (spdmVersion != SPDM_MESSAGE_VERSION_11)
     {
         return NV_ERR_INVALID_STATE;
     }
@@ -1080,10 +1096,11 @@ spdmGetAttestationReport_GH100
     NvU32  *pCecAttestationReportSize
 )
 {
-    NV_STATUS status             = NV_OK;
-    uint8_t   numBlocks          = 0;
-    uint32_t  measurementSize    = 0;
-    void     *pMeasurementBuffer = NULL;
+    NV_STATUS  status             = NV_OK;
+    uint8_t    numBlocks          = 0;
+    uint32_t   measurementSize    = 0;
+    size_t     vcaSize            = 0;
+    void      *pMeasurementBuffer = NULL;
 
     if (pGpu == NULL || pSpdm == NULL)
     {
@@ -1135,19 +1152,31 @@ spdmGetAttestationReport_GH100
 
             return NV_ERR_INVALID_STATE;
         }
-
+        if (libspdm_get_connection_version(pSpdm->pLibspdmContext) >= SPDM_MESSAGE_VERSION_12)
+        {
+            vcaSize = *pAttestationReportSize;
+            CHECK_SPDM_STATUS(libspdm_get_data(pSpdm->pLibspdmContext, LIBSPDM_DATA_VCA_CACHE,
+                                                NULL, pAttestationReport, &vcaSize));
+            if (vcaSize == 0)
+            {
+                return NV_ERR_INVALID_STATE;
+            }
+        }
+        // Now we start to construct the Attestation Report, starting from the VCA cache.
+        pAttestationReport = (void *)((uintptr_t)pAttestationReport + vcaSize);
         //
-        // Message log buffer will hold Attestation Report, which is comprised of
-        // the GET_MEASUREMENTS request concatenated with the MEASUREMENTS response.
+        // Message log buffer will hold Attestation Report.
+        // For SPDM 1.1, it is comprised of the GET_MEASUREMENTS request concatenated with the MEASUREMENTS response.
+        // For SPDM 1.2, it's comprised of VCA, the GET_MEASUREMENTS request and the MEASUREMENTS response.
         //
-        if (*pAttestationReportSize < libspdm_get_msg_log_size(pSpdm->pLibspdmContext))
+        if (*pAttestationReportSize < vcaSize + libspdm_get_msg_log_size(pSpdm->pLibspdmContext))
         {
             return NV_ERR_BUFFER_TOO_SMALL;
         }
 
         portMemCopy(pAttestationReport, *pAttestationReportSize,
                     pSpdm->pMsgLog, libspdm_get_msg_log_size(pSpdm->pLibspdmContext));
-        *pAttestationReportSize = libspdm_get_msg_log_size(pSpdm->pLibspdmContext);
+        *pAttestationReportSize = (NvU32)(vcaSize + libspdm_get_msg_log_size(pSpdm->pLibspdmContext));
     }
 
     // Retrieve CEC Attestation Report, if requested.
@@ -1432,4 +1461,3 @@ spdmSendCtrlCall_GH100
 
     return status;
 }
-

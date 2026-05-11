@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -447,7 +447,6 @@ kheadProcessVblankCallbacks_IMPL
     NvU32     state
 )
 {
-    KernelDisplay    *pKernelDisplay = GPU_GET_KERNEL_DISPLAY(pGpu);
     OBJTMR           *pTmr      = GPU_GET_TIMER(pGpu);
     VBLANKCALLBACK   *pCallback = NULL;
     VBLANKCALLBACK   *pNext     = NULL;
@@ -536,7 +535,7 @@ kheadProcessVblankCallbacks_IMPL
                         // We need to avoid calling the _vblank_callback during Panel Replay
                         // as it will be taken care during _RG_VBLANK interrupt handling
                         //
-                        if (pCallback != (VBLANKCALLBACK *)pKernelDisplay->pRgVblankCb && !pKernelDisplay->bIsPanelReplayEnabled)
+                        if (pCallback != (VBLANKCALLBACK *)pKernelHead->pRgVblankCb && !pKernelHead->bIsPanelReplayEnabled)
                         {
                             pCallback->Proc(pGpu,
                                     pCallback->pObject,

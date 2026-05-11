@@ -42,15 +42,31 @@ _out/Linux_x86_64/dp_evoadapter.o: \
  ../common/sdk/nvidia/inc/class/cl9010_callback.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073dfp.h \
  ../common/displayport/inc/dp_auxdefs.h \
+ ../common/displayport/inc/dp_qse.h \
+ ../common/displayport/inc/dp_messagecodings.h \
+ ../common/displayport/inc/dp_messages.h \
+ ../common/displayport/inc/dp_address.h \
+ ../common/displayport/inc/dp_bitstream.h \
+ ../common/displayport/inc/dp_buffer.h \
+ ../common/displayport/inc/dp_splitter.h \
+ ../common/displayport/inc/dp_auxretry.h \
+ ../common/displayport/inc/dp_timeout.h \
+ ../common/displayport/inc/dp_messageheader.h \
+ ../common/displayport/inc/dp_merger.h \
+ ../common/displayport/inc/dp_configcaps.h \
+ ../common/displayport/inc/dp_connector.h \
+ ../common/displayport/inc/dp_guid.h \
+ ../common/displayport/inc/dp_evoadapter.h \
+ ../common/displayport/inc/../../modeset/timing/nvt_dsc_pps.h \
+ ../common/displayport/inc/../../modeset/timing/nvtiming.h \
+ ../common/displayport/inc/dp_crc.h \
  ../common/displayport/inc/dp_tracing.h \
  ../common/displayport/inc/dp_vrr.h ../common/displayport/inc/dp_printf.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl5070/ctrl5070or.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl5070/ctrl5070common.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl5070/ctrl5070base.h \
- ../common/displayport/inc/dp_evoadapter2x.h \
- ../common/displayport/inc/dp_evoadapter.h \
- ../common/displayport/inc/dp_timeout.h
+ ../common/displayport/inc/dp_evoadapter2x.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 ../common/displayport/inc/dp_internal.h:
 ../common/sdk/nvidia/inc/nvtypes.h:
@@ -100,6 +116,24 @@ _out/Linux_x86_64/dp_evoadapter.o: \
 ../common/sdk/nvidia/inc/class/cl9010_callback.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073dfp.h:
 ../common/displayport/inc/dp_auxdefs.h:
+../common/displayport/inc/dp_qse.h:
+../common/displayport/inc/dp_messagecodings.h:
+../common/displayport/inc/dp_messages.h:
+../common/displayport/inc/dp_address.h:
+../common/displayport/inc/dp_bitstream.h:
+../common/displayport/inc/dp_buffer.h:
+../common/displayport/inc/dp_splitter.h:
+../common/displayport/inc/dp_auxretry.h:
+../common/displayport/inc/dp_timeout.h:
+../common/displayport/inc/dp_messageheader.h:
+../common/displayport/inc/dp_merger.h:
+../common/displayport/inc/dp_configcaps.h:
+../common/displayport/inc/dp_connector.h:
+../common/displayport/inc/dp_guid.h:
+../common/displayport/inc/dp_evoadapter.h:
+../common/displayport/inc/../../modeset/timing/nvt_dsc_pps.h:
+../common/displayport/inc/../../modeset/timing/nvtiming.h:
+../common/displayport/inc/dp_crc.h:
 ../common/displayport/inc/dp_tracing.h:
 ../common/displayport/inc/dp_vrr.h:
 ../common/displayport/inc/dp_printf.h:
@@ -108,5 +142,3 @@ _out/Linux_x86_64/dp_evoadapter.o: \
 ../common/sdk/nvidia/inc/ctrl/ctrl5070/ctrl5070common.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl5070/ctrl5070base.h:
 ../common/displayport/inc/dp_evoadapter2x.h:
-../common/displayport/inc/dp_evoadapter.h:
-../common/displayport/inc/dp_timeout.h:

@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2015-2023 NVIDIA Corporation
+    Copyright (c) 2015-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -370,6 +370,17 @@ static uvm_membar_t uvm_push_get_and_reset_membar_flag(uvm_push_t *push)
         return UVM_MEMBAR_GPU;
 
     return UVM_MEMBAR_SYS;
+}
+
+// Set a membar push flag.
+static void uvm_push_set_membar(uvm_push_t *push, uvm_membar_t membar)
+{
+    if (membar == UVM_MEMBAR_NONE)
+        uvm_push_set_flag(push, UVM_PUSH_FLAG_NEXT_MEMBAR_NONE);
+    else if (membar == UVM_MEMBAR_GPU)
+        uvm_push_set_flag(push, UVM_PUSH_FLAG_NEXT_MEMBAR_GPU);
+    else
+        UVM_ASSERT(membar == UVM_MEMBAR_SYS);
 }
 
 // Get the size of the push so far

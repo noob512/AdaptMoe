@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2002-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2002-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -52,7 +52,7 @@ kbusControlGetCaps
     NvU32 caps = 0;
 
     // if the Chip is integrated.
-    if ( IsTEGRA(pGpu) || pGpu->getProperty(pGpu, PDB_PROP_GPU_IS_SOC_SDM ))
+    if (IsTEGRA(pGpu) || pGpu->pGpuArch->bGpuArchIsZeroFb)
     {
         caps |= NV2080_CTRL_BUS_INFO_CAPS_CHIP_INTEGRATED;
     }
@@ -81,50 +81,6 @@ _kbusGetHostCaps(OBJGPU *pGpu, NvU8 *pHostCaps)
     SLI_LOOP_END
 
     return status;
-}
-
-static NV_STATUS
-_getAspmL1FlagsSendRpc
-(
-    OBJGPU *pGpu,
-    NvBool *bCyaMaskL1,
-    NvBool *bEnableAspmDtL1
-)
-{
-    RM_API    *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);
-    NV_STATUS  rmStatus;
-    NV2080_CTRL_INTERNAL_BIF_GET_ASPM_L1_FLAGS_PARAMS *pBifAspmL1Flags;
-
-    // Allocate memory for the command parameter
-    pBifAspmL1Flags = portMemAllocNonPaged(sizeof(*pBifAspmL1Flags));
-    if (pBifAspmL1Flags == NULL)
-    {
-        NV_PRINTF(LEVEL_ERROR, "Could not allocate pBifAspmL1Flags.");
-        rmStatus = NV_ERR_NO_MEMORY;
-        goto _getAspmL1FlagsSendRpc_exit;
-    }
-    portMemSet(pBifAspmL1Flags, 0, sizeof(*pBifAspmL1Flags));
-
-    // Send RPC to GSP to get physical BIF PDBs
-    rmStatus = pRmApi->Control(pRmApi,
-                                pGpu->hInternalClient,
-                                pGpu->hInternalSubdevice,
-                                NV2080_CTRL_CMD_INTERNAL_BIF_GET_ASPM_L1_FLAGS,
-                                pBifAspmL1Flags, sizeof(*pBifAspmL1Flags));
-
-    if (NV_OK != rmStatus)
-    {
-        NV_PRINTF(LEVEL_ERROR,
-                    "Error 0x%x receiving bus ASPM disable flags from GSP.\n", rmStatus);
-        goto _getAspmL1FlagsSendRpc_exit;
-    }
-
-    *bCyaMaskL1      = pBifAspmL1Flags->bCyaMaskL1;
-    *bEnableAspmDtL1 = pBifAspmL1Flags->bEnableAspmDtL1;
-
-_getAspmL1FlagsSendRpc_exit:
-    portMemFree(pBifAspmL1Flags);
-    return rmStatus;
 }
 
 //
@@ -170,6 +126,18 @@ deviceCtrlCmdHostGetCapsV2_IMPL
     return rmStatus;
 }
 
+NV_STATUS
+deviceCtrlCmdHostGetCapsV2_SOC
+(
+    Device *pDevice,
+    NV0080_CTRL_HOST_GET_CAPS_V2_PARAMS *pHostCapsParamsV2
+)
+{
+    portMemSet(pHostCapsParamsV2, '\0', sizeof(*pHostCapsParamsV2));
+
+    return NV_OK;
+}
+
 //
 // BUS RM SubDevice Controls
 //
@@ -181,9 +149,8 @@ subdeviceCtrlCmdBusGetPciInfo_IMPL
 )
 {
     OBJGPU *pGpu = GPU_RES_GET_GPU(pSubdevice);
-    KernelBif *pKernelBif = GPU_GET_KERNEL_BIF(pGpu);
 
-    if (pKernelBif == NULL || !kbifIsPciBusFamily(pKernelBif))
+    if (!gpuIsPciBusFamily(pGpu))
     {
         return NV_ERR_NOT_SUPPORTED;
     }
@@ -196,40 +163,6 @@ subdeviceCtrlCmdBusGetPciInfo_IMPL
     // Return device ID field.  We no longer support probing past the BR02 bridge.
     //
     pPciInfoParams->pciExtDeviceId = REF_VAL(NV_CONFIG_PCI_NV_0_DEVICE_ID, pPciInfoParams->pciDeviceId);
-
-    return NV_OK;
-}
-
-NV_STATUS
-subdeviceCtrlCmdBusGetAspmDisableFlags_IMPL
-(
-    Subdevice *pSubdevice,
-    NV2080_CTRL_BUS_GET_ASPM_DISABLE_FLAGS_PARAMS *pParams
-)
-{
-    OBJGPU    *pGpu   = GPU_RES_GET_GPU(pSubdevice);
-    OBJSYS    *pSys   = SYS_GET_INSTANCE();
-    OBJCL     *pCl    = SYS_GET_CL(pSys);
-    NV_STATUS  rmStatus;
-    NvBool     bCyaMaskL1, bEnableAspmDtL1;
-
-    // Send RPC to GSP to obtain BIF PDB values.
-    rmStatus = _getAspmL1FlagsSendRpc(pGpu, &bCyaMaskL1, &bEnableAspmDtL1);
-    if (NV_OK != rmStatus)
-    {
-        return rmStatus;
-    }
-
-    pParams->aspmDisableFlags[NV2080_CTRL_ASPM_DISABLE_FLAGS_L1_MASK_REGKEY_OVERRIDE]                = bCyaMaskL1;
-    // This flag correnpond to an deprecated PDB_PROP_OS_RM_MAKES_POLICY_DECISIONS property which is always returing TURE on non-MACOSX.
-    pParams->aspmDisableFlags[NV2080_CTRL_ASPM_DISABLE_FLAGS_OS_RM_MAKES_POLICY_DECISIONS]           = NV_TRUE;
-    pParams->aspmDisableFlags[NV2080_CTRL_ASPM_DISABLE_FLAGS_GPU_BEHIND_BRIDGE]                      = pGpu->getProperty(pGpu, PDB_PROP_GPU_BEHIND_BRIDGE);
-    pParams->aspmDisableFlags[NV2080_CTRL_ASPM_DISABLE_FLAGS_GPU_UPSTREAM_PORT_L1_UNSUPPORTED]       = pGpu->getProperty(pGpu, PDB_PROP_GPU_UPSTREAM_PORT_L1_UNSUPPORTED);
-    pParams->aspmDisableFlags[NV2080_CTRL_ASPM_DISABLE_FLAGS_GPU_UPSTREAM_PORT_L1_POR_SUPPORTED]     = pGpu->getProperty(pGpu, PDB_PROP_GPU_UPSTREAM_PORT_L1_POR_SUPPORTED);
-    pParams->aspmDisableFlags[NV2080_CTRL_ASPM_DISABLE_FLAGS_GPU_UPSTREAM_PORT_L1_POR_MOBILE_ONLY]   = pGpu->getProperty(pGpu, PDB_PROP_GPU_UPSTREAM_PORT_L1_POR_MOBILE_ONLY);
-    pParams->aspmDisableFlags[NV2080_CTRL_ASPM_DISABLE_FLAGS_CL_ASPM_L1_CHIPSET_DISABLED]            = pCl->getProperty(pCl, PDB_PROP_CL_ASPM_L1_CHIPSET_DISABLED);
-    pParams->aspmDisableFlags[NV2080_CTRL_ASPM_DISABLE_FLAGS_CL_ASPM_L1_CHIPSET_ENABLED_MOBILE_ONLY] = pCl->getProperty(pCl, PDB_PROP_CL_ASPM_L1_CHIPSET_ENABLED_MOBILE_ONLY);
-    pParams->aspmDisableFlags[NV2080_CTRL_ASPM_DISABLE_FLAGS_BIF_ENABLE_ASPM_DT_L1]                  = bEnableAspmDtL1;
 
     return NV_OK;
 }
@@ -283,6 +216,8 @@ getBusInfos(OBJGPU *pGpu, NV2080_CTRL_BUS_INFO *pBusInfos, NvU32 busInfoListSize
     {
         NvBool bSendRpc = NV_FALSE;
 
+        NV_CHECK_OK_OR_RETURN(LEVEL_INFO, gpuValidateBusInfoIndex_HAL(pGpu, pBusInfos[i].index));
+
         switch (pBusInfos[i].index)
         {
             case NV2080_CTRL_BUS_INFO_INDEX_PCIE_GEN_INFO:
@@ -327,7 +262,7 @@ getBusInfos(OBJGPU *pGpu, NV2080_CTRL_BUS_INFO *pBusInfos, NvU32 busInfoListSize
         {
             case NV2080_CTRL_BUS_INFO_INDEX_TYPE:
             {
-                pBusInfos[i].data = kbifGetBusIntfType_HAL(pKernelBif);
+                pBusInfos[i].data = gpuGetBusIntfType_HAL(pGpu);
                 break;
             }
             case NV2080_CTRL_BUS_INFO_INDEX_INTLINE:
@@ -342,7 +277,7 @@ getBusInfos(OBJGPU *pGpu, NV2080_CTRL_BUS_INFO *pBusInfos, NvU32 busInfoListSize
             }
             case NV2080_CTRL_BUS_INFO_INDEX_PCIE_GPU_LINK_CAPS:
             {
-                if (kbifIsPciBusFamily(pKernelBif) && IS_VIRTUAL(pGpu))
+                if (gpuIsPciBusFamily(pGpu) && IS_VIRTUAL(pGpu))
                 {
                     VGPU_STATIC_INFO *pVSI = GPU_GET_STATIC_INFO(pGpu);
                     pBusInfos[i].data = pVSI->pcieGpuLinkCaps;
@@ -387,7 +322,7 @@ getBusInfos(OBJGPU *pGpu, NV2080_CTRL_BUS_INFO *pBusInfos, NvU32 busInfoListSize
             case NV2080_CTRL_BUS_INFO_INDEX_PCIE_GPU_LINK_UNSUPPORTED_REQUESTS_CLEAR:
             case NV2080_CTRL_BUS_INFO_INDEX_MSI_INFO:
             {
-                if (kbifIsPciBusFamily(pKernelBif))
+                if (gpuIsPciBusFamily(pGpu))
                 {
                     NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kbifControlGetPCIEInfo(pGpu, pKernelBif, &pBusInfos[i]));
                 }
@@ -503,7 +438,7 @@ getBusInfos(OBJGPU *pGpu, NV2080_CTRL_BUS_INFO *pBusInfos, NvU32 busInfoListSize
             }
             case NV2080_CTRL_BUS_INFO_INDEX_BUS_NUMBER:
             {
-                if (kbifIsPciBusFamily(pKernelBif))
+                if (gpuIsPciBusFamily(pGpu))
                 {
                     pBusInfos[i].data = gpuGetBus(pGpu);
                 }
@@ -515,7 +450,7 @@ getBusInfos(OBJGPU *pGpu, NV2080_CTRL_BUS_INFO *pBusInfos, NvU32 busInfoListSize
             }
             case NV2080_CTRL_BUS_INFO_INDEX_DEVICE_NUMBER:
             {
-                if (kbifIsPciBusFamily(pKernelBif))
+                if (gpuIsPciBusFamily(pGpu))
                 {
                     pBusInfos[i].data = gpuGetDevice(pGpu);
                 }
@@ -532,7 +467,7 @@ getBusInfos(OBJGPU *pGpu, NV2080_CTRL_BUS_INFO *pBusInfos, NvU32 busInfoListSize
                 // We no longer support AGP/PCIe bridges so Bus/GPU interface
                 // types are the same
                 //
-                pBusInfos[i].data = kbifGetBusIntfType_HAL(pKernelBif);
+                pBusInfos[i].data = gpuGetBusIntfType_HAL(pGpu);
                 break;
             }
             case NV2080_CTRL_BUS_INFO_INDEX_DOMAIN_NUMBER:
@@ -620,7 +555,7 @@ subdeviceCtrlCmdBusGetPciBarInfo_IMPL
     KernelBus *pKernelBus = GPU_GET_KERNEL_BUS(pGpu);
     NvU32 i;
 
-    if (!kbifIsPciBusFamily(GPU_GET_KERNEL_BIF(pGpu)))
+    if (!gpuIsPciBusFamily(pGpu))
     {
         return NV_ERR_NOT_SUPPORTED;
     }
@@ -731,6 +666,16 @@ subdeviceCtrlCmdBusSetC2CLpwrStateVote_VF
 (
     Subdevice                                           *pSubdevice,
     NV2080_CTRL_CMD_BUS_SET_C2C_LPWR_STATE_VOTE_PARAMS  *pParams
+)
+{
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+NV_STATUS
+subdeviceCtrlCmdBusSetC2CIdleThreshold_VF
+(
+    Subdevice                                              *pSubdevice,
+    NV2080_CTRL_CMD_BUS_SET_C2C_LPWR_IDLE_THRESHOLD_PARAMS *pParams
 )
 {
     return NV_ERR_NOT_SUPPORTED;

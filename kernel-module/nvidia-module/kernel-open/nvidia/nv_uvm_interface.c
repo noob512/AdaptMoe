@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2013-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2013-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -38,18 +38,18 @@
 #include "nv_gpu_ops.h"
 #include "rm-gpu-ops.h"
 
-// This is really a struct UvmOpsUvmEvents *. It needs to be an atomic because
-// it can be read outside of the g_pNvUvmEventsLock. Use getUvmEvents and
+// This is really a struct UvmEventsLinux *. It needs to be an atomic because it
+// can be read outside of the g_pNvUvmEventsLock. Use getUvmEvents and
 // setUvmEvents to access it.
 static atomic_long_t g_pNvUvmEvents;
 static struct semaphore g_pNvUvmEventsLock;
 
-static struct UvmOpsUvmEvents *getUvmEvents(void)
+static struct UvmEventsLinux *getUvmEvents(void)
 {
-    return (struct UvmOpsUvmEvents *)atomic_long_read(&g_pNvUvmEvents);
+    return (struct UvmEventsLinux *)atomic_long_read(&g_pNvUvmEvents);
 }
 
-static void setUvmEvents(struct UvmOpsUvmEvents *newEvents)
+static void setUvmEvents(struct UvmEventsLinux *newEvents)
 {
     atomic_long_set(&g_pNvUvmEvents, (long)newEvents);
 }
@@ -1047,12 +1047,55 @@ NV_STATUS nvUvmInterfaceDisableAccessCntr(uvmGpuDeviceHandle device,
 }
 EXPORT_SYMBOL(nvUvmInterfaceDisableAccessCntr);
 
-// this function is called by the UVM driver to register the ops
-NV_STATUS nvUvmInterfaceRegisterUvmCallbacks(struct UvmOpsUvmEvents *importedUvmOps)
+NV_STATUS nvUvmInterfaceAccessBitsBufAlloc(uvmGpuDeviceHandle device,
+                                           UvmGpuAccessBitsBufferAlloc* pAccessBitsInfo)
+{
+    nvidia_stack_t *sp = nvUvmGetSafeStack();
+    NV_STATUS status;
+
+    status = rm_gpu_ops_access_bits_buffer_alloc(sp, (gpuDeviceHandle)device,
+                                                 pAccessBitsInfo);
+
+    nvUvmFreeSafeStack(sp);
+    return status;
+}
+EXPORT_SYMBOL(nvUvmInterfaceAccessBitsBufAlloc);
+
+NV_STATUS nvUvmInterfaceAccessBitsBufFree(uvmGpuDeviceHandle device,
+                                          UvmGpuAccessBitsBufferAlloc* pAccessBitsInfo)
+{
+    nvidia_stack_t *sp = nvUvmGetSafeStack();
+    NV_STATUS status;
+
+    status = rm_gpu_ops_access_bits_buffer_free(sp, (gpuDeviceHandle)device,
+                                                pAccessBitsInfo);
+
+    nvUvmFreeSafeStack(sp);
+    return status;
+}
+EXPORT_SYMBOL(nvUvmInterfaceAccessBitsBufFree);
+
+NV_STATUS nvUvmInterfaceAccessBitsDump(uvmGpuDeviceHandle device,
+                                       UvmGpuAccessBitsBufferAlloc* pAccessBitsInfo,
+                                       UVM_ACCESS_BITS_DUMP_MODE mode)
+{
+    nvidia_stack_t *sp = nvUvmGetSafeStack();
+    NV_STATUS status = NV_OK;
+
+    status = rm_gpu_ops_access_bits_dump(sp, (gpuDeviceHandle)device,
+                                         pAccessBitsInfo, mode);
+
+    nvUvmFreeSafeStack(sp);
+    return status;
+}
+EXPORT_SYMBOL(nvUvmInterfaceAccessBitsDump);
+
+// this function is called by the UVM driver to register the event callbacks
+NV_STATUS nvUvmInterfaceRegisterUvmEvents(struct UvmEventsLinux *importedEvents)
 {
     NV_STATUS status = NV_OK;
 
-    if (!importedUvmOps)
+    if (!importedEvents)
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
@@ -1066,13 +1109,13 @@ NV_STATUS nvUvmInterfaceRegisterUvmCallbacks(struct UvmOpsUvmEvents *importedUvm
     {
         // Be careful: as soon as the pointer is assigned, top half ISRs can
         // start reading it to make callbacks, even before we drop the lock.
-        setUvmEvents(importedUvmOps);
+        setUvmEvents(importedEvents);
     }
     up(&g_pNvUvmEventsLock);
 
     return status;
 }
-EXPORT_SYMBOL(nvUvmInterfaceRegisterUvmCallbacks);
+EXPORT_SYMBOL(nvUvmInterfaceRegisterUvmEvents);
 
 static void flush_top_half(void *info)
 {
@@ -1081,7 +1124,7 @@ static void flush_top_half(void *info)
     return;
 }
 
-void nvUvmInterfaceDeRegisterUvmOps(void)
+void nvUvmInterfaceDeRegisterUvmEvents(void)
 {
     // Taking the lock forces us to wait for non-interrupt callbacks to finish
     // up.
@@ -1094,7 +1137,7 @@ void nvUvmInterfaceDeRegisterUvmOps(void)
     // cores. We can wait for them to finish by waiting for a context switch to
     // happen on every core.
     //
-    // This is slow, but since nvUvmInterfaceDeRegisterUvmOps is very rare
+    // This is slow, but since nvUvmInterfaceDeRegisterUvmEvents is very rare
     // (module unload) it beats having the top half synchronize with a spin lock
     // every time.
     //
@@ -1103,12 +1146,12 @@ void nvUvmInterfaceDeRegisterUvmOps(void)
     // ones to finish.
     on_each_cpu(flush_top_half, NULL, 1);
 }
-EXPORT_SYMBOL(nvUvmInterfaceDeRegisterUvmOps);
+EXPORT_SYMBOL(nvUvmInterfaceDeRegisterUvmEvents);
 
 NV_STATUS nv_uvm_suspend(void)
 {
     NV_STATUS status = NV_OK;
-    struct UvmOpsUvmEvents *events;
+    struct UvmEventsLinux *events;
 
     // Synchronize callbacks with unregistration
     down(&g_pNvUvmEventsLock);
@@ -1130,7 +1173,7 @@ NV_STATUS nv_uvm_suspend(void)
 NV_STATUS nv_uvm_resume(void)
 {
     NV_STATUS status = NV_OK;
-    struct UvmOpsUvmEvents *events;
+    struct UvmEventsLinux *events;
 
     // Synchronize callbacks with unregistration
     down(&g_pNvUvmEventsLock);
@@ -1149,48 +1192,6 @@ NV_STATUS nv_uvm_resume(void)
     return status;
 }
 
-void nv_uvm_notify_start_device(const NvU8 *pUuid)
-{
-    NvProcessorUuid uvmUuid;
-    struct UvmOpsUvmEvents *events;
-
-    memcpy(uvmUuid.uuid, pUuid, UVM_UUID_LEN);
-
-    // Synchronize callbacks with unregistration
-    down(&g_pNvUvmEventsLock);
-
-    // It's not strictly necessary to use a cached local copy of the events
-    // pointer here since it can't change under the lock, but we'll do it for
-    // consistency.
-    events = getUvmEvents();
-    if(events && events->startDevice)
-    {
-        events->startDevice(&uvmUuid);
-    }
-    up(&g_pNvUvmEventsLock);
-}
-
-void nv_uvm_notify_stop_device(const NvU8 *pUuid)
-{
-    NvProcessorUuid uvmUuid;
-    struct UvmOpsUvmEvents *events;
-
-    memcpy(uvmUuid.uuid, pUuid, UVM_UUID_LEN);
-
-    // Synchronize callbacks with unregistration
-    down(&g_pNvUvmEventsLock);
-
-    // It's not strictly necessary to use a cached local copy of the events
-    // pointer here since it can't change under the lock, but we'll do it for
-    // consistency.
-    events = getUvmEvents();
-    if(events && events->stopDevice)
-    {
-        events->stopDevice(&uvmUuid);
-    }
-    up(&g_pNvUvmEventsLock);
-}
-
 NV_STATUS nv_uvm_event_interrupt(const NvU8 *pUuid)
 {
     //
@@ -1200,7 +1201,7 @@ NV_STATUS nv_uvm_event_interrupt(const NvU8 *pUuid)
     // absolutely necessary.
     //
     // Instead, we allow this function to be called concurrently with
-    // nvUvmInterfaceDeRegisterUvmOps. That function will clear the events
+    // nvUvmInterfaceDeRegisterUvmEvents. That function will clear the events
     // pointer, then wait for all top halves to finish out. This means the
     // pointer may change out from under us, but the callbacks are still safe to
     // invoke while we're in this function.
@@ -1209,7 +1210,7 @@ NV_STATUS nv_uvm_event_interrupt(const NvU8 *pUuid)
     // nor the compiler make assumptions about the pointer remaining valid while
     // in this function.
     //
-    struct UvmOpsUvmEvents *events = getUvmEvents();
+    struct UvmEventsLinux *events = getUvmEvents();
 
     if (events && events->isrTopHalf)
         return events->isrTopHalf((const NvProcessorUuid *)pUuid);
@@ -1243,10 +1244,10 @@ EXPORT_SYMBOL(nvUvmInterfaceGetNvlinkInfo);
 NV_STATUS nv_uvm_drain_P2P(const NvU8 *uuid)
 {
     NvProcessorUuid uvmUuid;
-    struct UvmOpsUvmEvents *events;
+    struct UvmEventsLinux *events;
     NV_STATUS ret = NV_ERR_NOT_SUPPORTED;
 
-    memcpy(uvmUuid.uuid, uuid, UVM_UUID_LEN);
+    memcpy(uvmUuid.uuid, uuid, NV_UUID_LEN);
 
     // Synchronize callbacks with unregistration
     down(&g_pNvUvmEventsLock);
@@ -1267,10 +1268,10 @@ NV_STATUS nv_uvm_drain_P2P(const NvU8 *uuid)
 NV_STATUS nv_uvm_resume_P2P(const NvU8 *uuid)
 {
     NvProcessorUuid uvmUuid;
-    struct UvmOpsUvmEvents *events;
+    struct UvmEventsLinux *events;
     NV_STATUS ret = NV_ERR_NOT_SUPPORTED;
 
-    memcpy(uvmUuid.uuid, uuid, UVM_UUID_LEN);
+    memcpy(uvmUuid.uuid, uuid, NV_UUID_LEN);
 
     // Synchronize callbacks with unregistration
     down(&g_pNvUvmEventsLock);

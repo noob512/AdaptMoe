@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2018-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2018-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -41,7 +41,7 @@
  * Parameters:
  *
  * location
- *   Only used for HSHUBMMU.
+ *   Only used for HSHUBMMU for pre-Blackwell.
  *
  * sublocation
  *   Only used for HSHUBMMU.
@@ -68,7 +68,6 @@ typedef struct NV208F_CTRL_MMU_ECC_INJECT_ERROR_PARAMS {
     NvU32 sublocation;
     NvU8  unit;
     NvU8  errorType;
-    NvU8  instance;
 } NV208F_CTRL_MMU_ECC_INJECT_ERROR_PARAMS;
 
 
@@ -146,4 +145,25 @@ typedef struct NV208F_CTRL_MMU_GET_NUM_HUBMMUS_PARAMS {
     NvU32 numHubmmus;
 } NV208F_CTRL_MMU_GET_NUM_HUBMMUS_PARAMS;
 
+ // extension NV_VERIF_FEATURES
+
+/*
+* NV208F_CTRL_CMD_MMU_GET_NUM_L2TLBS
+*
+* Returns the number of ECC Capable L2TLBs.
+*
+* numL2tlbs [out]
+*   Number of L2tlbs
+*
+* Possible status values returned are:
+*   NV_OK
+*   NV_ERR_NOT_SUPPORTED
+*/
+#define NV208F_CTRL_CMD_MMU_GET_NUM_L2TLBS (0x208f0b06) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_DIAG_MMU_INTERFACE_ID << 8) | NV208F_CTRL_MMU_GET_NUM_L2TLBS_PARAMS_MESSAGE_ID" */
+
+#define NV208F_CTRL_MMU_GET_NUM_L2TLBS_PARAMS_MESSAGE_ID (0x6U)
+
+typedef struct NV208F_CTRL_MMU_GET_NUM_L2TLBS_PARAMS {
+    NvU32 numL2tlbs;
+} NV208F_CTRL_MMU_GET_NUM_L2TLBS_PARAMS;
 /* _ctrl208fmmu_h_ */

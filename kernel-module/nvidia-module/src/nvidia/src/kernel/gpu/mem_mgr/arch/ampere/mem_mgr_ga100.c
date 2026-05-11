@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2018-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2018-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -32,7 +32,6 @@
 
 #include "kernel/gpu/intr/intr.h"
 #include "kernel/gpu/mig_mgr/kernel_mig_manager.h"
-#include "vgpu/vgpu_events.h"
 #include "nvdevid.h"
 
 #include "published/ampere/ga100/dev_mmu.h"
@@ -126,7 +125,7 @@ memmgrScrubRegistryOverrides_GA100
          pGpu->getProperty(pGpu, PDB_PROP_GPU_IS_VIRTUALIZATION_MODE_HOST_VGPU) ||
          IS_VIRTUAL_WITHOUT_SRIOV(pGpu) ||
          RMCFG_FEATURE_PLATFORM_GSP ||
-         pGpu->getProperty(pGpu, PDB_PROP_GPU_BROKEN_FB) ||
+         (pGpu->getProperty(pGpu, PDB_PROP_GPU_BROKEN_FB) && !pMemoryManager->bSysmemCompressionSupportDef) ||
          IsSLIEnabled(pGpu))
     {
         pMemoryManager->bScrubOnFreeEnabled = NV_FALSE;
@@ -505,14 +504,63 @@ memmgrInsertUnprotectedRegionAtBottomOfFb_GA100
 NvBool
 memmgrIsMemDescSupportedByFla_GA100
 (
-    OBJGPU *pGpu,
-    MemoryManager *pMemoryManager,
-    MEMORY_DESCRIPTOR *pMemDesc
+    OBJGPU            *pFlaOwnerGpu,
+    MemoryManager     *pFlaOwnerMemoryManager,
+    MEMORY_DESCRIPTOR *pPhysMemDesc
 )
 {
-    if ((memdescGetAddressSpace(pMemDesc) == ADDR_FBMEM) || memdescIsEgm(pMemDesc))
+    NV_ADDRESS_SPACE addrSpace = memdescGetAddressSpace(pPhysMemDesc);
+
+    // For FB, make sure source and dest GPUs are same as peer mappings are not supported.
+    if ((addrSpace == ADDR_FBMEM) && (pFlaOwnerGpu == pPhysMemDesc->pGpu))
     {
         return NV_TRUE;
     }
+
+    //
+    // For EGM, make sure source and dest GPUs belong to the same CPU socket. Remote EGM
+    // is not supported.
+    //
+    if (memdescIsEgm(pPhysMemDesc))
+    {
+        if (pFlaOwnerGpu->cpuNumaNodeId == pPhysMemDesc->pGpu->cpuNumaNodeId)
+        {
+            return NV_TRUE;
+        }
+    }
+
     return NV_FALSE;
 }
+
+/*!
+ *  @brief Validates the page size for FLA memory
+ *
+ *  @returns NvBool
+ */
+NvBool
+memmgrIsValidFlaPageSize_GA100
+(
+    OBJGPU *pGpu,
+    MemoryManager *pMemoryManager,
+    NvU64 pageSize,
+    NvBool bIsMulticast
+)
+{
+    NvBool bIsSupported;
+
+    switch(pageSize)
+    {
+        case RM_PAGE_SIZE_2M:
+            bIsSupported = !bIsMulticast;
+            break;
+        case RM_PAGE_SIZE_512M:
+            bIsSupported = NV_TRUE;
+            break;
+        default:
+            bIsSupported = NV_FALSE;
+            break;
+    }
+
+    return bIsSupported;
+}
+

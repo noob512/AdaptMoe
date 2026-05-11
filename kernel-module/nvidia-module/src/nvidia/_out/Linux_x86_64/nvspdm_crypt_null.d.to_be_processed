@@ -1,25 +1,25 @@
 _out/Linux_x86_64/nvspdm_crypt_null.o: \
  src/libraries/libspdm/nvidia/nvspdm_crypt_null.c \
  ../common/sdk/nvidia/inc/cpuopsys.h \
- src/libraries/libspdm/3.1.1/include/hal/base.h \
- src/libraries/libspdm/3.1.1/include/hal/library/debuglib.h \
- src/libraries/libspdm/3.1.1/include/hal/base.h \
- src/libraries/libspdm/3.1.1/include/internal/libspdm_lib_config.h \
+ src/libraries/libspdm/3.5.0/include/hal/base.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/debuglib.h \
+ src/libraries/libspdm/3.5.0/include/hal/base.h \
+ src/libraries/libspdm/3.5.0/include/internal/libspdm_lib_config.h \
  src/libraries/libspdm/nvidia/nvspdm_rmconfig.h \
- src/libraries/libspdm/3.1.1/include/internal/libspdm_macro_check.h \
- src/libraries/libspdm/3.1.1/include/hal/library/memlib.h \
- src/libraries/libspdm/3.1.1/include/hal/library/cryptlib.h \
- src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_hash.h \
- src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_mac.h \
- src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_aead.h \
- src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_cert.h \
- src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_hkdf.h \
- src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_rsa.h \
- src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_ec.h \
- src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_dh.h \
- src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_ecd.h \
- src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_sm2.h \
- src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_rng.h \
+ src/libraries/libspdm/3.5.0/include/internal/libspdm_macro_check.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/memlib.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/cryptlib.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_hash.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_mac.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_aead.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_cert.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_hkdf.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_rsa.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_ec.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_dh.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_ecd.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_sm2.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_rng.h \
  generated/rmconfig.h inc/kernel/core/prelude.h \
  ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
  arch/nvalloc/common/inc/nvrangetypes.h \
@@ -36,7 +36,7 @@ _out/Linux_x86_64/nvspdm_crypt_null.o: \
  ../common/sdk/nvidia/inc/class/cl9010_callback.h \
  ../common/inc/nvctassert.h inc/libraries/nvport/nvport.h \
  inc/libraries/nvport/core.h inc/libraries/nvport/atomic.h \
- inc/libraries/nvport/inline/atomic_gcc.h inc/libraries/nvport/debug.h \
+ inc/libraries/nvport/inline/atomic_c11.h inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
  inc/libraries/nvport/util.h inc/libraries/nvport/inline/util_generic.h \
@@ -47,9 +47,9 @@ _out/Linux_x86_64/nvspdm_crypt_null.o: \
  inc/libraries/nvport/safe.h inc/libraries/nvport/inline/safe_generic.h \
  inc/libraries/nvport/thread.h inc/libraries/nvport/crypto.h \
  inc/libraries/nvport/string.h inc/libraries/nvport/cpu.h \
- inc/libraries/nvoc/object.h inc/libraries/nvoc/prelude.h \
- inc/libraries/utils/nvmacro.h generated/g_object_nvoc.h \
- inc/libraries/nvoc/runtime.h inc/libraries/nvoc/rtti.h \
+ inc/libraries/nvoc/object.h generated/g_object_nvoc.h \
+ inc/libraries/nvoc/runtime.h inc/libraries/nvoc/prelude.h \
+ inc/libraries/utils/nvmacro.h inc/libraries/nvoc/rtti.h \
  inc/kernel/core/printf.h inc/libraries/utils/nvprintf.h \
  inc/libraries/utils/nvprintf_level.h inc/libraries/nvlog/nvlog_printf.h \
  inc/libraries/nvlog/internal/nvlog_printf_internal.h \
@@ -60,25 +60,25 @@ _out/Linux_x86_64/nvspdm_crypt_null.o: \
  generated/g_hal.h ../common/sdk/nvidia/inc/rmcd.h \
  ../common/sdk/nvidia/inc/nvcd.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
-src/libraries/libspdm/3.1.1/include/hal/base.h:
-src/libraries/libspdm/3.1.1/include/hal/library/debuglib.h:
-src/libraries/libspdm/3.1.1/include/hal/base.h:
-src/libraries/libspdm/3.1.1/include/internal/libspdm_lib_config.h:
+src/libraries/libspdm/3.5.0/include/hal/base.h:
+src/libraries/libspdm/3.5.0/include/hal/library/debuglib.h:
+src/libraries/libspdm/3.5.0/include/hal/base.h:
+src/libraries/libspdm/3.5.0/include/internal/libspdm_lib_config.h:
 src/libraries/libspdm/nvidia/nvspdm_rmconfig.h:
-src/libraries/libspdm/3.1.1/include/internal/libspdm_macro_check.h:
-src/libraries/libspdm/3.1.1/include/hal/library/memlib.h:
-src/libraries/libspdm/3.1.1/include/hal/library/cryptlib.h:
-src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_hash.h:
-src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_mac.h:
-src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_aead.h:
-src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_cert.h:
-src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_hkdf.h:
-src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_rsa.h:
-src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_ec.h:
-src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_dh.h:
-src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_ecd.h:
-src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_sm2.h:
-src/libraries/libspdm/3.1.1/include/hal/library/cryptlib/cryptlib_rng.h:
+src/libraries/libspdm/3.5.0/include/internal/libspdm_macro_check.h:
+src/libraries/libspdm/3.5.0/include/hal/library/memlib.h:
+src/libraries/libspdm/3.5.0/include/hal/library/cryptlib.h:
+src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_hash.h:
+src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_mac.h:
+src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_aead.h:
+src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_cert.h:
+src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_hkdf.h:
+src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_rsa.h:
+src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_ec.h:
+src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_dh.h:
+src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_ecd.h:
+src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_sm2.h:
+src/libraries/libspdm/3.5.0/include/hal/library/cryptlib/cryptlib_rng.h:
 generated/rmconfig.h:
 inc/kernel/core/prelude.h:
 ../common/sdk/nvidia/inc/nvtypes.h:
@@ -103,7 +103,7 @@ arch/nvalloc/common/inc/nvrangetypes.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -122,10 +122,10 @@ inc/libraries/nvport/crypto.h:
 inc/libraries/nvport/string.h:
 inc/libraries/nvport/cpu.h:
 inc/libraries/nvoc/object.h:
-inc/libraries/nvoc/prelude.h:
-inc/libraries/utils/nvmacro.h:
 generated/g_object_nvoc.h:
 inc/libraries/nvoc/runtime.h:
+inc/libraries/nvoc/prelude.h:
+inc/libraries/utils/nvmacro.h:
 inc/libraries/nvoc/rtti.h:
 inc/kernel/core/printf.h:
 inc/libraries/utils/nvprintf.h:

@@ -136,13 +136,9 @@ struct NVOC_METADATA__Sec2Context {
     const struct NVOC_VTABLE__Sec2Context vtable;
 };
 
-#ifndef __NVOC_CLASS_Sec2Context_TYPEDEF__
-#define __NVOC_CLASS_Sec2Context_TYPEDEF__
-typedef struct Sec2Context Sec2Context;
-#endif /* __NVOC_CLASS_Sec2Context_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_Sec2Context
-#define __nvoc_class_id_Sec2Context 0x4c3439
+#define __nvoc_class_id_Sec2Context 0x4c3439u
+typedef struct Sec2Context Sec2Context;
 #endif /* __nvoc_class_id_Sec2Context */
 
 // Casting support
@@ -160,12 +156,33 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_Sec2Context;
 
 NV_STATUS __nvoc_objCreateDynamic_Sec2Context(Sec2Context**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_Sec2Context(Sec2Context**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_Sec2Context(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_Sec2Context((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_Sec2Context(Sec2Context**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_Sec2Context(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_Sec2Context((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+#ifdef __nvoc_sec2_context_h_disabled
+static inline NV_STATUS sec2ctxConstructHal(struct Sec2Context *pSec2Context, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("Sec2Context was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_sec2_context_h_disabled
+#define sec2ctxConstructHal(pSec2Context, pCallContext, pParams) sec2ctxConstructHal_KERNEL(pSec2Context, pCallContext, pParams)
+#endif // __nvoc_sec2_context_h_disabled
+
+#ifdef __nvoc_sec2_context_h_disabled
+static inline void sec2ctxDestructHal(struct Sec2Context *pSec2Context) {
+    NV_ASSERT_FAILED_PRECOMP("Sec2Context was disabled!");
+}
+#else // __nvoc_sec2_context_h_disabled
+#define sec2ctxDestructHal(pSec2Context) sec2ctxDestructHal_KERNEL(pSec2Context)
+#endif // __nvoc_sec2_context_h_disabled
+
+
+// Wrapper macros for halified functions
+#define sec2ctxConstructHal_HAL(pSec2Context, pCallContext, pParams) sec2ctxConstructHal(pSec2Context, pCallContext, pParams)
+#define sec2ctxDestructHal_HAL(pSec2Context) sec2ctxDestructHal(pSec2Context)
 #define sec2ctxGetSwMethods_FNPTR(pChannelDescendant) pChannelDescendant->__nvoc_base_ChannelDescendant.__nvoc_metadata_ptr->vtable.__chandesGetSwMethods__
 #define sec2ctxGetSwMethods(pChannelDescendant, ppMethods, pNumMethods) sec2ctxGetSwMethods_DISPATCH(pChannelDescendant, ppMethods, pNumMethods)
 #define sec2ctxIsSwMethodStalling_FNPTR(pChannelDescendant) pChannelDescendant->__nvoc_base_ChannelDescendant.__nvoc_metadata_ptr->vtable.__chandesIsSwMethodStalling__
@@ -360,38 +377,21 @@ static inline NV_STATUS sec2ctxGetOrAllocNotifShare_DISPATCH(struct Sec2Context 
     return pNotifier->__nvoc_metadata_ptr->vtable.__sec2ctxGetOrAllocNotifShare__(pNotifier, hNotifierClient, hNotifierResource, ppNotifShare);
 }
 
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
 NV_STATUS sec2ctxConstructHal_KERNEL(struct Sec2Context *pSec2Context, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
-
-
-#ifdef __nvoc_sec2_context_h_disabled
-static inline NV_STATUS sec2ctxConstructHal(struct Sec2Context *pSec2Context, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {
-    NV_ASSERT_FAILED_PRECOMP("Sec2Context was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_sec2_context_h_disabled
-#define sec2ctxConstructHal(pSec2Context, pCallContext, pParams) sec2ctxConstructHal_KERNEL(pSec2Context, pCallContext, pParams)
-#endif //__nvoc_sec2_context_h_disabled
-
-#define sec2ctxConstructHal_HAL(pSec2Context, pCallContext, pParams) sec2ctxConstructHal(pSec2Context, pCallContext, pParams)
 
 void sec2ctxDestructHal_KERNEL(struct Sec2Context *pSec2Context);
 
-
-#ifdef __nvoc_sec2_context_h_disabled
-static inline void sec2ctxDestructHal(struct Sec2Context *pSec2Context) {
-    NV_ASSERT_FAILED_PRECOMP("Sec2Context was disabled!");
-}
-#else //__nvoc_sec2_context_h_disabled
-#define sec2ctxDestructHal(pSec2Context) sec2ctxDestructHal_KERNEL(pSec2Context)
-#endif //__nvoc_sec2_context_h_disabled
-
-#define sec2ctxDestructHal_HAL(pSec2Context) sec2ctxDestructHal(pSec2Context)
-
-static inline NV_STATUS __nvoc_sec2ctxConstruct(struct Sec2Context *arg_pSec2Context, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams) {
-    return sec2ctxConstructHal(arg_pSec2Context, arg_pCallContext, arg_pParams);
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
+static inline NV_STATUS __nvoc_sec2ctxConstruct(struct Sec2Context *pSec2Context, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams){
+    return sec2ctxConstructHal(pSec2Context, pCallContext, pParams);
 }
 
-static inline void __nvoc_sec2ctxDestruct(struct Sec2Context *pSec2Context) {
+static inline void __nvoc_sec2ctxDestruct(struct Sec2Context *pSec2Context){
     sec2ctxDestructHal(pSec2Context);
 }
 

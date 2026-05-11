@@ -100,8 +100,7 @@ void nvPreFlip(NVDevEvoRec *pDevEvo,
 void nvPostFlip(NVDevEvoRec *pDevEvo,
                 struct NvKmsFlipWorkArea *pWorkArea,
                 const NvBool skipUpdate,
-                const NvU32 applyAllowVrrApiHeadMasks[NVKMS_MAX_SUBDEVICES],
-                NvS32 *pVrrSemaphoreIndex);
+                const NvU32 applyAllowVrrApiHeadMasks[NVKMS_MAX_SUBDEVICES]);
 
 NvBool nvPrepareToDoPreFlip(NVDevEvoRec *pDevEvo,
                             struct NvKmsFlipWorkArea *pWorkArea);

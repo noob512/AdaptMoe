@@ -40,9 +40,8 @@ kheadVsyncNotificationOverRgVblankIntr_v04_04
     KernelHead          *pKernelHead
 )
 {
-    KernelDisplay   *pKernelDisplay = GPU_GET_KERNEL_DISPLAY(pGpu);
-    VBLANKCALLBACK  *pCallback = (VBLANKCALLBACK *)pKernelDisplay->pRgVblankCb;
-    if (pKernelDisplay->bIsPanelReplayEnabled)
+    VBLANKCALLBACK  *pCallback = (VBLANKCALLBACK *)pKernelHead->pRgVblankCb;
+    if (pKernelHead->bIsPanelReplayEnabled)
     {
         if (pCallback != NULL && pCallback->Proc != NULL)
         {

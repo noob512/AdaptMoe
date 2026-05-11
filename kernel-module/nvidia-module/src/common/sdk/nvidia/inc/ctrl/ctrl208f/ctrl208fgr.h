@@ -34,8 +34,6 @@
 
 #include "ctrl/ctrl2080/ctrl2080gr.h"
 
-
-
 /*
  * NV208F_CTRL_CMD_GR_ECC_INJECT_ERROR
  *

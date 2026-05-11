@@ -31,12 +31,41 @@
 #define NV_PFB_PRI_MMU_INT_VECTOR_FAULT_NOTIFY_REPLAYABLE                                64 /* R---V */
 #define NV_PFB_PRI_MMU_INT_VECTOR_FAULT_NOTIFY_NON_REPLAYABLE                        132 /* R---V */
 
+#define NV_PFB_PRI_MMU_PAGE_FAULT_CTRL                              0x00100CF8 /* RW-4R */
+#define NV_PFB_PRI_MMU_PAGE_FAULT_CTRL_PRF_FILTER                          1:0 /* RWEVF */
+#define NV_PFB_PRI_MMU_PAGE_FAULT_CTRL_PRF_FILTER_SEND_ALL          0x00000000 /* RW--V */
+#define NV_PFB_PRI_MMU_PAGE_FAULT_CTRL_PRF_FILTER_SEND_NONE         0x00000003 /* RWE-V */
+
 #define NV_PFB_PRI_MMU_WPR2_ADDR_LO                                            0x001FA824 /* RW-4R */
 #define NV_PFB_PRI_MMU_WPR2_ADDR_LO_VAL                                              31:4 /* RWEVF */
 #define NV_PFB_PRI_MMU_WPR2_ADDR_LO_ALIGNMENT                                  0x0000000c /*       */
 #define NV_PFB_PRI_MMU_WPR2_ADDR_HI                                            0x001FA828 /* RW-4R */
 #define NV_PFB_PRI_MMU_WPR2_ADDR_HI_VAL                                              31:4 /* RWEVF */
 #define NV_PFB_PRI_MMU_WPR2_ADDR_HI_ALIGNMENT                                  0x0000000c /*       */
+
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_GET(i)                         (0x00100E2C+(i)*20) /* RW-4A */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_GET__SIZE_1                     2 /*       */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_GET_PTR                              19:0 /* RWEVF */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_GET_PTR_RESET                  0x00000000 /* RWE-V */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_GET_GETPTR_CORRUPTED                30:30 /* RWEVF */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_GET_GETPTR_CORRUPTED_NO        0x00000000 /* RWE-V */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_GET_GETPTR_CORRUPTED_YES       0x00000001 /* RW--V */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_GET_GETPTR_CORRUPTED_CLEAR     0x00000001 /* RW--V */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_GET_OVERFLOW                        31:31 /* RWEVF */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_GET_OVERFLOW_NO                0x00000000 /* RWE-V */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_GET_OVERFLOW_YES               0x00000001 /* RW--V */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_GET_OVERFLOW_CLEAR             0x00000001 /* RW--V */
+
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_PUT(i)                         (0x00100E30+(i)*20) /* R--4A */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_PUT__SIZE_1                    2 /*       */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_PUT_PTR                               19:0 /* R-EVF */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_PUT_PTR_RESET                   0x00000000 /* R-E-V */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_PUT_GETPTR_CORRUPTED                 30:30 /* R-EVF */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_PUT_GETPTR_CORRUPTED_NO         0x00000000 /* R-E-V */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_PUT_GETPTR_CORRUPTED_YES        0x00000001 /* R---V */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_PUT_OVERFLOW                         31:31 /* R-EVF */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_PUT_OVERFLOW_NO                 0x00000000 /* R-E-V */
+#define NV_PFB_PRI_MMU_FAULT_BUFFER_PUT_OVERFLOW_YES                0x00000001 /* R---V */
 
 #define NV_PFB_PRI_MMU_FAULT_BUFFER_SIZE_VAL                          19:0 /* RWEVF */
 #define NV_PFB_PRI_MMU_FAULT_BUFFER_SIZE_VAL_RESET              0x00000000 /* RWE-V */

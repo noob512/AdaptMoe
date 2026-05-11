@@ -367,17 +367,15 @@ NvBool nvAllocLutSurfacesEvo(NVDevEvoPtr pDevEvo)
     nvkms_memset(&pDevEvo->lut.notifierState, 0,
                  sizeof(pDevEvo->lut.notifierState));
 
-    if (pDevEvo->hal->caps.needDefaultLutSurface) {
-        pDevEvo->lut.defaultLut = AllocLutSurfaceEvo(pDevEvo);
-        if (pDevEvo->lut.defaultLut == NULL) {
-            nvFreeLutSurfacesEvo(pDevEvo);
-            return FALSE;
-        }
-
-        nvInvalidateDefaultLut(pDevEvo);
-
-        pDevEvo->hal->InitDefaultLut(pDevEvo);
+    pDevEvo->lut.defaultLut = AllocLutSurfaceEvo(pDevEvo);
+    if (pDevEvo->lut.defaultLut == NULL) {
+        nvFreeLutSurfacesEvo(pDevEvo);
+        return FALSE;
     }
+
+    nvInvalidateDefaultLut(pDevEvo);
+
+    pDevEvo->hal->InitDefaultLut(pDevEvo);
 
     return TRUE;
 }

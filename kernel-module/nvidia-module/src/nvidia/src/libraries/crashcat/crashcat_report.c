@@ -55,7 +55,7 @@ void crashcatReportLog_IMPL(CrashCatReport *pReport)
     NV_ASSERT_OR_RETURN_VOID((pReport->validTags & NVBIT(NV_CRASHCAT_PACKET_TYPE_REPORT)) != 0);
 
     // TODO: acquire mutex to prevent multi-line reports interleaving
-
+    crashcatEngineResetLog(pReport->pEngine);
     crashcatReportLogSource_HAL(pReport);
     crashcatReportLogReporter_HAL(pReport);
 

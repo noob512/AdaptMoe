@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -259,7 +259,8 @@ knvlinkSetupPeerMapping_GP100
 )
 {
     NV_STATUS status = NV_OK;
-    NvU64     peerLinkMask;
+    NvU64 peerLinkMask;
+    NVLINK_BIT_VECTOR peerLinkMaskVec;
 
     NV2080_CTRL_INTERNAL_NVLINK_PRE_SETUP_NVLINK_PEER_PARAMS  preSetupNvlinkPeerParams;
     NV2080_CTRL_INTERNAL_NVLINK_POST_SETUP_NVLINK_PEER_PARAMS postSetupNvlinkPeerParams;
@@ -277,13 +278,18 @@ knvlinkSetupPeerMapping_GP100
         }
 
         peerLinkMask = KNVLINK_GET_MASK(pKernelNvlink, peerLinkMasks[gpuGetInstance(pRemoteGpu)], 64);
-        knvlinkGetEffectivePeerLinkMask_HAL(pGpu, pKernelNvlink, pRemoteGpu, &peerLinkMask);
+        NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+            convertMaskToBitVector(peerLinkMask, &peerLinkMaskVec),
+            return; );
+        knvlinkGetEffectivePeerLinkMask_HAL(pGpu, pKernelNvlink, pRemoteGpu, &peerLinkMaskVec);
 
-        if (peerLinkMask != 0)
+        if (!bitVectorTestAllCleared(&peerLinkMaskVec))
         {
             portMemSet(&preSetupNvlinkPeerParams, 0, sizeof(preSetupNvlinkPeerParams));
             preSetupNvlinkPeerParams.peerId        = peerId;
-            preSetupNvlinkPeerParams.peerLinkMask  = peerLinkMask;
+            NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+                convertBitVectorToLinkMasks(&peerLinkMaskVec, &preSetupNvlinkPeerParams.peerLinkMask, 
+                                    sizeof(preSetupNvlinkPeerParams.peerLinkMask), NULL), return; );
             preSetupNvlinkPeerParams.bEgmPeer      = GPU_GET_KERNEL_BUS(pGpu)->p2p.bEgmPeer[peerId];
             preSetupNvlinkPeerParams.bNvswitchConn = knvlinkIsGpuConnectedToNvswitch(pGpu, pKernelNvlink);
 
@@ -314,7 +320,7 @@ knvlinkSetupPeerMapping_GP100
  * @param[in] pGpu           OBJGPU ptr
  * @param[in] pKernelNvlink  KernelNvlink ptr
  */
-NvU32
+NVLINK_BIT_VECTOR *
 knvlinkGetConnectedLinksMask_GP100
 (
     OBJGPU       *pGpu,
@@ -389,3 +395,16 @@ knvlinkCoreGetDevicePciInfo_GP100
     devInfo->pciInfo.function = 0;
 }
 #endif
+
+/*!
+ * @brief Get supported core link states for this device
+ */
+NvU32
+knvlinkGetSupportedCoreLinkStateMask_GP100
+(
+    OBJGPU *pGpu,
+    KernelNvlink *pKernelNvlink
+)
+{
+    return 0xFFFFFFFF;
+}

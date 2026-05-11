@@ -71,6 +71,10 @@
 #define NV_CHRAM_CHANNEL_UPDATE_RESET_PBDMA_FAULTED      0x00000011 /*       */
 #define NV_CHRAM_CHANNEL_UPDATE_RESET_ENG_FAULTED        0x00000021 /*       */
 #define NV_CHRAM_CHANNEL_UPDATE_CLEAR_CHANNEL            0xFFFFFFFF /*       */
+#define NV_RUNLIST_INTERNAL_DOORBELL                           0x090 /* -W-4R */
+#define NV_RUNLIST_INTERNAL_DOORBELL_CHID      11:0 /*       */
+#define NV_RUNLIST_INTERNAL_DOORBELL_CHID_HW      10:0 /* -WXUF */
+#define NV_RUNLIST_INTERNAL_DOORBELL_GFID                      21:16 /* -WXUF */
 #define NV_RUNLIST_PREEMPT                                     0x098 /* RW-4R */
 #define NV_RUNLIST_PREEMPT_ID                                    11:0 /*       */
 #define NV_RUNLIST_PREEMPT_ID_HW                   10:0 /* RWIUF */

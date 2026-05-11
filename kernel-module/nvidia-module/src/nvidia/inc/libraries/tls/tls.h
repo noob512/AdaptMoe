@@ -143,6 +143,12 @@ enum {
 NvU64 tlsEntryAlloc(void);
 
 /**
+ * @brief Returns true if TLS entries are refcounted.
+ * Callers should ignore refcounts returned by the API is false.
+ **/
+NvBool tlsIsRefcounted(void);
+
+/**
  * @brief Get pointer to TLS entry for given @p entryId.
  *
  * This function increments the refCount of the given entry.
@@ -227,6 +233,15 @@ NvU32 tlsEntryReleaseWithAllocator(NvU64 entryId, PORT_MEM_ALLOCATOR *pAllocator
  *
  */
 NvP64 tlsEntryGet(NvU64 entryId);
+
+/**
+ * @brief Set TLS data pointer for given entryId.
+ *
+ * This function will not modify the refCount.
+ *
+ * @return NV_FALSE if the entry doesn't exist.
+ */
+NvBool tlsEntrySet(NvU64 entryId, NvP64 entryData);
 
 /**
  * @brief Increment the refCount of given TLS entry.

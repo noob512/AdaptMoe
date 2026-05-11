@@ -37,7 +37,7 @@
 // DATA SIZE (bytes): 38912
 // COMPRESSED SIZE (bytes): 18958
 //
-static BINDATA_CONST NvU8 kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_IMAGE_DBG_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_IMAGE_DBG_data[] = 
 {
     0xed, 0xdb, 0x43, 0x90, 0x28, 0x4d, 0x1b, 0x28, 0xe8, 0xb6, 0x6d, 0xdb, 0xb6, 0x6d, 0xdb, 0xb6,
     0xed, 0xd3, 0xb6, 0x6d, 0xdb, 0xb6, 0x6d, 0xdb, 0xb6, 0xfb, 0xb4, 0xdd, 0xa7, 0x7b, 0xfe, 0x3b,
@@ -1254,7 +1254,7 @@ BINDATA_STORAGE_PVT kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_IMAGE_DB
 // DATA SIZE (bytes): 36
 // COMPRESSED SIZE (bytes): 27
 //
-static BINDATA_CONST NvU8 kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_HEADER_DBG_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_HEADER_DBG_data[] = 
 {
     0x63, 0x60, 0x00, 0x02, 0x46, 0x20, 0xf6, 0x06, 0x62, 0x5f, 0x08, 0x13, 0x4c, 0x78, 0x41, 0x69,
     0x20, 0x00, 0x00, 0x78, 0xb1, 0xb4, 0x67, 0x24, 0x00, 0x00, 0x00,
@@ -1288,7 +1288,7 @@ BINDATA_STORAGE_PVT kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_HEADER_D
 // DATA SIZE (bytes): 38912
 // COMPRESSED SIZE (bytes): 18959
 //
-static BINDATA_CONST NvU8 kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_IMAGE_PROD_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_IMAGE_PROD_data[] = 
 {
     0xed, 0xdb, 0x43, 0x94, 0xe8, 0x4c, 0x1b, 0x28, 0xea, 0xb6, 0x6d, 0xdb, 0xb6, 0xdd, 0xbd, 0xdb,
     0xb6, 0x6d, 0xbb, 0x7b, 0xb7, 0x6d, 0xdb, 0xe6, 0x6e, 0xdb, 0xb6, 0x6d, 0xdb, 0xb6, 0xef, 0x7f,
@@ -2505,7 +2505,7 @@ BINDATA_STORAGE_PVT kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_IMAGE_PR
 // DATA SIZE (bytes): 36
 // COMPRESSED SIZE (bytes): 27
 //
-static BINDATA_CONST NvU8 kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_HEADER_PROD_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_HEADER_PROD_data[] = 
 {
     0x63, 0x60, 0x00, 0x02, 0x46, 0x20, 0xf6, 0x06, 0x62, 0x5f, 0x08, 0x13, 0x4c, 0x78, 0x41, 0x69,
     0x20, 0x00, 0x00, 0x78, 0xb1, 0xb4, 0x67, 0x24, 0x00, 0x00, 0x00,
@@ -2539,7 +2539,7 @@ BINDATA_STORAGE_PVT kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_HEADER_P
 // DATA SIZE (bytes): 16
 // COMPRESSED SIZE (bytes): N/A
 //
-static BINDATA_CONST NvU8 kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_SIG_DBG_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_SIG_DBG_data[] = 
 {
     0x51, 0x74, 0x69, 0x9b, 0x30, 0xca, 0x6e, 0x77, 0x77, 0xfd, 0xaf, 0x66, 0x8a, 0xc7, 0xf1, 0x61,
 };
@@ -2572,7 +2572,7 @@ BINDATA_STORAGE_PVT kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_SIG_DBG_
 // DATA SIZE (bytes): 16
 // COMPRESSED SIZE (bytes): N/A
 //
-static BINDATA_CONST NvU8 kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_SIG_PROD_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_SIG_PROD_data[] = 
 {
     0x5a, 0x0f, 0xba, 0x2b, 0xf9, 0xee, 0x52, 0x33, 0x74, 0xaa, 0x49, 0x9e, 0x59, 0xf1, 0xd6, 0x39,
 };
@@ -2605,7 +2605,7 @@ BINDATA_STORAGE_PVT kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_SIG_PROD
 // DATA SIZE (bytes): 4
 // COMPRESSED SIZE (bytes): N/A
 //
-static BINDATA_CONST NvU8 kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_PATCH_LOC_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_PATCH_LOC_data[] = 
 {
     0x00, 0x4d, 0x00, 0x00,
 };
@@ -2638,7 +2638,7 @@ BINDATA_STORAGE_PVT kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_PATCH_LO
 // DATA SIZE (bytes): 4
 // COMPRESSED SIZE (bytes): N/A
 //
-static BINDATA_CONST NvU8 kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_PATCH_SIG_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_PATCH_SIG_data[] = 
 {
     0x00, 0x00, 0x00, 0x00,
 };
@@ -2671,7 +2671,7 @@ BINDATA_STORAGE_PVT kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_PATCH_SI
 // DATA SIZE (bytes): 12
 // COMPRESSED SIZE (bytes): N/A
 //
-static BINDATA_CONST NvU8 kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_PATCH_META_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_PATCH_META_data[] = 
 {
     0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00,
 };
@@ -2704,7 +2704,7 @@ BINDATA_STORAGE_PVT kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_PATCH_ME
 // DATA SIZE (bytes): 4
 // COMPRESSED SIZE (bytes): N/A
 //
-static BINDATA_CONST NvU8 kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_NUM_SIGS_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) kgspBinArchiveBooterUnloadUcode_TU116_BINDATA_LABEL_NUM_SIGS_data[] = 
 {
     0x01, 0x00, 0x00, 0x00,
 };

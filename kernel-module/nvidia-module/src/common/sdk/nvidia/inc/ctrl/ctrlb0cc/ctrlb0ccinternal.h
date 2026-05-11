@@ -136,6 +136,11 @@ typedef struct NVB0CC_CTRL_INTERNAL_PERMISSIONS_INIT_PARAMS {
     NvBool bDevProfilingPermitted;
 
     /*!
+     * [in] Is Device tracing permitted
+     */
+    NvBool bDevTracePermitted;
+
+    /*!
      * [in] Is Context profiling permitted
      */
     NvBool bCtxProfilingPermitted;
@@ -149,6 +154,11 @@ typedef struct NVB0CC_CTRL_INTERNAL_PERMISSIONS_INIT_PARAMS {
      * [in] Is SYS memory profiling permitted
      */
     NvBool bSysMemoryProfilingPermitted;
+
+    /*!
+     * [in] Is Async CE profiling permitted
+     */
+    NvBool bAsyncCeProfilingPermitted;
 } NVB0CC_CTRL_INTERNAL_PERMISSIONS_INIT_PARAMS;
 
 #define NVB0CC_CTRL_INTERNAL_ALLOC_PMA_STREAM_PARAMS_MESSAGE_ID (0x4U)

@@ -100,7 +100,7 @@ typedef struct _NvPushAllocDeviceParams {
          * mapped. */
         NvU32       gpuVASpaceObject;
         /* ctxDma handle to be used with MapMemoryDma. */
-        NvU32       gpuVASpace;
+        NvU32       gpuVASpaceCtxDma;
     } subDevice[NV_MAX_SUBDEVICES];
 
     struct {

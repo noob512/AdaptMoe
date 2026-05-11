@@ -46,7 +46,7 @@ _out/Linux_x86_64/g_finn_rm_api.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl83de/ctrl83debase.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlb06f.h inc/libraries/nvport/nvport.h \
  inc/libraries/nvport/core.h inc/libraries/nvport/atomic.h \
- inc/libraries/nvport/inline/atomic_gcc.h inc/libraries/nvport/debug.h \
+ inc/libraries/nvport/inline/atomic_c11.h inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
  inc/libraries/nvport/util.h inc/libraries/nvport/inline/util_generic.h \
@@ -108,7 +108,7 @@ _out/Linux_x86_64/g_finn_rm_api.o: \
 inc/libraries/nvport/nvport.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:

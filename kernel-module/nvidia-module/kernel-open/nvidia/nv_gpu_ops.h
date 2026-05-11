@@ -35,6 +35,7 @@
 #define _NV_GPU_OPS_H_
 #include "nvgputypes.h"
 #include "nv_uvm_types.h"
+#include "nv_uvm_user_types.h"
 
 typedef struct gpuSession       *gpuSessionHandle;
 typedef struct gpuDevice        *gpuDeviceHandle;
@@ -61,6 +62,16 @@ NV_STATUS nvGpuOpsDeviceCreate(struct gpuSession *session,
                                NvBool bCreateSmcPartition);
 
 NV_STATUS nvGpuOpsDeviceDestroy(struct gpuDevice *device);
+
+NV_STATUS nvGpuOpsAccessBitsBufAlloc(struct gpuDevice *device,
+                                     gpuAccessBitsBufferAlloc *pAccessBitsInfo);
+
+NV_STATUS nvGpuOpsAccessBitsBufFree(struct gpuDevice *device,
+                                    gpuAccessBitsBufferAlloc *pAccessBitsInfo);
+
+NV_STATUS nvGpuOpsAccessBitsDump(struct gpuDevice *device,
+                                 gpuAccessBitsBufferAlloc *pAccessBitsInfo,
+                                 UVM_ACCESS_BITS_DUMP_MODE mode);
 
 NV_STATUS nvGpuOpsAddressSpaceCreate(struct gpuDevice *device,
                                      NvU64 vaBase,

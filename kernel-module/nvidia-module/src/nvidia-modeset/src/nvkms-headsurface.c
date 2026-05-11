@@ -40,7 +40,7 @@
 #include <class/cl0040.h> /* NV01_MEMORY_LOCAL_USER */
 #include <class/cl003e.h> /* NV01_MEMORY_SYSTEM */
 #include <class/cla06fsubch.h>
-#include <class/clb06f.h> /* MAXWELL_CHANNEL_GPFIFO_A */
+#include <class/clc46f.h> /* TURING_CHANNEL_GPFIFO */
 
 static NvBool AllocNotifiers(NVHsDeviceEvoRec *pHsDevice);
 static void FreeNotifiers(NVHsDeviceEvoRec *pHsDevice);
@@ -1648,10 +1648,10 @@ static void HsFlushL2(
 
     NvPushChannelPtr p = &pHsChannel->nvPush.channel;
     /* Host WFI */
-    nvPushImmedVal(p, NVA06F_SUBCHANNEL_2D, NVB06F_WFI, 0);
+    nvPushImmedVal(p, NVA06F_SUBCHANNEL_2D, NVC46F_WFI, 0);
     /* Flush L2 to backing store */
-    nvPushMethod(p, NVA06F_SUBCHANNEL_2D, NVB06F_MEM_OP_D, 1);
-    nvPushSetMethodData(p, DRF_DEF(B06F, _MEM_OP_D, _OPERATION, _L2_FLUSH_DIRTY));
+    nvPushMethod(p, NVA06F_SUBCHANNEL_2D, NVC46F_MEM_OP_D, 1);
+    nvPushSetMethodData(p, DRF_DEF(C46F, _MEM_OP_D, _OPERATION, _L2_FLUSH_DIRTY));
 }
 
 /*!
@@ -1866,7 +1866,7 @@ static void HsProcFsRecordScanline(
     const NVDispEvoRec *pDispEvo,
     const NvU32 apiHead)
 {
-#if NVKMS_PROCFS_ENABLE
+#if NVKMS_HEADSURFACE_STATS
     NVHsChannelEvoRec *pHsChannel = pDispEvo->pHsChannel[apiHead];
     NvU16 scanLine = 0;
     NvBool inBlankingPeriod = FALSE;
@@ -1890,13 +1890,13 @@ static void HsProcFsRecordScanline(
                 scanLine, pHsChannel->statistics.scanLine.vVisible);
         }
     }
-#endif /* NVKMS_PROCFS_ENABLE */
+#endif /* NVKMS_HEADSURFACE_STATS */
 }
 
 static void HsProcFsRecordPreviousFrameNotDone(
     NVHsChannelEvoPtr pHsChannel)
 {
-#if NVKMS_PROCFS_ENABLE
+#if NVKMS_HEADSURFACE_STATS
     pHsChannel->statistics.nPreviousFrameNotDone++;
 #endif
 }
@@ -1905,19 +1905,19 @@ static void HsProcFsRecordFullscreenSgFrames(
     NVHsChannelEvoPtr pHsChannel,
     NvBool isFullscreen)
 {
-#if NVKMS_PROCFS_ENABLE
+#if NVKMS_HEADSURFACE_STATS
     if (isFullscreen) {
         pHsChannel->statistics.nFullscreenSgFrames++;
     } else {
         pHsChannel->statistics.nNonFullscreenSgFrames++;
     }
-#endif /* NVKMS_PROCFS_ENABLE */
+#endif /* NVKMS_HEADSURFACE_STATS */
 }
 
 static void HsProcFsRecordOmittedNonSgHsUpdate(
     NVHsChannelEvoPtr pHsChannel)
 {
-#if NVKMS_PROCFS_ENABLE
+#if NVKMS_HEADSURFACE_STATS
     pHsChannel->statistics.nOmittedNonSgHsUpdates++;
 #endif
 }
@@ -2416,7 +2416,7 @@ void nvHsRemoveVBlankCallback(NVHsChannelEvoPtr pHsChannel)
 void nvHsAllocStatistics(
     NVHsChannelEvoRec *pHsChannel)
 {
-#if NVKMS_PROCFS_ENABLE
+#if NVKMS_HEADSURFACE_STATS
     const NVDispEvoRec *pDispEvo = pHsChannel->pDispEvo;
     const NvU32 apiHead = pHsChannel->apiHead;
     const NVHwModeTimingsEvo *pTimings =
@@ -2430,19 +2430,19 @@ void nvHsAllocStatistics(
     n = pHsChannel->statistics.scanLine.vVisible + 1;
 
     pHsChannel->statistics.scanLine.pHistogram = nvCalloc(1, sizeof(NvU64) * n);
-#endif /* NVKMS_PROCFS_ENABLE */
+#endif /* NVKMS_HEADSURFACE_STATS */
 }
 
 void nvHsFreeStatistics(
     NVHsChannelEvoRec *pHsChannel)
 {
-#if NVKMS_PROCFS_ENABLE
+#if NVKMS_HEADSURFACE_STATS
     nvFree(pHsChannel->statistics.scanLine.pHistogram);
     nvkms_memset(&pHsChannel->statistics, 0, sizeof(pHsChannel->statistics));
-#endif /* NVKMS_PROCFS_ENABLE */
+#endif /* NVKMS_HEADSURFACE_STATS */
 }
 
-#if NVKMS_PROCFS_ENABLE
+#if NVKMS_HEADSURFACE_STATS
 
 static const struct {
     const char *before;
@@ -2972,4 +2972,4 @@ void nvHsProcFs(
 
     HsProcFsScanLine(pInfoString, pHsChannel);
 }
-#endif /* NVKMS_PROCFS_ENABLE */
+#endif /* NVKMS_HEADSURFACE_STATS */

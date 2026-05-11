@@ -113,10 +113,19 @@ memmgrDestruct_IMPL
 {
     NvU32 i;
 
+    OBJGPU *pGpu = ENG_GET_GPU(pMemoryManager);
+
+    memmgrDestroyScanoutCarveoutHeap_HAL(pGpu, pMemoryManager);
+
     for (i = 0; i < NUM_FBSR_TYPES; i++)
     {
         objDelete(pMemoryManager->pFbsr[i]);
         pMemoryManager->pFbsr[i] = NULL;
+    }
+
+    if (pMemoryManager->pHeap != NULL && pMemoryManager->pHeap->pPmaObject != NULL)
+    {
+        pmaDestroy(pMemoryManager->pHeap->pPmaObject);
     }
 
     objDelete(pMemoryManager->pHeap);
@@ -139,6 +148,34 @@ _memmgrInitRegistryOverridesAtConstruct
     MemoryManager *pMemoryManager
 )
 {
+    NvU32 NV_ATTRIBUTE_UNUSED data32;
+
+    if (osReadRegistryDword(pGpu, NV_REG_STR_RM_ENABLE_LARGE_PAGE_SYSMEM_DEFAULT, &data32) == NV_OK)
+    {
+        if (data32 == NV_REG_STR_RM_ENABLE_LARGE_PAGE_SYSMEM_DEFAULT_ENABLE)
+        {
+            pMemoryManager->bSysmemPageSizeDefaultAllowLargePages = NV_TRUE;
+        }
+        else
+        {
+            pMemoryManager->bSysmemPageSizeDefaultAllowLargePages = NV_FALSE;
+        }
+
+        NV_PRINTF(LEVEL_NOTICE, "Large page sysmem default override to 0x%x via regkey.\n",
+            pMemoryManager->bSysmemPageSizeDefaultAllowLargePages);
+    }
+
+    if (osReadRegistryDword(
+            pGpu, NV_REG_STR_RM_FORCE_ENABLE_FLA_SYSMEM, &data32) == NV_OK)
+    {
+        if (data32 ==
+                NV_REG_STR_RM_FORCE_ENABLE_FLA_SYSMEM_TRUE)
+        {
+            pMemoryManager->bForceEnableFlaSysmem = NV_TRUE;
+            NV_PRINTF(LEVEL_NOTICE,
+                "Enabled FLA+sysmem via regkey.\n");
+        }
+    }
 }
 
 static void
@@ -176,30 +213,6 @@ _memmgrInitRegistryOverrides(OBJGPU *pGpu, MemoryManager *pMemoryManager)
         pMemoryManager->bFastScrubberEnabled = NV_FALSE;
     }
 
-    if (NV_OK == osReadRegistryDword(pGpu, NV_REG_STR_RM_SYSMEM_PAGE_SIZE, &data32))
-    {
-        switch (data32)
-        {
-            case RM_PAGE_SIZE:
-            case RM_PAGE_SIZE_64K:
-            case RM_PAGE_SIZE_HUGE:
-            case RM_PAGE_SIZE_512M:
-                break;
-            default:
-                NV_ASSERT(0);
-                NV_PRINTF(LEVEL_ERROR,
-                          "Sysmem page size 0x%x not supported! Defaulting to 4KB\n",
-                          data32);
-                data32 = RM_PAGE_SIZE;
-        }
-        pMemoryManager->sysmemPageSize = data32;
-    }
-    else
-    {
-        pMemoryManager->sysmemPageSize = RM_PAGE_SIZE;
-
-    }
-
     if (osReadRegistryDword(pGpu, NV_REG_STR_RM_ALLOW_SYSMEM_LARGE_PAGES, &data32) == NV_OK)
     {
         pMemoryManager->bAllowSysmemHugePages = data32 ? NV_TRUE : NV_FALSE;
@@ -216,6 +229,20 @@ _memmgrInitRegistryOverrides(OBJGPU *pGpu, MemoryManager *pMemoryManager)
         pMemoryManager->rsvdMemorySizeIncrement = (NvU64)data32 << 20;
         NV_PRINTF(LEVEL_ERROR,
                   "User specified increase in reserved size = %d MBs\n", data32);
+    }
+    
+    pMemoryManager->overrideMaxContextSizeRsvdMemory = NV_REG_STR_RM_OVERRIDE_MAX_CONTEXT_SIZE_RSVD_MEMORY_MB_DEFAULT;
+    if (osReadRegistryDword(pGpu, NV_REG_STR_RM_OVERRIDE_MAX_CONTEXT_SIZE_RSVD_MEMORY_MB, &data32) == NV_OK)
+    {
+        if (data32 > 0)
+        {
+            pMemoryManager->overrideMaxContextSizeRsvdMemory = (NvU64)data32 << 20;
+            NV_PRINTF(LEVEL_ERROR, "User specified max context size = %d MBs\n", data32);
+        }
+        else
+        {
+            NV_PRINTF(LEVEL_ERROR, "Invalid value for RMOverrideMaxContextSizeRsvdMemoryMB: %d\n", data32);
+        }
     }
 
     if (osReadRegistryDword(pGpu,
@@ -296,6 +323,11 @@ _memmgrInitRegistryOverrides(OBJGPU *pGpu, MemoryManager *pMemoryManager)
         }
     }
 
+    if (pMemoryManager->bLocalizedMemorySupported)
+    {
+        pMemoryManager->localizedMask = NVBIT64(memmgrGetLocalizedOffset_HAL(pGpu, pMemoryManager));
+    }
+
     if (osReadRegistryDword(pGpu, NV_REG_STR_DISABLE_GLOBAL_CE_UTILS, &data32) == NV_OK &&
         data32 == NV_REG_STR_DISABLE_GLOBAL_CE_UTILS_YES)
     {
@@ -311,23 +343,6 @@ _memmgrInitRegistryOverrides(OBJGPU *pGpu, MemoryManager *pMemoryManager)
         }
     }
 
-    if (osReadRegistryDword(pGpu, NV_REG_STR_RM_64K_BUG_5123775_WAR, &data32) == NV_OK)
-    {
-        NV_PRINTF(LEVEL_ERROR, "BUG 5123775 WAR: isEnabled %d\n", data32);
-        if (data32)
-        {
-            pMemoryManager->bug64kPage5123775War = NV_TRUE;
-        }
-        else
-        {
-            pMemoryManager->bug64kPage5123775War = NV_FALSE;
-        }
-    }
-    else
-    {
-        pMemoryManager->bug64kPage5123775War = NV_FALSE;
-    } 
-
     pMemoryManager->bCePhysicalVidmemAccessNotSupported = gpuIsSelfHosted(pGpu);
 }
 
@@ -340,7 +355,7 @@ memmgrStatePreInitLocked_IMPL
 {
     KernelMemorySystem *pKernelMemorySystem = GPU_GET_KERNEL_MEMORY_SYSTEM(pGpu);
 
-    if (IS_GSP_CLIENT(pGpu) || IS_VIRTUAL(pGpu))
+    if ((IS_GSP_CLIENT(pGpu) && !IS_DCE_CLIENT(pGpu)) || IS_VIRTUAL(pGpu))
     {
         //
         // Temporary hack to get OpenRM working without breaking SLI
@@ -353,7 +368,8 @@ memmgrStatePreInitLocked_IMPL
     // Determine the size of reserved memory
     NV_ASSERT_OK_OR_RETURN(memmgrPreInitReservedMemory_HAL(pGpu, pMemoryManager));
 
-    if (pKernelMemorySystem->pStaticConfig->bDisableCompbitBacking)
+    if (pKernelMemorySystem != NULL &&
+        pKernelMemorySystem->pStaticConfig->bDisableCompbitBacking)
     {
         pMemoryManager->bUseVirtualCopyOnSuspend = NV_FALSE;
     }
@@ -396,7 +412,8 @@ memmgrTestCeUtils
     }
 
     NV_ASSERT_OK_OR_GOTO(status,
-        memdescCreate(&pVidMemDesc, pGpu, sizeof vidmemData, RM_PAGE_SIZE, NV_TRUE, ADDR_FBMEM,
+        memdescCreate(&pVidMemDesc, pGpu, sizeof vidmemData, RM_PAGE_SIZE, NV_TRUE,
+                      pGpu->pGpuArch->bGpuArchIsZeroFb ? ADDR_SYSMEM : ADDR_FBMEM,
                       NV_MEMORY_UNCACHED, MEMDESC_FLAGS_NONE),
         failed);
     memdescTagAlloc(status,
@@ -406,7 +423,8 @@ memmgrTestCeUtils
 
     NV_ASSERT_OK_OR_GOTO(status,
         memdescCreate(&pSysMemDesc, pGpu, sizeof sysmemData, 0, NV_TRUE,
-                      RMCFG_FEATURE_PLATFORM_GSP ? ADDR_FBMEM : ADDR_SYSMEM,
+                      (RMCFG_FEATURE_PLATFORM_GSP && !pGpu->pGpuArch->bGpuArchIsZeroFb) ?
+                           ADDR_FBMEM : ADDR_SYSMEM,
                       NV_MEMORY_UNCACHED, MEMDESC_FLAGS_NONE),
         failed);
     memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_138,
@@ -441,13 +459,21 @@ memmgrInitInternalChannels_IMPL
 {
     NV_ASSERT_OK_OR_RETURN(memmgrScrubHandlePostSchedulingEnable_HAL(pGpu, pMemoryManager));
 
+    if (!RMCFG_FEATURE_PLATFORM_GSP &&
+        (pGpu->pGpuArch->bGpuArchIsZeroFb ||
+         pGpu->getProperty(pGpu, PDB_PROP_GPU_BROKEN_FB) ||
+         pGpu->getProperty(pGpu, PDB_PROP_GPU_IS_ALL_INST_IN_SYSMEM)))
+    {
+        // CeUtils doesn't give any perf boost to sysmem accesses on CPU, but on GSP it does
+        NV_PRINTF(LEVEL_INFO, "Skipping global CeUtils creation (supported platform but useless)\n");
+
+        return NV_OK;
+    }
+
     if (pMemoryManager->bDisableGlobalCeUtils ||
-        pGpu->getProperty(pGpu, PDB_PROP_GPU_BROKEN_FB) ||
-        pGpu->getProperty(pGpu, PDB_PROP_GPU_IS_ALL_INST_IN_SYSMEM) ||
-        pGpu->getProperty(pGpu, PDB_PROP_GPU_ZERO_FB) ||
         gpuIsCacheOnlyModeEnabled(pGpu) ||
         (IS_VIRTUAL(pGpu) && !IS_VIRTUAL_WITH_FULL_SRIOV(pGpu)) ||
-        IS_SIMULATION(pGpu) ||
+        !IS_SILICON(pGpu) ||
         IsDFPGA(pGpu))
     {
         NV_PRINTF(LEVEL_INFO, "Skipping global CeUtils creation (unsupported platform)\n");
@@ -615,6 +641,16 @@ memmgrStateInitLocked_IMPL
     }
 
     //
+    // If a region of FB or system memory is actively being used for console
+    // display memory on this GPU, mark it reserved in-place.
+    // In case of legacy SLI on Linux, console size is only known at StateInit
+    //
+
+    memmgrReserveConsoleRegion_HAL(pGpu, pMemoryManager);
+
+    NV_ASSERT_OK_OR_RETURN(memmgrAllocateConsoleRegion_HAL(pGpu, pMemoryManager));
+
+    //
     // Allocate framebuffer heap.  All memory must be allocated from here to keep the world
     // consistent (N.B. the heap size has been reduced by the amount of instance memory).
     //
@@ -738,7 +774,7 @@ memmgrVerifyGspDmaOps_IMPL
 {
     KernelBus *pKernelBus = GPU_GET_KERNEL_BUS(pGpu);
     NV_STATUS status = NV_OK;
-    MEMORY_DESCRIPTOR *pMemDesc;
+    MEMORY_DESCRIPTOR *pMemDesc = NULL;
     NvU8 *pTestBuffer;
     NvU32 testData = 0xdeadbeef;
     TRANSFER_SURFACE surf = {0};
@@ -757,7 +793,7 @@ memmgrVerifyGspDmaOps_IMPL
 
     status = memdescCreate(&pMemDesc, pGpu, RM_PAGE_SIZE, RM_PAGE_SIZE,
                            NV_TRUE, ADDR_FBMEM, NV_MEMORY_UNCACHED, 0);
-    NV_ASSERT_OR_RETURN(status == NV_OK, status);
+    NV_ASSERT_OR_GOTO(status == NV_OK, failed);
 
     memdescTagAlloc(status,
                     NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_20, pMemDesc);
@@ -800,6 +836,25 @@ failed:
     return status;
 }
 
+/*!
+ * @brief Check if any ZBC surface is referenced
+ */
+static NvBool
+_memmgrIsZbcSurfaceReferenced
+(
+    OBJGPU *pGpu,
+    MemoryManager *pMemoryManager
+)
+{
+    NvU32 i;
+    for (i = 0; i < NV_ARRAY_ELEMENTS(pMemoryManager->zbcSurfaces); i++)
+    {
+        if (pMemoryManager->zbcSurfaces[i] != 0)
+            return NV_TRUE;
+    }
+    return NV_FALSE;
+}
+
 NV_STATUS
 memmgrStateLoad_IMPL
 (
@@ -836,7 +891,7 @@ memmgrStatePreUnload_IMPL
 )
 {
     KernelMemorySystem *pKernelMemorySystem = GPU_GET_KERNEL_MEMORY_SYSTEM(pGpu);
-    NV_ASSERT((flags & GPU_STATE_FLAGS_PRESERVING) || pMemoryManager->zbcSurfaces == 0);
+    NV_ASSERT((flags & GPU_STATE_FLAGS_PRESERVING) || !_memmgrIsZbcSurfaceReferenced(pGpu, pMemoryManager));
 
     if ((flags & GPU_STATE_FLAGS_PRESERVING))
     {
@@ -852,7 +907,7 @@ memmgrStatePreUnload_IMPL
         osNumaOnliningEnabled(pGpu->pOsGpuInfo) &&
         pKernelMemorySystem->memPartitionNumaInfo[0].bInUse)
     {
-        pmaNumaOfflined(&pMemoryManager->pHeap->pmaObject);
+        pmaNumaOfflined(pMemoryManager->pHeap->pPmaObject);
     }
 
     return NV_OK;
@@ -898,32 +953,30 @@ memmgrStateDestroy_IMPL
     memmgrPageLevelPoolsDestroy(pGpu, pMemoryManager);
 
     // Destroy the heap entirely, and all associated structures
-    if (pHeap)
+    if (pHeap != NULL)
     {
         kmemsysPreHeapDestruct_HAL(pGpu, pKernelMemorySystem);
+
+        if (pHeap->pPmaObject != NULL)
+        {
+            pmaDestroy(pHeap->pPmaObject);
+        }
 
         objDelete(pHeap);
         pMemoryManager->pHeap = NULL;
     }
 
+    memmgrReleaseConsoleRegion(pGpu, pMemoryManager);
+
     // RMCONFIG: only if FBSR engine is enabled
     if (RMCFG_MODULE_FBSR)
     {
-        //
-        // Cleanup fbsrReservedRanges
-        // GSP_HEAP range is allocated, every other range is described
-        //
+        // Cleanup described fbsrReservedRanges
         if (pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_BEFORE_BAR2PTE] != NULL)
             memdescDestroy(pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_BEFORE_BAR2PTE]);
 
         if (pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_AFTER_BAR2PTE] != NULL)
             memdescDestroy(pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_AFTER_BAR2PTE]);
-
-        if (pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_GSP_HEAP] != NULL)
-        {
-            memdescFree(pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_GSP_HEAP]);
-            memdescDestroy(pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_GSP_HEAP]);
-        }
 
         if (pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_GSP_NON_WPR] != NULL)
             memdescDestroy(pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_GSP_NON_WPR]);
@@ -933,7 +986,6 @@ memmgrStateDestroy_IMPL
 
         pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_BEFORE_BAR2PTE] = NULL;
         pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_AFTER_BAR2PTE]  = NULL;
-        pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_GSP_HEAP]       = NULL;
         pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_GSP_NON_WPR]    = NULL;
         pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_VGA_WORKSPACE]  = NULL;
 
@@ -960,6 +1012,7 @@ memmgrStateDestroy_IMPL
             memmgrPreSchedulingDisableHandler, NULL);
     }
     memmgrScrubDestroy_HAL(pGpu, pMemoryManager);
+
 }
 
 static NV_STATUS
@@ -1045,8 +1098,7 @@ memmgrCreateHeap_IMPL
         if (memmgrIsPmaEnabled(pMemoryManager) &&
             memmgrIsPmaSupportedOnPlatform(pMemoryManager))
         {
-            portMemSet(&pMemoryManager->pHeap->pmaObject, 0, sizeof(pMemoryManager->pHeap->pmaObject));
-            status = memmgrPmaInitialize(pGpu, pMemoryManager, &pMemoryManager->pHeap->pmaObject);
+            status = memmgrPmaInitialize(pGpu, pMemoryManager, &(pMemoryManager->pHeap->pPmaObject));
             NV_ASSERT_OR_RETURN(status == NV_OK, status);
         }
 
@@ -1058,13 +1110,20 @@ memmgrCreateHeap_IMPL
         if ((memmgrIsPmaInitialized(pMemoryManager)) && (pMemoryManager->pHeap->bHasFbRegions))
         {
             status = memmgrPmaRegisterRegions(pGpu, pMemoryManager, pMemoryManager->pHeap,
-                                              &pMemoryManager->pHeap->pmaObject);
+                                              pMemoryManager->pHeap->pPmaObject);
             NV_ASSERT_OR_RETURN(status == NV_OK, status);
         }
 
         NV_ASSERT_OK_OR_RETURN(memmgrValidateFBEndReservation_HAL(pGpu, pMemoryManager));
 
-        NV_ASSERT_OK_OR_RETURN(memmgrReserveMemoryForFakeWPR_HAL(pGpu, pMemoryManager));
+        //
+        // In case of Inst-in-sys boot by ACR we should not reserve memory in FB for WPR
+        // since neither exists
+        //
+        if (!gpuIsInstInSysBootByAcrEnabled(pGpu))
+        {
+            NV_ASSERT_OK_OR_RETURN(memmgrReserveMemoryForFakeWPR_HAL(pGpu, pMemoryManager));
+        }
 
         NV_ASSERT_OK_OR_RETURN(memmgrReserveMemoryForPmu_HAL(pGpu, pMemoryManager));
 
@@ -1187,6 +1246,9 @@ _memmgrAllocInternalClientObjects
         goto failed;
     }
 
+    pMemoryManager->hThirdPartyP2P = 0;
+
+    if (gpuIsClassSupported(pGpu, NV50_THIRD_PARTY_P2P))
     {
         NV503C_ALLOC_PARAMETERS params;
         NvHandle hThirdPartyP2P = 0;
@@ -1215,7 +1277,6 @@ _memmgrAllocInternalClientObjects
         {
             NV_PRINTF(LEVEL_WARNING, "Error creating internal ThirdPartyP2P object: %x\n",
                       status);
-            pMemoryManager->hThirdPartyP2P = 0;
         }
         else
         {
@@ -1260,7 +1321,7 @@ memmgrGetUsedRamSize_IMPL
     heapGetSize(pHeap, &heapTotalSpace);
     if (memmgrIsPmaInitialized(pMemoryManager))
     {
-        pmaGetFreeMemory(&pHeap->pmaObject, &pmaFreeSpace);
+        pmaGetFreeMemory(pHeap->pPmaObject, &pmaFreeSpace);
         *pFbUsedSize = heapTotalSpace - heapFreeSpace - pmaFreeSpace;
     }
     else
@@ -1304,6 +1365,38 @@ memmgrGetUsedRamSize_IMPL
     }
 
     return NV_OK;
+}
+
+/*!
+ * @brief Check that there is zero PMA usage.
+ *
+ * @returns NV_OK or NV_ERR_INVALID_STATE when PMA usage is non-zero
+ */
+NV_STATUS
+memmgrCheckZeroPmaUsage_IMPL
+(
+    OBJGPU        *pGpu,
+    MemoryManager *pMemoryManager
+)
+{
+    Heap *pHeap = GPU_GET_HEAP(pGpu);
+
+   if (memmgrIsPmaInitialized(pMemoryManager))
+    {
+        NvU64 freeMem;
+        NvU64 totalMem;
+        pmaGetFreeMemory(pHeap->pPmaObject, &freeMem);
+        pmaGetTotalMemory(pHeap->pPmaObject, &totalMem);
+
+        if (freeMem != totalMem)
+        {
+            NV_PRINTF(LEVEL_ERROR, "PMA usage is non-zero, freeMem = 0x%llx bytes totalMem  = 0x%llx bytes\n",
+                freeMem, totalMem);
+            return NV_ERR_INVALID_STATE;
+        }
+    }
+
+   return NV_OK;
 }
 
 NV_STATUS
@@ -1430,7 +1523,7 @@ memmgrLargePageSupported_IMPL
         }
         else
         {
-            isSupported = (pMemoryManager->sysmemPageSize != RM_PAGE_SIZE);
+            isSupported = (osGetPageSize() != RM_PAGE_SIZE);
         }
     }
     else
@@ -1517,9 +1610,6 @@ memmgrGetMappableRamSizeMb_IMPL(MemoryManager *pMemoryManager)
 {
     return pMemoryManager->Ram.mapRamSizeMb;
 }
-//
-// ZBC clear create/destroy routines.
-//
 
 NV_STATUS
 memmgrFillMemdescForPhysAttr_IMPL
@@ -1531,7 +1621,7 @@ memmgrFillMemdescForPhysAttr_IMPL
     NvU64 *pOffset,
     NvU32 *pMemAperture,
     NvU32 *pMemKind,
-    NvU32 *pZCullId,
+    NvS32 *pZCullId,
     NvU32 *pGpuCacheAttr,
     NvU32 *pGpuP2PCacheAttr,
     NvU64 *contigSegmentSize
@@ -1549,8 +1639,6 @@ memmgrFillMemdescForPhysAttr_IMPL
     if (memdescGetAddressSpace(pMemDesc) == ADDR_FBMEM )
         *pMemAperture = NV0041_CTRL_CMD_GET_SURFACE_PHYS_ATTR_APERTURE_VIDMEM;
     else if (memdescGetAddressSpace(pMemDesc) == ADDR_SYSMEM)
-        *pMemAperture = NV0041_CTRL_CMD_GET_SURFACE_PHYS_ATTR_APERTURE_SYSMEM;
-    else if (memdescGetAddressSpace(pMemDesc) == ADDR_EGM)
         *pMemAperture = NV0041_CTRL_CMD_GET_SURFACE_PHYS_ATTR_APERTURE_SYSMEM;
     else if (memdescGetAddressSpace(pMemDesc) == ADDR_VIRTUAL )
     {
@@ -1605,6 +1693,89 @@ memmgrFillMemdescForPhysAttr_IMPL
     }
 
     return NV_OK;
+}
+
+static NvU64
+_memmgrPickDefaultSysmemPageSize
+(
+    OBJGPU *pGpu,
+    MemoryManager *pMemoryManager,
+    NvU64 memSize,
+    NvU32 attr,
+    NvU32 attr2,
+    NvBool bClientAllocation
+)
+{
+    KernelGmmu *pKernelGmmu = GPU_GET_KERNEL_GMMU(pGpu);
+    NvU64 pageSize;
+    NvU64 supportedPageMask = osGetSupportedSysmemPageSizeMask();
+    // Only client allocations support the retrying an allocation.
+    NvBool bDefaultAllowLargePages = (pMemoryManager->bSysmemPageSizeDefaultAllowLargePages && bClientAllocation);
+
+    // If large pages are not supported, return the OS page size.
+    if (!bDefaultAllowLargePages)
+    {
+        return osGetPageSize();
+    }
+
+    // Choose largest page size that fits the allocation
+    if (kgmmuIsHugePageSupported(pKernelGmmu) &&
+        (memSize >= RM_PAGE_SIZE_HUGE) &&
+        (supportedPageMask & RM_PAGE_SIZE_HUGE))
+    {
+        pageSize = RM_PAGE_SIZE_HUGE;
+    }
+    else if (((memSize >= kgmmuGetMinBigPageSize(pKernelGmmu))  &&
+              (supportedPageMask & kgmmuGetMaxBigPageSize_HAL(pKernelGmmu))) ||
+              FLD_TEST_DRF(OS32, _ATTR2, _SMMU_ON_GPU, _ENABLE, attr2))
+    {
+        pageSize = kgmmuGetMaxBigPageSize_HAL(pKernelGmmu);
+    }
+    else
+    {
+        pageSize = osGetPageSize();
+    }
+
+    return pageSize;
+}
+
+static NvU64
+_memmgrPickDefaultGpuPageSize
+(
+    OBJGPU *pGpu,
+    MemoryManager *pMemoryManager,
+    NvU64 memSize,
+    NvU32 memFormat,
+    NvU32 attr,
+    NvU32 attr2,
+    NvBool bClientAllocation
+)
+{
+    KernelGmmu *pKernelGmmu = GPU_GET_KERNEL_GMMU(pGpu);
+    NvU64 pageSize;
+    NvBool bUseDefaultHugePagesize = NV_TRUE;
+
+    // WDDMV2 Windows it expect default page size to be 4K /64KB /128KB. See bug 200743528.
+
+    if (kgmmuIsHugePageSupported(pKernelGmmu) &&
+        (memSize >= RM_PAGE_SIZE_HUGE) &&
+        bUseDefaultHugePagesize)
+    {
+        pageSize = RM_PAGE_SIZE_HUGE;
+    }
+    else if ((memFormat != NVOS32_ATTR_FORMAT_PITCH) ||
+             (memSize >= kgmmuGetMinBigPageSize(pKernelGmmu)) ||
+             bClientAllocation ||
+             FLD_TEST_DRF(OS32, _ATTR2, _SMMU_ON_GPU, _ENABLE, attr2))
+    {
+        pageSize = kgmmuGetMaxBigPageSize_HAL(pKernelGmmu);
+    }
+    else
+    {
+        pageSize = RM_PAGE_SIZE;
+    }
+
+    return pageSize;
 }
 
 NvU64
@@ -1671,13 +1842,12 @@ memmgrDeterminePageSize_IMPL
         {
             if (RM_ATTR_PAGE_SIZE_BIG == pageSizeAttr ||
                 RM_ATTR_PAGE_SIZE_HUGE == pageSizeAttr ||
-                RM_ATTR_PAGE_SIZE_256GB == pageSizeAttr ||
-                RM_ATTR_PAGE_SIZE_512MB == pageSizeAttr)
+                RM_ATTR_PAGE_SIZE_512MB == pageSizeAttr ||
+                RM_ATTR_PAGE_SIZE_256GB == pageSizeAttr)
             {
                 NV_PRINTF(LEVEL_ERROR,
                           "Big/Huge/512MB/256GB page size not supported in sysmem.\n");
-
-                NV_ASSERT_OR_RETURN(0, 0);
+                return 0;
             }
             else
             {
@@ -1690,41 +1860,22 @@ memmgrDeterminePageSize_IMPL
             {
                 case RM_ATTR_PAGE_SIZE_INVALID:
                     NV_PRINTF(LEVEL_ERROR, "invalid page size attr\n");
-                    NV_ASSERT_OR_RETURN(0, 0);
+                    return 0;
 
                 case RM_ATTR_PAGE_SIZE_DEFAULT:
                 {
-                    NvBool bUseDefaultHugePagesize = NV_TRUE;
-                    // WDDMV2 Windows it expect default page size to be 4K /64KB /128KB
-
-                    //
-                    // For sysmem, the default should select the native OS page size
-                    // as clients tend to make an assumption about the default flag.
-                    // TODO: 4691005
-                    //
-                    if (RMCFG_FEATURE_PLATFORM_UNIX && (addrSpace == ADDR_SYSMEM))
+                    if (addrSpace == ADDR_SYSMEM)
                     {
-                        pageSize = osGetPageSize();
-                        break;
+                        pageSize = _memmgrPickDefaultSysmemPageSize(pGpu, pMemoryManager,
+                                                                    memSize, *pRetAttr, *pRetAttr2,
+                                                                    hClient != 0);
                     }
-
-                    if (bUseDefaultHugePagesize &&
-                        kgmmuIsHugePageSupported(pKernelGmmu) &&
-                        (memSize >= RM_PAGE_SIZE_HUGE) && (addrSpace != ADDR_SYSMEM ||
-                        pMemoryManager->sysmemPageSize == RM_PAGE_SIZE_HUGE))
+                    else
                     {
-                        pageSize = RM_PAGE_SIZE_HUGE;
-                        break;
+                        pageSize = _memmgrPickDefaultGpuPageSize(pGpu, pMemoryManager,
+                                                                 memSize, memFormat, *pRetAttr, *pRetAttr2,
+                                                                 hClient != 0);
                     }
-                    else if ((memFormat != NVOS32_ATTR_FORMAT_PITCH) ||
-                             (memSize >= kgmmuGetMinBigPageSize(pKernelGmmu)) || hClient ||
-                             FLD_TEST_DRF(OS32, _ATTR2, _SMMU_ON_GPU, _ENABLE, *pRetAttr2))
-                    {
-                        pageSize = kgmmuGetMaxBigPageSize_HAL(pKernelGmmu);
-                        break;
-                    }
-
-                    pageSize = RM_PAGE_SIZE;
                     break;
                 }
 
@@ -1743,7 +1894,7 @@ memmgrDeterminePageSize_IMPL
                     }
                     else
                     {
-                        NV_ASSERT_OR_RETURN(0, 0);
+                        return 0;
                     }
                     break;
 
@@ -1754,7 +1905,7 @@ memmgrDeterminePageSize_IMPL
                     }
                     else
                     {
-                        NV_ASSERT_OR_RETURN(0, 0);
+                        return 0;
                     }
                     break;
 
@@ -1765,11 +1916,11 @@ memmgrDeterminePageSize_IMPL
                     }
                     else
                     {
-                        NV_ASSERT_OR_RETURN(0, 0);
+                        return 0;
                     }
                     break;
                 default:
-                    NV_ASSERT(0);
+                    return 0;
             }
         }
     }
@@ -1799,8 +1950,9 @@ memmgrDeterminePageSize_IMPL
             *pRetAttr = FLD_SET_DRF(OS32, _ATTR, _PAGE_SIZE, _HUGE, *pRetAttr);
             *pRetAttr2 = FLD_SET_DRF(OS32, _ATTR2, _PAGE_SIZE_HUGE, _256GB,  *pRetAttr2);
             break;
+
         default:
-            NV_ASSERT(0);
+            return 0;
     }
 
     return pageSize;
@@ -1860,59 +2012,6 @@ memmgrSetPlatformPmaSupport_IMPL
     return (NV_OK);
 }
 
-/*!
- * Allocate console region in CPU-RM based on region table passed from Physical RM
- */
-NV_STATUS
-memmgrAllocateConsoleRegion_IMPL
-(
-    OBJGPU *pGpu,
-    MemoryManager *pMemoryManager,
-    FB_REGION_DESCRIPTOR *pConsoleFbRegion
-)
-{
-
-    NV_STATUS status     = NV_OK;
-    NvU32     consoleRegionId = 0x0;
-    NvU64     regionSize;
-
-    if (pMemoryManager->Ram.ReservedConsoleDispMemSize > 0)
-    {
-        pMemoryManager->Ram.fbRegion[consoleRegionId].bLostOnSuspend = NV_FALSE;
-        pMemoryManager->Ram.fbRegion[consoleRegionId].bPreserveOnSuspend = NV_TRUE;
-
-        pConsoleFbRegion->base = pMemoryManager->Ram.fbRegion[consoleRegionId].base;
-        pConsoleFbRegion->limit = pMemoryManager->Ram.fbRegion[consoleRegionId].limit;
-
-        regionSize = pConsoleFbRegion->limit - pConsoleFbRegion->base + 1;
-
-        // Once the console is reserved, we don't expect to reserve it again
-        NV_ASSERT_OR_RETURN(pMemoryManager->Ram.pReservedConsoleMemDesc == NULL,
-                        NV_ERR_STATE_IN_USE);
-
-        status = memdescCreate(&pMemoryManager->Ram.pReservedConsoleMemDesc, pGpu,
-                            regionSize, RM_PAGE_SIZE_64K, NV_TRUE, ADDR_FBMEM,
-                            NV_MEMORY_UNCACHED,
-                            MEMDESC_FLAGS_SKIP_RESOURCE_COMPUTE);
-        if (status != NV_OK)
-        {
-            pConsoleFbRegion->base = pConsoleFbRegion->limit = 0;
-            return status;
-        }
-
-        memdescDescribe(pMemoryManager->Ram.pReservedConsoleMemDesc, ADDR_FBMEM,
-                        pConsoleFbRegion->base, regionSize);
-        memdescSetPageSize(pMemoryManager->Ram.pReservedConsoleMemDesc,
-                    AT_GPU, RM_PAGE_SIZE);
-
-
-        NV_PRINTF(LEVEL_INFO, "Allocating console region of size: %llx, at base : %llx \n ",
-                        regionSize, pConsoleFbRegion->base);
-    }
-
-    return status;
-}
-
 void
 memmgrReleaseConsoleRegion_IMPL
 (
@@ -1920,8 +2019,8 @@ memmgrReleaseConsoleRegion_IMPL
     MemoryManager *pMemoryManager
 )
 {
-    memdescDestroy(pMemoryManager->Ram.pReservedConsoleMemDesc);
-    pMemoryManager->Ram.pReservedConsoleMemDesc = NULL;
+    memdescDestroy(pMemoryManager->pReservedConsoleMemDesc);
+    pMemoryManager->pReservedConsoleMemDesc = NULL;
 }
 
 PMEMORY_DESCRIPTOR
@@ -1931,7 +2030,7 @@ memmgrGetReservedConsoleMemDesc_IMPL
     MemoryManager *pMemoryManager
 )
 {
-    return pMemoryManager->Ram.pReservedConsoleMemDesc;
+    return pMemoryManager->pReservedConsoleMemDesc;
 }
 
 /*!
@@ -2174,11 +2273,9 @@ NV_STATUS memmgrFree_IMPL
     }
 
     // Free up the memory allocated by PMA.
-    if (pMemDesc->pPmaAllocInfo)
+    if (pMemDesc->pPmaAllocInfo != NULL)
     {
-        FB_ALLOC_INFO        *pFbAllocInfo       = NULL;
-        FB_ALLOC_PAGE_FORMAT *pFbAllocPageFormat = NULL;
-        OBJGPU               *pMemdescOwnerGpu   = NULL;
+        OBJGPU *pMemdescOwnerGpu = NULL;
 
         //
         // A memdesc can be duped under a peer device. In that case, before
@@ -2200,78 +2297,25 @@ NV_STATUS memmgrFree_IMPL
                 // For now just assert!
                 //
                 NV_ASSERT(0);
-                memdescDestroy(pMemDesc);
                 goto pma_free_exit;
             }
         }
 
         pMemdescOwnerGpu = pMemDesc->pGpu;
 
-        //
-        // Similar to the above WAR, if portMem alocations fail for any reason,
-        // just assert and return NV_OK to ensure that the rest of the clean up
-        // happens correctly.
-        //
-        pFbAllocInfo = portMemAllocNonPaged(sizeof(FB_ALLOC_INFO));
-        if (pFbAllocInfo == NULL)
+        // Disabling scrub on free for non compressible surfaces
+        if (RMCFG_FEATURE_MODS_FEATURES &&
+            !memmgrIsKind_HAL(GPU_GET_MEMORY_MANAGER(pMemdescOwnerGpu),
+                              FB_IS_KIND_COMPRESSIBLE,
+                              memdescGetPteKind(pMemDesc)))
         {
-            NV_ASSERT(0);
-            goto pma_free_exit;
+            pmaFreeFlag = PMA_FREE_SKIP_SCRUB;
         }
 
-        pFbAllocPageFormat = portMemAllocNonPaged(sizeof(FB_ALLOC_PAGE_FORMAT));
-        if (pFbAllocPageFormat == NULL) {
-            NV_ASSERT(0);
-            goto pma_free_exit;
-        }
-
-        portMemSet(pFbAllocInfo, 0, sizeof(FB_ALLOC_INFO));
-        portMemSet(pFbAllocPageFormat, 0, sizeof(FB_ALLOC_PAGE_FORMAT));
-        pFbAllocInfo->hClient = hClient;
-        pFbAllocInfo->hDevice = hDevice;
-        pFbAllocInfo->pageFormat = pFbAllocPageFormat;
-
-        //
-        // Do not release any HW resources associated with this allocation
-        // until the last reference to the allocation is freed. Passing
-        // hwresid = 0 and format = pitch to memmgrFreeHwResources will ensure
-        // that no comptags/zcull/zbc resources are freed.
-        //
-        if (pMemDesc->RefCount == 1)
-        {
-            pFbAllocInfo->hwResId = memdescGetHwResId(pMemDesc);
-            pFbAllocInfo->format  = memdescGetPteKind(pMemDesc);
-        }
-        else
-        {
-            pFbAllocInfo->hwResId = 0;
-            pFbAllocInfo->format = 0;
-        }
-        pFbAllocInfo->offset  = offsetAlign;
-        pFbAllocInfo->size    = pMemDesc->Size;
-
-        // Free any HW resources allocated.
-        memmgrFreeHwResources(pMemdescOwnerGpu,
-                GPU_GET_MEMORY_MANAGER(pMemdescOwnerGpu), pFbAllocInfo);
-
-        if (pMemDesc->pPmaAllocInfo != NULL)
-        {
-            // Disabling scrub on free for non compressible surfaces
-            if (RMCFG_FEATURE_PLATFORM_MODS &&
-                !memmgrIsKind_HAL(GPU_GET_MEMORY_MANAGER(pMemdescOwnerGpu),
-                                  FB_IS_KIND_COMPRESSIBLE,
-                                  memdescGetPteKind(pMemDesc)))
-            {
-                pmaFreeFlag = PMA_FREE_SKIP_SCRUB;
-            }
-
-            vidmemPmaFree(pMemdescOwnerGpu, pHeap, pMemDesc->pPmaAllocInfo, pmaFreeFlag);
-            NV_PRINTF(LEVEL_INFO, "Freeing PMA allocation\n");
-        }
+        vidmemPmaFree(pMemdescOwnerGpu, pHeap, pMemDesc->pPmaAllocInfo, pmaFreeFlag);
+        NV_PRINTF(LEVEL_INFO, "Freeing PMA allocation\n");
 
 pma_free_exit:
-        portMemFree(pFbAllocInfo);
-        portMemFree(pFbAllocPageFormat);
         memdescDestroy(pMemDesc);
 
         return NV_OK;
@@ -2396,14 +2440,14 @@ memmgrSetPartitionableMem_IMPL
         NvU32 numPmaRegions;
         NvU32 pmaConfig = PMA_QUERY_NUMA_ONLINED;
 
-        NV_ASSERT_OK_OR_RETURN(pmaGetRegionInfo(&pHeap->pmaObject,
+        NV_ASSERT_OK_OR_RETURN(pmaGetRegionInfo(pHeap->pPmaObject,
             &numPmaRegions, &pFirstPmaRegionDesc));
 
         base = pFirstPmaRegionDesc->base;
-        pmaGetFreeMemory(&pHeap->pmaObject, &freeMem);
-        pmaGetTotalMemory(&pHeap->pmaObject, &size);
+        pmaGetFreeMemory(pHeap->pPmaObject, &freeMem);
+        pmaGetTotalMemory(pHeap->pPmaObject, &size);
 
-        NV_ASSERT_OK(pmaQueryConfigs(&pHeap->pmaObject, &pmaConfig));
+        NV_ASSERT_OK(pmaQueryConfigs(pHeap->pPmaObject, &pmaConfig));
 
         //
         // MIG won't be used alongside APM and hence the check below is of no use
@@ -2421,27 +2465,13 @@ memmgrSetPartitionableMem_IMPL
         if ((!gpuIsCCorApmFeatureEnabled(pGpu) || IS_MIG_ENABLED(pGpu)) &&
             !(pmaConfig & PMA_QUERY_NUMA_ONLINED))
         {
-            NvU64 maxUsedPmaSize = 2 * RM_PAGE_SIZE_128K;
             //
             // PMA should be completely free at this point, otherwise we risk
             // not setting the right partitionable range (pmaGetLargestFree's
             // offset argument is not implemented as of this writing, so we
-            // only get the base address of the region that contains it). There
-            // is a known allocation from the top-level scrubber/CeUtils channel that
-            // is expected to be no larger than 128K. Issue a warning for any
-            // other uses.
+            // only get the base address of the region that contains it).
             //
-            if ((size > maxUsedPmaSize) &&
-                (freeMem < (size - maxUsedPmaSize)))
-            {
-                NV_PRINTF(LEVEL_ERROR,
-                    "Assumption that PMA is empty (after accounting for the top-level scrubber and CeUtils) is not met!\n");
-                NV_PRINTF(LEVEL_ERROR,
-                    "    free space = 0x%llx bytes, total space = 0x%llx bytes\n",
-                    freeMem, size);
-                NV_ASSERT_OR_RETURN(freeMem >= (size - maxUsedPmaSize),
-                                    NV_ERR_INVALID_STATE);
-            }
+            NV_ASSERT_OK_OR_RETURN(memmgrCheckZeroPmaUsage(pGpu, pMemoryManager));
         }
     }
 
@@ -2552,13 +2582,14 @@ memmgrGetKindComprForGpu_KERNEL
 {
     NvU32               ctagId = FB_HWRESID_CTAGID_VAL_FERMI(memdescGetHwResId(pMemDesc));
     NvU32               kind   = memdescGetPteKindForGpu(pMemDesc, pMappingGpu);
-    const MEMORY_SYSTEM_STATIC_CONFIG *pMappingMemSysConfig =
-        kmemsysGetStaticConfig(pMappingGpu, GPU_GET_KERNEL_MEMORY_SYSTEM(pMappingGpu));
 
     // Compression is not supported on memory not backed by a GPU
     if (pMemDesc->pGpu != NULL && memmgrIsKind_HAL(pMemoryManager, FB_IS_KIND_COMPRESSIBLE, kind) &&
         (ctagId == 0 || ctagId == FB_HWRESID_CTAGID_VAL_FERMI(-1)))
     {
+        const MEMORY_SYSTEM_STATIC_CONFIG *pMappingMemSysConfig =
+            kmemsysGetStaticConfig(pMappingGpu, GPU_GET_KERNEL_MEMORY_SYSTEM(pMappingGpu));
+
         portMemSet(pComprInfo, 0, sizeof(*pComprInfo));
 
         pComprInfo->kind = kind;
@@ -2638,7 +2669,7 @@ memmgrSetMIGPartitionableBAR1Range_IMPL
     NvU64 partitionableBar1Start;
     NvU64 partitionableBar1End;
 
-    if (pGpu->getProperty(pGpu, PDB_PROP_GPU_ZERO_FB))
+    if (pGpu->pGpuArch->bGpuArchIsZeroFb)
         return NV_OK;
 
     NV_ASSERT_OR_RETURN(pBar1VAS != NULL, NV_ERR_INVALID_STATE);
@@ -2729,7 +2760,7 @@ memmgrAllocMIGGPUInstanceMemory_PF
             if (kmigmgrGetSwizzIdInUseMask(pGpu, pKernelMIGManager) == 0x0)
             {
                 // Remove swizz Id 0 / baremetal GPU memory NUMA node
-                pmaNumaOfflined(&GPU_GET_HEAP(pGpu)->pmaObject);
+                pmaNumaOfflined(GPU_GET_HEAP(pGpu)->pPmaObject);
                 kmemsysNumaRemoveMemory_HAL(pGpu, pKernelMemorySystem, 0);
             }
 
@@ -2859,10 +2890,9 @@ _memmgrInitMIGMemoryPartitionHeap
     if (memmgrIsPmaEnabled(pMemoryManager) &&
         memmgrIsPmaSupportedOnPlatform(pMemoryManager))
     {
-        portMemSet(&pMemoryPartitionHeap->pmaObject, 0, sizeof(pMemoryPartitionHeap->pmaObject));
         NV_ASSERT_OK_OR_GOTO(
             status,
-            memmgrPmaInitialize(pGpu, pMemoryManager, &pMemoryPartitionHeap->pmaObject),
+            memmgrPmaInitialize(pGpu, pMemoryManager, &(pMemoryPartitionHeap->pPmaObject)),
             fail);
 
         if (bNumaEnabled)
@@ -2880,7 +2910,7 @@ _memmgrInitMIGMemoryPartitionHeap
             //
             NV_ASSERT_OK_OR_GOTO(
                 status,
-                pmaNumaOnlined(&pMemoryPartitionHeap->pmaObject,
+                pmaNumaOnlined(pMemoryPartitionHeap->pPmaObject,
                                pKernelMemorySystem->memPartitionNumaInfo[swizzId].numaNodeId,
                                pKernelMemorySystem->coherentCpuFbBase,
                                pKernelMemorySystem->numaOnlineSize),
@@ -2903,7 +2933,7 @@ _memmgrInitMIGMemoryPartitionHeap
         NV_ASSERT_OK_OR_GOTO(
             status,
             memmgrPmaRegisterRegions(pGpu, pMemoryManager, pMemoryPartitionHeap,
-                                     &pMemoryPartitionHeap->pmaObject),
+                                     pMemoryPartitionHeap->pPmaObject),
             fail);
     }
 
@@ -2929,6 +2959,11 @@ fail:
 
     if (pMemoryPartitionHeap != NULL)
     {
+        if (pMemoryPartitionHeap->pPmaObject != NULL)
+        {
+            pmaDestroy(pMemoryPartitionHeap->pPmaObject);
+        }
+
         objDelete(pMemoryPartitionHeap);
         *ppMemoryPartitionHeap = NULL;
     }
@@ -2958,6 +2993,11 @@ memmgrFreeMIGGPUInstanceMemory_IMPL
     if (!kmigmgrIsMemoryPartitioningNeeded_HAL(pGpu, pKernelMIGManager, swizzId))
         return NV_OK;
 
+    if (*ppMemoryPartitionHeap != NULL && (*ppMemoryPartitionHeap)->pPmaObject != NULL)
+    {
+        pmaDestroy((*ppMemoryPartitionHeap)->pPmaObject);
+    }
+
     objDelete(*ppMemoryPartitionHeap);
     *ppMemoryPartitionHeap = NULL;
 
@@ -2978,7 +3018,7 @@ memmgrFreeMIGGPUInstanceMemory_IMPL
                                      &numaNodeId));
             // Baremetal NUMA node id should be same as pGpu->numaNodeId
             NV_ASSERT_OR_RETURN(numaNodeId == pGpu->numaNodeId, NV_ERR_INVALID_STATE);
-            NV_ASSERT_OK_OR_RETURN(pmaNumaOnlined(&GPU_GET_HEAP(pGpu)->pmaObject,
+            NV_ASSERT_OK_OR_RETURN(pmaNumaOnlined(GPU_GET_HEAP(pGpu)->pPmaObject,
                                                   pGpu->numaNodeId,
                                                   pKernelMemorySystem->coherentCpuFbBase,
                                                   pKernelMemorySystem->numaOnlineSize));
@@ -3045,7 +3085,7 @@ memmgrPageLevelPoolsCreate_IMPL
         pFmt = kgmmuFmtGet(pKernelGmmu, GMMU_FMT_VERSION_DEFAULT, 0);
         NV_ASSERT_OR_RETURN(NULL != pFmt, NV_ERR_INVALID_ARGUMENT);
 
-        status = rmMemPoolSetup((void *)&pHeap->pmaObject, &pMemoryManager->pPageLevelReserve,
+        status = rmMemPoolSetup((void *)pHeap->pPmaObject, &pMemoryManager->pPageLevelReserve,
                                     (pFmt->version == GMMU_FMT_VERSION_1) ? POOL_CONFIG_GMMU_FMT_1 : POOL_CONFIG_GMMU_FMT_2);
 
         NV_ASSERT(NV_OK == status);
@@ -3119,7 +3159,8 @@ memmgrPageLevelPoolsGetInfo_IMPL
     }
 
     // If memory partitioning is enabled, then use per-partition pool allocator
-    if (bMemPartitioningEnabled)
+    if (bMemPartitioningEnabled &&
+        !kmigmgrIsDeviceUsingDeviceProfiling(pGpu, pKernelMIGManager, pDevice))
     {
         MIG_INSTANCE_REF ref;
         NV_ASSERT_OK_OR_RETURN(
@@ -3170,14 +3211,45 @@ _memmgrPmaStatsUpdateCb
         return;
     }
 
-    totalMem = MEM_RD64(&pSharedData->totalPmaMemory);
+    // static BAR1 update
+    {
+        NvU64 freeSize = 0;
+        NvU64 bar1AvailSize = 0;
+        NvBool bZeroRusd = kbusIsBar1Disabled(pKernelBus);
+        NvU32 gfid;
+        NvU64 fbInUse;
+        NV_STATUS status;
 
-    pBar1Info = gpushareddataWriteStart(pGpu, bar1MemoryInfo);
+        NV_ASSERT_OK_OR_ELSE(status, vgpuGetCallingContextGfid(pGpu, &gfid), return);
 
-    MEM_WR32(&pBar1Info->bar1AvailSize, MEM_RD32(&pBar1Info->bar1Size) -
-        ((totalMem - freeMem) >> 10)); // Available size in KB
+        bZeroRusd = bZeroRusd || IS_MIG_ENABLED(pGpu);
 
-    gpushareddataWriteFinish(pGpu, bar1MemoryInfo);
+        // bar1Size is not owned here, no need to update anything if zero RUSD
+        if (bZeroRusd)
+        {
+            return;
+        }
+
+        // no need to update bar1size
+        //
+        // We access this structure locklessly and can't iterate the
+        // VASpace's structures which may change underneath us
+        // Use the cached value of the free size which always has a valid value
+        //
+        freeSize = pKernelBus->bar1[gfid].vasFreeSize;
+
+        totalMem = MEM_RD64(&pSharedData->totalPmaMemory);
+        fbInUse = totalMem - freeMem;
+
+         // Available size in KB
+        bar1AvailSize = (freeSize + pKernelBus->bar1[gfid].staticBar1.size - fbInUse) / 1024;
+
+        pBar1Info = gpushareddataWriteStart(pGpu, bar1MemoryInfo);
+
+        MEM_WR32(&pBar1Info->bar1AvailSize, bar1AvailSize);
+
+        gpushareddataWriteFinish(pGpu, bar1MemoryInfo);
+    }
 }
 
 static void
@@ -3194,7 +3266,7 @@ _memmgrInitRUSDHeapSize
 
     NV_ASSERT_OR_RETURN_VOID(memmgrIsPmaInitialized(pMemoryManager));
 
-    pPma = &pMemoryManager->pHeap->pmaObject;
+    pPma = pMemoryManager->pHeap->pPmaObject;
     pmaGetTotalMemory(pPma, &bytesTotal);
     bytesTotal -= ((NvU64)pKernelMemorySystem->fbOverrideStartKb << 10);
 
@@ -3219,12 +3291,13 @@ memmgrPmaInitialize_IMPL
 (
     OBJGPU        *pGpu,
     MemoryManager *pMemoryManager,
-    PMA           *pPma
+    PMA          **ppPma
 )
 {
     NvU32 pmaInitFlags = PMA_INIT_NONE;
     NV_STATUS status = NV_OK;
     NvBool bNumaEnabled = osNumaOnliningEnabled(pGpu->pOsGpuInfo);
+    PMA          *pPma;
 
     NV_ASSERT(memmgrIsPmaEnabled(pMemoryManager) &&
               memmgrIsPmaSupportedOnPlatform(pMemoryManager));
@@ -3257,12 +3330,14 @@ memmgrPmaInitialize_IMPL
         }
     }
 
-    status = pmaInitialize(pPma, pmaInitFlags);
+    status = pmaInitialize(ppPma, pmaInitFlags);
     if (status != NV_OK)
     {
         NV_PRINTF(LEVEL_ERROR, "Failed to initialize PMA!\n");
         return status;
     }
+
+    pPma = *ppPma;
 
     pmaRegisterUpdateStatsCb(pPma, _memmgrPmaStatsUpdateCb, pGpu);
 
@@ -3316,9 +3391,19 @@ memmgrInitFbRegions_IMPL
         if (!gpuIsCacheOnlyModeEnabled(pGpu))
         {
             pMemoryManager->Ram.mapRamSizeMb = pMemoryManager->Ram.fbAddrSpaceSizeMb = 32;
-            NV_PRINTF(LEVEL_ERROR,
+            NV_PRINTF(LEVEL_INFO,
                       "Bug 594534: HACK: Report 32MB of framebuffer instead of reading registers.\n");
 
+        }
+
+        //
+        // The carveout needs support from firmware side which is not
+        // configured in all the platforms.
+        //
+        if (memmgrInitZeroFbRegionsHal_HAL(pGpu, pMemoryManager) != NV_OK)
+        {
+            NV_PRINTF(LEVEL_INFO,
+                      "Failed to setup carveout. Carevout functionality is disabled\n");
         }
 
         return NV_OK;
@@ -3572,7 +3657,7 @@ memmgrGetClientFbAddrSpaceSize_IMPL
 
     if (bIsPmaEnabled)
     {
-        pmaGetClientAddrSpaceSize(&pHeap->pmaObject, &size);
+        pmaGetClientAddrSpaceSize(pHeap->pPmaObject, &size);
     }
     else
     {
@@ -3646,7 +3731,7 @@ memmgrGetFreeMemoryForAllMIGGPUInstances_IMPL
         pHeap = pKernelMIGGPUInstance->pMemoryPartitionHeap;
 
         if (memmgrIsPmaInitialized(pMemoryManager))
-            pmaGetFreeMemory(&pHeap->pmaObject, &val);
+            pmaGetFreeMemory(pHeap->pPmaObject, &val);
         else
             heapGetFree(pHeap, &val);
 
@@ -3684,7 +3769,7 @@ memmgrGetTotalMemoryForAllMIGGPUInstances_IMPL
         pHeap = pKernelMIGGPUInstance->pMemoryPartitionHeap;
 
         if (memmgrIsPmaInitialized(pMemoryManager))
-            pmaGetTotalMemory(&pHeap->pmaObject, &val);
+            pmaGetTotalMemory(pHeap->pPmaObject, &val);
         else
             heapGetSize(pHeap, &val);
 
@@ -3709,7 +3794,7 @@ memmgrGetTopLevelScrubberStatus_IMPL
     if (memmgrIsPmaInitialized(pMemoryManager))
     {
         Heap *pHeap = GPU_GET_HEAP(pGpu);
-        NV_ASSERT_OK(pmaQueryConfigs(&pHeap->pmaObject, &pmaConfigs));
+        NV_ASSERT_OK(pmaQueryConfigs(pHeap->pPmaObject, &pmaConfigs));
         bTopLevelScrubberEnabled = (pmaConfigs & PMA_QUERY_SCRUB_ENABLED) != 0x0;
         bTopLevelScrubberConstructed = (pmaConfigs & PMA_QUERY_SCRUB_VALID) != 0x0;
     }
@@ -3880,6 +3965,7 @@ memmgrReserveMemoryForFsp_IMPL
         }
 
     }
+
     return NV_OK;
 }
 
@@ -4025,6 +4111,9 @@ memmgrInitCeUtils_IMPL
     const MEMORY_SYSTEM_STATIC_CONFIG *pMemorySystemConfig =
         kmemsysGetStaticConfig(pGpu, GPU_GET_KERNEL_MEMORY_SYSTEM(pGpu));
     NV0050_ALLOCATION_PARAMETERS ceUtilsParams = {0};
+    KernelMIGManager *pKernelMIGManager = GPU_GET_KERNEL_MIG_MANAGER(pGpu);
+    KERNEL_MIG_GPU_INSTANCE *pKernelMIGGPUInstance = NULL;
+    NvBool bMIGInUse = IS_MIG_IN_USE(pGpu);
 
     NV_ASSERT_OR_RETURN(pMemoryManager->pCeUtils == NULL, NV_ERR_INVALID_STATE);
 
@@ -4044,7 +4133,23 @@ memmgrInitCeUtils_IMPL
         ceUtilsParams.flags |= DRF_DEF(0050_CEUTILS, _FLAGS, _VIRTUAL_MODE, _TRUE);
     }
 
-    NV_ASSERT_OK_OR_RETURN(objCreate(&pMemoryManager->pCeUtils, pMemoryManager, CeUtils, ENG_GET_GPU(pMemoryManager), NULL, &ceUtilsParams));
+    // CeUtils doesn’t support MIG on host/baremetal
+    if (IS_VIRTUAL(pGpu) && bMIGInUse)
+    {
+        KERNEL_MIG_GPU_INSTANCE *pCurrKernelMIGGPUInstance;
+        FOR_EACH_VALID_GPU_INSTANCE(pGpu, pKernelMIGManager, pCurrKernelMIGGPUInstance)
+        {
+            if (pCurrKernelMIGGPUInstance->swizzId == 0)
+            {
+                pKernelMIGGPUInstance = pCurrKernelMIGGPUInstance;
+                break;
+            }
+        }
+        FOR_EACH_VALID_GPU_INSTANCE_END();
+    }
+
+    NV_ASSERT_OK_OR_RETURN(objCreate(&pMemoryManager->pCeUtils, pMemoryManager, CeUtils,
+                           ENG_GET_GPU(pMemoryManager), pKernelMIGGPUInstance, &ceUtilsParams));
 
     NV_STATUS status = memmgrTestCeUtils(pGpu, pMemoryManager);
     NV_ASSERT_OK(status);
@@ -4093,9 +4198,11 @@ memmgrGetInternalClientHandles_IMPL
     NvHandle *phSubdevice
 )
 {
-    if (IS_MIG_IN_USE(pGpu))
+    KernelMIGManager *pKernelMIGManager = GPU_GET_KERNEL_MIG_MANAGER(pGpu);
+
+    if (IS_MIG_IN_USE(pGpu) &&
+       !kmigmgrIsDeviceUsingDeviceProfiling(pGpu, pKernelMIGManager, pExternalDevice))
     {
-        KernelMIGManager *pKernelMIGManager = GPU_GET_KERNEL_MIG_MANAGER(pGpu);
         MIG_INSTANCE_REF pMigInstanceRef;
         KERNEL_MIG_GPU_INSTANCE *pKernelMIGGpuInstance;
 

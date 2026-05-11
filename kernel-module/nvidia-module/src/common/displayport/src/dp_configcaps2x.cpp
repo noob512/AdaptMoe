@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -67,8 +67,8 @@ void DPCDHALImpl2x::parseAndSetCableId(NvU8 cableId)
 
 void DPCDHALImpl2x::performCableIdHandshakeForTypeC()
 {
-    NvU8 txCableCaps = 0;
-    NvU8 rxCableCaps = 0;
+    NvU8    txCableCaps         = 0;
+    NvU8    rxCableCaps         = 0;
 
     if (AuxRetry::ack !=
         bus.read(NV_DPCD20_CABLE_ATTRIBUTES_UPDATED_BY_DPRX, &rxCableCaps, sizeof rxCableCaps))
@@ -79,6 +79,7 @@ void DPCDHALImpl2x::performCableIdHandshakeForTypeC()
     {
         parseAndSetCableId(rxCableCaps);
     }
+    caps2x.rxCableCaps.bHandshakeCompleted = (rxCableCaps != 0);
 
     if (caps2x.txCableCaps.bIsSupported)
     {
@@ -210,6 +211,7 @@ void DPCDHALImpl2x::performCableIdHandshakeForTypeC()
         {
             parseAndSetCableId(rxCableCaps);
         }
+        caps2x.rxCableCaps.bHandshakeCompleted = (rxCableCaps != 0);
 
         // If no matches, reflect that to the DPRX
         if (txCableCaps != rxCableCaps)
@@ -238,6 +240,7 @@ void DPCDHALImpl2x::performCableIdHandshake()
     {
         parseAndSetCableId(rxCableCaps);
     }
+    caps2x.rxCableCaps.bHandshakeCompleted = NV_TRUE;
 }
 
 void DPCDHALImpl2x::setUSBCCableIDInfo(NV0073_CTRL_DP_USBC_CABLEID_INFO *cableIDInfo)
@@ -284,6 +287,16 @@ void DPCDHALImpl2x::parseAndReadCaps()
     unsigned retries = 16;
 
     DPCDHALImpl::parseAndReadCaps();
+
+    // reset DP tunneling UHBR caps
+    caps2x.dpInTunnelingCaps.bUHBR_10GSupported = NV_FALSE;
+    caps2x.dpInTunnelingCaps.bUHBR_13_5GSupported = NV_FALSE;
+    caps2x.dpInTunnelingCaps.bUHBR_20GSupported = NV_FALSE;
+
+    // reset rxCableCaps
+    caps2x.rxCableCaps.bUHBR_10GSupported = NV_TRUE;
+    caps2x.rxCableCaps.bUHBR_13_5GSupported = NV_TRUE;
+    caps2x.rxCableCaps.bUHBR_20GSupported = NV_TRUE;
 
     // 02206h
     if (AuxRetry::ack == bus.read(NV_DPCD14_EXTENDED_MAIN_LINK_CHANNEL_CODING, &buffer[0], 1))
@@ -606,7 +619,7 @@ void DPCDHALImpl2x::overrideCableIdCap(LinkRate linkRate, bool bEnable)
             caps2x.rxCableCaps .bUHBR_10GSupported = bEnable;
             break;
         default:
-            DP_PRINTF(DP_ERROR, "DPHAL> Invalid link rate (%d) to override.", linkRate);
+            DP_PRINTF(DP_ERROR, "DPHAL> Invalid link rate (%" LinkRate_fmtu ") to override.", linkRate);
     }
 }
 
@@ -881,5 +894,77 @@ MainLinkChannelCoding DPCDHALImpl2x::getMainLinkChannelCoding()
         return ChannelCoding128B132B;
 
     return ChannelCoding8B10B;
+}
+
+void DPCDHALImpl2x::fetchLinkStatusESI()
+{
+    NvU8                    buffer[16]              = {0};
+    NvS32                   rxIndex;
+    MainLinkChannelCoding   mainLinkChannelCoding   = getMainLinkChannelCoding();
+
+    // LINK_STATUS_ESI from 0x200C to 0x200F
+    int bytesToRead = 4;
+
+    // Reset all laneStatus to true.
+    resetIntrLaneStatus();
+    for (rxIndex = caps.phyRepeaterCount; rxIndex >= (NvS32) NV0073_CTRL_DP_DATA_TARGET_SINK; rxIndex--)
+    {
+        if (rxIndex != NV0073_CTRL_DP_DATA_TARGET_SINK)
+        {
+            // Ignore LTTPR Link Status for 128b/132b
+            if (mainLinkChannelCoding == ChannelCoding128B132B)
+                continue;
+            readLTTPRLinkStatus(rxIndex, &buffer[0xC]);
+        }
+        else
+        {
+            bus.read(NV_DPCD_LANE0_1_STATUS_ESI, &buffer[0xC], bytesToRead);
+        }
+
+        for (int lane = 0; lane < 4; lane++)
+        {
+            // lane0/1: buffer[0xC], lane2/3: buffer[0xD]
+            unsigned laneBits = buffer[0xC+lane/2];
+            if (lane % 2 == 0)
+            {
+                // lane0/2: _LANEX_XPLUS1_STATUS_ESI_LANEX
+                interrupts.laneStatusIntr.laneStatus[lane].clockRecoveryDone       &=
+                            FLD_TEST_DRF(_DPCD, _LANEX_XPLUS1_STATUS_ESI_LANEX, _CR_DONE, _YES, laneBits);
+                interrupts.laneStatusIntr.laneStatus[lane].channelEqualizationDone &=
+                            FLD_TEST_DRF(_DPCD, _LANEX_XPLUS1_STATUS_ESI_LANEX, _CHN_EQ_DONE, _YES, laneBits);
+                interrupts.laneStatusIntr.laneStatus[lane].symbolLocked            &=
+                            FLD_TEST_DRF(_DPCD, _LANEX_XPLUS1_STATUS_ESI_LANEX, _SYMBOL_LOCKED, _YES, laneBits);
+            }
+            else
+            {
+                // lane1/3: _LANEX_XPLUS1_STATUS_ESI_LANEXPLUS1
+                interrupts.laneStatusIntr.laneStatus[lane].clockRecoveryDone       &=
+                            FLD_TEST_DRF(_DPCD, _LANEX_XPLUS1_STATUS_ESI_LANEXPLUS1, _CR_DONE, _YES, laneBits);
+                interrupts.laneStatusIntr.laneStatus[lane].channelEqualizationDone &=
+                            FLD_TEST_DRF(_DPCD, _LANEX_XPLUS1_STATUS_ESI_LANEXPLUS1, _CHN_EQ_DONE, _YES, laneBits);
+                interrupts.laneStatusIntr.laneStatus[lane].symbolLocked            &=
+                            FLD_TEST_DRF(_DPCD, _LANEX_XPLUS1_STATUS_ESI_LANEXPLUS1, _SYMBOL_LOCKED, _YES, laneBits);
+            }
+        }
+        // Buffer[0xE]: NV_DPCD_LANE_ALIGN_STATUS_UPDATED_ESI
+        interrupts.laneStatusIntr.interlaneAlignDone    &=
+            FLD_TEST_DRF(_DPCD, _LANE_ALIGN_STATUS_UPDATED_ESI, _INTERLANE_ALIGN_DONE, _YES, buffer[0xE]);
+        interrupts.laneStatusIntr.downstmPortChng       &=
+            FLD_TEST_DRF(_DPCD, _LANE_ALIGN_STATUS_UPDATED_ESI, _DOWNSTRM_PORT_STATUS_DONE, _YES, buffer[0xE]);
+        interrupts.laneStatusIntr.linkStatusUpdated     &=
+            FLD_TEST_DRF(_DPCD, _LANE_ALIGN_STATUS_UPDATED_ESI, _LINK_STATUS_UPDATED, _YES, buffer[0xE]);
+    }
+
+    // Buffer[0xF]: NV_DPCD_SINK_STATUS_ESI
+    interrupts.sinkStatus.receiverPort0InSync     =
+        FLD_TEST_DRF(_DPCD, _SINK_STATUS, _RECEIVE_PORT_0_STATUS, _IN_SYNC_YES, buffer[0xF]);
+    interrupts.sinkStatus.receiverPort1InSync     =
+        FLD_TEST_DRF(_DPCD, _SINK_STATUS, _RECEIVE_PORT_1_STATUS, _IN_SYNC_YES, buffer[0xF]);
+    interrupts2x.sinkStatus2x.streamRegenerated   =
+        FLD_TEST_DRF(_DPCD20, _SINK_STATUS, _STREAM_REGENERATED, _YES, buffer[0xF]);
+    interrupts2x.sinkStatus2x.interhopAuxReply    =
+        FLD_TEST_DRF(_DPCD20, _SINK_STATUS, _INTRA_HOP_AUX_REPLY, _LTTPR, buffer[0xF]);
+
+    this->setDirtyLinkStatus(false);
 }
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2018-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2018-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -31,7 +31,7 @@
 \***************************************************************************/
 
 #include "kernel/gpu/gr/kernel_graphics.h"
-#include "kernel/rmapi/event.h"
+#include "kernel/rmapi/event_api.h"
 #include "kernel/rmapi/event_buffer.h"
 #include "libraries/resserv/rs_server.h"
 #include "kernel/core/locks.h"
@@ -78,7 +78,7 @@ struct KGRAPHICS_FECS_TRACE_INFO
     NvU16  fecsCtxswLogRecordsPerIntr;
     NvU16  fecsTraceRdOffset;
     NvU16  fecsTraceCounter;
-    NvU32  fecsCtxswLogIntrPending;
+    PORT_ATOMIC NvU32  fecsCtxswLogIntrPending;
     NvU32  fecsLastSeqno;
 
 #if PORT_IS_MODULE_SUPPORTED(crypto)
@@ -110,7 +110,7 @@ struct KGRMGR_FECS_GLOBAL_TRACE_INFO
     NvU32 fecsTimerInterval;
 
     // Atomic for scheduling the fecs callback in timer mode
-    NvU32 fecsCallbackScheduled;
+    PORT_ATOMIC NvU32 fecsCallbackScheduled;
 
     // Number of consumer clients
     NvS16 fecsCtxswLogConsumerCount;
@@ -214,9 +214,12 @@ formatAndNotifyFecsRecord
     NvU32                          timestampId;
     NvU64                          noisyTimestampStart = 0;
     NvU64                          noisyTimestampRange = 0;
-    NvU32                          instSize;
-    NvU32                          instShift;
+    NvU64                          instSize;
+    NvU64                          instAlign;
     NV_STATUS                      status;
+    NvU32                          instAperture;
+    NvU32                          cpuCacheAttrib;
+    const NV_ADDRESS_SPACE         *pInstAllocList;
 
     if (pRecord == NULL)
     {
@@ -226,13 +229,32 @@ formatAndNotifyFecsRecord
     }
 
     NV_ASSERT_OR_RETURN_VOID(pFecsGlobalTraceInfo != NULL);
+    status = kfifoGetInstMemInfo_HAL(pKernelFifo, &instSize, &instAlign,
+                                     NULL, &cpuCacheAttrib, &pInstAllocList);
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Unable to get instance memory info!\n");
+    }
 
-    kfifoGetInstBlkSizeAlign_HAL(pKernelFifo, &instSize, &instShift);
+    switch (pInstAllocList[0])
+    {
+        case ADDR_SYSMEM:
+            // Cache-ability is inconsequential to the kfifoConvertInstToKernelChannel_HAL since both values translate to ADDR_SYSMEM.
+            if(cpuCacheAttrib == NV_MEMORY_CACHED)
+                instAperture = INST_BLOCK_APERTURE_SYSTEM_COHERENT_MEMORY;
+            else
+                instAperture = INST_BLOCK_APERTURE_SYSTEM_NON_COHERENT_MEMORY;
+            break;
+        case ADDR_FBMEM:
+        default:
+            instAperture = INST_BLOCK_APERTURE_VIDEO_MEMORY;
+            break;
+    }
 
     portMemSet(&notifRecord, 0, sizeof(notifRecord));
 
-    inst.address = ((NvU64)pRecord->context_ptr) << instShift;
-    inst.aperture = INST_BLOCK_APERTURE_VIDEO_MEMORY;
+    inst.address = ((NvU64)pRecord->context_ptr) << BIT_IDX_64(instAlign);
+    inst.aperture = instAperture;
     inst.gfid = GPU_GFID_PF;
     if (pRecord->context_ptr &&
         (kfifoConvertInstToKernelChannel_HAL(pGpu, pKernelFifo, &inst, &pKernelChannel) != NV_OK))
@@ -241,8 +263,8 @@ formatAndNotifyFecsRecord
         pKernelChannel = NULL;
     }
 
-    inst.address = ((NvU64)pRecord->new_context_ptr) << instShift;
-    inst.aperture = INST_BLOCK_APERTURE_VIDEO_MEMORY;
+    inst.address = ((NvU64)pRecord->new_context_ptr) << BIT_IDX_64(instAlign);
+    inst.aperture = instAperture;
     inst.gfid = GPU_GFID_PF;
     if (pRecord->new_context_ptr &&
         (kfifoConvertInstToKernelChannel_HAL(pGpu, pKernelFifo, &inst, &pKernelChannelNew) != NV_OK))
@@ -665,7 +687,7 @@ fecsCtxswLoggingInit
         return NV_ERR_NO_MEMORY;
     portMemSet(pFecsTraceInfo, 0, sizeof(*pFecsTraceInfo));
 
-    seed = osGetCurrentTick();
+    seed = osGetMonotonicTimeNs();
     pFecsTraceInfo->pFecsLogPrng = portCryptoPseudoRandomGeneratorCreate(seed);
 
     *ppFecsTraceInfo = pFecsTraceInfo;
@@ -796,7 +818,7 @@ _fecsSignalCallbackScheduled
 )
 {
     NV_ASSERT_OR_RETURN(pFecsGlobalTraceInfo != NULL, 0);
-    return portAtomicCompareAndSwapU32(&pFecsGlobalTraceInfo->fecsCallbackScheduled, 1, 0);
+    return portAtomicCompareAndSwapU32(&pFecsGlobalTraceInfo->fecsCallbackScheduled, 1U, 0U);
 }
 
 static void
@@ -849,7 +871,12 @@ _fecsTimerCallback
 
         if (fecsBufferChanged(pGpu, pKernelGraphics) && _fecsSignalCallbackScheduled(pFecsGlobalTraceInfo))
         {
-            NV_CHECK_OK(status, LEVEL_ERROR, osQueueWorkItemWithFlags(pGpu, _fecsOsWorkItem, NULL, OS_QUEUE_WORKITEM_FLAGS_LOCK_GPU_GROUP_DEVICE));
+            NV_CHECK_OK(status,
+                LEVEL_ERROR,
+                osQueueWorkItem(pGpu,
+                                _fecsOsWorkItem,
+                                NULL,
+                                (OsQueueWorkItemFlags){.bLockGpuGroupDevice = NV_TRUE}));
 
             if (status != NV_OK)
                 _fecsClearCallbackScheduled(pFecsGlobalTraceInfo);
@@ -1717,7 +1744,7 @@ fecsSignalIntrPendingIfNotPending
 
     NV_ASSERT_OR_RETURN(pFecsTraceInfo != NULL, NV_FALSE);
 
-    return portAtomicCompareAndSwapU32(&pFecsTraceInfo->fecsCtxswLogIntrPending, 1, 0);
+    return portAtomicCompareAndSwapU32(&pFecsTraceInfo->fecsCtxswLogIntrPending, 1U, 0U);
 }
 
 /*! Atomically clear intr callback pending, return NV_TRUE if was pending */
@@ -1732,7 +1759,7 @@ fecsClearIntrPendingIfPending
 
     NV_ASSERT_OR_RETURN(pFecsTraceInfo != NULL, NV_FALSE);
 
-    return portAtomicCompareAndSwapU32(&pFecsTraceInfo->fecsCtxswLogIntrPending, 0, 1);
+    return portAtomicCompareAndSwapU32(&pFecsTraceInfo->fecsCtxswLogIntrPending, 0U, 1U);
 }
 
 /*! Atomically check if intr callback pending */

@@ -26,9 +26,42 @@
 #include "nv-pci.h"
 #include "nv-msi.h"
 #include "nv-hypervisor.h"
+#include "nv-reg.h"
 
 #if defined(NV_VGPU_KVM_BUILD)
 #include "nv-vgpu-vfio-interface.h"
+#endif
+#include <linux/iommu.h>
+
+#include <linux/clk.h>
+#include <linux/device.h>
+#include <linux/jiffies.h>
+#include <linux/kernel.h>
+#include <linux/workqueue.h>
+
+#if defined(CONFIG_PM_DEVFREQ)
+#include <linux/devfreq.h>
+
+#if defined(CONFIG_DEVFREQ_THERMAL) \
+    && defined(NV_DEVFREQ_DEV_PROFILE_HAS_IS_COOLING_DEVICE) \
+    && defined(NV_THERMAL_ZONE_FOR_EACH_TRIP_PRESENT) \
+    && defined(NV_THERMAL_BIND_CDEV_TO_TRIP_PRESENT) \
+    && defined(NV_THERMAL_UNBIND_CDEV_FROM_TRIP_PRESENT)
+#include <linux/thermal.h>
+#define NV_HAS_COOLING_SUPPORTED 1
+#else
+#define NV_HAS_COOLING_SUPPORTED 0
+#endif
+
+#endif
+
+#if defined(CONFIG_INTERCONNECT) \
+    && defined(NV_ICC_SET_BW_PRESENT) \
+    && defined(NV_DEVM_ICC_GET_PRESENT)
+#include <linux/interconnect.h>
+#define NV_HAS_ICC_SUPPORTED 1
+#else
+#define NV_HAS_ICC_SUPPORTED 0
 #endif
 
 #if defined(NV_SEQ_READ_ITER_PRESENT)
@@ -46,6 +79,7 @@
 #endif
 
 extern int NVreg_GrdmaPciTopoCheckOverride;
+extern int NVreg_ExcludeAllGpus;
 
 static void
 nv_check_and_exclude_gpu(
@@ -54,6 +88,13 @@ nv_check_and_exclude_gpu(
 )
 {
     char *uuid_str;
+
+    if (NVreg_ExcludeAllGpus)
+    {
+        NV_DEV_PRINTF(NV_DBG_INFO, nv, "Excluding all GPUs as requested\n");
+        nv->flags |= NV_FLAG_EXCLUDE;
+        return;
+    }
 
     uuid_str = rm_get_gpu_uuid(sp, nv);
     if (uuid_str == NULL)
@@ -151,32 +192,6 @@ static void nv_get_pci_sysfs_config
 #endif
 }
 
-static void nv_init_dynamic_power_management
-(
-    nvidia_stack_t *sp,
-    struct pci_dev *pci_dev
-)
-{
-    nv_linux_state_t *nvl = pci_get_drvdata(pci_dev);
-    nv_state_t *nv = NV_STATE_PTR(nvl);
-    NvBool pr3_acpi_method_present = NV_FALSE;
-
-    nvl->sysfs_config_file = NULL;
-
-    nv_get_pci_sysfs_config(pci_dev, nvl);
-
-    if (nv_get_hypervisor_type() != OS_HYPERVISOR_UNKNOWN)
-    {
-        pr3_acpi_method_present = nv_acpi_power_resource_method_present(pci_dev);
-    }
-    else if (pci_dev->bus && pci_dev->bus->self)
-    {
-        pr3_acpi_method_present = nv_acpi_power_resource_method_present(pci_dev->bus->self);
-    }
-
-    rm_init_dynamic_power_management(sp, nv, pr3_acpi_method_present);
-}
-
 static int nv_resize_pcie_bars(struct pci_dev *pci_dev) {
 #if defined(NV_PCI_REBAR_GET_POSSIBLE_SIZES_PRESENT)
     u16 cmd;
@@ -237,7 +252,11 @@ static int nv_resize_pcie_bars(struct pci_dev *pci_dev) {
 
 resize:
     /* Attempt to resize BAR1 to the largest supported size */
+#if defined(NV_PCI_RESIZE_RESOURCE_HAS_EXCLUDE_BARS_ARG)
+    r = pci_resize_resource(pci_dev, NV_GPU_BAR1, requested_size, 0);
+#else
     r = pci_resize_resource(pci_dev, NV_GPU_BAR1, requested_size);
+#endif
 
     if (r) {
         if (r == -ENOSPC)
@@ -290,9 +309,7 @@ resize:
 #endif /* NV_PCI_REBAR_GET_POSSIBLE_SIZES_PRESENT */
 }
 
-#if defined(NV_DEVICE_PROPERTY_READ_U64_PRESENT) && \
-    defined(CONFIG_ACPI_NUMA) && \
-    NV_IS_EXPORT_SYMBOL_PRESENT_pxm_to_node
+#if defined(CONFIG_ACPI_NUMA) && NV_IS_EXPORT_SYMBOL_PRESENT_pxm_to_node
 /*
  * Parse the SRAT table to look for numa node associated with the GPU.
  *
@@ -398,7 +415,7 @@ exit:
     acpi_put_table(table_header);
     return pxm_count;
 }
-#endif
+#endif // defined(CONFIG_ACPI_NUMA) && NV_IS_EXPORT_SYMBOL_PRESENT_pxm_to_node
 
 static void
 nv_init_coherent_link_info
@@ -406,9 +423,7 @@ nv_init_coherent_link_info
     nv_state_t *nv
 )
 {
-#if defined(NV_DEVICE_PROPERTY_READ_U64_PRESENT) && \
-    defined(CONFIG_ACPI_NUMA) && \
-    NV_IS_EXPORT_SYMBOL_PRESENT_pxm_to_node
+#if defined(CONFIG_ACPI_NUMA) && NV_IS_EXPORT_SYMBOL_PRESENT_pxm_to_node
     nv_linux_state_t *nvl = NV_GET_NVL_FROM_NV_STATE(nv);
     NvU64 pa = 0;
     NvU64 pxm_start = 0;
@@ -432,6 +447,12 @@ nv_init_coherent_link_info
     if (device_property_read_u64(nvl->dev, "nvidia,gpu-mem-base-pa", &pa) == 0)
     {
         nvl->coherent_link_info.gpu_mem_pa = pa;
+
+        NvU64 gpu_mem_size;
+        if (device_property_read_u64(nvl->dev, "nvidia,gpu-mem-size", &gpu_mem_size) == 0)
+        {
+            nvl->coherent_link_info.gpu_mem_size = gpu_mem_size;
+        }
     }
     else
     {
@@ -553,8 +574,1189 @@ nv_init_coherent_link_info
 
 failed:
     NV_DEV_PRINTF(NV_DBG_SETUP, nv, "Cannot get coherent link info.\n");
-#endif
+#endif // defined(CONFIG_ACPI_NUMA) && NV_IS_EXPORT_SYMBOL_PRESENT_pxm_to_node
     return;
+}
+
+#if defined(CONFIG_PM_DEVFREQ)
+
+#define to_tegra_devfreq_dev(x) \
+    container_of(x, struct nv_pci_tegra_devfreq_dev, dev)
+
+struct nv_pci_tegra_devfreq_data {
+    const char *clk_name;
+    const char *icc_name;
+    const unsigned int gpc_fuse_field;
+    const TEGRASOC_DEVFREQ_CLK devfreq_clk;
+};
+
+#if NV_HAS_COOLING_SUPPORTED
+struct nv_pci_tegra_thermal_data {
+    const char *tz_name;
+    const struct thermal_trip *passive_trip;
+    struct list_head zones;
+};
+#endif
+
+struct nv_pci_tegra_devfreq_dev {
+    TEGRASOC_DEVFREQ_CLK devfreq_clk;
+    int domain;
+    struct device dev;
+    struct list_head gpc_cluster;
+    struct list_head nvd_cluster;
+    struct nv_pci_tegra_devfreq_dev *gpc_master;
+    struct nv_pci_tegra_devfreq_dev *nvd_master;
+    struct clk *clk;
+    struct devfreq *devfreq;
+    bool boost_enabled;
+    struct delayed_work boost_disable;
+#if NV_HAS_ICC_SUPPORTED
+    struct icc_path *icc_path;
+#endif
+#if NV_HAS_COOLING_SUPPORTED
+    struct list_head therm_zones;
+#endif
+};
+
+static const struct nv_pci_tegra_devfreq_data gb10b_tegra_devfreq_table[] = {
+    {
+        .clk_name = "gpc0clk",
+        .icc_name = "gpu-write",
+        .gpc_fuse_field = BIT(0),
+        .devfreq_clk = TEGRASOC_DEVFREQ_CLK_GPC,
+    },
+    {
+        .clk_name = "gpc1clk",
+        .icc_name = "gpu-write",
+        .gpc_fuse_field = BIT(1),
+        .devfreq_clk = TEGRASOC_DEVFREQ_CLK_GPC,
+    },
+    {
+        .clk_name = "gpc2clk",
+        .icc_name = "gpu-write",
+        .gpc_fuse_field = BIT(2),
+        .devfreq_clk = TEGRASOC_DEVFREQ_CLK_GPC,
+    },
+    {
+        .clk_name = "nvdclk",
+        .icc_name = "video-write",
+        .devfreq_clk = TEGRASOC_DEVFREQ_CLK_NVD,
+    },
+    {
+        .clk_name = "sysclk"
+    },
+    {
+        .clk_name = "uprocclk"
+    },
+};
+
+static void nv_pci_gb10b_device_release(struct device *dev)
+{
+    ;
+}
+
+static int
+nv_pci_gb10b_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
+{
+    struct pci_dev *pdev = to_pci_dev(dev->parent);
+    nv_linux_state_t *nvl = pci_get_drvdata(pdev);
+    struct nv_pci_tegra_devfreq_dev *tdev = to_tegra_devfreq_dev(dev), *tptr;
+    unsigned long rate;
+#if NV_HAS_ICC_SUPPORTED
+    static const unsigned num_mss_ports = 8;
+    static const unsigned mss_port_bandwidth = 32;
+    static const unsigned gpu_bus_bandwidth = num_mss_ports * mss_port_bandwidth;
+    u32 kBps;
+#endif
+
+    /*
+     * If the device is suspended, skip the frequency scaling
+     * because the clocks may be unavailable.
+     * Otherwise, set the clocks to the target frequency.
+     */
+    if (pm_runtime_suspended(&pdev->dev))
+    {
+        return 0;
+    }
+
+    clk_set_rate(tdev->clk, *freq);
+    *freq = clk_get_rate(tdev->clk);
+
+#if NV_HAS_ICC_SUPPORTED
+    if (tdev->icc_path != NULL)
+    {
+        kBps = Bps_to_icc(*freq * gpu_bus_bandwidth * 400 / 1000);
+        if (tdev->boost_enabled)
+        {
+            kBps = UINT_MAX;
+        }
+        icc_set_bw(tdev->icc_path, kBps, 0);
+    }
+#endif
+
+    rate = 0;
+    list_for_each_entry(tptr, &tdev->gpc_cluster, gpc_cluster)
+    {
+        if (tptr->gpc_master != NULL)
+        {
+            rate = max(rate, clk_get_rate(tptr->gpc_master->clk));
+        }
+
+        if (tptr->nvd_master != NULL)
+        {
+            rate = max(rate, clk_get_rate(tptr->nvd_master->clk));
+        }
+
+        if (tdev->boost_enabled
+            && (tptr == nvl->sys_devfreq_dev || tptr == nvl->pwr_devfreq_dev))
+        {
+            clk_set_rate(tptr->clk, ULONG_MAX);
+        }
+        else
+        {
+            clk_set_rate(tptr->clk, rate);
+        }
+    }
+
+    rate = 0;
+    list_for_each_entry(tptr, &tdev->nvd_cluster, nvd_cluster)
+    {
+        if (tptr->gpc_master != NULL)
+        {
+            rate = max(rate, clk_get_rate(tptr->gpc_master->clk));
+        }
+
+        if (tptr->nvd_master != NULL)
+        {
+            rate = max(rate, clk_get_rate(tptr->nvd_master->clk));
+        }
+
+        if (tdev->boost_enabled
+            && (tptr == nvl->sys_devfreq_dev || tptr == nvl->pwr_devfreq_dev))
+        {
+            clk_set_rate(tptr->clk, ULONG_MAX);
+        }
+        else
+        {
+            clk_set_rate(tptr->clk, rate);
+        }
+    }
+
+    return 0;
+}
+
+static int
+nv_pci_tegra_devfreq_get_cur_freq(struct device *dev, unsigned long *freq)
+{
+    struct nv_pci_tegra_devfreq_dev *tdev = to_tegra_devfreq_dev(dev);
+
+    //
+    // Clock frequency reported from CCF is only valid when GPU is active.
+    // If GPU is suspended, return 0 frequency because whole GPU is powered off.
+    // Otherwise, return the last frequency step saved in devfreq.
+    //
+    if (pm_runtime_active(dev->parent))
+        *freq = clk_get_rate(tdev->clk);
+    else if (pm_runtime_suspended(dev->parent))
+        *freq = 0;
+    else
+        *freq = tdev->devfreq->previous_freq;
+
+    return 0;
+}
+
+static int
+nv_pci_tegra_devfreq_get_dev_status(struct device *dev,
+                                    struct devfreq_dev_status *stat)
+{
+    struct pci_dev *pdev = to_pci_dev(dev->parent);
+    nv_linux_state_t *nvl = pci_get_drvdata(pdev);
+    nv_state_t *nv = NV_STATE_PTR(nvl);
+    nvidia_stack_t *sp = NULL;
+    struct nv_pci_tegra_devfreq_dev *tdev = to_tegra_devfreq_dev(dev);
+    unsigned int load = 0;
+    int retval = 0;
+    NV_STATUS status;
+
+    //
+    // GPU can be under suspending/suspended/resuming state defined the runtime
+    // PM (RPM) framework. When device is under either of these states, DVFS based
+    // on GPU load information should be disabled.
+    //
+    // Complete load-based DVFS cycle involve GPU load query through rmapi and
+    // clock scaling through BPMP MRQ_CLK mailbox request, which will awake the
+    // GPU and contradict the suspended state.
+    //
+    if (!pm_runtime_active(&pdev->dev))
+    {
+        stat->total_time = 100;
+        stat->busy_time = 0;
+        stat->current_frequency = tdev->devfreq->previous_freq;
+        return 0;
+    }
+
+    retval = nv_kmem_cache_alloc_stack(&sp);
+    if (retval != 0)
+    {
+        dev_warn(&pdev->dev, "fail to nv_kmem_cache_alloc_stack: %d\n", retval);
+        return -ENOMEM;
+    }
+
+    //
+    // Fetch the load value in percentage from the specified clock domain. If the
+    // load information is unavailable, just consider the load as 100% so that the
+    // devfreq core will scale the underlying clock to Fmax to prevent any
+    // performance drop.
+    //
+    status = rm_pmu_perfmon_get_load(sp, nv, &load, tdev->devfreq_clk);
+    if (status != NV_OK)
+    {
+        load = 100;
+    }
+
+    // Load calculation equals to (busy_time / total_time) in devfreq governors
+    // and devfreq governors expect total_time and busy_time in the same unit
+    stat->total_time = 100;
+    stat->busy_time = load;
+    stat->current_frequency = clk_get_rate(tdev->clk);
+
+    nv_kmem_cache_free_stack(sp);
+
+    return retval;
+}
+
+static void
+populate_opp_table(struct nv_pci_tegra_devfreq_dev *tdev)
+{
+    unsigned long max_rate, min_rate, step, rate;
+    long val;
+
+    /* Get the max rate of the clock */
+    val = clk_round_rate(tdev->clk, ULONG_MAX);
+    max_rate = (val < 0) ? ULONG_MAX : (unsigned long)val;
+
+    /* Get the min rate of the clock */
+    val = clk_round_rate(tdev->clk, 0);
+    min_rate = (val < 0) ? ULONG_MAX : (unsigned long)val;
+
+    /* Get the step size of the clock */
+    step = (min_rate == ULONG_MAX) ? ULONG_MAX : (min_rate + 1);
+    val = clk_round_rate(tdev->clk, step);
+    if ((val < 0) || (val < min_rate))
+    {
+        step = 0;
+    }
+    else
+    {
+        step = (unsigned long)val - min_rate;
+    }
+
+    /* Create the OPP table */
+    rate = min_rate;
+    do {
+        dev_pm_opp_add(&tdev->dev, rate, 0);
+        rate += step;
+    } while (rate <= max_rate && step);
+}
+
+static void
+nv_pci_tegra_devfreq_remove_opps(struct nv_pci_tegra_devfreq_dev *tdev)
+{
+#if defined(NV_DEVFREQ_HAS_FREQ_TABLE)
+    unsigned long *freq_table = tdev->devfreq->freq_table;
+    unsigned int max_state = tdev->devfreq->max_state;
+#else
+    unsigned long *freq_table = tdev->devfreq->profile->freq_table;
+    unsigned int max_state = tdev->devfreq->profile->max_state;
+#endif
+    int i;
+
+    for (i = 0; i < max_state; i++)
+    {
+        dev_pm_opp_remove(&tdev->dev, freq_table[i]);
+    }
+}
+
+#if NV_HAS_COOLING_SUPPORTED
+static int
+nv_pci_tegra_thermal_get_passive_trip_cb(struct thermal_trip *trip, void *arg)
+{
+    const struct thermal_trip **ptrip = arg;
+
+    /* Return zero to continue the search */
+    if (trip->type != THERMAL_TRIP_PASSIVE)
+        return 0;
+
+    /* Return nonzero to terminate the search */
+    *ptrip = trip;
+    return -1;
+}
+
+static int
+nv_pci_tegra_init_cooling_device(struct nv_pci_tegra_devfreq_dev *tdev)
+{
+    struct device *pdev = tdev->dev.parent;
+    const struct thermal_trip *passive_trip = NULL;
+    struct devfreq *devfreq = tdev->devfreq;
+    struct nv_pci_tegra_thermal_data *data;
+    struct thermal_zone_device *tzdev;
+    int i, err, val, n_strings, n_elems;
+    u32 temp_min, temp_max;
+    const char *tz_name;
+
+    if (!devfreq->cdev)
+    {
+        nv_printf(NV_DBG_ERRORS, "NVRM: devfreq cooling cannot be found\n");
+        return -ENODEV;
+    }
+
+    if (!pdev->of_node)
+    {
+        nv_printf(NV_DBG_ERRORS, "NVRM: associated OF node cannot be found\n");
+        return -ENODEV;
+    }
+
+    val = of_property_count_strings(pdev->of_node, "nvidia,thermal-zones");
+    if (val == -EINVAL)
+    {
+        return 0;
+    }
+    else if (val < 0)
+    {
+        nv_printf(NV_DBG_ERRORS, "NVRM: nvidia,thermal-zones DT property format error\n");
+        return val;
+    }
+    n_strings = val;
+
+    val = of_property_count_u32_elems(pdev->of_node, "nvidia,cooling-device");
+    if (val == -EINVAL)
+    {
+        return 0;
+    }
+    else if (val < 0)
+    {
+        nv_printf(NV_DBG_ERRORS, "NVRM: nvidia,cooling-device DT property format error\n");
+        return val;
+    }
+    n_elems = val;
+
+    if ((n_elems >> 1) != n_strings)
+    {
+        nv_printf(NV_DBG_ERRORS,
+            "NVRM: number of strings specified in nvidia,thermal-zones needs to"
+            "be exact half the number of elements specified nvidia,cooling-device\n");
+        return -EINVAL;
+    }
+
+    if (((n_elems >> 1) == 0) && ((n_elems & 1) == 1))
+    {
+        nv_printf(NV_DBG_ERRORS,
+            "NVRM: number of elements specified in nvidia,cooling-device needs"
+            "to be an even number\n");
+        return -EINVAL;
+    }
+
+    for (i = 0; i < n_strings; i++)
+    {
+        data = devm_kzalloc(pdev, sizeof(*data), GFP_KERNEL);
+        if (data == NULL)
+        {
+            err = -ENOMEM;
+            goto err_nv_pci_tegra_init_cooling_device;
+        }
+
+        of_property_read_string_index(pdev->of_node,
+                                      "nvidia,thermal-zones", i, &tz_name);
+        of_property_read_u32_index(pdev->of_node,
+                                   "nvidia,cooling-device", (i << 1) + 0, &temp_min);
+        of_property_read_u32_index(pdev->of_node,
+                                   "nvidia,cooling-device", (i << 1) + 1, &temp_max);
+
+        tzdev = thermal_zone_get_zone_by_name(tz_name);
+        if (IS_ERR(tzdev))
+        {
+            nv_printf(NV_DBG_ERRORS,
+                "NVRM: fail to get %s thermal_zone_device\n", tz_name);
+            err = -ENODEV;
+            goto err_nv_pci_tegra_init_cooling_device;
+        }
+
+        thermal_zone_for_each_trip(tzdev, nv_pci_tegra_thermal_get_passive_trip_cb, &passive_trip);
+        if (passive_trip == NULL)
+        {
+            nv_printf(NV_DBG_ERRORS,
+                "NVRM: fail to find passive_trip in %s thermal_zone_device\n", tz_name);
+            err = -ENODEV;
+            goto err_nv_pci_tegra_init_cooling_device;
+        }
+
+        val = thermal_bind_cdev_to_trip(tzdev,
+                                        passive_trip,
+                                        devfreq->cdev,
+                                        temp_max, temp_min, THERMAL_WEIGHT_DEFAULT);
+        if (val != 0)
+        {
+            nv_printf(NV_DBG_ERRORS,
+                "NVRM: fail to bind devfreq cooling device with %s thermal_zone_device\n", tz_name);
+            err = -ENODEV;
+            goto err_nv_pci_tegra_init_cooling_device;
+        }
+
+        data->tz_name = tz_name;
+        data->passive_trip = passive_trip;
+        list_add_tail(&data->zones, &tdev->therm_zones);
+    }
+
+    return 0;
+
+err_nv_pci_tegra_init_cooling_device:
+    list_for_each_entry(data, &tdev->therm_zones, zones)
+    {
+        tzdev = thermal_zone_get_zone_by_name(data->tz_name);
+        if (IS_ERR(tzdev))
+        {
+            continue;
+        }
+
+        thermal_unbind_cdev_from_trip(tzdev, data->passive_trip, devfreq->cdev);
+    }
+
+    return err;
+}
+#endif
+
+static int
+nv_pci_gb10b_add_devfreq_device(struct nv_pci_tegra_devfreq_dev *tdev)
+{
+    struct devfreq_dev_profile *profile;
+    int err;
+
+    populate_opp_table(tdev);
+
+    profile = devm_kzalloc(&tdev->dev, sizeof(*profile), GFP_KERNEL);
+    if (profile == NULL)
+    {
+        err = -ENOMEM;
+        goto err_nv_pci_gb10b_add_devfreq_device_opp;
+    }
+
+    profile->target = nv_pci_gb10b_devfreq_target;
+    profile->get_cur_freq = nv_pci_tegra_devfreq_get_cur_freq;
+    profile->get_dev_status = nv_pci_tegra_devfreq_get_dev_status;
+    profile->initial_freq = clk_get_rate(tdev->clk);
+    profile->polling_ms = 25;
+#if NV_HAS_COOLING_SUPPORTED
+    profile->is_cooling_device = true;
+#endif
+
+    tdev->devfreq = devm_devfreq_add_device(&tdev->dev,
+                                            profile,
+                                            DEVFREQ_GOV_PERFORMANCE,
+                                            NULL);
+    if (IS_ERR(tdev->devfreq))
+    {
+        err = PTR_ERR(tdev->devfreq);
+        goto err_nv_pci_gb10b_add_devfreq_device_opp;
+    }
+
+#if NV_HAS_COOLING_SUPPORTED
+    err = nv_pci_tegra_init_cooling_device(tdev);
+    if (err)
+    {
+        goto err_nv_pci_gb10b_add_devfreq_device;
+    }
+#endif
+
+    return 0;
+
+#if NV_HAS_COOLING_SUPPORTED
+err_nv_pci_gb10b_add_devfreq_device:
+    devm_devfreq_remove_device(&tdev->dev, tdev->devfreq);
+#endif
+err_nv_pci_gb10b_add_devfreq_device_opp:
+    nv_pci_tegra_devfreq_remove_opps(tdev);
+
+    return err;
+}
+
+static int
+nv_pci_gb10b_register_devfreq(struct pci_dev *pdev)
+{
+    nv_linux_state_t *nvl = pci_get_drvdata(pdev);
+    nv_state_t *nv = NV_STATE_PTR(nvl);
+    struct pci_bus *pbus = pdev->bus;
+    const struct nv_pci_tegra_devfreq_data *tdata;
+    struct nv_pci_tegra_devfreq_dev *tdev;
+#if NV_HAS_ICC_SUPPORTED
+    struct icc_path *icc_path;
+#endif
+    struct clk *clk;
+    int i, err, node;
+    resource_size_t bar0_addr, bar0_size;
+    void *bar0_map;
+    u32 gpc_fuse_mask;
+
+    while (pbus->parent != NULL)
+    {
+        pbus = pbus->parent;
+    }
+
+    node = max(0, dev_to_node(to_pci_host_bridge(pbus->bridge)->dev.parent));
+
+    bar0_addr = (resource_size_t)nv->bars[NV_GPU_BAR_INDEX_REGS].cpu_address;
+    bar0_size = (resource_size_t)nv->bars[NV_GPU_BAR_INDEX_REGS].size;
+    bar0_map = devm_ioremap(&pdev->dev, bar0_addr, bar0_size);
+
+    if (bar0_map == NULL)
+    {
+        gpc_fuse_mask = 0;
+    }
+    else
+    {
+        gpc_fuse_mask = readl(bar0_map + nv->gpc_fuse_status_offset);
+    }
+
+    nv_printf(NV_DBG_INFO, "NVRM: devfreq registration detects gpc_fuse_mask = %u\n", gpc_fuse_mask);
+
+    for (i = 0; i < nvl->devfreq_table_size; i++)
+    {
+        tdata = &nvl->devfreq_table[i];
+
+        if (gpc_fuse_mask && (gpc_fuse_mask & tdata->gpc_fuse_field))
+        {
+            continue;
+        }
+
+#if NV_HAS_ICC_SUPPORTED
+        if (tdata->icc_name != NULL)
+        {
+            icc_path = devm_of_icc_get(&pdev->dev, tdata->icc_name);
+            if (IS_ERR_OR_NULL(icc_path))
+            {
+                icc_path = NULL;
+            }
+        }
+#endif
+
+        clk = devm_clk_get(&pdev->dev, tdata->clk_name);
+        if (IS_ERR_OR_NULL(clk))
+        {
+            continue;
+        }
+
+        tdev = devm_kzalloc(&pdev->dev, sizeof(*tdev), GFP_KERNEL);
+        if (tdev == NULL)
+        {
+            return -ENOMEM;
+        }
+
+        INIT_LIST_HEAD(&tdev->gpc_cluster);
+        INIT_LIST_HEAD(&tdev->nvd_cluster);
+#if NV_HAS_COOLING_SUPPORTED
+        INIT_LIST_HEAD(&tdev->therm_zones);
+#endif
+#if NV_HAS_ICC_SUPPORTED
+        tdev->icc_path = icc_path;
+#endif
+        tdev->clk = clk;
+        tdev->domain = node;
+        tdev->devfreq_clk = tdata->devfreq_clk;
+
+        tdev->dev.parent = &pdev->dev;
+        tdev->dev.release = nv_pci_gb10b_device_release;
+        dev_set_name(&tdev->dev, "%s-%d", tdata->clk_name, node);
+
+        if (strstr(tdata->clk_name, "gpc"))
+        {
+            if (nvl->gpc_devfreq_dev != NULL)
+            {
+                list_add_tail(&tdev->gpc_cluster, &nvl->gpc_devfreq_dev->gpc_cluster);
+                tdev->gpc_master = nvl->gpc_devfreq_dev;
+            }
+            else
+            {
+                nvl->gpc_devfreq_dev = tdev;
+                dev_set_name(&tdev->dev, "gpu-gpc-%d", node);
+            }
+        }
+        else if (strstr(tdata->clk_name, "nvd"))
+        {
+            nvl->nvd_devfreq_dev = tdev;
+            dev_set_name(&tdev->dev, "gpu-nvd-%d", node);
+        }
+        else if (strstr(tdata->clk_name, "sys"))
+        {
+            nvl->sys_devfreq_dev = tdev;
+            dev_set_name(&tdev->dev, "gpu-sys-%d", node);
+        }
+        else if (strstr(tdata->clk_name, "uproc"))
+        {
+            nvl->pwr_devfreq_dev = tdev;
+            dev_set_name(&tdev->dev, "gpu-pwr-%d", node);
+        }
+
+        err = device_register(&tdev->dev);
+        if (err != 0)
+        {
+            goto error_return;
+        }
+    }
+
+    if (nvl->gpc_devfreq_dev != NULL)
+    {
+        err = nv_pci_gb10b_add_devfreq_device(nvl->gpc_devfreq_dev);
+        if (err != 0)
+        {
+            nvl->gpc_devfreq_dev->devfreq = NULL;
+            goto error_slave_teardown;
+        }
+        if (nvl->sys_devfreq_dev != NULL)
+        {
+            list_add_tail(&nvl->sys_devfreq_dev->gpc_cluster, &nvl->gpc_devfreq_dev->gpc_cluster);
+            nvl->sys_devfreq_dev->gpc_master = nvl->gpc_devfreq_dev;
+        }
+
+        if (nvl->pwr_devfreq_dev != NULL)
+        {
+            list_add_tail(&nvl->pwr_devfreq_dev->gpc_cluster, &nvl->gpc_devfreq_dev->gpc_cluster);
+            nvl->pwr_devfreq_dev->gpc_master = nvl->gpc_devfreq_dev;
+        }
+    }
+
+    if (nvl->nvd_devfreq_dev != NULL)
+    {
+        err = nv_pci_gb10b_add_devfreq_device(nvl->nvd_devfreq_dev);
+        if (err != 0)
+        {
+            nvl->nvd_devfreq_dev->devfreq = NULL;
+            goto error_slave_teardown;
+        }
+        if (nvl->sys_devfreq_dev != NULL)
+        {
+            list_add_tail(&nvl->sys_devfreq_dev->nvd_cluster, &nvl->nvd_devfreq_dev->nvd_cluster);
+            nvl->sys_devfreq_dev->nvd_master = nvl->nvd_devfreq_dev;
+        }
+
+        if (nvl->pwr_devfreq_dev != NULL)
+        {
+            list_add_tail(&nvl->pwr_devfreq_dev->nvd_cluster, &nvl->nvd_devfreq_dev->nvd_cluster);
+            nvl->pwr_devfreq_dev->nvd_master = nvl->nvd_devfreq_dev;
+        }
+    }
+
+    return 0;
+
+error_slave_teardown:
+    if (nvl->sys_devfreq_dev != NULL)
+    {
+        if (nvl->sys_devfreq_dev->gpc_master != NULL)
+        {
+            list_del(&nvl->sys_devfreq_dev->gpc_cluster);
+            nvl->sys_devfreq_dev->gpc_master = NULL;
+        }
+
+        device_unregister(&nvl->sys_devfreq_dev->dev);
+        nvl->sys_devfreq_dev = NULL;
+    }
+    if (nvl->pwr_devfreq_dev != NULL)
+    {
+        if (nvl->pwr_devfreq_dev->gpc_master != NULL)
+        {
+            list_del(&nvl->pwr_devfreq_dev->gpc_cluster);
+            nvl->pwr_devfreq_dev->gpc_master = NULL;
+        }
+
+        device_unregister(&nvl->pwr_devfreq_dev->dev);
+        nvl->pwr_devfreq_dev = NULL;
+    }
+error_return:
+    /* The caller will call unregister to unwind on failure */
+    return err;
+}
+
+static int
+nv_pci_gb10b_suspend_devfreq(struct device *dev)
+{
+    struct pci_dev *pci_dev = to_pci_dev(dev);
+    nv_linux_state_t *nvl = pci_get_drvdata(pci_dev);
+    int err = 0;
+
+    if (nvl->gpc_devfreq_dev != NULL && nvl->gpc_devfreq_dev->devfreq != NULL)
+    {
+#if defined(NV_DEVFREQ_HAS_SUSPEND_FREQ)
+        mutex_lock(&nvl->gpc_devfreq_dev->devfreq->lock);
+        nvl->gpc_devfreq_dev->devfreq->suspend_freq = nvl->gpc_devfreq_dev->devfreq->previous_freq;
+        mutex_unlock(&nvl->gpc_devfreq_dev->devfreq->lock);
+#endif
+
+        err = devfreq_suspend_device(nvl->gpc_devfreq_dev->devfreq);
+        if (err)
+        {
+            return err;
+        }
+
+#if NV_HAS_ICC_SUPPORTED
+        if (nvl->gpc_devfreq_dev->icc_path != NULL)
+        {
+            icc_set_bw(nvl->gpc_devfreq_dev->icc_path, 0, 0);
+        }
+#endif
+    }
+
+    if (nvl->nvd_devfreq_dev != NULL && nvl->nvd_devfreq_dev->devfreq != NULL)
+    {
+#if defined(NV_DEVFREQ_HAS_SUSPEND_FREQ)
+        mutex_lock(&nvl->nvd_devfreq_dev->devfreq->lock);
+        nvl->nvd_devfreq_dev->devfreq->suspend_freq = nvl->nvd_devfreq_dev->devfreq->previous_freq;
+        mutex_unlock(&nvl->nvd_devfreq_dev->devfreq->lock);
+#endif
+
+        err = devfreq_suspend_device(nvl->nvd_devfreq_dev->devfreq);
+        if (err)
+        {
+            return err;
+        }
+
+#if NV_HAS_ICC_SUPPORTED
+        if (nvl->nvd_devfreq_dev->icc_path != NULL)
+        {
+            icc_set_bw(nvl->nvd_devfreq_dev->icc_path, 0, 0);
+        }
+#endif
+    }
+
+    return err;
+}
+
+static int
+nv_pci_gb10b_resume_devfreq(struct device *dev)
+{
+    struct pci_dev *pci_dev = to_pci_dev(dev);
+    nv_linux_state_t *nvl = pci_get_drvdata(pci_dev);
+    int err = 0;
+
+    if (nvl->gpc_devfreq_dev != NULL && nvl->gpc_devfreq_dev->devfreq != NULL)
+    {
+        err = devfreq_resume_device(nvl->gpc_devfreq_dev->devfreq);
+        if (err)
+        {
+            return err;
+        }
+#if defined(NV_UPDATE_DEVFREQ_PRESENT)
+        /*
+         * During GPU runtime suspended state, switching the devfreq governor
+         * which doesn't poll for GPU utilization could lead to devfreq
+         * frequency not being updated after runtime resume.
+         *
+         * Manually trigger the devfreq update here to ensure the
+         * frequency is compliant with the devfreq governor.
+         */
+        mutex_lock(&nvl->gpc_devfreq_dev->devfreq->lock);
+        update_devfreq(nvl->gpc_devfreq_dev->devfreq);
+        mutex_unlock(&nvl->gpc_devfreq_dev->devfreq->lock);
+#endif
+    }
+
+    if (nvl->nvd_devfreq_dev != NULL && nvl->nvd_devfreq_dev->devfreq != NULL)
+    {
+        err = devfreq_resume_device(nvl->nvd_devfreq_dev->devfreq);
+        if (err)
+        {
+            return err;
+        }
+#if defined(NV_UPDATE_DEVFREQ_PRESENT)
+        mutex_lock(&nvl->nvd_devfreq_dev->devfreq->lock);
+        update_devfreq(nvl->nvd_devfreq_dev->devfreq);
+        mutex_unlock(&nvl->nvd_devfreq_dev->devfreq->lock);
+#endif
+    }
+
+    return err;
+}
+
+static void nv_pci_devfreq_disable_boost(struct work_struct *work)
+{
+#if defined(NV_UPDATE_DEVFREQ_PRESENT)
+    struct nv_pci_tegra_devfreq_dev *tdev;
+
+    tdev = container_of(work, struct nv_pci_tegra_devfreq_dev, boost_disable.work);
+    tdev->boost_enabled = 0;
+#endif
+}
+
+static int
+nv_pci_gb10b_devfreq_enable_boost(struct device *dev, unsigned int duration)
+{
+#if defined(NV_UPDATE_DEVFREQ_PRESENT)
+    struct pci_dev *pci_dev = to_pci_dev(dev);
+    nv_linux_state_t *nvl = pci_get_drvdata(pci_dev);
+    struct nv_pci_tegra_devfreq_dev *tdev;
+    unsigned long delay;
+
+    if (duration == 0)
+        return 0;
+
+    delay = msecs_to_jiffies(duration * 1000);
+
+    tdev = nvl->gpc_devfreq_dev;
+    if (tdev != NULL && tdev->devfreq != NULL && tdev->boost_enabled == 0)
+    {
+        tdev->boost_enabled = 1;
+
+        INIT_DELAYED_WORK(&tdev->boost_disable, nv_pci_devfreq_disable_boost);
+        schedule_delayed_work(&tdev->boost_disable, delay);
+    }
+
+    tdev = nvl->nvd_devfreq_dev;
+    if (tdev != NULL && tdev->devfreq != NULL && tdev->boost_enabled == 0)
+    {
+        tdev->boost_enabled = 1;
+
+        INIT_DELAYED_WORK(&tdev->boost_disable, nv_pci_devfreq_disable_boost);
+        schedule_delayed_work(&tdev->boost_disable, delay);
+    }
+
+    return 0;
+#else // !defined(NV_UPDATE_DEVFREQ_PRESENT)
+    return -1;
+#endif
+}
+
+static int
+nv_pci_gb10b_devfreq_disable_boost(struct device *dev)
+{
+#if defined(NV_UPDATE_DEVFREQ_PRESENT)
+    struct pci_dev *pci_dev = to_pci_dev(dev);
+    nv_linux_state_t *nvl = pci_get_drvdata(pci_dev);
+    struct nv_pci_tegra_devfreq_dev *tdev;
+
+    tdev = nvl->gpc_devfreq_dev;
+    if (tdev != NULL && tdev->devfreq != NULL && tdev->boost_enabled)
+    {
+        tdev->boost_enabled = 0;
+        cancel_delayed_work_sync(&tdev->boost_disable);
+    }
+
+    tdev = nvl->nvd_devfreq_dev;
+    if (tdev != NULL && tdev->devfreq != NULL && tdev->boost_enabled)
+    {
+        tdev->boost_enabled = 0;
+        cancel_delayed_work_sync(&tdev->boost_disable);
+    }
+
+    return 0;
+#else // !defined(NV_UPDATE_DEVFREQ_PRESENT)
+    return -1;
+#endif
+}
+
+struct nv_pci_tegra_data {
+    unsigned short vendor;
+    unsigned short device;
+    const struct nv_pci_tegra_devfreq_data *devfreq_table;
+    unsigned int devfreq_table_size;
+    int (*devfreq_register)(struct pci_dev*);
+    int (*devfreq_suspend)(struct device*);
+    int (*devfreq_resume)(struct device*);
+    int (*devfreq_enable_boost)(struct device*, unsigned int);
+    int (*devfreq_disable_boost)(struct device*);
+};
+
+static const struct nv_pci_tegra_data nv_pci_tegra_table[] = {
+    {
+        .vendor = 0x10de,
+        .device = 0x2b00,
+        .devfreq_table = gb10b_tegra_devfreq_table,
+        .devfreq_table_size = ARRAY_SIZE(gb10b_tegra_devfreq_table),
+        .devfreq_register = nv_pci_gb10b_register_devfreq,
+        .devfreq_suspend = nv_pci_gb10b_suspend_devfreq,
+        .devfreq_resume = nv_pci_gb10b_resume_devfreq,
+        .devfreq_enable_boost = nv_pci_gb10b_devfreq_enable_boost,
+        .devfreq_disable_boost = nv_pci_gb10b_devfreq_disable_boost,
+    },
+};
+
+static void
+nv_pci_tegra_devfreq_remove(struct nv_pci_tegra_devfreq_dev *tdev)
+{
+    struct nv_pci_tegra_devfreq_dev *tptr, *next;
+#if NV_HAS_COOLING_SUPPORTED
+    struct nv_pci_tegra_thermal_data *data;
+    struct thermal_zone_device *tzdev;
+#endif
+
+    if (tdev->devfreq != NULL)
+    {
+#if NV_HAS_COOLING_SUPPORTED
+        list_for_each_entry(data, &tdev->therm_zones, zones)
+        {
+            tzdev = thermal_zone_get_zone_by_name(data->tz_name);
+            if (IS_ERR(tzdev))
+            {
+                continue;
+            }
+
+            thermal_unbind_cdev_from_trip(tzdev, data->passive_trip, tdev->devfreq->cdev);
+        }
+#endif
+        devm_devfreq_remove_device(&tdev->dev, tdev->devfreq);
+        nv_pci_tegra_devfreq_remove_opps(tdev);
+        tdev->devfreq = NULL;
+    }
+
+#if NV_HAS_ICC_SUPPORTED
+    if (tdev->icc_path != NULL)
+    {
+        icc_set_bw(tdev->icc_path, 0, 0);
+    }
+#endif
+
+    list_for_each_entry_safe(tptr, next, &tdev->gpc_cluster, gpc_cluster)
+    {
+        if (tptr->clk != NULL)
+        {
+            devm_clk_put(tdev->dev.parent, tptr->clk);
+            tptr->clk = NULL;
+            device_unregister(&tptr->dev);
+        }
+
+        list_del(&tptr->gpc_cluster);
+        tptr->gpc_master = NULL;
+    }
+
+    list_for_each_entry_safe(tptr, next, &tdev->nvd_cluster, nvd_cluster)
+    {
+        if (tptr->clk != NULL)
+        {
+            devm_clk_put(tdev->dev.parent, tptr->clk);
+            tptr->clk = NULL;
+            device_unregister(&tptr->dev);
+        }
+
+        list_del(&tptr->nvd_cluster);
+        tptr->nvd_master = NULL;
+    }
+
+    if (tdev->clk != NULL)
+    {
+        devm_clk_put(tdev->dev.parent, tptr->clk);
+        tdev->clk = NULL;
+        device_unregister(&tdev->dev);
+    }
+}
+
+static void
+nv_pci_tegra_unregister_devfreq(struct pci_dev *pdev)
+{
+    nv_linux_state_t *nvl = pci_get_drvdata(pdev);
+
+    if (nvl->gpc_devfreq_dev != NULL)
+    {
+        nv_pci_tegra_devfreq_remove(nvl->gpc_devfreq_dev);
+        nvl->gpc_devfreq_dev = NULL;
+    }
+
+    if (nvl->nvd_devfreq_dev != NULL)
+    {
+        nv_pci_tegra_devfreq_remove(nvl->nvd_devfreq_dev);
+        nvl->nvd_devfreq_dev = NULL;
+    }
+}
+
+static const struct nv_pci_tegra_data*
+nv_pci_get_tegra_igpu_data(struct pci_dev *pdev)
+{
+    const struct nv_pci_tegra_data *tegra_data = NULL;
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(nv_pci_tegra_table); i++)
+    {
+        tegra_data = &nv_pci_tegra_table[i];
+
+        if ((tegra_data->vendor == pdev->vendor)
+            && (tegra_data->device == pdev->device))
+        {
+            return tegra_data;
+        }
+    }
+
+    return NULL;
+}
+
+void nv_pci_tegra_boost_clocks(struct device *dev)
+{
+#if defined(CONFIG_PM_DEVFREQ)
+    nv_linux_state_t *nvl = pci_get_drvdata(to_pci_dev(dev));
+    const struct nv_pci_tegra_devfreq_data *tdata;
+    struct clk *clk = NULL;
+    unsigned long max_freq;
+    int i;
+
+    for (i = 0; i < nvl->devfreq_table_size; i++)
+    {
+        tdata = &nvl->devfreq_table[i];
+
+        /*
+         * Don't boost the GPC, NVD clocks but only the uprocclk
+         * and sysclk. This saves power consumption of GPU rail
+         * and reduces impact to GPU suspend/resume latency.
+         */
+        if (strstr(tdata->clk_name, "uproc") || strstr(tdata->clk_name, "sys"))
+        {
+            clk = devm_clk_get(dev, tdata->clk_name);
+        }
+        else
+        {
+            continue;
+        }
+
+        max_freq = clk_round_rate(clk, ULONG_MAX);
+        clk_set_rate(clk, max_freq);
+    }
+#endif
+}
+
+static int
+nv_pci_tegra_register_devfreq(struct pci_dev *pdev)
+{
+    nv_linux_state_t *nvl = pci_get_drvdata(pdev);
+    const struct nv_pci_tegra_data *tegra_data = NULL;
+    int err;
+
+    tegra_data = nv_pci_get_tegra_igpu_data(pdev);
+
+    if (tegra_data == NULL)
+    {
+        return 0;
+    }
+
+    nvl->devfreq_table = tegra_data->devfreq_table;
+    nvl->devfreq_table_size = tegra_data->devfreq_table_size;
+    nvl->devfreq_suspend = tegra_data->devfreq_suspend;
+    nvl->devfreq_resume = tegra_data->devfreq_resume;
+    nvl->devfreq_enable_boost = tegra_data->devfreq_enable_boost;
+    nvl->devfreq_disable_boost = tegra_data->devfreq_disable_boost;
+
+    err = tegra_data->devfreq_register(pdev);
+    if (err != 0)
+    {
+        nv_pci_tegra_unregister_devfreq(pdev);
+        return err;
+    }
+
+    return 0;
+}
+#endif
+
+static void nv_init_dynamic_power_management
+(
+    nvidia_stack_t *sp,
+    struct pci_dev *pci_dev
+)
+{
+    nv_linux_state_t *nvl = pci_get_drvdata(pci_dev);
+    nv_state_t *nv = NV_STATE_PTR(nvl);
+    NvBool pr3_acpi_method_present = NV_FALSE;
+
+    nvl->sysfs_config_file = NULL;
+
+    nv_get_pci_sysfs_config(pci_dev, nvl);
+
+    if (nv_get_hypervisor_type() != OS_HYPERVISOR_UNKNOWN)
+    {
+        pr3_acpi_method_present = nv_acpi_power_resource_method_present(pci_dev);
+    }
+    else if (pci_dev->bus && pci_dev->bus->self)
+    {
+        pr3_acpi_method_present = nv_acpi_power_resource_method_present(pci_dev->bus->self);
+    }
+
+    rm_init_dynamic_power_management(sp, nv, pr3_acpi_method_present);
+}
+
+static void nv_init_tegra_gpu_pg_mask(nvidia_stack_t *sp, struct pci_dev *pci_dev)
+{
+    nv_linux_state_t *nvl = pci_get_drvdata(pci_dev);
+    nv_state_t *nv = NV_STATE_PTR(nvl);
+    struct device_node *np = pci_dev->dev.of_node;
+    u32 gpu_pg_mask = 0;
+
+    /* Only continue with certain Tegra PCI iGPUs */
+    if (!nv->supports_tegra_igpu_rg)
+    {
+        return;
+    }
+
+    nv->tegra_pci_igpu_pg_mask = NV_TEGRA_PCI_IGPU_PG_MASK_DEFAULT;
+
+    of_property_read_u32(np, "nvidia,fuse-overrides", &gpu_pg_mask);
+    if (gpu_pg_mask != 0) {
+        nv_printf(NV_DBG_INFO,
+            "NVRM: nvidia,fuse-overrides parsed from device tree: 0x%x\n", gpu_pg_mask);
+        nv->tegra_pci_igpu_pg_mask = gpu_pg_mask;
+    }
+
+    nv_set_gpu_pg_mask(nv);
+
+    /*
+     * Trigger GPU reset to make new value of static TPC/GPC/FBP
+     * power-gating mask effective in BPMP-FW. Otherwise, the BPMP-FW
+     * may just save the mask in SW variable until next GPU reset.
+     */
+    nv_trigger_gpu_flr(nv);
+}
+
+static NvBool
+nv_pci_validate_bars(const struct pci_dev *pci_dev, NvBool only_bar0)
+{
+    unsigned int i, j;
+    NvBool last_bar_64bit = NV_FALSE;
+
+    for (i = 0, j = 0; i < NVRM_PCICFG_NUM_BARS && j < NV_GPU_NUM_BARS; i++)
+    {
+        if (NV_PCI_RESOURCE_VALID(pci_dev, i))
+        {
+            if ((NV_PCI_RESOURCE_FLAGS(pci_dev, i) & PCI_BASE_ADDRESS_MEM_TYPE_64) &&
+                (NV_PCI_RESOURCE_FLAGS(pci_dev, i) & PCI_BASE_ADDRESS_MEM_PREFETCH))
+            {
+                last_bar_64bit = NV_TRUE;
+            }
+
+            //
+            // If we are here, then we have found a valid BAR -- 32 or 64-bit.
+            //
+            j++;
+
+            if (only_bar0)
+                return NV_TRUE;
+
+            continue;
+        }
+
+        //
+        // If last_bar_64bit is "true" then, we are looking at the 2nd (upper)
+        // half of the 64-bit BAR. This is typically all 0s which looks invalid
+        // but it's normal and not a problem and we can ignore it and continue.
+        //
+        if (last_bar_64bit)
+        {
+            last_bar_64bit = NV_FALSE;
+            continue;
+        }
+
+        // Invalid 32 or 64-bit BAR.
+        nv_printf(NV_DBG_ERRORS,
+            "NVRM: This PCI I/O region assigned to your NVIDIA device is invalid:\n"
+            "NVRM: BAR%d is %" NvU64_fmtu "M @ 0x%" NvU64_fmtx " (PCI:%04x:%02x:%02x.%x)\n", i,
+            (NvU64)(NV_PCI_RESOURCE_SIZE(pci_dev, i) >> 20),
+            (NvU64)NV_PCI_RESOURCE_START(pci_dev, i),
+            NV_PCI_DOMAIN_NUMBER(pci_dev), NV_PCI_BUS_NUMBER(pci_dev),
+            NV_PCI_SLOT_NUMBER(pci_dev), PCI_FUNC(pci_dev->devfn));
+
+        return NV_FALSE;
+    }
+
+    return NV_TRUE;
 }
 
 /* find nvidia devices and set initial state */
@@ -572,17 +1774,12 @@ nv_pci_probe
     nvidia_stack_t *sp = NULL;
     NvBool prev_nv_ats_supported = nv_ats_supported;
     NV_STATUS status;
-    NvBool last_bar_64bit = NV_FALSE;
     NvU8 regs_bar_index = nv_bar_index_to_os_bar_index(pci_dev,
                                                        NV_GPU_BAR_INDEX_REGS);
+    NvBool bar0_requested = NV_FALSE;
 
     nv_printf(NV_DBG_SETUP, "NVRM: probing 0x%x 0x%x, class 0x%x\n",
         pci_dev->vendor, pci_dev->device, pci_dev->class);
-
-    if (nv_kmem_cache_alloc_stack(&sp) != 0)
-    {
-        return -1;
-    }
 
 #ifdef NV_PCI_SRIOV_SUPPORT
     if (pci_dev->is_virtfn)
@@ -599,20 +1796,38 @@ nv_pci_probe
                       "since IOMMU is not present on the system.\n",
                        NV_PCI_DOMAIN_NUMBER(pci_dev), NV_PCI_BUS_NUMBER(pci_dev),
                        NV_PCI_SLOT_NUMBER(pci_dev), PCI_FUNC(pci_dev->devfn));
-            goto failed;
+            return -1;
         }
 
-        nv_kmem_cache_free_stack(sp);
         return 0;
 #else
         nv_printf(NV_DBG_ERRORS, "NVRM: Ignoring probe for VF %04x:%02x:%02x.%x ",
                   NV_PCI_DOMAIN_NUMBER(pci_dev), NV_PCI_BUS_NUMBER(pci_dev),
                   NV_PCI_SLOT_NUMBER(pci_dev), PCI_FUNC(pci_dev->devfn));
 
-        goto failed;
+        return -1;
 #endif /* NV_VGPU_KVM_BUILD */
     }
 #endif /* NV_PCI_SRIOV_SUPPORT */
+
+    if (nv_kmem_cache_alloc_stack(&sp) != 0)
+    {
+        return -1;
+    }
+
+    if (!rm_wait_for_bar_firewall(
+                sp,
+                NV_PCI_DOMAIN_NUMBER(pci_dev),
+                NV_PCI_BUS_NUMBER(pci_dev),
+                NV_PCI_SLOT_NUMBER(pci_dev),
+                PCI_FUNC(pci_dev->devfn),
+                pci_dev->device,
+                pci_dev->subsystem_device))
+    {
+        nv_printf(NV_DBG_ERRORS,
+            "NVRM: failed to wait for bar firewall to lower\n");
+        goto failed;
+    }
 
     if (!rm_is_supported_pci_device(
                 (pci_dev->class >> 16) & 0xFF,
@@ -648,52 +1863,9 @@ nv_pci_probe
         goto failed;
     }
 
-    for (i = 0, j = 0; i < NVRM_PCICFG_NUM_BARS && j < NV_GPU_NUM_BARS; i++)
-    {
-        if (NV_PCI_RESOURCE_VALID(pci_dev, i))
-        {
-            if ((NV_PCI_RESOURCE_FLAGS(pci_dev, i) & PCI_BASE_ADDRESS_MEM_TYPE_64) &&
-                (NV_PCI_RESOURCE_FLAGS(pci_dev, i) & PCI_BASE_ADDRESS_MEM_PREFETCH))
-            {
-                last_bar_64bit = NV_TRUE;
-            }
-
-            //
-            // If we are here, then we have found a valid BAR -- 32 or 64-bit.
-            //
-            j++;
-            continue;
-        }
-
-        //
-        // If last_bar_64bit is "true" then, we are looking at the 2nd (upper)
-        // half of the 64-bit BAR. This is typically all 0s which looks invalid
-        // but it's normal and not a problem and we can ignore it and continue.
-        //
-        if (last_bar_64bit)
-        {
-            last_bar_64bit = NV_FALSE;
-            continue;
-        }
-
-        // Invalid 32 or 64-bit BAR.
-        nv_printf(NV_DBG_ERRORS,
-            "NVRM: This PCI I/O region assigned to your NVIDIA device is invalid:\n"
-            "NVRM: BAR%d is %" NvU64_fmtu "M @ 0x%" NvU64_fmtx " (PCI:%04x:%02x:%02x.%x)\n", i,
-            (NvU64)(NV_PCI_RESOURCE_SIZE(pci_dev, i) >> 20),
-            (NvU64)NV_PCI_RESOURCE_START(pci_dev, i),
-            NV_PCI_DOMAIN_NUMBER(pci_dev), NV_PCI_BUS_NUMBER(pci_dev),
-            NV_PCI_SLOT_NUMBER(pci_dev), PCI_FUNC(pci_dev->devfn));
-
-        // With GH180 C2C, VF BAR1/2 are disabled and therefore expected to be 0.
-        if (j != NV_GPU_BAR_INDEX_REGS)
-        {
-            nv_printf(NV_DBG_INFO, "NVRM: ignore invalid BAR failure for BAR%d\n", j);
-            continue;
-        }
-
+    // Validate if BAR0 is usable
+    if (!nv_pci_validate_bars(pci_dev, /* only_bar0 = */ NV_TRUE))
         goto failed;
-    }
 
     if (!request_mem_region(NV_PCI_RESOURCE_START(pci_dev, regs_bar_index),
                             NV_PCI_RESOURCE_SIZE(pci_dev, regs_bar_index),
@@ -708,11 +1880,7 @@ nv_pci_probe
         goto failed;
     }
 
-    if (nv_resize_pcie_bars(pci_dev)) {
-        nv_printf(NV_DBG_ERRORS,
-            "NVRM: Fatal Error while attempting to resize PCIe BARs.\n");
-        goto failed;
-    }
+    bar0_requested = NV_TRUE;
 
     NV_KZALLOC(nvl, sizeof(nv_linux_state_t));
     if (nvl == NULL)
@@ -722,6 +1890,22 @@ nv_pci_probe
     }
 
     nv  = NV_STATE_PTR(nvl);
+    os_mem_copy(nv->cached_gpu_info.vbios_version, "??.??.??.??.??", 15);
+
+    for (i = 0; i < NVRM_PCICFG_NUM_BARS; i++)
+    {
+        if ((NV_PCI_RESOURCE_VALID(pci_dev, i)) &&
+            (NV_PCI_RESOURCE_FLAGS(pci_dev, i) & PCI_BASE_ADDRESS_SPACE)
+                == PCI_BASE_ADDRESS_SPACE_MEMORY)
+        {
+            nv->bars[NV_GPU_BAR_INDEX_REGS].offset = NVRM_PCICFG_BAR_OFFSET(i);
+            nv->bars[NV_GPU_BAR_INDEX_REGS].cpu_address = NV_PCI_RESOURCE_START(pci_dev, i);
+            nv->bars[NV_GPU_BAR_INDEX_REGS].size = NV_PCI_RESOURCE_SIZE(pci_dev, i);
+
+            break;
+        }
+    }
+    nv->regs = &nv->bars[NV_GPU_BAR_INDEX_REGS];
 
     pci_set_drvdata(pci_dev, (void *)nvl);
 
@@ -749,26 +1933,55 @@ nv_pci_probe
         goto err_not_supported;
     }
 
+    if ((rm_is_supported_device(sp, nv)) != NV_OK)
+        goto err_not_supported;
+
+    // Wire RM HAL
+    if (!rm_init_private_state(sp, nv))
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv, "rm_init_private_state() failed!\n");
+        goto err_zero_dev;
+    }
+
+    if (!nv->is_tegra_pci_igpu &&
+        !pci_devid_is_self_hosted(pci_dev->device) &&
+        !nv_pci_validate_bars(pci_dev, /* only_bar0 = */ NV_FALSE))
+        goto err_zero_dev;
+
+    if (nv_resize_pcie_bars(pci_dev)) {
+        nv_printf(NV_DBG_ERRORS,
+            "NVRM: Fatal Error while attempting to resize PCIe BARs.\n");
+        goto err_zero_dev;
+    }
+
     nvl->all_mappings_revoked = NV_TRUE;
     nvl->safe_to_mmap = NV_TRUE;
     nvl->gpu_wakeup_callback_needed = NV_TRUE;
     INIT_LIST_HEAD(&nvl->open_files);
 
-    for (i = 0, j = 0; i < NVRM_PCICFG_NUM_BARS && j < NV_GPU_NUM_BARS; i++)
+    if (!nv->is_tegra_pci_igpu)
     {
-        if ((NV_PCI_RESOURCE_VALID(pci_dev, i)) &&
-            (NV_PCI_RESOURCE_FLAGS(pci_dev, i) & PCI_BASE_ADDRESS_SPACE)
-                == PCI_BASE_ADDRESS_SPACE_MEMORY)
+        for (i = 0, j = 0; i < NVRM_PCICFG_NUM_BARS && j < NV_GPU_NUM_BARS; i++)
         {
-            nv->bars[j].offset = NVRM_PCICFG_BAR_OFFSET(i);
-            nv->bars[j].cpu_address = NV_PCI_RESOURCE_START(pci_dev, i);
-            nv->bars[j].size = NV_PCI_RESOURCE_SIZE(pci_dev, i);
-            j++;
+            if (j == NV_GPU_BAR_INDEX_REGS)
+            {
+                j++;
+                continue;
+            }
+
+            if ((NV_PCI_RESOURCE_VALID(pci_dev, i)) &&
+                (NV_PCI_RESOURCE_FLAGS(pci_dev, i) & PCI_BASE_ADDRESS_SPACE)
+                    == PCI_BASE_ADDRESS_SPACE_MEMORY)
+            {
+                nv->bars[j].offset = NVRM_PCICFG_BAR_OFFSET(i);
+                nv->bars[j].cpu_address = NV_PCI_RESOURCE_START(pci_dev, i);
+                nv->bars[j].size = NV_PCI_RESOURCE_SIZE(pci_dev, i);
+                j++;
+            }
         }
     }
-    nv->regs = &nv->bars[NV_GPU_BAR_INDEX_REGS];
-    nv->fb   = &nv->bars[NV_GPU_BAR_INDEX_FB];
 
+    nv->fb   = &nv->bars[NV_GPU_BAR_INDEX_FB];
     nv->interrupt_line = pci_dev->irq;
 
     NV_ATOMIC_SET(nvl->numa_info.status, NV_IOCTL_NUMA_STATUS_DISABLED);
@@ -776,25 +1989,48 @@ nv_pci_probe
 
 #if NV_IS_EXPORT_SYMBOL_GPL_pci_ats_supported
     nv->ats_support = pci_ats_supported(nvl->pci_dev);
-#elif defined(NV_PCI_DEV_HAS_ATS_ENABLED)
+#else
     nv->ats_support = nvl->pci_dev->ats_enabled;
 #endif
+
+    if (nv->ats_support)
+    {
+        int ret __attribute__ ((unused));
+
+        NV_DEV_PRINTF(NV_DBG_INFO, nv, "ATS supported by this GPU!\n");
+
+#if NV_IS_EXPORT_SYMBOL_GPL_iommu_dev_enable_feature
+#if defined(CONFIG_IOMMU_SVA) && \
+    (defined(NV_IOASID_GET_PRESENT) || defined(NV_MM_PASID_DROP_PRESENT))
+        ret = iommu_dev_enable_feature(nvl->dev, IOMMU_DEV_FEAT_SVA);
+        if (ret == 0)
+        {
+            NV_DEV_PRINTF(NV_DBG_INFO, nv, "Enabled SMMU SVA feature! \n");
+        }
+        else if (ret == -EBUSY)
+        {
+            NV_DEV_PRINTF(NV_DBG_INFO, nv, "SMMU SVA feature already enabled!\n");
+        }
+        else
+        {
+            NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                          "Enabling SMMU SVA feature failed! ret: %d\n", ret);
+            nv->ats_support = NV_FALSE;
+        }
+#else
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                      "Enabling SMMU SVA feature failed due to lack of necessary kernel configs.\n");
+        nv->ats_support = NV_FALSE;
+#endif
+#endif // NV_IS_EXPORT_SYMBOL_GPL_iommu_dev_enable_feature
+    }
 
     if (pci_devid_is_self_hosted(pci_dev->device))
     {
         nv_init_coherent_link_info(nv);
     }
 
-    if (nv->ats_support)
-    {
-        NV_DEV_PRINTF(NV_DBG_INFO, nv, "ATS supported by this GPU!\n");
-    }
     nv_ats_supported |= nv->ats_support;
-
-    if (nv->pci_info.vendor_id == 0x10de && nv->pci_info.device_id == 0x2e2a) {
-        /* Disable advertising ATS support to UVM when GB20B is present */
-        nv_ats_supported = NV_FALSE;
-    }
 
     nv_clk_get_handles(nv);
 
@@ -813,24 +2049,18 @@ nv_pci_probe
     if (status == NV_ERR_GPU_IS_LOST)
     {
         NV_DEV_PRINTF(NV_DBG_INFO, nv, "GPU is lost, skipping nv_pci_probe\n");
-        goto err_not_supported;
-    }
-
-    if ((rm_is_supported_device(sp, nv)) != NV_OK)
-        goto err_not_supported;
-
-    if (!rm_init_private_state(sp, nv))
-    {
-        NV_DEV_PRINTF(NV_DBG_ERRORS, nv, "rm_init_private_state() failed!\n");
-        goto err_zero_dev;
+        goto err_gpu_lost;
     }
 
     nv->cpu_numa_node_id = dev_to_node(nvl->dev);
 
+    /* Initialize per-device init_on_probe from registry value NVreg_GpuInitOnProbe */
+    nvl->init_on_probe = (NVreg_GpuInitOnProbe != 0);
+
     if (nv_linux_init_open_q(nvl) != 0)
     {
         NV_DEV_PRINTF(NV_DBG_ERRORS, nv, "nv_linux_init_open_q() failed!\n");
-        goto err_zero_dev;
+        goto err_gpu_lost;
     }
 
     nv_printf(NV_DBG_INFO,
@@ -846,40 +2076,22 @@ nv_pci_probe
 
     num_nv_devices++;
 
-    /*
-     * The newly created nvl object is added to the nv_linux_devices global list
-     * only after all the initialization operations for that nvl object are
-     * completed, so as to protect against simultaneous lookup operations which
-     * may discover a partially initialized nvl object in the list
-     */
-    LOCK_NV_LINUX_DEVICES();
-
-    if (nv_linux_add_device_locked(nvl) != 0)
-    {
-        UNLOCK_NV_LINUX_DEVICES();
-        goto err_add_device;
-    }
-
-    UNLOCK_NV_LINUX_DEVICES();
-
     pm_vt_switch_required(nvl->dev, NV_TRUE);
 
+#if defined(CONFIG_PM_DEVFREQ)
+    // Support dynamic power management if device is a tegra PCI iGPU
+    rm_init_tegra_dynamic_power_management(sp, nv);
+#endif
     nv_init_dynamic_power_management(sp, pci_dev);
 
-    nv_procfs_add_gpu(nvl);
+    nv_init_tegra_gpu_pg_mask(sp, pci_dev);
+
+    rm_get_gpu_uuid_raw(sp, nv);
 
     /* Parse and set any per-GPU registry keys specified. */
     nv_parse_per_device_option_string(sp);
 
     rm_set_rm_firmware_requested(sp, nv);
-
-#if defined(NV_VGPU_KVM_BUILD)
-    if (nvidia_vgpu_vfio_probe(nvl->pci_dev) != NV_OK)
-    {
-        NV_DEV_PRINTF(NV_DBG_ERRORS, nv, "Failed to register device to vGPU VFIO module");
-        goto err_vgpu_kvm;
-    }
-#endif
 
     nv_check_and_exclude_gpu(sp, nv);
 
@@ -889,6 +2101,91 @@ nv_pci_probe
     dev_pm_set_driver_flags(nvl->dev, DPM_FLAG_NEVER_SKIP);
 #endif
 
+#if defined(CONFIG_PM_DEVFREQ)
+    /*
+     * Expose clock control interface via devfreq framework for Tegra iGPU and
+     * let the linux kernel itself to support all the clock scaling logic for
+     * Tegra iGPU.
+     *
+     * On Tegra platforms, most of the clocks are managed by the BPMP. PMU inside
+     * the iGPU does not have direct communication path to the BPMP, so using
+     * existing clock management features (e.g. Pstates, PerfCf, and etc) with
+     * PMU will not work.
+     */
+    if (nv_pci_tegra_register_devfreq(pci_dev) != 0)
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv, "Failed to register linux devfreq");
+        goto err_add_device;
+    };
+#endif
+
+    /*
+     * Assign a minor number for the newly created nvl object
+     */
+    LOCK_NV_LINUX_DEVICES();
+    if (nv_linux_assign_minor_locked(nvl) != 0)
+    {
+        UNLOCK_NV_LINUX_DEVICES();
+        goto err_add_device;
+    }
+    UNLOCK_NV_LINUX_DEVICES();
+
+    if (nvl->init_on_probe && !(nv->flags & NV_FLAG_EXCLUDE))
+    {
+        int ret;
+        nv_printf(NV_DBG_SETUP, "NVRM: Starting device %04x:%02x:%02x.%x\n",
+            NV_PCI_DOMAIN_NUMBER(pci_dev), NV_PCI_BUS_NUMBER(pci_dev),
+            NV_PCI_SLOT_NUMBER(pci_dev), PCI_FUNC(pci_dev->devfn));
+
+        ret = nv_start_device(nv, sp);
+        if (ret)
+        {
+            nv_printf(NV_DBG_ERRORS, "NVRM: Device start failed for %04x:%02x:%02x.%x (ret=%d)\n",
+                NV_PCI_DOMAIN_NUMBER(pci_dev), NV_PCI_BUS_NUMBER(pci_dev),
+                NV_PCI_SLOT_NUMBER(pci_dev), PCI_FUNC(pci_dev->devfn), ret);
+            goto err_remove_minor;
+        }
+    }
+
+    /*
+     * The newly created nvl object is added to the nv_linux_devices global list
+     * only after all the initialization operations for that nvl object are
+     * completed, so as to protect against simultaneous lookup operations which
+     * may discover a partially initialized nvl object in the list
+     */
+    LOCK_NV_LINUX_DEVICES();
+    nv_linux_add_device_locked(nvl);
+    UNLOCK_NV_LINUX_DEVICES();
+
+    /*
+     * Create the procfs entry only after all the initialization operations for
+     * the nvl object are completed and the device is added to the
+     * nv_linux_devices global list
+     */
+    nv_procfs_add_gpu(nvl);
+
+#if defined(NV_VGPU_KVM_BUILD)
+    /*
+     * vGPU VFIO probe requires the device to be added to the nv_linux_devices
+     * global list since the vgpu mgr daemon invokes a open() call on the device
+     * as part of the probe sequence
+     */
+    if (nvidia_vgpu_vfio_probe(nvl->pci_dev) != NV_OK)
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv, "Failed to register device to vGPU VFIO module");
+        goto err_free_all;
+    }
+#endif
+
+    /*
+     * Notification must be sent only after all the initialization operations
+     * as part of the probe sequence are complete.
+     * Do not add code after this line which can fail nv_pci_probe().
+     */
+    rm_notify_gpu_addition(sp, nv);
+
+    nvidia_modeset_probe(nvl);
+
     /*
      * Dynamic power management should be enabled as the last step.
      * Kernel runtime power management framework can put the device
@@ -897,47 +2194,51 @@ nv_pci_probe
      */
     rm_enable_dynamic_power_management(sp, nv);
 
-    /*
-     * This must be the last action in nv_pci_probe(). Do not add code after this line.
-     */
-    rm_notify_gpu_addition(sp, nv);
-
     nv_kmem_cache_free_stack(sp);
 
     return 0;
 
 #if defined(NV_VGPU_KVM_BUILD)
-err_vgpu_kvm:
+err_free_all:
 #endif
     nv_procfs_remove_gpu(nvl);
-    rm_cleanup_dynamic_power_management(sp, nv);
-    pm_vt_switch_unregister(nvl->dev);
     LOCK_NV_LINUX_DEVICES();
     nv_linux_remove_device_locked(nvl);
     UNLOCK_NV_LINUX_DEVICES();
+    if (nvl->init_on_probe)
+        nv_stop_device(nv, sp);
+err_remove_minor:
+    LOCK_NV_LINUX_DEVICES();
+    nv_linux_remove_minor_locked(nvl);
+    UNLOCK_NV_LINUX_DEVICES();
 err_add_device:
+    rm_cleanup_dynamic_power_management(sp, nv);
+    pm_vt_switch_unregister(nvl->dev);
     nv_linux_stop_open_q(nvl);
+err_gpu_lost:
+    nv_clk_clear_handles(nv);
+    nv_ats_supported = prev_nv_ats_supported;
 err_zero_dev:
     rm_free_private_state(sp, nv);
 err_not_supported:
-    nv_clk_clear_handles(nv);
-    nv_ats_supported = prev_nv_ats_supported;
     nv_lock_destroy_locks(sp, nv);
+failed:
+    if (bar0_requested)
+    {
+        release_mem_region(NV_PCI_RESOURCE_START(pci_dev, regs_bar_index),
+                           NV_PCI_RESOURCE_SIZE(pci_dev, regs_bar_index));
+    }
+    NV_PCI_DISABLE_DEVICE(pci_dev);
+    pci_set_drvdata(pci_dev, NULL);
     if (nvl != NULL)
     {
         NV_KFREE(nvl, sizeof(nv_linux_state_t));
     }
-    release_mem_region(NV_PCI_RESOURCE_START(pci_dev, regs_bar_index),
-                       NV_PCI_RESOURCE_SIZE(pci_dev, regs_bar_index));
-    NV_PCI_DISABLE_DEVICE(pci_dev);
-    pci_set_drvdata(pci_dev, NULL);
-failed:
     nv_kmem_cache_free_stack(sp);
     return -1;
 }
 
-static void
-nv_pci_remove(struct pci_dev *pci_dev)
+static void nv_pci_remove_helper(struct pci_dev *pci_dev, bool block_if_gpu_in_use)
 {
     nv_linux_state_t *nvl = NULL;
     nv_state_t *nv;
@@ -945,9 +2246,6 @@ nv_pci_remove(struct pci_dev *pci_dev)
     NvU8 regs_bar_index = nv_bar_index_to_os_bar_index(pci_dev,
                                                        NV_GPU_BAR_INDEX_REGS);
 
-    nv_printf(NV_DBG_SETUP, "NVRM: removing GPU %04x:%02x:%02x.%x\n",
-              NV_PCI_DOMAIN_NUMBER(pci_dev), NV_PCI_BUS_NUMBER(pci_dev),
-              NV_PCI_SLOT_NUMBER(pci_dev), PCI_FUNC(pci_dev->devfn));
 
 #ifdef NV_PCI_SRIOV_SUPPORT
     if (pci_dev->is_virtfn)
@@ -960,19 +2258,34 @@ nv_pci_remove(struct pci_dev *pci_dev)
     }
 #endif /* NV_PCI_SRIOV_SUPPORT */
 
-    if (nv_kmem_cache_alloc_stack(&sp) != 0)
-    {
-        return;
-    }
-
     nvl = pci_get_drvdata(pci_dev);
     if (!nvl || (nvl->pci_dev != pci_dev))
     {
-        nv_kmem_cache_free_stack(sp);
         return;
     }
 
     nv = NV_STATE_PTR(nvl);
+
+#if NV_IS_EXPORT_SYMBOL_GPL_iommu_dev_disable_feature
+#if defined(CONFIG_IOMMU_SVA) && \
+    (defined(NV_IOASID_GET_PRESENT) || defined(NV_MM_PASID_DROP_PRESENT))
+    if (nv->ats_support)
+    {
+        int ret;
+
+        ret = iommu_dev_disable_feature(nvl->dev, IOMMU_DEV_FEAT_SVA);
+        if (ret == 0)
+        {
+            NV_DEV_PRINTF(NV_DBG_INFO, nv, "Disabled SMMU SVA feature! \n");
+        }
+        else
+        {
+            NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                          "Disabling SMMU SVA feature failed! ret: %d\n", ret);
+        }
+    }
+#endif
+#endif // NV_IS_EXPORT_SYMBOL_GPL_iommu_dev_disable_feature
 
     /*
      * Flush and stop open_q before proceeding with removal to ensure nvl
@@ -980,9 +2293,26 @@ nv_pci_remove(struct pci_dev *pci_dev)
      */
     nv_linux_stop_open_q(nvl);
 
+    nvidia_modeset_remove(nv->gpu_id);
+
     LOCK_NV_LINUX_DEVICES();
     down(&nvl->ldata_lock);
-    nv->flags |= NV_FLAG_PCI_REMOVE_IN_PROGRESS;
+
+    if (!block_if_gpu_in_use && (atomic64_read(&nvl->usage_count) != 0))
+    {
+        up(&nvl->ldata_lock);
+        UNLOCK_NV_LINUX_DEVICES();
+        return;
+    }
+
+    if (nv_kmem_cache_alloc_stack(&sp) != 0)
+    {
+        up(&nvl->ldata_lock);
+        UNLOCK_NV_LINUX_DEVICES();
+        return;
+    }
+
+    nv_linux_remove_device_locked(nvl);
 
     rm_notify_gpu_removal(sp, nv);
 
@@ -991,7 +2321,7 @@ nv_pci_remove(struct pci_dev *pci_dev)
      * For eGPU, fall off the bus along with clients active is a valid scenario.
      * Hence skipping the sanity check for eGPU.
      */
-    if ((NV_ATOMIC_READ(nvl->usage_count) != 0) && !(nv->is_external_gpu))
+    if ((atomic64_read(&nvl->usage_count) != 0) && !(nv->is_external_gpu))
     {
         nv_printf(NV_DBG_ERRORS,
                   "NVRM: Attempting to remove device %04x:%02x:%02x.%x with non-zero usage count!\n",
@@ -1002,9 +2332,8 @@ nv_pci_remove(struct pci_dev *pci_dev)
          * We can't return from this function without corrupting state, so we wait for
          * the usage count to go to zero.
          */
-        while (NV_ATOMIC_READ(nvl->usage_count) != 0)
+        while (atomic64_read(&nvl->usage_count) != 0)
         {
-
             /*
              * While waiting, release the locks so that other threads can make
              * forward progress.
@@ -1023,7 +2352,7 @@ nv_pci_remove(struct pci_dev *pci_dev)
                 nv_printf(NV_DBG_ERRORS,
                           "NVRM: Failed removal of device %04x:%02x:%02x.%x!\n",
                           NV_PCI_DOMAIN_NUMBER(pci_dev), NV_PCI_BUS_NUMBER(pci_dev),
-                          NV_PCI_SLOT_NUMBER(pci_dev), PCI_FUNC(pci_dev->devfn));  
+                          NV_PCI_SLOT_NUMBER(pci_dev), PCI_FUNC(pci_dev->devfn));
                 WARN_ON(1);
                 goto done;
             }
@@ -1039,15 +2368,30 @@ nv_pci_remove(struct pci_dev *pci_dev)
 
     rm_check_for_gpu_surprise_removal(sp, nv);
 
-    nv_linux_remove_device_locked(nvl);
-
     /* Remove proc entry for this GPU */
     nv_procfs_remove_gpu(nvl);
+
+#if defined(CONFIG_PM_DEVFREQ)
+    nv_pci_tegra_unregister_devfreq(pci_dev);
+#endif
 
     nv_clk_clear_handles(nv);
 
     rm_cleanup_dynamic_power_management(sp, nv);
 
+    /*
+     * Stop device if it was initialized on probe but only after dynamic power
+     * management is disabled
+     */
+    if (nvl->init_on_probe && !(nv->flags & NV_FLAG_EXCLUDE))
+    {
+        nv_printf(NV_DBG_SETUP, "NVRM: Stopping device %04x:%02x:%02x.%x\n",
+              NV_PCI_DOMAIN_NUMBER(pci_dev), NV_PCI_BUS_NUMBER(pci_dev),
+              NV_PCI_SLOT_NUMBER(pci_dev), PCI_FUNC(pci_dev->devfn));
+        nv_stop_device(nv, sp);
+    }
+
+    nv_linux_remove_minor_locked(nvl);
     nv->removed = NV_TRUE;
 
     UNLOCK_NV_LINUX_DEVICES();
@@ -1059,7 +2403,7 @@ nv_pci_remove(struct pci_dev *pci_dev)
     nvidia_vgpu_vfio_remove(pci_dev, NV_TRUE);
 #endif
 
-    if ((nv->flags & NV_FLAG_PERSISTENT_SW_STATE) || (nv->flags & NV_FLAG_OPEN))
+    if ((nv->flags & NV_FLAG_PERSISTENT_SW_STATE) || (nv->flags & NV_FLAG_INITIALIZED))
     {
         nv_acpi_unregister_notifier(nvl);
         if (nv->flags & NV_FLAG_PERSISTENT_SW_STATE)
@@ -1076,7 +2420,7 @@ nv_pci_remove(struct pci_dev *pci_dev)
         nvl->sysfs_config_file = NULL;
     }
 
-    if (NV_ATOMIC_READ(nvl->usage_count) == 0)
+    if (atomic64_read(&nvl->usage_count) == 0)
     {
         nv_lock_destroy_locks(sp, nv);
     }
@@ -1092,7 +2436,7 @@ nv_pci_remove(struct pci_dev *pci_dev)
 
     num_nv_devices--;
 
-    if (NV_ATOMIC_READ(nvl->usage_count) == 0)
+    if (atomic64_read(&nvl->usage_count) == 0)
     {
         NV_PCI_DISABLE_DEVICE(pci_dev);
         NV_KFREE(nvl, sizeof(nv_linux_state_t));
@@ -1111,17 +2455,39 @@ done:
 }
 
 static void
+nv_pci_remove(struct pci_dev *pci_dev)
+{
+
+    nv_printf(NV_DBG_SETUP, "NVRM: removing GPU %04x:%02x:%02x.%x\n",
+              NV_PCI_DOMAIN_NUMBER(pci_dev), NV_PCI_BUS_NUMBER(pci_dev),
+              NV_PCI_SLOT_NUMBER(pci_dev), PCI_FUNC(pci_dev->devfn));
+
+    nv_pci_remove_helper(pci_dev, true);
+}
+
+static void
 nv_pci_shutdown(struct pci_dev *pci_dev)
 {
     nv_linux_state_t *nvl = pci_get_drvdata(pci_dev);
+    
+    if (!nvl || (nvl->pci_dev != pci_dev))
+    {
+        return;
+    }
 
-    if ((nvl != NULL) && nvl->is_forced_shutdown)
+    if (nvl->is_forced_shutdown)
     {
         nvl->is_forced_shutdown = NV_FALSE;
         return;
     }
 
-    if (nvl != NULL)
+#if defined(CONFIG_PM_DEVFREQ)
+    nv_pci_tegra_unregister_devfreq(pci_dev);
+#endif
+
+    nv_pci_remove_helper(pci_dev, false);
+
+    if (pci_get_drvdata(pci_dev) != NULL)
     {
         nvl->nv_state.is_shutdown = NV_TRUE;
     }
@@ -1297,20 +2663,84 @@ nv_pci_count_devices(void)
  * the same IOMMU group.
  */
 NvBool nv_pci_is_valid_topology_for_direct_pci(
-    nv_state_t    *nv,
-    struct device *dev
+    nv_state_t     *nv,
+    struct pci_dev *peer
 )
 {
     struct pci_dev *pdev0 = to_pci_dev(nv->dma_dev->dev);
-    struct pci_dev *pdev1 = to_pci_dev(dev);
+    struct pci_dev *pdev1 = peer;
 
     if (!nv->coherent)
     {
         return NV_FALSE;
     }
 
-    return (NVreg_GrdmaPciTopoCheckOverride != 0) ||
-           (pdev0->dev.iommu_group == pdev1->dev.iommu_group);
+    return (pdev0->dev.iommu_group == pdev1->dev.iommu_group);
+}
+
+NvBool nv_pci_has_common_pci_switch(
+    nv_state_t     *nv,
+    struct pci_dev *peer
+)
+{
+    struct pci_dev *pci_dev0, *pci_dev1;
+
+    pci_dev0 = pci_upstream_bridge(to_pci_dev(nv->dma_dev->dev));
+
+    while (pci_dev0 != NULL)
+    {
+        pci_dev1 = pci_upstream_bridge(peer);
+
+        while (pci_dev1 != NULL)
+        {
+            if (pci_dev0 == pci_dev1)
+                return NV_TRUE;
+
+            pci_dev1 = pci_upstream_bridge(pci_dev1);
+        }
+
+        pci_dev0 = pci_upstream_bridge(pci_dev0);
+    }
+
+    return NV_FALSE;
+}
+
+NvBool NV_API_CALL nv_grdma_pci_topology_supported(
+    nv_state_t      *nv,
+    nv_dma_device_t *dma_peer
+)
+{
+    //
+    // Skip topo check on coherent platforms since
+    // NIC can map over C2C anyway and PCIe topology shouldn't matter.
+    //
+    if (nv->coherent)
+    {
+        return NV_TRUE;
+    }
+
+    switch (NVreg_GrdmaPciTopoCheckOverride)
+    {
+        case NV_REG_GRDMA_PCI_TOPO_CHECK_OVERRIDE_ALLOW_ACCESS:
+            return NV_TRUE;
+        case NV_REG_GRDMA_PCI_TOPO_CHECK_OVERRIDE_DENY_ACCESS:
+            return NV_FALSE;
+        default:
+            break;
+    }
+
+    // Allow RDMA by default on passthrough VMs.
+    if ((nv->flags & NV_FLAG_PASSTHRU) != 0)
+        return NV_TRUE;
+
+    //
+    // Only allow RDMA on unsupported chipsets if there exists
+    // a common PCI switch between the GPU and the other device
+    //
+    if ((nv->flags & NV_FLAG_PCI_P2P_UNSUPPORTED_CHIPSET) != 0)
+        return nv_pci_has_common_pci_switch(nv, to_pci_dev(dma_peer->dev));
+
+    return NV_TRUE;
 }
 
 #if defined(CONFIG_PM)
@@ -1330,6 +2760,7 @@ struct pci_driver nv_pci_driver = {
 #if defined(CONFIG_PM)
     .driver.pm = &nv_pm_ops,
 #endif
+    .driver.probe_type = PROBE_FORCE_SYNCHRONOUS,
 };
 
 void nv_pci_unregister_driver(void)

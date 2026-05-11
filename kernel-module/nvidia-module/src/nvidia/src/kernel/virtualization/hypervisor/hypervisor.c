@@ -31,6 +31,7 @@
 #include "virtualization/hypervisor/hypervisor.h"
 #include "os/os.h"
 #include "nvRmReg.h"
+#include "platform/chipset/chipset.h"
 
 static HYPERVISOR_OPS _hypervisorOps[OS_HYPERVISOR_UNKNOWN];
 
@@ -102,6 +103,18 @@ NV_STATUS hypervisorDetection_IMPL
 
 found_one:
     pHypervisor->bDetected = NV_TRUE;
+#if defined(NVCPU_AARCH64) && RMCFG_MODULE_CL
+    {
+        OBJSYS *pSys = SYS_GET_INSTANCE();
+        OBJCL *pCl = SYS_GET_CL(pSys);
+
+        //
+        // BAR should be mapped as Device type in virtualization environment
+        // until Bug 3332061 is addressed completely.
+        //
+        pCl->setProperty(pCl, PDB_PROP_CL_DISABLE_IOMAP_WC, NV_TRUE);
+    }
+#endif
 
     if (pHypervisor->bIsHVMGuest)
     {

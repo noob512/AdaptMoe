@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -53,9 +53,7 @@ kvidengIsVideoTraceLogSupported_IMPL
     OBJGPU *pGpu
 )
 {
-    NvBool bSupported = !hypervisorIsVgxHyper() &&
-                        !gpuIsSriovEnabled(pGpu) &&
-                        !RMCFG_FEATURE_MODS_FEATURES &&
+    NvBool bSupported = !RMCFG_FEATURE_MODS_FEATURES &&
                         !IS_SIMULATION(pGpu);
 
     bSupported &= !gpuIsCCFeatureEnabled(pGpu);
@@ -68,6 +66,11 @@ kvidengIsVideoTraceLogSupported_IMPL
         bSupported &= (pVSI != NULL) &&
                       pVSI->vgpuStaticProperties.bProfilingTracingEnabled &&
                       IS_VIRTUAL_WITH_FULL_SRIOV(pGpu);
+    }
+
+    if (hypervisorIsVgxHyper())
+    {
+        bSupported = NV_FALSE;
     }
 
     if (pGpu->kernelVideoEngines[0] != NULL)
@@ -174,7 +177,7 @@ NV_STATUS kvidengInitLogging_KERNEL
     /*!
      * Random number generator used for generate noisy timestamp
      */
-    seed = osGetCurrentTick();
+    seed = osGetMonotonicTimeNs();
     pKernelVideoEngine->videoTraceInfo.pVideoLogPrng = portCryptoPseudoRandomGeneratorCreate(seed);
 
     pKernelVideoEngine->bVideoTraceEnabled = NV_TRUE;

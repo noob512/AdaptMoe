@@ -17,14 +17,16 @@ _out/Linux_x86_64/nvkms-console-restore.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080unix.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gpu.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080gr.h \
- ../common/sdk/nvidia/inc/nvcfg_sdk.h ../common/sdk/nvidia/inc/nvstatus.h \
+ ../common/sdk/nvidia/inc/nvcfg_sdk.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h \
+ ../common/sdk/nvidia/inc/nvstatus.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl30f1.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl5070/ctrl5070system.h \
@@ -54,9 +56,9 @@ _out/Linux_x86_64/nvkms-console-restore.o: \
  ../common/modeset/hdmipacket/nvhdmi_frlInterface.h \
  ../common/modeset/hdmipacket/nvhdmipkt.h ../common/inc/nvHdmiFrlCommon.h \
  ../common/modeset/hdmipacket/../timing/nvtiming.h ../common/inc/nv_smg.h \
- ../common/inc/nvrmcontext.h ../common/inc/nv_mig_types.h \
- include/nvkms-dpy.h include/nvkms-flip.h include/nvkms-modepool.h \
- include/nvkms-utils.h include/nvkms-modeset.h \
+ ../common/inc/nvctassert.h ../common/inc/nvrmcontext.h \
+ ../common/inc/nv_mig_types.h include/nvkms-dpy.h include/nvkms-flip.h \
+ include/nvkms-modepool.h include/nvkms-utils.h include/nvkms-modeset.h \
  ../common/sdk/nvidia/inc/class/cl0092_callback.h \
  include/nvkms-prealloc.h include/nvkms-private.h include/nvkms-rm.h \
  ../common/sdk/nvidia/inc/class/cl0092.h include/nvkms-utils.h \
@@ -87,7 +89,7 @@ interface/nvkms-format.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h:
-../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080unix.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gpu.h:
@@ -95,6 +97,7 @@ interface/nvkms-format.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080gr.h:
 ../common/sdk/nvidia/inc/nvcfg_sdk.h:
+../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h:
 ../common/sdk/nvidia/inc/nvstatus.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl30f1.h:
@@ -133,6 +136,7 @@ include/nvkms-prealloc-types.h:
 ../common/inc/nvHdmiFrlCommon.h:
 ../common/modeset/hdmipacket/../timing/nvtiming.h:
 ../common/inc/nv_smg.h:
+../common/inc/nvctassert.h:
 ../common/inc/nvrmcontext.h:
 ../common/inc/nv_mig_types.h:
 include/nvkms-dpy.h:

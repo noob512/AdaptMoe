@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2020-2024 NVIDIA Corporation
+    Copyright (c) 2020-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -39,6 +39,11 @@
 #include "uvm_hopper_fault_buffer.h"
 #include "hwref/hopper/gh100/dev_fault.h"
 #include "hwref/hopper/gh100/dev_mmu.h"
+
+// Field defines which are unmaintained by HW
+#define NV_MMU_VER3_PTE_ADDRESS_SYS                                     51:12
+#define NV_MMU_VER3_PTE_ADDRESS_PEER                                    51:12
+#define NV_MMU_VER3_PTE_ADDRESS_VID                                     39:12
 
 #define MMU_BIG 0
 #define MMU_SMALL 1
@@ -116,7 +121,10 @@ static NvLength allocation_size_hopper(NvU32 depth, NvU64 page_size)
     if (depth == 5 && page_size == UVM_PAGE_SIZE_64K)
         return 256;
 
-    // depth 0 requires only a 16-byte allocation, but it must be 4k aligned.
+    // depth 0 requires only a 16-byte allocation to house the 2 entries at the
+    // 0-depth level. Due to HW constraints, the effective minimum allocation
+    // size is 32 bytes. It must be 4k aligned.
+    // See comments in uvm_gpu.h:gmmu_pt_depth0_init_required for details.
     return 4096;
 }
 
@@ -177,6 +185,8 @@ static NvU64 make_pte_hopper(uvm_aperture_t aperture, NvU64 address, uvm_prot_t 
     // aperture 2:1
     if (aperture == UVM_APERTURE_SYS)
         aperture_bits = NV_MMU_VER3_PTE_APERTURE_SYSTEM_COHERENT_MEMORY;
+    else if (aperture == UVM_APERTURE_SYS_NON_COHERENT)
+        aperture_bits = NV_MMU_VER3_PTE_APERTURE_SYSTEM_NON_COHERENT_MEMORY;
     else if (aperture == UVM_APERTURE_VID)
         aperture_bits = NV_MMU_VER3_PTE_APERTURE_VIDEO_MEMORY;
     else if (aperture >= UVM_APERTURE_PEER_0 && aperture <= UVM_APERTURE_PEER_7)
@@ -229,13 +239,11 @@ static NvU64 make_sparse_pte_hopper(void)
            HWCONST64(_MMU_VER3, PTE, PCF, SPARSE);
 }
 
-static NvU64 unmapped_pte_hopper(NvU64 page_size)
+static NvU64 unmapped_pte_hopper(void)
 {
     // Setting PCF to NO_VALID_4KB_PAGE on an otherwise-zeroed big PTE causes
     // the corresponding 4k PTEs to be ignored. This allows the invalidation of
     // a mixed PDE range to be much faster.
-    if (page_size != UVM_PAGE_SIZE_64K)
-        return 0;
 
     // When VALID == 0, GMMU still reads the PCF field, which indicates the PTE
     // is sparse (make_sparse_pte_hopper) or an unmapped big-page PTE.
@@ -243,7 +251,7 @@ static NvU64 unmapped_pte_hopper(NvU64 page_size)
            HWCONST64(_MMU_VER3, PTE, PCF, NO_VALID_4KB_PAGE);
 }
 
-static NvU64 poisoned_pte_hopper(void)
+static NvU64 poisoned_pte_hopper(uvm_page_tree_t *tree)
 {
     // An invalid PTE won't be fatal from faultable units like SM, which is the
     // most likely source of bad PTE accesses.
@@ -257,7 +265,7 @@ static NvU64 poisoned_pte_hopper(void)
     // be aligned to page_size.
     NvU64 phys_addr = 0x2bad000000ULL;
 
-    NvU64 pte_bits = make_pte_hopper(UVM_APERTURE_VID, phys_addr, UVM_PROT_READ_ONLY, UVM_MMU_PTE_FLAGS_NONE);
+    NvU64 pte_bits = tree->hal->make_pte(UVM_APERTURE_VID, phys_addr, UVM_PROT_READ_ONLY, UVM_MMU_PTE_FLAGS_NONE);
     return WRITE_HWCONST64(pte_bits, _MMU_VER3, PTE, PCF, PRIVILEGE_RO_NO_ATOMIC_UNCACHED_ACD);
 }
 
@@ -372,6 +380,12 @@ static NvU64 single_pde_hopper(uvm_mmu_page_table_alloc_t *phys_alloc, uvm_page_
             case UVM_APERTURE_VID:
                 pde_bits |= HWCONST64(_MMU_VER3, PDE, APERTURE, VIDEO_MEMORY);
                 break;
+            case UVM_APERTURE_SYS_NON_COHERENT:
+                // SYS_NON_COHERENT aperture is currently only used for some
+                // BAR1 P2P addresses and testing in kernel_driver_get_rm_ptes.
+                // Since UVM never places page tables in peer memory,
+                // SYS_NON_COHERENT should never be used in PDEs.
+                // falls through
             default:
                 UVM_ASSERT_MSG(0, "Invalid aperture: %d\n", phys_alloc->addr.aperture);
                 break;
@@ -401,6 +415,12 @@ static NvU64 big_half_pde_hopper(uvm_mmu_page_table_alloc_t *phys_alloc, uvm_pag
             case UVM_APERTURE_VID:
                 pde_bits |= HWCONST64(_MMU_VER3, DUAL_PDE, APERTURE_BIG, VIDEO_MEMORY);
                 break;
+            case UVM_APERTURE_SYS_NON_COHERENT:
+                // SYS_NON_COHERENT aperture is currently only used for some
+                // BAR1 P2P addresses and testing in kernel_driver_get_rm_ptes.
+                // Since UVM never places page tables in peer memory,
+                // SYS_NON_COHERENT should never be used in PDEs.
+                // falls through
             default:
                 UVM_ASSERT_MSG(0, "Invalid big aperture %d\n", phys_alloc->addr.aperture);
                 break;
@@ -433,6 +453,12 @@ static NvU64 small_half_pde_hopper(uvm_mmu_page_table_alloc_t *phys_alloc, uvm_p
             case UVM_APERTURE_VID:
                 pde_bits |= HWCONST64(_MMU_VER3, DUAL_PDE, APERTURE_SMALL, VIDEO_MEMORY);
                 break;
+            case UVM_APERTURE_SYS_NON_COHERENT:
+                // SYS_NON_COHERENT aperture is currently only used for some
+                // BAR1 P2P addresses and testing in kernel_driver_get_rm_ptes.
+                // Since UVM never places page tables in peer memory,
+                // SYS_NON_COHERENT should never be used in PDEs.
+                // falls through
             default:
                 UVM_ASSERT_MSG(0, "Invalid small aperture %d\n", phys_alloc->addr.aperture);
                 break;
@@ -481,19 +507,12 @@ static void make_pde_hopper(void *entry,
 
 static uvm_mmu_mode_hal_t hopper_mmu_mode_hal;
 
-uvm_mmu_mode_hal_t *uvm_hal_mmu_mode_hopper(NvU64 big_page_size)
+uvm_mmu_mode_hal_t *uvm_hal_mmu_mode_hopper(void)
 {
     static bool initialized = false;
 
-    UVM_ASSERT(big_page_size == UVM_PAGE_SIZE_64K || big_page_size == UVM_PAGE_SIZE_128K);
-
-    // TODO: Bug 1789555: RM should reject the creation of GPU VA spaces with
-    // 128K big page size for Pascal+ GPUs
-    if (big_page_size == UVM_PAGE_SIZE_128K)
-        return NULL;
-
     if (!initialized) {
-        uvm_mmu_mode_hal_t *ampere_mmu_mode_hal = uvm_hal_mmu_mode_ampere(big_page_size);
+        uvm_mmu_mode_hal_t *ampere_mmu_mode_hal = uvm_hal_mmu_mode_ampere();
         UVM_ASSERT(ampere_mmu_mode_hal);
 
         // The assumption made is that arch_hal->mmu_mode_hal() will be called

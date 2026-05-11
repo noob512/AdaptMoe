@@ -17,7 +17,7 @@ _out/Linux_x86_64/deprecated_context.o: \
  ../common/sdk/nvidia/inc/class/cl9010_callback.h \
  ../common/inc/nvctassert.h inc/libraries/nvport/nvport.h \
  inc/libraries/nvport/core.h inc/libraries/nvport/atomic.h \
- inc/libraries/nvport/inline/atomic_gcc.h inc/libraries/nvport/debug.h \
+ inc/libraries/nvport/inline/atomic_c11.h inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
  inc/libraries/nvport/util.h inc/libraries/nvport/inline/util_generic.h \
@@ -28,9 +28,9 @@ _out/Linux_x86_64/deprecated_context.o: \
  inc/libraries/nvport/safe.h inc/libraries/nvport/inline/safe_generic.h \
  inc/libraries/nvport/thread.h inc/libraries/nvport/crypto.h \
  inc/libraries/nvport/string.h inc/libraries/nvport/cpu.h \
- inc/libraries/nvoc/object.h inc/libraries/nvoc/prelude.h \
- inc/libraries/utils/nvmacro.h generated/g_object_nvoc.h \
- inc/libraries/nvoc/runtime.h inc/libraries/nvoc/rtti.h \
+ inc/libraries/nvoc/object.h generated/g_object_nvoc.h \
+ inc/libraries/nvoc/runtime.h inc/libraries/nvoc/prelude.h \
+ inc/libraries/utils/nvmacro.h inc/libraries/nvoc/rtti.h \
  inc/kernel/core/printf.h inc/libraries/utils/nvprintf.h \
  inc/libraries/utils/nvprintf_level.h inc/libraries/nvlog/nvlog_printf.h \
  inc/libraries/nvlog/internal/nvlog_printf_internal.h \
@@ -47,10 +47,11 @@ _out/Linux_x86_64/deprecated_context.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073common.h \
+ inc/libraries/utils/nvbitvector.h inc/libraries/utils/nvrange.h \
  interface/nvacpitypes.h ../common/sdk/nvidia/inc/nvimpshared.h \
- ../common/sdk/nvidia/inc/nvi2c.h inc/kernel/os/nv_memory_type.h \
- inc/kernel/os/nv_memory_area.h inc/kernel/os/capability.h \
- arch/nvalloc/unix/include/os_custom.h \
+ ../common/sdk/nvidia/inc/nvi2c.h inc/kernel/os/capability.h \
+ inc/kernel/os/nv_memory_area.h inc/kernel/os/nv_memory_type.h \
+ inc/kernel/os/workitem.h arch/nvalloc/unix/include/os_custom.h \
  arch/nvalloc/unix/include/os-interface.h \
  ../common/sdk/nvidia/inc/nv_stdarg.h arch/nvalloc/unix/include/nv-caps.h \
  src/kernel/rmapi/deprecated_context.h \
@@ -80,7 +81,7 @@ arch/nvalloc/common/inc/nvrangetypes.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -99,10 +100,10 @@ inc/libraries/nvport/crypto.h:
 inc/libraries/nvport/string.h:
 inc/libraries/nvport/cpu.h:
 inc/libraries/nvoc/object.h:
-inc/libraries/nvoc/prelude.h:
-inc/libraries/utils/nvmacro.h:
 generated/g_object_nvoc.h:
 inc/libraries/nvoc/runtime.h:
+inc/libraries/nvoc/prelude.h:
+inc/libraries/utils/nvmacro.h:
 inc/libraries/nvoc/rtti.h:
 inc/kernel/core/printf.h:
 inc/libraries/utils/nvprintf.h:
@@ -132,12 +133,15 @@ inc/libraries/containers/btree.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073common.h:
+inc/libraries/utils/nvbitvector.h:
+inc/libraries/utils/nvrange.h:
 interface/nvacpitypes.h:
 ../common/sdk/nvidia/inc/nvimpshared.h:
 ../common/sdk/nvidia/inc/nvi2c.h:
-inc/kernel/os/nv_memory_type.h:
-inc/kernel/os/nv_memory_area.h:
 inc/kernel/os/capability.h:
+inc/kernel/os/nv_memory_area.h:
+inc/kernel/os/nv_memory_type.h:
+inc/kernel/os/workitem.h:
 arch/nvalloc/unix/include/os_custom.h:
 arch/nvalloc/unix/include/os-interface.h:
 ../common/sdk/nvidia/inc/nv_stdarg.h:

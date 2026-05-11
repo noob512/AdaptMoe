@@ -214,6 +214,18 @@ gpuConstructUserRegisterAccessMap_IMPL(OBJGPU *pGpu)
     const NvU8  *compressedData      = NULL;
     const NvU32 *profilingRangesArr  = NULL;
 
+    if (pGpu->getProperty(pGpu, PDB_PROP_GPU_TEGRA_SOC_NVDISPLAY))
+    {
+        //
+        // This function constructs the User Register Access Map for entire
+        // GPU BAR 0 space, SOC Display register range is different and
+        // UDISP space needs to be accessed by Usermode MODS and Kernel mode nvkms clients.
+        // TODO vijkumar construction of user access map for Display needs to be revisited.
+        // for now skip this function for SOC NVDISPLAY.
+        //
+        return NV_OK;
+    }
+
     if (IS_VIRTUAL(pGpu))
     {
         // Usermode access maps unused in Guest RM. Initialize this boolean and leave.
@@ -336,7 +348,6 @@ done:
 NV_STATUS
 gpuInitRegisterAccessMap_IMPL(OBJGPU *pGpu, NvU8 *pAccessMap, NvU32 accessMapSize, const NvU8 *pComprData, const NvU32 comprDataSize)
 {
-    PGZ_INFLATE_STATE pGzState = NULL;
     NvU32 inflatedBytes        = 0;
 
     NV_ASSERT_OR_RETURN(pAccessMap != NULL, NV_ERR_INVALID_STATE);
@@ -350,13 +361,7 @@ gpuInitRegisterAccessMap_IMPL(OBJGPU *pGpu, NvU8 *pAccessMap, NvU32 accessMapSiz
     //
     pComprData += 10;
 
-    NV_ASSERT_OK_OR_RETURN(utilGzAllocate((NvU8*)pComprData, accessMapSize, &pGzState));
-
-    NV_ASSERT(pGzState);
-
-    inflatedBytes = utilGzGetData(pGzState, 0, accessMapSize, pAccessMap);
-
-    utilGzDestroy(pGzState);
+    inflatedBytes = utilGzGetData(pComprData, accessMapSize, 0, accessMapSize, pAccessMap);
 
     if (inflatedBytes != accessMapSize)
     {

@@ -34,13 +34,13 @@
 // VAR NAME: N/A
 // COMPRESSION: YES
 // COMPLEX_STRUCT: NO
-// DATA SIZE (bytes): 84
+// DATA SIZE (bytes): 92
 // COMPRESSED SIZE (bytes): 28
 //
-static BINDATA_CONST NvU8 kgspBinArchiveConcatenatedFMCDesc_GH100_BINDATA_LABEL_UCODE_DESC_PROD_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) kgspBinArchiveConcatenatedFMCDesc_GH100_BINDATA_LABEL_UCODE_DESC_PROD_data[] = 
 {
-    0x63, 0x65, 0x20, 0x02, 0x70, 0x41, 0xf1, 0x0a, 0x20, 0xde, 0x04, 0xc4, 0x37, 0x19, 0x19, 0x18,
-    0xf1, 0xe8, 0x03, 0x00, 0x92, 0x10, 0x68, 0x6c, 0x54, 0x00, 0x00, 0x00,
+    0x63, 0x63, 0x20, 0x02, 0x70, 0x41, 0xf1, 0x0a, 0x20, 0xde, 0x04, 0xc4, 0x37, 0x19, 0x19, 0x18,
+    0x89, 0xd0, 0x07, 0x00, 0x03, 0x82, 0x12, 0xe7, 0x5c, 0x00, 0x00, 0x00,
 };
 #endif // defined(BINDATA_INCLUDE_DATA)
 
@@ -50,7 +50,7 @@ BINDATA_STORAGE_PVT kgspBinArchiveConcatenatedFMCDesc_GH100_BINDATA_LABEL_UCODE_
 
 #if defined(BINDATA_INCLUDE_STORAGE_PVT_DEFN)
 {
-    84,                                                                // uncompressed data size (bytes)
+    92,                                                                // uncompressed data size (bytes)
     28,                                                                // compressed data size (bytes)
     kgspBinArchiveConcatenatedFMCDesc_GH100_BINDATA_LABEL_UCODE_DESC_PROD_data, // compressed data pointer
     NV_TRUE,                                                           // is pData compressed?

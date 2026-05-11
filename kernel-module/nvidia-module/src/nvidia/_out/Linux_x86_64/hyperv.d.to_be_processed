@@ -7,7 +7,7 @@ _out/Linux_x86_64/hyperv.o: \
  ../common/sdk/nvidia/inc/cpuopsys.h ../common/sdk/nvidia/inc/nvstatus.h \
  ../common/sdk/nvidia/inc/nvtypes.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
@@ -61,9 +61,11 @@ _out/Linux_x86_64/hyperv.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073dfp.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073common.h \
+ inc/libraries/utils/nvbitvector.h inc/libraries/utils/nvrange.h \
  interface/nvacpitypes.h ../common/sdk/nvidia/inc/nvimpshared.h \
- ../common/sdk/nvidia/inc/nvi2c.h inc/kernel/os/nv_memory_type.h \
- inc/kernel/os/capability.h arch/nvalloc/unix/include/os_custom.h \
+ ../common/sdk/nvidia/inc/nvi2c.h inc/kernel/os/capability.h \
+ inc/kernel/os/nv_memory_type.h inc/kernel/os/workitem.h \
+ arch/nvalloc/unix/include/os_custom.h \
  arch/nvalloc/unix/include/os-interface.h \
  ../common/sdk/nvidia/inc/nv_stdarg.h arch/nvalloc/unix/include/nv-caps.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
@@ -78,7 +80,7 @@ inc/libraries/nvport/nvport.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -164,11 +166,14 @@ generated/g_os_nvoc.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073dfp.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073common.h:
+inc/libraries/utils/nvbitvector.h:
+inc/libraries/utils/nvrange.h:
 interface/nvacpitypes.h:
 ../common/sdk/nvidia/inc/nvimpshared.h:
 ../common/sdk/nvidia/inc/nvi2c.h:
-inc/kernel/os/nv_memory_type.h:
 inc/kernel/os/capability.h:
+inc/kernel/os/nv_memory_type.h:
+inc/kernel/os/workitem.h:
 arch/nvalloc/unix/include/os_custom.h:
 arch/nvalloc/unix/include/os-interface.h:
 ../common/sdk/nvidia/inc/nv_stdarg.h:

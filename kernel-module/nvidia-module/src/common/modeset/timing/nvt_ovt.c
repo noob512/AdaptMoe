@@ -1,40 +1,37 @@
-//*****************************************************************************
-//
-//  SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-//  SPDX-License-Identifier: MIT
-//
-//  Permission is hereby granted, free of charge, to any person obtaining a
-//  copy of this software and associated documentation files (the "Software"),
-//  to deal in the Software without restriction, including without limitation
-//  the rights to use, copy, modify, merge, publish, distribute, sublicense,
-//  and/or sell copies of the Software, and to permit persons to whom the
-//  Software is furnished to do so, subject to the following conditions:
-//
-//  The above copyright notice and this permission notice shall be included in
-//  all copies or substantial portions of the Software.
-//
-//  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-//  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-//  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-//  THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-//  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-//  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-//  DEALINGS IN THE SOFTWARE.
-//
-//  File:       nvt_ovt.c
-//
-//  Purpose:    calculate Optimized Video Timing (OVT) timing
-//
-//*****************************************************************************
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: MIT
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+/** @file  nvt_ovt.c
+ *  @brief calculate Optimized Video Timing (OVT) timing
+ */
 
 
 #include "nvBinSegment.h"
 #include "nvmisc.h"
 
 #include "nvtiming_pvt.h"
-
+ 
 PUSH_SEGMENTS
-
 CONS_SEGMENT(PAGE_CONS)
 
 const NvU32 NVT_OVT_PIXEL_CLOCK_GRANULARITY  = 1000;      // Resulting Pixel Clock will be a multiple of this
@@ -58,20 +55,6 @@ CODE_SEGMENT(PAGE_DD_CODE)
 static NvU32 nvFloorPow2_U32(NvU32 x)
 {
     return x & ~(x - 1);
-}
-
-CODE_SEGMENT(PAGE_DD_CODE)
-static NvU32 computeGCD(NvU32 a, NvU32 b)
-{
-    NvU32 temp;
-    while (b != 0)
-    {
-        temp = a % b;
-        if (temp == 0) return b;
-        a = b;
-        b = temp;
-    }
-    return a;
 }
 
 CODE_SEGMENT(PAGE_DD_CODE)
@@ -290,6 +273,30 @@ NvBool NvTiming_IsTimingOVT(const NVT_TIMING *pTiming)
         return NV_TRUE;
     }
     return NV_FALSE;
+}
+
+CODE_SEGMENT(PAGE_DD_CODE)
+NvU32 computeGCD(NvU32 a, NvU32 b)
+{
+    NvU32 temp;
+    while (b != 0)
+    {
+        temp = a % b;
+        if (temp == 0) return b;
+        a = b;
+        b = temp;
+    }
+    return a;
+}
+
+CODE_SEGMENT(PAGE_DD_CODE)
+NvU32 computeLCM(NvU32 a, NvU32 b)
+{
+    if (a == 0 || b == 0)
+    {
+        return 0;
+    }
+    return (a / computeGCD(a, b)) * b;
 }
 
 POP_SEGMENTS

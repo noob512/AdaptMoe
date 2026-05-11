@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2005-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2005-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -382,6 +382,7 @@ typedef struct NV0000_CTRL_SYSTEM_GET_CPU_INFO_PARAMS {
  *     This parameter specifies NV0000_CTRL_SYSTEM_CHIPSET_FLAG_XXX flags:
  *     _HAS_RESIZABLE_BAR_ISSUE_YES: Chipset where the use of resizable BAR1
  *     should be disabled - bug 3440153
+ *     _BAR1_UNALIGNED_ACCESS_YES: unaligned acccess in BAR1 is allowed.
  *
  * Possible status values returned are:
  *   NV_OK
@@ -419,6 +420,10 @@ typedef struct NV0000_CTRL_SYSTEM_GET_CHIPSET_INFO_PARAMS {
 #define NV0000_CTRL_SYSTEM_CHIPSET_FLAG_HAS_RESIZABLE_BAR_ISSUE                  0:0
 #define NV0000_CTRL_SYSTEM_CHIPSET_FLAG_HAS_RESIZABLE_BAR_ISSUE_NO  (0x00000000U)
 #define NV0000_CTRL_SYSTEM_CHIPSET_FLAG_HAS_RESIZABLE_BAR_ISSUE_YES (0x00000001U)
+
+#define NV0000_CTRL_SYSTEM_CHIPSET_FLAG_BAR1_UNALIGNED_ACCESS                    1:1
+#define NV0000_CTRL_SYSTEM_CHIPSET_FLAG_BAR1_UNALIGNED_ACCESS_NO    (0x00000000U)
+#define NV0000_CTRL_SYSTEM_CHIPSET_FLAG_BAR1_UNALIGNED_ACCESS_YES   (0x00000001U)
 
 
 
@@ -656,68 +661,6 @@ typedef struct NV0000_CTRL_SYSTEM_DEBUG_RMMSG_CTRL_PARAMS {
     NvU32 count;
     NvU8  data[NV0000_CTRL_SYSTEM_DEBUG_RMMSG_SIZE];
 } NV0000_CTRL_SYSTEM_DEBUG_RMMSG_CTRL_PARAMS;
-
-/*
- * NV0000_CTRL_SYSTEM_HWBC_INFO
- *
- * This structure contains information about the HWBC (BR04) specified by 
- * hwbcId.
- *   
- *   hwbcId
- *     This field specifies the HWBC ID.
- *   firmwareVersion
- *     This field returns the version of the firmware on the HWBC (BR04), if
- *     present. This is a packed binary number of the form 0x12345678, which
- *     corresponds to a firmware version of 12.34.56.78.
- *   subordinateBus
- *     This field returns the subordinate bus number of the HWBC (BR04).
- *   secondaryBus
- *     This field returns the secondary bus number of the HWBC (BR04).
- *
- * Possible status values returned are:
- *   NV_OK
- *   NV_ERR_INVALID_ARGUMENT
- */
-
-typedef struct NV0000_CTRL_SYSTEM_HWBC_INFO {
-    NvU32 hwbcId;
-    NvU32 firmwareVersion;
-    NvU32 subordinateBus;
-    NvU32 secondaryBus;
-} NV0000_CTRL_SYSTEM_HWBC_INFO;
-
-#define NV0000_CTRL_SYSTEM_HWBC_INVALID_ID   (0xFFFFFFFFU)
-
-/*
- * NV0000_CTRL_CMD_SYSTEM_GET_HWBC_INFO
- *
- * This command returns information about all Hardware Broadcast (HWBC) 
- * devices present in the system that are BR04s. To get the complete
- * list of HWBCs in the system, all GPUs present in the system must be 
- * initialized. See the description of NV0000_CTRL_CMD_GPU_ATTACH_IDS to 
- * accomplish this.
- *   
- *   hwbcInfo
- *     This field is an array of NV0000_CTRL_SYSTEM_HWBC_INFO structures into
- *     which HWBC information is placed. There is one entry for each HWBC
- *     present in the system. Valid entries are contiguous, invalid entries 
- *     have the hwbcId equal to NV0000_CTRL_SYSTEM_HWBC_INVALID_ID. If no HWBC
- *     is present in the system, all the entries would be marked invalid, but
- *     the return value would still be SUCCESS.
- *     
- * Possible status values returned are:
- *   NV_OK
- *   NV_ERR_INVALID_ARGUMENT
- */
-#define NV0000_CTRL_CMD_SYSTEM_GET_HWBC_INFO (0x124U) /* finn: Evaluated from "(FINN_NV01_ROOT_SYSTEM_INTERFACE_ID << 8) | NV0000_CTRL_SYSTEM_GET_HWBC_INFO_PARAMS_MESSAGE_ID" */
-
-#define NV0000_CTRL_SYSTEM_MAX_HWBCS         (0x00000080U)
-
-#define NV0000_CTRL_SYSTEM_GET_HWBC_INFO_PARAMS_MESSAGE_ID (0x24U)
-
-typedef struct NV0000_CTRL_SYSTEM_GET_HWBC_INFO_PARAMS {
-    NV0000_CTRL_SYSTEM_HWBC_INFO hwbcInfo[NV0000_CTRL_SYSTEM_MAX_HWBCS];
-} NV0000_CTRL_SYSTEM_GET_HWBC_INFO_PARAMS;
 
 /*
  * NV0000_CTRL_CMD_SYSTEM_GPS_CONTROL
@@ -1361,19 +1304,18 @@ typedef struct NV0000_CTRL_SYSTEM_GET_P2P_CAPS_V2_PARAMS {
 
 #define NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_MATRIX (0x13aU) /* finn: Evaluated from "(FINN_NV01_ROOT_SYSTEM_INTERFACE_ID << 8) | NV0000_CTRL_SYSTEM_GET_P2P_CAPS_MATRIX_PARAMS_MESSAGE_ID" */
 
-typedef NvU32 NV0000_CTRL_P2P_CAPS_MATRIX_ROW[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
 #define NV0000_CTRL_SYSTEM_GET_P2P_CAPS_MATRIX_PARAMS_MESSAGE_ID (0x3AU)
 
 typedef struct NV0000_CTRL_SYSTEM_GET_P2P_CAPS_MATRIX_PARAMS {
-    NvU32                           grpACount;
-    NvU32                           grpBCount;
-    NvU32                           gpuIdGrpA[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
-    NvU32                           gpuIdGrpB[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
-    NV0000_CTRL_P2P_CAPS_MATRIX_ROW p2pCaps[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
-    NV0000_CTRL_P2P_CAPS_MATRIX_ROW a2bOptimalReadCes[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
-    NV0000_CTRL_P2P_CAPS_MATRIX_ROW a2bOptimalWriteCes[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
-    NV0000_CTRL_P2P_CAPS_MATRIX_ROW b2aOptimalReadCes[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
-    NV0000_CTRL_P2P_CAPS_MATRIX_ROW b2aOptimalWriteCes[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
+    NvU32 grpACount;
+    NvU32 grpBCount;
+    NvU32 gpuIdGrpA[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
+    NvU32 gpuIdGrpB[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
+    NvU32 p2pCaps[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS][NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
+    NvU32 a2bOptimalReadCes[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS][NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
+    NvU32 a2bOptimalWriteCes[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS][NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
+    NvU32 b2aOptimalReadCes[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS][NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
+    NvU32 b2aOptimalWriteCes[NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS][NV0000_CTRL_SYSTEM_MAX_P2P_GROUP_GPUS];
 } NV0000_CTRL_SYSTEM_GET_P2P_CAPS_MATRIX_PARAMS;
 
 /*
@@ -1571,24 +1513,6 @@ typedef struct NV0000_CTRL_SYSTEM_GPS_CTRL_PARAMS {
 #define NV0000_CTRL_GPS_CMD_PS_STATUS_OFF                      (0U)
 #define NV0000_CTRL_GPS_CMD_PS_STATUS_ON                       (1U)
 
-
-/*
- * NV0000_CTRL_CMD_SYSTEM_SET_SECURITY_SETTINGS
- *
- * This command allows privileged users to update the values of
- * security settings governing RM behavior.
- *
- * Possible status values returned are:
- *   NV_OK
- *   NV_ERR_INVALID_ARGUMENT,
- *   NV_ERR_INVALID_OBJECT_HANDLE
- *   NV_ERR_NOT_SUPPORTED
- *   NV_ERR_INSUFFICIENT_PERMISSIONS
- *
- * Please note: as implied above, administrator privileges are
- * required to modify security settings.
- */
-#define NV0000_CTRL_CMD_SYSTEM_SET_SECURITY_SETTINGS           (0x129U) /* finn: Evaluated from "(FINN_NV01_ROOT_SYSTEM_INTERFACE_ID << 8) | NV0000_CTRL_SYSTEM_GPS_GET_PERF_SENSOR_COUNTERS_PARAMS_MESSAGE_ID" */
 
 #define GPS_MAX_COUNTERS_PER_BLOCK                             32U
 #define NV0000_CTRL_SYSTEM_GPS_GET_PERF_SENSOR_COUNTERS_PARAMS_MESSAGE_ID (0x29U)
@@ -2210,11 +2134,22 @@ typedef struct NV0000_CTRL_SYSTEM_NVPCF_GET_POWER_MODE_INFO_PARAMS {
      */
     NvU32  dcTspLongTimescaleLimitmA;
 
+    /*
+     * The long timescale limit override.
+     */
+    NvU32  dcTspLongTimescaleLimitOverridemA;
+
    /*
     * This is the active arbitrated short timescale limit provided by Qboost and
     * honored by RM/PMU
     */
     NvU32  dcTspShortTimescaleLimitmA;
+
+   /*
+    * This is the value provided by the SBIOS to update the short timescale 
+    * DC-TSP power policy managed by the PMU 
+    */
+    NvU32  dcTspShortTimescaleLimitOverridemA;
 
     /* Dynamic Boost AC support */
     NvBool bEnableForAC;

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2008-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2008-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -151,8 +151,7 @@ typedef struct ContextDma ContextDma;
     }                                                                                   \
     while (0)
 
-#define NV_RM_RPC_MAP_MEMORY_DMA(pGpu, hclient, hdevice, hdma, hmemory, offset, length, flags,  \
-                                 dmaoffset, status)                                             \
+#define NV_RM_RPC_MAP_MEMORY_DMA(pGpu, pParams, status)                                         \
     do                                                                                          \
     {                                                                                           \
         OBJRPC *pRpc;                                                                           \
@@ -160,15 +159,13 @@ typedef struct ContextDma ContextDma;
         NV_ASSERT(pRpc != NULL);                                                                \
         if ((status == NV_OK) && (pRpc != NULL) &&                                              \
             !gpuIsSplitVasManagementServerClientRmEnabled(pGpu))                                \
-            status = rpcMapMemoryDma_HAL(pGpu, pRpc, hclient, hdevice, hdma, hmemory, offset,   \
-                                         length, flags, dmaoffset);                             \
+            status = rpcMapMemoryDma_HAL(pGpu, pRpc, pParams);                                  \
         else if (pRpc == NULL)                                                                  \
             status = NV_ERR_INSUFFICIENT_RESOURCES;                                             \
     } while (0)
 
 
-#define NV_RM_RPC_UNMAP_MEMORY_DMA(pGpu, hclient, hdevice, hdma, hmemory, flags, dmaoffset, \
-                                   status)                                                  \
+#define NV_RM_RPC_UNMAP_MEMORY_DMA(pGpu, pParams,  status)                                  \
     do                                                                                      \
     {                                                                                       \
         OBJRPC *pRpc;                                                                       \
@@ -176,8 +173,7 @@ typedef struct ContextDma ContextDma;
         NV_ASSERT(pRpc != NULL);                                                            \
         if ((status == NV_OK) && (pRpc != NULL) &&                                          \
             !gpuIsSplitVasManagementServerClientRmEnabled(pGpu))                            \
-            status = rpcUnmapMemoryDma_HAL(pGpu, pRpc, hclient, hdevice, hdma, hmemory,     \
-                                           flags, dmaoffset);                               \
+            status = rpcUnmapMemoryDma_HAL(pGpu, pRpc, pParams);                            \
         else if (pRpc == NULL)                                                              \
             status = NV_ERR_INSUFFICIENT_RESOURCES;                                         \
     } while (0)
@@ -203,7 +199,7 @@ typedef struct ContextDma ContextDma;
         NV_ASSERT(pRpc != NULL);                                                              \
         if ((status == NV_OK) && (pRpc != NULL))                                              \
         {                                                                                     \
-            if (IS_GSP_CLIENT(pGpu))                                                          \
+            if (IS_FW_CLIENT(pGpu))                                                           \
             {                                                                                 \
                 NV_RM_RPC_ALLOC_SHARE_DEVICE_FWCLIENT(pGpu, hclient, hdevice, hclientshare, htargetclient, htargetdevice, hclass, \
                                                       allocflags, vasize, vamode, bFirstDevice, status); \
@@ -227,7 +223,7 @@ typedef struct ContextDma ContextDma;
         NV_ASSERT(pRpc != NULL);                                                    \
         if ((status == NV_OK) && (pRpc != NULL))                                    \
         {                                                                           \
-            if (IS_GSP_CLIENT(pGpu))                                                \
+            if (IS_FW_CLIENT(pGpu))                                                 \
             {                                                                       \
                 RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);                      \
                 status = pRmApi->Control(pRmApi, hClient, hObject, cmd,             \
@@ -251,7 +247,7 @@ typedef struct ContextDma ContextDma;
         NV_ASSERT(pRpc != NULL);                                                        \
         if ((status == NV_OK) && (pRpc != NULL))                                        \
         {                                                                               \
-            if (IS_GSP_CLIENT(pGpu))                                                    \
+            if (IS_FW_CLIENT(pGpu))                                                     \
             {                                                                           \
                 RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);                          \
                 status = pRmApi->AllocWithHandle(pRmApi, hclient, hparent, hchannel,    \
@@ -275,7 +271,7 @@ typedef struct ContextDma ContextDma;
         NV_ASSERT(pRpc != NULL);                                                        \
         if ((status == NV_OK) && (pRpc != NULL))                                        \
         {                                                                               \
-            if (IS_GSP_CLIENT(pGpu))                                                    \
+            if (IS_FW_CLIENT(pGpu))                                                     \
             {                                                                           \
                 RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);                          \
                 status = pRmApi->AllocWithHandle(pRmApi, hclient, hchannel, hobject,    \
@@ -299,7 +295,7 @@ typedef struct ContextDma ContextDma;
         NV_ASSERT(pRpc != NULL);                                        \
         if ((status == NV_OK) && (pRpc != NULL))                        \
         {                                                               \
-            if (IS_GSP_CLIENT(pGpu))                                    \
+            if (IS_FW_CLIENT(pGpu))                                     \
             {                                                           \
                 RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);          \
                 status = pRmApi->Free(pRmApi, hclient, hobject);        \
@@ -320,7 +316,7 @@ typedef struct ContextDma ContextDma;
         /* used in failure cases, macro doesn't overwrite rmStatus */   \
         if (pRpc != NULL)                                               \
         {                                                               \
-            if (IS_GSP_CLIENT(pGpu))                                    \
+            if (IS_FW_CLIENT(pGpu))                                     \
             {                                                           \
                 RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);          \
                 pRmApi->Free(pRmApi, hclient, hobject);                 \
@@ -342,7 +338,7 @@ typedef struct ContextDma ContextDma;
         NV_ASSERT(pRpc != NULL);                                                   \
         if ((status == NV_OK) && (pRpc != NULL))                                   \
         {                                                                          \
-            if (IS_GSP_CLIENT(pGpu))                                               \
+            if (IS_FW_CLIENT(pGpu))                                                \
             {                                                                      \
                 RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);                     \
                 NV0005_ALLOC_PARAMETERS allocParams = {0};                         \
@@ -372,7 +368,7 @@ typedef struct ContextDma ContextDma;
         NV_ASSERT(pRpc != NULL);                                                        \
         if ((status == NV_OK) && (pRpc != NULL))                                        \
         {                                                                               \
-            if (IS_GSP_CLIENT(pGpu))                                                    \
+            if (IS_FW_CLIENT(pGpu))                                                     \
             {                                                                           \
                 RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);                          \
                 NV2080_ALLOC_PARAMETERS alloc_params = {0};                             \
@@ -398,7 +394,7 @@ typedef struct ContextDma ContextDma;
         NV_ASSERT(pRpc != NULL);                                                \
         if ((status == NV_OK) && (pRpc != NULL))                                \
         {                                                                       \
-            if (IS_GSP_CLIENT(pGpu))                                            \
+            if (IS_FW_CLIENT(pGpu))                                             \
             {                                                                   \
                 RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);                  \
                 status = pRmApi->DupObject(pRmApi, hclient, hparent,            \
@@ -483,28 +479,6 @@ static inline void NV_RM_RPC_SIM_FREE_INFRA(OBJGPU *pGpu, ...) { return; }
             status = NV_ERR_INSUFFICIENT_RESOURCES;                                         \
     } while (0)
 
-#define NV_RM_RPC_SET_PAGE_DIRECTORY(pGpu, hClient, hDevice, pParams, status) \
-    do                                                                        \
-    {                                                                         \
-        OBJRPC *pRpc = GPU_GET_RPC(pGpu);                                     \
-        NV_ASSERT(pRpc != NULL);                                              \
-        if ((status == NV_OK) && (pRpc != NULL))                              \
-            status = rpcSetPageDirectory_HAL(pGpu, pRpc, hClient, hDevice, pParams);  \
-        else if (pRpc == NULL)                                                 \
-            status = NV_ERR_INSUFFICIENT_RESOURCES;                            \
-    } while (0)
-
-#define NV_RM_RPC_UNSET_PAGE_DIRECTORY(pGpu, hClient, hDevice, pParams, status) \
-    do                                                                          \
-    {                                                                           \
-        OBJRPC *pRpc = GPU_GET_RPC(pGpu);                                       \
-        NV_ASSERT(pRpc != NULL);                                                \
-        if ((status == NV_OK) && (pRpc != NULL))                                \
-            status = rpcUnsetPageDirectory_HAL(pGpu, pRpc, hClient, hDevice, pParams);  \
-        else if (pRpc == NULL)                                                   \
-            status = NV_ERR_INSUFFICIENT_RESOURCES;                              \
-    } while (0)
-
 static inline void NV_RM_RPC_PMA_SCRUBBER_SHARED_BUFFER_GUEST_PAGES_OPERATION(OBJGPU *pGpu, ...) { return; }
 
 #define NV_RM_RPC_INVALIDATE_TLB(pGpu, status, pdbAddress, regVal)         \
@@ -522,7 +496,17 @@ static inline void NV_RM_RPC_PMA_SCRUBBER_SHARED_BUFFER_GUEST_PAGES_OPERATION(OB
 // DCE_CLIENT_RM specific RPCs
 //
 
-#define NV_RM_RPC_DCE_RM_INIT(pGpu, bInit, status)      do {} while (0)
+#define NV_RM_RPC_DCE_RM_INIT(pGpu, bInit, status)                              \
+    do                                                                          \
+    {                                                                           \
+        OBJRPC* pRpc = GPU_GET_RPC(pGpu);                                       \
+        if ((status == NV_OK) && (pRpc != NULL))                                \
+        {                                                                       \
+            RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);                      \
+            status = rpcDceRmInit_dce(pRmApi, bInit);                           \
+        } else if (pRpc == NULL)                                                \
+            status = NV_ERR_INSUFFICIENT_RESOURCES;                             \
+    } while (0)
 
 //
 // GSP_CLIENT_RM specific RPCs
@@ -581,6 +565,17 @@ static inline void NV_RM_RPC_PMA_SCRUBBER_SHARED_BUFFER_GUEST_PAGES_OPERATION(OB
         NV_ASSERT(pRpc != NULL);                                               \
         if ((status == NV_OK) && (pRpc != NULL))                               \
             status = rpcEccNotifierWriteAck_HAL(pGpu, pRpc);                   \
+        else if (pRpc == NULL)                                                 \
+            status = NV_ERR_INSUFFICIENT_RESOURCES;                            \
+    } while (0)
+
+#define NV_RM_RPC_INIT_GSP_TRACE_CRASH_BUFFER(pGpu, status, pa, size)          \
+    do                                                                         \
+    {                                                                          \
+        OBJRPC *pRpc = GPU_GET_RPC(pGpu);                                      \
+        NV_ASSERT(pRpc != NULL);                                               \
+        if ((status == NV_OK) && (pRpc != NULL))                               \
+            status = rpcInitGspTraceCrashBuffer_HAL(pGpu, pRpc, pa, size);     \
         else if (pRpc == NULL)                                                 \
             status = NV_ERR_INSUFFICIENT_RESOURCES;                            \
     } while (0)

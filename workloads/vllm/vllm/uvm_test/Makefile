@@ -23,13 +23,16 @@ NVCCFLAGS = -Xcompiler -fPIC -O2 -std=c++17
 LDFLAGS = -shared -L$(CUDA_LIB) -lcudart -ldl
 
 # Targets
-all: uvm_allocator.so libcudamalloc_managed.so
+all: uvm_allocator.so libcudamalloc_managed.so phase_f_smoke
 
 # PyTorch pluggable allocator (same as before)
 uvm: uvm_allocator.so
 
 uvm_allocator.so: uvm_allocator.cpp
 	$(NVCC) $(NVCCFLAGS) -shared -o $@ $< -lcudart
+
+phase_f_smoke: phase_f_smoke.cpp uvm_allocator.so
+	$(CXX) -O2 -std=c++17 -I$(CUDA_INCLUDE) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< -l:uvm_allocator.so -L$(CUDA_LIB) -lcudart -ldl
 
 # LD_PRELOAD library to intercept all cudaMalloc calls
 preload: libcudamalloc_managed.so
@@ -38,6 +41,6 @@ libcudamalloc_managed.so: cuda_malloc_managed_preload.cpp
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -I$(CUDA_INCLUDE) -o $@ $<
 
 clean:
-	rm -f uvm_allocator.so libcudamalloc_managed.so
+	rm -f uvm_allocator.so libcudamalloc_managed.so phase_f_smoke
 
 .PHONY: all uvm preload clean

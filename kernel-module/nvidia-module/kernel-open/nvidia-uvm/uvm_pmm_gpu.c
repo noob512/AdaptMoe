@@ -98,14 +98,16 @@
 //
 // When a memory allocation from PMA fails and eviction is requested, PMM will
 // check whether it can evict any user memory chunks to satisfy the request.
-// All allocated user memory root chunks are tracked in an LRU list
-// (root_chunks.va_block_used). A root chunk is moved to the tail of that list
-// whenever any of its subchunks is allocated (unpinned) by a VA block (see
-// uvm_pmm_gpu_unpin_allocated()). When a root chunk is selected for eviction,
-// it has the eviction flag set (see pick_root_chunk_to_evict()). This flag
-// affects many of the PMM operations on all of the subchunks of the root chunk
-// being evicted. See usage of (root_)chunk_is_in_eviction(), in particular in
-// chunk_free_locked() and claim_free_chunk().
+// All allocated user memory root chunks are tracked in one of several LRU lists
+// (root_chunks.alloc_list[n]). The list used depends on the state of the chunk
+// (see uvm_pmm_alloc_list_t). A root chunk is moved to the tail of the used
+// list (UVM_PMM_ALLOC_LIST_USED) whenever any of its subchunks is allocated
+// (unpinned) by a VA block (see uvm_pmm_gpu_unpin_allocated()). When a root
+// chunk is selected for eviction, it has the eviction flag set
+// (see pick_root_chunk_to_evict()). This flag affects many of the PMM
+// operations on all of the subchunks of the root chunk being evicted. See usage
+// of (root_)chunk_is_in_eviction(), in particular in chunk_free_locked() and
+// claim_free_chunk().
 //
 // To evict a root chunk, all of its free subchunks are pinned, then all
 // resident pages backed by it are moved to the CPU one VA block at a time.
@@ -174,7 +176,6 @@
 #include "uvm_va_range.h"
 #include "uvm_test.h"
 #include "uvm_linux.h"
-#include "uvm_bpf_struct_ops.h"
 
 #if defined(CONFIG_PCI_P2PDMA) && defined(NV_STRUCT_PAGE_HAS_ZONE_DEVICE_DATA)
 #include <linux/pci-p2pdma.h>
@@ -349,7 +350,7 @@ static void root_chunk_unlock(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chu
 // have an opt-out.
 static bool gpu_supports_pma_eviction(uvm_gpu_t *gpu)
 {
-    return uvm_global_oversubscription && uvm_parent_gpu_supports_eviction(gpu->parent);
+    return uvm_global_oversubscription;
 }
 
 uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *pmm)
@@ -407,12 +408,18 @@ static void chunk_pin(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
     uvm_gpu_root_chunk_t *root_chunk = root_chunk_from_chunk(pmm, chunk);
 
-    uvm_assert_spinlock_locked(&pmm->list_lock);
+    // The PMM list_lock must be held, but calling uvm_assert_spinlock_locked()
+    // is not possible here due to the absence of the UVM context pointer in
+    // the interrupt context when called from devmem_page_free().
+
     UVM_ASSERT(chunk->state != UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
     chunk->state = UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED;
 
-    if (chunk_is_root_chunk(chunk))
+
+    if (chunk_is_root_chunk(chunk)) {
+        ++pmm->root_chunks.pinned_count;
         return;
+    }
 
     // For subchunks, update the pinned leaf chunks count tracked in the
     // suballoc of the root chunk.
@@ -435,14 +442,15 @@ static void chunk_unpin(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_pmm_gpu_
 
     uvm_assert_spinlock_locked(&pmm->list_lock);
     UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
-    UVM_ASSERT(chunk->va_block == NULL);
     UVM_ASSERT(chunk_is_root_chunk_pinned(pmm, chunk));
     UVM_ASSERT(new_state != UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
 
     chunk->state = new_state;
 
-    if (chunk_is_root_chunk(chunk))
+    if (chunk_is_root_chunk(chunk)) {
+        --pmm->root_chunks.pinned_count;
         return;
+    }
 
     // For subchunks, update the pinned leaf chunks count tracked in the
     // suballoc of the root chunk.
@@ -461,7 +469,7 @@ static void chunk_unpin(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_pmm_gpu_
 static void uvm_gpu_chunk_set_in_eviction(uvm_gpu_chunk_t *chunk, bool in_eviction)
 {
     UVM_ASSERT(uvm_gpu_chunk_is_user(chunk));
-    UVM_ASSERT(uvm_gpu_chunk_get_size(chunk) == UVM_CHUNK_SIZE_MAX);
+    UVM_ASSERT(chunk_is_root_chunk(chunk));
 
     chunk->in_eviction = in_eviction;
 }
@@ -481,15 +489,21 @@ uvm_gpu_t *uvm_gpu_chunk_get_gpu(const uvm_gpu_chunk_t *chunk)
     return gpu;
 }
 
-struct page *uvm_gpu_chunk_to_page(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
+NvU64 uvm_gpu_chunk_to_sys_addr(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
     uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
     NvU64 sys_addr = chunk->address + gpu->parent->system_bus.memory_window_start;
-    unsigned long pfn = sys_addr >> PAGE_SHIFT;
 
     UVM_ASSERT(sys_addr + uvm_gpu_chunk_get_size(chunk) <= gpu->parent->system_bus.memory_window_end + 1);
-    UVM_ASSERT(gpu->mem_info.numa.enabled);
+    return sys_addr;
+}
 
+struct page *uvm_gpu_chunk_to_page(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
+{
+    uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
+    unsigned long pfn = uvm_gpu_chunk_to_sys_addr(pmm, chunk) >> PAGE_SHIFT;
+
+    UVM_ASSERT(gpu->mem_info.numa.enabled);
     return pfn_to_page(pfn);
 }
 
@@ -516,79 +530,59 @@ void uvm_pmm_gpu_sync(uvm_pmm_gpu_t *pmm)
     }
 }
 
-// PMM (物理内存管理器) 的核心显存分配函数。
-// 职责：在指定的 GPU 上，分配 num_chunks 个大小为 chunk_size 的物理显存块。
 static NV_STATUS pmm_gpu_alloc(uvm_pmm_gpu_t *pmm,
                                size_t num_chunks,
                                uvm_chunk_size_t chunk_size,
-                               uvm_pmm_gpu_memory_type_t mem_type, // 内存类型（如普通显存、系统内存等）
-                               uvm_pmm_alloc_flags_t flags,        // 分配标志（如是否允许驱逐 EVICT）
-                               uvm_gpu_chunk_t **chunks,           // 输出参数：存放分配到的物理块指针数组
-                               uvm_tracker_t *out_tracker)         // 输出参数：记录这些物理块的异步执行状态
+                               uvm_pmm_gpu_memory_type_t mem_type,
+                               uvm_pmm_alloc_flags_t flags,
+                               uvm_gpu_chunk_t **chunks,
+                               uvm_tracker_t *out_tracker)
 {
     uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
     NV_STATUS status;
-    uvm_tracker_t local_tracker = UVM_TRACKER_INIT(); // 局部追踪器，用于收集所有申请到的块的异步状态
+    uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
     size_t i;
 
-    // 【1. 极其严格的基础校验】
     UVM_ASSERT((unsigned)mem_type < UVM_PMM_GPU_MEMORY_TYPE_COUNT);
-    UVM_ASSERT_MSG(is_power_of_2(chunk_size), "chunk size %u\n", chunk_size); // 物理块大小必须是 2 的幂
-    UVM_ASSERT_MSG(chunk_size & pmm->chunk_sizes[mem_type], "chunk size %u\n", chunk_size); // 必须是硬件支持的尺寸
+    UVM_ASSERT_MSG(is_power_of_2(chunk_size), "chunk size %u\n", chunk_size);
+    UVM_ASSERT_MSG(chunk_size & pmm->chunk_sizes[mem_type], "chunk size %u\n", chunk_size);
     UVM_ASSERT(num_chunks == 0 || chunks);
     UVM_ASSERT((flags & UVM_PMM_ALLOC_FLAGS_MASK) == flags);
 
-    // 【2. 呼应前文：防死锁断言】
-    // 还记得上一个函数里的 UVM_PMM_ALLOC_FLAGS_EVICT (暴力驱逐模式) 吗？
-    // 这里做了一个极其重要的检查：如果调用者要求驱逐别人，那么调用者**当前绝对不能持有 VA Block 锁**！
-    // uvm_assert_lockable_order 会检查当前线程的锁层级，确保不会发生死锁。
-    // 这完美印证了我们之前说的：“必须先解锁，才能来申请带有驱逐标志的内存”。
     if (flags & UVM_PMM_ALLOC_FLAGS_EVICT) {
+        // If eviction is requested then VA block locks need to be lockable
         uvm_assert_lockable_order(UVM_LOCK_ORDER_VA_BLOCK);
     }
 
-    // 【3. 循环分配物理块】
     for (i = 0; i < num_chunks; i++) {
         uvm_gpu_root_chunk_t *root_chunk;
 
-        // 【核心调用：从空闲链表/伙伴系统中拿地】
-        // 如果找不到，且 flags 允许，它内部会触发 Eviction (驱逐)
         status = alloc_chunk(pmm, mem_type, chunk_size, flags, &chunks[i]);
         if (status != NV_OK)
-            goto error; // 如果任何一个块分配失败（比如 OOM），跳转去回滚
+            goto error;
 
-        // 获取这个物理块所属的“根块 (Root Chunk)”
-        // GPU 的显存通常按 2MB 或更大的 Root Chunk 管理，再切分成 64KB 等小块给你
         root_chunk = root_chunk_from_chunk(pmm, chunks[i]);
 
-        // 【4. 收集异步历史包袱 (Tracker 追踪器)】
-        // 为什么刚分配的新块会有“历史包袱”？
-        // 因为物理内存是循环利用的！这块地皮可能 1 微秒前刚被别人释放，
-        // 而 GPU 硬件可能还在执行针对这块地皮的上一笔 DMA 读取或清零操作。
-        // 所以我们必须把它的 Tracker（异步任务凭证）收集起来，保护好。
-        root_chunk_lock(pmm, root_chunk); // 锁住物理根块
-        uvm_tracker_remove_completed(&root_chunk->tracker); // 剔除已经执行完的硬件任务
-        status = uvm_tracker_add_tracker_safe(&local_tracker, &root_chunk->tracker); // 把还在执行的任务合入本地追踪器
+        root_chunk_lock(pmm, root_chunk);
+        uvm_tracker_remove_completed(&root_chunk->tracker);
+        status = uvm_tracker_add_tracker_safe(&local_tracker, &root_chunk->tracker);
         root_chunk_unlock(pmm, root_chunk);
 
         if (status != NV_OK) {
-            i++; // 保证当前这个块也能在 error 回滚中被释放
+            i++;
             goto error;
         }
     }
 
-    // 【5. 跨 GPU 依赖隔离 (极其深邃的生命周期管理)】
-    // 如果刚才分配的内存块，之前被【另一张 GPU】异步访问过，Tracker 里就会有那张 GPU 的任务凭证。
-    // 如果我们就这样把 Tracker 返回给调用者，调用者（比如 VA Space）就会把那张不相关的 GPU 记录到自己的依赖里。
-    // 一旦那张 GPU 被热拔插或者销毁，就会引发灾难性的生命周期崩溃。
-    // 解决办法：在这里**死等**（阻塞 CPU），直到所有不属于当前 GPU 的历史任务全部执行完毕！
+    // Before we return to the caller, we need to ensure that the tracker only
+    // contains tracker entries belonging to the PMM's GPU. Otherwise we
+    // could leak trackers for other GPUs into VA spaces which never
+    // registered those GPUs, causing lifetime problems when those GPUs go
+    // away.
     status = uvm_tracker_wait_for_other_gpus(&local_tracker, gpu);
     if (status != NV_OK)
         goto error;
 
-    // 【6. 移交异步追踪凭证】
-    // 将合并后的、纯净的（只有当前 GPU 任务的）追踪器，交付给调用者。
-    // 调用者知道：“在使用这几块显存前，必须确保 out_tracker 里的任务都走完了。”
     if (out_tracker) {
         status = uvm_tracker_add_tracker_safe(out_tracker, &local_tracker);
         uvm_tracker_clear(&local_tracker);
@@ -596,20 +590,14 @@ static NV_STATUS pmm_gpu_alloc(uvm_pmm_gpu_t *pmm,
             goto error;
     }
 
-    // 等待并销毁剩余的局部 tracker（如果 out_tracker 为空，这里就是死等所有历史任务完成）
     return uvm_tracker_wait_deinit(&local_tracker);
 
-// ==========================================================
-// 【错误回滚机制 (Rollback)】
-// 事务的原子性：要么全部分配成功，要么一个都不要。
-// ==========================================================
 error:
     uvm_tracker_deinit(&local_tracker);
-    // 经典的 while(i-- > 0) 倒序释放！把刚才成功申请到的 chunk 依次还给 PMM。
     while (i-- > 0)
         free_chunk(pmm, chunks[i]);
 
-    // 把输出数组全部清零，防止外层调用者使用已经释放的野指针。
+    // Reset the array to make error handling easier for callers.
     memset(chunks, 0, sizeof(chunks[0]) * num_chunks);
 
     return status;
@@ -630,8 +618,6 @@ NV_STATUS uvm_pmm_gpu_alloc_kernel(uvm_pmm_gpu_t *pmm,
         return status;
 
     for (i = 0; i < num_chunks; ++i) {
-        UVM_ASSERT(chunks[i]->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
-
         uvm_spin_lock(&pmm->list_lock);
         chunk_unpin(pmm, chunks[i], UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
         chunks[i]->is_referenced = false;
@@ -651,150 +637,54 @@ NV_STATUS uvm_pmm_gpu_alloc_user(uvm_pmm_gpu_t *pmm,
     return pmm_gpu_alloc(pmm, num_chunks, chunk_size, UVM_PMM_GPU_MEMORY_TYPE_USER, flags, chunks, out_tracker);
 }
 
-// 核心内部函数：根据物理块（chunk）的当前状态，更新它（以及它所属的根块）在全局链表中的位置。
-// 注意：调用此函数前，必须已经持有 pmm->list_lock 锁。
 static void chunk_update_lists_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
-    // 【架构核心：找“族长”】
-    // 传进来的 chunk 可能只是一个被切分出来的 64KB 小块。
-    // 但是 GPU 的物理驱逐（Eviction）通常是以 2MB 的大块为单位的。
-    // 所以，我们必须通过这个小块，找到包含它的那个 2MB 的“根块（Root Chunk）”。
     uvm_gpu_root_chunk_t *root_chunk = root_chunk_from_chunk(pmm, chunk);
 
-    // 防御性编程：确保当前线程确实拿到了全局的链表自旋锁
     uvm_assert_spinlock_locked(&pmm->list_lock);
 
-    // ==========================================================
-    // 【1. LRU 驱逐链表管理 (仅限 User 内存)】
-    // ==========================================================
     if (uvm_gpu_chunk_is_user(chunk)) {
-        
-        // 检查这个 2MB 根块里，是否还有【任何】一个小块处于被钉死（Pinned）状态？
         if (chunk_is_root_chunk_pinned(pmm, chunk)) {
-            // 如果这个 2MB 根块里哪怕只有一个 64KB 的小块正在被钉住施工，
-            // 那么整个 2MB 的根块都绝对不能被驱逐！
             UVM_ASSERT(root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT ||
                        root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
-            
-            // 既然不能被驱逐，就把它从所有 LRU 驱逐链表（比如 va_block_used）中直接摘除！
-            // 这样“死神”在遍历链表时，就根本看不到它。
             list_del_init(&root_chunk->chunk.list);
         }
         else if (root_chunk->chunk.state != UVM_PMM_GPU_CHUNK_STATE_FREE) {
-            // 如果这个根块没有任何部分被钉死，且它不是完全空闲的（即里面有数据）。
-            // 说明它现在处于“虽然在使用，但随时可以被驱逐”的安全状态！
-            
             UVM_ASSERT(root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT ||
                        root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
-            
-            // 【核心 LRU 动作】
-            // 将这个 2MB 的根块，移动到全局“已使用链表 (va_block_used)”的【尾部 (Tail)】。
-            // 尾部代表“最近刚刚被访问过/活跃过”。它会被排在驱逐候选人的最后面。
-            list_move_tail(&root_chunk->chunk.list, &pmm->root_chunks.va_block_used);
-
-            // 【高级定制：eBPF 激活钩子】
-            // 既然这块内存刚进入“可被驱逐 (evictable)”状态，
-            // 驱动在这里触发一个 eBPF 钩子 (GPU Block Activate)。
-            // 如果系统管理员写了自定义的 eBPF 脚本，他们可以在这里拦截，
-            // 甚至直接把这个块从尾部移到头部（强行提升驱逐优先级），实现基于业务感知的显存管理。
-            uvm_bpf_call_gpu_block_activate(pmm, &root_chunk->chunk, &pmm->root_chunks.va_block_used);
+            list_move_tail(&root_chunk->chunk.list, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED]);
         }
     }
 
-    // ==========================================================
-    // 【2. 空闲链表与伙伴系统管理 (针对当前小块)】
-    // ==========================================================
-    // TODO: NVIDIA 工程师的留言。Bug 1757148 表明他们在处理碎片化（Fragmentation）时还有优化空间。
-    
-    if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_FREE) {
-        // 如果当前这个块（无论多大）被彻底释放了。
-        // 去 PMM 的空闲链表矩阵里（通常是一个按大小分类的伙伴系统数组），
-        // 找到属于它这个尺寸的链表，把它挂在尾部。
+    // TODO: Bug 1757148: Improve fragmentation of split chunks
+    if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_FREE)
         list_move_tail(&chunk->list, find_free_list_chunk(pmm, chunk));
-    }
-    else if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED) {
-        // 如果它刚被分配，正处于“临时钉死”状态，
-        // 既不能被分配给别人（不在 free list），也不能被驱逐（不在 LRU list）。
-        // 那么就让它做个“孤魂野鬼”，从所有链表里彻底摘除。
+    else if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED)
         list_del_init(&chunk->list);
-    }
-}
-
-// 核心内部函数：解除物理块的“临时钉死（Temp Pinned）”状态，
-// 并将其正式挂载（落户）到指定的虚拟内存块（VA Block）下，最后将其加入 LRU 驱逐链表。
-static void gpu_unpin_temp(uvm_pmm_gpu_t *pmm,
-                           uvm_gpu_chunk_t *chunk,
-                           uvm_va_block_t *va_block,
-                           bool is_referenced)
-{
-    // 【1. 极其严格的状态断言 (Sanity Checks)】
-    // 确保这块地皮当前确实是“临时钉死”状态。
-    // （在 block_alloc_gpu_chunk 刚分配出来时，状态就是这个，防止施工时被驱逐算法踢走）
-    UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
-    // 确保这是普通的 User 内存，而不是 Kernel（页表）内存。Kernel 内存有另一套管法。
-    UVM_ASSERT(uvm_gpu_chunk_is_user(chunk));
-
-    // 初始化这个物理块的链表节点，为接下来把它挂到 LRU 全局链表做准备
-    INIT_LIST_HEAD(&chunk->list);
-
-    // 【2. 获取全局链表锁】
-    // 接下来要修改物理内存的状态和全局的 LRU 链表，必须加锁防止并发冲突。
-    uvm_spin_lock(&pmm->list_lock);
-
-    // 确保这个物理块目前是个“自由身”，还没有绑定过任何虚拟内存块
-    UVM_ASSERT(!chunk->va_block);
-    // 确保传进来的虚拟内存块指针是有效的
-    UVM_ASSERT(va_block);
-    // 确保存储在这个物理块内部的“虚拟页索引”没有越界（一个 2MB 的 VA Block 最多包含 512 个 4KB 页）
-    UVM_ASSERT(chunk->va_block_page_index < uvm_va_block_num_cpu_pages(va_block));
-
-    // ==========================================================
-    // 【3. 核心动作 A：解除钉死 (Unpin)】
-    // ==========================================================
-    // 摘除保护伞！将状态从 TEMP_PINNED（临时钉死）正式降级为 ALLOCATED（已分配）。
-    // 从这一刻起，底层的 PMA (Physical Memory Allocator) 就知道这块内存可以被驱逐了。
-    chunk_unpin(pmm, chunk, UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
-
-    // ==========================================================
-    // 【4. 核心动作 B：正式落户 (Binding)】
-    // ==========================================================
-    // 标记这块内存是否刚刚被硬件页表引用过（映射过）。
-    chunk->is_referenced = is_referenced;
-    
-    // 【点睛之笔：虚实结合】
-    // 将物理块 (chunk) 的内部指针指向虚拟块 (va_block)。
-    // 配合之前 chunk->va_block_page_index，这在底层建立了一座极其坚固的反向映射（Reverse Mapping）桥梁。
-    // 以后如果驱逐算法选中了这个物理 chunk，它就能顺着这个指针，瞬间找到对应的虚拟 va_block，从而解除虚拟页表映射！
-    chunk->va_block = va_block;
-
-    // ==========================================================
-    // 【5. 核心动作 C：加入 LRU 链表 (Update Lists)】
-    // ==========================================================
-    // 就是这个函数！它内部包含了你刚才指出的那行代码：
-    // list_move_tail(&root_chunk->chunk.list, &pmm->root_chunks.va_block_used);
-    // 根据 is_referenced 标志和状态，将这块刚刚转正的物理内存，
-    // 精准地安插到 PMM 全局的“已使用链表 (va_block_used)”的尾部，使其成为最安全的、最晚被驱逐的内存。
-    chunk_update_lists_locked(pmm, chunk);
-
-    // 释放全局链表锁
-    uvm_spin_unlock(&pmm->list_lock);
 }
 
 void uvm_pmm_gpu_unpin_allocated(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_va_block_t *va_block)
 {
-    gpu_unpin_temp(pmm, chunk, va_block, false);
-}
+    UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
+    UVM_ASSERT(uvm_gpu_chunk_is_user(chunk));
+    UVM_ASSERT(list_empty(&chunk->list));
+    UVM_ASSERT(va_block);
+    UVM_ASSERT(chunk->va_block == va_block);
 
-void uvm_pmm_gpu_unpin_referenced(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_va_block_t *va_block)
-{
-    gpu_unpin_temp(pmm, chunk, va_block, true);
+    uvm_spin_lock(&pmm->list_lock);
+
+    chunk_unpin(pmm, chunk, UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
+    chunk_update_lists_locked(pmm, chunk);
+
+    uvm_spin_unlock(&pmm->list_lock);
 }
 
 void uvm_pmm_gpu_free(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_tracker_t *tracker)
 {
     NV_STATUS status;
 
-    if (!chunk)
+    // Referenced chunks are freed by Linux when the reference is released.
+    if (!chunk || chunk->is_referenced)
         return;
 
     UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED ||
@@ -860,6 +750,10 @@ static bool assert_chunk_mergeable(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
     size_t i;
 
     UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT);
+    UVM_ASSERT_MSG(chunk->suballoc->allocated == num_subchunks(chunk),
+                   "%u != %u\n",
+                   chunk->suballoc->allocated,
+                   num_subchunks(chunk));
     UVM_ASSERT(first_child->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED ||
                first_child->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
 
@@ -869,23 +763,9 @@ static bool assert_chunk_mergeable(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
         UVM_ASSERT(child->state == first_child->state);
 
         if ((first_child->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED) && uvm_gpu_chunk_is_user(first_child)) {
-            uvm_gpu_chunk_t *prev_child = chunk->suballoc->subchunks[i-1];
-
             UVM_ASSERT(child->va_block == child_va_block);
-            UVM_ASSERT(child->va_block_page_index ==
-                       prev_child->va_block_page_index + uvm_gpu_chunk_get_size(prev_child) / PAGE_SIZE);
-            UVM_ASSERT(child->is_referenced == prev_child->is_referenced);
+            UVM_ASSERT(child->is_referenced == first_child->is_referenced);
         }
-    }
-
-    if (first_child->state == UVM_PMM_GPU_CHUNK_STATE_FREE) {
-        UVM_ASSERT(chunk->suballoc->allocated == 0);
-    }
-    else {
-        UVM_ASSERT_MSG(chunk->suballoc->allocated == num_subchunks(chunk),
-                       "%u != %u\n",
-                       chunk->suballoc->allocated,
-                       num_subchunks(chunk));
     }
 
     return true;
@@ -920,12 +800,14 @@ static void merge_gpu_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
         UVM_ASSERT(subchunk->va_block);
 
         chunk->va_block = subchunk->va_block;
-        chunk->va_block_page_index = subchunk->va_block_page_index;
         chunk->is_referenced = subchunk->is_referenced;
     }
     else if (child_state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED) {
         UVM_ASSERT(root_chunk->chunk.suballoc->pinned_leaf_chunks >= num_sub);
         root_chunk->chunk.suballoc->pinned_leaf_chunks += 1 - num_sub;
+        chunk->va_block = subchunk->va_block;
+        if (chunk_is_root_chunk(chunk))
+            ++pmm->root_chunks.pinned_count;
     }
 
     chunk->state = child_state;
@@ -949,7 +831,7 @@ static void merge_gpu_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
         UVM_ASSERT(list_empty(&subchunk->list));
 
         if ((child_state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED) && uvm_gpu_chunk_is_user(subchunk))
-            UVM_ASSERT(subchunk->va_block != NULL);
+            UVM_ASSERT(subchunk->va_block);
 
         kmem_cache_free(CHUNK_CACHE, subchunk);
     }
@@ -1316,10 +1198,9 @@ void uvm_pmm_gpu_mark_chunk_evicted(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 
     UVM_ASSERT(chunk_is_in_eviction(pmm, chunk));
     UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
-    UVM_ASSERT(chunk->va_block != NULL);
+    UVM_ASSERT(chunk->va_block);
 
     chunk->va_block = NULL;
-    chunk->va_block_page_index = PAGES_PER_UVM_VA_BLOCK;
     chunk_pin(pmm, chunk);
 
     uvm_spin_unlock(&pmm->list_lock);
@@ -1448,6 +1329,7 @@ static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root
 
     UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
     uvm_gpu_chunk_set_in_eviction(chunk, false);
+    --pmm->root_chunks.in_eviction_count;
 
     chunk->is_zero = false;
 
@@ -1480,6 +1362,7 @@ error:
     uvm_spin_lock(&pmm->list_lock);
 
     uvm_gpu_chunk_set_in_eviction(chunk, false);
+    --pmm->root_chunks.in_eviction_count;
 
     // In case we didn't manage to evict any chunks and hence the root is still
     // unpinned, we need to put it back on an eviction list.
@@ -1531,13 +1414,11 @@ static void chunk_start_eviction(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 
     list_del_init(&chunk->list);
     uvm_gpu_chunk_set_in_eviction(chunk, true);
+    ++pmm->root_chunks.in_eviction_count;
 }
 
-static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, struct list_head *list,
-                                            enum uvm_bpf_action (*bpf_hook)(uvm_pmm_gpu_t *, uvm_gpu_chunk_t *, struct list_head *))
+static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_pmm_alloc_list_t alloc_list)
 {
-    enum uvm_bpf_action action = UVM_BPF_ACTION_DEFAULT;
-
     uvm_spin_lock(&pmm->list_lock);
 
     UVM_ASSERT(uvm_gpu_chunk_get_size(chunk) == UVM_CHUNK_SIZE_MAX);
@@ -1550,14 +1431,7 @@ static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t 
         // eviction lists.
         UVM_ASSERT(!list_empty(&chunk->list));
 
-        // Call BPF hook first to allow control over list operation
-        if (bpf_hook)
-            action = bpf_hook(pmm, chunk, list);
-
-        // Only move to tail if BPF doesn't bypass
-        if (action != UVM_BPF_ACTION_BYPASS) {
-            list_move_tail(&chunk->list, list);
-        }
+        list_move_tail(&chunk->list, &pmm->root_chunks.alloc_list[alloc_list]);
     }
 
     uvm_spin_unlock(&pmm->list_lock);
@@ -1565,43 +1439,67 @@ static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t 
 
 void uvm_pmm_gpu_mark_root_chunk_used(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
-    root_chunk_update_eviction_list(pmm, chunk, &pmm->root_chunks.va_block_used,
-                                    uvm_bpf_call_gpu_block_access);
+    root_chunk_update_eviction_list(pmm, chunk, UVM_PMM_ALLOC_LIST_USED);
 }
 
 void uvm_pmm_gpu_mark_root_chunk_unused(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
-    root_chunk_update_eviction_list(pmm, chunk, &pmm->root_chunks.va_block_unused, NULL);
+    root_chunk_update_eviction_list(pmm, chunk, UVM_PMM_ALLOC_LIST_UNUSED);
 }
 
-// “挑选受害者”：从物理内存管理器 (PMM) 中挑选一个 2MB 的根块进行驱逐。
-// 挑选顺序：脏空闲块 -> 干净空闲块 -> 未使用块 -> 正在使用的块。
+void uvm_pmm_gpu_mark_root_chunk_discarded(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
+{
+    root_chunk_update_eviction_list(pmm, chunk, UVM_PMM_ALLOC_LIST_DISCARDED);
+}
+
+static uvm_pmm_alloc_list_t get_alloc_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
+{
+    uvm_pmm_alloc_list_t alloc_list;
+
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+
+    for (alloc_list = 0; alloc_list < UVM_PMM_ALLOC_LIST_COUNT; alloc_list++) {
+        uvm_gpu_chunk_t *entry;
+        list_for_each_entry(entry, &pmm->root_chunks.alloc_list[alloc_list], list) {
+            if (entry == chunk)
+                return alloc_list;
+        }
+    }
+
+    return UVM_PMM_ALLOC_LIST_COUNT;
+}
+
+static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
+{
+    uvm_pmm_alloc_list_t alloc_list;
+
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+
+    for (alloc_list = 0; alloc_list < UVM_PMM_ALLOC_LIST_COUNT; alloc_list++) {
+        uvm_gpu_chunk_t *chunk = list_first_chunk(&pmm->root_chunks.alloc_list[alloc_list]);
+        if (chunk)
+            return chunk;
+    }
+
+    return NULL;
+}
+
 static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
 {
     uvm_gpu_chunk_t *chunk;
 
-    // 获取自旋锁。因为我们要遍历并修改全局的链表结构，必须防止其他线程并发修改。
     uvm_spin_lock(&pmm->list_lock);
 
-    // ==========================================================
-    // 优先级 1：捡漏“脏”空闲块 (Free & Non-Zero)
-    // ==========================================================
-    // 为什么叫驱逐，却先查空闲链表？
-    // 因为在并发环境下，从上一次分配失败到这里拿锁的几微秒间，可能刚好有别的线程释放了内存！
-    // 优先选择“非清零 (NO_ZERO)”的空闲块。因为如果要分配的内存马上会被新数据覆盖，
-    // 把已经清零的块拿来用是一种浪费（清零也是消耗 GPU 算力的）。
+    // Check if there are root chunks sitting in the free lists. Non-zero
+    // chunks are preferred.
     chunk = list_first_chunk(find_free_list(pmm,
                                             UVM_PMM_GPU_MEMORY_TYPE_USER,
                                             UVM_CHUNK_SIZE_MAX,
                                             UVM_PMM_LIST_NO_ZERO));
     if (chunk)
-        UVM_ASSERT(!chunk->is_zero); // 确保拿到的是脏块
+        UVM_ASSERT(!chunk->is_zero);
 
-    // ==========================================================
-    // 优先级 2：捡漏“干净”空闲块 (Free & Zeroed)
-    // ==========================================================
     if (!chunk) {
-        // 如果没有脏的空闲块，那就退而求其次，拿已经清零的空闲块。
         chunk = list_first_chunk(find_free_list(pmm,
                                                 UVM_PMM_GPU_MEMORY_TYPE_USER,
                                                 UVM_CHUNK_SIZE_MAX,
@@ -1610,141 +1508,84 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
             UVM_ASSERT(chunk->is_zero);
     }
 
-    // ==========================================================
-    // 优先级 3：高级定制策略 (The eBPF Hook)
-    // ==========================================================
-    // 如果没有空闲块，说明真的要开始“杀进程（驱逐数据）”了。
-    // 在下手之前，UVM 提供了一个内核 eBPF (Extended Berkeley Packet Filter) 钩子！
-    // 这允许系统管理员或外部监控程序注入一段自定义的代码，
-    // 动态地对 `va_block_used` 和 `va_block_unused` 链表进行重新排序。
-    // 比如：你可以写一个 eBPF 程序，强制要求“永远先驱逐进程 PID 1234 的显存”。
-    if (!chunk) {
-        uvm_bpf_call_gpu_evict_prepare(pmm,
-                                          &pmm->root_chunks.va_block_used,
-                                          &pmm->root_chunks.va_block_unused);
-    }
-
-    // ==========================================================
-    // 优先级 4：驱逐“未使用”的驻留块 (Unused Blocks)
-    // ==========================================================
-    // eBPF 排序完（或者没挂载 eBPF）之后，优先从“未使用”链表里抓人。
-    // 这里的 unused 通常指的是：虽然分配给了某个 VA Block，但当前没有任何页表映射指向它，
-    // 或者近期根本没有被访问过的数据。踢走它的性能代价最小。
+    // TODO: Bug 1765193: Move the chunks to the tail of the used list whenever
+    // they get mapped.
     if (!chunk)
-        chunk = list_first_chunk(&pmm->root_chunks.va_block_unused);
+        chunk = get_first_allocated_chunk(pmm);
 
-    // ==========================================================
-    // 优先级 5：驱逐“正在使用”的块 (Used Blocks - 终极受害者)
-    // ==========================================================
-    // TODO: Bug 1765193 揭示了 NVIDIA 内部的优化方向。目前这里使用的是简单的 FIFO (先进先出)，
-    // 拿到链表头部的第一个块就杀。NVIDIA 工程师在这里留了标记，打算未来将其优化为严格的 LRU (最近最少使用) 链表。
-    if (!chunk)
-        chunk = list_first_chunk(&pmm->root_chunks.va_block_used);
-
-    // ==========================================================
-    // 收尾工作
-    // ==========================================================
     if (chunk)
-        // 标记这个块正在被驱逐，防止在这个漫长的过程中被其他线程误用。
         chunk_start_eviction(pmm, chunk);
 
-    uvm_spin_unlock(&pmm->list_lock); // 解锁
+    uvm_spin_unlock(&pmm->list_lock);
 
     if (chunk)
-        // 把底层的 chunk 转换回包含更多元数据的 root_chunk 并返回给强拆大队。
         return root_chunk_from_chunk(pmm, chunk);
-        
-    return NULL; // 如果连正在使用的块都没有（比如全被锁死 Pin 住了），彻底 OOM。
+
+    return NULL;
 }
 
-// 核心驱逐函数：在全局显存耗尽时，挑选一个已被占用的物理根块（Root Chunk，通常 2MB），
-// 将里面的数据强行踢回 CPU，然后把腾出来的空块交接给调用者。
 static NV_STATUS pick_and_evict_root_chunk(uvm_pmm_gpu_t *pmm,
-                                           uvm_pmm_gpu_memory_type_t type, // 需要分配的新内存类型（User 或 Kernel）
+                                           uvm_pmm_gpu_memory_type_t type,
                                            uvm_pmm_context_t pmm_context,
                                            uvm_gpu_chunk_t **out_chunk)
 {
-    uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
     NV_STATUS status;
     uvm_gpu_chunk_t *chunk;
     uvm_gpu_root_chunk_t *root_chunk;
 
-    // 【1. 基础防御机制】
-    // 确保当前硬件架构真的支持驱逐操作。
-    UVM_ASSERT(uvm_parent_gpu_supports_eviction(gpu->parent));
-    // 必须持有全局 PMM 大锁！强拆期间，绝对不允许其他线程来捣乱账本。
     uvm_assert_mutex_locked(&pmm->lock);
 
-    // ==========================================================
-    // 【2. 死亡点名 (The Grim Reaper)】
-    // ==========================================================
-    // 遍历内部的 LRU（最近最少使用）链表或其他启发式结构，
-    // 找出一个最没有存在感、最久没被访问过的倒霉蛋 2MB 根块。
     root_chunk = pick_root_chunk_to_evict(pmm);
-    if (!root_chunk)
-        return NV_ERR_NO_MEMORY; // 连能踢的倒霉蛋都找不到了（比如所有内存全被钉死了），彻底 OOM。
+    if (!root_chunk) {
+        if (pmm_context == PMM_CONTEXT_DEFAULT && type == UVM_PMM_GPU_MEMORY_TYPE_USER && \
+            (READ_ONCE(pmm->root_chunks.pinned_count) > 0 || READ_ONCE(pmm->root_chunks.in_eviction_count) > 0)) {
 
-    // ==========================================================
-    // 【3. 执行强拆 (The Eviction)】
-    // ==========================================================
-    // 这是真正干苦力活的地方：
-    // 1. 解除指向这个 2MB 物理块的所有虚拟内存页表映射。
-    // 2. 将这 2MB 数据打包，生成 DMA 指令，顺着 PCIe 总线全部搬回 CPU 内存。
-    // （注意：虽然叫 evict，但通常是异步提交任务，具体看底层的实现机制）
+            // There are UVM managed root chunks that are currently 'in-flight'
+            // and not tracked on any of the lists. Try again after returning
+            // from PMM.
+            return NV_ERR_MORE_PROCESSING_REQUIRED;
+        }
+
+        return NV_ERR_NO_MEMORY;
+    }
+
     status = evict_root_chunk(pmm, root_chunk, pmm_context);
     if (status != NV_OK)
         return status;
 
-    // 拿到被洗劫一空、重新变回自由身的物理块。
     chunk = &root_chunk->chunk;
 
-    // ==========================================================
-    // 【4. 特殊待遇：User 内存转 Kernel 内存】
-    // ==========================================================
-    // UVM 管理的内存主要分两种：
-    // - User (用户态内存)：比如你代码里的数组，随时可以被踢回 CPU。
-    // - Kernel (内核态内存)：比如 GPU 的底层页表 (Page Tables)，这种内存是绝对不能被踢出的，必须钉死 (Pin) 在显存里！
     if (type == UVM_PMM_GPU_MEMORY_TYPE_KERNEL) {
         NvU32 flags = 0;
         if (pmm_context == PMM_CONTEXT_PMA_EVICTION)
             flags |= UVM_PMA_CALLED_FROM_PMA_EVICTION;
 
-        // 【底层 PMA 交互：申请免死金牌】
-        // 既然要把这块地皮用作 Kernel 内存，我们就必须向更底层的 PMA（NVIDIA RM 资源管理器）申请“钉死 (Pin)”。
-        // 告诉底层硬件：“这 2MB 从现在起是皇家用地，任何底层硬件驱逐机制都不准动它！”
+        // Transitioning user memory type to kernel memory type requires pinning
+        // it so that PMA doesn't pick it for eviction.
         status = nvUvmInterfacePmaPinPages(pmm->pma,
                                            &chunk->address,
                                            1,
                                            UVM_CHUNK_SIZE_MAX,
                                            flags);
-                                           
-        // 【处理极限并发竞争 (Race Condition)】
         if (status == NV_ERR_IN_USE) {
-            // 极其罕见且倒霉的情况发生了：
-            // 就在我们挑选这个块、把它清空、准备钉死它的这几微秒里，
-            // 底层的 PMA 自己也正在执行它自己的硬件级驱逐，并且也刚好盯上了这块地皮！
-            // 既然 PMA 已经捷足先登了，我们只能认怂。
-            // 动作：把这个根块还给 PMA，然后返回 NV_ERR_IN_USE。外层代码收到后会重新循环，重新挑下一个倒霉蛋。
+            // Pinning can fail if some of the pages have been chosen for
+            // eviction already. In that case free the root chunk back to PMA
+            // and let the caller retry.
             free_root_chunk(pmm, root_chunk, free_root_chunk_mode_from_pmm_context(pmm_context));
+
             return status;
         }
 
-        // 确保 Pin 操作成功，否则直接报错抓取日志。
         UVM_ASSERT_MSG(status == NV_OK,
                        "pmaPinPages(root_chunk=0x%llx) failed unexpectedly: %s\n",
                        chunk->address,
                        nvstatusToString(status));
 
-        // 【5. 篡改户口本】
-        // 在局部自旋锁的保护下，正式将这块物理内存的“户口”从 User 改为 Kernel。
         uvm_spin_lock(&pmm->list_lock);
         chunk->type = type;
         uvm_spin_unlock(&pmm->list_lock);
     }
 
-    // ==========================================================
-    // 【6. 胜利交接】
-    // ==========================================================
     *out_chunk = chunk;
     return NV_OK;
 }
@@ -1854,13 +1695,12 @@ static NV_STATUS alloc_or_evict_root_chunk(uvm_pmm_gpu_t *pmm,
                                            uvm_pmm_alloc_flags_t flags,
                                            uvm_gpu_chunk_t **chunk_out)
 {
-    uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
     NV_STATUS status;
     uvm_gpu_chunk_t *chunk;
 
     status = alloc_root_chunk(pmm, type, flags, &chunk);
     if (status != NV_OK) {
-        if ((flags & UVM_PMM_ALLOC_FLAGS_EVICT) && uvm_parent_gpu_supports_eviction(gpu->parent))
+        if (flags & UVM_PMM_ALLOC_FLAGS_EVICT)
             status = pick_and_evict_root_chunk_retry(pmm, type, PMM_CONTEXT_DEFAULT, chunk_out);
 
         return status;
@@ -1870,68 +1710,28 @@ static NV_STATUS alloc_or_evict_root_chunk(uvm_pmm_gpu_t *pmm,
     return status;
 }
 
-// 分配一个 Root Chunk（根块，GPU 物理内存管理的最大连续单元，通常为 2MB）。
-// 如果系统显存耗尽，且调用者允许，它会触发“驱逐（Eviction）”机制。
-// 
-// 为什么叫 "_unlocked"？
-// 因为调用这个函数时，调用者【没有】且【不应该】持有全局的 PMM（物理内存管理器）大锁。
-// 这允许函数在“显存充足”的绝大多数情况下，完全无锁或使用极轻量级锁完成分配，极大提升并发性能。
+// Same as alloc_or_evit_root_chunk(), but without the PMM lock held.
 static NV_STATUS alloc_or_evict_root_chunk_unlocked(uvm_pmm_gpu_t *pmm,
                                                     uvm_pmm_gpu_memory_type_t type,
                                                     uvm_pmm_alloc_flags_t flags,
                                                     uvm_gpu_chunk_t **chunk_out)
 {
-    uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
     NV_STATUS status;
     uvm_gpu_chunk_t *chunk;
 
-    // ==========================================================
-    // 第一步：乐观分配 (Fast Path - The Optimistic Try)
-    // ==========================================================
-    // 尝试直接分配一个根块。
-    // 底层的 alloc_root_chunk 可能会使用无锁链表（Lock-free lists）或非常细粒度的自旋锁。
-    // 只要系统里还有空闲的 2MB 大块，这一步就会极速成功，完全不会阻塞其他正在申请显存的线程。
     status = alloc_root_chunk(pmm, type, flags, &chunk);
-    
-    // ==========================================================
-    // 第二步：OOM 后的暴力驱逐 (Slow Path - The Pessimistic Fallback)
-    // ==========================================================
     if (status != NV_OK) {
-        // 如果 status != NV_OK，通常意味着显存彻底满了（Out Of Memory）。
-        
-        // 检查两个条件：
-        // 1. 调用者是否在标志位 (flags) 里授权了我们可以进行“驱逐 (EVICT)”？
-        // 2. 当前这块 GPU 的硬件架构是否支持驱逐机制？
-        if ((flags & UVM_PMM_ALLOC_FLAGS_EVICT) && uvm_parent_gpu_supports_eviction(gpu->parent)) {
-            
-            // 【防线收缩：获取全局大锁】
-            // 既然要驱逐别人的数据，这就涉及在全局的 LRU（最近最少使用）链表中挑选受害者、
-            // 修改全局状态表、甚至引发数据搬运。这绝对不能并发执行！
-            // 所以，必须在这里老老实实地把 PMM 全局大锁（pmm->lock）给锁上。
+        if (flags & UVM_PMM_ALLOC_FLAGS_EVICT) {
             uvm_mutex_lock(&pmm->lock);
-            
-            // 【执行终极审判】
-            // 在锁的保护下，挑选一个倒霉的受害者（通常是很久没被访问过的内存块），
-            // 把它的数据踢回 CPU 主板内存，然后把空出来的 Root Chunk 抢过来分配给我们。
-            // 这个函数内部包含了极为复杂的重试和挑选逻辑。
             status = pick_and_evict_root_chunk_retry(pmm, type, PMM_CONTEXT_DEFAULT, chunk_out);
-            
-            // 活干完了（或者彻底失败了），释放全局大锁。
             uvm_mutex_unlock(&pmm->lock);
         }
 
-        // 如果驱逐成功，status 会变成 NV_OK；
-        // 如果调用者不允许驱逐，或者驱逐了半天也没腾出空间，就把错误码原样返回给上层。
         return status;
     }
 
-    // ==========================================================
-    // 第三步：胜利交付
-    // ==========================================================
-    // 如果第一步的乐观分配直接成功了，代码会跳过中间的 if 块直接来到这里。
-    // 将拿到的大地皮指针赋值给输出参数。
     *chunk_out = chunk;
-    return status; // 返回 NV_OK
+    return status;
 }
 
 static NV_STATUS alloc_chunk_with_splits(uvm_pmm_gpu_t *pmm,
@@ -2023,8 +1823,8 @@ static NV_STATUS alloc_chunk_with_splits(uvm_pmm_gpu_t *pmm,
     UVM_PANIC();
 }
 
-// 分配一个指定大小的物理显存块（Chunk）。
-// 策略顺序：直接捡漏 -> 请求完整大块 -> 拿大块切碎/驱逐。
+// Allocates a single chunk of a given size. If needed, splits a chunk of
+// bigger size or, if that is not possible, allocates from PMA or evicts.
 NV_STATUS alloc_chunk(uvm_pmm_gpu_t *pmm,
                       uvm_pmm_gpu_memory_type_t type,
                       uvm_chunk_size_t chunk_size,
@@ -2034,68 +1834,37 @@ NV_STATUS alloc_chunk(uvm_pmm_gpu_t *pmm,
     NV_STATUS status;
     uvm_gpu_chunk_t *chunk;
 
-    // ==========================================================
-    // 第一步：极速模式（捡漏）
-    // ==========================================================
-    // 从 PMM 的空闲链表里找找，有没有【刚好】是这个尺寸的空闲内存块？
-    // 这个操作极快，几乎没有开销。
     chunk = claim_free_chunk(pmm, type, chunk_size);
     if (chunk) {
-        // 运气不错，刚好有闲置的，直接跳转到结尾交付。
+        // A free chunk could be claimed, we are done.
         goto out;
     }
 
-    // ==========================================================
-    // 第二步：大宗交易模式（分配 Root Chunk）
-    // ==========================================================
-    // UVM_CHUNK_SIZE_MAX 通常指的是 GPU 支持的最大块（Root Chunk，通常 2MB）。
     if (chunk_size == UVM_CHUNK_SIZE_MAX) {
-        // 如果调用者就是要一整块最大的地皮，我们完全不需要拿“剪刀”去切。
-        // 所以，我们直接调用 alloc_or_evict_root_chunk_unlocked。
-        // 
-        // 【关键点：为什么是 unlocked (不加锁)？】
-        // 因为分配这么大的内存，如果系统没空地了，它内部就会触发极其缓慢的“驱逐 (Eviction)”。
-        // 如果我们在这里加上了全局 PMM 大锁，再去执行长达几毫秒的驱逐，
-        // 整个 GPU 的所有其他显存分配请求都会被卡死！
-        // 所以我们不加外层锁，直接进去，让它内部自己去处理安全的加解锁逻辑。
+        // For chunks of root chunk size we won't be doing any splitting so we
+        // can just directly try allocating without holding the PMM lock. If
+        // eviction is necessary, the lock will be acquired internally.
         status = alloc_or_evict_root_chunk_unlocked(pmm, type, flags, &chunk);
         if (status != NV_OK)
-            return status; // 如果拿不到大块（OOM），直接返回报错
+            return status;
 
         goto out;
     }
 
-    // ==========================================================
-    // 第三步：裁缝模式（大块切小块）
-    // ==========================================================
-    // 走到这里说明：
-    // 1. 我们没有刚好合适的闲置小块。
-    // 2. 我们需要的不是最大块（我们需要的是 64KB、4KB 这种小块）。
-    // 
-    // 这意味着我们必须找一块更大的内存，把它“切开 (Split)”。
-    // 切割操作会打乱全局的空闲链表结构（比如把一个 2M 切成两个 1M，挂到不同的链表上），
-    // 这是一个全局敏感的写操作，必须【加锁】！
-    uvm_mutex_lock(&pmm->lock); // 拿全局 PMM 大剪刀的钥匙
+    // We didn't find a free chunk and we will require splits so acquire the
+    // PMM lock.
+    uvm_mutex_lock(&pmm->lock);
 
-    // 进入复杂的切割分配逻辑。它内部会去找更大的块，一路切下来，直到切出我们需要的尺寸。
-    // 如果连大块都没有了，它内部同样会触发请求（可能包含驱逐）。
     status = alloc_chunk_with_splits(pmm, type, chunk_size, flags, &chunk);
 
-    uvm_mutex_unlock(&pmm->lock); // 把剪刀还回去，解锁
+    uvm_mutex_unlock(&pmm->lock);
 
-    // ==========================================================
-    // 错误处理与清理
-    // ==========================================================
     if (status != NV_OK) {
-        // 如果切割分配也失败了（彻底没内存了）。
-        // 这里的 free_next_available_root_chunk 是一种“兜底清理”机制。
-        // 在某些极端碎片化的情况下，尝试释放/规整一些还能用的根块，防止系统彻底宕机。
         (void)free_next_available_root_chunk(pmm, type);
         return status;
     }
 
 out:
-    // 成功！将这块充满着汗水与智慧的物理显存地皮，交接给上层。
     *out_chunk = chunk;
 
     return NV_OK;
@@ -2129,10 +1898,9 @@ static void init_root_chunk(uvm_pmm_gpu_t *pmm,
                    uvm_pmm_gpu_chunk_state_string(chunk->state),
                    uvm_gpu_name(gpu));
 
-    UVM_ASSERT(chunk->parent == NULL);
-    UVM_ASSERT(chunk->suballoc == NULL);
-    UVM_ASSERT(chunk->va_block == NULL);
-    UVM_ASSERT(chunk->va_block_page_index == PAGES_PER_UVM_VA_BLOCK);
+    UVM_ASSERT(!chunk->parent);
+    UVM_ASSERT(!chunk->suballoc);
+    UVM_ASSERT(!chunk->va_block);
     UVM_ASSERT(list_empty(&chunk->list));
     UVM_ASSERT(uvm_gpu_chunk_get_size(chunk) == UVM_CHUNK_SIZE_MAX);
     UVM_ASSERT(!root_chunk_has_elevated_page(pmm, root_chunk));
@@ -2143,6 +1911,9 @@ static void init_root_chunk(uvm_pmm_gpu_t *pmm,
     chunk->type = type;
     chunk->state = initial_state;
     chunk->is_zero = is_zero;
+
+    if (initial_state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED)
+        ++pmm->root_chunks.pinned_count;
 
     chunk_update_lists_locked(pmm, chunk);
 
@@ -2374,7 +2145,6 @@ NV_STATUS split_gpu_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
         subchunk->type = chunk->type;
         uvm_gpu_chunk_set_size(subchunk, subchunk_size);
         subchunk->parent = chunk;
-        subchunk->va_block_page_index = PAGES_PER_UVM_VA_BLOCK;
         subchunk->is_zero = chunk->is_zero;
         INIT_LIST_HEAD(&subchunk->list);
 
@@ -2386,8 +2156,10 @@ NV_STATUS split_gpu_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
             uvm_assert_mutex_locked(&chunk->va_block->lock);
 
             subchunk->va_block = chunk->va_block;
-            subchunk->va_block_page_index = chunk->va_block_page_index + (i * subchunk_size) / PAGE_SIZE;
             subchunk->is_referenced = chunk->is_referenced;
+        }
+        else if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED) {
+            subchunk->va_block = chunk->va_block;
         }
     }
 
@@ -2402,7 +2174,6 @@ NV_STATUS split_gpu_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 
     if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED) {
         chunk->va_block = NULL;
-        chunk->va_block_page_index = PAGES_PER_UVM_VA_BLOCK;
         chunk->is_referenced = false;
     }
     else if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED) {
@@ -2412,8 +2183,13 @@ NV_STATUS split_gpu_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 
         // When a pinned root chunk gets split, the count starts at 0 not
         // accounting for the root chunk itself so add the 1 back.
-        if (chunk_is_root_chunk(chunk))
+        if (chunk_is_root_chunk(chunk)) {
             root_chunk->chunk.suballoc->pinned_leaf_chunks += 1;
+            --pmm->root_chunks.pinned_count;
+        }
+
+        chunk->va_block = NULL;
+        chunk->is_referenced = false;
     }
 
     chunk->state = UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT;
@@ -2495,16 +2271,15 @@ static void chunk_free_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 
     if (root_chunk->chunk.in_eviction) {
         // A root chunk with pinned subchunks would never be picked for eviction
-        // so this one has to be in the allocated state. Pin it and let the
-        // evicting thread pick it up.
-        UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
-        UVM_ASSERT(chunk->va_block != NULL);
-        UVM_ASSERT(chunk->va_block_page_index != PAGES_PER_UVM_VA_BLOCK);
-        UVM_ASSERT(list_empty(&chunk->list));
-        chunk->va_block = NULL;
-        chunk->va_block_page_index = PAGES_PER_UVM_VA_BLOCK;
-        chunk->is_zero = false;
-        chunk_pin(pmm, chunk);
+        // but HMM evictions will end up here so leave the chunk pinned (or pin
+        // it) and let the eviction thread pick it up.
+        if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED) {
+            UVM_ASSERT(chunk->va_block);
+            UVM_ASSERT(list_empty(&chunk->list));
+            chunk->va_block = NULL;
+            chunk->is_zero = false;
+            chunk_pin(pmm, chunk);
+        }
         return;
     }
 
@@ -2518,16 +2293,13 @@ static void chunk_free_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
         }
     }
 
-    if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED) {
-        chunk_unpin(pmm, chunk, UVM_PMM_GPU_CHUNK_STATE_FREE);
-    }
-    else {
-        chunk->state = UVM_PMM_GPU_CHUNK_STATE_FREE;
-        chunk->va_block = NULL;
-    }
-
-    chunk->va_block_page_index = PAGES_PER_UVM_VA_BLOCK;
+    chunk->va_block = NULL;
     chunk->is_zero = false;
+
+    if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED)
+        chunk_unpin(pmm, chunk, UVM_PMM_GPU_CHUNK_STATE_FREE);
+    else
+        chunk->state = UVM_PMM_GPU_CHUNK_STATE_FREE;
 
     chunk_update_lists_locked(pmm, chunk);
 }
@@ -3173,134 +2945,6 @@ cleanup:
     return status;
 }
 
-typedef struct
-{
-    // Start/end of the physical region to be traversed (IN)
-    NvU64 phys_start;
-    NvU64 phys_end;
-
-    // Pointer to the array of mappins where to store results (OUT)
-    uvm_reverse_map_t *mappings;
-
-    // Number of entries written to mappings (OUT)
-    NvU32 num_mappings;
-} get_chunk_mappings_data_t;
-
-// Chunk traversal function used for phys-to-virt translation. These are the
-// possible return values.
-//
-// - NV_ERR_OUT_OF_RANGE: no allocated physical chunks were found
-// - NV_ERR_MORE_DATA_AVAILABLE: allocated physical chunks were found
-// - NV_OK: allocated physical chunks may have been found. Check num_mappings
-static NV_STATUS get_chunk_mappings_in_range(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, void *data)
-{
-    uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
-    get_chunk_mappings_data_t *get_chunk_mappings_data = (get_chunk_mappings_data_t *)data;
-    NvU64 chunk_end = chunk->address + uvm_gpu_chunk_get_size(chunk) - 1;
-
-    uvm_assert_mutex_locked(&pmm->lock);
-
-    // Kernel chunks do not have assigned VA blocks so we can just skip them
-    if (chunk->type == UVM_PMM_GPU_MEMORY_TYPE_KERNEL)
-        return NV_WARN_NOTHING_TO_DO;
-
-    // This chunk is located before the requested physical range. Skip its
-    // children and keep going
-    if (chunk_end < get_chunk_mappings_data->phys_start)
-        return NV_WARN_NOTHING_TO_DO;
-
-    // We are beyond the search phys range. Stop traversing.
-    if (chunk->address > get_chunk_mappings_data->phys_end) {
-        if (get_chunk_mappings_data->num_mappings > 0)
-            return NV_ERR_MORE_DATA_AVAILABLE;
-        else
-            return NV_ERR_OUT_OF_RANGE;
-    }
-
-    uvm_spin_lock(&pmm->list_lock);
-
-    // Return results for allocated leaf chunks, only
-    if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED) {
-        uvm_reverse_map_t *reverse_map;
-
-        UVM_ASSERT(chunk->va_block);
-        uvm_va_block_retain(chunk->va_block);
-
-        reverse_map = &get_chunk_mappings_data->mappings[get_chunk_mappings_data->num_mappings];
-
-        reverse_map->va_block = chunk->va_block;
-        reverse_map->region = uvm_va_block_region(chunk->va_block_page_index,
-                                                  chunk->va_block_page_index + uvm_gpu_chunk_get_size(chunk) / PAGE_SIZE);
-        reverse_map->owner = gpu->id;
-
-        // If we land in the middle of a chunk, adjust the offset
-        if (get_chunk_mappings_data->phys_start > chunk->address) {
-            NvU64 offset = get_chunk_mappings_data->phys_start - chunk->address;
-
-            reverse_map->region.first += offset / PAGE_SIZE;
-        }
-
-        // If the physical range doesn't cover the whole chunk, adjust num_pages
-        if (get_chunk_mappings_data->phys_end < chunk_end)
-            reverse_map->region.outer -= (chunk_end - get_chunk_mappings_data->phys_end) / PAGE_SIZE;
-
-        ++get_chunk_mappings_data->num_mappings;
-    }
-
-    uvm_spin_unlock(&pmm->list_lock);
-
-    return NV_OK;
-}
-
-NvU32 uvm_pmm_gpu_phys_to_virt(uvm_pmm_gpu_t *pmm, NvU64 phys_addr, NvU64 region_size, uvm_reverse_map_t *out_mappings)
-{
-    NvU64 chunk_base_addr = UVM_ALIGN_DOWN(phys_addr, UVM_CHUNK_SIZE_MAX);
-    NvU64 size_in_chunk = min(UVM_CHUNK_SIZE_MAX - (phys_addr - chunk_base_addr), region_size);
-    NvU32 num_mappings = 0;
-
-    UVM_ASSERT(PAGE_ALIGNED(phys_addr));
-    UVM_ASSERT(PAGE_ALIGNED(region_size));
-
-    uvm_mutex_lock(&pmm->lock);
-
-    // Traverse the whole requested region
-    do {
-        NV_STATUS status = NV_OK;
-        uvm_gpu_root_chunk_t *root_chunk = root_chunk_from_address(pmm, phys_addr);
-        uvm_gpu_chunk_t *chunk = &root_chunk->chunk;
-        get_chunk_mappings_data_t get_chunk_mappings_data;
-
-        get_chunk_mappings_data.phys_start = phys_addr;
-        get_chunk_mappings_data.phys_end = phys_addr + size_in_chunk - 1;
-        get_chunk_mappings_data.mappings = out_mappings + num_mappings;
-        get_chunk_mappings_data.num_mappings = 0;
-
-        // Walk the chunks for the current root chunk
-        status = chunk_walk_pre_order(pmm,
-                                      chunk,
-                                      get_chunk_mappings_in_range,
-                                      &get_chunk_mappings_data);
-        if (status == NV_ERR_OUT_OF_RANGE)
-            break;
-
-        if (get_chunk_mappings_data.num_mappings > 0) {
-            UVM_ASSERT(status == NV_OK || status == NV_ERR_MORE_DATA_AVAILABLE);
-            num_mappings += get_chunk_mappings_data.num_mappings;
-        }
-        else {
-            UVM_ASSERT(status == NV_OK);
-        }
-
-        region_size -= size_in_chunk;
-        phys_addr += size_in_chunk;
-        size_in_chunk = min((NvU64)UVM_CHUNK_SIZE_MAX, region_size);
-    } while (region_size > 0);
-
-    uvm_mutex_unlock(&pmm->lock);
-
-    return num_mappings;
-}
-
 #if UVM_IS_CONFIG_HMM()
 
 uvm_gpu_chunk_t *uvm_pmm_devmem_page_to_chunk(struct page *page)
@@ -3336,7 +2980,7 @@ static bool uvm_pmm_gpu_check_orphan_pages(uvm_pmm_gpu_t *pmm)
     unsigned long devmem_end;
     unsigned long pfn;
 
-    if (!pmm->initialized || !uvm_hmm_is_enabled_system_wide())
+    if (!pmm->initialized || !uvm_hmm_is_enabled_system_wide() || !gpu->parent->devmem)
         return ret;
 
     devmem_start = gpu->parent->devmem->pagemap.range.start + gpu->mem_info.phys_start;
@@ -3361,6 +3005,11 @@ static bool uvm_pmm_gpu_check_orphan_pages(uvm_pmm_gpu_t *pmm)
             break;
         }
 
+        if (page->zone_device_data) {
+            ret = false;
+            break;
+        }
+
         if (page_count(page)) {
             ret = false;
             break;
@@ -3375,6 +3024,14 @@ static void devmem_page_free(struct page *page)
     uvm_gpu_chunk_t *chunk = uvm_pmm_devmem_page_to_chunk(page);
     uvm_gpu_t *gpu = uvm_gpu_chunk_get_gpu(chunk);
 
+    if (chunk->va_block) {
+        uvm_va_space_t *va_space = chunk->va_block->hmm.va_space;
+
+        UVM_ASSERT(va_space);
+        atomic64_dec(&va_space->hmm.allocated_page_count);
+        UVM_ASSERT(atomic64_read(&va_space->hmm.allocated_page_count) >= 0);
+    }
+
     page->zone_device_data = NULL;
 
     // We should be calling free_chunk() except that it acquires a mutex and
@@ -3384,13 +3041,30 @@ static void devmem_page_free(struct page *page)
     spin_lock(&gpu->pmm.list_lock.lock);
 
     UVM_ASSERT(chunk->is_referenced);
+
+    chunk->va_block = NULL;
     chunk->is_referenced = false;
+
+    if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED) {
+        list_del_init(&chunk->list);
+        chunk_pin(&gpu->pmm, chunk);
+    }
+    else {
+        UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
+        UVM_ASSERT(list_empty(&chunk->list));
+    }
+
     list_add_tail(&chunk->list, &gpu->pmm.root_chunks.va_block_lazy_free);
 
     spin_unlock(&gpu->pmm.list_lock.lock);
 
     nv_kthread_q_schedule_q_item(&gpu->parent->lazy_free_q,
                                  &gpu->pmm.root_chunks.va_block_lazy_free_q_item);
+}
+
+static void devmem_folio_free(struct folio *folio)
+{
+    devmem_page_free(&folio->page);
 }
 
 // This is called by HMM when the CPU faults on a ZONE_DEVICE private entry.
@@ -3401,7 +3075,7 @@ static vm_fault_t devmem_fault(struct vm_fault *vmf)
     if (!va_space)
         return VM_FAULT_SIGBUS;
 
-    return uvm_va_space_cpu_fault_hmm(va_space, vmf->vma, vmf);
+    return uvm_va_space_cpu_fault_hmm(va_space, vmf);
 }
 
 static vm_fault_t devmem_fault_entry(struct vm_fault *vmf)
@@ -3411,7 +3085,11 @@ static vm_fault_t devmem_fault_entry(struct vm_fault *vmf)
 
 static const struct dev_pagemap_ops uvm_pmm_devmem_ops =
 {
+#if defined(NV_PAGEMAP_OPS_HAS_FOLIO_FREE)
+    .folio_free = devmem_folio_free,
+#else
     .page_free = devmem_page_free,
+#endif
     .migrate_to_ram = devmem_fault_entry,
 };
 
@@ -3480,47 +3158,6 @@ err:
     return NULL;
 }
 
-NV_STATUS uvm_pmm_devmem_init(uvm_parent_gpu_t *gpu)
-{
-    // Create a DEVICE_PRIVATE page for every GPU page available on the parent.
-    unsigned long size = gpu->max_allocatable_address;
-
-    if (!uvm_hmm_is_enabled_system_wide()) {
-        gpu->devmem = NULL;
-        return NV_OK;
-    }
-
-    gpu->devmem = devmem_reuse_pagemap(size);
-    if (!gpu->devmem)
-        gpu->devmem = devmem_alloc_pagemap(size);
-
-    if (!gpu->devmem)
-        return NV_ERR_NO_MEMORY;
-
-    return NV_OK;
-}
-
-void uvm_pmm_devmem_deinit(uvm_parent_gpu_t *gpu)
-{
-    if (!gpu->devmem)
-        return;
-
-    list_add_tail(&gpu->devmem->list_node, &g_uvm_global.devmem_ranges.list);
-    gpu->devmem = NULL;
-}
-
-void uvm_pmm_devmem_exit(void)
-{
-    uvm_pmm_gpu_devmem_t *devmem, *devmem_next;
-
-    list_for_each_entry_safe(devmem, devmem_next, &g_uvm_global.devmem_ranges.list, list_node) {
-        list_del(&devmem->list_node);
-        memunmap_pages(&devmem->pagemap);
-        release_mem_region(devmem->pagemap.range.start, range_len(&devmem->pagemap.range));
-        kfree(devmem);
-    }
-}
-
 unsigned long uvm_pmm_gpu_devmem_get_pfn(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 {
     uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
@@ -3528,26 +3165,106 @@ unsigned long uvm_pmm_gpu_devmem_get_pfn(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *ch
 
     return (devmem_start + chunk->address) >> PAGE_SHIFT;
 }
-
+#else // UVM_IS_CONFIG_HMM()
+static void *devmem_alloc_pagemap(unsigned long size) { return NULL; }
+static void *devmem_reuse_pagemap(unsigned long size) { return NULL; }
 #endif // UVM_IS_CONFIG_HMM()
 
-#if !UVM_IS_CONFIG_HMM()
-NV_STATUS uvm_pmm_devmem_init(uvm_parent_gpu_t *gpu)
+#if defined(CONFIG_PCI_P2PDMA)
+// PCI P2PDMA device caching functions
+// Similar to devmem caching, we cache PCI devices to avoid expensive
+// registration/unregistration cycles during GPU add/remove operations.
+
+// This function tries to find an existing PCI device registration and if
+// available returns it for reuse.
+static uvm_pmm_gpu_pci_dev_list_t *uvm_pmm_pci_p2pdma_reuse_device(struct pci_dev *pdev)
 {
-    return NV_OK;
+    uvm_pmm_gpu_pci_dev_list_t *pci_dev_entry;
+
+    list_for_each_entry(pci_dev_entry, &g_uvm_global.pci_p2pdma_devices.list, list_node) {
+        if (pci_dev_entry->pdev == pdev) {
+            struct dev_pagemap *pgmap = NV_GET_DEV_PAGEMAP(pci_dev_entry->dev_start_pfn);
+
+            // If a valid pagemap is present for the start pfn, the p2pdma registration
+            // is valid and can be reused.
+            if (pgmap) {
+                put_dev_pagemap(pgmap);
+                return pci_dev_entry;
+            }
+            else {
+                // The device was present, but hotplug or another event such as unbind
+                // removed the device from underneath, start fresh.
+                list_del_init(&pci_dev_entry->list_node);
+                uvm_kvfree(pci_dev_entry);
+                break;
+            }
+        }
+    }
+
+    return NULL;
 }
 
-void uvm_pmm_devmem_deinit(uvm_parent_gpu_t *gpu)
+// This function caches a PCI device registration for later reuse.
+static void uvm_pmm_pci_p2pdma_cache_device(struct pci_dev *pdev, unsigned long dev_start_pfn)
 {
+    uvm_pmm_gpu_pci_dev_list_t *pci_dev_entry;
+
+    pci_dev_entry = uvm_kvmalloc_zero(sizeof(*pci_dev_entry));
+    if (!pci_dev_entry) {
+        // If we can't allocate memory for caching, we'll just skip caching
+        // This is not a fatal error, just means we'll have to re-register next time
+        return;
+    }
+
+    pci_dev_entry->pdev = pdev;
+    pci_dev_entry->func = NV_PCI_DEVFN(pdev);
+    pci_dev_entry->bus = NV_PCI_BUS_NUMBER(pdev);
+    pci_dev_entry->domain = NV_PCI_DOMAIN_NUMBER(pdev);
+    pci_dev_entry->dev_start_pfn = dev_start_pfn;
+
+    list_add_tail(&pci_dev_entry->list_node, &g_uvm_global.pci_p2pdma_devices.list);
 }
 
-static bool uvm_pmm_gpu_check_orphan_pages(uvm_pmm_gpu_t *pmm)
+// PCI P2PDMA cleanup function
+void uvm_pmm_pci_p2pdma_cache_exit(void)
 {
-    return true;
-}
-#endif // UVM_IS_CONFIG_HMM()
+    uvm_pmm_gpu_pci_dev_list_t *pci_dev_entry, *pci_dev_next;
 
-#if defined(CONFIG_PCI_P2PDMA) && defined(NV_STRUCT_PAGE_HAS_ZONE_DEVICE_DATA)
+    list_for_each_entry_safe(pci_dev_entry, pci_dev_next, &g_uvm_global.pci_p2pdma_devices.list, list_node) {
+
+        // If there was a race with PCI hotplug, the devm release action would free the
+        // memory associated with the pci p2p dma memory. Otherwise get a reference
+        // to the device and ensure it's still present before freeing pages
+        if (pci_device_is_present(pci_dev_entry->pdev)) {
+            struct pci_dev *pdev = NV_GET_DOMAIN_BUS_AND_SLOT(pci_dev_entry->domain, pci_dev_entry->bus, pci_dev_entry->func);
+
+            if (pdev) {
+                struct dev_pagemap *pgmap;
+
+                UVM_ASSERT(pdev == pci_dev_entry->pdev);
+
+                pgmap = NV_GET_DEV_PAGEMAP(pci_dev_entry->dev_start_pfn);
+                if (pgmap) {
+                    put_dev_pagemap(pgmap);
+                    devm_memunmap_pages(&pdev->dev, pgmap);
+                }
+
+                pci_dev_put(pdev);
+            }
+
+            list_del(&pci_dev_entry->list_node);
+            uvm_kvfree(pci_dev_entry);
+        }
+    }
+}
+#else // CONFIG_PCI_P2PDMA
+void uvm_pmm_pci_p2pdma_cache_exit(void)
+{
+
+}
+#endif // CONFIG_PCI_P2PDMA
+
+#if (UVM_CDMM_PAGES_SUPPORTED() || defined(CONFIG_PCI_P2PDMA)) && defined(NV_STRUCT_PAGE_HAS_ZONE_DEVICE_DATA)
 static void device_p2p_page_free_wake(struct nv_kref *ref)
 {
     uvm_device_p2p_mem_t *p2p_mem = container_of(ref, uvm_device_p2p_mem_t, refcount);
@@ -3562,37 +3279,222 @@ static void device_p2p_page_free(struct page *page)
     nv_kref_put(&p2p_mem->refcount, device_p2p_page_free_wake);
 }
 
-static const struct dev_pagemap_ops uvm_device_p2p_pgmap_ops =
+static void device_p2p_folio_free(struct folio *folio)
 {
-    .page_free = device_p2p_page_free,
+    device_p2p_page_free(&folio->page);
+}
+#endif
+
+#if UVM_CDMM_PAGES_SUPPORTED()
+static void device_coherent_page_free(struct page *page)
+{
+    device_p2p_page_free(page);
+}
+
+static void device_coherent_folio_free(struct folio *folio)
+{
+    device_p2p_page_free(&folio->page);
+}
+
+static const struct dev_pagemap_ops uvm_device_coherent_pgmap_ops =
+{
+#if defined(NV_PAGEMAP_OPS_HAS_FOLIO_FREE)
+    .folio_free = device_coherent_folio_free,
+#else
+    .page_free = device_coherent_page_free,
+#endif
 };
 
-void uvm_pmm_gpu_device_p2p_init(uvm_gpu_t *gpu)
+static NV_STATUS uvm_pmm_cdmm_init(uvm_parent_gpu_t *parent_gpu)
 {
-    unsigned long pci_start_pfn = pci_resource_start(gpu->parent->pci_dev,
-                                                     uvm_device_p2p_static_bar(gpu)) >> PAGE_SHIFT;
-    unsigned long pci_end_pfn = pci_start_pfn + (gpu->mem_info.static_bar1_size >> PAGE_SHIFT);
-    struct page *p2p_page;
+    uvm_pmm_gpu_devmem_t *devmem;
+    void *ptr;
+    NV_STATUS status;
 
-    gpu->device_p2p_initialised = false;
-    uvm_mutex_init(&gpu->device_p2p_lock, UVM_LOCK_ORDER_GLOBAL);
+    UVM_ASSERT(!uvm_hmm_is_enabled_system_wide());
 
-    if (uvm_parent_gpu_is_coherent(gpu->parent)) {
-        // A coherent system uses normal struct pages.
-        gpu->device_p2p_initialised = true;
+    list_for_each_entry(devmem, &g_uvm_global.devmem_ranges.list, list_node) {
+        if (devmem->pagemap.range.start == parent_gpu->system_bus.memory_window_start) {
+            UVM_ASSERT(devmem->pagemap.type == MEMORY_DEVICE_COHERENT);
+            UVM_ASSERT(devmem->pagemap.range.end ==
+                       SUBSECTION_ALIGN_UP(parent_gpu->system_bus.memory_window_end >> PAGE_SHIFT) << PAGE_SHIFT);
+            list_del(&devmem->list_node);
+            parent_gpu->devmem = devmem;
+            parent_gpu->device_p2p_initialised = true;
+            return NV_OK;
+        }
+    }
+
+    devmem = kzalloc(sizeof(*devmem), GFP_KERNEL);
+    if (!devmem)
+        goto err;
+
+    devmem->size = parent_gpu->system_bus.memory_window_end - parent_gpu->system_bus.memory_window_start;
+    devmem->pagemap.type = MEMORY_DEVICE_COHERENT;
+    devmem->pagemap.range.start = parent_gpu->system_bus.memory_window_start;
+    devmem->pagemap.range.end = SUBSECTION_ALIGN_UP(parent_gpu->system_bus.memory_window_end >> PAGE_SHIFT) << PAGE_SHIFT;
+    devmem->pagemap.nr_range = 1;
+    devmem->pagemap.ops = &uvm_device_coherent_pgmap_ops;
+    devmem->pagemap.owner = &g_uvm_global;
+
+    // Numa node ID doesn't matter for ZONE_DEVICE coherent pages.
+    ptr = memremap_pages(&devmem->pagemap, NUMA_NO_NODE);
+    if (IS_ERR(ptr)) {
+        UVM_ERR_PRINT("memremap_pages() err %ld\n", PTR_ERR(ptr));
+        status = errno_to_nv_status(PTR_ERR(ptr));
+        goto err_free;
+    }
+
+    parent_gpu->devmem = devmem;
+    parent_gpu->device_p2p_initialised = true;
+
+    return NV_OK;
+
+err_free:
+    kfree(devmem);
+
+err:
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static void uvm_pmm_cdmm_deinit(uvm_parent_gpu_t *parent_gpu)
+{
+    parent_gpu->device_p2p_initialised = false;
+    list_add_tail(&parent_gpu->devmem->list_node, &g_uvm_global.devmem_ranges.list);
+    parent_gpu->devmem = NULL;
+}
+#else // UVM_CDMM_PAGES_SUPPORTED
+static NV_STATUS uvm_pmm_cdmm_init(uvm_parent_gpu_t *parent_gpu) { return NV_OK; }
+static void uvm_pmm_cdmm_deinit(uvm_parent_gpu_t *parent_gpu) {}
+#endif // UVM_CDMM_PAGES_SUPPORTED
+
+#if UVM_IS_CONFIG_HMM() || UVM_CDMM_PAGES_SUPPORTED()
+NV_STATUS uvm_pmm_devmem_init(uvm_parent_gpu_t *gpu)
+{
+    // Create a DEVICE_PRIVATE page for every GPU page available on the parent.
+    unsigned long size = gpu->max_allocatable_address;
+
+    if (gpu->cdmm_enabled)
+        return uvm_pmm_cdmm_init(gpu);
+
+    if (!uvm_hmm_is_enabled_system_wide()) {
+        gpu->devmem = NULL;
+        return NV_OK;
+    }
+
+    if (gpu->test.inject_error.disable_devmem)
+        return NV_ERR_BUSY_RETRY;
+
+    gpu->devmem = devmem_reuse_pagemap(size);
+    if (!gpu->devmem)
+        gpu->devmem = devmem_alloc_pagemap(size);
+
+    if (!gpu->devmem)
+        return NV_ERR_BUSY_RETRY;
+
+    return NV_OK;
+}
+
+void uvm_pmm_devmem_deinit(uvm_parent_gpu_t *gpu)
+{
+    if (gpu->cdmm_enabled && gpu->devmem) {
+        uvm_pmm_cdmm_deinit(gpu);
         return;
     }
 
-    // RM sets this when it has created a contiguous BAR mapping large enough to
-    // cover all of GPU memory that will be allocated to userspace buffers. This
-    // is required to support the P2PDMA feature to ensure we have a P2PDMA page
-    // available for every mapping.
-    if (!gpu->mem_info.static_bar1_size)
+    if (!gpu->devmem)
         return;
 
-    if (pci_p2pdma_add_resource(gpu->parent->pci_dev, uvm_device_p2p_static_bar(gpu), 0, 0)) {
-        UVM_ERR_PRINT("Unable to initialse PCI P2PDMA pages\n");
+    list_add_tail(&gpu->devmem->list_node, &g_uvm_global.devmem_ranges.list);
+    gpu->devmem = NULL;
+}
+
+void uvm_pmm_devmem_exit(void)
+{
+    uvm_pmm_gpu_devmem_t *devmem, *devmem_next;
+
+    list_for_each_entry_safe(devmem, devmem_next, &g_uvm_global.devmem_ranges.list, list_node) {
+        list_del(&devmem->list_node);
+        memunmap_pages(&devmem->pagemap);
+        if (devmem->pagemap.type == MEMORY_DEVICE_PRIVATE)
+            release_mem_region(devmem->pagemap.range.start, range_len(&devmem->pagemap.range));
+        kfree(devmem);
+    }
+}
+#else
+NV_STATUS uvm_pmm_devmem_init(uvm_parent_gpu_t *gpu) { return NV_OK; }
+void uvm_pmm_devmem_deinit(uvm_parent_gpu_t *gpu) {}
+void uvm_pmm_devmem_exit(void) {}
+#endif
+
+#if !UVM_IS_CONFIG_HMM()
+static bool uvm_pmm_gpu_check_orphan_pages(uvm_pmm_gpu_t *pmm)
+{
+    return true;
+}
+#endif // UVM_IS_CONFIG_HMM()
+
+// PCI P2PDMA pages are not well supported by the kernel/architecture on all
+// ARM64 based systems so disable support for those systems.
+// TODO: Bug 5303506: ARM64: P2PDMA pages cannot be accessed from the CPU on
+// ARM
+#if defined(CONFIG_PCI_P2PDMA) && defined(NV_STRUCT_PAGE_HAS_ZONE_DEVICE_DATA) && !defined(NVCPU_AARCH64)
+
+static const struct dev_pagemap_ops uvm_device_p2p_pgmap_ops =
+{
+#if defined(NV_PAGEMAP_OPS_HAS_FOLIO_FREE)
+    .folio_free = device_p2p_folio_free,
+#else
+    .page_free = device_p2p_page_free,
+#endif
+};
+
+void uvm_pmm_gpu_device_p2p_init(uvm_parent_gpu_t *parent_gpu)
+{
+    unsigned long pci_start_pfn = pci_resource_start(parent_gpu->pci_dev,
+                                                     uvm_device_p2p_static_bar(parent_gpu)) >> PAGE_SHIFT;
+    unsigned long pci_end_pfn = pci_start_pfn + (parent_gpu->static_bar1_size >> PAGE_SHIFT);
+    struct page *p2p_page;
+    uvm_pmm_gpu_pci_dev_list_t *cached_pci_dev;
+
+    if (uvm_parent_gpu_is_coherent(parent_gpu)) {
+        // P2PDMA support with CDMM enabled requires special
+        // MEMORY_DEVICE_COHERENT pages to have been allocated which will have
+        // also set the p2p initialised state if successful.
+        if (parent_gpu->cdmm_enabled)
+            return;
+
+        parent_gpu->device_p2p_initialised = true;
         return;
+    }
+
+    parent_gpu->device_p2p_initialised = false;
+
+    // RM sets static_bar1_size when it has created a contiguous BAR mapping
+    // large enough to cover all of GPU memory that will be allocated to
+    // userspace buffers. This is required to support the P2PDMA feature to
+    // ensure we have a P2PDMA page available for every mapping.
+    //
+    // Due to current limitations in the Linux kernel we can only create
+    // the P2PDMA pages if the BAR1 region has not already been mapped
+    // write-combined. By default RM maps the region write-combined, but this
+    // can be disabled by setting the RmForceDisableIomapWC regkey which allows
+    // creation of the P2PDMA pages.
+    // TODO: Bug 5044562: P2PDMA pages require the PCIe BAR to be mapped UC
+    if (!parent_gpu->static_bar1_size || parent_gpu->static_bar1_write_combined)
+        return;
+
+    // Try to reuse a cached PCI device registration first
+    cached_pci_dev = uvm_pmm_pci_p2pdma_reuse_device(parent_gpu->pci_dev);
+
+    // If we didn't find a cached registration or couldn't reuse it, register now
+    if (!cached_pci_dev) {
+        if (pci_p2pdma_add_resource(parent_gpu->pci_dev, uvm_device_p2p_static_bar(parent_gpu), 0, 0)) {
+            UVM_ERR_PRINT("Unable to initialse PCI P2PDMA pages\n");
+            return;
+        }
+        // Cache once and reuse till the driver is unloaded
+        uvm_pmm_pci_p2pdma_cache_device(parent_gpu->pci_dev, pci_start_pfn);
     }
 
     // The current upstream PCIe P2PDMA architecture does not allow drivers to
@@ -3606,40 +3508,31 @@ void uvm_pmm_gpu_device_p2p_init(uvm_gpu_t *gpu)
     for (; page_to_pfn(p2p_page) < pci_end_pfn; p2p_page++)
         p2p_page->zone_device_data = NULL;
 
-    gpu->device_p2p_initialised = true;
+    parent_gpu->device_p2p_initialised = true;
 }
 
-void uvm_pmm_gpu_device_p2p_deinit(uvm_gpu_t *gpu)
+void uvm_pmm_gpu_device_p2p_deinit(uvm_parent_gpu_t *parent_gpu)
 {
-    unsigned long pci_start_pfn = pci_resource_start(gpu->parent->pci_dev,
-                                                     uvm_device_p2p_static_bar(gpu)) >> PAGE_SHIFT;
-    struct page *p2p_page;
-
-    if (gpu->device_p2p_initialised && !uvm_parent_gpu_is_coherent(gpu->parent)) {
-        p2p_page = pfn_to_page(pci_start_pfn);
-        devm_memunmap_pages(&gpu->parent->pci_dev->dev, page_pgmap(p2p_page));
-    }
-
-    gpu->device_p2p_initialised = false;
+    parent_gpu->device_p2p_initialised = false;
 }
 #else // CONFIG_PCI_P2PDMA
 
 // Coherent platforms can do P2PDMA without CONFIG_PCI_P2PDMA
-void uvm_pmm_gpu_device_p2p_init(uvm_gpu_t *gpu)
+void uvm_pmm_gpu_device_p2p_init(uvm_parent_gpu_t *parent_gpu)
 {
-    gpu->device_p2p_initialised = false;
-    uvm_mutex_init(&gpu->device_p2p_lock, UVM_LOCK_ORDER_GLOBAL);
+    if (uvm_parent_gpu_is_coherent(parent_gpu)) {
+        if (parent_gpu->cdmm_enabled)
+            return;
 
-    if (uvm_parent_gpu_is_coherent(gpu->parent)) {
         // A coherent system uses normal struct pages.
-        gpu->device_p2p_initialised = true;
+        parent_gpu->device_p2p_initialised = true;
         return;
     }
 }
 
-void uvm_pmm_gpu_device_p2p_deinit(uvm_gpu_t *gpu)
+void uvm_pmm_gpu_device_p2p_deinit(uvm_parent_gpu_t *parent_gpu)
 {
-    gpu->device_p2p_initialised = false;
+    parent_gpu->device_p2p_initialised = false;
 }
 #endif // CONFIG_PCI_P2PDMA
 
@@ -3654,6 +3547,7 @@ static void process_lazy_free(uvm_pmm_gpu_t *pmm)
     // is empty.
     while (!list_empty(&pmm->root_chunks.va_block_lazy_free)) {
         chunk = list_first_entry(&pmm->root_chunks.va_block_lazy_free, uvm_gpu_chunk_t, list);
+        UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
         list_del_init(&chunk->list);
         uvm_spin_unlock(&pmm->list_lock);
 
@@ -3679,6 +3573,7 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
         { 0, uvm_mem_kernel_chunk_sizes(gpu)},
     };
     NV_STATUS status = NV_OK;
+    uvm_pmm_alloc_list_t alloc_list;
     size_t i, j, k;
 
     // UVM_CHUNK_SIZE_INVALID is UVM_CHUNK_SIZE_MAX shifted left by 1. This
@@ -3693,10 +3588,14 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
                 INIT_LIST_HEAD(&pmm->free_list[i][j][k]);
         }
     }
-    INIT_LIST_HEAD(&pmm->root_chunks.va_block_used);
-    INIT_LIST_HEAD(&pmm->root_chunks.va_block_unused);
+
+    for (alloc_list = 0; alloc_list < UVM_PMM_ALLOC_LIST_COUNT; alloc_list++)
+        INIT_LIST_HEAD(&pmm->root_chunks.alloc_list[alloc_list]);
+
     INIT_LIST_HEAD(&pmm->root_chunks.va_block_lazy_free);
     nv_kthread_q_item_init(&pmm->root_chunks.va_block_lazy_free_q_item, process_lazy_free_entry, pmm);
+    pmm->root_chunks.pinned_count = 0;
+    pmm->root_chunks.in_eviction_count = 0;
 
     uvm_mutex_init(&pmm->lock, UVM_LOCK_ORDER_PMM);
     uvm_init_rwsem(&pmm->pma_lock, UVM_LOCK_ORDER_PMM_PMA);
@@ -3752,7 +3651,6 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
         chunk->state = UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED;
         uvm_gpu_chunk_set_size(chunk, UVM_CHUNK_SIZE_MAX);
         chunk->address = i * UVM_CHUNK_SIZE_MAX;
-        chunk->va_block_page_index = PAGES_PER_UVM_VA_BLOCK;
     }
 
     status = uvm_bit_locks_init(&pmm->root_chunks.bitlocks, pmm->root_chunks.count, UVM_LOCK_ORDER_PMM_ROOT_CHUNK);
@@ -3810,9 +3708,9 @@ void uvm_pmm_gpu_deinit(uvm_pmm_gpu_t *pmm)
 
     gpu = uvm_pmm_to_gpu(pmm);
 
-    UVM_ASSERT(uvm_pmm_gpu_check_orphan_pages(pmm));
     nv_kthread_q_flush(&gpu->parent->lazy_free_q);
     UVM_ASSERT(list_empty(&pmm->root_chunks.va_block_lazy_free));
+    UVM_ASSERT(uvm_pmm_gpu_check_orphan_pages(pmm));
     release_free_root_chunks(pmm);
 
     if (gpu->mem_info.size != 0 && gpu_supports_pma_eviction(gpu))
@@ -3866,7 +3764,7 @@ NV_STATUS uvm_test_evict_chunk(UVM_TEST_EVICT_CHUNK_PARAMS *params, struct file 
     uvm_va_space_down_read(va_space);
 
     gpu = uvm_va_space_get_gpu_by_uuid(va_space, &params->gpu_uuid);
-    if (!gpu || !uvm_parent_gpu_supports_eviction(gpu->parent)) {
+    if (!gpu) {
         uvm_va_space_up_read(va_space);
         uvm_va_space_mm_or_current_release_unlock(va_space, mm);
         return NV_ERR_INVALID_DEVICE;
@@ -4204,4 +4102,56 @@ NV_STATUS uvm_test_pmm_query_pma_stats(UVM_TEST_PMM_QUERY_PMA_STATS_PARAMS *para
 
     uvm_gpu_release(gpu);
     return NV_OK;
+}
+
+NV_STATUS uvm_test_pmm_get_alloc_list(UVM_TEST_PMM_GET_ALLOC_LIST_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_gpu_t *gpu;
+    uvm_va_block_t *va_block;
+    uvm_gpu_chunk_t *chunk;
+    NV_STATUS status = NV_OK;
+
+    // -Wall implies -Wenum-compare, so cast through int to avoid warnings
+    BUILD_BUG_ON((int)UVM_TEST_PMM_ALLOC_LIST_UNUSED    != (int)UVM_PMM_ALLOC_LIST_UNUSED);
+    BUILD_BUG_ON((int)UVM_TEST_PMM_ALLOC_LIST_DISCARDED != (int)UVM_PMM_ALLOC_LIST_DISCARDED);
+    BUILD_BUG_ON((int)UVM_TEST_PMM_ALLOC_LIST_USED      != (int)UVM_PMM_ALLOC_LIST_USED);
+    BUILD_BUG_ON((int)UVM_TEST_PMM_ALLOC_LIST_COUNT     != (int)UVM_PMM_ALLOC_LIST_COUNT);
+
+    uvm_va_space_down_read(va_space);
+
+    gpu = uvm_va_space_get_gpu_by_uuid(va_space, &params->gpu_uuid);
+    if (!gpu) {
+        status = NV_ERR_INVALID_DEVICE;
+        goto out;
+    }
+
+    status = uvm_va_block_find(va_space, params->address, &va_block);
+    if (status != NV_OK)
+        goto out;
+
+    // No chunk or chunk not on an alloc list
+    status = NV_ERR_INVALID_STATE;
+
+    uvm_mutex_lock(&va_block->lock);
+
+    chunk = uvm_va_block_lookup_gpu_chunk(va_block, gpu, params->address);
+    if (chunk) {
+        uvm_pmm_alloc_list_t alloc_list;
+
+        uvm_spin_lock(&gpu->pmm.list_lock);
+        alloc_list = get_alloc_list(&gpu->pmm, chunk);
+        uvm_spin_unlock(&gpu->pmm.list_lock);
+
+        if (alloc_list != UVM_PMM_ALLOC_LIST_COUNT) {
+            params->list_type = alloc_list;
+            status = NV_OK;
+        }
+    }
+
+    uvm_mutex_unlock(&va_block->lock);
+
+out:
+    uvm_va_space_up_read(va_space);
+    return status;
 }

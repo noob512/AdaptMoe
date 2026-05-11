@@ -33,6 +33,7 @@
 #define BPPX256_SCALER       256U
 
 #include "os/os.h"
+#include "core/locks.h"
 #include "gpu/gpu.h"
 #include "gpu/disp/kern_disp.h"
 #include "gpu/disp/disp_objs.h"
@@ -133,6 +134,10 @@ dispcmnCtrlCmdSystemAllocateDisplayBandwidth_IMPL
         return status;
     }
 
+    status = dispapiValidateRmctrlPriv(pGpu);
+    if (status != NV_OK)
+        return status;
+
     pKernelDisplay = GPU_GET_KERNEL_DISPLAY(pGpu);
     if (pKernelDisplay->getProperty(pKernelDisplay,
                                     PDB_PROP_KDISP_IMP_ALLOC_BW_IN_KERNEL_RM_DEF))
@@ -165,6 +170,80 @@ dispcmnCtrlCmdSystemAllocateDisplayBandwidth_IMPL
                             NV0073_CTRL_CMD_SYSTEM_INTERNAL_ALLOCATE_DISPLAY_BANDWIDTH,
                             pParams, sizeof(*pParams));
     }
+    return status;
+}
+
+/*!
+ * @brief Query Display Bandwidth values set by UEFI.
+ */
+NV_STATUS
+dispcmnCtrlCmdSystemQueryUefiDisplayBandwidth_IMPL
+(
+    DispCommon *pDispCommon,
+    NV0073_CTRL_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH_PARAMS *pParams
+)
+{
+    OBJGPU        *pGpu;
+    KernelDisplay *pKernelDisplay;
+    NV_STATUS      status;
+
+    // client gave us a subdevice #: get right pGpu for it
+    status = dispapiSetUnicastAndSynchronize_HAL(
+                               staticCast(pDispCommon, DisplayApi),
+                               DISPAPI_GET_GPUGRP(pDispCommon),
+                               &pGpu,
+                               NULL,
+                               pParams->subDeviceInstance);
+    if (status != NV_OK)
+    {
+        return status;
+    }
+
+    status = dispapiValidateRmctrlPriv(pGpu);
+    if (status != NV_OK)
+        return status;
+
+    pKernelDisplay = GPU_GET_KERNEL_DISPLAY(pGpu);
+
+    status =
+        kdispGetUefiDisplayBandwidth_HAL(pGpu,
+                                         pKernelDisplay,
+                                         &pParams->isoBandwidthKBPS,
+                                         &pParams->floorBandwidthKBPS);
+
+    return status;
+}
+
+NV_STATUS
+dispcmnCtrlCmdSystemGetVblankEnable_IMPL
+(
+    DispCommon *pDispCommon,
+    NV0073_CTRL_SYSTEM_GET_VBLANK_ENABLE_PARAMS *pVBEnableParams
+)
+{
+    OBJGPU        *pGpu;
+    KernelDisplay *pKernelDisplay;
+    KernelHead    *pKernelHead;
+    NV_STATUS status = NV_OK;
+    // client gave us a subdevice #: get right pGpu for it
+    status = dispapiSetUnicastAndSynchronize_HAL(
+                               staticCast(pDispCommon, DisplayApi),
+                               DISPAPI_GET_GPUGRP(pDispCommon),
+                               &pGpu,
+                               NULL,
+                               pVBEnableParams->subDeviceInstance);
+    if(status != NV_OK)
+    {
+        return status;
+    }
+
+    pKernelDisplay = GPU_GET_KERNEL_DISPLAY(pGpu);
+    pKernelHead = KDISP_GET_HEAD(pKernelDisplay,pVBEnableParams->head);
+    NV_ASSERT_OR_RETURN(pKernelHead != NULL, NV_ERR_INVALID_ARGUMENT);
+
+    pVBEnableParams->bEnabled = (kheadReadVblankIntrState(pGpu, pKernelHead) !=
+                                 NV_HEAD_VBLANK_INTR_UNAVAILABLE);
+
     return status;
 }
 
@@ -310,10 +389,12 @@ static NV_STATUS _kheadCheckVblankCountCallback
     KernelDisplay *pKernelDisplay = GPU_GET_KERNEL_DISPLAY(pGpu);
     KernelHead    *pKernelHead    = KDISP_GET_HEAD(pKernelDisplay, param1);
 
+    portSyncSpinlockAcquire(pKernelHead->Vblank.pSpinlock);
     if ((--pKernelHead->Vblank.VblankCountTimeout) == 0)
     {
         pKernelHead->Vblank.Callback.CheckVblankCount.Flags &= ~VBLANK_CALLBACK_FLAG_PERSISTENT;
     }
+    portSyncSpinlockRelease(pKernelHead->Vblank.pSpinlock);
 
     return NV_OK;
 }
@@ -329,6 +410,14 @@ dispcmnCtrlCmdSystemGetVblankCounter_IMPL
     KernelDisplay *pKernelDisplay = GPU_GET_KERNEL_DISPLAY(pGpu);
     KernelHead    *pKernelHead;
     NvU32 flags =  (VBLANK_CALLBACK_FLAG_SPECIFIED_VBLANK_NEXT | VBLANK_CALLBACK_FLAG_PERSISTENT);
+
+    //
+    // Ensure that GPU locks are not held, otherwise we would need to maintain a strict order of locks,
+    // in case if some other GPU lock is held by the current thread. This is not necessary,
+    // since this ctrl/ would only be called by UMD clients, thus there would never be any GPU lock held.
+    // If any GPU lock is held by the current thread, we just bail out early.
+    //
+    NV_CHECK_OR_RETURN(LEVEL_ERROR, rmGpuLocksGetOwnedMask() == 0, NV_ERR_INVALID_LOCK_STATE);
 
     pKernelHead = KDISP_GET_HEAD(pKernelDisplay, pVBCounterParams->head);
     if (pKernelHead == NULL)
@@ -348,18 +437,45 @@ dispcmnCtrlCmdSystemGetVblankCounter_IMPL
         flags |= VBLANK_CALLBACK_FLAG_LOW_LATENCY;
     }
 
-    pKernelHead->Vblank.VblankCountTimeout = 60 * VBLANK_INFO_GATHER_KEEPALIVE_SECONDS;
+    //
+    // This spinlock is required to prevent a possible race condition with _kheadCheckVblankCountCallback,
+    // given that we don't hold the GPU lock at this point and VblankCountTimeout can be reset
+    // in _kheadCheckVblankCountCallback in parallel.
+    //
+    portSyncSpinlockAcquire(pKernelHead->Vblank.pSpinlock);
 
-    pKernelHead->Vblank.Callback.CheckVblankCount.Proc   = _kheadCheckVblankCountCallback;
-    pKernelHead->Vblank.Callback.CheckVblankCount.pObject = NULL;
-    pKernelHead->Vblank.Callback.CheckVblankCount.bObjectIsChannelDescendant = NV_FALSE;
-    pKernelHead->Vblank.Callback.CheckVblankCount.Param1 = pKernelHead->PublicId;
-    pKernelHead->Vblank.Callback.CheckVblankCount.Param2 = 0;
-    pKernelHead->Vblank.Callback.CheckVblankCount.Status = NV_OK;
-    pKernelHead->Vblank.Callback.CheckVblankCount.bIsVblankNotifyEnable = NV_TRUE;
-    pKernelHead->Vblank.Callback.CheckVblankCount.Flags  = flags;
+    NvBool bAddCallback = pKernelHead->Vblank.VblankCountTimeout == 0;
+    if (!bAddCallback)
+    {
+        pKernelHead->Vblank.VblankCountTimeout = 60 * VBLANK_INFO_GATHER_KEEPALIVE_SECONDS;
+    }
 
-    kheadAddVblankCallback(pGpu, pKernelHead, &pKernelHead->Vblank.Callback.CheckVblankCount);
+    //
+    // Safe to release the lock immediately, since the counter is monotonically decrementing and
+    // the only possible race condition here is adding multiple callbacks.
+    // But that wouldn't never happen, since kheadAddVblankCallback doesn't allow duplicates.
+    //
+    portSyncSpinlockRelease(pKernelHead->Vblank.pSpinlock);
+
+    if (bAddCallback)
+    {
+        NV_ASSERT_OK_OR_RETURN(rmDeviceGpuLocksAcquire(pGpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_DISP));
+
+        pKernelHead->Vblank.VblankCountTimeout = 60 * VBLANK_INFO_GATHER_KEEPALIVE_SECONDS;
+
+        pKernelHead->Vblank.Callback.CheckVblankCount.Proc   = _kheadCheckVblankCountCallback;
+        pKernelHead->Vblank.Callback.CheckVblankCount.pObject = NULL;
+        pKernelHead->Vblank.Callback.CheckVblankCount.bObjectIsChannelDescendant = NV_FALSE;
+        pKernelHead->Vblank.Callback.CheckVblankCount.Param1 = pKernelHead->PublicId;
+        pKernelHead->Vblank.Callback.CheckVblankCount.Param2 = 0;
+        pKernelHead->Vblank.Callback.CheckVblankCount.Status = NV_OK;
+        pKernelHead->Vblank.Callback.CheckVblankCount.bIsVblankNotifyEnable = NV_TRUE;
+        pKernelHead->Vblank.Callback.CheckVblankCount.Flags  = flags;
+
+        kheadAddVblankCallback(pGpu, pKernelHead, &pKernelHead->Vblank.Callback.CheckVblankCount);
+
+        rmDeviceGpuLocksRelease(pGpu, GPUS_LOCK_FLAGS_NONE, NULL);
+    }
 
     if (IS_GSP_CLIENT(pGpu))
     {
@@ -376,62 +492,6 @@ dispcmnCtrlCmdSystemGetVblankCounter_IMPL
     {
         pVBCounterParams->verticalBlankCounter = kheadGetVblankNormLatencyCounter_HAL(pKernelHead);
     }
-
-    return NV_OK;
-}
-
-/*
- * @brief This call engages the WAR for VR where the Pstate
- *        switching can cause delay in serving Vblank interrupts
- *        by servicing disp interrupts inline.
- *
- * @return
- *   NV_OK
- *     The request successfully completed.
- *   NV_ERR_INVALID_ARGUMENT
- *     Invalid argument is passed.
- */
-NV_STATUS
-dispcmnCtrlCmdInlineDispIntrServiceWarForVr_IMPL
-(
-    DispCommon *pDispCommon,
-    NV0073_CTRL_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR_PARAMS *pParams
-)
-{
-    OBJGPU   *pGpu  = NULL;
-    RM_API   *pRmApi;
-    NV_STATUS status;
-    KernelDisplay *pKernelDisplay = NULL;
-
-    // Get the right pGpu from subdevice instance given by client
-    status = dispapiSetUnicastAndSynchronize_HAL(
-                               staticCast(pDispCommon, DisplayApi),
-                               DISPAPI_GET_GPUGRP(pDispCommon),
-                               &pGpu,
-                               NULL,
-                               pParams->subDeviceInstance);
-
-    if (status != NV_OK)
-    {
-        return status;
-    }
-
-    SLI_LOOP_START(SLI_LOOP_FLAGS_BC_ONLY)
-
-    pKernelDisplay = GPU_GET_KERNEL_DISPLAY(pGpu);
-    if (pKernelDisplay == NULL)
-        SLI_LOOP_RETURN(NV_ERR_INVALID_STATE);
-
-    pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);
-
-    status = pRmApi->Control(pRmApi,
-                           RES_GET_CLIENT_HANDLE(pDispCommon),
-                           RES_GET_HANDLE(pDispCommon),
-                           NV0073_CTRL_CMD_INTERNAL_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR,
-                           pParams,
-                           sizeof(*pParams));
-
-    SLI_LOOP_END
 
     return NV_OK;
 }
@@ -504,6 +564,8 @@ dispcmnCtrlCmdCalculateDpImp_IMPL
     dpModesetData.SetRasterBlankEndX        = pParams->modesetInfo.rasterBlankEndX;
     dpModesetData.bDscEnable                = pParams->modesetInfo.bDSCEnabled;
     dpModesetData.colorFormat               = pParams->modesetInfo.colorFormat;
+    dpModesetData.twoChannelAudioHz         = pParams->modesetInfo.twoChannelAudioHz;
+    dpModesetData.eightChannelAudioHz       = pParams->modesetInfo.eightChannelAudioHz;
 
     if (dpModesetData.bDscEnable)
     {
@@ -616,6 +678,10 @@ dispcmnCtrlCmdSystemGetLoadVCounterInfo_IMPL
                                NULL,
                                pLoadVCounterInfoParams->subDeviceInstance);
 
+    if (status != NV_OK)
+        return status;
+
+    status = dispapiValidateRmctrlPriv(pGpu);
     if (status != NV_OK)
         return status;
 

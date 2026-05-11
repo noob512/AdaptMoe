@@ -271,8 +271,7 @@ static void EnableVRR(NVDpyEvoPtr pDpyEvo)
                          "%s: Failed to initialize G-SYNC",
                          pDpyEvo->name);
         }
-    } else if (pDispEvo->pDevEvo->caps.supportsDP13 &&
-               device->getIgnoreMSACap()) {
+    } else if (device->getIgnoreMSACap()) {
         // DP monitors indicate Adaptive-Sync support through the
         // MSA_TIMING_PAR_IGNORED bit in the DOWN_STREAM_PORT_COUNT register
         // (DP spec 1.4a section 2.2.4.1.1)
@@ -530,6 +529,14 @@ NvBool nvDPLibDpyIsYuv420ModeSupported(const NVDpyEvoRec *pDpyEvo)
     DisplayPort::Device *dev = (pDpyEvo->dp.pDpLibDevice != NULL) ?
         pDpyEvo->dp.pDpLibDevice->device : NULL;
     return (dev != NULL) && (dev->getSDPExtnForColorimetrySupported());
+}
+
+NvBool nvDPLibDpyUsesHDMIActivePcon(const NVDpyEvoRec *pDpyEvo)
+{
+    DisplayPort::Device *dev = (pDpyEvo->dp.pDpLibDevice != NULL) ?
+        pDpyEvo->dp.pDpLibDevice->device : NULL;
+    return (dev != NULL) &&
+           (dev->getConnectorType() == DisplayPort::connectorHDMI);
 }
 
 // Adaptive-Sync is enabled/disabled by setting the MSA_TIMING_PAR_IGNORE_EN

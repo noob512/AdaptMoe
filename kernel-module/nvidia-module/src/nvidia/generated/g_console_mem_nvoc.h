@@ -85,9 +85,6 @@ struct ConsoleMemory {
     struct RmResource *__nvoc_pbase_RmResource;    // rmres super^2
     struct Memory *__nvoc_pbase_Memory;    // mem super
     struct ConsoleMemory *__nvoc_pbase_ConsoleMemory;    // conmem
-
-    // Vtable with 1 per-object function pointer
-    NV_STATUS (*__conmemCtrlCmdNotifyConsoleDisabled__)(struct ConsoleMemory * /*this*/);  // exported (id=0x760101)
 };
 
 
@@ -128,13 +125,9 @@ struct NVOC_METADATA__ConsoleMemory {
     const struct NVOC_VTABLE__ConsoleMemory vtable;
 };
 
-#ifndef __NVOC_CLASS_ConsoleMemory_TYPEDEF__
-#define __NVOC_CLASS_ConsoleMemory_TYPEDEF__
-typedef struct ConsoleMemory ConsoleMemory;
-#endif /* __NVOC_CLASS_ConsoleMemory_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_ConsoleMemory
-#define __nvoc_class_id_ConsoleMemory 0xaac69e
+#define __nvoc_class_id_ConsoleMemory 0xaac69eu
+typedef struct ConsoleMemory ConsoleMemory;
 #endif /* __nvoc_class_id_ConsoleMemory */
 
 // Casting support
@@ -152,14 +145,27 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_ConsoleMemory;
 
 NV_STATUS __nvoc_objCreateDynamic_ConsoleMemory(ConsoleMemory**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_ConsoleMemory(ConsoleMemory**, Dynamic*, NvU32, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_ConsoleMemory(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_ConsoleMemory((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_ConsoleMemory(ConsoleMemory**, Dynamic*, NvU32, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_ConsoleMemory(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_ConsoleMemory((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
-#define conmemCtrlCmdNotifyConsoleDisabled_FNPTR(pConsoleMemory) pConsoleMemory->__conmemCtrlCmdNotifyConsoleDisabled__
-#define conmemCtrlCmdNotifyConsoleDisabled(pConsoleMemory) conmemCtrlCmdNotifyConsoleDisabled_DISPATCH(pConsoleMemory)
+// Wrapper macros for implementation functions
+NV_STATUS conmemConstruct_IMPL(struct ConsoleMemory *pConsoleMemory, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_conmemConstruct(pConsoleMemory, pCallContext, pParams) conmemConstruct_IMPL(pConsoleMemory, pCallContext, pParams)
+
+NV_STATUS conmemCtrlCmdNotifyConsoleDisabled_IMPL(struct ConsoleMemory *pConsoleMemory);
+#ifdef __nvoc_console_mem_h_disabled
+static inline NV_STATUS conmemCtrlCmdNotifyConsoleDisabled(struct ConsoleMemory *pConsoleMemory) {
+    NV_ASSERT_FAILED_PRECOMP("ConsoleMemory was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_console_mem_h_disabled
+#define conmemCtrlCmdNotifyConsoleDisabled(pConsoleMemory) conmemCtrlCmdNotifyConsoleDisabled_IMPL(pConsoleMemory)
+#endif // __nvoc_console_mem_h_disabled
+
+
+// Wrapper macros for halified functions
 #define conmemCanCopy_FNPTR(pConsoleMemory) pConsoleMemory->__nvoc_metadata_ptr->vtable.__conmemCanCopy__
 #define conmemCanCopy(pConsoleMemory) conmemCanCopy_DISPATCH(pConsoleMemory)
 #define conmemIsDuplicate_FNPTR(pMemory) pMemory->__nvoc_base_Memory.__nvoc_metadata_ptr->vtable.__memIsDuplicate__
@@ -214,10 +220,6 @@ NV_STATUS __nvoc_objCreate_ConsoleMemory(ConsoleMemory**, Dynamic*, NvU32, CALL_
 #define conmemAddAdditionalDependants(pClient, pResource, pReference) conmemAddAdditionalDependants_DISPATCH(pClient, pResource, pReference)
 
 // Dispatch functions
-static inline NV_STATUS conmemCtrlCmdNotifyConsoleDisabled_DISPATCH(struct ConsoleMemory *pConsoleMemory) {
-    return pConsoleMemory->__conmemCtrlCmdNotifyConsoleDisabled__(pConsoleMemory);
-}
-
 static inline NvBool conmemCanCopy_DISPATCH(struct ConsoleMemory *pConsoleMemory) {
     return pConsoleMemory->__nvoc_metadata_ptr->vtable.__conmemCanCopy__(pConsoleMemory);
 }
@@ -322,13 +324,16 @@ static inline void conmemAddAdditionalDependants_DISPATCH(struct RsClient *pClie
     pResource->__nvoc_metadata_ptr->vtable.__conmemAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
-NV_STATUS conmemCtrlCmdNotifyConsoleDisabled_IMPL(struct ConsoleMemory *pConsoleMemory);
-
+// Virtual method declarations and/or inline definitions
 NvBool conmemCanCopy_IMPL(struct ConsoleMemory *pConsoleMemory);
 
-NV_STATUS conmemConstruct_IMPL(struct ConsoleMemory *arg_pConsoleMemory, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
+// Exported method declarations and/or inline definitions
+NV_STATUS conmemCtrlCmdNotifyConsoleDisabled_IMPL(struct ConsoleMemory *pConsoleMemory);
 
-#define __nvoc_conmemConstruct(arg_pConsoleMemory, arg_pCallContext, arg_pParams) conmemConstruct_IMPL(arg_pConsoleMemory, arg_pCallContext, arg_pParams)
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

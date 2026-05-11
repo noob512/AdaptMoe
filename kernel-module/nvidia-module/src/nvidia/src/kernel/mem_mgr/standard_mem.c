@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2018-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2018-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -56,7 +56,12 @@ NV_STATUS stdmemValidateParams
         return NV_ERR_INVALID_ARGUMENT;
     }
 
-   //
+    if (pAllocData->size == 0)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    //
     // These flags don't do anything in this path. No mapping on alloc and
     // kernel map is controlled by TYPE
     //
@@ -242,11 +247,3 @@ stdmemQueryPageSize
                                    pAllocData->format, pAllocData->flags, &retAttr, &retAttr2);
 }
 
-//
-// Control calls for system memory objects maintained outside the heap.
-//
-
-NvU64 stdmemGetSysmemPageSize_IMPL(OBJGPU * pGpu, StandardMemory *pStdMemory)
-{
-    return GPU_GET_MEMORY_MANAGER(pGpu)->sysmemPageSize;
-}

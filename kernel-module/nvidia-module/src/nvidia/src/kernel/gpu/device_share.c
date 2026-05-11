@@ -67,7 +67,6 @@ deviceSetClientShare_IMPL
     pDevice->pVASpace = NULL;
     pDevice->hClientShare = hClientShare;
     pDevice->deviceAllocFlags = deviceAllocFlags;
-    pDevice->deviceInternalAllocFlags = 0;
     pDevice->vaSize = vaSize;
 
     if (deviceAllocFlags & NV_DEVICE_ALLOCATION_FLAGS_RESTRICT_RESERVED_VALIMITS)
@@ -93,8 +92,7 @@ deviceInitClientShare
     Device     *pDevice,
     NvHandle    hClientShare,
     NvU64       vaSize,
-    NvU32       deviceAllocFlags,
-    NvU32       deviceAllocInternalFlags
+    NvU32       deviceAllocFlags
 )
 {
     Device      *pShareDevice;
@@ -186,17 +184,6 @@ deviceInitClientShare
             NV_ASSERT(!pDevice->vaLimitInternal);
         }
 
-        //
-        // NV_DEVICE_ALLOCATION_FLAGS_VASPACE_IS_MIRRORED will be removed once CUDA phases out
-        // and uses the ctrl call  NV0080_CTRL_DMA_ENABLE_PRIVILEGED_RANGE
-        // to set privileged address space
-        //
-        if ((deviceAllocFlags & NV_DEVICE_ALLOCATION_FLAGS_VASPACE_IS_MIRRORED)
-            || (deviceAllocInternalFlags & NV_DEVICE_INTERNAL_ALLOCATION_FLAGS_ENABLE_PRIVILEGED_VASPACE)
-           )
-        {
-            flags |= VASPACE_FLAGS_SET_MIRRORED;
-        }
         if (NULL != GPU_GET_KERNEL_GMMU(pGpu))
             vaspaceClass = kgmmuGetVaspaceClass_HAL(GPU_GET_KERNEL_GMMU(pGpu));
         if (NULL == GPU_GET_KERNEL_GMMU(pGpu) && (pGpu->getProperty(pGpu, PDB_PROP_GPU_TEGRA_SOC_NVDISPLAY) || IsDFPGA(pGpu)))
@@ -286,8 +273,7 @@ deviceInitClientShare
             status = deviceInitClientShare(pShareDevice,
                                            pShareDevice->hClientShare,
                                            pShareDevice->vaSize,
-                                           pShareDevice->deviceAllocFlags,
-                                           pShareDevice->deviceInternalAllocFlags);
+                                           pShareDevice->deviceAllocFlags);
             if (status != NV_OK)
                 return status;
         }
@@ -338,8 +324,7 @@ deviceGetDefaultVASpace_IMPL
         status = deviceInitClientShare(pDevice,
                                        pDevice->hClientShare,
                                        pDevice->vaSize,
-                                       pDevice->deviceAllocFlags,
-                                       pDevice->deviceInternalAllocFlags);
+                                       pDevice->deviceAllocFlags);
     }
 
     *ppVAS = pDevice->pVASpace;

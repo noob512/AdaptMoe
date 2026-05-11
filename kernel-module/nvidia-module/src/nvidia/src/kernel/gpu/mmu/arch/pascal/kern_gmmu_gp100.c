@@ -29,6 +29,7 @@
 #include "gpu/mem_mgr/fermi_dma.h"
 
 #include "published/pascal/gp100/dev_fb.h"
+#include "published/pascal/gp100/dev_hubmmu_base_addendum.h"
 #include "published/pascal/gp100/dev_ram.h"
 #include "published/pascal/gp100/dev_fault.h"
 
@@ -97,7 +98,7 @@ kgmmuInstBlkVaLimitGet_GP100
     NV_ASSERT(subctxId == FIFO_PDB_IDX_BASE);
     NV_ASSERT_OR_RETURN(pVAS, NV_ERR_INVALID_ARGUMENT);
 
-    vaLimit  = vaspaceGetVaLimit(pVAS) - pParams->uvmKernelPrivRegion;
+    vaLimit  = vaspaceGetVaLimit(pVAS);
     *pData   = (vaLimit & vaMask) | 0xfff;
     *pOffset = SF_OFFSET(NV_RAMIN_ADR_LIMIT_LO);
 
@@ -147,8 +148,7 @@ kgmmuInstBlkPageDirBaseGet_GP100
         NvU32              addrLo;
         NvU64              bigPageSize = vaspaceGetBigPageSize(pVAS);
 
-        pPDB = (pParams->bIsClientAdmin) ? vaspaceGetKernelPageDirBase(pVAS, pGpu) :
-            vaspaceGetPageDirBase(pVAS, pGpu);
+        pPDB = vaspaceGetPageDirBase(pVAS, pGpu);
         NV_ASSERT_OR_RETURN(pPDB != NULL, NV_ERR_INVALID_STATE);
 
         physAdd  = memdescGetPhysAddr(pPDB, AT_GPU, 0);
@@ -244,45 +244,45 @@ kgmmuFaultCancelIssueInvalidate_GP100
 )
 {
     NvU32 data32 = 0;
-    data32 = FLD_SET_DRF_NUM(_PFB, _PRI_MMU_INVALIDATE, _ALL_VA,
-        NV_PFB_PRI_MMU_INVALIDATE_ALL_VA_TRUE, data32);
+    data32 = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_INVALIDATE, _ALL_VA,
+        NV_HUBMMU_PRI_MMU_INVALIDATE_ALL_VA_TRUE, data32);
 
-    data32 = FLD_SET_DRF_NUM(_PFB, _PRI_MMU_INVALIDATE, _ALL_PDB,
-        NV_PFB_PRI_MMU_INVALIDATE_ALL_PDB_TRUE, data32);
+    data32 = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_INVALIDATE, _ALL_PDB,
+        NV_HUBMMU_PRI_MMU_INVALIDATE_ALL_PDB_TRUE, data32);
 
-    data32 = FLD_SET_DRF_NUM(_PFB, _PRI_MMU_INVALIDATE, _HUBTLB_ONLY,
-        NV_PFB_PRI_MMU_INVALIDATE_HUBTLB_ONLY_FALSE, data32);
+    data32 = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_INVALIDATE, _HUBTLB_ONLY,
+        NV_HUBMMU_PRI_MMU_INVALIDATE_HUBTLB_ONLY_FALSE, data32);
 
-    data32 = FLD_SET_DRF_NUM(_PFB, _PRI_MMU_INVALIDATE, _SYS_MEMBAR,
-        NV_PFB_PRI_MMU_INVALIDATE_SYS_MEMBAR_FALSE, data32);
+    data32 = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_INVALIDATE, _SYS_MEMBAR,
+        NV_HUBMMU_PRI_MMU_INVALIDATE_SYS_MEMBAR_FALSE, data32);
 
-    data32 = FLD_SET_DRF_NUM(_PFB, _PRI_MMU_INVALIDATE, _ACK,
-        NV_PFB_PRI_MMU_INVALIDATE_ACK_NONE_REQUIRED, data32);
+    data32 = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_INVALIDATE, _ACK,
+        NV_HUBMMU_PRI_MMU_INVALIDATE_ACK_NONE_REQUIRED, data32);
 
-    data32 = FLD_SET_DRF_NUM(_PFB, _PRI_MMU_INVALIDATE, _CACHE_LEVEL,
-        NV_PFB_PRI_MMU_INVALIDATE_CACHE_LEVEL_ALL, data32);
+    data32 = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_INVALIDATE, _CACHE_LEVEL,
+        NV_HUBMMU_PRI_MMU_INVALIDATE_CACHE_LEVEL_ALL, data32);
 
-    data32 = FLD_SET_DRF_NUM(_PFB, _PRI_MMU_INVALIDATE, _TRIGGER,
-        NV_PFB_PRI_MMU_INVALIDATE_TRIGGER_TRUE, data32);
+    data32 = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_INVALIDATE, _TRIGGER,
+        NV_HUBMMU_PRI_MMU_INVALIDATE_TRIGGER_TRUE, data32);
 
     if (bGlobal)
     {
-        data32 = FLD_SET_DRF_NUM(_PFB, _PRI_MMU_INVALIDATE, _REPLAY,
-            NV_PFB_PRI_MMU_INVALIDATE_REPLAY_CANCEL_GLOBAL, data32);
+        data32 = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_INVALIDATE, _REPLAY,
+            NV_HUBMMU_PRI_MMU_INVALIDATE_REPLAY_CANCEL_GLOBAL, data32);
     }
     else
     {
-        data32 = FLD_SET_DRF_NUM(_PFB, _PRI_MMU_INVALIDATE, _REPLAY,
-            NV_PFB_PRI_MMU_INVALIDATE_REPLAY_CANCEL_TARGETED, data32);
+        data32 = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_INVALIDATE, _REPLAY,
+            NV_HUBMMU_PRI_MMU_INVALIDATE_REPLAY_CANCEL_TARGETED, data32);
 
-        data32 = FLD_SET_DRF_NUM(_PFB, _PRI_MMU_INVALIDATE, _CANCEL_CLIENT_ID,
+        data32 = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_INVALIDATE, _CANCEL_CLIENT_ID,
             pCancelInfo->clientId, data32);
 
-        data32 = FLD_SET_DRF_NUM(_PFB, _PRI_MMU_INVALIDATE, _CANCEL_GPC_ID,
+        data32 = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_INVALIDATE, _CANCEL_GPC_ID,
             pCancelInfo->gpcId, data32);
 
-        data32 = FLD_SET_DRF_NUM(_PFB, _PRI_MMU_INVALIDATE, _CANCEL_CLIENT_TYPE,
-            NV_PFB_PRI_MMU_INVALIDATE_CANCEL_CLIENT_TYPE_GPC, data32);
+        data32 = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_INVALIDATE, _CANCEL_CLIENT_TYPE,
+            NV_HUBMMU_PRI_MMU_INVALIDATE_CANCEL_CLIENT_TYPE_GPC, data32);
     }
 
     pParams->regVal = data32;

@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -44,12 +44,11 @@ extern "C" {
 #ifndef _DIAGAPI_H_
 #define _DIAGAPI_H_
 
-#include "class/cl208f.h" // NV208F_NOTIFIERS_MAXCOUNT
 #include "ctrl/ctrl208f.h" // rmcontrol params
 #include "ctrl/ctrl208f/ctrl208fgr.h" // rmcontrol params
 
 #include "gpu/gpu_resource.h"
-#include "rmapi/event.h"
+#include "rmapi/event_api.h"
 #include "rmapi/control.h"
 #include "gpu/gpu_halspec.h"
 
@@ -96,26 +95,8 @@ struct DiagApi {
     struct Notifier *__nvoc_pbase_Notifier;    // notify super
     struct DiagApi *__nvoc_pbase_DiagApi;    // diagapi
 
-    // Vtable with 16 per-object function pointers
-    NV_STATUS (*__diagapiCtrlCmdFifoCheckEngineContext__)(struct DiagApi * /*this*/, NV208F_CTRL_FIFO_CHECK_ENGINE_CONTEXT_PARAMS *);  // exported (id=0x208f0401)
+    // Vtable with 1 per-object function pointer
     NV_STATUS (*__diagapiCtrlCmdFifoGetChannelState__)(struct DiagApi * /*this*/, NV208F_CTRL_FIFO_GET_CHANNEL_STATE_PARAMS *);  // halified (2 hals) exported (id=0x208f0403) body
-    NV_STATUS (*__diagapiCtrlCmdFbCtrlGpuCache__)(struct DiagApi * /*this*/, NV208F_CTRL_FB_CTRL_GPU_CACHE_PARAMS *);  // exported (id=0x208f0506)
-    NV_STATUS (*__diagapiCtrlCmdFbEccSetKillPtr__)(struct DiagApi * /*this*/, NV208F_CTRL_FB_ECC_SET_KILL_PTR_PARAMS *);  // exported (id=0x208f050e)
-    NV_STATUS (*__diagapiCtrlCmdFbClearRemappedRows__)(struct DiagApi * /*this*/, NV208F_CTRL_FB_CLEAR_REMAPPED_ROWS_PARAMS *);  // exported (id=0x208f0515)
-    NV_STATUS (*__diagapiCtrlCmdGpuGetRamSvopValues__)(struct DiagApi * /*this*/, NV208F_CTRL_GPU_RAM_SVOP_VALUES_PARAMS *);  // exported (id=0x208f1101)
-    NV_STATUS (*__diagapiCtrlCmdGpuSetRamSvopValues__)(struct DiagApi * /*this*/, NV208F_CTRL_GPU_RAM_SVOP_VALUES_PARAMS *);  // exported (id=0x208f1102)
-    NV_STATUS (*__diagapiCtrlCmdGpuVerifyInforom__)(struct DiagApi * /*this*/, NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS *);  // exported (id=0x208f1105)
-    NV_STATUS (*__diagapiCtrlCmdGrInjectCtxswUcodeError__)(struct DiagApi * /*this*/, NV208F_CTRL_GR_INJECT_CTXSW_UCODE_ERROR_PARAMS *);  // exported (id=0x208f1206)
-    NV_STATUS (*__diagapiCtrlCmdBifPBIWriteCommand__)(struct DiagApi * /*this*/, NV208F_CTRL_BIF_PBI_WRITE_COMMAND_PARAMS *);  // exported (id=0x208f0701)
-    NV_STATUS (*__diagapiCtrlCmdBifConfigRegRead__)(struct DiagApi * /*this*/, NV208F_CTRL_BIF_CONFIG_REG_READ_PARAMS *);  // exported (id=0x208f0702)
-    NV_STATUS (*__diagapiCtrlCmdBifConfigRegWrite__)(struct DiagApi * /*this*/, NV208F_CTRL_BIF_CONFIG_REG_WRITE_PARAMS *);  // exported (id=0x208f0703)
-    NV_STATUS (*__diagapiCtrlCmdBifInfo__)(struct DiagApi * /*this*/, NV208F_CTRL_BIF_INFO_PARAMS *);  // exported (id=0x208f0704)
-    NV_STATUS (*__diagapiCtrlCmdUcodeCoverageGetState__)(struct DiagApi * /*this*/, NV208F_CTRL_UCODE_COVERAGE_GET_STATE_PARAMS *);  // exported (id=0x208f1901)
-    NV_STATUS (*__diagapiCtrlCmdUcodeCoverageSetState__)(struct DiagApi * /*this*/, NV208F_CTRL_UCODE_COVERAGE_SET_STATE_PARAMS *);  // exported (id=0x208f1902)
-    NV_STATUS (*__diagapiCtrlCmdUcodeCoverageGetData__)(struct DiagApi * /*this*/, NV208F_CTRL_UCODE_COVERAGE_GET_DATA_PARAMS *);  // exported (id=0x208f1903)
-
-    // Data members
-    NvU32 notifyActions[1];
 };
 
 
@@ -161,13 +142,9 @@ struct NVOC_METADATA__DiagApi {
     const struct NVOC_VTABLE__DiagApi vtable;
 };
 
-#ifndef __NVOC_CLASS_DiagApi_TYPEDEF__
-#define __NVOC_CLASS_DiagApi_TYPEDEF__
-typedef struct DiagApi DiagApi;
-#endif /* __NVOC_CLASS_DiagApi_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_DiagApi
-#define __nvoc_class_id_DiagApi 0xaa3066
+#define __nvoc_class_id_DiagApi 0xaa3066u
+typedef struct DiagApi DiagApi;
 #endif /* __nvoc_class_id_DiagApi */
 
 // Casting support
@@ -185,49 +162,234 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_DiagApi;
 
 NV_STATUS __nvoc_objCreateDynamic_DiagApi(DiagApi**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_DiagApi(DiagApi**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_DiagApi(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_DiagApi((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_DiagApi(DiagApi**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_DiagApi(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_DiagApi((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS diagapiConstruct_IMPL(struct DiagApi *pDiagApi, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_diagapiConstruct(pDiagApi, pCallContext, pParams) diagapiConstruct_IMPL(pDiagApi, pCallContext, pParams)
+
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCoverageGetState(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_GET_STATE_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCoverageGetState(pDiagApi, pParams) diagapiCoverageGetState_KERNEL(pDiagApi, pParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCoverageSetState(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_GET_STATE_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCoverageSetState(pDiagApi, pParams) diagapiCoverageSetState_KERNEL(pDiagApi, pParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCoverageGetData(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_GET_DATA_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCoverageGetData(pDiagApi, pParams) diagapiCoverageGetData_KERNEL(pDiagApi, pParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdFifoCheckEngineContext_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FIFO_CHECK_ENGINE_CONTEXT_PARAMS *pCheckEngineContextParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdFifoCheckEngineContext(struct DiagApi *pDiagApi, NV208F_CTRL_FIFO_CHECK_ENGINE_CONTEXT_PARAMS *pCheckEngineContextParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdFifoCheckEngineContext(pDiagApi, pCheckEngineContextParams) diagapiCtrlCmdFifoCheckEngineContext_IMPL(pDiagApi, pCheckEngineContextParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdFbCtrlGpuCache_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FB_CTRL_GPU_CACHE_PARAMS *pGpuCacheParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdFbCtrlGpuCache(struct DiagApi *pDiagApi, NV208F_CTRL_FB_CTRL_GPU_CACHE_PARAMS *pGpuCacheParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdFbCtrlGpuCache(pDiagApi, pGpuCacheParams) diagapiCtrlCmdFbCtrlGpuCache_IMPL(pDiagApi, pGpuCacheParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdFbEccSetKillPtr_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FB_ECC_SET_KILL_PTR_PARAMS *pParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdFbEccSetKillPtr(struct DiagApi *pDiagApi, NV208F_CTRL_FB_ECC_SET_KILL_PTR_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdFbEccSetKillPtr(pDiagApi, pParams) diagapiCtrlCmdFbEccSetKillPtr_IMPL(pDiagApi, pParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdFbEccSetWriteKill_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FB_ECC_SET_WRITE_KILL_PARAMS *pParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdFbEccSetWriteKill(struct DiagApi *pDiagApi, NV208F_CTRL_FB_ECC_SET_WRITE_KILL_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdFbEccSetWriteKill(pDiagApi, pParams) diagapiCtrlCmdFbEccSetWriteKill_IMPL(pDiagApi, pParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdFbEccInjectionSupported_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FB_ECC_INJECTION_SUPPORTED_PARAMS *pParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdFbEccInjectionSupported(struct DiagApi *pDiagApi, NV208F_CTRL_FB_ECC_INJECTION_SUPPORTED_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdFbEccInjectionSupported(pDiagApi, pParams) diagapiCtrlCmdFbEccInjectionSupported_IMPL(pDiagApi, pParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdFbClearRemappedRows_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FB_CLEAR_REMAPPED_ROWS_PARAMS *pRemappedRowsParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdFbClearRemappedRows(struct DiagApi *pDiagApi, NV208F_CTRL_FB_CLEAR_REMAPPED_ROWS_PARAMS *pRemappedRowsParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdFbClearRemappedRows(pDiagApi, pRemappedRowsParams) diagapiCtrlCmdFbClearRemappedRows_IMPL(pDiagApi, pRemappedRowsParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdFbClearRemappedBanks_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FB_CLEAR_REMAPPED_BANKS_PARAMS *pRemappedBanksParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdFbClearRemappedBanks(struct DiagApi *pDiagApi, NV208F_CTRL_FB_CLEAR_REMAPPED_BANKS_PARAMS *pRemappedBanksParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdFbClearRemappedBanks(pDiagApi, pRemappedBanksParams) diagapiCtrlCmdFbClearRemappedBanks_IMPL(pDiagApi, pRemappedBanksParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdGpuGetRamSvopValues_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_GPU_RAM_SVOP_VALUES_PARAMS *pGetRamSvopParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdGpuGetRamSvopValues(struct DiagApi *pDiagApi, NV208F_CTRL_GPU_RAM_SVOP_VALUES_PARAMS *pGetRamSvopParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdGpuGetRamSvopValues(pDiagApi, pGetRamSvopParams) diagapiCtrlCmdGpuGetRamSvopValues_IMPL(pDiagApi, pGetRamSvopParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdGpuSetRamSvopValues_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_GPU_RAM_SVOP_VALUES_PARAMS *pSetRamSvopParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdGpuSetRamSvopValues(struct DiagApi *pDiagApi, NV208F_CTRL_GPU_RAM_SVOP_VALUES_PARAMS *pSetRamSvopParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdGpuSetRamSvopValues(pDiagApi, pSetRamSvopParams) diagapiCtrlCmdGpuSetRamSvopValues_IMPL(pDiagApi, pSetRamSvopParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdGpuVerifyInforom_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS *pParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdGpuVerifyInforom(struct DiagApi *pDiagApi, NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdGpuVerifyInforom(pDiagApi, pParams) diagapiCtrlCmdGpuVerifyInforom_IMPL(pDiagApi, pParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdGrInjectCtxswUcodeError_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_GR_INJECT_CTXSW_UCODE_ERROR_PARAMS *pParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdGrInjectCtxswUcodeError(struct DiagApi *pDiagApi, NV208F_CTRL_GR_INJECT_CTXSW_UCODE_ERROR_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdGrInjectCtxswUcodeError(pDiagApi, pParams) diagapiCtrlCmdGrInjectCtxswUcodeError_IMPL(pDiagApi, pParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdBifPBIWriteCommand_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_PBI_WRITE_COMMAND_PARAMS *pWritePbiParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdBifPBIWriteCommand(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_PBI_WRITE_COMMAND_PARAMS *pWritePbiParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdBifPBIWriteCommand(pDiagApi, pWritePbiParams) diagapiCtrlCmdBifPBIWriteCommand_IMPL(pDiagApi, pWritePbiParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdBifConfigRegRead_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_CONFIG_REG_READ_PARAMS *pReadConfigReg);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdBifConfigRegRead(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_CONFIG_REG_READ_PARAMS *pReadConfigReg) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdBifConfigRegRead(pDiagApi, pReadConfigReg) diagapiCtrlCmdBifConfigRegRead_IMPL(pDiagApi, pReadConfigReg)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdBifConfigRegWrite_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_CONFIG_REG_WRITE_PARAMS *pWriteConfigReg);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdBifConfigRegWrite(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_CONFIG_REG_WRITE_PARAMS *pWriteConfigReg) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdBifConfigRegWrite(pDiagApi, pWriteConfigReg) diagapiCtrlCmdBifConfigRegWrite_IMPL(pDiagApi, pWriteConfigReg)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdBifInfo_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_INFO_PARAMS *pInfo);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdBifInfo(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_INFO_PARAMS *pInfo) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdBifInfo(pDiagApi, pInfo) diagapiCtrlCmdBifInfo_IMPL(pDiagApi, pInfo)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdUcodeInstrumentationGetState_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_GET_STATE_PARAMS *pParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdUcodeInstrumentationGetState(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_GET_STATE_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdUcodeInstrumentationGetState(pDiagApi, pParams) diagapiCtrlCmdUcodeInstrumentationGetState_IMPL(pDiagApi, pParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdUcodeInstrumentationSetState_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_SET_STATE_PARAMS *pParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdUcodeInstrumentationSetState(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_SET_STATE_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdUcodeInstrumentationSetState(pDiagApi, pParams) diagapiCtrlCmdUcodeInstrumentationSetState_IMPL(pDiagApi, pParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+NV_STATUS diagapiCtrlCmdUcodeInstrumentationGetData_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_GET_DATA_PARAMS *pParams);
+#ifdef __nvoc_subdevice_diag_h_disabled
+static inline NV_STATUS diagapiCtrlCmdUcodeInstrumentationGetData(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_GET_DATA_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_subdevice_diag_h_disabled
+#define diagapiCtrlCmdUcodeInstrumentationGetData(pDiagApi, pParams) diagapiCtrlCmdUcodeInstrumentationGetData_IMPL(pDiagApi, pParams)
+#endif // __nvoc_subdevice_diag_h_disabled
+
+
+// Wrapper macros for halified functions
 #define diagapiControl_FNPTR(pDiagApi) pDiagApi->__nvoc_metadata_ptr->vtable.__diagapiControl__
 #define diagapiControl(pDiagApi, pCallContext, pParams) diagapiControl_DISPATCH(pDiagApi, pCallContext, pParams)
 #define diagapiControlFilter_FNPTR(pDiagApi) pDiagApi->__nvoc_metadata_ptr->vtable.__diagapiControlFilter__
 #define diagapiControlFilter(pDiagApi, pCallContext, pParams) diagapiControlFilter_DISPATCH(pDiagApi, pCallContext, pParams)
-#define diagapiCtrlCmdFifoCheckEngineContext_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdFifoCheckEngineContext__
-#define diagapiCtrlCmdFifoCheckEngineContext(pDiagApi, pCheckEngineContextParams) diagapiCtrlCmdFifoCheckEngineContext_DISPATCH(pDiagApi, pCheckEngineContextParams)
+#define diagapiCoverageGetState_HAL(pDiagApi, pParams) diagapiCoverageGetState(pDiagApi, pParams)
+#define diagapiCoverageSetState_HAL(pDiagApi, pParams) diagapiCoverageSetState(pDiagApi, pParams)
+#define diagapiCoverageGetData_HAL(pDiagApi, pParams) diagapiCoverageGetData(pDiagApi, pParams)
 #define diagapiCtrlCmdFifoGetChannelState_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdFifoGetChannelState__
 #define diagapiCtrlCmdFifoGetChannelState(pDiagApi, pChannelStateParams) diagapiCtrlCmdFifoGetChannelState_DISPATCH(pDiagApi, pChannelStateParams)
 #define diagapiCtrlCmdFifoGetChannelState_HAL(pDiagApi, pChannelStateParams) diagapiCtrlCmdFifoGetChannelState_DISPATCH(pDiagApi, pChannelStateParams)
-#define diagapiCtrlCmdFbCtrlGpuCache_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdFbCtrlGpuCache__
-#define diagapiCtrlCmdFbCtrlGpuCache(pDiagApi, pGpuCacheParams) diagapiCtrlCmdFbCtrlGpuCache_DISPATCH(pDiagApi, pGpuCacheParams)
-#define diagapiCtrlCmdFbEccSetKillPtr_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdFbEccSetKillPtr__
-#define diagapiCtrlCmdFbEccSetKillPtr(pDiagApi, pParams) diagapiCtrlCmdFbEccSetKillPtr_DISPATCH(pDiagApi, pParams)
-#define diagapiCtrlCmdFbClearRemappedRows_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdFbClearRemappedRows__
-#define diagapiCtrlCmdFbClearRemappedRows(pDiagApi, pRemappedRowsParams) diagapiCtrlCmdFbClearRemappedRows_DISPATCH(pDiagApi, pRemappedRowsParams)
-#define diagapiCtrlCmdGpuGetRamSvopValues_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdGpuGetRamSvopValues__
-#define diagapiCtrlCmdGpuGetRamSvopValues(pDiagApi, pGetRamSvopParams) diagapiCtrlCmdGpuGetRamSvopValues_DISPATCH(pDiagApi, pGetRamSvopParams)
-#define diagapiCtrlCmdGpuSetRamSvopValues_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdGpuSetRamSvopValues__
-#define diagapiCtrlCmdGpuSetRamSvopValues(pDiagApi, pSetRamSvopParams) diagapiCtrlCmdGpuSetRamSvopValues_DISPATCH(pDiagApi, pSetRamSvopParams)
-#define diagapiCtrlCmdGpuVerifyInforom_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdGpuVerifyInforom__
-#define diagapiCtrlCmdGpuVerifyInforom(pDiagApi, pParams) diagapiCtrlCmdGpuVerifyInforom_DISPATCH(pDiagApi, pParams)
-#define diagapiCtrlCmdGrInjectCtxswUcodeError_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdGrInjectCtxswUcodeError__
-#define diagapiCtrlCmdGrInjectCtxswUcodeError(pDiagApi, pParams) diagapiCtrlCmdGrInjectCtxswUcodeError_DISPATCH(pDiagApi, pParams)
-#define diagapiCtrlCmdBifPBIWriteCommand_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdBifPBIWriteCommand__
-#define diagapiCtrlCmdBifPBIWriteCommand(pDiagApi, pWritePbiParams) diagapiCtrlCmdBifPBIWriteCommand_DISPATCH(pDiagApi, pWritePbiParams)
-#define diagapiCtrlCmdBifConfigRegRead_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdBifConfigRegRead__
-#define diagapiCtrlCmdBifConfigRegRead(pDiagApi, pReadConfigReg) diagapiCtrlCmdBifConfigRegRead_DISPATCH(pDiagApi, pReadConfigReg)
-#define diagapiCtrlCmdBifConfigRegWrite_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdBifConfigRegWrite__
-#define diagapiCtrlCmdBifConfigRegWrite(pDiagApi, pWriteConfigReg) diagapiCtrlCmdBifConfigRegWrite_DISPATCH(pDiagApi, pWriteConfigReg)
-#define diagapiCtrlCmdBifInfo_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdBifInfo__
-#define diagapiCtrlCmdBifInfo(pDiagApi, pInfo) diagapiCtrlCmdBifInfo_DISPATCH(pDiagApi, pInfo)
-#define diagapiCtrlCmdUcodeCoverageGetState_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdUcodeCoverageGetState__
-#define diagapiCtrlCmdUcodeCoverageGetState(pDiagApi, pParams) diagapiCtrlCmdUcodeCoverageGetState_DISPATCH(pDiagApi, pParams)
-#define diagapiCtrlCmdUcodeCoverageSetState_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdUcodeCoverageSetState__
-#define diagapiCtrlCmdUcodeCoverageSetState(pDiagApi, pParams) diagapiCtrlCmdUcodeCoverageSetState_DISPATCH(pDiagApi, pParams)
-#define diagapiCtrlCmdUcodeCoverageGetData_FNPTR(pDiagApi) pDiagApi->__diagapiCtrlCmdUcodeCoverageGetData__
-#define diagapiCtrlCmdUcodeCoverageGetData(pDiagApi, pParams) diagapiCtrlCmdUcodeCoverageGetData_DISPATCH(pDiagApi, pParams)
 #define diagapiMap_FNPTR(pGpuResource) pGpuResource->__nvoc_base_GpuResource.__nvoc_metadata_ptr->vtable.__gpuresMap__
 #define diagapiMap(pGpuResource, pCallContext, pParams, pCpuMapping) diagapiMap_DISPATCH(pGpuResource, pCallContext, pParams, pCpuMapping)
 #define diagapiUnmap_FNPTR(pGpuResource) pGpuResource->__nvoc_base_GpuResource.__nvoc_metadata_ptr->vtable.__gpuresUnmap__
@@ -294,68 +456,8 @@ static inline NV_STATUS diagapiControlFilter_DISPATCH(struct DiagApi *pDiagApi, 
     return pDiagApi->__nvoc_metadata_ptr->vtable.__diagapiControlFilter__(pDiagApi, pCallContext, pParams);
 }
 
-static inline NV_STATUS diagapiCtrlCmdFifoCheckEngineContext_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_FIFO_CHECK_ENGINE_CONTEXT_PARAMS *pCheckEngineContextParams) {
-    return pDiagApi->__diagapiCtrlCmdFifoCheckEngineContext__(pDiagApi, pCheckEngineContextParams);
-}
-
 static inline NV_STATUS diagapiCtrlCmdFifoGetChannelState_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_FIFO_GET_CHANNEL_STATE_PARAMS *pChannelStateParams) {
     return pDiagApi->__diagapiCtrlCmdFifoGetChannelState__(pDiagApi, pChannelStateParams);
-}
-
-static inline NV_STATUS diagapiCtrlCmdFbCtrlGpuCache_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_FB_CTRL_GPU_CACHE_PARAMS *pGpuCacheParams) {
-    return pDiagApi->__diagapiCtrlCmdFbCtrlGpuCache__(pDiagApi, pGpuCacheParams);
-}
-
-static inline NV_STATUS diagapiCtrlCmdFbEccSetKillPtr_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_FB_ECC_SET_KILL_PTR_PARAMS *pParams) {
-    return pDiagApi->__diagapiCtrlCmdFbEccSetKillPtr__(pDiagApi, pParams);
-}
-
-static inline NV_STATUS diagapiCtrlCmdFbClearRemappedRows_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_FB_CLEAR_REMAPPED_ROWS_PARAMS *pRemappedRowsParams) {
-    return pDiagApi->__diagapiCtrlCmdFbClearRemappedRows__(pDiagApi, pRemappedRowsParams);
-}
-
-static inline NV_STATUS diagapiCtrlCmdGpuGetRamSvopValues_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_GPU_RAM_SVOP_VALUES_PARAMS *pGetRamSvopParams) {
-    return pDiagApi->__diagapiCtrlCmdGpuGetRamSvopValues__(pDiagApi, pGetRamSvopParams);
-}
-
-static inline NV_STATUS diagapiCtrlCmdGpuSetRamSvopValues_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_GPU_RAM_SVOP_VALUES_PARAMS *pSetRamSvopParams) {
-    return pDiagApi->__diagapiCtrlCmdGpuSetRamSvopValues__(pDiagApi, pSetRamSvopParams);
-}
-
-static inline NV_STATUS diagapiCtrlCmdGpuVerifyInforom_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS *pParams) {
-    return pDiagApi->__diagapiCtrlCmdGpuVerifyInforom__(pDiagApi, pParams);
-}
-
-static inline NV_STATUS diagapiCtrlCmdGrInjectCtxswUcodeError_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_GR_INJECT_CTXSW_UCODE_ERROR_PARAMS *pParams) {
-    return pDiagApi->__diagapiCtrlCmdGrInjectCtxswUcodeError__(pDiagApi, pParams);
-}
-
-static inline NV_STATUS diagapiCtrlCmdBifPBIWriteCommand_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_PBI_WRITE_COMMAND_PARAMS *pWritePbiParams) {
-    return pDiagApi->__diagapiCtrlCmdBifPBIWriteCommand__(pDiagApi, pWritePbiParams);
-}
-
-static inline NV_STATUS diagapiCtrlCmdBifConfigRegRead_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_CONFIG_REG_READ_PARAMS *pReadConfigReg) {
-    return pDiagApi->__diagapiCtrlCmdBifConfigRegRead__(pDiagApi, pReadConfigReg);
-}
-
-static inline NV_STATUS diagapiCtrlCmdBifConfigRegWrite_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_CONFIG_REG_WRITE_PARAMS *pWriteConfigReg) {
-    return pDiagApi->__diagapiCtrlCmdBifConfigRegWrite__(pDiagApi, pWriteConfigReg);
-}
-
-static inline NV_STATUS diagapiCtrlCmdBifInfo_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_INFO_PARAMS *pInfo) {
-    return pDiagApi->__diagapiCtrlCmdBifInfo__(pDiagApi, pInfo);
-}
-
-static inline NV_STATUS diagapiCtrlCmdUcodeCoverageGetState_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_COVERAGE_GET_STATE_PARAMS *pParams) {
-    return pDiagApi->__diagapiCtrlCmdUcodeCoverageGetState__(pDiagApi, pParams);
-}
-
-static inline NV_STATUS diagapiCtrlCmdUcodeCoverageSetState_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_COVERAGE_SET_STATE_PARAMS *pParams) {
-    return pDiagApi->__diagapiCtrlCmdUcodeCoverageSetState__(pDiagApi, pParams);
-}
-
-static inline NV_STATUS diagapiCtrlCmdUcodeCoverageGetData_DISPATCH(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_COVERAGE_GET_DATA_PARAMS *pParams) {
-    return pDiagApi->__diagapiCtrlCmdUcodeCoverageGetData__(pDiagApi, pParams);
 }
 
 static inline NV_STATUS diagapiMap_DISPATCH(struct DiagApi *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_CPU_MAP_PARAMS *pParams, struct RsCpuMapping *pCpuMapping) {
@@ -470,65 +572,25 @@ static inline NV_STATUS diagapiGetOrAllocNotifShare_DISPATCH(struct DiagApi *pNo
     return pNotifier->__nvoc_metadata_ptr->vtable.__diagapiGetOrAllocNotifShare__(pNotifier, hNotifierClient, hNotifierResource, ppNotifShare);
 }
 
-NV_STATUS diagapiCoverageGetState_KERNEL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_COVERAGE_GET_STATE_PARAMS *pParams);
-
-
-#ifdef __nvoc_subdevice_diag_h_disabled
-static inline NV_STATUS diagapiCoverageGetState(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_COVERAGE_GET_STATE_PARAMS *pParams) {
-    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_subdevice_diag_h_disabled
-#define diagapiCoverageGetState(pDiagApi, pParams) diagapiCoverageGetState_KERNEL(pDiagApi, pParams)
-#endif //__nvoc_subdevice_diag_h_disabled
-
-#define diagapiCoverageGetState_HAL(pDiagApi, pParams) diagapiCoverageGetState(pDiagApi, pParams)
-
-NV_STATUS diagapiCoverageSetState_KERNEL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_COVERAGE_GET_STATE_PARAMS *pParams);
-
-
-#ifdef __nvoc_subdevice_diag_h_disabled
-static inline NV_STATUS diagapiCoverageSetState(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_COVERAGE_GET_STATE_PARAMS *pParams) {
-    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_subdevice_diag_h_disabled
-#define diagapiCoverageSetState(pDiagApi, pParams) diagapiCoverageSetState_KERNEL(pDiagApi, pParams)
-#endif //__nvoc_subdevice_diag_h_disabled
-
-#define diagapiCoverageSetState_HAL(pDiagApi, pParams) diagapiCoverageSetState(pDiagApi, pParams)
-
-NV_STATUS diagapiCoverageGetData_KERNEL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_COVERAGE_GET_DATA_PARAMS *pParams);
-
-
-#ifdef __nvoc_subdevice_diag_h_disabled
-static inline NV_STATUS diagapiCoverageGetData(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_COVERAGE_GET_DATA_PARAMS *pParams) {
-    NV_ASSERT_FAILED_PRECOMP("DiagApi was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_subdevice_diag_h_disabled
-#define diagapiCoverageGetData(pDiagApi, pParams) diagapiCoverageGetData_KERNEL(pDiagApi, pParams)
-#endif //__nvoc_subdevice_diag_h_disabled
-
-#define diagapiCoverageGetData_HAL(pDiagApi, pParams) diagapiCoverageGetData(pDiagApi, pParams)
-
+// Virtual method declarations and/or inline definitions
 NV_STATUS diagapiControl_IMPL(struct DiagApi *pDiagApi, struct CALL_CONTEXT *pCallContext, struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams);
 
 NV_STATUS diagapiControlFilter_IMPL(struct DiagApi *pDiagApi, struct CALL_CONTEXT *pCallContext, struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams);
 
+// Exported method declarations and/or inline definitions
 NV_STATUS diagapiCtrlCmdFifoCheckEngineContext_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FIFO_CHECK_ENGINE_CONTEXT_PARAMS *pCheckEngineContextParams);
-
-static inline NV_STATUS diagapiCtrlCmdFifoGetChannelState_46f6a7(struct DiagApi *pDiagApi, NV208F_CTRL_FIFO_GET_CHANNEL_STATE_PARAMS *pChannelStateParams) {
-    return NV_ERR_NOT_SUPPORTED;
-}
-
-NV_STATUS diagapiCtrlCmdFifoGetChannelState_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FIFO_GET_CHANNEL_STATE_PARAMS *pChannelStateParams);
 
 NV_STATUS diagapiCtrlCmdFbCtrlGpuCache_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FB_CTRL_GPU_CACHE_PARAMS *pGpuCacheParams);
 
 NV_STATUS diagapiCtrlCmdFbEccSetKillPtr_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FB_ECC_SET_KILL_PTR_PARAMS *pParams);
 
+NV_STATUS diagapiCtrlCmdFbEccSetWriteKill_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FB_ECC_SET_WRITE_KILL_PARAMS *pParams);
+
+NV_STATUS diagapiCtrlCmdFbEccInjectionSupported_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FB_ECC_INJECTION_SUPPORTED_PARAMS *pParams);
+
 NV_STATUS diagapiCtrlCmdFbClearRemappedRows_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FB_CLEAR_REMAPPED_ROWS_PARAMS *pRemappedRowsParams);
+
+NV_STATUS diagapiCtrlCmdFbClearRemappedBanks_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FB_CLEAR_REMAPPED_BANKS_PARAMS *pRemappedBanksParams);
 
 NV_STATUS diagapiCtrlCmdGpuGetRamSvopValues_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_GPU_RAM_SVOP_VALUES_PARAMS *pGetRamSvopParams);
 
@@ -546,15 +608,28 @@ NV_STATUS diagapiCtrlCmdBifConfigRegWrite_IMPL(struct DiagApi *pDiagApi, NV208F_
 
 NV_STATUS diagapiCtrlCmdBifInfo_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_BIF_INFO_PARAMS *pInfo);
 
-NV_STATUS diagapiCtrlCmdUcodeCoverageGetState_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_COVERAGE_GET_STATE_PARAMS *pParams);
+NV_STATUS diagapiCtrlCmdUcodeInstrumentationGetState_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_GET_STATE_PARAMS *pParams);
 
-NV_STATUS diagapiCtrlCmdUcodeCoverageSetState_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_COVERAGE_SET_STATE_PARAMS *pParams);
+NV_STATUS diagapiCtrlCmdUcodeInstrumentationSetState_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_SET_STATE_PARAMS *pParams);
 
-NV_STATUS diagapiCtrlCmdUcodeCoverageGetData_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_COVERAGE_GET_DATA_PARAMS *pParams);
+NV_STATUS diagapiCtrlCmdUcodeInstrumentationGetData_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_GET_DATA_PARAMS *pParams);
 
-NV_STATUS diagapiConstruct_IMPL(struct DiagApi *arg_pDiagApi, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
+// HAL method declarations without bodies
+NV_STATUS diagapiCoverageGetState_KERNEL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_GET_STATE_PARAMS *pParams);
 
-#define __nvoc_diagapiConstruct(arg_pDiagApi, arg_pCallContext, arg_pParams) diagapiConstruct_IMPL(arg_pDiagApi, arg_pCallContext, arg_pParams)
+NV_STATUS diagapiCoverageSetState_KERNEL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_GET_STATE_PARAMS *pParams);
+
+NV_STATUS diagapiCoverageGetData_KERNEL(struct DiagApi *pDiagApi, NV208F_CTRL_UCODE_INSTRUMENTATION_GET_DATA_PARAMS *pParams);
+
+NV_STATUS diagapiCtrlCmdFifoGetChannelState_IMPL(struct DiagApi *pDiagApi, NV208F_CTRL_FIFO_GET_CHANNEL_STATE_PARAMS *pChannelStateParams);
+
+// Inline HAL method definitions
+static inline NV_STATUS diagapiCtrlCmdFifoGetChannelState_395e98(struct DiagApi *pDiagApi, NV208F_CTRL_FIFO_GET_CHANNEL_STATE_PARAMS *pChannelStateParams){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

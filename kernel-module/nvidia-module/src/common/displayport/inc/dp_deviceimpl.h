@@ -34,7 +34,9 @@
 #include "dp_edid.h"
 #include "dp_list.h"
 #include "dp_auxdefs.h"
+#include "dp_qse.h"
 #include "dp_vrr.h"
+#include "dp_displayid2.h"
 
 namespace DisplayPort
 {
@@ -121,6 +123,8 @@ namespace DisplayPort
         Edid              rawEDID;
         Edid              processedEdid;
         Edid              ddcEdid;
+
+        DisplayID2x       displayId2x;
         DPCDHAL         * hal;
         GroupImpl       * activeGroup;
         ConnectorImpl   * connector;
@@ -202,6 +206,7 @@ namespace DisplayPort
 
         TriState bSdpExtCapable;
         TriState bAsyncSDPCapable;
+
         bool bMSAOverMSTCapable;
         bool bDscPassThroughColorFormatWar;
 
@@ -219,6 +224,8 @@ namespace DisplayPort
         virtual unsigned    getRawEDIDSize() const;
         virtual bool        getRawEDID(char * buffer, unsigned size) const;
 
+        virtual unsigned    getDisplayId2xSize() const;
+        virtual bool        getDisplayId2x(char * buffer, unsigned size) const;
         virtual bool getPCONCaps(PCONCaps *pPCONCaps);
 
         virtual Group * getOwningGroup()
@@ -391,6 +398,10 @@ namespace DisplayPort
             return maxModeBwRequired;
         }
 
+        bool getStuffDummySymbolsFor128b132b() const { return processedEdid.WARData.bStuffDummySymbolsFor128b132b; }
+        bool getStuffDummySymbolsFor8b10b() const { return processedEdid.WARData.bStuffDummySymbolsFor8b10b; }
+        bool getApplyStuffDummySymbolsWAR() const { return processedEdid.WARFlags.bApplyStuffDummySymbolsWAR; }
+
         virtual void queryGUID2();
 
         virtual bool getSDPExtnForColorimetrySupported();
@@ -433,6 +444,8 @@ namespace DisplayPort
         virtual bool    isMarkedForDeletion() {return bisMarkedForDeletion;};
         virtual bool    getRawDscCaps(NvU8 *buffer, NvU32 bufferSize);
         virtual bool    setRawDscCaps(const NvU8 *buffer, NvU32 bufferSize);
+        virtual bool    setValidatedRawDscCaps(NvU8 *buffer, NvU32 bufferSize);
+        virtual bool    validatePPSData(DSCPPSDATA *pPps);
 
         virtual AuxBus::status dscCrcControl(NvBool bEnable, gpuDscCrc *dataGpu, sinkDscCrc *dataSink);
 
@@ -532,6 +545,7 @@ namespace DisplayPort
             bool                     retryRemoteBKSVReadMessage;
             bool                     retryRemoteBCapsReadMessage;
             bool                     retryRemote22BCapsReadMessage;
+            bool                     tryRemote1XCaps;
             bool                     bBKSVReadMessagePending;
             bool                     bBCapsReadMessagePending;
 
@@ -557,6 +571,7 @@ namespace DisplayPort
 
             bool hdcpValidateKsv(const NvU8 *ksv, NvU32 Size);
             void handleRemoteDpcdReadDownReply(MessageManager::Message * from);
+            void readRemoteHdcp1xCaps(void);
             void messageFailed(MessageManager::Message * from, NakData * nakData);
             void messageCompleted(MessageManager::Message * from);
     };

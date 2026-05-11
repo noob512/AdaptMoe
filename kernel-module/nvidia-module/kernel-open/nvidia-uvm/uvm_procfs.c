@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2015-2018 NVIDIA Corporation
+    Copyright (c) 2015-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -35,16 +35,21 @@
 #if defined(CONFIG_PROC_FS)
   // This parameter enables additional debug procfs entries. It's enabled by
   // default for debug and develop builds and disabled for release builds.
-  int uvm_enable_debug_procfs = UVM_IS_DEBUG() || UVM_IS_DEVELOP();
+  static int uvm_enable_debug_procfs = UVM_IS_DEBUG() || UVM_IS_DEVELOP();
   module_param(uvm_enable_debug_procfs, int, S_IRUGO);
   MODULE_PARM_DESC(uvm_enable_debug_procfs, "Enable debug procfs entries in /proc/" UVM_PROC_DIR_NAME);
 #else
-  int uvm_enable_debug_procfs = 0;
+  static int uvm_enable_debug_procfs = 0;
 #endif
 
 static struct proc_dir_entry *uvm_proc_dir;
 static struct proc_dir_entry *uvm_proc_gpus;
 static struct proc_dir_entry *uvm_proc_cpu;
+
+bool uvm_procfs_is_debug_enabled(void)
+{
+    return uvm_enable_debug_procfs != 0;
+}
 
 NV_STATUS uvm_procfs_init(void)
 {
@@ -80,4 +85,3 @@ struct proc_dir_entry *uvm_procfs_get_cpu_base_dir(void)
 {
     return uvm_proc_cpu;
 }
-

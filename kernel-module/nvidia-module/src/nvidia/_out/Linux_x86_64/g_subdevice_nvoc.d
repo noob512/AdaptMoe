@@ -4,7 +4,7 @@ _out/Linux_x86_64/g_subdevice_nvoc.o: \
  ../common/sdk/nvidia/inc/cpuopsys.h ../common/sdk/nvidia/inc/nvstatus.h \
  ../common/sdk/nvidia/inc/nvtypes.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
@@ -49,10 +49,11 @@ _out/Linux_x86_64/g_subdevice_nvoc.o: \
  ../common/sdk/nvidia/inc/rmcd.h ../common/sdk/nvidia/inc/nvcd.h \
  inc/kernel/gpu/mem_mgr/mem_desc.h generated/g_mem_desc_nvoc.h \
  inc/libraries/poolalloc.h inc/libraries/nvport/nvport.h \
- inc/libraries/containers/list.h inc/kernel/rmapi/resource.h \
- generated/g_resource_nvoc.h inc/kernel/rmapi/control.h \
- inc/kernel/rmapi/param_copy.h inc/kernel/os/nv_memory_area.h \
- inc/kernel/rmapi/event.h generated/g_event_nvoc.h \
+ inc/libraries/containers/list.h inc/kernel/gpu/mem_mgr/rm_page_size.h \
+ inc/kernel/os/nv_memory_iterator.h inc/kernel/os/nv_memory_area.h \
+ inc/kernel/rmapi/resource.h generated/g_resource_nvoc.h \
+ inc/kernel/rmapi/control.h inc/kernel/rmapi/param_copy.h \
+ inc/kernel/rmapi/event_api.h generated/g_event_api_nvoc.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000event.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
@@ -94,6 +95,7 @@ _out/Linux_x86_64/g_subdevice_nvoc.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080bsp.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl90f1.h \
  ../common/sdk/nvidia/inc/mmu_fmt_types.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl30f1.h \
@@ -131,7 +133,8 @@ _out/Linux_x86_64/g_subdevice_nvoc.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080vgpumgrinternal.h \
  ../common/sdk/nvidia/inc/ctrl/ctrla081.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080hshub.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080unix.h
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080unix.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080bif.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 inc/libraries/nvoc/runtime.h:
 inc/libraries/nvport/nvport.h:
@@ -142,7 +145,7 @@ inc/libraries/nvport/nvport.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -218,13 +221,15 @@ generated/g_mem_desc_nvoc.h:
 inc/libraries/poolalloc.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/containers/list.h:
+inc/kernel/gpu/mem_mgr/rm_page_size.h:
+inc/kernel/os/nv_memory_iterator.h:
+inc/kernel/os/nv_memory_area.h:
 inc/kernel/rmapi/resource.h:
 generated/g_resource_nvoc.h:
 inc/kernel/rmapi/control.h:
 inc/kernel/rmapi/param_copy.h:
-inc/kernel/os/nv_memory_area.h:
-inc/kernel/rmapi/event.h:
-generated/g_event_nvoc.h:
+inc/kernel/rmapi/event_api.h:
+generated/g_event_api_nvoc.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000event.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
@@ -273,6 +278,7 @@ generated/rmconfig.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080bsp.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl90f1.h:
 ../common/sdk/nvidia/inc/mmu_fmt_types.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl30f1.h:
@@ -311,3 +317,4 @@ generated/rmconfig.h:
 ../common/sdk/nvidia/inc/ctrl/ctrla081.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080hshub.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080unix.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080bif.h:

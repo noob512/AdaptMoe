@@ -30,6 +30,7 @@
 #include "gpu/fsp/kern_fsp.h"
 #include "gpu/fsp/kern_fsp_retval.h"
 #include "gpu/gsp/kernel_gsp.h"
+#include "gpu/gsp/gsp_init_args.h"
 #include "gpu/mem_mgr/mem_mgr.h"
 #include "gpu/pmu/kern_pmu.h"
 #include "gpu/spdm/spdm.h"
@@ -246,11 +247,14 @@ kfspCanSendPacket_GH100
 {
     NvU32 cmdqHead;
     NvU32 cmdqTail;
+    NvU32 msgqHead;
+    NvU32 msgqTail;
 
     _kfspGetQueueHeadTail_GH100(pGpu, pKernelFsp, &cmdqHead, &cmdqTail);
+    _kfspGetMsgQueueHeadTail_GH100(pGpu, pKernelFsp, &msgqHead, &msgqTail);
 
     // FSP will set QUEUE_HEAD = TAIL after each packet is received
-    return (cmdqHead == cmdqTail);
+    return (cmdqHead == cmdqTail) && (msgqHead == msgqTail);
 }
 
 /*!
@@ -492,7 +496,6 @@ kfspProcessNvdmMessage_GH100
     return status;
 }
 
-
 /*!
  * @brief Process FSP command response
  *
@@ -535,6 +538,7 @@ kfspProcessCommandResponse_GH100
     {
         NV_PRINTF(LEVEL_ERROR, "FSP response reported error. Task ID: 0x%0x Command type: 0x%0x Error code: 0x%0x\n",
                 pCmdResponse->taskId, pCmdResponse->commandNvdmType, pCmdResponse->errorCode);
+        kfspDumpDebugState_HAL(pGpu, pKernelFsp);
     }
 
     return status;
@@ -832,6 +836,7 @@ kfspGetGspUcodeArchive
 
         if (kgspIsDebugModeEnabled_HAL(pGpu, pKernelGsp))
         {
+
             if (pCC != NULL && pCC->getProperty(pCC, PDB_PROP_CONFCOMPUTE_CC_FEATURE_ENABLED))
             {
                 return NULL;
@@ -868,17 +873,6 @@ kfspGetGspUcodeArchive
             {
                 NV_PRINTF(LEVEL_ERROR, "Loading GSP debug inst-in-sys image for monolithic RM using FSP.\n");
 
-                //
-                // GB20X inst-in-sys images will reset PMU, FBFALCON, FECS and GPCCS
-                // and then lower CPUCTL/reset PLM.
-                // Reason for that is that there is fuse configration
-                // changing source isolation of those registers (to GSP/FSP/SEC2).
-                //
-                if (IsGB20X(pGpu))
-                {
-                    pGsp->setProperty(pGsp, PDB_PROP_GSP_INST_IN_SYS_FMC_WILL_RESET_ENGINES, NV_TRUE);
-                }
-
                 return gspGetBinArchiveGspFmcInstInSysGfwDebugSigned_HAL(pGsp);
             }
             else
@@ -899,6 +893,17 @@ kfspGetGspUcodeArchive
                     {
                         return gspGetBinArchiveGspFmcSpdmGfwDebugSigned_HAL(pGsp);
                     }
+                    else
+                    {
+                        // When CC is enabled but SPDM is not enabled. Only for MODS.
+                        return gspGetBinArchiveGspFmcGfwDebugSigned_HAL(pGsp);
+                    }
+                }
+                else
+                // GSP has a separate stress test profile for cases when ACR is enabled during inst-in-sys mode for the chip
+                if (gspIsStressTestEnabled_HAL(pGpu, pGsp))
+                {
+                    return gspGetBinArchiveGspFmcGfwStressDebugSigned_HAL(pGsp);
                 }
                 else
                 {
@@ -911,17 +916,6 @@ kfspGetGspUcodeArchive
             if (gpuIsGspToBootInInstInSysMode_HAL(pGpu))
             {
                 NV_PRINTF(LEVEL_ERROR, "Loading GSP prod inst-in-sys image for monolithic RM using FSP.\n");
-
-                //
-                // GB20X inst-in-sys images will reset PMU, FBFALCON, FECS and GPCCS
-                // and then lower CPUCTL/reset PLM.
-                // Reason for that is that there is fuse configration
-                // changing source isolation of those registers (to GSP/FSP/SEC2).
-                //
-                if (IsGB20X(pGpu))
-                {
-                    pGsp->setProperty(pGsp, PDB_PROP_GSP_INST_IN_SYS_FMC_WILL_RESET_ENGINES, NV_TRUE);
-                }
 
                 return gspGetBinArchiveGspFmcInstInSysGfwProdSigned_HAL(pGsp);
             }
@@ -936,6 +930,11 @@ kfspGetGspUcodeArchive
                         pSpdm->getProperty(pSpdm, PDB_PROP_SPDM_ENABLED))
                     {
                         return gspGetBinArchiveGspCcFmcGfwProdSigned_HAL(pGsp);
+                    }
+                    else
+                    {
+                        // When CC is enabled but SPDM is not enabled. Only for MODS.
+                        return gspGetBinArchiveGspFmcGfwProdSigned_HAL(pGsp);
                     }
                 }
                 else
@@ -1061,7 +1060,7 @@ kfspSetupGspImages
     NV_ASSERT_OR_GOTO(status == NV_OK, failed);
 
     // Clean up CPU side resources since they are not needed anymore
-    memdescUnmap(pKernelFsp->pGspFmcMemdesc, NV_TRUE, 0, pVaKernel, pPrivKernel);
+    memdescUnmap(pKernelFsp->pGspFmcMemdesc, NV_TRUE, pVaKernel, pPrivKernel);
 
     pCotPayload->gspFmcSysmemOffset = memdescGetPhysAddr(pKernelFsp->pGspFmcMemdesc, AT_GPU, 0);
 
@@ -1113,11 +1112,10 @@ _kfspIsGspTargetMaskReleased
     NvU32 reg;
 
     //
-    // This register is read with the raw OS read to avoid the 0xbadf sanity checking
+    // This register is read with GPU_REG_RD32_UNCHECKED to avoid the 0xbadf sanity checking
     // done by the usual register read utilities.
     //
-    reg = osDevReadReg032(pGpu, gpuGetDeviceMapping(pGpu, DEVICE_INDEX_GPU, 0),
-                          DRF_BASE(NV_PGSP) + NV_PFALCON_FALCON_HWCFG2);
+    reg = GPU_REG_RD32_UNCHECKED(pGpu, DRF_BASE(NV_PGSP) + NV_PFALCON_FALCON_HWCFG2);
 
     return ((reg != 0) && ((reg & privErrTargetLockedMask) != privErrTargetLocked));
 }
@@ -1444,13 +1442,8 @@ kfspPrepareBootCommands_GH100
         {
             frtsOffsetFromEnd += kfspGetExtraReservedMemorySize_HAL(pGpu, pKernelFsp) +
                 kpmuReservedMemorySizeGet(GPU_GET_KERNEL_PMU(pGpu));
-
-            //
-            // 2M alignment seems to be required? Should be NOP unless kpmuReserve
-            // is non 0 and GH100 WAR is needed
-            //
-            frtsOffsetFromEnd = NV_ALIGN_UP(frtsOffsetFromEnd, 0x200000U);
         }
+
         KernelGsp *pKernelGsp = GPU_GET_KERNEL_GSP(pGpu);
 
         //
@@ -1458,12 +1451,26 @@ kfspPrepareBootCommands_GH100
         // This is done to avoid memory with an ECC error that caused the first boot
         // attempt failure. This value will be 0 during normal boot.
         //
-        // Align the margin size to 2MB, as there's potentially an undocumented alignment
-        // requirement (the previous value should already be 2MB-aligned) and the extra
-        // padding won't hurt.
-        //
         if (pKernelGsp != NULL)
-            frtsOffsetFromEnd += NV_ALIGN_UP64(kgspGetWprEndMargin(pGpu, pKernelGsp), 0x200000U);
+        {
+            frtsOffsetFromEnd += kgspGetWprEndMargin(pGpu, pKernelGsp);
+        }
+        //
+        // Ensure that FRTS offset from end is aligned to WPR granularity,
+        // which is sized to 128K, hence using the MMU-related 128K constant define.
+        //
+        // TODO: we use several different constants in our code to refer to WPR's
+        // 128K alignment requirement, they need to be unified.
+        //
+        // Note that we can safely assume that FB size is aligned to this value,
+        // since FB size always has 1MB granularity.
+        //
+        // FRTS size itself is also aligned to WPR granularity (FRTS is expected to be 1MB),
+        // so this will guarantee that a WPR can be created where FRTS starts.
+        //
+        // This also helps us with placing PMU's backing store in the PMU reservation.
+        //
+        frtsOffsetFromEnd = NV_ALIGN_UP(frtsOffsetFromEnd, WPR_ALIGNMENT);
 
         pKernelFsp->pCotPayload->frtsVidmemOffset = frtsOffsetFromEnd;
         pKernelFsp->pCotPayload->frtsVidmemSize = frtsSize;
@@ -1504,6 +1511,16 @@ failed:
 
     return status;
 }
+
+void kfspResetGspFmcErrorCode_GH100
+(
+    OBJGPU    *pGpu,
+    KernelFsp *pKernelFsp
+)
+{
+    GPU_REG_WR32(pGpu, NV_PBUS_SW_SCRATCH_GSP_FMC_ERROR, 0);
+}
+
 /*!
  * @brief Send GSP-FMC and FRTS info to FSP
  *
@@ -1527,6 +1544,9 @@ kfspSendBootCommands_GH100
     NV_STATUS status = NV_OK;
 
     NV_ASSERT_OR_RETURN(pKernelFsp->pCotPayload != NULL, NV_ERR_INVALID_STATE);
+
+    // Reset the GSP-FMC error code register to prevent reporting stale data
+    kfspResetGspFmcErrorCode_HAL(pGpu, pKernelFsp);
 
     status = kfspSendAndReadMessage(pGpu, pKernelFsp, (NvU8 *)pKernelFsp->pCotPayload,
                                     sizeof(NVDM_PAYLOAD_COT), NVDM_TYPE_COT, NULL, 0);

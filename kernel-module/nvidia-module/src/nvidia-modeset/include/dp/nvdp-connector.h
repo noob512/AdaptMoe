@@ -39,8 +39,6 @@ void nvDPNotifyShortPulse(NVDPLibConnectorPtr pNVDpLibConnector);
 
 void nvDPDestroyConnector(NVDPLibConnectorPtr pNVDpLibConnector);
 
-NvBool nvDPIsLinkAwaitingTransition(NVConnectorEvoPtr pConnectorEvo);
-
 NVDPLibModesetStatePtr nvDPLibCreateModesetState(
     const NVDispEvoRec *pDispEvo,
     const NvU32 head,
@@ -90,6 +88,9 @@ enum NVDpLinkMode {
 enum NVDpLinkMode nvDPGetActiveLinkMode(NVDPLibConnectorPtr pDpLibConnector);
 
 void nvDPSetLinkHandoff(NVDPLibConnectorPtr pDpLibConnector, NvBool enable);
+
+NvBool nvDPIsFECForceEnabled(NVConnectorEvoPtr pConnectorEvo);
+NvBool nvDPForceEnableFEC(NVConnectorEvoPtr pConnectorEvo, NvBool enable);
 
 #ifdef __cplusplus
 };

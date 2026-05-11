@@ -16,7 +16,7 @@
 
 
 #ifdef DEBUG
-char __nvoc_class_id_uniqueness_check__0x6c347f = 1;
+char __nvoc_class_id_uniqueness_check__6c347f = 1;
 #endif
 
 extern const struct NVOC_CLASS_DEF __nvoc_class_def_OBJVASPACE;
@@ -38,6 +38,7 @@ extern const struct NVOC_EXPORT_INFO __nvoc_export_info__OBJVASPACE;
 
 // Up-thunk(s) to bridge OBJVASPACE methods to ancestors (if any)
 
+// Class-specific details for OBJVASPACE
 // Not instantiable because it's an abstract class with following pure virtual functions:
 //  vaspaceConstruct_
 //  vaspaceAlloc
@@ -46,17 +47,15 @@ extern const struct NVOC_EXPORT_INFO __nvoc_export_info__OBJVASPACE;
 //  vaspaceGetVasInfo
 const struct NVOC_CLASS_DEF __nvoc_class_def_OBJVASPACE = 
 {
-    /*classInfo=*/ {
-        /*size=*/               sizeof(OBJVASPACE),
-        /*classId=*/            classId(OBJVASPACE),
-        /*providerId=*/         &__nvoc_rtti_provider,
+    .classInfo.size =               sizeof(OBJVASPACE),
+    .classInfo.classId =            classId(OBJVASPACE),
+    .classInfo.providerId =         &__nvoc_rtti_provider,
 #if NV_PRINTF_STRINGS_ALLOWED
-        /*name=*/               "OBJVASPACE",
+    .classInfo.name =               "OBJVASPACE",
 #endif
-    },
-    /*objCreatefn=*/        (NVOC_DYNAMIC_OBJ_CREATE) NULL,
-    /*pCastInfo=*/          &__nvoc_castinfo__OBJVASPACE,
-    /*pExportInfo=*/        &__nvoc_export_info__OBJVASPACE
+    .objCreatefn =        (NVOC_DYNAMIC_OBJ_CREATE) NULL,
+    .pCastInfo =          &__nvoc_castinfo__OBJVASPACE,
+    .pExportInfo =        &__nvoc_export_info__OBJVASPACE
 };
 
 
@@ -84,13 +83,11 @@ static const struct NVOC_METADATA__OBJVASPACE __nvoc_metadata__OBJVASPACE = {
     .vtable.__vaspaceGetHeap__ = &vaspaceGetHeap_9451a7,    // inline virtual body
     .vtable.__vaspaceGetMapPageSize__ = &vaspaceGetMapPageSize_c26fae,    // inline virtual body
     .vtable.__vaspaceGetBigPageSize__ = &vaspaceGetBigPageSize_c26fae,    // inline virtual body
-    .vtable.__vaspaceIsMirrored__ = &vaspaceIsMirrored_2fa1ff,    // inline virtual body
     .vtable.__vaspaceIsFaultCapable__ = &vaspaceIsFaultCapable_2fa1ff,    // inline virtual body
     .vtable.__vaspaceIsExternallyOwned__ = &vaspaceIsExternallyOwned_2fa1ff,    // inline virtual body
     .vtable.__vaspaceIsAtsEnabled__ = &vaspaceIsAtsEnabled_2fa1ff,    // inline virtual body
     .vtable.__vaspaceGetPasid__ = &vaspaceGetPasid_14ee5e,    // inline virtual body
     .vtable.__vaspaceGetPageDirBase__ = &vaspaceGetPageDirBase_9451a7,    // inline virtual body
-    .vtable.__vaspaceGetKernelPageDirBase__ = &vaspaceGetKernelPageDirBase_9451a7,    // inline virtual body
     .vtable.__vaspacePinRootPageDir__ = &vaspacePinRootPageDir_14ee5e,    // inline virtual body
     .vtable.__vaspaceUnpinRootPageDir__ = &vaspaceUnpinRootPageDir_af5be7,    // inline virtual body
     .vtable.__vaspaceInvalidateTlb__ = &vaspaceInvalidateTlb_IMPL,    // virtual
@@ -112,31 +109,41 @@ const struct NVOC_CASTINFO __nvoc_castinfo__OBJVASPACE = {
 
 const struct NVOC_EXPORT_INFO __nvoc_export_info__OBJVASPACE = 
 {
-    /*numEntries=*/     0,
-    /*pExportEntries=*/  0
+    .numEntries=     0,
+    .pExportEntries= 0
 };
 
+
+// Destruct OBJVASPACE object.
 void __nvoc_dtor_Object(Object*);
-void __nvoc_dtor_OBJVASPACE(OBJVASPACE *pThis) {
+void __nvoc_dtor_OBJVASPACE(OBJVASPACE* pThis) {
+
+// Recurse to superclass destructors.
     __nvoc_dtor_Object(&pThis->__nvoc_base_Object);
+
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
-
 void __nvoc_init_dataField_OBJVASPACE(OBJVASPACE *pThis) {
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
 
-NV_STATUS __nvoc_ctor_Object(Object* );
+
+// Construct OBJVASPACE object.
+NV_STATUS __nvoc_ctor_Object(Object *);
 NV_STATUS __nvoc_ctor_OBJVASPACE(OBJVASPACE *pThis) {
     NV_STATUS status = NV_OK;
+
+    // Recurse to ancestor constructor(s).
     status = __nvoc_ctor_Object(&pThis->__nvoc_base_Object);
     if (status != NV_OK) goto __nvoc_ctor_OBJVASPACE_fail_Object;
+
+    // Initialize data fields.
     __nvoc_init_dataField_OBJVASPACE(pThis);
     goto __nvoc_ctor_OBJVASPACE_exit; // Success
 
+    // Unwind on error.
 __nvoc_ctor_OBJVASPACE_fail_Object:
 __nvoc_ctor_OBJVASPACE_exit:
-
     return status;
 }
 
@@ -146,7 +153,7 @@ static void __nvoc_init_funcTable_OBJVASPACE_1(OBJVASPACE *pThis) {
 } // End __nvoc_init_funcTable_OBJVASPACE_1
 
 
-// Initialize vtable(s) for 29 virtual method(s).
+// Initialize vtable(s) for 27 virtual method(s).
 void __nvoc_init_funcTable_OBJVASPACE(OBJVASPACE *pThis) {
     __nvoc_init_funcTable_OBJVASPACE_1(pThis);
 }

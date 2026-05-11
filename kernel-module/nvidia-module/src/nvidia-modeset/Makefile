@@ -54,6 +54,7 @@ CFLAGS += -D__NO_CTYPE
 
 CFLAGS += -DNV_CPU_INTRINSICS_KERNEL
 CFLAGS += -DNVHDMIPKT_RM_CALLS_INTERNAL=0
+CFLAGS += -DNVHDMIPKT_NVKMS
 
 # XXX it would be nice to only define these for appropriate files...
 CFLAGS += -DSOFTFLOAT_ROUND_ODD
@@ -195,9 +196,6 @@ $$(eval $$(call READ_ONLY_OBJECT_FROM_FILE_RULE,$$(OUTPUTDIR)/$(1)_shaders.xz))
 SHADER_OBJS += $$(OUTPUTDIR)/$(1)_shaders.xz.o
 endef
 
-$(eval $(call COMPRESS_SHADERS,maxwell))
-$(eval $(call COMPRESS_SHADERS,pascal))
-$(eval $(call COMPRESS_SHADERS,volta))
 $(eval $(call COMPRESS_SHADERS,turing))
 $(eval $(call COMPRESS_SHADERS,ampere))
 $(eval $(call COMPRESS_SHADERS,hopper))

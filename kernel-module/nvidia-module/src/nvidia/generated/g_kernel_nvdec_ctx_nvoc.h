@@ -135,13 +135,9 @@ struct NVOC_METADATA__NvdecContext {
     const struct NVOC_VTABLE__NvdecContext vtable;
 };
 
-#ifndef __NVOC_CLASS_NvdecContext_TYPEDEF__
-#define __NVOC_CLASS_NvdecContext_TYPEDEF__
-typedef struct NvdecContext NvdecContext;
-#endif /* __NVOC_CLASS_NvdecContext_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_NvdecContext
-#define __nvoc_class_id_NvdecContext 0x70d2be
+#define __nvoc_class_id_NvdecContext 0x70d2beu
+typedef struct NvdecContext NvdecContext;
 #endif /* __nvoc_class_id_NvdecContext */
 
 // Casting support
@@ -159,12 +155,33 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_NvdecContext;
 
 NV_STATUS __nvoc_objCreateDynamic_NvdecContext(NvdecContext**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_NvdecContext(NvdecContext**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_NvdecContext(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_NvdecContext((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_NvdecContext(NvdecContext**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_NvdecContext(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_NvdecContext((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+#ifdef __nvoc_kernel_nvdec_ctx_h_disabled
+static inline NV_STATUS nvdecctxConstructHal(struct NvdecContext *pNvdecContext, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("NvdecContext was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_nvdec_ctx_h_disabled
+#define nvdecctxConstructHal(pNvdecContext, pCallContext, pParams) nvdecctxConstructHal_KERNEL(pNvdecContext, pCallContext, pParams)
+#endif // __nvoc_kernel_nvdec_ctx_h_disabled
+
+#ifdef __nvoc_kernel_nvdec_ctx_h_disabled
+static inline void nvdecctxDestructHal(struct NvdecContext *pNvdecContext) {
+    NV_ASSERT_FAILED_PRECOMP("NvdecContext was disabled!");
+}
+#else // __nvoc_kernel_nvdec_ctx_h_disabled
+#define nvdecctxDestructHal(pNvdecContext) nvdecctxDestructHal_KERNEL(pNvdecContext)
+#endif // __nvoc_kernel_nvdec_ctx_h_disabled
+
+
+// Wrapper macros for halified functions
+#define nvdecctxConstructHal_HAL(pNvdecContext, pCallContext, pParams) nvdecctxConstructHal(pNvdecContext, pCallContext, pParams)
+#define nvdecctxDestructHal_HAL(pNvdecContext) nvdecctxDestructHal(pNvdecContext)
 #define nvdecctxGetSwMethods_FNPTR(pChannelDescendant) pChannelDescendant->__nvoc_base_ChannelDescendant.__nvoc_metadata_ptr->vtable.__chandesGetSwMethods__
 #define nvdecctxGetSwMethods(pChannelDescendant, ppMethods, pNumMethods) nvdecctxGetSwMethods_DISPATCH(pChannelDescendant, ppMethods, pNumMethods)
 #define nvdecctxIsSwMethodStalling_FNPTR(pChannelDescendant) pChannelDescendant->__nvoc_base_ChannelDescendant.__nvoc_metadata_ptr->vtable.__chandesIsSwMethodStalling__
@@ -359,38 +376,21 @@ static inline NV_STATUS nvdecctxGetOrAllocNotifShare_DISPATCH(struct NvdecContex
     return pNotifier->__nvoc_metadata_ptr->vtable.__nvdecctxGetOrAllocNotifShare__(pNotifier, hNotifierClient, hNotifierResource, ppNotifShare);
 }
 
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
 NV_STATUS nvdecctxConstructHal_KERNEL(struct NvdecContext *pNvdecContext, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
-
-
-#ifdef __nvoc_kernel_nvdec_ctx_h_disabled
-static inline NV_STATUS nvdecctxConstructHal(struct NvdecContext *pNvdecContext, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {
-    NV_ASSERT_FAILED_PRECOMP("NvdecContext was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_kernel_nvdec_ctx_h_disabled
-#define nvdecctxConstructHal(pNvdecContext, pCallContext, pParams) nvdecctxConstructHal_KERNEL(pNvdecContext, pCallContext, pParams)
-#endif //__nvoc_kernel_nvdec_ctx_h_disabled
-
-#define nvdecctxConstructHal_HAL(pNvdecContext, pCallContext, pParams) nvdecctxConstructHal(pNvdecContext, pCallContext, pParams)
 
 void nvdecctxDestructHal_KERNEL(struct NvdecContext *pNvdecContext);
 
-
-#ifdef __nvoc_kernel_nvdec_ctx_h_disabled
-static inline void nvdecctxDestructHal(struct NvdecContext *pNvdecContext) {
-    NV_ASSERT_FAILED_PRECOMP("NvdecContext was disabled!");
-}
-#else //__nvoc_kernel_nvdec_ctx_h_disabled
-#define nvdecctxDestructHal(pNvdecContext) nvdecctxDestructHal_KERNEL(pNvdecContext)
-#endif //__nvoc_kernel_nvdec_ctx_h_disabled
-
-#define nvdecctxDestructHal_HAL(pNvdecContext) nvdecctxDestructHal(pNvdecContext)
-
-static inline NV_STATUS __nvoc_nvdecctxConstruct(struct NvdecContext *arg_pNvdecContext, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams) {
-    return nvdecctxConstructHal(arg_pNvdecContext, arg_pCallContext, arg_pParams);
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
+static inline NV_STATUS __nvoc_nvdecctxConstruct(struct NvdecContext *pNvdecContext, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams){
+    return nvdecctxConstructHal(pNvdecContext, pCallContext, pParams);
 }
 
-static inline void __nvoc_nvdecctxDestruct(struct NvdecContext *pNvdecContext) {
+static inline void __nvoc_nvdecctxDestruct(struct NvdecContext *pNvdecContext){
     nvdecctxDestructHal(pNvdecContext);
 }
 

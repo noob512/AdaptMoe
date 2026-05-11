@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -33,6 +33,11 @@
 #define NV_CE_LCE_MASK_INIT                   0xFFFFFFFF
 #define NV_CE_EVEN_ASYNC_LCE_MASK             0x55555550
 #define NV_CE_ODD_ASYNC_LCE_MASK              0xAAAAAAA0
+#define NV_CE_EVEN_MIG_LCE_MASK               0x55555554
+#define NV_CE_ODD_MIG_LCE_MASK                0xAAAAAAA8
+#define NV_CE_EVEN_PCE_MASK                   0x55555555
+#define NV_CE_ODD_PCE_MASK                    0xAAAAAAAA
+#define NV_CE_ALL_PCE_MASK                    0xFFFFFF
 #define NV_CE_INVALID_TOPO_IDX                0xFFFF
 #define NV_CE_SYSMEM_LCE_START_INDEX          0x2
 #define NV_CE_SYSMEM_LCE_END_INDEX            0x4
@@ -176,6 +181,339 @@ done:
     portMemFree(pLocalGrceConfig);
 
     return status;
+}
+
+void
+kceSetDecompCeCap_GB100
+(
+    OBJGPU      *pGpu,
+    KernelCE    *pKCe
+)
+{
+    if(pKCe != NULL)
+    {
+        pKCe->ceCapsMask |= NVBIT32(CE_CAPS_DECOMPRESS);
+    }
+}
+
+/**
+ * @brief This function returns the MIG GPU Instance mappings a specific
+ *        partition should be using based on the input of LCEs available
+ *
+ * @param[in]   pGpu                        OBJGPU pointer
+ * @param[in]   pKCe                        KernelCE pointer
+ * @param[in]   lceAvailableMask            Bit mask of LCEs available to this GPU Instance
+ * @param[out]  pLocalPceLceMap             Pointer to PCE-LCE array
+ *
+ * @return NV_TRUE after mapping is populated. There is no error return as an invalid
+ *         mapping should not result in fatal error.
+ */
+NV_STATUS
+kceGetMappingsForMIGGpuInstance_GB100
+(
+    OBJGPU *pGpu,
+    KernelCE *pKCe,
+    NvU32 lceAvailableMask,
+    NvU32 *pLocalPceLceMap
+)
+{
+    KernelCE *pKCeIter = NULL;
+    NvU32 totalNumLcesAvailable = nvPopCount32(lceAvailableMask);
+    NvU32 shimLceMask = kceGetLceMaskForShimInstance_HAL(pGpu, pKCe);
+    NvU32 pcesForEvenLces = 0;
+    NvU32 pcesForOddLces = 0;
+    NvU32 totalPcesAvailable;
+    NvU32 numLcesToMap;
+    NvU32 lceEvenMaskToUse;
+    NvU32 lceOddMaskToUse;
+    NvU32 numMinPcesPerLce;
+    NvU32 numLcesMapped;
+    NvU32 lceIdx;
+    NvU32 pceIdx;
+    NvU32 i;
+    NVLINK_TOPOLOGY_PARAMS *pTopoParams;
+
+    //
+    // Initialize the pceAvailableMask to include all PCEs.
+    // Iterate over all HSHUBs in both shims to generate a mask of PCEs available.
+    // Considering FS, take the minimal mask of the two shims and use that PCE mask.
+    //
+
+    pTopoParams = portMemAllocNonPaged(sizeof(*pTopoParams));
+    NV_ASSERT_OR_RETURN(pTopoParams != NULL, NV_ERR_NO_MEMORY);
+    portMemSet(pTopoParams, 0, sizeof(*pTopoParams));
+
+    totalPcesAvailable = NV_CE_ALL_PCE_MASK;
+
+    KCE_ITER_SHIM_BEGIN(pGpu, pKCeIter)
+    {
+        NvU32 localPcesAvailable = 0;
+        kceGetAvailableHubPceMask(pGpu, pKCeIter, pTopoParams);
+
+        for (i = 0; i < NV2080_CTRL_CE_MAX_HSHUBS; i++)
+        {
+            localPcesAvailable |= pTopoParams->pceAvailableMaskPerConnectingHub[i];
+        }
+        totalPcesAvailable &= localPcesAvailable;
+    }
+    KCE_ITER_END;
+
+    // For even LCEs generate pce mask
+    kceGetPceConfigForLceMIGGpuInstance(pGpu,
+                                        pKCe,
+                                        lceAvailableMask & NV_CE_EVEN_MIG_LCE_MASK & shimLceMask,
+                                        totalNumLcesAvailable,
+                                        &pcesForEvenLces,
+                                        &numLcesToMap,
+                                        &lceEvenMaskToUse,
+                                        &numMinPcesPerLce);
+
+    // For odd LCEs generate pce mask
+    kceGetPceConfigForLceMIGGpuInstance(pGpu,
+                                        pKCe,
+                                        lceAvailableMask & NV_CE_ODD_MIG_LCE_MASK & shimLceMask,
+                                        totalNumLcesAvailable,
+                                        &pcesForOddLces,
+                                        &numLcesToMap,
+                                        &lceOddMaskToUse,
+                                        &numMinPcesPerLce);
+
+    // For each even LCE, assign required number of PCEs from the even PCE mask on this shim
+    pcesForEvenLces &= totalPcesAvailable;
+    numLcesMapped = 0;
+    FOR_EACH_INDEX_IN_MASK(32, lceIdx, lceEvenMaskToUse)
+    {
+        if (numLcesMapped >= (numLcesToMap / 2))
+        {
+            break;
+        }
+
+        // Assign even PCEs first in an attempt to use PCEs from the same UTLB
+        NvU32 pcesLocalAvailable  = pcesForEvenLces & NV_CE_EVEN_PCE_MASK;
+        for (i = 0; i < numMinPcesPerLce; i++)
+        {
+            if (pcesLocalAvailable == 0)
+            {
+                // assign odd LCEs if evens are no longer available
+                pcesLocalAvailable  = pcesForEvenLces & NV_CE_ODD_PCE_MASK;
+
+                if ((pcesForEvenLces & NV_CE_ODD_PCE_MASK) == 0)
+                {
+                    // no more PCEs left to assign
+                    break;
+                }
+            }
+
+            pceIdx = CE_GET_LOWEST_AVAILABLE_IDX(pcesLocalAvailable);
+            if (pceIdx <= kceGetPce2lceConfigSize1_HAL(pKCe))
+            {
+                pcesLocalAvailable = pcesLocalAvailable & ~NVBIT32(pceIdx);
+                pcesForEvenLces    = pcesForEvenLces & ~NVBIT32(pceIdx);
+                pLocalPceLceMap[pceIdx] = lceIdx % NV_KCE_GROUP_ID_STRIDE;
+            }
+        }
+        numLcesMapped++;
+    }
+    FOR_EACH_INDEX_IN_MASK_END;
+
+    // For each odd LCE, assign required number of PCEs from the odd PCE mask on this shim
+    pcesForOddLces &= totalPcesAvailable;
+    numLcesMapped = 0;
+    FOR_EACH_INDEX_IN_MASK(32, lceIdx, lceOddMaskToUse)
+    {
+        if (numLcesMapped >= (numLcesToMap / 2))
+        {
+            break;
+        }
+
+        NvU32 numPcesMapped = 0;
+        // Assign even PCEs first in an attempt to use PCEs from the same UTLB
+        NvU32 pcesLocalAvailable  = pcesForOddLces & NV_CE_EVEN_PCE_MASK;
+        for (i = 0; i < numMinPcesPerLce; i++)
+        {
+            if (pcesLocalAvailable == 0)
+            {
+                // assign odd LCEs if evens are no longer available
+                pcesLocalAvailable  = pcesForOddLces & NV_CE_ODD_PCE_MASK;
+
+                if ((pcesForOddLces & NV_CE_ODD_PCE_MASK) == 0)
+                {
+                    // no more PCEs left to assign
+                    break;
+                }
+            }
+
+            pceIdx = CE_GET_LOWEST_AVAILABLE_IDX(pcesLocalAvailable);
+            if (pceIdx <= kceGetPce2lceConfigSize1_HAL(pKCe))
+            {
+                pcesLocalAvailable = pcesLocalAvailable & ~NVBIT32(pceIdx);
+                pcesForOddLces     = pcesForOddLces & ~NVBIT32(pceIdx);
+                pLocalPceLceMap[pceIdx] = lceIdx % NV_KCE_GROUP_ID_STRIDE; //shim consideration
+                numPcesMapped++;
+
+                // Due to FS limitations regardless of min PCE request, only assign half the PCEs
+                if (numPcesMapped >= (numMinPcesPerLce / 2))
+                {
+                    break;
+                }
+            }
+        }
+        numLcesMapped++;
+
+        //
+        // Mark decomp capabilities if applicable.
+        // Note this is currently applicable to ODD LCEs to account for FB Thread IDs
+        //
+        KernelCE *pKCeLce = GPU_GET_KCE(pGpu, lceIdx);
+        kceSetDecompCeCap_HAL(pGpu, pKCeLce);
+    }
+    FOR_EACH_INDEX_IN_MASK_END;
+
+    portMemFree(pTopoParams);
+
+    return NV_OK;
+}
+
+/**
+ * @brief This function takes care of mapping work submit LCEs mappings for CC case.
+ *
+ * @param[in]   pGpu                                OBJGPU pointer
+ * @param[in]   pKCe                                KernelCE pointer
+ * @param[in]   pAvailablePceMaskForConnectingHub   Pointer to CEs available per HSHUB
+ * @param[out]  pExposedLceMask                     Pointer to LCE Mask
+ */
+NV_STATUS
+kceMapPceLceForWorkSubmitLces_GB100
+(
+    OBJGPU      *pGpu,
+    KernelCE    *pKCe,
+    NvU32       *pAvailablePceMaskForConnectingHub,
+    NvU32       *pExposedLceMask
+)
+{
+    if (!gpuIsCCFeatureEnabled(pGpu))
+    {
+        return NV_OK;
+    }
+
+    KernelCE *pKCeIter = NULL;
+
+    NvU32 numPcesPerLce;
+    NvU32 numLces;
+    NvU32 supportedPceMask;
+    NvU32 supportedLceMask;
+    NvU32 pcesPerHshub;
+    NvU32 pceIndex;
+    NvU32 lceMask;
+    NvU32 hshubIndex;
+    NvU32 maxLceCount;
+    NvU32 lceIndex;
+    NvU32 lastShimInstance = 0;
+
+    kceGetPceConfigForLceType(pGpu,
+                              pKCe,
+                              NV2080_CTRL_CE_LCE_TYPE_CC_WORK_SUBMIT,
+                              &numPcesPerLce,
+                              &numLces,
+                              &supportedPceMask,
+                              &supportedLceMask,
+                              &pcesPerHshub);
+
+    maxLceCount = supportedLceMask;
+    HIGHESTBITIDX_32(maxLceCount); // HIGHESTBITIDX_32 is destructive.
+    maxLceCount++;
+
+    //
+    // Choose the last shim instance that has PCEs
+    //
+    KCE_ITER_SHIM_BEGIN(pGpu, pKCeIter)
+    {
+        //
+        // Skip any shims that don't have any PCEs connected to the hubs
+        //
+        if (pKCeIter->shimConnectingHubMask == 0)
+        {
+            continue;
+        }
+
+        hshubIndex = CE_GET_LOWEST_AVAILABLE_IDX(pKCeIter->shimConnectingHubMask);
+        pceIndex   = CE_GET_LOWEST_AVAILABLE_IDX((pAvailablePceMaskForConnectingHub[hshubIndex] &
+                                                  supportedPceMask));
+
+        if (pceIndex < kceGetPce2lceConfigSize1_HAL(pKCeIter))
+        {
+            lastShimInstance = NV_MAX(pKCeIter->shimInstance, lastShimInstance);
+        }
+    }
+    KCE_ITER_END;
+
+    KCE_ITER_SHIM_BEGIN(pGpu, pKCeIter)
+    {
+        //
+        // Assign this LCE only on the last shim instance only on multiple shim chips.
+        //
+        if (pKCeIter->shimInstance == 0 || pKCeIter->shimInstance != lastShimInstance)
+        {
+            continue;
+        }
+
+        for (NvU32 index = 0; index < 2; ++index)
+        {
+            lceMask = kceGetLceMaskForShimInstance_HAL(pGpu, pKCeIter) &
+                      supportedLceMask &
+                     ~(*pExposedLceMask);
+
+            // Prefer odd numbered LCEs as even numbered ones are used for other apertures.
+            if ((lceMask & NV_CE_ODD_ASYNC_LCE_MASK) != 0)
+            {
+                lceMask &= NV_CE_ODD_ASYNC_LCE_MASK;
+            }
+
+            lceIndex = CE_GET_LOWEST_AVAILABLE_IDX(lceMask);
+
+            if (lceIndex >= maxLceCount)
+            {
+                break;
+            }
+
+            FOR_EACH_INDEX_IN_MASK(32, hshubIndex, pKCeIter->shimConnectingHubMask)
+            {
+                if (pAvailablePceMaskForConnectingHub[hshubIndex] == 0)
+                {
+                    continue;
+                }
+
+                pceIndex = CE_GET_LOWEST_AVAILABLE_IDX((pAvailablePceMaskForConnectingHub[hshubIndex] & supportedPceMask));
+
+                if (pceIndex < kceGetPce2lceConfigSize1_HAL(pKCeIter))
+                {
+                    pAvailablePceMaskForConnectingHub[hshubIndex] &= ~(NVBIT32(pceIndex));
+                    //
+                    // Convert absolute LCE index to shim local index
+                    //
+                    pKCeIter->pPceLceMap[pceIndex] = lceIndex % NV_KCE_GROUP_ID_STRIDE;
+                    *pExposedLceMask              |= NVBIT(lceIndex);
+                    lceMask                       &= ~(NVBIT32(lceIndex));
+
+                    KernelCE *pKCeLce = GPU_GET_KCE(pGpu, lceIndex);
+
+                    NV_ASSERT(pKCeLce != NULL);
+                    pKCeLce->ceCapsMask |= NVBIT32(CE_CAPS_CC_WORK_SUBMIT);
+
+                    NV_PRINTF(LEVEL_INFO,
+                              "Work submit CE Mapping -- PCE Index: %d -> LCE Index: %d\n",
+                              pceIndex,
+                              lceIndex);
+
+                    break;
+                }
+            }
+            FOR_EACH_INDEX_IN_MASK_END;
+        }
+    }
+    KCE_ITER_END;
+
+    return NV_OK;
 }
 
 /**
@@ -334,7 +672,19 @@ _ceGetAlgorithmPceIndex
                                  sizeof(maxHshubParams)));
 
     *pHshubId = maxHshubParams.maxHshubs - 1;
-    *pceIndex = CE_GET_LOWEST_AVAILABLE_IDX(pAvailablePceMaskForConnectingHub[*pHshubId]);
+
+    //
+    // Do not include decomp PCEs (as they are not AES capable) in NVLINK LCE in CC mode as
+    // we want to make NVLINK LCE a secure LCE
+    //
+    if (!gpuIsCCFeatureEnabled(pGpu))
+    {
+        *pceIndex = CE_GET_LOWEST_AVAILABLE_IDX(pAvailablePceMaskForConnectingHub[*pHshubId]);
+    }
+    else
+    {
+        *pceIndex = CE_GET_LOWEST_AVAILABLE_IDX((pAvailablePceMaskForConnectingHub[*pHshubId] & ~(pKCe->decompPceMask)));
+    }
 
     if (*pceIndex <= kceGetPce2lceConfigSize1_HAL(pKCe))
     {
@@ -373,7 +723,7 @@ kceMapPceLceForNvlinkPeers_GB100
     KernelNvlink   *pKernelNvlink         = GPU_GET_KERNEL_NVLINK(pGpu);
     NV_STATUS       status                = NV_OK;
     NvU32           pceMask               = 0;
-    NvU32           peerLinkMask          = 0;
+    NvU64           peerLinkMask          = 0;
     NvU32           gpuInstance           = 0;
     NvU32           pceIndex              = kceGetPce2lceConfigSize1_HAL(pKCe);
     NvBool          bPeerAssigned         = NV_FALSE;
@@ -381,15 +731,13 @@ kceMapPceLceForNvlinkPeers_GB100
     OBJGPU         *pRemoteGpu;
     NvU32           lceIndex;
     NvU32           linkId;
-    NvU32           gpuMask;
-    NvU32           hshubIndex;
+    NvU32           gpuMask;    
     NvU32           maxLceCount;
     NvU32           numPcesPerLce;
     NvU32           numLces;
     NvU32           supportedPceMask;
     NvU32           supportedLceMask;
     NvU32           pcesPerHshub;
-    NvBool          bIsPceAvailable;
 
     kceGetPceConfigForLceType(pGpu,
                               pKCe,
@@ -403,9 +751,6 @@ kceMapPceLceForNvlinkPeers_GB100
     maxLceCount = supportedLceMask;
     HIGHESTBITIDX_32(maxLceCount); // HIGHESTBITIDX_32 is destructive.
     maxLceCount++;
-
-    NV2080_CTRL_INTERNAL_HSHUB_GET_HSHUB_ID_FOR_LINKS_PARAMS params;
-    portMemSet(&params, 0, sizeof(params));
 
     peerAvailableLceMask = kceGetNvlinkPeerSupportedLceMask_HAL(pGpu, pKCe, peerAvailableLceMask) &
                                 kceGetLceMask(pGpu) &
@@ -457,7 +802,6 @@ kceMapPceLceForNvlinkPeers_GB100
                                         ~(*pExposedLceMask);
         }
 
-
         lceIndex = CE_GET_LOWEST_AVAILABLE_IDX(peerAvailableLceMask);
 
         if (lceIndex >= maxLceCount)
@@ -478,51 +822,131 @@ kceMapPceLceForNvlinkPeers_GB100
             continue;
         }
 
-        params.linkMask = peerLinkMask;
-
-        status = knvlinkExecGspRmRpc(pGpu,
-                                     pKernelNvlink,
-                                     NV2080_CTRL_CMD_INTERNAL_HSHUB_GET_HSHUB_ID_FOR_LINKS,
-                                     &params,
-                                     sizeof(params));
-        NV_ASSERT_OK_OR_RETURN(status);
-
-        FOR_EACH_INDEX_IN_MASK(32, linkId, peerLinkMask)
+        if (!kceSupportsEquidistantPces_HAL(pGpu, pKCe))
         {
-            hshubIndex  = params.hshubIds[linkId];
-            pceIndex    = CE_GET_LOWEST_AVAILABLE_IDX(pAvailablePceMaskForConnectingHub[hshubIndex]);
+            NvU32  hshubIndex;
+            NvBool bIsPceAvailable;
+            NV2080_CTRL_INTERNAL_HSHUB_GET_HSHUB_ID_FOR_LINKS_PARAMS params;
+            portMemSet(&params, 0, sizeof(params));
+            params.linkMask = peerLinkMask;
 
-            bIsPceAvailable = _ceGetAlgorithmPceIndex(pGpu, pKCe, pAvailablePceMaskForConnectingHub, &pceIndex, &hshubIndex);
-            if (bIsPceAvailable && (pceIndex < kceGetPce2lceConfigSize1_HAL(pKCe)))
+            status = knvlinkExecGspRmRpc(pGpu,
+                                         pKernelNvlink,
+                                         NV2080_CTRL_CMD_INTERNAL_HSHUB_GET_HSHUB_ID_FOR_LINKS,
+                                         &params,
+                                         sizeof(params));
+            NV_ASSERT_OK_OR_RETURN(status);
+
+            FOR_EACH_INDEX_IN_MASK(64, linkId, peerLinkMask)
             {
-                pceMask                                         |= NVBIT32(pceIndex);
-                pAvailablePceMaskForConnectingHub[hshubIndex]   &= ~(NVBIT32(pceIndex));
+                hshubIndex  = params.hshubIds[linkId];
+                pceIndex    = CE_GET_LOWEST_AVAILABLE_IDX(pAvailablePceMaskForConnectingHub[hshubIndex]);
+
+                bIsPceAvailable = _ceGetAlgorithmPceIndex(pGpu, pKCe, pAvailablePceMaskForConnectingHub, &pceIndex, &hshubIndex);
+                if (bIsPceAvailable && (pceIndex < kceGetPce2lceConfigSize1_HAL(pKCe)))
+                {
+                    pceMask                                         |= NVBIT32(pceIndex);
+                    pAvailablePceMaskForConnectingHub[hshubIndex]   &= ~(NVBIT32(pceIndex));
+                }
+            }
+            FOR_EACH_INDEX_IN_MASK_END;
+        }
+        else
+        {
+            NvU32 numPcesAssigned    = 0;
+            NvU32 numLinks           = nvPopCount64(peerLinkMask);
+            NvU32 connectingHubIndex = 0;
+            NvBool bFoundPces;
+
+            KernelCE *pKCeShimOwner;
+
+            status = kceFindShimOwner(pGpu, pKCe, &pKCeShimOwner);
+
+            while (numPcesAssigned < numLinks)
+            {
+                bFoundPces = NV_FALSE;
+
+                FOR_EACH_INDEX_IN_MASK(32, connectingHubIndex, pKCeShimOwner->shimConnectingHubMask)
+                {
+                    if (pAvailablePceMaskForConnectingHub[connectingHubIndex] == 0)
+                    {
+                        continue;
+                    }
+
+                    if (numPcesAssigned >= numLinks)
+                    {
+                        break;
+                    }
+
+                    FOR_EACH_INDEX_IN_MASK(32, pceIndex, pAvailablePceMaskForConnectingHub[connectingHubIndex] & supportedPceMask)
+                    {
+                        if (numPcesAssigned >= numLinks)
+                        {
+                            break;
+                        }
+
+                        bFoundPces                                             = NV_TRUE;
+                        pceMask                                               |= NVBIT32(pceIndex);
+                        pAvailablePceMaskForConnectingHub[connectingHubIndex] &= ~(NVBIT32(pceIndex));
+                        ++numPcesAssigned;
+                    }
+                    FOR_EACH_INDEX_IN_MASK_END;
+                }
+                FOR_EACH_INDEX_IN_MASK_END;
+
+                if (!bFoundPces)
+                {
+                    break;
+                }
             }
         }
-        FOR_EACH_INDEX_IN_MASK_END;
 
         if (pceMask != 0)
         {
-            peerAvailableLceMask    &= ~(NVBIT32(lceIndex));
-            *pExposedLceMask        |= NVBIT32(lceIndex);
-            bPeerAssigned            = NV_TRUE;
+            peerAvailableLceMask &= ~(NVBIT32(lceIndex));
+            *pExposedLceMask     |= NVBIT32(lceIndex);
+            bPeerAssigned         = NV_TRUE;
+
+            NvU32 numPceSplit = nvPopCount32(pceMask) / 2;
+            NvU32 numPceAssigned = 0;
+            NvU32 secondLceIndex = CE_GET_LOWEST_AVAILABLE_IDX(peerAvailableLceMask);
+
+            if (pKCe->bMultipleP2PLce)
+            {
+                if (secondLceIndex >= maxLceCount)
+                {
+                    NV_PRINTF(LEVEL_ERROR,
+                              "Invalid Second LCE Index Request. lceIndex = %d, maxLceCount = %d\n",
+                              secondLceIndex, maxLceCount);
+                    return NV_OK;
+                }
+                else
+                {
+                    peerAvailableLceMask &= ~(NVBIT32(secondLceIndex));
+                    *pExposedLceMask     |= NVBIT32(secondLceIndex);
+                }
+            }
 
             FOR_EACH_INDEX_IN_MASK(32, pceIndex, pceMask)
             {
+                NvU32 currentLceIndex = (pKCe->bMultipleP2PLce && (numPceAssigned > numPceSplit)) ? secondLceIndex : lceIndex;
+
                 //
                 // Convert absolute LCE index to shim local index
                 //
-                pKCe->pPceLceMap[pceIndex] = lceIndex % NV_KCE_GROUP_ID_STRIDE;
-                KernelCE *pKCeLce          = GPU_GET_KCE(pGpu, lceIndex);
+                pKCe->pPceLceMap[pceIndex] = currentLceIndex % NV_KCE_GROUP_ID_STRIDE;
+                KernelCE *pKCeLce          = GPU_GET_KCE(pGpu, currentLceIndex);
+                numPceAssigned++;
                 if(pKCeLce != NULL)
                 {
-                   pKCeLce->ceCapsMask    |= NVBIT32(CE_CAPS_NVLINK_P2P);
+                   pKCeLce->ceCapsMask     |= NVBIT32(CE_CAPS_NVLINK_P2P);
+                   pKCeLce->nvlinkPeerMask |= NVBIT32(pRemoteGpu->gpuInstance);
                 }
                 NV_PRINTF(LEVEL_INFO, "Nvlink peer CE Mapping for GPU%d <-> GPU%d -- PCE Index: %d -> LCE Index: %d\n",
                           pGpu->gpuInstance,
                           pRemoteGpu->gpuInstance,
                           pceIndex,
-                          lceIndex);
+                          currentLceIndex);
             }
             FOR_EACH_INDEX_IN_MASK_END;
         }
@@ -564,7 +988,6 @@ kceMapPceLceForGRCE_GB100
     NvU32         hshubIndex;
     NvU32         pceIndex;
     KernelCE     *pKCeIter;
-    NvU32         pceExcludeMaskForSharedGrce;
 
     KCE_ITER_SHIM_BEGIN(pGpu, pKCeIter)
     {
@@ -578,28 +1001,6 @@ kceMapPceLceForGRCE_GB100
 
         hshubIndex = CE_GET_LOWEST_AVAILABLE_IDX(pKCeIter->shimConnectingHubMask);
 
-        pceExcludeMaskForSharedGrce = pKCeIter->decompPceMask;
-
-        if (gpuIsCCFeatureEnabled(pGpu))
-        {
-            NvU32 numPcesPerLce;
-            NvU32 numLces;
-            NvU32 supportedPceMask;
-            NvU32 supportedLceMask;
-            NvU32 pcesPerHshub;
-
-            kceGetPceConfigForLceType(pGpu,
-                                      pKCe,
-                                      NV2080_CTRL_CE_LCE_TYPE_PCIE,
-                                      &numPcesPerLce,
-                                      &numLces,
-                                      &supportedPceMask,
-                                      &supportedLceMask,
-                                      &pcesPerHshub);
-
-            pceExcludeMaskForSharedGrce = pceExcludeMaskForSharedGrce | supportedPceMask;
-        }
-
         // Some PCEs have not been assigned. Pick one and use that for GRCE.
         if ((pAvailablePceMaskForConnectingHub[hshubIndex] & ~(pKCeIter->decompPceMask)) != 0)
         {
@@ -607,6 +1008,7 @@ kceMapPceLceForGRCE_GB100
             *pExposedLceMask   |= NVBIT32(lceIndex);
             pceIndex            = CE_GET_LOWEST_AVAILABLE_IDX((pAvailablePceMaskForConnectingHub[hshubIndex] &
                                                               ~(pKCeIter->decompPceMask)));
+            NV_ASSERT_OR_RETURN_VOID(pceIndex < NV2080_CTRL_MAX_PCES);
 
             if (pceIndex < kceGetPce2lceConfigSize1_HAL(pKCeIter))
             {
@@ -625,7 +1027,7 @@ kceMapPceLceForGRCE_GB100
 
             for (pceIndex = 0; pceIndex < size; ++pceIndex)
             {
-                if ((NVBIT32(pceIndex) & pceExcludeMaskForSharedGrce) == 0)
+                if ((NVBIT32(pceIndex) & pKCeIter->decompPceMask) == 0)
                 {
                     if (pKCeIter->pPceLceMap[pceIndex] != NV2080_CTRL_CE_UPDATE_PCE_LCE_MAPPINGS_INVALID_LCE)
                     {
@@ -975,8 +1377,7 @@ kceMapPceLceForC2C_GB100
                 for (index = 0; index < pcesPerHshub; ++index)
                 {
                     pceIndex = CE_GET_LOWEST_AVAILABLE_IDX((pAvailablePceMaskForConnectingHub[hshubIndex] & supportedPceMask));
-
-                    if (pceIndex >= kceGetPce2lceConfigSize1_HAL(pKCeIter))
+                    if ((pceIndex >= kceGetPce2lceConfigSize1_HAL(pKCeIter)) || (pceIndex >= NV2080_CTRL_MAX_PCES))
                     {
                         break;
                     }
@@ -1133,8 +1534,16 @@ kceMapPceLceForScrub_GB100
             for (index = 0; index < pcesPerHshub; ++index)
             {
                 pceIndex = CE_GET_LOWEST_AVAILABLE_IDX((pAvailablePceMaskForConnectingHub[hshubIndex] & supportedPceMask));
+                if (pceIndex >= NV2080_CTRL_MAX_PCES)
+                {
+                    //
+                    // Scrub limits 2 PCEs per HSHUB. If not enough are available
+                    // it is acceptable to continue mapping on the next HSHUB
+                    //
+                    continue;
+                }
 
-                if (pceIndex < kceGetPce2lceConfigSize1_HAL(pKCeIter))
+                if ((pceIndex < kceGetPce2lceConfigSize1_HAL(pKCeIter)) && (pceIndex < NV2080_CTRL_MAX_PCES))
                 {
                     pAvailablePceMaskForConnectingHub[hshubIndex]   &= (~(NVBIT32(pceIndex)));
 
@@ -1408,7 +1817,7 @@ kceGetMappings_GB100
                               pExposedLceMask);
 
     //
-    // C) First, assign PCEs to Peers if nvlink is enabled or NVswitch enabled
+    // D) Assign PCEs to Peers if nvlink is enabled or NVswitch enabled
     //
     if (pKernelNvlink && !knvlinkIsForcedConfig(pGpu, pKernelNvlink))
     {
@@ -1418,8 +1827,20 @@ kceGetMappings_GB100
                                        pLocalPceLceMap,
                                        pExposedLceMask);
     }
+
     //
-    // D) Assign PCEs for Scrub
+    // C) Assign LCEs for work launch and completion. We need this only on platforms
+    // that require bounce buffers. x86 is one such platform.
+    //
+#if defined(NVCPU_X86_64)
+    kceMapPceLceForWorkSubmitLces_HAL(pGpu,
+                                      pKCeShimOwner,
+                                      availablePceMaskForConnectingHub,
+                                      pExposedLceMask);
+#endif
+
+    //
+    // E) Assign PCEs for Scrub
     //
     kceMapPceLceForScrub_HAL(pGpu,
                              pKCeShimOwner,
@@ -1427,15 +1848,26 @@ kceGetMappings_GB100
                              pExposedLceMask);
 
     //
-    // E) Assign GRCE after PCEs to ensure proper sharing if required
+    // GrCE is not being used in CC. If we are assigning a GrCE, it needs to be in primary die.
+    // In MPT mode, all the 16 AES capable PCEs are being assigned to NVLINK LCE. To have a shared
+    // GrCE, we need to share it with NVLINK LCE, but this makes NVLINK LCE a non-secure LCE. To have
+    // a dedicated GrCE, we need to remove a PCE from NVLINK LCE and use it for GrCE, but this would
+    // reduce the BW of NVLINK LCE. Both of these are not preferred. Hence, removing the GrCE in CC
+    // mode as it is anyways not used.
     //
-    kceMapPceLceForGRCE_HAL(pGpu,
-                            pKCeShimOwner,
-                            availablePceMaskForConnectingHub,
-                            pLocalPceLceMap,
-                            pExposedLceMask,
-                            pLocalGrceMap,
-                            pTopoParams->fbhubPceMask);
+    if (!gpuIsCCFeatureEnabled(pGpu))
+    {
+        //
+        // F) Assign GRCE after PCEs to ensure proper sharing if required
+        //
+        kceMapPceLceForGRCE_HAL(pGpu,
+                                pKCeShimOwner,
+                                availablePceMaskForConnectingHub,
+                                pLocalPceLceMap,
+                                pExposedLceMask,
+                                pLocalGrceMap,
+                                pTopoParams->fbhubPceMask);
+    }
 
     //
     // At minimum PCEs need to be assigned for LCE4. Assign PCEs for LCE4 if not already assigned.
@@ -1572,6 +2004,32 @@ kceIsCeNvlinkP2P_GB100
     return (pKCe->ceCapsMask & NVBIT32(CE_CAPS_NVLINK_P2P)) && !pKCe->bStubbed;
 }
 
+NvBool
+kceIsCCWorkSubmitLce_GB100
+(
+    OBJGPU      *pGpu,
+    KernelCE    *pKCe
+)
+{
+    return (pKCe->ceCapsMask & NVBIT32(CE_CAPS_CC_WORK_SUBMIT)) && !pKCe->bStubbed;
+}
+
+/**
+ * @brief Returns true if the current LCE can be used for fast scrubbing.
+ *
+ * @param[in]      pGpu       OBJGPU pointer
+ * @param[in]      pKCe       KernelCE pointer
+ */
+NvBool
+kceIsScrubLce_GB100
+(
+    OBJGPU      *pGpu,
+    KernelCE    *pKCe
+)
+{
+    return (pKCe->ceCapsMask & NVBIT32(CE_CAPS_SCRUB)) && !pKCe->bStubbed;
+}
+
 /**
  * @brief Sets the CE capabilities based on PCE-LCE mapping algorithm
  *
@@ -1606,6 +2064,12 @@ kceAssignCeCaps_GB100
             NV_PRINTF(LEVEL_INFO, "LCE %d assigned for Sysmem Wr.\n", pKCe->publicID);
             RMCTRL_SET_CAP(pKCeCaps, NV2080_CTRL_CE_CAPS, _CE_SYSMEM_WRITE);
         }
+
+        if (kceIsScrubLce_HAL(pGpu, pKCe))
+        {
+            NV_PRINTF(LEVEL_INFO, "LCE %d assigned for fast scrubbing.\n", pKCe->publicID);
+            RMCTRL_SET_CAP(pKCeCaps, NV2080_CTRL_CE_CAPS, _CE_SCRUB);
+        }
     }
 
     if (pKernelNvlink != NULL && kceIsCeNvlinkP2P_HAL(pGpu, pKCe))
@@ -1613,4 +2077,94 @@ kceAssignCeCaps_GB100
         NV_PRINTF(LEVEL_INFO, "LCE %d assigned for NVLINK.\n", pKCe->publicID);
         RMCTRL_SET_CAP(pKCeCaps, NV2080_CTRL_CE_CAPS, _CE_NVLINK_P2P);
     }
+
+    if (gpuIsCCFeatureEnabled(pGpu))
+    {
+        if (kceIsCCWorkSubmitLce_HAL(pGpu, pKCe))
+        {
+            NV_PRINTF(LEVEL_INFO, "LCE %d assigned for CC Work Submit.\n", pKCe->publicID);
+            RMCTRL_SET_CAP(pKCeCaps, NV2080_CTRL_CE_CAPS, _CE_CC_WORK_SUBMIT);
+        }
+    }
+}
+
+/**
+ * @brief Returns the CEs marked for P2P based on PCE-LCE mapping algorithm
+ *
+ * @param[in]      pKCe               KernelCE pointer
+ * @param[in]      pGpu               OBJGPU pointer
+ * @param[in]      gpuMask            GPU mask
+ * @param[out]     pNvlinkP2PCeMask   Mask of LCEs marked for P2P
+ */
+NV_STATUS
+kceGetP2PCes_GB100
+(
+    KernelCE *pKCe,
+    OBJGPU   *pGpu,
+    NvU32     gpuMask,
+    NvU32    *pNvlinkP2PCeMask
+)
+{
+    NvU32          gpuCount       = gpumgrGetSubDeviceCount(gpuMask);
+    KernelNvlink  *pKernelNvlink  = GPU_GET_KERNEL_NVLINK(pGpu);
+    KernelCE      *pKCeLoop;
+    NvU32          remoteGpuMask  = 0;
+
+    if (pKernelNvlink == NULL)
+    {
+        return NV_WARN_NOTHING_TO_DO;
+    }
+
+    //
+    // Get the remote GPU mask. In the case of loopback mode, GPU count will be
+    // 1. So, current GPU will be the remote GPU as well. If the GPU count is 2,
+    // then in the case, figure out the remote GPU mask.
+    //
+    if (gpuCount == 1)
+    {
+        remoteGpuMask = gpuMask;
+    }
+    else
+    {
+        OBJGPU  *pRemoteGpu     = NULL;
+        NvU32    gpuInstance    = 0;
+
+        while ((pRemoteGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
+        {
+            if (pRemoteGpu != pGpu)
+            {
+                remoteGpuMask = NVBIT32(gpuGetInstance(pRemoteGpu));
+                break;
+            }
+        }
+    }
+
+    KCE_ITER_ALL_BEGIN(pGpu, pKCeLoop, 0)
+    {
+        if (pKCeLoop->bStubbed)
+            continue;
+
+        if (kceIsCeNvlinkP2P_HAL(pGpu, pKCeLoop))
+        {
+            if (knvlinkIsGpuConnectedToNvswitch(pGpu, pKernelNvlink))
+            {
+                *pNvlinkP2PCeMask |= NVBIT32(pKCeLoop->publicID);
+            }
+            else
+            {
+                if ((pKCeLoop->nvlinkPeerMask & remoteGpuMask) > 0)
+                {
+                    *pNvlinkP2PCeMask |= NVBIT32(pKCeLoop->publicID);
+                }
+            }
+        }
+    }
+    KCE_ITER_END
+
+    if (*pNvlinkP2PCeMask == 0)
+    {
+        return kceGetP2PCes_GH100(pKCe, pGpu, gpuMask, pNvlinkP2PCeMask);
+    }
+
+    return NV_OK;
 }

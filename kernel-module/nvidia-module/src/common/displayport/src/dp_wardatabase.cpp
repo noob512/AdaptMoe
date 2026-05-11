@@ -112,6 +112,20 @@ void ConnectorImpl2x::applyOuiWARs()
                 }
             }
             break;
+        case 0xAD6000:
+            if ((modelName[0] == 'M') &&
+                (modelName[1] == 'C') &&
+                (modelName[2] == '2') &&
+                (modelName[3] == '9') &&
+                (modelName[4] == '0'))
+            {
+                bForceHeadShutdownPerMonitor = true;
+                bApplyStuffDummySymbolsWAR = true;
+                bStuffDummySymbolsFor128b132b = false;
+                bStuffDummySymbolsFor8b10b = true;
+            }
+            break;
+
     }
 }
 
@@ -446,6 +460,11 @@ void Edid::applyEdidWorkArounds(NvU32 warFlag, const DpMonitorDenylistData *pDen
                         DP_PRINTF(DP_NOTICE, "DP-WAR> Sharp EDP implements only Legacy interrupt address range");
                     }
                     break;
+
+                    case 0x157F:
+                    // Bug 5317617 - ALPM doesn't work with Sharp panel at lower link rates.
+                    this->WARFlags.forceMaxLinkConfig = true;
+                    break;
             }
             break;
 
@@ -499,16 +518,25 @@ void Edid::applyEdidWorkArounds(NvU32 warFlag, const DpMonitorDenylistData *pDen
 
         // LG
         case 0xE430:
-            if (ProductID == 0x0469)
+            switch (ProductID)
             {
-                //
-                // The LG display can't be driven at FHD with 2*RBR.
-                // Force max link config
-                //
-                this->WARFlags.forceMaxLinkConfig = true;
-                DP_PRINTF(DP_NOTICE, "DP-WAR> Force maximum link config WAR required on LG panel.");
-                DP_PRINTF(DP_NOTICE, "DP-WAR>   bug 1649626");
-                break;
+                case 0x0469:
+                {
+                    //
+                    // The LG display can't be driven at FHD with 2*RBR.
+                    // Force max link config
+                    //
+                    this->WARFlags.forceMaxLinkConfig = true;
+                    DP_PRINTF(DP_NOTICE, "DP-WAR> Force maximum link config WAR required on LG panel.");
+                    DP_PRINTF(DP_NOTICE, "DP-WAR>   bug 1649626");
+                    break;
+                }
+                case 0x06DB:
+                {
+                    this->WARFlags.useLegacyAddress = true;
+                    DP_PRINTF(DP_NOTICE, "DP-WAR> LG eDP implements only Legacy interrupt address range");
+                    break;
+                }
             }
             break;
         case 0x8F34:
@@ -602,7 +630,8 @@ void Edid::applyEdidWorkArounds(NvU32 warFlag, const DpMonitorDenylistData *pDen
                 DP_PRINTF(DP_NOTICE, "DP-WAR> Disable DSC max BPP limit of 16 for DSC.");
             }
             else if (ProductID == 0x5CA7 || ProductID == 0x9E9D || ProductID == 0x9EA0 || ProductID == 0x9EA5 || ProductID == 0x5CB7 ||
-                     ProductID == 0x9EA8 || ProductID == 0x9EAF || ProductID == 0x7846 || ProductID == 0x7849 || ProductID == 0x5CB5)
+                     ProductID == 0x9EA8 || ProductID == 0x9EAF || ProductID == 0x7846 || ProductID == 0x7849 || ProductID == 0x5CB5 ||
+                     ProductID == 0x77E0 || ProductID == 0x9EB9 || ProductID == 0x5BBF)
             {
                 this->WARFlags.bForceHeadShutdownOnModeTransition = true;
                 DP_PRINTF(DP_NOTICE, "DP-WAR> Force head shutdown on Mode transition.");
@@ -615,12 +644,13 @@ void Edid::applyEdidWorkArounds(NvU32 warFlag, const DpMonitorDenylistData *pDen
                 this->WARFlags.bSkipCableIdCheck = true;
                 DP_PRINTF(DP_NOTICE, "DP-WAR> Panel does not expose cable capability. Ignoring it. Bug 4968411");
             }
-            else if(ProductID == 0x24b5 || ProductID == 0x32f2)
+            else if(ProductID == 0x24b5 || ProductID == 0x32f2 || ProductID == 0x27BC)
             {
                 //
                 // Asus ROG PG248QP  (0x24b5) Bug 5100062
                 // Asus ROG PG32UCDM (0x32f2) Bug 5088957
-                //
+                // Asus ROG PG27AQN  (0x27BC) Bug 5300665
+
                 this->WARFlags.bForceHeadShutdown = true;
                 DP_PRINTF(DP_NOTICE, "DP-WAR> Force head shutdown.");
             }
@@ -648,6 +678,21 @@ void Edid::applyEdidWorkArounds(NvU32 warFlag, const DpMonitorDenylistData *pDen
             {
                 this->WARFlags.bDisableDownspread = true;
                 DP_PRINTF(DP_NOTICE, "DP-WAR> VRT monitor does not work with GB20x when downspread is enabled. Disabling downspread.");
+            }
+            break;
+        case 0xAC10:
+            switch (ProductID)
+            {
+                case 0x42AD:
+                case 0x42AC:
+                    this->WARFlags.bApplyStuffDummySymbolsWAR   = true;
+                    this->WARData.bStuffDummySymbolsFor128b132b = true;
+                    this->WARData.bStuffDummySymbolsFor8b10b    = false;
+                    break;
+                case 0xA21F:
+                    this->WARFlags.bForceHeadShutdown = true;
+                    DP_PRINTF(DP_NOTICE, "DP-WAR> Force head shutdown for Dell AW2524H.");
+                    break;
             }
             break;
         default:

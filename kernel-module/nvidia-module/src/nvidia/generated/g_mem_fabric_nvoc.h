@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -98,14 +98,6 @@ struct MemoryFabric {
     struct RmResource *__nvoc_pbase_RmResource;    // rmres super^2
     struct Memory *__nvoc_pbase_Memory;    // mem super
     struct MemoryFabric *__nvoc_pbase_MemoryFabric;    // memoryfabric
-
-    // Vtable with 6 per-object function pointers
-    NV_STATUS (*__memoryfabricCtrlGetInfo__)(struct MemoryFabric * /*this*/, NV00F8_CTRL_GET_INFO_PARAMS *);  // exported (id=0xf80101)
-    NV_STATUS (*__memoryfabricCtrlCmdDescribe__)(struct MemoryFabric * /*this*/, NV00F8_CTRL_DESCRIBE_PARAMS *);  // exported (id=0xf80102)
-    NV_STATUS (*__memoryfabricCtrlAttachMem__)(struct MemoryFabric * /*this*/, NV00F8_CTRL_ATTACH_MEM_PARAMS *);  // exported (id=0xf80103)
-    NV_STATUS (*__memoryfabricCtrlDetachMem__)(struct MemoryFabric * /*this*/, NV00F8_CTRL_DETACH_MEM_PARAMS *);  // exported (id=0xf80104)
-    NV_STATUS (*__memoryfabricCtrlGetNumAttachedMem__)(struct MemoryFabric * /*this*/, NV00F8_CTRL_GET_NUM_ATTACHED_MEM_PARAMS *);  // exported (id=0xf80105)
-    NV_STATUS (*__memoryfabricCtrlGetPageLevelInfo__)(struct MemoryFabric * /*this*/, NV00F8_CTRL_GET_PAGE_LEVEL_INFO_PARAMS *);  // exported (id=0xf80107)
 };
 
 
@@ -147,13 +139,9 @@ struct NVOC_METADATA__MemoryFabric {
     const struct NVOC_VTABLE__MemoryFabric vtable;
 };
 
-#ifndef __NVOC_CLASS_MemoryFabric_TYPEDEF__
-#define __NVOC_CLASS_MemoryFabric_TYPEDEF__
-typedef struct MemoryFabric MemoryFabric;
-#endif /* __NVOC_CLASS_MemoryFabric_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_MemoryFabric
-#define __nvoc_class_id_MemoryFabric 0x127499
+#define __nvoc_class_id_MemoryFabric 0x127499u
+typedef struct MemoryFabric MemoryFabric;
 #endif /* __nvoc_class_id_MemoryFabric */
 
 // Casting support
@@ -171,12 +159,80 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_MemoryFabric;
 
 NV_STATUS __nvoc_objCreateDynamic_MemoryFabric(MemoryFabric**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_MemoryFabric(MemoryFabric**, Dynamic*, NvU32, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_MemoryFabric(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_MemoryFabric((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_MemoryFabric(MemoryFabric**, Dynamic*, NvU32, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_MemoryFabric(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_MemoryFabric((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS memoryfabricConstruct_IMPL(struct MemoryFabric *pMemoryFabric, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_memoryfabricConstruct(pMemoryFabric, pCallContext, pParams) memoryfabricConstruct_IMPL(pMemoryFabric, pCallContext, pParams)
+
+void memoryfabricDestruct_IMPL(struct MemoryFabric *pMemoryFabric);
+#define __nvoc_memoryfabricDestruct(pMemoryFabric) memoryfabricDestruct_IMPL(pMemoryFabric)
+
+NV_STATUS memoryfabricCtrlGetInfo_IMPL(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_GET_INFO_PARAMS *pParams);
+#ifdef __nvoc_mem_fabric_h_disabled
+static inline NV_STATUS memoryfabricCtrlGetInfo(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_GET_INFO_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("MemoryFabric was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_mem_fabric_h_disabled
+#define memoryfabricCtrlGetInfo(pMemoryFabric, pParams) memoryfabricCtrlGetInfo_IMPL(pMemoryFabric, pParams)
+#endif // __nvoc_mem_fabric_h_disabled
+
+NV_STATUS memoryfabricCtrlCmdDescribe_IMPL(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_DESCRIBE_PARAMS *pParams);
+#ifdef __nvoc_mem_fabric_h_disabled
+static inline NV_STATUS memoryfabricCtrlCmdDescribe(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_DESCRIBE_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("MemoryFabric was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_mem_fabric_h_disabled
+#define memoryfabricCtrlCmdDescribe(pMemoryFabric, pParams) memoryfabricCtrlCmdDescribe_IMPL(pMemoryFabric, pParams)
+#endif // __nvoc_mem_fabric_h_disabled
+
+NV_STATUS memoryfabricCtrlAttachMem_IMPL(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_ATTACH_MEM_PARAMS *pParams);
+#ifdef __nvoc_mem_fabric_h_disabled
+static inline NV_STATUS memoryfabricCtrlAttachMem(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_ATTACH_MEM_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("MemoryFabric was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_mem_fabric_h_disabled
+#define memoryfabricCtrlAttachMem(pMemoryFabric, pParams) memoryfabricCtrlAttachMem_IMPL(pMemoryFabric, pParams)
+#endif // __nvoc_mem_fabric_h_disabled
+
+NV_STATUS memoryfabricCtrlDetachMem_IMPL(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_DETACH_MEM_PARAMS *pParams);
+#ifdef __nvoc_mem_fabric_h_disabled
+static inline NV_STATUS memoryfabricCtrlDetachMem(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_DETACH_MEM_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("MemoryFabric was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_mem_fabric_h_disabled
+#define memoryfabricCtrlDetachMem(pMemoryFabric, pParams) memoryfabricCtrlDetachMem_IMPL(pMemoryFabric, pParams)
+#endif // __nvoc_mem_fabric_h_disabled
+
+NV_STATUS memoryfabricCtrlGetNumAttachedMem_IMPL(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_GET_NUM_ATTACHED_MEM_PARAMS *pParams);
+#ifdef __nvoc_mem_fabric_h_disabled
+static inline NV_STATUS memoryfabricCtrlGetNumAttachedMem(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_GET_NUM_ATTACHED_MEM_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("MemoryFabric was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_mem_fabric_h_disabled
+#define memoryfabricCtrlGetNumAttachedMem(pMemoryFabric, pParams) memoryfabricCtrlGetNumAttachedMem_IMPL(pMemoryFabric, pParams)
+#endif // __nvoc_mem_fabric_h_disabled
+
+NV_STATUS memoryfabricCtrlGetPageLevelInfo_IMPL(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_GET_PAGE_LEVEL_INFO_PARAMS *pParams);
+#ifdef __nvoc_mem_fabric_h_disabled
+static inline NV_STATUS memoryfabricCtrlGetPageLevelInfo(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_GET_PAGE_LEVEL_INFO_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("MemoryFabric was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_mem_fabric_h_disabled
+#define memoryfabricCtrlGetPageLevelInfo(pMemoryFabric, pParams) memoryfabricCtrlGetPageLevelInfo_IMPL(pMemoryFabric, pParams)
+#endif // __nvoc_mem_fabric_h_disabled
+
+
+// Wrapper macros for halified functions
 #define memoryfabricUnmapFrom_FNPTR(pMemoryFabric) pMemoryFabric->__nvoc_metadata_ptr->vtable.__memoryfabricUnmapFrom__
 #define memoryfabricUnmapFrom(pMemoryFabric, pParams) memoryfabricUnmapFrom_DISPATCH(pMemoryFabric, pParams)
 #define memoryfabricCanCopy_FNPTR(pMemoryFabric) pMemoryFabric->__nvoc_metadata_ptr->vtable.__memoryfabricCanCopy__
@@ -185,18 +241,6 @@ NV_STATUS __nvoc_objCreate_MemoryFabric(MemoryFabric**, Dynamic*, NvU32, CALL_CO
 #define memoryfabricCopyConstruct(pMemoryFabric, pCallContext, pParams) memoryfabricCopyConstruct_DISPATCH(pMemoryFabric, pCallContext, pParams)
 #define memoryfabricControl_FNPTR(pMemoryFabric) pMemoryFabric->__nvoc_metadata_ptr->vtable.__memoryfabricControl__
 #define memoryfabricControl(pMemoryFabric, pCallContext, pParams) memoryfabricControl_DISPATCH(pMemoryFabric, pCallContext, pParams)
-#define memoryfabricCtrlGetInfo_FNPTR(pMemoryFabric) pMemoryFabric->__memoryfabricCtrlGetInfo__
-#define memoryfabricCtrlGetInfo(pMemoryFabric, pParams) memoryfabricCtrlGetInfo_DISPATCH(pMemoryFabric, pParams)
-#define memoryfabricCtrlCmdDescribe_FNPTR(pMemoryFabric) pMemoryFabric->__memoryfabricCtrlCmdDescribe__
-#define memoryfabricCtrlCmdDescribe(pMemoryFabric, pParams) memoryfabricCtrlCmdDescribe_DISPATCH(pMemoryFabric, pParams)
-#define memoryfabricCtrlAttachMem_FNPTR(pMemoryFabric) pMemoryFabric->__memoryfabricCtrlAttachMem__
-#define memoryfabricCtrlAttachMem(pMemoryFabric, pParams) memoryfabricCtrlAttachMem_DISPATCH(pMemoryFabric, pParams)
-#define memoryfabricCtrlDetachMem_FNPTR(pMemoryFabric) pMemoryFabric->__memoryfabricCtrlDetachMem__
-#define memoryfabricCtrlDetachMem(pMemoryFabric, pParams) memoryfabricCtrlDetachMem_DISPATCH(pMemoryFabric, pParams)
-#define memoryfabricCtrlGetNumAttachedMem_FNPTR(pMemoryFabric) pMemoryFabric->__memoryfabricCtrlGetNumAttachedMem__
-#define memoryfabricCtrlGetNumAttachedMem(pMemoryFabric, pParams) memoryfabricCtrlGetNumAttachedMem_DISPATCH(pMemoryFabric, pParams)
-#define memoryfabricCtrlGetPageLevelInfo_FNPTR(pMemoryFabric) pMemoryFabric->__memoryfabricCtrlGetPageLevelInfo__
-#define memoryfabricCtrlGetPageLevelInfo(pMemoryFabric, pParams) memoryfabricCtrlGetPageLevelInfo_DISPATCH(pMemoryFabric, pParams)
 #define memoryfabricIsDuplicate_FNPTR(pMemory) pMemory->__nvoc_base_Memory.__nvoc_metadata_ptr->vtable.__memIsDuplicate__
 #define memoryfabricIsDuplicate(pMemory, hMemory, pDuplicate) memoryfabricIsDuplicate_DISPATCH(pMemory, hMemory, pDuplicate)
 #define memoryfabricGetMapAddrSpace_FNPTR(pMemory) pMemory->__nvoc_base_Memory.__nvoc_metadata_ptr->vtable.__memGetMapAddrSpace__
@@ -259,30 +303,6 @@ static inline NV_STATUS memoryfabricCopyConstruct_DISPATCH(struct MemoryFabric *
 
 static inline NV_STATUS memoryfabricControl_DISPATCH(struct MemoryFabric *pMemoryFabric, CALL_CONTEXT *pCallContext, struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams) {
     return pMemoryFabric->__nvoc_metadata_ptr->vtable.__memoryfabricControl__(pMemoryFabric, pCallContext, pParams);
-}
-
-static inline NV_STATUS memoryfabricCtrlGetInfo_DISPATCH(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_GET_INFO_PARAMS *pParams) {
-    return pMemoryFabric->__memoryfabricCtrlGetInfo__(pMemoryFabric, pParams);
-}
-
-static inline NV_STATUS memoryfabricCtrlCmdDescribe_DISPATCH(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_DESCRIBE_PARAMS *pParams) {
-    return pMemoryFabric->__memoryfabricCtrlCmdDescribe__(pMemoryFabric, pParams);
-}
-
-static inline NV_STATUS memoryfabricCtrlAttachMem_DISPATCH(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_ATTACH_MEM_PARAMS *pParams) {
-    return pMemoryFabric->__memoryfabricCtrlAttachMem__(pMemoryFabric, pParams);
-}
-
-static inline NV_STATUS memoryfabricCtrlDetachMem_DISPATCH(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_DETACH_MEM_PARAMS *pParams) {
-    return pMemoryFabric->__memoryfabricCtrlDetachMem__(pMemoryFabric, pParams);
-}
-
-static inline NV_STATUS memoryfabricCtrlGetNumAttachedMem_DISPATCH(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_GET_NUM_ATTACHED_MEM_PARAMS *pParams) {
-    return pMemoryFabric->__memoryfabricCtrlGetNumAttachedMem__(pMemoryFabric, pParams);
-}
-
-static inline NV_STATUS memoryfabricCtrlGetPageLevelInfo_DISPATCH(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_GET_PAGE_LEVEL_INFO_PARAMS *pParams) {
-    return pMemoryFabric->__memoryfabricCtrlGetPageLevelInfo__(pMemoryFabric, pParams);
 }
 
 static inline NV_STATUS memoryfabricIsDuplicate_DISPATCH(struct MemoryFabric *pMemory, NvHandle hMemory, NvBool *pDuplicate) {
@@ -377,6 +397,7 @@ static inline void memoryfabricAddAdditionalDependants_DISPATCH(struct RsClient 
     pResource->__nvoc_metadata_ptr->vtable.__memoryfabricAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
+// Virtual method declarations and/or inline definitions
 NV_STATUS memoryfabricUnmapFrom_IMPL(struct MemoryFabric *pMemoryFabric, struct RS_RES_UNMAP_FROM_PARAMS *pParams);
 
 NvBool memoryfabricCanCopy_IMPL(struct MemoryFabric *pMemoryFabric);
@@ -385,6 +406,7 @@ NV_STATUS memoryfabricCopyConstruct_IMPL(struct MemoryFabric *pMemoryFabric, CAL
 
 NV_STATUS memoryfabricControl_IMPL(struct MemoryFabric *pMemoryFabric, CALL_CONTEXT *pCallContext, struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams);
 
+// Exported method declarations and/or inline definitions
 NV_STATUS memoryfabricCtrlGetInfo_IMPL(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_GET_INFO_PARAMS *pParams);
 
 NV_STATUS memoryfabricCtrlCmdDescribe_IMPL(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_DESCRIBE_PARAMS *pParams);
@@ -397,12 +419,10 @@ NV_STATUS memoryfabricCtrlGetNumAttachedMem_IMPL(struct MemoryFabric *pMemoryFab
 
 NV_STATUS memoryfabricCtrlGetPageLevelInfo_IMPL(struct MemoryFabric *pMemoryFabric, NV00F8_CTRL_GET_PAGE_LEVEL_INFO_PARAMS *pParams);
 
-NV_STATUS memoryfabricConstruct_IMPL(struct MemoryFabric *arg_pMemoryFabric, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_memoryfabricConstruct(arg_pMemoryFabric, arg_pCallContext, arg_pParams) memoryfabricConstruct_IMPL(arg_pMemoryFabric, arg_pCallContext, arg_pParams)
-void memoryfabricDestruct_IMPL(struct MemoryFabric *pMemoryFabric);
-
-#define __nvoc_memoryfabricDestruct(pMemoryFabric) memoryfabricDestruct_IMPL(pMemoryFabric)
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

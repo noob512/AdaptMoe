@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2016-2024 NVIDIA Corporation
+    Copyright (c) 2016-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -22,6 +22,7 @@
 *******************************************************************************/
 
 #include "uvm_api.h"
+#include "uvm_common.h"
 #include "uvm_global.h"
 #include "uvm_perf_events.h"
 #include "uvm_perf_module.h"
@@ -196,6 +197,8 @@ typedef struct
         unsigned                          max_resets;
 
         NvU64                                 pin_ns;
+
+        NvS8                              lapse_stat;
     } params;
 
     uvm_va_space_t                         *va_space;
@@ -261,12 +264,21 @@ static unsigned uvm_perf_thrashing_pin_threshold = UVM_PERF_THRASHING_PIN_THRESH
 
 // TODO: Bug 1768615: [uvm] Automatically tune default values for thrashing
 // detection/prevention parameters
-#define UVM_PERF_THRASHING_LAPSE_USEC_DEFAULT 500
+#define UVM_PERF_THRASHING_LAPSE_USEC_DEFAULT 500ULL
 #define UVM_PERF_THRASHING_LAPSE_USEC_DEFAULT_EMULATION (UVM_PERF_THRASHING_LAPSE_USEC_DEFAULT * 800)
+
+#define UVM_PERF_THRASHING_LAPSE_USEC_MAX (UVM_PERF_THRASHING_LAPSE_USEC_DEFAULT * 1000)
+#define UVM_PERF_THRASHING_LAPSE_USEC_MIN (UVM_PERF_THRASHING_LAPSE_USEC_DEFAULT / 100)
 
 // Lapse of time in microseconds that determines if two consecutive events on
 // the same page can be considered thrashing
 static unsigned uvm_perf_thrashing_lapse_usec = UVM_PERF_THRASHING_LAPSE_USEC_DEFAULT;
+
+#define UVM_PERF_LAPSE_VOTE_THRESHOLD   32
+
+// Number of lapse intervals greater than uvm_perf_thrashing_lapse_usec,
+// big enough to consider readjusting.
+static unsigned int uvm_perf_lapse_vote_threshold = UVM_PERF_LAPSE_VOTE_THRESHOLD;
 
 #define UVM_PERF_THRASHING_NAP_DEFAULT 1
 #define UVM_PERF_THRASHING_NAP_MAX     100
@@ -308,6 +320,7 @@ module_param(uvm_perf_thrashing_enable,        uint, S_IRUGO);
 module_param(uvm_perf_thrashing_threshold,     uint, S_IRUGO);
 module_param(uvm_perf_thrashing_pin_threshold, uint, S_IRUGO);
 module_param(uvm_perf_thrashing_lapse_usec,    uint, S_IRUGO);
+module_param(uvm_perf_lapse_vote_threshold,    uint, S_IRUGO);
 module_param(uvm_perf_thrashing_nap,           uint, S_IRUGO);
 module_param(uvm_perf_thrashing_epoch,         uint, S_IRUGO);
 module_param(uvm_perf_thrashing_pin,           uint, S_IRUGO);
@@ -323,6 +336,7 @@ static bool g_uvm_perf_thrashing_enable;
 static unsigned g_uvm_perf_thrashing_threshold;
 static unsigned g_uvm_perf_thrashing_pin_threshold;
 static NvU64 g_uvm_perf_thrashing_lapse_usec;
+static unsigned g_uvm_perf_lapse_vote_threshold;
 static NvU64 g_uvm_perf_thrashing_nap;
 static NvU64 g_uvm_perf_thrashing_epoch;
 static NvU64 g_uvm_perf_thrashing_pin;
@@ -397,9 +411,13 @@ static void page_thrashing_set_throttling_end_time_stamp(page_thrashing_info_t *
 static uvm_perf_module_t g_module_thrashing;
 
 // Callback declaration for the performance heuristics events
-static void thrashing_event_cb(uvm_perf_event_t event_id, uvm_perf_event_data_t *event_data);
-static void thrashing_block_destroy_cb(uvm_perf_event_t event_id, uvm_perf_event_data_t *event_data);
-static void thrashing_block_munmap_cb(uvm_perf_event_t event_id, uvm_perf_event_data_t *event_data);
+static void thrashing_event_cb(uvm_va_space_t *va_space, uvm_perf_event_t event_id, uvm_perf_event_data_t *event_data);
+static void thrashing_block_destroy_cb(uvm_va_space_t *va_space,
+                                       uvm_perf_event_t event_id,
+                                       uvm_perf_event_data_t *event_data);
+static void thrashing_block_munmap_cb(uvm_va_space_t *va_space,
+                                      uvm_perf_event_t event_id,
+                                      uvm_perf_event_data_t *event_data);
 
 static uvm_perf_module_event_callback_desc_t g_callbacks_thrashing[] = {
     { UVM_PERF_EVENT_BLOCK_DESTROY, thrashing_block_destroy_cb },
@@ -680,7 +698,7 @@ void uvm_perf_thrashing_info_destroy(uvm_va_block_t *va_block)
     }
 }
 
-void thrashing_block_destroy_cb(uvm_perf_event_t event_id, uvm_perf_event_data_t *event_data)
+void thrashing_block_destroy_cb(uvm_va_space_t *va_space, uvm_perf_event_t event_id, uvm_perf_event_data_t *event_data)
 {
     uvm_va_block_t *va_block;
 
@@ -703,7 +721,7 @@ void thrashing_block_destroy_cb(uvm_perf_event_t event_id, uvm_perf_event_data_t
     uvm_perf_thrashing_info_destroy(va_block);
 }
 
-void thrashing_block_munmap_cb(uvm_perf_event_t event_id, uvm_perf_event_data_t *event_data)
+void thrashing_block_munmap_cb(uvm_va_space_t *va_space, uvm_perf_event_t event_id, uvm_perf_event_data_t *event_data)
 {
     uvm_va_block_t *va_block = event_data->block_munmap.block;
     uvm_va_block_region_t region = event_data->block_munmap.region;
@@ -1227,12 +1245,11 @@ static bool is_migration_pinned_pages_update(uvm_va_block_t *va_block,
 
 // This function processes migration/revocation events and determines if the
 // affected pages are thrashing or not.
-void thrashing_event_cb(uvm_perf_event_t event_id, uvm_perf_event_data_t *event_data)
+void thrashing_event_cb(uvm_va_space_t *va_space, uvm_perf_event_t event_id, uvm_perf_event_data_t *event_data)
 {
     va_space_thrashing_info_t *va_space_thrashing;
     block_thrashing_info_t *block_thrashing = NULL;
     uvm_va_block_t *va_block;
-    uvm_va_space_t *va_space;
     NvU64 address;
     NvU64 bytes;
     uvm_processor_id_t processor_id;
@@ -1251,6 +1268,11 @@ void thrashing_event_cb(uvm_perf_event_t event_id, uvm_perf_event_data_t *event_
         bytes        = event_data->migration.bytes;
         processor_id = event_data->migration.dst;
 
+        // TODO: Bug 5138823: [uvm] Add support for thrashing detection and
+        // mitigation for pageable memory
+        if (!va_block)
+            return;
+
         // Skip the thrashing detection logic on eviction as we cannot take
         // the VA space lock
         if (event_data->migration.cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION)
@@ -1260,7 +1282,6 @@ void thrashing_event_cb(uvm_perf_event_t event_id, uvm_perf_event_data_t *event_
         if (!uvm_id_equal(event_data->migration.dst, event_data->migration.make_resident_context->dest_id))
             return;
 
-        va_space = uvm_va_block_get_va_space(va_block);
         va_space_thrashing = va_space_thrashing_info_get(va_space);
         if (!va_space_thrashing->params.enable)
             return;
@@ -1302,7 +1323,6 @@ void thrashing_event_cb(uvm_perf_event_t event_id, uvm_perf_event_data_t *event_
         bytes        = event_data->revocation.bytes;
         processor_id = event_data->revocation.proc_id;
 
-        va_space = uvm_va_block_get_va_space(va_block);
         va_space_thrashing = va_space_thrashing_info_get(va_space);
         if (!va_space_thrashing->params.enable)
             return;
@@ -1402,6 +1422,10 @@ static bool thrashing_processors_have_fast_access_to(uvm_va_space_t *va_space,
 
     // Combine NVLINK/C2C and native atomics mask since we could have PCIe
     // atomics in the future
+    // TODO: Bug 5232283: has_fast_link is used incorrectly. It should be
+    // documented that has_fast_link is always symmetric. has_fast_link_from
+    // will be needed if the symmetry assumption is ever broken.
+
     uvm_processor_mask_and(fast_to,
                            &va_space->has_fast_link[uvm_id_value(to)],
                            &va_space->has_native_atomics[uvm_id_value(to)]);
@@ -1487,6 +1511,8 @@ static uvm_perf_thrashing_hint_t get_hint_for_migration_thrashing(va_space_thras
         UVM_ASSERT(UVM_ID_IS_VALID(closest_resident_id));
     }
 
+    // TODO: Bug 5279540 : In CDMM mode, if the closest_resident_id is GPU,
+    // we need to pin to the CPU as opposed to throttling.
     if (thrashing_processors_can_access(va_space, page_thrashing, preferred_location)) {
         // The logic in uvm_va_block_select_residency chooses the preferred
         // location if the requester can access it, so all processors should
@@ -1506,8 +1532,8 @@ static uvm_perf_thrashing_hint_t get_hint_for_migration_thrashing(va_space_thras
         // to the current residency. This is skipped if the preferred location
         // is thrashing and not accessible by the rest of thrashing processors.
         // Otherwise, we would be in the condition above.
-        if (UVM_ID_IS_CPU(closest_resident_id)) {
-            // On P9 systems, we prefer the CPU to map vidmem (since it can
+        if (UVM_ID_IS_CPU(closest_resident_id) && thrashing_processors_can_access(va_space, page_thrashing, requester)) {
+            // On Coherent systems, we prefer the CPU to map vidmem (since it can
             // cache it), so don't map the GPU to sysmem.
             if (UVM_ID_IS_GPU(requester)) {
                 hint.type = UVM_PERF_THRASHING_HINT_TYPE_PIN;
@@ -1594,12 +1620,47 @@ static uvm_perf_thrashing_hint_t get_hint_for_migration_thrashing(va_space_thras
     return hint;
 }
 
-// 核心性能启发式函数：在发生缺页时被调用，告诉缺页处理程序是否需要采取特殊操作来抑制“内存抖动”。
-// 它的状态机分为 4 个阶段：
-// - Phase0: 块级监控。连续抖动发生时，按页面创建监控结构。
-// - Phase1: 限流 (Throttling)。当多个处理器争抢一页时，开启限流。除了一个“天选之子”可以继续外，其他争抢者都会被强制休眠（惩罚）。
-// - Phase2: 钉住 (Pinning)。如果限流了几次还是不管用，直接把这页“钉死”在某个处理器的物理内存上，不允许再搬运了！大家都跨总线过来读写。
-// - Phase3: 撤销限流 (Revocation throttling)。即使钉死了，如果是因为原子操作导致的权限争抢，还是会引起性能问题，此时退回到 Phase1 继续限流。
+static void adjust_thrashing_lapse(va_space_thrashing_info_t *ti, NvU64 lapse)
+{
+    // If lapse is non-default, i.e. provided by user explicitly, don't adjust it
+    if (g_uvm_perf_thrashing_lapse_usec != UVM_PERF_THRASHING_LAPSE_USEC_DEFAULT)
+        return;
+
+    // Update statistics without if-else conditionals.
+    ti->params.lapse_stat += 2 * !(lapse < ti->params.lapse_ns) - 1;
+
+    // Voting capped exponential adjustment
+    if (ti->params.lapse_stat >= g_uvm_perf_lapse_vote_threshold &&
+        ti->params.lapse_ns < UVM_PERF_THRASHING_LAPSE_USEC_MAX * 1000)
+        ti->params.lapse_ns += min(ti->params.lapse_ns / 8, UVM_PERF_THRASHING_LAPSE_USEC_MAX / 10 * 1000);
+    else
+    if (-ti->params.lapse_stat <= -(int)g_uvm_perf_lapse_vote_threshold &&
+        ti->params.lapse_ns > UVM_PERF_THRASHING_LAPSE_USEC_MIN * 1000)
+        ti->params.lapse_ns -= max(ti->params.lapse_ns / 8, UVM_PERF_THRASHING_LAPSE_USEC_MIN * 1000);
+    else
+        return;
+
+    ti->params.lapse_stat /= 2;
+}
+
+// Function called on fault that tells the fault handler if any operation
+// should be performed to minimize thrashing. The logic is as follows:
+//
+// - Phase0: Block thrashing. If a number of consecutive thrashing events have
+//   been detected on the VA block, per-page thrashing tracking information is
+//   created.
+// - Phase1: Throttling. When several processors fight over a page, we start a
+//   "throttling period". During that period, only one processor will be able
+//   to service faults on the page, and the rest will be throttled. All CPU
+//   faults are considered to belong to the same device, even if they come from
+//   different CPU threads.
+// - Phase2: Pinning. After a number of consecutive throttling periods, the page
+//   is pinned on a specific processor which all of the thrashing processors can
+//   access.
+// - Phase3: Revocation throttling. Even if the page is pinned, it can be still
+//   thrashing due to revocation events (mainly due to system-wide atomics). In
+//   that case we keep the page pinned while applying the same algorithm as in
+//   Phase1.
 uvm_perf_thrashing_hint_t uvm_perf_thrashing_get_hint(uvm_va_block_t *va_block,
                                                       uvm_va_block_context_t *va_block_context,
                                                       NvU64 address,
@@ -1614,41 +1675,43 @@ uvm_perf_thrashing_hint_t uvm_perf_thrashing_get_hint(uvm_va_block_t *va_block,
     NvU64 time_stamp;
     NvU64 last_time_stamp;
 
-    // 默认建议：什么都不用做，正常搬运即可
     hint.type = UVM_PERF_THRASHING_HINT_TYPE_NONE;
 
-    // 如果全局或局部没有开启/分配抖动监控，直接返回
     if (!va_space_thrashing->params.enable)
         return hint;
 
+    // If we don't have enough memory to store thrashing information, we assume
+    // no thrashing
     block_thrashing = thrashing_info_get(va_block);
-    if (!block_thrashing || !block_thrashing->pages)
+    if (!block_thrashing)
         return hint;
 
-    time_stamp = NV_GETTIME(); // 获取当前时间戳
+    // If the per-page tracking structure has not been created yet, we assume
+    // no thrashing
+    if (!block_thrashing->pages)
+        return hint;
 
-    // ==========================================================
-    // 机制 1：全局状态重置 (Epoch Reset)
-    // ==========================================================
-    // 如果距离上一次发生抖动已经过了很久（超过了 epoch_ns），
-    // 并且当前没有被钉死的页面，也没有超过最大重置次数限制。
-    // 那么裁判认为：“这波争抢已经彻底过去了，清空历史记录，节约内存。”
+    time_stamp = NV_GETTIME();
+
     if (block_thrashing->last_thrashing_time_stamp != 0 &&
         (time_stamp - block_thrashing->last_thrashing_time_stamp > va_space_thrashing->params.epoch_ns) &&
         block_thrashing->pinned_pages.count == 0 &&
         block_thrashing->thrashing_reset_count < va_space_thrashing->params.max_resets) {
-        
         uvm_page_index_t reset_page_index;
+
         ++block_thrashing->thrashing_reset_count;
 
-        // 解除所有因为历史原因被限流休眠的处理器（大赦天下）
+        // Clear the state of throttled processors to make sure that we flush
+        // any pending ThrottlingEnd events
         for_each_va_block_page_in_mask(reset_page_index, &block_thrashing->thrashing_pages, va_block) {
-            thrashing_throttling_reset_page(va_block, block_thrashing,
+            thrashing_throttling_reset_page(va_block,
+                                            block_thrashing,
                                             &block_thrashing->pages[reset_page_index],
                                             reset_page_index);
         }
 
-        // 彻底释放这 2MB 块的页面监控内存，重置计数器
+        // Reset per-page tracking structure
+        // TODO: Bug 1769904 [uvm] Speculatively unpin pages that were pinned on a specific memory due to thrashing
         UVM_ASSERT(uvm_page_mask_empty(&block_thrashing->pinned_pages.mask));
         uvm_kvfree(block_thrashing->pages);
         block_thrashing->pages                     = NULL;
@@ -1657,97 +1720,87 @@ uvm_perf_thrashing_hint_t uvm_perf_thrashing_get_hint(uvm_va_block_t *va_block,
         block_thrashing->last_time_stamp           = 0;
         block_thrashing->last_thrashing_time_stamp = 0;
         uvm_page_mask_zero(&block_thrashing->thrashing_pages);
-        goto done; // 记录清空了，自然不需要惩罚，直接跳转结束
+        goto done;
     }
 
     page_thrashing = &block_thrashing->pages[page_index];
 
-    // ==========================================================
-    // 机制 2：容忍度阈值 (Threshold)
-    // ==========================================================
-    // 偶尔搬运几次是可以接受的。只有当这个页面的争抢次数超过了阈值，裁判才会真正介入。
+    // Not enough thrashing events yet
     if (page_thrashing->num_thrashing_events < va_space_thrashing->params.threshold)
         goto done;
 
-    // ==========================================================
-    // 机制 3：执行“限流”刑期 (Enforce Throttling)
-    // ==========================================================
-    // 如果当前申请缺页的处理器 (requester)，正处于被裁判“黄牌警告（限流休眠）”的状态中
+    // If the requesting processor is throttled, check the throttling end time
+    // stamp
     if (uvm_processor_mask_test(&page_thrashing->throttled_processors, requester)) {
         NvU64 throttling_end_time_stamp = page_thrashing_get_throttling_end_time_stamp(page_thrashing);
-        
-        // 检查刑期满没满？如果还没到结束时间，并且它不是那个被豁免的“天选处理器”：
         if (time_stamp < throttling_end_time_stamp &&
             !uvm_id_equal(requester, page_thrashing->do_not_throttle_processor_id)) {
-            
-            // 刑期未满，继续判处“限流”。
-            // 外层代码拿到这个提示后，会让这个 CPU 线程或 GPU 真的睡过去。
             hint.type = UVM_PERF_THRASHING_HINT_TYPE_THROTTLE;
             goto done;
         }
 
-        // 刑期满了，解除它的黄牌状态
         thrashing_throttle_end_processor(va_block, block_thrashing, page_thrashing, page_index, requester);
     }
 
     UVM_ASSERT(!uvm_processor_mask_test(&page_thrashing->throttled_processors, requester));
+
     last_time_stamp = page_thrashing_get_time_stamp(page_thrashing);
 
-    // ==========================================================
-    // 机制 4：冷却期忽略 (Cooldown / Lapse)
-    // ==========================================================
-    // 如果虽然历史争抢次数很高，但上一次争抢发生在很久很久以前（超过 lapse_ns），
-    // 说明这页数据已经“冷却”了，当做普通缺页处理。
+    adjust_thrashing_lapse(va_space_thrashing, time_stamp - last_time_stamp);
+
+    // If the lapse since the last thrashing event is longer than a thrashing
+    // lapse we are no longer thrashing
     if (time_stamp - last_time_stamp > va_space_thrashing->params.lapse_ns &&
         !page_thrashing->pinned) {
         goto done;
     }
 
-    // ==========================================================
-    // 机制 5：更新判决状态机
-    // ==========================================================
-    // 将当前请求者加入“争抢者名单”
+    // Set the requesting processor in the thrashing processors mask
     uvm_processor_mask_set(&page_thrashing->processors, requester);
+
     UVM_ASSERT(page_thrashing->has_migration_events || page_thrashing->has_revocation_events);
 
-    // 核心算法：更新历史，判断当前处于 Phase 1(限流) 还是 Phase 2(钉住)
+    // Update throttling heuristics
     thrashing_throttle_update(va_space_thrashing, va_block, page_thrashing, requester, time_stamp);
 
-    // 【特殊情况：原子操作带来的权限撤销风暴】
-    // 页面已经被钉死了（不搬运了），按理说不会有带宽瓶颈了。
-    // 但是！如果有多个 GPU 同时在对这页数据做 system-wide Atomics（全局原子加减等），
-    // 它们会疯狂地互相撤销对方的页表权限（Revocation），这同样会让系统瘫痪。
-    // 此时，“钉住”已经没用了，只能重新祭出“黄牌”，强制限流休眠一部分处理器。
     if (page_thrashing->pinned &&
         page_thrashing->has_revocation_events &&
         !uvm_id_equal(requester, page_thrashing->do_not_throttle_processor_id)) {
-        
+
+        // When we get revocation thrashing, this is due to system-wide atomics
+        // downgrading the permissions of other processors. Revocations only
+        // happen when several processors are mapping the same page and there
+        // are no migrations. In this case, the only thing we can do is to
+        // throttle the execution of the processors.
         hint.type = UVM_PERF_THRASHING_HINT_TYPE_THROTTLE;
     }
     else {
-        // 常规情况：让底层算法根据争抢的历史频率，决定是出示黄牌(THROTTLE) 还是红牌(PIN)。
         hint = get_hint_for_migration_thrashing(va_space_thrashing,
-                                                va_block, va_block_context,
-                                                page_index, page_thrashing, requester);
+                                                va_block,
+                                                va_block_context,
+                                                page_index,
+                                                page_thrashing,
+                                                requester);
     }
 
-// ==========================================================
-// 最终执行：将判决结果落实到状态和统计中
-// ==========================================================
 done:
     if (hint.type == UVM_PERF_THRASHING_HINT_TYPE_PIN) {
-        // 如果判决是“钉住”，则执行钉住操作。
-        // 这意味着这页数据将强制留在当前的 residency 上，后续其他 GPU 只能跨 PCIe/NVLink 远端读写。
-        NV_STATUS status = thrashing_pin_page(va_space_thrashing, va_block, va_block_context,
-                                              block_thrashing, page_thrashing, page_index,
-                                              time_stamp, hint.pin.residency, requester);
+        NV_STATUS status = thrashing_pin_page(va_space_thrashing,
+                                              va_block,
+                                              va_block_context,
+                                              block_thrashing,
+                                              page_thrashing,
+                                              page_index,
+                                              time_stamp,
+                                              hint.pin.residency,
+                                              requester);
 
-        // 如果钉住失败（比如目标内存爆了 OOM），只能降级处罚，改为“限流”。
+        // If there was some problem pinning the page (i.e. OOM), demote to
+        // throttling)
         if (status != NV_OK) {
             hint.type = UVM_PERF_THRASHING_HINT_TYPE_THROTTLE;
         }
         else {
-            // 钉住成功，记录统计数据
             if (uvm_id_equal(hint.pin.residency, requester))
                 PROCESSOR_THRASHING_STATS_INC(requester, num_pin_local);
             else
@@ -1758,13 +1811,17 @@ done:
     }
 
     if (hint.type == UVM_PERF_THRASHING_HINT_TYPE_THROTTLE) {
-        // 如果判决是“限流”，则计算刑期结束时间，并把这个处理器加入“黑名单”
-        thrashing_throttle_processor(va_block, block_thrashing, page_thrashing, page_index, requester);
+        thrashing_throttle_processor(va_block,
+                                     block_thrashing,
+                                     page_thrashing,
+                                     page_index,
+                                     requester);
+
         PROCESSOR_THRASHING_STATS_INC(requester, num_throttle);
+
         hint.throttle.end_time_stamp = page_thrashing_get_throttling_end_time_stamp(page_thrashing);
     }
     else if (hint.type == UVM_PERF_THRASHING_HINT_TYPE_NONE && page_thrashing) {
-        // 如果平安无事，确保状态是干净的
         UVM_ASSERT(!uvm_processor_mask_test(&page_thrashing->throttled_processors, requester));
         UVM_ASSERT(!page_thrashing->pinned);
         UVM_ASSERT(UVM_ID_IS_INVALID(page_thrashing->pinned_residency_id));
@@ -1992,6 +2049,8 @@ NV_STATUS uvm_perf_thrashing_init(void)
                                          UVM_PERF_THRASHING_PIN_THRESHOLD_MAX);
 
     INIT_THRASHING_PARAMETER_NONZERO(uvm_perf_thrashing_lapse_usec, UVM_PERF_THRASHING_LAPSE_USEC_DEFAULT);
+
+    INIT_THRASHING_PARAMETER_NONZERO(uvm_perf_lapse_vote_threshold, UVM_PERF_THRASHING_LAPSE_USEC_DEFAULT);
 
     INIT_THRASHING_PARAMETER_NONZERO_MAX(uvm_perf_thrashing_nap,
                                          UVM_PERF_THRASHING_NAP_DEFAULT,

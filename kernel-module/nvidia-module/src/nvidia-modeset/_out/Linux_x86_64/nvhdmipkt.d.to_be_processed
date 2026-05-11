@@ -37,7 +37,9 @@ _out/Linux_x86_64/nvhdmipkt.o: ../common/modeset/hdmipacket/nvhdmipkt.c \
  ../common/sdk/nvidia/inc/class/clca70.h \
  ../common/sdk/nvidia/inc/class/clca7d.h \
  ../common/sdk/nvidia/inc/class/clcb70.h \
- ../common/sdk/nvidia/inc/class/clcb7d.h ../common/inc/hdmi_spec.h
+ ../common/sdk/nvidia/inc/class/clcb7d.h \
+ ../common/sdk/nvidia/inc/class/clcc70.h \
+ ../common/sdk/nvidia/inc/class/clcc7d.h ../common/inc/hdmi_spec.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 ../common/sdk/nvidia/inc/nvlimits.h:
 ../common/modeset/hdmipacket/nvhdmipkt_common.h:
@@ -79,4 +81,6 @@ _out/Linux_x86_64/nvhdmipkt.o: ../common/modeset/hdmipacket/nvhdmipkt.c \
 ../common/sdk/nvidia/inc/class/clca7d.h:
 ../common/sdk/nvidia/inc/class/clcb70.h:
 ../common/sdk/nvidia/inc/class/clcb7d.h:
+../common/sdk/nvidia/inc/class/clcc70.h:
+../common/sdk/nvidia/inc/class/clcc7d.h:
 ../common/inc/hdmi_spec.h:

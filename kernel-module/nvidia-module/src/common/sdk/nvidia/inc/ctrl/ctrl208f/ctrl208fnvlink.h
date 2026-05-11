@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -31,6 +31,7 @@
 //
 
 #include "ctrl/ctrl208f/ctrl208fbase.h"
+#include "ctrl/ctrl2080/ctrl2080nvlink_common.h"
 
 /*
  * NV208F_CTRL_CMD_NVLINK_ECC_INJECT_ERROR
@@ -63,9 +64,9 @@
 #define NV208F_CTRL_NVLINK_ECC_INJECT_ERROR_PARAMS_MESSAGE_ID (0x1U)
 
 typedef struct NV208F_CTRL_NVLINK_ECC_INJECT_ERROR_PARAMS {
-    NvU8  errorUnit;
-    NvU8  errorType;
-    NvU32 linkMask;
+    NvU8 errorUnit;
+    NvU8 errorType;
+    NV_DECLARE_ALIGNED(NV2080_CTRL_NVLINK_LINK_MASK links, 8);
 } NV208F_CTRL_NVLINK_ECC_INJECT_ERROR_PARAMS;
 
 /*

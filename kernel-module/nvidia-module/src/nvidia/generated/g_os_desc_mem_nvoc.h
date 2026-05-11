@@ -124,13 +124,9 @@ struct NVOC_METADATA__OsDescMemory {
     const struct NVOC_VTABLE__OsDescMemory vtable;
 };
 
-#ifndef __NVOC_CLASS_OsDescMemory_TYPEDEF__
-#define __NVOC_CLASS_OsDescMemory_TYPEDEF__
-typedef struct OsDescMemory OsDescMemory;
-#endif /* __NVOC_CLASS_OsDescMemory_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_OsDescMemory
-#define __nvoc_class_id_OsDescMemory 0xb3dacd
+#define __nvoc_class_id_OsDescMemory 0xb3dacdu
+typedef struct OsDescMemory OsDescMemory;
 #endif /* __nvoc_class_id_OsDescMemory */
 
 // Casting support
@@ -148,12 +144,20 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_OsDescMemory;
 
 NV_STATUS __nvoc_objCreateDynamic_OsDescMemory(OsDescMemory**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_OsDescMemory(OsDescMemory**, Dynamic*, NvU32, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_OsDescMemory(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_OsDescMemory((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_OsDescMemory(OsDescMemory**, Dynamic*, NvU32, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_OsDescMemory(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_OsDescMemory((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS osdescConstruct_IMPL(struct OsDescMemory *pOsDescMemory, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_osdescConstruct(pOsDescMemory, pCallContext, pParams) osdescConstruct_IMPL(pOsDescMemory, pCallContext, pParams)
+
+void osdescDestruct_IMPL(struct OsDescMemory *pOsDescMemory);
+#define __nvoc_osdescDestruct(pOsDescMemory) osdescDestruct_IMPL(pOsDescMemory)
+
+
+// Wrapper macros for halified functions
 #define osdescCanCopy_FNPTR(pOsDescMemory) pOsDescMemory->__nvoc_metadata_ptr->vtable.__osdescCanCopy__
 #define osdescCanCopy(pOsDescMemory) osdescCanCopy_DISPATCH(pOsDescMemory)
 #define osdescIsDuplicate_FNPTR(pMemory) pMemory->__nvoc_base_Memory.__nvoc_metadata_ptr->vtable.__memIsDuplicate__
@@ -312,14 +316,14 @@ static inline void osdescAddAdditionalDependants_DISPATCH(struct RsClient *pClie
     pResource->__nvoc_metadata_ptr->vtable.__osdescAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
+// Virtual method declarations and/or inline definitions
 NvBool osdescCanCopy_IMPL(struct OsDescMemory *pOsDescMemory);
 
-NV_STATUS osdescConstruct_IMPL(struct OsDescMemory *arg_pOsDescMemory, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_osdescConstruct(arg_pOsDescMemory, arg_pCallContext, arg_pParams) osdescConstruct_IMPL(arg_pOsDescMemory, arg_pCallContext, arg_pParams)
-void osdescDestruct_IMPL(struct OsDescMemory *pOsDescMemory);
-
-#define __nvoc_osdescDestruct(pOsDescMemory) osdescDestruct_IMPL(pOsDescMemory)
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

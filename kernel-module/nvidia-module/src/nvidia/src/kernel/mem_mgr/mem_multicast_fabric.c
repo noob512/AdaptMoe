@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -50,6 +50,7 @@
 #include "gpu/bus/kern_bus.h"
 #include "gpu/mem_mgr/mem_desc.h"
 #include "gpu/mem_mgr/mem_mgr.h"
+#include "gpu/mem_sys/kern_mem_sys.h"
 #include "gpu/subdevice/subdevice.h"
 #include "kernel/gpu/nvlink/kernel_nvlink.h"
 #include "mem_mgr/fabric_vaspace.h"
@@ -76,13 +77,21 @@ typedef struct mem_multicast_fabric_client_info
     Memory *pMemory;
 } MEM_MULTICAST_FABRIC_CLIENT_INFO;
 
+typedef struct mem_multicast_fabric_gpu_nvlink_attr
+{
+    NvU32   cliqueId;
+    NvU64   bwModeEpoch;
+    NvU16   bwMode;
+} MEM_MULTICAST_FABRIC_GPU_NVLINK_ATTR;
+
 typedef struct mem_multicast_fabric_gpu_info
 {
     void   *pGpuOsInfo;
     OBJGPU *pGpu;
     NvU64   gpuProbeHandle;
-    NvU32   cliqueId;
     NvBool  bMcflaAlloc;
+
+    MEM_MULTICAST_FABRIC_GPU_NVLINK_ATTR nvlAttr;
 
     //
     // Unique import event ID. Valid only if the GPU was remotely attached to
@@ -100,7 +109,8 @@ typedef struct mem_multicast_fabric_gpu_info
 
 typedef struct mem_multicast_fabric_remote_gpu_info
 {
-    NvU32 cliqueId;
+    MEM_MULTICAST_FABRIC_GPU_NVLINK_ATTR nvlAttr;
+
     NvU64 key;
 } MEM_MULTICAST_FABRIC_REMOTE_GPU_INFO;
 
@@ -145,9 +155,18 @@ typedef struct mem_multicast_fabric_descriptor
 
     //
     // Boolean to be set when an Inband request has been sent to FM
-    // and is currently in progress
+    // and is currently in progress.
+    //
+    // This flag is only set on the prime object.
     //
     NvBool bInbandReqInProgress;
+
+    //
+    // Boolean set when an inband request response is received.
+    //
+    // This flag is set on both prime and non-prime objects.
+    //
+    NvBool bResponseReceived;
 
     //
     // Request Id associated with the Inband request in progress when
@@ -198,6 +217,26 @@ typedef struct mem_multicast_fabric_descriptor
     PORT_RWLOCK *pLock;
 } MEM_MULTICAST_FABRIC_DESCRIPTOR;
 
+static void
+_memMulticastfabricResolvePageSize(NvU64 *pPageSize)
+{
+    // Treat 0 as default page size at the beginning of the fabric construct call.
+    if (*pPageSize == 0)
+    {
+        *pPageSize = NV_MEMORY_MULTICAST_FABRIC_PAGE_SIZE_512M;
+    }
+}
+
+static void
+_memMulticastfabricResolveAlignment(NvU64 *pAlignment, NvU64 pageSize)
+{
+    // Currently alignment is restricted to be same as page size.
+    if (*pAlignment == 0)
+    {
+        *pAlignment = pageSize;
+    }
+}
+
 static NvBool
 _memMulticastFabricIsPrime
 (
@@ -224,11 +263,14 @@ _memMulticastFabricInitAttachEvent
 (
     NvU64                        gpuFabricProbeHandle,
     NvU64                        key,
+    NvU64                        bwModeEpoch,
+    NvU16                        bwMode,
     NvU32                        cliqueId,
     NvU16                        exportNodeId,
     NvU16                        index,
     NvUuid                      *pExportUuid,
     NvS32                        imexChannel,
+    NvU64                        pageSize,
     NV00F1_CTRL_FABRIC_EVENT    *pEvent
 )
 {
@@ -241,8 +283,11 @@ _memMulticastFabricInitAttachEvent
     pEvent->data.attach.gpuFabricProbeHandle = gpuFabricProbeHandle;
     pEvent->data.attach.key = key;
     pEvent->data.attach.cliqueId = cliqueId;
+    pEvent->data.attach.bwModeEpoch = bwModeEpoch;
+    pEvent->data.attach.bwMode = bwMode;
     pEvent->data.attach.index = index;
     pEvent->data.attach.exportNodeId = exportNodeId;
+    pEvent->data.attach.pageSize = pageSize;
     portMemCopy(pEvent->data.attach.exportUuid, NV_MEM_EXPORT_UUID_LEN,
                 pExportUuid->uuid,              NV_MEM_EXPORT_UUID_LEN);
 }
@@ -276,27 +321,16 @@ _memMulticastFabricValidateAllocParams
     if (!_memMulticastFabricIsPrime(pAllocParams->allocFlags))
         return NV_OK;
 
-    // Only page size 512MB is supported
-    if (pAllocParams->pageSize != NV_MEMORY_MULTICAST_FABRIC_PAGE_SIZE_512M)
-    {
-        NV_PRINTF(LEVEL_ERROR,
-            "Unsupported pageSize: 0x%x. Only 512MB pagesize is supported\n",
-            pAllocParams->pageSize);
-        return NV_ERR_INVALID_ARGUMENT;
-    }
-
     if (pAllocParams->alignment != pAllocParams->pageSize)
     {
-        NV_PRINTF(LEVEL_ERROR,
-                  "Alignment must be pageSize for now\n");
+        NV_PRINTF(LEVEL_ERROR, "Alignment must be pageSize for now\n");
         return NV_ERR_INVALID_ARGUMENT;
     }
 
     // AllocSize should be page size aligned
     if (!NV_IS_ALIGNED64(pAllocParams->allocSize, pAllocParams->pageSize))
     {
-        NV_PRINTF(LEVEL_ERROR,
-                  "AllocSize should be pageSize aligned\n");
+        NV_PRINTF(LEVEL_ERROR, "AllocSize should be pageSize aligned\n");
         return NV_ERR_INVALID_ARGUMENT;
     }
 
@@ -449,7 +483,7 @@ _memMulticastFabricDescriptorEnqueueWait
     pNode = listAppendNew(&pMulticastFabricDesc->waitingClientsList);
     if (pNode == NULL)
     {
-        if (pOsEvent != NULL)
+        if (pValidatedOsEvent != NULL)
             osDereferenceObjectCount(pValidatedOsEvent);
 
         return NV_ERR_NO_MEMORY;
@@ -942,22 +976,19 @@ _memMulticastFabricSendInbandRequest
 static void
 _memorymulticastfabricDetachMem
 (
+    OBJGPU             *pGpu,
     FABRIC_VASPACE     *pFabricVAS,
     MEMORY_DESCRIPTOR  *pFabricMemDesc,
     NODE               *pMemNode
 )
 {
-    MEMORY_DESCRIPTOR *pPhysMemDesc;
     MEM_MULTICAST_FABRIC_ATTACH_MEM_INFO_NODE *pAttachMemInfoNode;
 
     pAttachMemInfoNode =
         (MEM_MULTICAST_FABRIC_ATTACH_MEM_INFO_NODE *)pMemNode->Data;
-    pPhysMemDesc = pAttachMemInfoNode->pPhysMemDesc;
 
-    fabricvaspaceUnmapPhysMemdesc(pFabricVAS, pFabricMemDesc,
-                                  pMemNode->keyStart,
-                                  pPhysMemDesc,
-                                  pAttachMemInfoNode->physMapLength);
+    fabricvaspaceUnmapPhysMemdesc(pFabricVAS, pFabricMemDesc, pMemNode->keyStart, pAttachMemInfoNode->physMapLength);
+
 }
 
 static void
@@ -1056,6 +1087,58 @@ _memMulticastFabricDescriptorFree
     fabricMulticastSetupCacheDelete(pFabric,
                                     pMulticastFabricDesc->inbandReqId);
 
+    //
+    // This block should be executed under pMulticastFabricModuleLock to
+    // make sure it is in sync with memorymulticastfabricTeamSetupResponseCallback().
+    //
+    // Otherwise, we might miss the fabricWakeUpThreadCallback() call if the
+    // memorymulticastfabricTeamSetupResponseCallback() searches the pWq in the
+    // cache before the pWq insertion by the freeing thread, causing the free
+    // thread to wait indefinitely.
+    //
+    // But today we take all GPU locks to sync these paths, so this race should
+    // not be hit.
+    //
+    if (pMulticastFabricDesc->bInbandReqInProgress)
+    {
+        THREAD_STATE_NODE *pThreadNode = NULL;
+        THREAD_STATE_FREE_CALLBACK freeCallback;
+
+        NV_ASSERT_OK(threadStateGetCurrent(&pThreadNode, NULL));
+
+        //
+        // In the process cleanup path or a deferred cleanup path, skip waiting on
+        // the clients which are being torn down. The process could be already in
+        // uninterruptible state at that point, and if for some reason GFM doesn't
+        // respond, we will be stuck indefinitely in the wait queue. Instead march
+        // on, and handle the cleanup later (see memorymulticastfabricTeamSetupResponseCallback)
+        // whenever GFM responds.
+        //
+        // This wait is really required for interruptible cases like NvRmFree(),
+        // to mimic a synchronous op.
+        //
+        if (!((pThreadNode->flags & THREAD_STATE_FLAGS_IS_EXITING) ||
+              (pThreadNode->flags & THREAD_STATE_FLAGS_IS_KERNEL_THREAD)))
+        {
+            OS_WAIT_QUEUE *pWq = NULL;
+            NV_ASSERT_OK(osAllocWaitQueue(&pWq));
+
+            if (pWq != NULL)
+            {
+                NV_ASSERT_OK(fabricMulticastCleanupCacheInsert(pFabric,
+                                            pMulticastFabricDesc->inbandReqId,
+                                            pWq));
+
+
+                freeCallback.pCb = fabricMulticastWaitOnTeamCleanupCallback;
+                freeCallback.pCbData = (void *)pMulticastFabricDesc->inbandReqId;
+
+                NV_ASSERT_OK(threadStateEnqueueCallbackOnFree(pThreadNode,
+                                                              &freeCallback));
+            }
+        }
+    }
+
     // Now I am the only one holding the pMulticastFabricDesc, drop the locks.
     portSyncRwLockReleaseWrite(pMulticastFabricDesc->pLock);
     portSyncRwLockReleaseWrite(pFabric->pMulticastFabricModuleLock);
@@ -1092,30 +1175,6 @@ _memMulticastFabricDescriptorFree
 
         _memMulticastFabricSendInbandRequest(pNode->pGpu, pMulticastFabricDesc,
                                     MEM_MULTICAST_FABRIC_TEAM_RELEASE_REQUEST);
-    }
-
-    if (pMulticastFabricDesc->bInbandReqInProgress)
-    {
-        OS_WAIT_QUEUE *pWq;
-        THREAD_STATE_NODE *pThreadNode = NULL;
-        THREAD_STATE_FREE_CALLBACK freeCallback;
-
-        NV_ASSERT_OK(osAllocWaitQueue(&pWq));
-
-        if (pWq != NULL)
-        {
-            NV_ASSERT_OK(fabricMulticastCleanupCacheInsert(pFabric,
-                                        pMulticastFabricDesc->inbandReqId,
-                                        pWq));
-
-            NV_ASSERT_OK(threadStateGetCurrent(&pThreadNode, NULL));
-
-            freeCallback.pCb = fabricMulticastWaitOnTeamCleanupCallback;
-            freeCallback.pCbData = (void *)pMulticastFabricDesc->inbandReqId;
-
-            NV_ASSERT_OK(threadStateEnqueueCallbackOnFree(pThreadNode,
-                                                          &freeCallback));
-        }
     }
 
     _memMulticastFabricGpuInfoRemove(pMulticastFabricDesc);
@@ -1227,12 +1286,10 @@ _memMulticastFabricDescriptorAllocUsingExpPacket
     //
     pMulticastFabricDesc->allocSize = 0;
 
-    //
-    // For now only pageSize support is 512MB. This needs to be revisited
-    // in case we support more pagesizes.
-    //
-    pMulticastFabricDesc->pageSize = NV_MEMORY_MULTICAST_FABRIC_PAGE_SIZE_512M;
-    pMulticastFabricDesc->alignment = NV_MEMORY_MULTICAST_FABRIC_PAGE_SIZE_512M;
+    pMulticastFabricDesc->pageSize = pAllocParams->pageSize;
+
+    // Alignment is required to match page size.
+    pMulticastFabricDesc->alignment = pAllocParams->pageSize;
 
     pMulticastFabricDesc->exportNodeId = memoryExportGetNodeId(pExportPacket);
     pMulticastFabricDesc->expUuid = expUuid;
@@ -1517,22 +1574,43 @@ _memMulticastFabricAttachGpuPostProcessor
         goto installMemDesc;
     }
 
-    if (mcTeamStatus != NV_OK)
+    //
+    // If MSE (or any entity on the other side) replies back with
+    // NV_ERR_BUSY_RETRY, resubmit the request.
+    //
+    if (_memMulticastFabricIsPrime(pMulticastFabricDesc->allocFlags) &&
+        (mcTeamStatus == NV_ERR_BUSY_RETRY))
+    {
+        status = _memMulticastFabricSendInbandRequest(pGpu, pMulticastFabricDesc,
+                                        MEM_MULTICAST_FABRIC_TEAM_SETUP_REQUEST);
+        if (status != NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR, "MCFLA retry failed %x\n", status);
+            goto installMemDesc;
+        }
+        else
+        {
+            // Don't install memdesc as we are successfully retrying...
+            return;
+        }
+    }
+    else if (mcTeamStatus != NV_OK)
+    {
         goto installMemDesc;
+    }
 
     if (!_memMulticastFabricIsPrime(pMulticastFabricDesc->allocFlags))
         pMulticastFabricDesc->allocSize = mcAddressSize;
 
     if (mcAddressSize < pMulticastFabricDesc->allocSize)
     {
-        NV_PRINTF(LEVEL_ERROR,
-                  "Insufficient mcAddressSize returned from Fabric Manager\n");
+        NV_PRINTF(LEVEL_ERROR, "Insufficient mcAddressSize returned from Fabric Manager\n");
         status = NV_ERR_INSUFFICIENT_RESOURCES;
         goto installMemDesc;
     }
 
-    if (!NV_IS_ALIGNED64(mcAddressBase,
-                         NV_MEMORY_MULTICAST_FABRIC_PAGE_SIZE_512M))
+    // The base address returned from FM needs to be page aligned.
+    if (!NV_IS_ALIGNED64(mcAddressBase, pMulticastFabricDesc->pageSize))
     {
         NV_PRINTF(LEVEL_ERROR,
                   "Insufficient mcAddressSize returned from Fabric Manager\n");
@@ -1540,8 +1618,7 @@ _memMulticastFabricAttachGpuPostProcessor
         goto installMemDesc;
     }
 
-    status = _memMulticastFabricCreateMemDesc(pMulticastFabricDesc,
-                                              mcAddressBase, &pMemDesc);
+    status = _memMulticastFabricCreateMemDesc(pMulticastFabricDesc, mcAddressBase, &pMemDesc);
     if (status != NV_OK)
     {
         NV_PRINTF(LEVEL_ERROR, "Failed to allocate fabric memdesc\n");
@@ -1558,12 +1635,10 @@ _memMulticastFabricAttachGpuPostProcessor
     }
 
 installMemDesc:
-    _memMulticastFabricInstallMemDesc(pMulticastFabricDesc, pMemDesc,
-                                      mcTeamHandle, status);
+    _memMulticastFabricInstallMemDesc(pMulticastFabricDesc, pMemDesc, mcTeamHandle, status);
 
      if ((status != NV_OK) && (mcTeamStatus == NV_OK))
-         _memMulticastFabricSendInbandRequest(pGpu, pMulticastFabricDesc,
-                                MEM_MULTICAST_FABRIC_TEAM_RELEASE_REQUEST);
+         _memMulticastFabricSendInbandRequest(pGpu, pMulticastFabricDesc, MEM_MULTICAST_FABRIC_TEAM_RELEASE_REQUEST);
 }
 
 NV_STATUS
@@ -1632,8 +1707,6 @@ memorymulticastfabricTeamSetupResponseCallback
 
     if (pMulticastFabricDesc != NULL)
     {
-        fabricMulticastSetupCacheDelete(pFabric, requestId);
-
         //
         // We have now safely acquired pMulticastFabricDesc->lock, which
         // should block the destructor from removing pMulticastFabricDesc
@@ -1647,14 +1720,20 @@ memorymulticastfabricTeamSetupResponseCallback
         //
         portSyncRwLockReleaseWrite(pFabric->pMulticastFabricModuleLock);
 
-        pMulticastFabricDesc->bInbandReqInProgress = NV_FALSE;
+        if (!pMulticastFabricDesc->bResponseReceived)
+        {
+            pMulticastFabricDesc->bInbandReqInProgress = NV_FALSE;
 
-        _memMulticastFabricAttachGpuPostProcessor(pGpu,
-                                                  pMulticastFabricDesc,
-                                                  mcTeamStatus,
-                                                  mcTeamHandle,
-                                                  mcAddressBase,
-                                                  mcAddressSize);
+            // This call sets `bInbandReqInProgress` on a successful retry.
+            _memMulticastFabricAttachGpuPostProcessor(pGpu,
+                                                      pMulticastFabricDesc,
+                                                      mcTeamStatus,
+                                                      mcTeamHandle,
+                                                      mcAddressBase,
+                                                      mcAddressSize);
+
+            pMulticastFabricDesc->bResponseReceived = !pMulticastFabricDesc->bInbandReqInProgress;
+        }
 
         portSyncRwLockReleaseWrite(pMulticastFabricDesc->pLock);
     }
@@ -1690,6 +1769,13 @@ memorymulticastfabricTeamSetupResponseCallback
     return NV_OK;
 }
 
+static void
+_memMulticastFabricConstructResolveDefaults(NV00FD_ALLOCATION_PARAMETERS *pAllocParams)
+{
+    _memMulticastfabricResolvePageSize(&pAllocParams->pageSize);
+    _memMulticastfabricResolveAlignment(&pAllocParams->alignment, pAllocParams->pageSize);
+}
+
 NV_STATUS
 memorymulticastfabricConstruct_IMPL
 (
@@ -1706,11 +1792,77 @@ memorymulticastfabricConstruct_IMPL
                                                   pCallContext, pParams);
     }
 
+    _memMulticastFabricConstructResolveDefaults(pAllocParams);
+
     NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
                 _memMulticastFabricValidateAllocParams(pAllocParams));
 
     return _memMulticastFabricConstruct(pMemoryMulticastFabric,
                                         pCallContext, pParams);
+}
+
+static NV_STATUS
+_memorymulticastfabricValidateNvlAttrCommon
+(
+    MEM_MULTICAST_FABRIC_GPU_NVLINK_ATTR *pNvlAttr,
+    NvU32                                 cliqueId,
+    NvU16                                 bwMode,
+    NvU64                                 bwModeEpoch
+)
+{
+    if (pNvlAttr->cliqueId != cliqueId)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Clique ID mismatch %u:%u\n", pNvlAttr->cliqueId, cliqueId);
+        return NV_ERR_INVALID_DEVICE;
+    }
+
+    if (pNvlAttr->bwModeEpoch != bwModeEpoch)
+    {
+        NV_PRINTF(LEVEL_ERROR, "bwModeEpoch mismatch %llu:%llu\n", pNvlAttr->bwModeEpoch, bwModeEpoch);
+        return NV_ERR_INVALID_DEVICE;
+    }
+
+    if (pNvlAttr->bwMode != bwMode)
+    {
+        NV_PRINTF(LEVEL_ERROR, "bwMode mismatch %u:%u\n", pNvlAttr->bwMode, bwMode);
+        return NV_ERR_INVALID_DEVICE;
+    }
+
+    return NV_OK;
+}
+
+static NV_STATUS
+_memorymulticastfabricValidateNvlAttr
+(
+    MEM_MULTICAST_FABRIC_DESCRIPTOR *pMulticastFabricDesc,
+    NvU32                            cliqueId,
+    NvU16                             bwMode,
+    NvU64                            bwModeEpoch
+)
+{
+    MEM_MULTICAST_FABRIC_GPU_INFO *pHead;
+    MEM_MULTICAST_FABRIC_REMOTE_GPU_INFO *pRemoteHead;
+
+    pHead = listHead(&pMulticastFabricDesc->gpuInfoList);
+    pRemoteHead = multimapFirstItem(&pMulticastFabricDesc->remoteGpuInfoMap);
+
+    if (pHead != NULL)
+    {
+        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+            _memorymulticastfabricValidateNvlAttrCommon(&pHead->nvlAttr,
+                                                        cliqueId, bwMode,
+                                                        bwModeEpoch));
+    }
+
+    if (pRemoteHead != NULL)
+    {
+        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+            _memorymulticastfabricValidateNvlAttrCommon(&pRemoteHead->nvlAttr,
+                                                        cliqueId, bwMode,
+                                                        bwModeEpoch));
+    }
+
+    return NV_OK;
 }
 
 //
@@ -1730,8 +1882,6 @@ _memorymulticastfabricCtrlAttachGpu
     NV_STATUS status;
     FABRIC_VASPACE *pFabricVAS;
     MEM_MULTICAST_FABRIC_GPU_INFO *pNode;
-    MEM_MULTICAST_FABRIC_GPU_INFO *pHead;
-    MEM_MULTICAST_FABRIC_REMOTE_GPU_INFO *pRemoteHead;
     CALL_CONTEXT *pCallContext = resservGetTlsCallContext();
 
     if (pParams->flags != 0)
@@ -1763,6 +1913,13 @@ _memorymulticastfabricCtrlAttachGpu
         return NV_ERR_NOT_SUPPORTED;
     }
 
+    // Perform validation of fabric page size against arch support
+    if (!memmgrIsValidFlaPageSize_HAL(pGpu, GPU_GET_MEMORY_MANAGER(pGpu), pMulticastFabricDesc->pageSize, NV_TRUE))
+    {
+        NV_PRINTF(LEVEL_ERROR, "Unsupported pageSize: 0x%llx.\n", pMulticastFabricDesc->pageSize);
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
     status = _memMulticastFabricGpuInfoAdd(pMemoryMulticastFabric,
                                            pCallContext->pControlParams);
     if (status != NV_OK)
@@ -1783,7 +1940,7 @@ _memorymulticastfabricCtrlAttachGpu
     }
 
     status = gpuFabricProbeGetFabricCliqueId(pGpu->pGpuFabricProbeInfoKernel,
-                                             &pNode->cliqueId);
+                                             &pNode->nvlAttr.cliqueId);
     if (status != NV_OK)
     {
         NV_PRINTF(LEVEL_ERROR,
@@ -1791,20 +1948,18 @@ _memorymulticastfabricCtrlAttachGpu
         goto fail;
     }
 
-    pHead = listHead(&pMulticastFabricDesc->gpuInfoList);
-    pRemoteHead = multimapFirstItem(&pMulticastFabricDesc->remoteGpuInfoMap);
+    pNode->nvlAttr.bwMode = knvlinkGetBWMode(pGpu, GPU_GET_KERNEL_NVLINK(pGpu));
 
-    if ((pHead != NULL) && (pHead->cliqueId != pNode->cliqueId))
-    {
-        NV_PRINTF(LEVEL_ERROR, "Clique ID mismatch\n");
-        status = NV_ERR_INVALID_DEVICE;
-        goto fail;
-    }
+    pNode->nvlAttr.bwModeEpoch = knvlinkGetBWModeEpoch(pGpu,
+                                                       GPU_GET_KERNEL_NVLINK(pGpu));
 
-    if ((pRemoteHead != NULL) && (pRemoteHead->cliqueId != pNode->cliqueId))
+    status = _memorymulticastfabricValidateNvlAttr(pMulticastFabricDesc,
+                                                   pNode->nvlAttr.cliqueId,
+                                                   pNode->nvlAttr.bwMode,
+                                                   pNode->nvlAttr.bwModeEpoch);
+    if (status != NV_OK)
     {
-        NV_PRINTF(LEVEL_ERROR, "Clique ID mismatch\n");
-        status = NV_ERR_INVALID_DEVICE;
+        NV_PRINTF(LEVEL_ERROR, "Clique ID etc. validation failed\n");
         goto fail;
     }
 
@@ -1864,11 +2019,14 @@ _memorymulticastfabricCtrlAttachGpu
 
         _memMulticastFabricInitAttachEvent(pNode->gpuProbeHandle,
                                            pMulticastFabricDesc->inbandReqId,
-                                           pNode->cliqueId,
+                                           pNode->nvlAttr.bwModeEpoch,
+                                           pNode->nvlAttr.bwMode,
+                                           pNode->nvlAttr.cliqueId,
                                            pMulticastFabricDesc->exportNodeId,
                                            pMulticastFabricDesc->index,
                                            &pMulticastFabricDesc->expUuid,
                                            pMulticastFabricDesc->imexChannel,
+                                           pMulticastFabricDesc->pageSize,
                                            &event);
 
         pNode->attachEventId = event.id;
@@ -2051,6 +2209,29 @@ NV_STATUS memorymulticastfabricCtrlSetFailure_IMPL
 #endif
 
 #ifdef NV00FD_CTRL_CMD_ATTACH_REMOTE_GPU
+
+//
+// Checks that the attached GPU has the same page size as the prime MCLFA object.
+// Note that the prime MCFLA object page size has been validated during construction.
+//
+static NV_STATUS
+_memorymulticastfabricValidateFabricAttr
+(
+    MEM_MULTICAST_FABRIC_DESCRIPTOR *pMulticastFabricDesc,
+    NvU64 pageSize
+)
+{
+    NV_STATUS status = NV_OK;
+
+    if (pMulticastFabricDesc->pageSize != pageSize)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Fabric validation failed. Prime and non-prime object page sizes do not match.\n");
+        status = NV_ERR_INVALID_ARGUMENT;
+    }
+
+    return status;
+}
+
 //
 // Note this function is not always called with the GPU lock. Be careful
 // while accessing GPU state.
@@ -2065,10 +2246,6 @@ _memorymulticastfabricCtrlAttachRemoteGpu
 {
     MEM_MULTICAST_FABRIC_DESCRIPTOR *pMulticastFabricDesc =
                                 pMemoryMulticastFabric->pMulticastFabricDesc;
-    MEM_MULTICAST_FABRIC_GPU_INFO *pHead =
-                        listHead(&pMulticastFabricDesc->gpuInfoList);
-    MEM_MULTICAST_FABRIC_REMOTE_GPU_INFO *pRemoteHead =
-                    multimapFirstItem(&pMulticastFabricDesc->remoteGpuInfoMap);
     MEM_MULTICAST_FABRIC_REMOTE_GPU_INFO *pNode;
     MEM_MULTICAST_FABRIC_GPU_INFO *pIter;
     MemMulticastFabricRemoteGpuInfoMapSubmap *pSubmap = NULL;
@@ -2101,17 +2278,21 @@ _memorymulticastfabricCtrlAttachRemoteGpu
         goto fail;
     }
 
-    if ((pHead != NULL) && (pHead->cliqueId != pParams->cliqueId))
+    status = _memorymulticastfabricValidateFabricAttr(pMulticastFabricDesc,
+                                                      pParams->pageSize);
+    if (status != NV_OK)
     {
-        NV_PRINTF(LEVEL_ERROR, "Clique ID mismatch\n");
-        status = NV_ERR_INVALID_DEVICE;
+        NV_PRINTF(LEVEL_ERROR, "Page size of remote GPU does not match prime MCLFA object\n");
         goto fail;
     }
 
-    if ((pRemoteHead != NULL) && (pRemoteHead->cliqueId != pParams->cliqueId))
+    status = _memorymulticastfabricValidateNvlAttr(pMulticastFabricDesc,
+                                                   pParams->cliqueId,
+                                                   pParams->bwMode,
+                                                   pParams->bwModeEpoch);
+    if (status != NV_OK)
     {
-        NV_PRINTF(LEVEL_ERROR, "Clique ID mismatch\n");
-        status = NV_ERR_INVALID_DEVICE;
+        NV_PRINTF(LEVEL_ERROR, "Clique ID etc. validation failed\n");
         goto fail;
     }
 
@@ -2160,7 +2341,9 @@ _memorymulticastfabricCtrlAttachRemoteGpu
     portMemSet(pNode, 0, sizeof(*pNode));
 
     pNode->key = pParams->key;
-    pNode->cliqueId = pParams->cliqueId;
+    pNode->nvlAttr.cliqueId = pParams->cliqueId;
+    pNode->nvlAttr.bwMode = pParams->bwMode;
+    pNode->nvlAttr.bwModeEpoch = pParams->bwModeEpoch;
 
     if ((pMulticastFabricDesc->numAttachedGpus + 1)
                                     == pMulticastFabricDesc->numMaxGpus)
@@ -2213,6 +2396,12 @@ fail:
     return status;
 }
 
+static void
+_memMulticastfabricRemoteAttachResolveDefaults(NV00FD_CTRL_ATTACH_REMOTE_GPU_PARAMS *pParams)
+{
+    _memMulticastfabricResolvePageSize(&pParams->pageSize);
+}
+
 NV_STATUS
 memorymulticastfabricCtrlAttachRemoteGpu_IMPL
 (
@@ -2229,6 +2418,9 @@ memorymulticastfabricCtrlAttachRemoteGpu_IMPL
     NvBool bLastAttach;
     NvBool bLastAttachRecheck;
     NvBool bGpuLockTaken = NV_FALSE;
+
+    // Resolve page size to 512MB if not set.
+    _memMulticastfabricRemoteAttachResolveDefaults(pParams);
 
 retry:
     //
@@ -2365,12 +2557,15 @@ _memorymulticastfabricCtrlDetachMem
     pFabricVAS = dynamicCast(pGpuInfo->pGpu->pFabricVAS, FABRIC_VASPACE);
     NV_ASSERT_OR_RETURN(pFabricVAS != NULL, NV_ERR_INVALID_STATE);
 
-    _memorymulticastfabricDetachMem(pFabricVAS, pFabricMemDesc, pNode);
+    _memorymulticastfabricDetachMem(pGpu, pFabricVAS, pFabricMemDesc, pNode);
 
     if (bRemoveInterMapping)
     {
-        refRemoveInterMapping(RES_GET_REF(pMemoryMulticastFabric),
-                              pAttachMemInfoNode->pInterMapping);
+        RsResourceRef *pMemoryMulticastFabricRef = RES_GET_REF(pMemoryMulticastFabric);
+        RsInterMapping *pInterMapping = pAttachMemInfoNode->pInterMapping;
+
+        refRemoveInterMapping(pMemoryMulticastFabricRef, pInterMapping, NV_FALSE);
+        refDestroyInterMapping(pMemoryMulticastFabricRef, pInterMapping);
     }
 
     btreeUnlink(pNode, &pGpuInfo->pAttachMemInfoTree);
@@ -2405,7 +2600,7 @@ memorymulticastfabricCtrlDetachMem_IMPL
         return status;
 
     pGpu = GPU_RES_GET_GPU(pSubdevice);
-    gpuMask = GPUS_LOCK_ALL;
+    gpuMask = NVBIT(gpuGetInstance(pGpu));
 
     //
     // Take per-GPU lock as we ensure source and destination devices are the
@@ -2441,7 +2636,7 @@ _memorymulticastfabricValidatePhysMem
 (
     RsClient              *pClient,
     NvHandle               hPhysMem,
-    OBJGPU               **ppGpu,
+    OBJGPU                *pGpu,
     Memory               **ppPhysMemory
 )
 {
@@ -2466,9 +2661,7 @@ _memorymulticastfabricValidatePhysMem
         return NV_ERR_INVALID_ARGUMENT;
     }
 
-    if (!memmgrIsMemDescSupportedByFla_HAL(pPhysMemDesc->pGpu,
-                                           GPU_GET_MEMORY_MANAGER(pPhysMemDesc->pGpu),
-                                           pPhysMemDesc))
+    if (!memmgrIsMemDescSupportedByFla_HAL(pGpu, GPU_GET_MEMORY_MANAGER(pGpu), pPhysMemDesc))
     {
         NV_PRINTF(LEVEL_ERROR, "Invalid physmem handle passed\n");
 
@@ -2484,7 +2677,6 @@ _memorymulticastfabricValidatePhysMem
         return NV_ERR_INVALID_ARGUMENT;
     }
 
-    *ppGpu = pPhysMemDesc->pGpu;
     *ppPhysMemory = pMemory;
 
     return NV_OK;
@@ -2498,6 +2690,7 @@ static NV_STATUS
 _memorymulticastfabricCtrlAttachMem
 (
     OBJGPU                        *pGpu,
+    Subdevice                     *pSubdevice,
     MemoryMulticastFabric         *pMemoryMulticastFabric,
     Memory                        *pPhysMemory,
     NV00FD_CTRL_ATTACH_MEM_PARAMS *pParams
@@ -2513,7 +2706,7 @@ _memorymulticastfabricCtrlAttachMem
     MEM_MULTICAST_FABRIC_ATTACH_MEM_INFO_NODE *pNode;
     NvU32 gpuMask = NVBIT(gpuGetInstance(pGpu));
     RsInterMapping *pInterMapping;
-
+    RsResourceRef *pMemoryMulticastFabricRef = RES_GET_REF(pMemoryMulticastFabric);
     if (!rmGpuGroupLockIsOwner(0, GPU_LOCK_GRP_MASK, &gpuMask))
         return NV_ERR_INVALID_LOCK_STATE;
 
@@ -2530,22 +2723,25 @@ _memorymulticastfabricCtrlAttachMem
 
     NV_ASSERT_OR_RETURN(pGpuInfo->bMcflaAlloc, NV_ERR_INVALID_STATE);
 
-    status = refAddInterMapping(RES_GET_REF(pMemoryMulticastFabric),
+    NV_ASSERT_OK_OR_RETURN(refCreateInterMapping(pMemoryMulticastFabricRef, &pInterMapping));
+
+    // No partial unmap supported
+    pInterMapping->size = 0;
+
+    status = refAddInterMapping(pMemoryMulticastFabricRef,
                                 RES_GET_REF(pPhysMemory),
-                                RES_GET_REF(pPhysMemory)->pParentRef,
-                                &pInterMapping);
+                                pParams->offset,
+                                RES_GET_REF(pSubdevice),
+                                pInterMapping);
     if (status != NV_OK)
     {
         NV_PRINTF(LEVEL_ERROR, "Failed to setup inter mapping\n");
+        refDestroyInterMapping(pMemoryMulticastFabricRef, pInterMapping);
         return status;
     }
 
     pInterMapping->flags = pParams->flags;
-    pInterMapping->dmaOffset = pParams->offset;
     pInterMapping->pMemDesc = pPhysMemDesc;
-
-    // No partial unmap supported
-    pInterMapping->size = 0;
 
     status = fabricvaspaceMapPhysMemdesc(pFabricVAS,
                                          pFabricMemDesc,
@@ -2569,12 +2765,12 @@ _memorymulticastfabricCtrlAttachMem
 
     portMemSet(pNode, 0, sizeof(*pNode));
 
-    pNode->node.keyStart = pParams->offset;
-    pNode->node.keyEnd   = pParams->offset;
-    pNode->physMapLength = pParams->mapLength;
-    pNode->pPhysMemDesc  = pPhysMemDesc;
-    pNode->pInterMapping = pInterMapping;
-    pNode->node.Data     = pNode;
+    pNode->node.keyStart    = pParams->offset;
+    pNode->node.keyEnd      = pParams->offset;
+    pNode->physMapLength    = pParams->mapLength;
+    pNode->pPhysMemDesc     = pPhysMemDesc;
+    pNode->pInterMapping    = pInterMapping;
+    pNode->node.Data        = pNode;
 
     status = btreeInsert(&pNode->node, &pGpuInfo->pAttachMemInfoTree);
     if (status != NV_OK)
@@ -2589,11 +2785,11 @@ freeNode:
     portMemFree(pNode);
 
 unmapVas:
-    fabricvaspaceUnmapPhysMemdesc(pFabricVAS, pFabricMemDesc, pParams->offset,
-                                  pPhysMemDesc, pParams->mapLength);
+    fabricvaspaceUnmapPhysMemdesc(pFabricVAS, pFabricMemDesc, pParams->offset, pParams->mapLength);
 
 removeIntermap:
-    refRemoveInterMapping(RES_GET_REF(pMemoryMulticastFabric), pInterMapping);
+    refRemoveInterMapping(pMemoryMulticastFabricRef, pInterMapping, NV_FALSE);
+    refDestroyInterMapping(pMemoryMulticastFabricRef, pInterMapping);
 
     return status;
 }
@@ -2611,17 +2807,23 @@ memorymulticastfabricCtrlAttachMem_IMPL
     NvU32 gpuMask;
     OBJGPU *pGpu;
     Memory *pPhysMemory;
+    Subdevice *pSubdevice = NULL;
 
     if (pParams->flags != 0)
         return NV_ERR_INVALID_ARGUMENT;
 
-    //
-    // TODO: pParams->hSubdevice will be used when deviceless memory classes
-    // will be supported.
-    //
+    status = subdeviceGetByHandle(RES_GET_CLIENT(pMemoryMulticastFabric),
+                                  pParams->hSubdevice, &pSubdevice);
+    if (status == NV_ERR_OBJECT_NOT_FOUND)
+        status = NV_ERR_INVALID_DEVICE;
+
+    if (status != NV_OK)
+        return status;
+
+    pGpu = GPU_RES_GET_GPU(pSubdevice);
 
     status = _memorymulticastfabricValidatePhysMem(RES_GET_CLIENT(pMemoryMulticastFabric),
-                                                   pParams->hMemory, &pGpu, &pPhysMemory);
+                                                   pParams->hMemory, pGpu, &pPhysMemory);
     if (status != NV_OK)
     {
         NV_PRINTF(LEVEL_ERROR, "Failed to validate physmem handle\n");
@@ -2648,7 +2850,7 @@ memorymulticastfabricCtrlAttachMem_IMPL
     //
     portSyncRwLockAcquireRead(pMulticastFabricDesc->pLock);
 
-    status = _memorymulticastfabricCtrlAttachMem(pGpu, pMemoryMulticastFabric,
+    status = _memorymulticastfabricCtrlAttachMem(pGpu, pSubdevice, pMemoryMulticastFabric,
                                                  pPhysMemory, pParams);
 
     portSyncRwLockReleaseRead(pMulticastFabricDesc->pLock);

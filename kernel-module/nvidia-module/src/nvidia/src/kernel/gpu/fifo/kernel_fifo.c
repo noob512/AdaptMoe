@@ -1,5 +1,5 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ /*
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -336,7 +336,7 @@ _kfifoChidMgrAllocChidHeaps
     // should not be in the same page
     //
     kfifoGetUserdSizeAlign_HAL(pKernelFifo, &userdBar1Size, NULL);
-    NvBool bIsolationEnabled = kfifoIsPreAllocatedUserDEnabled(pKernelFifo);
+    NvBool bIsolationEnabled = kfifoUserdNeedsIsolation(pKernelFifo);
     pChidMgr->pGlobalChIDHeap->eheapSetOwnerIsolation(pChidMgr->pGlobalChIDHeap,
                                                       bIsolationEnabled,
                                                       RM_PAGE_SIZE / userdBar1Size);
@@ -779,7 +779,10 @@ kfifoChidMgrAllocChid_IMPL
         /* Channel USERD manipuliation only supported without GFID */
         if (bForceUserdPage)
         {
-            NV_ASSERT_OR_RETURN(!bForceInternalIdx, NV_ERR_INVALID_STATE);
+            NV_ASSERT_TRUE_OR_GOTO(status,
+                !bForceInternalIdx,
+                NV_ERR_INVALID_STATE,
+                fail);
             ChID64 = ((NvU64)userdPageIdx) *
                          pChidMgr->pGlobalChIDHeap->ownerGranularity +
                      internalIdx;
@@ -809,8 +812,9 @@ kfifoChidMgrAllocChid_IMPL
             }
         }
 
-        NV_ASSERT_OK_OR_RETURN(
-            pChidMgr->pGlobalChIDHeap->eheapSetAllocRange(pChidMgr->pGlobalChIDHeap, rangeLo, rangeHi));
+        NV_ASSERT_OK_OR_GOTO(status,
+            pChidMgr->pGlobalChIDHeap->eheapSetAllocRange(pChidMgr->pGlobalChIDHeap, rangeLo, rangeHi),
+            fail);
 
         status = pChidMgr->pGlobalChIDHeap->eheapAlloc(
             pChidMgr->pGlobalChIDHeap, // This Heap
@@ -890,7 +894,6 @@ kfifoChidMgrAllocChid_IMPL
     return NV_OK;
 
 fail:
-    // We already know that pIsolationID is non-NULL here.
     portMemFree(pIsolationID);
     return status;
 }
@@ -1365,6 +1368,7 @@ kfifoChidMgrAllocChannelGroupHwID_IMPL
 )
 {
     NvU32 maxChannelGroups;
+    char logMessage[256] = "";
 
     if (pChGrpID == NULL)
         return NV_ERR_INVALID_ARGUMENT;
@@ -1389,6 +1393,13 @@ kfifoChidMgrAllocChannelGroupHwID_IMPL
     {
         *pChGrpID = maxChannelGroups;
         NV_PRINTF(LEVEL_ERROR, "No allocatable FIFO available.\n");
+
+        // For vGPU, log the error message on host side as well
+        if (IS_VIRTUAL(pGpu))
+        {
+            nvDbgSnprintf(logMessage, sizeof(logMessage), "Guest attempted to allocate channel above its max per engine channel limit 0x%x", maxChannelGroups);
+            NV_RM_RPC_LOG(pGpu, (const char *)logMessage, NV_VGPU_LOG_LEVEL_ERROR);
+        }
         return NV_ERR_NO_FREE_FIFOS;
     }
     return NV_OK;
@@ -1676,14 +1687,6 @@ kfifoChannelGroupSetTimeslice_IMPL
 
     NV_PRINTF(LEVEL_INFO, "Setting TSG %d Timeslice to %lldus\n",
               pKernelChannelGroup->grpID, timesliceUs);
-
-    if (timesliceUs < kfifoRunlistGetMinTimeSlice_HAL(pKernelFifo))
-    {
-        NV_PRINTF(LEVEL_ERROR,
-                  "Setting Timeslice to %lldus not allowed. Min value is %lldus\n",
-                  timesliceUs, kfifoRunlistGetMinTimeSlice_HAL(pKernelFifo));
-        return NV_ERR_NOT_SUPPORTED;
-    }
 
     pKernelChannelGroup->timesliceUs = timesliceUs;
 
@@ -2515,7 +2518,6 @@ kfifoGetRunlistBufPool_IMPL
  * @param[in]  pGpu                 Pointer to OBJGPU
  * @param[in]  pKernelFifo          Pointer to KernelFifo
  * @param[in]  runlistId            Runlist ID
- * @param[in]  bTsgSupported        Is TSG supported
  * @param[in]  maxRunlistEntries    Max entries to be supported in a runlist
  * @param[out] pSize                Size of runlist buffer
  * @param[out] pAlignment           Alignment for runlist buffer
@@ -2526,7 +2528,6 @@ kfifoGetRunlistBufInfo_IMPL
     OBJGPU       *pGpu,
     KernelFifo   *pKernelFifo,
     NvU32         runlistId,
-    NvBool        bTsgSupported,
     NvU32         maxRunlistEntries,
     NvU64        *pSize,
     NvU64        *pAlignment
@@ -2537,7 +2538,6 @@ kfifoGetRunlistBufInfo_IMPL
     CHID_MGR       *pChidMgr = kfifoGetChidMgr(pGpu, pKernelFifo, runlistId);
     NvU32           runlistSizeMultiplier = 1;
     RM_ENGINE_TYPE  rmEngineType;
-    NvU32           schedPolicy;
 
     NV_ASSERT_OR_RETURN(pSize != NULL, NV_ERR_INVALID_ARGUMENT);
     NV_ASSERT_OR_RETURN(pAlignment != NULL, NV_ERR_INVALID_ARGUMENT);
@@ -2555,9 +2555,7 @@ kfifoGetRunlistBufInfo_IMPL
     else
     {
         maxRunlistEntriesSupported = kfifoGetMaxChannelsInSystem(pGpu, pKernelFifo);
-        maxRunlistEntriesSupported += (bTsgSupported ?
-                                       kfifoGetMaxChannelGroupsInSystem(pGpu, pKernelFifo)
-                                       : 0);
+        maxRunlistEntriesSupported += kfifoGetMaxChannelGroupsInSystem(pGpu, pKernelFifo);
     }
 
     NV_ASSERT_OR_RETURN(maxRunlistEntries <= maxRunlistEntriesSupported, NV_ERR_INVALID_ARGUMENT);
@@ -2570,13 +2568,9 @@ kfifoGetRunlistBufInfo_IMPL
     NV_ASSERT_OK_OR_RETURN(kfifoEngineInfoXlate_HAL(pGpu, pKernelFifo, ENGINE_INFO_TYPE_RUNLIST,
                 runlistId, ENGINE_INFO_TYPE_RM_ENGINE_TYPE, (NvU32 *)&rmEngineType));
 
-    if (RM_ENGINE_TYPE_IS_GR(rmEngineType) && IS_MIG_IN_USE(pGpu))
+    if (IS_MIG_IN_USE(pGpu) && IS_GSP_CLIENT(pGpu))
     {
-        gpuGetSchedulerPolicy(pGpu, &schedPolicy);
-        if (schedPolicy != SCHED_POLICY_DEFAULT)
-        {
-            runlistSizeMultiplier = vgpuMgrGetSwrlCountToAllocate(pGpu);
-        }
+        runlistSizeMultiplier = vgpuMgrGetVmsetCountToAllocate(pGpu, rmEngineType);
     }
 
     runlistEntrySize = kfifoRunlistGetEntrySize_HAL(pKernelFifo);
@@ -2655,7 +2649,6 @@ kfifoRunlistGetBufAllocParams_IMPL
  *
  * @param[in]   pGpu
  * @param[in]   pKernelFifo
- * @param[in]   bSupportTsg         Will this runlist support TSGs?
  * @param[in]   aperture            NV_ADDRESS_SPACE requested
  * @param[in]   runlistId           runlistId to allocate buffer for
  * @param[in]   attr                CPU cacheability requested
@@ -2669,7 +2662,6 @@ kfifoRunlistAllocBuffers_IMPL
 (
     OBJGPU             *pGpu,
     KernelFifo         *pKernelFifo,
-    NvBool              bSupportTsg,
     NV_ADDRESS_SPACE    aperture,
     NvU32               runlistId,
     NvU32               attr,
@@ -2684,7 +2676,7 @@ kfifoRunlistAllocBuffers_IMPL
     NvU64     runlistAlign  = 0;
     NvU32     counter;
 
-    status = kfifoGetRunlistBufInfo(pGpu, pKernelFifo, runlistId, bSupportTsg,
+    status = kfifoGetRunlistBufInfo(pGpu, pKernelFifo, runlistId,
         maxRunlistEntries, &runlistSz, &runlistAlign);
     if (status != NV_OK)
     {
@@ -2844,9 +2836,6 @@ void kfifoGetDeviceCaps_IMPL
 
     if (kfifoIsUserdMapDmaSupported(pKernelFifo))
         RMCTRL_SET_CAP(tempCaps, NV0080_CTRL_FIFO_CAPS, _GPU_MAP_CHANNEL);
-
-    if (kfifoHostHasLbOverflow(pKernelFifo))
-        RMCTRL_SET_CAP(tempCaps, NV0080_CTRL_FIFO_CAPS, _HAS_HOST_LB_OVERFLOW_BUG_1667921);
 
     if (kfifoIsSubcontextSupported(pKernelFifo))
         RMCTRL_SET_CAP(tempCaps, NV0080_CTRL_FIFO_CAPS, _MULTI_VAS_PER_CHANGRP);
@@ -3521,7 +3510,6 @@ kfifoGetGuestEngineLookupTable_IMPL
         {NV2080_ENGINE_TYPE_NVENC0,     MC_ENGINE_IDX_NVENC},
         {NV2080_ENGINE_TYPE_NVENC1,     MC_ENGINE_IDX_NVENC1},
         {NV2080_ENGINE_TYPE_NVENC2,     MC_ENGINE_IDX_NVENC2},
-// Bug 4175886 - Use this new value for all chips once GB20X is released
         {NV2080_ENGINE_TYPE_NVENC3,     MC_ENGINE_IDX_NVENC3},
         {NV2080_ENGINE_TYPE_NVDEC0,     MC_ENGINE_IDX_NVDEC0},
         {NV2080_ENGINE_TYPE_NVDEC1,     MC_ENGINE_IDX_NVDEC1},
@@ -3861,4 +3849,15 @@ kfifoDoesUvmOwnedChannelExist_IMPL
     }
 
     return NV_FALSE;
+}
+
+KernelChannel *kfifoKernelChannelFromInfo_IMPL(OBJGPU *pGpu, KernelFifo *pKernelFifo, FIFO_CHANNEL_INFO channelInfo)
+{
+    NV_ASSERT_OR_RETURN(channelInfo.chid != INVALID_CHID, NULL);
+    NV_ASSERT_OR_RETURN(channelInfo.tsgInfo.runlistId != INVALID_RUNLIST_ID, NULL);
+
+    CHID_MGR *pChidMgr = kfifoGetChidMgr(pGpu, pKernelFifo, channelInfo.tsgInfo.runlistId);
+    NV_ASSERT_OR_RETURN(pChidMgr != NULL, NULL);
+
+    return kfifoChidMgrGetKernelChannel(pGpu, pKernelFifo, pChidMgr, channelInfo.chid);
 }

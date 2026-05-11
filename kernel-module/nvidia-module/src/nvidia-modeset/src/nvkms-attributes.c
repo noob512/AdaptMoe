@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2013 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2013-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -32,6 +32,7 @@
 #include "nvos.h"
 #include "nvkms-stereo.h"
 #include "nvkms-hdmi.h"
+#include "dp/nvdp-connector.h"
 
 #include <ctrl/ctrl0073/ctrl0073dp.h> // NV0073_CTRL_CMD_DP_GET_LINK_CONFIG_*
 
@@ -207,14 +208,6 @@ static NvBool GetHwHead(const NVDpyEvoRec *pDpyEvo, NvS64 *pHead)
     return TRUE;
 }
 
-static NvBool DitherConfigurationAllowed(const NVDpyEvoRec *pDpyEvo)
-{
-    NVDispEvoPtr pDispEvo = pDpyEvo->pDispEvo;
-    NVDevEvoPtr pDevEvo = pDispEvo->pDevEvo;
-
-    return pDevEvo->hal->caps.supportedDitheringModes != 0;
-}
-
 static void SetDitheringCommon(NVDpyEvoPtr pDpyEvo)
 {
     NVEvoUpdateState updateState = { };
@@ -253,10 +246,6 @@ static void SetDitheringCommon(NVDpyEvoPtr pDpyEvo)
  */
 static NvBool SetDithering(NVDpyEvoRec *pDpyEvo, NvS64 dithering)
 {
-    if (!DitherConfigurationAllowed(pDpyEvo)) {
-        return FALSE;
-    }
-
     switch (dithering) {
     case NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_AUTO:
     case NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_ENABLED:
@@ -275,35 +264,25 @@ static NvBool SetDithering(NVDpyEvoRec *pDpyEvo, NvS64 dithering)
 
 static NvBool GetDithering(const NVDpyEvoRec *pDpyEvo, NvS64 *pDithering)
 {
-    if (!DitherConfigurationAllowed(pDpyEvo)) {
-        return FALSE;
-    }
-
     *pDithering = pDpyEvo->requestedDithering.state;
 
     return TRUE;
 }
 
-static NvBool GetDitheringGenericValidValues(
-    const NVDpyEvoRec *pDpyEvo,
-    struct NvKmsAttributeValidValuesCommonReply *pValidValues)
-{
-    return DitherConfigurationAllowed(pDpyEvo);
-}
+#define NV_SUPPORTED_DITHERING_MODES                                    \
+    ((1 << NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_MODE_AUTO)        | \
+     (1 << NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_MODE_DYNAMIC_2X2) | \
+     (1 << NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_MODE_STATIC_2X2)  | \
+     (1 << NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_MODE_TEMPORAL))
 
 /*!
  * Assigns ditheringMode on all dpys driven by pDpyEvo's head.
  */
 static NvBool SetDitheringMode(NVDpyEvoRec *pDpyEvo, NvS64 ditheringMode)
 {
-    NVDevEvoPtr pDevEvo = pDpyEvo->pDispEvo->pDevEvo;
     NvU32 mask = (1 << ditheringMode);
 
-    if (!DitherConfigurationAllowed(pDpyEvo)) {
-        return FALSE;
-    }
-
-    if (!(mask & pDevEvo->hal->caps.supportedDitheringModes)) {
+    if (!(mask & NV_SUPPORTED_DITHERING_MODES)) {
         return FALSE;
     }
 
@@ -327,10 +306,6 @@ static NvBool SetDitheringMode(NVDpyEvoRec *pDpyEvo, NvS64 ditheringMode)
 static NvBool GetDitheringMode(const NVDpyEvoRec *pDpyEvo,
                                NvS64 *pDitheringMode)
 {
-    if (!DitherConfigurationAllowed(pDpyEvo)) {
-        return FALSE;
-    }
-
     *pDitheringMode = pDpyEvo->requestedDithering.mode;
 
     return TRUE;
@@ -340,17 +315,9 @@ static NvBool GetDitheringModeValidValues(
     const NVDpyEvoRec *pDpyEvo,
     struct NvKmsAttributeValidValuesCommonReply *pValidValues)
 {
-    NVDispEvoPtr pDispEvo = pDpyEvo->pDispEvo;
-    NVDevEvoPtr pDevEvo = pDispEvo->pDevEvo;
-
-    if (!DitherConfigurationAllowed(pDpyEvo)) {
-        return FALSE;
-    }
-
     nvAssert(pValidValues->type == NV_KMS_ATTRIBUTE_TYPE_INTBITS);
 
-    pValidValues->u.bits.ints =
-        pDevEvo->hal->caps.supportedDitheringModes;
+    pValidValues->u.bits.ints = NV_SUPPORTED_DITHERING_MODES;
 
     return TRUE;
 }
@@ -360,14 +327,11 @@ static NvBool GetDitheringModeValidValues(
  */
 static NvBool SetDitheringDepth(NVDpyEvoRec *pDpyEvo, NvS64 ditheringDepth)
 {
-    if (!DitherConfigurationAllowed(pDpyEvo)) {
-        return FALSE;
-    }
-
     switch (ditheringDepth) {
     case NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_DEPTH_AUTO:
     case NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_DEPTH_6_BITS:
     case NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_DEPTH_8_BITS:
+    case NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_DEPTH_10_BITS:
         break;
     default:
         return FALSE;
@@ -383,10 +347,6 @@ static NvBool SetDitheringDepth(NVDpyEvoRec *pDpyEvo, NvS64 ditheringDepth)
 static NvBool GetDitheringDepth(const NVDpyEvoRec *pDpyEvo,
                                 NvS64 *pDitheringDepth)
 {
-    if (!DitherConfigurationAllowed(pDpyEvo)) {
-        return FALSE;
-    }
-
     *pDitheringDepth = pDpyEvo->requestedDithering.depth;
 
     return TRUE;
@@ -395,10 +355,6 @@ static NvBool GetDitheringDepth(const NVDpyEvoRec *pDpyEvo,
 static NvBool GetCurrentDithering(const NVDpyEvoRec *pDpyEvo,
                                   NvS64 *pCurrentDithering)
 {
-    if (!DitherConfigurationAllowed(pDpyEvo)) {
-        return FALSE;
-    }
-
     *pCurrentDithering = pDpyEvo->currentAttributes.dithering.enabled;
 
     return TRUE;
@@ -407,10 +363,6 @@ static NvBool GetCurrentDithering(const NVDpyEvoRec *pDpyEvo,
 static NvBool GetCurrentDitheringMode(const NVDpyEvoRec *pDpyEvo,
                                       NvS64 *pCurrentDitheringMode)
 {
-    if (!DitherConfigurationAllowed(pDpyEvo)) {
-        return FALSE;
-    }
-
     *pCurrentDitheringMode =
         pDpyEvo->currentAttributes.dithering.mode;
 
@@ -420,10 +372,6 @@ static NvBool GetCurrentDitheringMode(const NVDpyEvoRec *pDpyEvo,
 static NvBool GetCurrentDitheringDepth(const NVDpyEvoRec *pDpyEvo,
                                        NvS64 *pCurrentDitheringDepth)
 {
-
-    if (!DitherConfigurationAllowed(pDpyEvo)) {
-        return FALSE;
-    }
 
     *pCurrentDitheringDepth =
         pDpyEvo->currentAttributes.dithering.depth;
@@ -497,101 +445,6 @@ static NvBool GetDigitalVibranceValidValues(
     return TRUE;
 }
 
-static NvBool ImageSharpeningAvailable(const NVDpyEvoRec *pDpyEvo)
-{
-    if (!pDpyEvo->pDispEvo->pDevEvo->hal->caps.supportsImageSharpening) {
-        return FALSE;
-    }
-
-    if (!nvDpyEvoIsActive(pDpyEvo)) {
-        return FALSE;
-    }
-
-    return pDpyEvo->currentAttributes.imageSharpening.available;
-}
-
-/*!
- * Assigns imageSharpening on all dpys driven by pDpyEvo's head.
- */
-static NvBool SetImageSharpening(NVDpyEvoRec *pDpyEvo, NvS64 imageSharpening)
-{
-    NVEvoUpdateState updateState = { };
-    NVDispEvoPtr pDispEvo = pDpyEvo->pDispEvo;
-    NVDispApiHeadStateEvoRec *pApiHeadState;
-    NvU32 head;
-
-    if ((pDpyEvo->apiHead == NV_INVALID_HEAD) ||
-            !ImageSharpeningAvailable(pDpyEvo)) {
-        return FALSE;
-    }
-    pApiHeadState = &pDispEvo->apiHeadState[pDpyEvo->apiHead];
-
-    nvAssert((pApiHeadState->hwHeadsMask) != 0x0 &&
-             (nvDpyIdIsInDpyIdList(pDpyEvo->id, pApiHeadState->activeDpys)));
-
-    imageSharpening = NV_MAX(imageSharpening, NV_EVO_IMAGE_SHARPENING_MIN);
-    imageSharpening = NV_MIN(imageSharpening, NV_EVO_IMAGE_SHARPENING_MAX);
-
-    FOR_EACH_EVO_HW_HEAD_IN_MASK(pApiHeadState->hwHeadsMask, head) {
-        nvSetImageSharpeningEvo(pDispEvo, head, imageSharpening, &updateState);
-    }
-
-    nvEvoUpdateAndKickOff(pDispEvo, FALSE, &updateState,
-                          TRUE /* releaseElv */);
-
-    pApiHeadState->attributes.imageSharpening.value = imageSharpening;
-
-    return TRUE;
-}
-
-static NvBool GetImageSharpening(const NVDpyEvoRec *pDpyEvo,
-                                 NvS64 *pImageSharpening)
-{
-    if (!ImageSharpeningAvailable(pDpyEvo)) {
-        return FALSE;
-    }
-
-    *pImageSharpening = pDpyEvo->currentAttributes.imageSharpening.value;
-
-    return TRUE;
-}
-
-static NvBool GetImageSharpeningValidValues(
-    const NVDpyEvoRec *pDpyEvo,
-    struct NvKmsAttributeValidValuesCommonReply *pValidValues)
-{
-    if (!ImageSharpeningAvailable(pDpyEvo)) {
-        return FALSE;
-    }
-
-    nvAssert(pValidValues->type == NV_KMS_ATTRIBUTE_TYPE_RANGE);
-
-    pValidValues->u.range.min = NV_EVO_IMAGE_SHARPENING_MIN;
-    pValidValues->u.range.max = NV_EVO_IMAGE_SHARPENING_MAX;
-
-    return TRUE;
-}
-
-static NvBool GetImageSharpeningAvailable(const NVDpyEvoRec *pDpyEvo,
-                                          NvS64 *pImageSharpeningAvailable)
-{
-    *pImageSharpeningAvailable = ImageSharpeningAvailable(pDpyEvo);
-
-    return TRUE;
-}
-
-static NvBool GetImageSharpeningDefault(const NVDpyEvoRec *pDpyEvo,
-                                        NvS64 *pImageSharpeningDefault)
-{
-    if (!nvDpyEvoIsActive(pDpyEvo)) {
-        return FALSE;
-    }
-
-    *pImageSharpeningDefault = NV_EVO_IMAGE_SHARPENING_DEFAULT;
-
-    return TRUE;
-}
-
 static NvBool ColorSpaceAndRangeAvailable(const NVDpyEvoRec *pDpyEvo)
 {
     return ((pDpyEvo->pConnectorEvo->legacyType ==
@@ -614,11 +467,13 @@ static void DpyPostColorSpaceOrRangeSetEvo(NVDpyEvoPtr pDpyEvo)
     NvU32 head;
     NvBool colorSpaceChanged = FALSE;
     NvBool colorBpcChanged = FALSE;
+    NVDpyAttributeColor tmpDpyColor;
 
     if (pDpyEvo->apiHead == NV_INVALID_HEAD) {
         return;
     }
     pApiHeadState = &pDispEvo->apiHeadState[pDpyEvo->apiHead];
+    tmpDpyColor = pApiHeadState->attributes.color;
 
     nvAssert((pApiHeadState->hwHeadsMask) != 0x0 &&
              (nvDpyIdIsInDpyIdList(pDpyEvo->id, pApiHeadState->activeDpys)));
@@ -643,30 +498,20 @@ static void DpyPostColorSpaceOrRangeSetEvo(NVDpyEvoPtr pDpyEvo)
     colorSpaceChanged = (pApiHeadState->attributes.color.format != colorSpace);
     colorBpcChanged = (pApiHeadState->attributes.color.bpc != colorBpc);
 
-    /* For DP, neither color space nor bpc can be changed without a modeset */
-    if (nvConnectorUsesDPLib(pDpyEvo->pConnectorEvo) &&
+    /* For DP and HDMI FRL, neither color space nor bpc can be changed without a modeset */
+    if ((nvConnectorUsesDPLib(pDpyEvo->pConnectorEvo) ||
+            (pApiHeadState->timings.protocol == NVKMS_PROTOCOL_SOR_HDMI_FRL)) &&
         (colorSpaceChanged || colorBpcChanged)) {
         return;
     }
 
-    /*
-     * Hardware does not support HDMI FRL with YUV422, and it is not possible
-     * to downgrade current color bpc on HDMI FRL at this point.
-     */
-    if ((pApiHeadState->timings.protocol == NVKMS_PROTOCOL_SOR_HDMI_FRL) &&
-            ((colorSpace == NV_KMS_DPY_ATTRIBUTE_CURRENT_COLOR_SPACE_YCbCr422) ||
-             (pApiHeadState->attributes.color.bpc > colorBpc))) {
-        return;
-    }
+    tmpDpyColor.format = colorSpace;
+    tmpDpyColor.range = colorRange;
+    tmpDpyColor.bpc = colorBpc;
 
     if (nvDpyIsHdmiEvo(pDpyEvo) &&
-            (colorBpc > pApiHeadState->attributes.color.bpc)) {
-        NVDpyAttributeColor tmpDpyColor = pApiHeadState->attributes.color;
-
-        tmpDpyColor.format = colorSpace;
-        tmpDpyColor.range = colorRange;
-        tmpDpyColor.bpc = colorBpc;
-
+            ((colorBpc > pApiHeadState->attributes.color.bpc) || 
+              colorSpaceChanged)) {
         /*
          * For HDMI FRL, downgrade the selected color bpc to the current color
          * bpc so that the current color bpc remains unchanged.
@@ -677,11 +522,9 @@ static void DpyPostColorSpaceOrRangeSetEvo(NVDpyEvoPtr pDpyEvo)
             const NvKmsDpyOutputColorFormatInfo colorFormatsInfo =
                 nvDpyGetOutputColorFormatInfo(pDpyEvo);
 
-            while (nvHdmiGetEffectivePixelClockKHz(pDpyEvo,
-                                                   &pApiHeadState->timings,
-                                                   &tmpDpyColor) >
-                       pDpyEvo->maxSingleLinkPixelClockKHz) {
-
+            while (!nvHdmiIsTmdsPossible(pDpyEvo,
+                                         &pApiHeadState->timings,
+                                         &tmpDpyColor)) {
                 if(!nvDowngradeColorSpaceAndBpc(pDpyEvo,
                                                 &colorFormatsInfo,
                                                 &tmpDpyColor)) {
@@ -689,15 +532,11 @@ static void DpyPostColorSpaceOrRangeSetEvo(NVDpyEvoPtr pDpyEvo)
                 }
             }
         }
+    } 
 
-        pApiHeadState->attributes.color.format = tmpDpyColor.format;
-        pApiHeadState->attributes.color.range = tmpDpyColor.range;
-        pApiHeadState->attributes.color.bpc = tmpDpyColor.bpc;
-    } else {
-        pApiHeadState->attributes.color.format = colorSpace;
-        pApiHeadState->attributes.color.range = colorRange;
-        pApiHeadState->attributes.color.bpc = colorBpc;
-    }
+    pApiHeadState->attributes.color.format = tmpDpyColor.format;
+    pApiHeadState->attributes.color.range = tmpDpyColor.range;
+    pApiHeadState->attributes.color.bpc = tmpDpyColor.bpc;
 
     /* Update hardware's current colorSpace and colorRange */
     FOR_EACH_EVO_HW_HEAD_IN_MASK(pApiHeadState->hwHeadsMask, head) {
@@ -730,18 +569,11 @@ static void DpyPostColorSpaceOrRangeSetEvo(NVDpyEvoPtr pDpyEvo)
 
 static NvU32 DpyGetValidColorSpaces(const NVDpyEvoRec *pDpyEvo)
 {
-    const NVDevEvoRec *pDevEvo = pDpyEvo->pDispEvo->pDevEvo;
     NvU32 val = (1 << NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE_RGB);
-
-    if ((nvDpyIsHdmiEvo(pDpyEvo) &&
-            (pDevEvo->caps.hdmiYCbCr422MaxBpc != 0)) ||
-        (nvConnectorUsesDPLib(pDpyEvo->pConnectorEvo) &&
-            (pDevEvo->caps.dpYCbCr422MaxBpc != 0))) {
-        val |= (1 << NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE_YCbCr422);
-    }
 
     if (nvDpyIsHdmiEvo(pDpyEvo) ||
             nvConnectorUsesDPLib(pDpyEvo->pConnectorEvo)) {
+        val |= (1 << NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE_YCbCr422);
         val |= (1 << NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE_YCbCr444);
     }
 
@@ -1125,6 +957,42 @@ static NvBool GetDisplayportSinkIsAudioCapableValidValues(
     return TRUE;
 }
 
+static NvBool SetDisplayportForceEnableFEC(NVDpyEvoRec *pDpyEvo, NvS64 value)
+{
+    NVConnectorEvoPtr pConnectorEvo = pDpyEvo->pConnectorEvo;
+
+    if (!nvConnectorUsesDPLib(pConnectorEvo)) {
+        return FALSE;
+    }
+
+    return nvDPForceEnableFEC(pConnectorEvo, !!value);
+}
+
+static NvBool GetDisplayportForceEnableFEC(const NVDpyEvoRec *pDpyEvo,
+                                           NvS64 *pValue)
+{
+    NVConnectorEvoPtr pConnectorEvo = pDpyEvo->pConnectorEvo;
+
+    if (!nvConnectorUsesDPLib(pConnectorEvo)) {
+        return FALSE;
+    }
+
+    *pValue = nvDPIsFECForceEnabled(pConnectorEvo);
+
+    return TRUE;
+}
+
+static NvBool GetDisplayportForceEnableFECValidValues(
+    const NVDpyEvoRec *pDpyEvo,
+    struct NvKmsAttributeValidValuesCommonReply *pValidValues)
+{
+    if (!nvConnectorUsesDPLib(pDpyEvo->pConnectorEvo)) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
 NvS64 nvRMLaneCountToNvKms(NvU32 rmLaneCount)
 {
     switch (rmLaneCount) {
@@ -1286,7 +1154,7 @@ static const struct {
     [NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING] = {
         .set            = SetDithering,
         .get            = GetDithering,
-        .getValidValues = GetDitheringGenericValidValues,
+        .getValidValues = NULL,
         .type           = NV_KMS_ATTRIBUTE_TYPE_INTEGER,
     },
     [NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_MODE] = {
@@ -1298,25 +1166,25 @@ static const struct {
     [NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_DEPTH] = {
         .set            = SetDitheringDepth,
         .get            = GetDitheringDepth,
-        .getValidValues = GetDitheringGenericValidValues,
+        .getValidValues = NULL,
         .type           = NV_KMS_ATTRIBUTE_TYPE_INTEGER,
     },
     [NV_KMS_DPY_ATTRIBUTE_CURRENT_DITHERING] = {
         .set            = NULL,
         .get            = GetCurrentDithering,
-        .getValidValues = GetDitheringGenericValidValues,
+        .getValidValues = NULL,
         .type           = NV_KMS_ATTRIBUTE_TYPE_BOOLEAN,
     },
     [NV_KMS_DPY_ATTRIBUTE_CURRENT_DITHERING_MODE] = {
         .set            = NULL,
         .get            = GetCurrentDitheringMode,
-        .getValidValues = GetDitheringGenericValidValues,
+        .getValidValues = NULL,
         .type           = NV_KMS_ATTRIBUTE_TYPE_INTEGER,
     },
     [NV_KMS_DPY_ATTRIBUTE_CURRENT_DITHERING_DEPTH] = {
         .set            = NULL,
         .get            = GetCurrentDitheringDepth,
-        .getValidValues = GetDitheringGenericValidValues,
+        .getValidValues = NULL,
         .type           = NV_KMS_ATTRIBUTE_TYPE_INTEGER,
     },
     [NV_KMS_DPY_ATTRIBUTE_DIGITAL_VIBRANCE] = {
@@ -1324,24 +1192,6 @@ static const struct {
         .get            = GetDigitalVibrance,
         .getValidValues = GetDigitalVibranceValidValues,
         .type           = NV_KMS_ATTRIBUTE_TYPE_RANGE,
-    },
-    [NV_KMS_DPY_ATTRIBUTE_IMAGE_SHARPENING] = {
-        .set            = SetImageSharpening,
-        .get            = GetImageSharpening,
-        .getValidValues = GetImageSharpeningValidValues,
-        .type           = NV_KMS_ATTRIBUTE_TYPE_RANGE,
-    },
-    [NV_KMS_DPY_ATTRIBUTE_IMAGE_SHARPENING_AVAILABLE] = {
-        .set            = NULL,
-        .get            = GetImageSharpeningAvailable,
-        .getValidValues = NULL,
-        .type           = NV_KMS_ATTRIBUTE_TYPE_BOOLEAN,
-    },
-    [NV_KMS_DPY_ATTRIBUTE_IMAGE_SHARPENING_DEFAULT] = {
-        .set            = NULL,
-        .get            = GetImageSharpeningDefault,
-        .getValidValues = NULL,
-        .type           = NV_KMS_ATTRIBUTE_TYPE_INTEGER,
     },
     [NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE] = {
         .set            = SetRequestedColorSpace,
@@ -1413,6 +1263,12 @@ static const struct {
         .set            = NULL,
         .get            = GetDisplayportSinkIsAudioCapable,
         .getValidValues = GetDisplayportSinkIsAudioCapableValidValues,
+        .type           = NV_KMS_ATTRIBUTE_TYPE_BOOLEAN,
+    },
+    [NV_KMS_DPY_ATTRIBUTE_DISPLAYPORT_FORCE_ENABLE_FEC] = {
+        .set            = SetDisplayportForceEnableFEC,
+        .get            = GetDisplayportForceEnableFEC,
+        .getValidValues = GetDisplayportForceEnableFECValidValues,
         .type           = NV_KMS_ATTRIBUTE_TYPE_BOOLEAN,
     },
     [NV_KMS_DPY_ATTRIBUTE_FRAMELOCK_DISPLAY_CONFIG] = {

@@ -16,7 +16,7 @@
 
 
 #ifdef DEBUG
-char __nvoc_class_id_uniqueness_check__0x01c1bf = 1;
+char __nvoc_class_id_uniqueness_check__01c1bf = 1;
 #endif
 
 extern const struct NVOC_CLASS_DEF __nvoc_class_def_KernelMIGManager;
@@ -25,10 +25,10 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_OBJENGSTATE;
 
 // Forward declarations for KernelMIGManager
 void __nvoc_init__OBJENGSTATE(OBJENGSTATE*);
-void __nvoc_init__KernelMIGManager(KernelMIGManager*, RmHalspecOwner *pRmhalspecowner);
-void __nvoc_init_funcTable_KernelMIGManager(KernelMIGManager*, RmHalspecOwner *pRmhalspecowner);
-NV_STATUS __nvoc_ctor_KernelMIGManager(KernelMIGManager*, RmHalspecOwner *pRmhalspecowner);
-void __nvoc_init_dataField_KernelMIGManager(KernelMIGManager*, RmHalspecOwner *pRmhalspecowner);
+void __nvoc_init__KernelMIGManager(KernelMIGManager*, GpuHalspecOwner *pGpuhalspecowner, RmHalspecOwner *pRmhalspecowner);
+void __nvoc_init_funcTable_KernelMIGManager(KernelMIGManager*, GpuHalspecOwner *pGpuhalspecowner, RmHalspecOwner *pRmhalspecowner);
+NV_STATUS __nvoc_ctor_KernelMIGManager(KernelMIGManager*, GpuHalspecOwner *pGpuhalspecowner, RmHalspecOwner *pRmhalspecowner);
+void __nvoc_init_dataField_KernelMIGManager(KernelMIGManager*, GpuHalspecOwner *pGpuhalspecowner, RmHalspecOwner *pRmhalspecowner);
 void __nvoc_dtor_KernelMIGManager(KernelMIGManager*);
 
 // Structures used within RTTI (run-time type information)
@@ -53,19 +53,18 @@ NV_STATUS __nvoc_up_thunk_OBJENGSTATE_kmigmgrStatePostUnload(struct OBJGPU *pGpu
 void __nvoc_up_thunk_OBJENGSTATE_kmigmgrStateDestroy(struct OBJGPU *pGpu, struct KernelMIGManager *pEngstate);    // this
 NvBool __nvoc_up_thunk_OBJENGSTATE_kmigmgrIsPresent(struct OBJGPU *pGpu, struct KernelMIGManager *pEngstate);    // this
 
+// Class-specific details for KernelMIGManager
 const struct NVOC_CLASS_DEF __nvoc_class_def_KernelMIGManager = 
 {
-    /*classInfo=*/ {
-        /*size=*/               sizeof(KernelMIGManager),
-        /*classId=*/            classId(KernelMIGManager),
-        /*providerId=*/         &__nvoc_rtti_provider,
+    .classInfo.size =               sizeof(KernelMIGManager),
+    .classInfo.classId =            classId(KernelMIGManager),
+    .classInfo.providerId =         &__nvoc_rtti_provider,
 #if NV_PRINTF_STRINGS_ALLOWED
-        /*name=*/               "KernelMIGManager",
+    .classInfo.name =               "KernelMIGManager",
 #endif
-    },
-    /*objCreatefn=*/        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_KernelMIGManager,
-    /*pCastInfo=*/          &__nvoc_castinfo__KernelMIGManager,
-    /*pExportInfo=*/        &__nvoc_export_info__KernelMIGManager
+    .objCreatefn =        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_KernelMIGManager,
+    .pCastInfo =          &__nvoc_castinfo__KernelMIGManager,
+    .pExportInfo =        &__nvoc_export_info__KernelMIGManager
 };
 
 
@@ -200,23 +199,31 @@ NvBool __nvoc_up_thunk_OBJENGSTATE_kmigmgrIsPresent(struct OBJGPU *pGpu, struct 
 
 const struct NVOC_EXPORT_INFO __nvoc_export_info__KernelMIGManager = 
 {
-    /*numEntries=*/     0,
-    /*pExportEntries=*/  0
+    .numEntries=     0,
+    .pExportEntries= 0
 };
 
+
+// Destruct KernelMIGManager object.
+void __nvoc_kmigmgrDestruct(KernelMIGManager*);
 void __nvoc_dtor_OBJENGSTATE(OBJENGSTATE*);
-void __nvoc_dtor_KernelMIGManager(KernelMIGManager *pThis) {
+void __nvoc_dtor_KernelMIGManager(KernelMIGManager* pThis) {
+
+// Call destructor.
     __nvoc_kmigmgrDestruct(pThis);
+
+// Recurse to superclass destructors.
     __nvoc_dtor_OBJENGSTATE(&pThis->__nvoc_base_OBJENGSTATE);
+
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
-
-void __nvoc_init_dataField_KernelMIGManager(KernelMIGManager *pThis, RmHalspecOwner *pRmhalspecowner) {
-    ChipHal *chipHal = &pRmhalspecowner->chipHal;
+void __nvoc_init_dataField_KernelMIGManager(KernelMIGManager *pThis, GpuHalspecOwner *pGpuhalspecowner, RmHalspecOwner *pRmhalspecowner) {
+    ChipHal *chipHal = &pGpuhalspecowner->chipHal;
     const unsigned long chipHal_HalVarIdx = (unsigned long)chipHal->__nvoc_HalVarIdx;
     RmVariantHal *rmVariantHal = &pRmhalspecowner->rmVariantHal;
     const unsigned long rmVariantHal_HalVarIdx = (unsigned long)rmVariantHal->__nvoc_HalVarIdx;
     PORT_UNREFERENCED_VARIABLE(pThis);
+    PORT_UNREFERENCED_VARIABLE(pGpuhalspecowner);
     PORT_UNREFERENCED_VARIABLE(pRmhalspecowner);
     PORT_UNREFERENCED_VARIABLE(chipHal);
     PORT_UNREFERENCED_VARIABLE(chipHal_HalVarIdx);
@@ -224,33 +231,45 @@ void __nvoc_init_dataField_KernelMIGManager(KernelMIGManager *pThis, RmHalspecOw
     PORT_UNREFERENCED_VARIABLE(rmVariantHal_HalVarIdx);
 
     // NVOC Property Hal field -- PDB_PROP_KMIGMGR_IS_MISSING
+    if (( ((chipHal_HalVarIdx >> 5) == 3UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x0000a000UL) )) /* ChipHal: T234D | T264D */ 
+    {
+        pThis->setProperty(pThis, PDB_PROP_KMIGMGR_IS_MISSING, NV_TRUE);
+    }
     // default
+    else
     {
         pThis->setProperty(pThis, PDB_PROP_KMIGMGR_IS_MISSING, NV_FALSE);
     }
 }
 
-NV_STATUS __nvoc_ctor_OBJENGSTATE(OBJENGSTATE* );
-NV_STATUS __nvoc_ctor_KernelMIGManager(KernelMIGManager *pThis, RmHalspecOwner *pRmhalspecowner) {
+
+// Construct KernelMIGManager object.
+NV_STATUS __nvoc_ctor_OBJENGSTATE(OBJENGSTATE *);
+NV_STATUS __nvoc_ctor_KernelMIGManager(KernelMIGManager *pThis, GpuHalspecOwner *pGpuhalspecowner, RmHalspecOwner *pRmhalspecowner) {
     NV_STATUS status = NV_OK;
+
+    // Recurse to ancestor constructor(s).
     status = __nvoc_ctor_OBJENGSTATE(&pThis->__nvoc_base_OBJENGSTATE);
     if (status != NV_OK) goto __nvoc_ctor_KernelMIGManager_fail_OBJENGSTATE;
-    __nvoc_init_dataField_KernelMIGManager(pThis, pRmhalspecowner);
+
+    // Initialize data fields.
+    __nvoc_init_dataField_KernelMIGManager(pThis, pGpuhalspecowner, pRmhalspecowner);
     goto __nvoc_ctor_KernelMIGManager_exit; // Success
 
+    // Unwind on error.
 __nvoc_ctor_KernelMIGManager_fail_OBJENGSTATE:
 __nvoc_ctor_KernelMIGManager_exit:
-
     return status;
 }
 
 // Vtable initialization
-static void __nvoc_init_funcTable_KernelMIGManager_1(KernelMIGManager *pThis, RmHalspecOwner *pRmhalspecowner) {
-    ChipHal *chipHal = &pRmhalspecowner->chipHal;
+static void __nvoc_init_funcTable_KernelMIGManager_1(KernelMIGManager *pThis, GpuHalspecOwner *pGpuhalspecowner, RmHalspecOwner *pRmhalspecowner) {
+    ChipHal *chipHal = &pGpuhalspecowner->chipHal;
     const unsigned long chipHal_HalVarIdx = (unsigned long)chipHal->__nvoc_HalVarIdx;
     RmVariantHal *rmVariantHal = &pRmhalspecowner->rmVariantHal;
     const unsigned long rmVariantHal_HalVarIdx = (unsigned long)rmVariantHal->__nvoc_HalVarIdx;
     PORT_UNREFERENCED_VARIABLE(pThis);
+    PORT_UNREFERENCED_VARIABLE(pGpuhalspecowner);
     PORT_UNREFERENCED_VARIABLE(pRmhalspecowner);
     PORT_UNREFERENCED_VARIABLE(chipHal);
     PORT_UNREFERENCED_VARIABLE(chipHal_HalVarIdx);
@@ -287,57 +306,57 @@ static void __nvoc_init_funcTable_KernelMIGManager_1(KernelMIGManager *pThis, Rm
         pThis->__kmigmgrLoadStaticInfo__ = &kmigmgrLoadStaticInfo_KERNEL;
     }
 
-    // kmigmgrSetStaticInfo -- halified (2 hals)
+    // kmigmgrSetStaticInfo -- halified (2 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
         pThis->__kmigmgrSetStaticInfo__ = &kmigmgrSetStaticInfo_VF;
     }
     else
     {
-        pThis->__kmigmgrSetStaticInfo__ = &kmigmgrSetStaticInfo_46f6a7;
+        pThis->__kmigmgrSetStaticInfo__ = &kmigmgrSetStaticInfo_395e98;
     }
 
-    // kmigmgrClearStaticInfo -- halified (2 hals)
+    // kmigmgrClearStaticInfo -- halified (2 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
         pThis->__kmigmgrClearStaticInfo__ = &kmigmgrClearStaticInfo_VF;
     }
     else
     {
-        pThis->__kmigmgrClearStaticInfo__ = &kmigmgrClearStaticInfo_b3696a;
+        pThis->__kmigmgrClearStaticInfo__ = &kmigmgrClearStaticInfo_d44104;
     }
 
-    // kmigmgrSaveToPersistenceFromVgpuStaticInfo -- halified (2 hals)
+    // kmigmgrSaveToPersistenceFromVgpuStaticInfo -- halified (2 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
         pThis->__kmigmgrSaveToPersistenceFromVgpuStaticInfo__ = &kmigmgrSaveToPersistenceFromVgpuStaticInfo_VF;
     }
     else
     {
-        pThis->__kmigmgrSaveToPersistenceFromVgpuStaticInfo__ = &kmigmgrSaveToPersistenceFromVgpuStaticInfo_46f6a7;
+        pThis->__kmigmgrSaveToPersistenceFromVgpuStaticInfo__ = &kmigmgrSaveToPersistenceFromVgpuStaticInfo_395e98;
     }
 
-    // kmigmgrDeleteGPUInstanceRunlists -- halified (2 hals)
+    // kmigmgrDeleteGPUInstanceRunlists -- halified (2 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
-        pThis->__kmigmgrDeleteGPUInstanceRunlists__ = &kmigmgrDeleteGPUInstanceRunlists_56cd7a;
+        pThis->__kmigmgrDeleteGPUInstanceRunlists__ = &kmigmgrDeleteGPUInstanceRunlists_ac1694;
     }
     else
     {
         pThis->__kmigmgrDeleteGPUInstanceRunlists__ = &kmigmgrDeleteGPUInstanceRunlists_FWCLIENT;
     }
 
-    // kmigmgrCreateGPUInstanceRunlists -- halified (2 hals)
+    // kmigmgrCreateGPUInstanceRunlists -- halified (2 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
-        pThis->__kmigmgrCreateGPUInstanceRunlists__ = &kmigmgrCreateGPUInstanceRunlists_56cd7a;
+        pThis->__kmigmgrCreateGPUInstanceRunlists__ = &kmigmgrCreateGPUInstanceRunlists_ac1694;
     }
     else
     {
         pThis->__kmigmgrCreateGPUInstanceRunlists__ = &kmigmgrCreateGPUInstanceRunlists_FWCLIENT;
     }
 
-    // kmigmgrRestoreFromPersistence -- halified (2 hals)
+    // kmigmgrRestoreFromPersistence -- halified (2 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
         pThis->__kmigmgrRestoreFromPersistence__ = &kmigmgrRestoreFromPersistence_VF;
@@ -347,21 +366,69 @@ static void __nvoc_init_funcTable_KernelMIGManager_1(KernelMIGManager *pThis, Rm
         pThis->__kmigmgrRestoreFromPersistence__ = &kmigmgrRestoreFromPersistence_PF;
     }
 
-    // kmigmgrCreateGPUInstanceCheck -- halified (3 hals)
-    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x80000000UL) )) /* ChipHal: GB10B */ 
+    // kmigmgrApplyDefaultCeMappings -- halified (2 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0xbc000000UL) ) ||
+        ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* ChipHal: GH100 | GB100 | GB102 | GB10B | GB110 | GB112 */ 
+    {
+        pThis->__kmigmgrApplyDefaultCeMappings__ = &kmigmgrApplyDefaultCeMappings_GH100;
+    }
+    // default
+    else
+    {
+        pThis->__kmigmgrApplyDefaultCeMappings__ = &kmigmgrApplyDefaultCeMappings_d44104;
+    }
+
+    // kmigmgrClearMIGGpuInstanceCeMapping -- halified (2 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x9c000000UL) ) ||
+        ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* ChipHal: GH100 | GB100 | GB102 | GB110 | GB112 */ 
+    {
+        pThis->__kmigmgrClearMIGGpuInstanceCeMapping__ = &kmigmgrClearMIGGpuInstanceCeMapping_GH100;
+    }
+    // default
+    else
+    {
+        pThis->__kmigmgrClearMIGGpuInstanceCeMapping__ = &kmigmgrClearMIGGpuInstanceCeMapping_ac1694;
+    }
+
+    // kmigmgrApplyMIGGpuInstanceCeMapping -- halified (2 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x9c000000UL) ) ||
+        ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* ChipHal: GH100 | GB100 | GB102 | GB110 | GB112 */ 
+    {
+        pThis->__kmigmgrApplyMIGGpuInstanceCeMapping__ = &kmigmgrApplyMIGGpuInstanceCeMapping_GH100;
+    }
+    // default
+    else
+    {
+        pThis->__kmigmgrApplyMIGGpuInstanceCeMapping__ = &kmigmgrApplyMIGGpuInstanceCeMapping_ac1694;
+    }
+
+    // kmigmgrCreateGPUInstanceCheck -- halified (3 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x20000000UL) )) /* ChipHal: GB10B */ 
     {
         pThis->__kmigmgrCreateGPUInstanceCheck__ = &kmigmgrCreateGPUInstanceCheck_GB10B;
     }
-    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x01f0fbe0UL) )) /* ChipHal: TU102 | TU104 | TU106 | TU116 | TU117 | GA102 | GA103 | GA104 | GA106 | GA107 | AD102 | AD103 | AD104 | AD106 | AD107 */ 
-    {
-        pThis->__kmigmgrCreateGPUInstanceCheck__ = &kmigmgrCreateGPUInstanceCheck_46f6a7;
-    }
-    else
+    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x9c000400UL) ) ||
+             ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000003f9UL) )) /* ChipHal: GA100 | GH100 | GB100 | GB102 | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C */ 
     {
         pThis->__kmigmgrCreateGPUInstanceCheck__ = &kmigmgrCreateGPUInstanceCheck_GA100;
     }
+    else
+    {
+        pThis->__kmigmgrCreateGPUInstanceCheck__ = &kmigmgrCreateGPUInstanceCheck_395e98;
+    }
 
-    // kmigmgrIsDevinitMIGBitSet -- halified (3 hals)
+    // kmigmgrPatchCICapacity -- halified (2 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x20000000UL) )) /* ChipHal: GB10B */ 
+    {
+        pThis->__kmigmgrPatchCICapacity__ = &kmigmgrPatchCICapacity_GB10B;
+    }
+    // default
+    else
+    {
+        pThis->__kmigmgrPatchCICapacity__ = &kmigmgrPatchCICapacity_ac1694;
+    }
+
+    // kmigmgrIsDevinitMIGBitSet -- halified (3 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
         pThis->__kmigmgrIsDevinitMIGBitSet__ = &kmigmgrIsDevinitMIGBitSet_VF;
@@ -375,11 +442,22 @@ static void __nvoc_init_funcTable_KernelMIGManager_1(KernelMIGManager *pThis, Rm
         // default
         else
         {
-            pThis->__kmigmgrIsDevinitMIGBitSet__ = &kmigmgrIsDevinitMIGBitSet_3dd2c9;
+            pThis->__kmigmgrIsDevinitMIGBitSet__ = &kmigmgrIsDevinitMIGBitSet_d69453;
         }
     }
 
-    // kmigmgrDetectReducedConfig -- halified (2 hals)
+    // kmigmgrConfigurePMSettings -- halified (2 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x20000000UL) )) /* ChipHal: GB10B */ 
+    {
+        pThis->__kmigmgrConfigurePMSettings__ = &kmigmgrConfigurePMSettings_GB10B;
+    }
+    // default
+    else
+    {
+        pThis->__kmigmgrConfigurePMSettings__ = &kmigmgrConfigurePMSettings_ac1694;
+    }
+
+    // kmigmgrDetectReducedConfig -- halified (2 hals) body
     if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x00000400UL) )) /* ChipHal: GA100 */ 
     {
         pThis->__kmigmgrDetectReducedConfig__ = &kmigmgrDetectReducedConfig_GA100;
@@ -387,62 +465,73 @@ static void __nvoc_init_funcTable_KernelMIGManager_1(KernelMIGManager *pThis, Rm
     // default
     else
     {
-        pThis->__kmigmgrDetectReducedConfig__ = &kmigmgrDetectReducedConfig_b3696a;
+        pThis->__kmigmgrDetectReducedConfig__ = &kmigmgrDetectReducedConfig_d44104;
     }
 
-    // kmigmgrIsGPUInstanceCombinationValid -- halified (5 hals)
+    // kmigmgrIsGPUInstanceCombinationValid -- halified (5 hals) body
     if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x00000400UL) )) /* ChipHal: GA100 */ 
     {
         pThis->__kmigmgrIsGPUInstanceCombinationValid__ = &kmigmgrIsGPUInstanceCombinationValid_GA100;
     }
-    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x80000000UL) )) /* ChipHal: GB10B */ 
+    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x20000000UL) )) /* ChipHal: GB10B */ 
     {
         pThis->__kmigmgrIsGPUInstanceCombinationValid__ = &kmigmgrIsGPUInstanceCombinationValid_GB10B;
     }
-    else if (( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000007e0UL) )) /* ChipHal: GB202 | GB203 | GB205 | GB206 | GB207 | GB20B */ 
+    else if (( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000003f8UL) )) /* ChipHal: GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C */ 
     {
         pThis->__kmigmgrIsGPUInstanceCombinationValid__ = &kmigmgrIsGPUInstanceCombinationValid_GB202;
     }
-    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x70000000UL) ) ||
-             ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x00000006UL) )) /* ChipHal: GH100 | GB100 | GB102 | GB110 | GB112 */ 
+    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x9c000000UL) ) ||
+             ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* ChipHal: GH100 | GB100 | GB102 | GB110 | GB112 */ 
     {
         pThis->__kmigmgrIsGPUInstanceCombinationValid__ = &kmigmgrIsGPUInstanceCombinationValid_GH100;
     }
     // default
     else
     {
-        pThis->__kmigmgrIsGPUInstanceCombinationValid__ = &kmigmgrIsGPUInstanceCombinationValid_3dd2c9;
+        pThis->__kmigmgrIsGPUInstanceCombinationValid__ = &kmigmgrIsGPUInstanceCombinationValid_d69453;
     }
 
-    // kmigmgrIsGPUInstanceFlagValid -- halified (6 hals)
+    // kmigmgrIsGPUInstanceFlagValid -- halified (6 hals) body
     if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x00000400UL) )) /* ChipHal: GA100 */ 
     {
         pThis->__kmigmgrIsGPUInstanceFlagValid__ = &kmigmgrIsGPUInstanceFlagValid_GA100;
     }
-    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x10000000UL) )) /* ChipHal: GH100 */ 
+    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x04000000UL) )) /* ChipHal: GH100 */ 
     {
         pThis->__kmigmgrIsGPUInstanceFlagValid__ = &kmigmgrIsGPUInstanceFlagValid_GH100;
     }
-    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x80000000UL) )) /* ChipHal: GB10B */ 
+    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x20000000UL) )) /* ChipHal: GB10B */ 
     {
         pThis->__kmigmgrIsGPUInstanceFlagValid__ = &kmigmgrIsGPUInstanceFlagValid_GB10B;
     }
-    else if (( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000007e0UL) )) /* ChipHal: GB202 | GB203 | GB205 | GB206 | GB207 | GB20B */ 
+    else if (( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000003f8UL) )) /* ChipHal: GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C */ 
     {
         pThis->__kmigmgrIsGPUInstanceFlagValid__ = &kmigmgrIsGPUInstanceFlagValid_GB202;
     }
-    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x60000000UL) ) ||
-             ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x00000006UL) )) /* ChipHal: GB100 | GB102 | GB110 | GB112 */ 
+    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x98000000UL) ) ||
+             ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* ChipHal: GB100 | GB102 | GB110 | GB112 */ 
     {
         pThis->__kmigmgrIsGPUInstanceFlagValid__ = &kmigmgrIsGPUInstanceFlagValid_GB100;
     }
     // default
     else
     {
-        pThis->__kmigmgrIsGPUInstanceFlagValid__ = &kmigmgrIsGPUInstanceFlagValid_3dd2c9;
+        pThis->__kmigmgrIsGPUInstanceFlagValid__ = &kmigmgrIsGPUInstanceFlagValid_d69453;
     }
 
-    // kmigmgrGenerateComputeInstanceUuid -- halified (2 hals)
+    // kmigmgrGpuInstanceSupportVgpuTimeslice -- halified (2 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000003f8UL) )) /* ChipHal: GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C */ 
+    {
+        pThis->__kmigmgrGpuInstanceSupportVgpuTimeslice__ = &kmigmgrGpuInstanceSupportVgpuTimeslice_GB202;
+    }
+    // default
+    else
+    {
+        pThis->__kmigmgrGpuInstanceSupportVgpuTimeslice__ = &kmigmgrGpuInstanceSupportVgpuTimeslice_d69453;
+    }
+
+    // kmigmgrGenerateComputeInstanceUuid -- halified (2 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
         pThis->__kmigmgrGenerateComputeInstanceUuid__ = &kmigmgrGenerateComputeInstanceUuid_VF;
@@ -453,7 +542,7 @@ static void __nvoc_init_funcTable_KernelMIGManager_1(KernelMIGManager *pThis, Rm
         pThis->__kmigmgrGenerateComputeInstanceUuid__ = &kmigmgrGenerateComputeInstanceUuid_5baef9;
     }
 
-    // kmigmgrGenerateGPUInstanceUuid -- halified (2 hals)
+    // kmigmgrGenerateGPUInstanceUuid -- halified (2 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
         pThis->__kmigmgrGenerateGPUInstanceUuid__ = &kmigmgrGenerateGPUInstanceUuid_VF;
@@ -464,7 +553,7 @@ static void __nvoc_init_funcTable_KernelMIGManager_1(KernelMIGManager *pThis, Rm
         pThis->__kmigmgrGenerateGPUInstanceUuid__ = &kmigmgrGenerateGPUInstanceUuid_5baef9;
     }
 
-    // kmigmgrCreateComputeInstances -- halified (2 hals)
+    // kmigmgrCreateComputeInstances -- halified (2 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
         pThis->__kmigmgrCreateComputeInstances__ = &kmigmgrCreateComputeInstances_VF;
@@ -474,70 +563,89 @@ static void __nvoc_init_funcTable_KernelMIGManager_1(KernelMIGManager *pThis, Rm
         pThis->__kmigmgrCreateComputeInstances__ = &kmigmgrCreateComputeInstances_FWCLIENT;
     }
 
-    // kmigmgrIsMemoryPartitioningRequested -- halified (2 hals)
-    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x81f0fbe0UL) )) /* ChipHal: TU102 | TU104 | TU106 | TU116 | TU117 | GA102 | GA103 | GA104 | GA106 | GA107 | AD102 | AD103 | AD104 | AD106 | AD107 | GB10B */ 
-    {
-        pThis->__kmigmgrIsMemoryPartitioningRequested__ = &kmigmgrIsMemoryPartitioningRequested_3dd2c9;
-    }
-    else
+    // kmigmgrIsMemoryPartitioningRequested -- halified (2 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x9c000400UL) ) ||
+        ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000003f9UL) )) /* ChipHal: GA100 | GH100 | GB100 | GB102 | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C */ 
     {
         pThis->__kmigmgrIsMemoryPartitioningRequested__ = &kmigmgrIsMemoryPartitioningRequested_GA100;
     }
-
-    // kmigmgrIsMemoryPartitioningNeeded -- halified (2 hals)
-    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x81f0fbe0UL) )) /* ChipHal: TU102 | TU104 | TU106 | TU116 | TU117 | GA102 | GA103 | GA104 | GA106 | GA107 | AD102 | AD103 | AD104 | AD106 | AD107 | GB10B */ 
-    {
-        pThis->__kmigmgrIsMemoryPartitioningNeeded__ = &kmigmgrIsMemoryPartitioningNeeded_3dd2c9;
-    }
     else
+    {
+        pThis->__kmigmgrIsMemoryPartitioningRequested__ = &kmigmgrIsMemoryPartitioningRequested_d69453;
+    }
+
+    // kmigmgrIsMemoryPartitioningNeeded -- halified (2 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x9c000400UL) ) ||
+        ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000003f9UL) )) /* ChipHal: GA100 | GH100 | GB100 | GB102 | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C */ 
     {
         pThis->__kmigmgrIsMemoryPartitioningNeeded__ = &kmigmgrIsMemoryPartitioningNeeded_GA100;
     }
+    else
+    {
+        pThis->__kmigmgrIsMemoryPartitioningNeeded__ = &kmigmgrIsMemoryPartitioningNeeded_d69453;
+    }
 
-    // kmigmgrIsGfxCapabilitesRequested -- halified (2 hals)
-    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0xe0000000UL) ) ||
-        ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000007e6UL) )) /* ChipHal: GB100 | GB102 | GB10B | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GB20B */ 
+    // kmigmgrIsGfxCapabilitesRequested -- halified (2 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0xb8000000UL) ) ||
+        ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000003f9UL) )) /* ChipHal: GB100 | GB102 | GB10B | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C */ 
     {
         pThis->__kmigmgrIsGfxCapabilitesRequested__ = &kmigmgrIsGfxCapabilitesRequested_GB100;
     }
     // default
     else
     {
-        pThis->__kmigmgrIsGfxCapabilitesRequested__ = &kmigmgrIsGfxCapabilitesRequested_3dd2c9;
+        pThis->__kmigmgrIsGfxCapabilitesRequested__ = &kmigmgrIsGfxCapabilitesRequested_d69453;
     }
 
-    // kmigmgrMemSizeFlagToSwizzIdRange -- halified (3 hals)
+    // kmigmgrMemSizeFlagToSwizzIdRange -- halified (3 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
-        pThis->__kmigmgrMemSizeFlagToSwizzIdRange__ = &kmigmgrMemSizeFlagToSwizzIdRange_d64cd6;
+        pThis->__kmigmgrMemSizeFlagToSwizzIdRange__ = &kmigmgrMemSizeFlagToSwizzIdRange_e30f0e;
     }
     else
     {
-        if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x01f0fbe0UL) )) /* ChipHal: TU102 | TU104 | TU106 | TU116 | TU117 | GA102 | GA103 | GA104 | GA106 | GA107 | AD102 | AD103 | AD104 | AD106 | AD107 */ 
-        {
-            pThis->__kmigmgrMemSizeFlagToSwizzIdRange__ = &kmigmgrMemSizeFlagToSwizzIdRange_d64cd6;
-        }
-        else
+        if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0xbc000400UL) ) ||
+            ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000003f9UL) )) /* ChipHal: GA100 | GH100 | GB100 | GB102 | GB10B | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C */ 
         {
             pThis->__kmigmgrMemSizeFlagToSwizzIdRange__ = &kmigmgrMemSizeFlagToSwizzIdRange_GA100;
         }
+        else
+        {
+            pThis->__kmigmgrMemSizeFlagToSwizzIdRange__ = &kmigmgrMemSizeFlagToSwizzIdRange_e30f0e;
+        }
     }
 
-    // kmigmgrSwizzIdToSpan -- halified (3 hals)
-    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x80000000UL) )) /* ChipHal: GB10B */ 
+    // kmigmgrSwizzIdToSpan -- halified (3 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x20000000UL) )) /* ChipHal: GB10B */ 
     {
         pThis->__kmigmgrSwizzIdToSpan__ = &kmigmgrSwizzIdToSpan_GB10B;
     }
-    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x01f0fbe0UL) )) /* ChipHal: TU102 | TU104 | TU106 | TU116 | TU117 | GA102 | GA103 | GA104 | GA106 | GA107 | AD102 | AD103 | AD104 | AD106 | AD107 */ 
-    {
-        pThis->__kmigmgrSwizzIdToSpan__ = &kmigmgrSwizzIdToSpan_d64cd6;
-    }
-    else
+    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x9c000400UL) ) ||
+             ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000003f9UL) )) /* ChipHal: GA100 | GH100 | GB100 | GB102 | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C */ 
     {
         pThis->__kmigmgrSwizzIdToSpan__ = &kmigmgrSwizzIdToSpan_GA100;
     }
+    else
+    {
+        pThis->__kmigmgrSwizzIdToSpan__ = &kmigmgrSwizzIdToSpan_e30f0e;
+    }
 
-    // kmigmgrSetMIGState -- halified (2 hals)
+    // kmigmgrSwizzIdToGrSpan -- halified (3 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x20000000UL) )) /* ChipHal: GB10B */ 
+    {
+        pThis->__kmigmgrSwizzIdToGrSpan__ = &kmigmgrSwizzIdToGrSpan_GB10B;
+    }
+    else if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x9c000400UL) ) ||
+             ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000003f9UL) )) /* ChipHal: GA100 | GH100 | GB100 | GB102 | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C */ 
+    {
+        pThis->__kmigmgrSwizzIdToGrSpan__ = &kmigmgrSwizzIdToGrSpan_GA100;
+    }
+    else
+    {
+        pThis->__kmigmgrSwizzIdToGrSpan__ = &kmigmgrSwizzIdToGrSpan_e30f0e;
+    }
+
+    // kmigmgrSetMIGState -- halified (2 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
         pThis->__kmigmgrSetMIGState__ = &kmigmgrSetMIGState_VF;
@@ -547,19 +655,8 @@ static void __nvoc_init_funcTable_KernelMIGManager_1(KernelMIGManager *pThis, Rm
         pThis->__kmigmgrSetMIGState__ = &kmigmgrSetMIGState_FWCLIENT;
     }
 
-    // kmigmgrGetNextComputeSize -- halified (2 hals)
-    if (( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000007e0UL) )) /* ChipHal: GB202 | GB203 | GB205 | GB206 | GB207 | GB20B */ 
-    {
-        pThis->__kmigmgrGetNextComputeSize__ = &kmigmgrGetNextComputeSize_GB202;
-    }
-    // default
-    else
-    {
-        pThis->__kmigmgrGetNextComputeSize__ = &kmigmgrGetNextComputeSize_IMPL;
-    }
-
     // kmigmgrGetComputeProfileFromGpcCount -- halified (2 hals)
-    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x80000000UL) )) /* ChipHal: GB10B */ 
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x20000000UL) )) /* ChipHal: GB10B */ 
     {
         pThis->__kmigmgrGetComputeProfileFromGpcCount__ = &kmigmgrGetComputeProfileFromGpcCount_GB10B;
     }
@@ -569,11 +666,11 @@ static void __nvoc_init_funcTable_KernelMIGManager_1(KernelMIGManager *pThis, Rm
         pThis->__kmigmgrGetComputeProfileFromGpcCount__ = &kmigmgrGetComputeProfileFromGpcCount_IMPL;
     }
 
-    // kmigmgrIsCTSAlignmentRequired -- halified (3 hals)
-    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x60000000UL) ) ||
-        ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000007e6UL) )) /* ChipHal: GB100 | GB102 | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GB20B */ 
+    // kmigmgrIsCTSAlignmentRequired -- halified (3 hals) body
+    if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x98000000UL) ) ||
+        ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000003f9UL) )) /* ChipHal: GB100 | GB102 | GB110 | GB112 | GB202 | GB203 | GB205 | GB206 | GB207 | GB20B | GB20C */ 
     {
-        pThis->__kmigmgrIsCTSAlignmentRequired__ = &kmigmgrIsCTSAlignmentRequired_88bc07;
+        pThis->__kmigmgrIsCTSAlignmentRequired__ = &kmigmgrIsCTSAlignmentRequired_e661f0;
     }
     // default
     else
@@ -591,24 +688,24 @@ static void __nvoc_init_funcTable_KernelMIGManager_1(KernelMIGManager *pThis, Rm
     // kmigmgrRestoreFromBootConfig -- halified (2 hals) body
     if (( ((rmVariantHal_HalVarIdx >> 5) == 0UL) && ((1UL << (rmVariantHal_HalVarIdx & 0x1f)) & 0x00000001UL) )) /* RmVariantHal: VF */ 
     {
-        pThis->__kmigmgrRestoreFromBootConfig__ = &kmigmgrRestoreFromBootConfig_56cd7a;
+        pThis->__kmigmgrRestoreFromBootConfig__ = &kmigmgrRestoreFromBootConfig_ac1694;
     }
     else
     {
         pThis->__kmigmgrRestoreFromBootConfig__ = &kmigmgrRestoreFromBootConfig_PF;
     }
-} // End __nvoc_init_funcTable_KernelMIGManager_1 with approximately 66 basic block(s).
+} // End __nvoc_init_funcTable_KernelMIGManager_1 with approximately 79 basic block(s).
 
 
-// Initialize vtable(s) for 41 virtual method(s).
-void __nvoc_init_funcTable_KernelMIGManager(KernelMIGManager *pThis, RmHalspecOwner *pRmhalspecowner) {
+// Initialize vtable(s) for 47 virtual method(s).
+void __nvoc_init_funcTable_KernelMIGManager(KernelMIGManager *pThis, GpuHalspecOwner *pGpuhalspecowner, RmHalspecOwner *pRmhalspecowner) {
 
-    // Initialize vtable(s) with 27 per-object function pointer(s).
-    __nvoc_init_funcTable_KernelMIGManager_1(pThis, pRmhalspecowner);
+    // Initialize vtable(s) with 33 per-object function pointer(s).
+    __nvoc_init_funcTable_KernelMIGManager_1(pThis, pGpuhalspecowner, pRmhalspecowner);
 }
 
 // Initialize newly constructed object.
-void __nvoc_init__KernelMIGManager(KernelMIGManager *pThis, RmHalspecOwner *pRmhalspecowner) {
+void __nvoc_init__KernelMIGManager(KernelMIGManager *pThis, GpuHalspecOwner *pGpuhalspecowner, RmHalspecOwner *pRmhalspecowner) {
 
     // Initialize pointers to inherited data.
     pThis->__nvoc_pbase_Object = &pThis->__nvoc_base_OBJENGSTATE.__nvoc_base_Object;    // (obj) super^2
@@ -624,77 +721,96 @@ void __nvoc_init__KernelMIGManager(KernelMIGManager *pThis, RmHalspecOwner *pRmh
     pThis->__nvoc_metadata_ptr = &__nvoc_metadata__KernelMIGManager;    // (kmigmgr) this
 
     // Initialize per-object vtables.
-    __nvoc_init_funcTable_KernelMIGManager(pThis, pRmhalspecowner);
+    __nvoc_init_funcTable_KernelMIGManager(pThis, pGpuhalspecowner, pRmhalspecowner);
 }
 
-NV_STATUS __nvoc_objCreate_KernelMIGManager(KernelMIGManager **ppThis, Dynamic *pParent, NvU32 createFlags)
+NV_STATUS __nvoc_objCreate_KernelMIGManager(KernelMIGManager **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags)
 {
-    NV_STATUS status;
-    Object *pParentObj = NULL;
-    KernelMIGManager *pThis;
+    NV_STATUS __nvoc_status;
+    Object *__nvoc_pParentObj = NULL;
+    KernelMIGManager *__nvoc_pThis;
+    GpuHalspecOwner *pGpuhalspecowner;
     RmHalspecOwner *pRmhalspecowner;
 
-    // Assign `pThis`, allocating memory unless suppressed by flag.
-    status = __nvoc_handleObjCreateMemAlloc(createFlags, sizeof(KernelMIGManager), (void**)&pThis, (void**)ppThis);
-    if (status != NV_OK)
-        return status;
+    // Don't allocate memory if the caller has already done so.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+    {
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_ppThis != NULL && *__nvoc_ppThis != NULL, NV_ERR_INVALID_PARAMETER);
+        __nvoc_pThis = *__nvoc_ppThis;
+    }
+
+    // Allocate memory
+    else
+    {
+        __nvoc_pThis = portMemAllocNonPaged(sizeof(KernelMIGManager));
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_pThis != NULL, NV_ERR_NO_MEMORY);
+    }
 
     // Zero is the initial value for everything.
-    portMemSet(pThis, 0, sizeof(KernelMIGManager));
+    portMemSet(__nvoc_pThis, 0, sizeof(KernelMIGManager));
 
-    pThis->__nvoc_base_OBJENGSTATE.__nvoc_base_Object.createFlags = createFlags;
+    __nvoc_pThis->__nvoc_base_OBJENGSTATE.__nvoc_base_Object.createFlags = __nvoc_createFlags;
 
     // pParent must be a valid object that derives from a halspec owner class.
-    NV_ASSERT_OR_RETURN(pParent != NULL, NV_ERR_INVALID_ARGUMENT);
+    NV_CHECK_TRUE_OR_GOTO(__nvoc_status, LEVEL_ERROR, __nvoc_pParent != NULL, NV_ERR_INVALID_ARGUMENT, __nvoc_objCreate_KernelMIGManager_cleanup);
 
     // Link the child into the parent unless flagged not to do so.
-    if (!(createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
+    if (!(__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
     {
-        pParentObj = dynamicCast(pParent, Object);
-        objAddChild(pParentObj, &pThis->__nvoc_base_OBJENGSTATE.__nvoc_base_Object);
+        __nvoc_pParentObj = dynamicCast(__nvoc_pParent, Object);
+        objAddChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_OBJENGSTATE.__nvoc_base_Object);
     }
     else
     {
-        pThis->__nvoc_base_OBJENGSTATE.__nvoc_base_Object.pParent = NULL;
+        __nvoc_pThis->__nvoc_base_OBJENGSTATE.__nvoc_base_Object.pParent = NULL;
     }
 
-    if ((pRmhalspecowner = dynamicCast(pParent, RmHalspecOwner)) == NULL)
-        pRmhalspecowner = objFindAncestorOfType(RmHalspecOwner, pParent);
-    NV_ASSERT_OR_RETURN(pRmhalspecowner != NULL, NV_ERR_INVALID_ARGUMENT);
+    // HALs are defined by the parent or the first super class.
+    if ((pGpuhalspecowner = dynamicCast(__nvoc_pParent, GpuHalspecOwner)) == NULL)
+        pGpuhalspecowner = objFindAncestorOfType(GpuHalspecOwner, __nvoc_pParent);
+    NV_CHECK_TRUE_OR_GOTO(__nvoc_status, LEVEL_ERROR, pGpuhalspecowner != NULL, NV_ERR_INVALID_ARGUMENT, __nvoc_objCreate_KernelMIGManager_cleanup);
+    if ((pRmhalspecowner = dynamicCast(__nvoc_pParent, RmHalspecOwner)) == NULL)
+        pRmhalspecowner = objFindAncestorOfType(RmHalspecOwner, __nvoc_pParent);
+    NV_CHECK_TRUE_OR_GOTO(__nvoc_status, LEVEL_ERROR, pRmhalspecowner != NULL, NV_ERR_INVALID_ARGUMENT, __nvoc_objCreate_KernelMIGManager_cleanup);
 
-    __nvoc_init__KernelMIGManager(pThis, pRmhalspecowner);
-    status = __nvoc_ctor_KernelMIGManager(pThis, pRmhalspecowner);
-    if (status != NV_OK) goto __nvoc_objCreate_KernelMIGManager_cleanup;
+    // Initialize vtable, RTTI, etc., then call constructor.
+    __nvoc_init__KernelMIGManager(__nvoc_pThis, pGpuhalspecowner, pRmhalspecowner);
+    __nvoc_status = __nvoc_ctor_KernelMIGManager(__nvoc_pThis, pGpuhalspecowner, pRmhalspecowner);
+    if (__nvoc_status != NV_OK) goto __nvoc_objCreate_KernelMIGManager_cleanup;
 
     // Assignment has no effect if NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT is set.
-    *ppThis = pThis;
+    *__nvoc_ppThis = __nvoc_pThis;
 
+    // Success
     return NV_OK;
 
+    // Do not call destructors here since the constructor already called them.
 __nvoc_objCreate_KernelMIGManager_cleanup:
 
     // Unlink the child from the parent if it was linked above.
-    if (pParentObj != NULL)
-        objRemoveChild(pParentObj, &pThis->__nvoc_base_OBJENGSTATE.__nvoc_base_Object);
+    if (__nvoc_pParentObj != NULL)
+        objRemoveChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_OBJENGSTATE.__nvoc_base_Object);
 
-    // Do not call destructors here since the constructor already called them.
-    if (createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
-        portMemSet(pThis, 0, sizeof(KernelMIGManager));
+    // Zero out memory that was allocated by caller.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+        portMemSet(__nvoc_pThis, 0, sizeof(KernelMIGManager));
+
+    // Free memory allocated by `__nvoc_handleObjCreateMemAlloc`.
     else
     {
-        portMemFree(pThis);
-        *ppThis = NULL;
+        portMemFree(__nvoc_pThis);
+        *__nvoc_ppThis = NULL;
     }
 
-    // coverity[leaked_storage:FALSE]
-    return status;
+    // Failure
+    return __nvoc_status;
 }
 
-NV_STATUS __nvoc_objCreateDynamic_KernelMIGManager(KernelMIGManager **ppThis, Dynamic *pParent, NvU32 createFlags, va_list args) {
-    NV_STATUS status;
+NV_STATUS __nvoc_objCreateDynamic_KernelMIGManager(KernelMIGManager **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, va_list __nvoc_args) {
+    NV_STATUS __nvoc_status;
 
-    status = __nvoc_objCreate_KernelMIGManager(ppThis, pParent, createFlags);
+    __nvoc_status = __nvoc_objCreate_KernelMIGManager(__nvoc_ppThis, __nvoc_pParent, __nvoc_createFlags);
 
-    return status;
+    return __nvoc_status;
 }
 

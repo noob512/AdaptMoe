@@ -34,6 +34,8 @@
 
 /* ------------------------ Macros ----------------------------------------- */
 #define NV_GH100_SPDM_REQUESTER_CERT_COUNT  (3)
+#define PEM_CERT_HEADER_SIZE                (28)
+#define PEM_CERT_FOOTER_SIZE                (26)
 
 //
 //TODO : Need to generate individual encapsulated certification chain.
@@ -80,7 +82,102 @@ static NvU8 SPDM_REQ_ENCAP_CERTIFICATE_DER[NV_SPDM_ENCAP_CERT_SIZE_IN_BYTE] =
     0xd2, 0x38
 };
 
-/* ------------------------ Static Functions ------------------------------- */
+/* ------------------------ Private Functions ------------------------------- */
+
+/*!
+ * @param[in]     pGpu        Pointer to GPU object.
+ * @param[in]     pSpdm       Pointer to SPDM object.
+ * @param[in]     pBinStorage BINDATA storage of PEM certificate.
+ * @param[in]     bNeedCopy   Whether to copy the DER certificate to output buffer.
+ * @param[out]    pCert       Output buffer of the DER certificate.
+ * @param[in/out] pCertSize   As input, this pointer represent the size of pCert buffer;
+ *                            as output, this pointer contain the size of return certificate.
+ *
+ * @return        Return NV_OK if no error; otherwise return NV_ERR_XXX
+ */
+NV_STATUS spdmConvertCertificateToDer_GH100
+(
+    OBJGPU                *pGpu,
+    Spdm                  *pSpdm,
+    const BINDATA_STORAGE *pBinStorage,
+    NvBool                 bNeedCopy,
+    NvU8                  *pCert,
+    NvU64                 *pCertSize
+)
+{
+    NvU32 pemCertSize;
+    NvU32 derCertSize;
+    NvU8 *pemCert = NULL;
+    NV_STATUS status = NV_OK;
+
+    pemCertSize = bindataGetBufferSize(pBinStorage);
+    // check if the PEM cert is larger than the header and footer, 28 and 26 bytes respectively
+    if (pemCertSize < PEM_CERT_HEADER_SIZE + PEM_CERT_FOOTER_SIZE)
+    {
+        *pCertSize = 0;
+        status = NV_ERR_INVALID_DATA;
+        goto Exit;
+    }
+
+    pemCert = portMemAllocNonPaged(pemCertSize);
+    if (pemCert == NULL)
+    {
+        status = NV_ERR_NO_MEMORY;
+        *pCertSize = 0;
+        goto Exit;
+    }
+
+    status = bindataWriteToBuffer(pBinStorage, pemCert, pemCertSize);
+    if (status != NV_OK)
+    {
+        *pCertSize = 0;
+        goto Exit;
+    }
+
+    // calculate the size we need to allocate
+    // remove the PEM cert header and footer, which are 28 and 26 bytes respectively
+    derCertSize = pemCertSize - (PEM_CERT_HEADER_SIZE + PEM_CERT_FOOTER_SIZE);
+    // remove a linebreak after every 64 encoded characters
+    derCertSize -= (derCertSize + 64) / 65;
+    // 4 bytes of b64 characters are decoded into 3 bytes
+    derCertSize = (derCertSize / 4) * 3;
+
+    // footer size (26) + trailing linebreak (1) + 0-indexed array adjustment (1)
+    if (pemCert[pemCertSize - PEM_CERT_FOOTER_SIZE - 2] == '=')
+    {
+        derCertSize--;
+    }
+    // and the byte before that
+    if (pemCert[pemCertSize - PEM_CERT_FOOTER_SIZE - 3] == '=')
+    {
+        derCertSize--;
+    }
+
+    if (!bNeedCopy)
+    {
+        *pCertSize = derCertSize;
+        goto Exit;
+    }
+
+    // let libspdm_pem_to_der do the buffer size check for us
+    if (!libspdm_pem_to_der(pemCert, pCert, pemCertSize, (size_t *)pCertSize))
+    {
+        *pCertSize = 0;
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto Exit;
+    }
+    if (*pCertSize != derCertSize)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Decoded cert size is different from calculated!\n");
+        *pCertSize = 0;
+        status = NV_ERR_INVALID_DATA;
+        goto Exit;
+    }
+
+Exit:
+    portMemFree(pemCert);
+    return status;
+}
 
 /* ------------------------ Public Functions ------------------------------- */
 /*!
@@ -171,17 +268,19 @@ spdmGetIndividualCertificate_GH100
         return NV_ERR_INVALID_ARGUMENT;
     }
 
-    pBinStorage = bDerFormat ?
-                  (BINDATA_STORAGE *)bindataArchiveGetStorage(pBinArchive, BINDATA_LABEL_CERTIFICATE_DER) :
-                  (BINDATA_STORAGE *)bindataArchiveGetStorage(pBinArchive, BINDATA_LABEL_CERTIFICATE_PEM);
+    pBinStorage = (BINDATA_STORAGE *)bindataArchiveGetStorage(pBinArchive, BINDATA_LABEL_CERTIFICATE_PEM);
 
     if (pBinStorage == NULL)
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
 
-    certSize = bindataGetBufferSize(pBinStorage);
+    if (bDerFormat)
+    {
+        return spdmConvertCertificateToDer_HAL(pGpu, pSpdm, pBinStorage, bNeedCopy, pCert, pCertSize);
+    }
 
+    certSize = bindataGetBufferSize(pBinStorage);
     if (bNeedCopy)
     {
         if (*pCertSize < certSize)
@@ -351,7 +450,7 @@ spdmGetCertChains_GH100
 
     portMemCopy(pAttestationCertChain, *pAttestationCertChainSize,
                 pSpdm->pAttestationCertChain, pSpdm->attestationCertChainSize);
-    *pAttestationCertChainSize = pSpdm->attestationCertChainSize;
+    *pAttestationCertChainSize = (NvU32)pSpdm->attestationCertChainSize;
 
     return NV_OK;
 }

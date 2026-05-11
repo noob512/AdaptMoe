@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2018-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2018-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -42,12 +42,15 @@ NV_STATUS nvGenerateGpuUuid(NvU16 chipId, NvU64 pdi, NvUuid *pUuid);
 NV_STATUS nvGenerateSmcUuid(NvU16 chipId, NvU64 pdi,
                             NvU32 swizzId, NvU32 syspipeId, NvUuid *pUuid);
 
+NV_STATUS nvGenerateUgpuUuid(NvU16 chipId, NvU32 ugpugId, NvU64 pdi, NvUuid *pUuid);
+
 // 'G' 'P' 'U' '-'(x5), '\0x0', extra = 9
 #define NV_UUID_STR_LEN ((NV_UUID_LEN << 1) + 9)
 
 #define RM_UUID_PREFIX_GPU         0U
 #define RM_UUID_PREFIX_MIG         1U
 #define RM_UUID_PREFIX_DLA         2U
+#define RM_UUID_PREFIX_UGC         3U
 
 void nvGetUuidString(const NvUuid *pUuid, NvU8 prefix, char *pUuidStr);
 

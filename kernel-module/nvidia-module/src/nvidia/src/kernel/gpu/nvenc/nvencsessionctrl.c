@@ -98,6 +98,10 @@ _nvencsessionCtrlCmdNvencSwSessionUpdateInfo
             RmCtrlParams *pRmCtrlParams = pCallContext->pControlParams;
             NVA0BC_CTRL_NVENC_SW_SESSION_UPDATE_INFO_PARAMS rpcParams = {0};
 
+            NV_ASSERT_OR_RETURN(pRmCtrlParams->cmd == NVA0BC_CTRL_CMD_NVENC_SW_SESSION_UPDATE_INFO ||
+                                pRmCtrlParams->cmd == NVA0BC_CTRL_CMD_NVENC_SW_SESSION_UPDATE_INFO_V2,
+                                NV_ERR_INVALID_STATE);
+
             rpcParams.hResolution           = hResolution;
             rpcParams.vResolution           = vResolution;
             rpcParams.averageEncodeLatency  = pNvencSession->nvencSessionEntry.averageEncodeLatency;

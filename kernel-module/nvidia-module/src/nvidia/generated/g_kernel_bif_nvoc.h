@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2013-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2013-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -54,7 +54,7 @@ extern "C" {
 #include "rmpbicmdif.h"
 #include "nvoc/utility.h"
 #include "ctrl/ctrl2080/ctrl2080bus.h"
-
+#include "ctrl/ctrl2080/ctrl2080bif.h"
 
 /* ------------------------ Types definitions ------------------------------ */
 
@@ -96,6 +96,27 @@ extern "C" {
 #define BIF_PCIE_CPL_ATOMICS_CAS_32      BIF_PCIE_REQ_ATOMICS_CAS_32
 #define BIF_PCIE_CPL_ATOMICS_CAS_64      BIF_PCIE_REQ_ATOMICS_CAS_64
 #define BIF_PCIE_CPL_ATOMICS_CAS_128     BIF_PCIE_REQ_ATOMICS_CAS_128
+
+// Pex config reg data defines
+#define NV_BIF_PEX_CONFIG_REG_INVALID                                  (0)
+#define NV_BIF_PEX_CONFIG_REG_FN0_DEVICE_CTRL_STATUS                   (1)
+#define NV_BIF_PEX_CONFIG_REG_FN0_LINK_CTRL_STATUS                     (2)
+#define NV_BIF_PEX_CONFIG_REG_FN0_DEVICE_CTRL_STATUS_2                 (3)
+#define NV_BIF_PEX_CONFIG_REG_FN0_LINK_CAP                             (4)
+#define NV_BIF_PEX_CONFIG_REG_FN0_L1_PM_SUBSTATES_CTRL1                (5)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_CHECK_FAILED_STATUS              (6)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_MISROUTED_TLP_STATUS             (7)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_PCRC_CHECK_FAILED_STATUS         (8)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_CHECK_FAILED_MASK                (9)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_MISROUTED_TLP_MASK               (10)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_PCRC_CHECK_FAILED_MASK           (11)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_CHECK_FAILED_SEVERITY            (12)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_MISROUTED_TLP_SEVERITY           (13)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_PCRC_CHECK_FAILED_SEVERITY       (14)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_TLP_ENCRYPTION_STATUS            (15)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_TYPE_LINK_STREAM_ENABLED         (16)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_TYPE_SELECTIVE_STREAM_ENABLED    (17)
+#define NV_BIF_PEX_CONFIG_REG_FN0_IDE_TYPE_FLOW_THROUGH_STREAM_ENABLED (18)
 
 // XVE bus options
 typedef enum BUS_OPTIONS
@@ -151,6 +172,61 @@ typedef struct
     NvU32 linkCap;
 } KBIF_CACHE_PCIE_CONFIG_REG;
 
+// Information related to PciePowerControl
+typedef struct
+{
+    NvU32  identifiedKeyOrder;
+    NvU32  identifiedKeyLocation;
+    NvU32  pciePowerControlValue;
+    NvBool bPciePowerControlPresent;
+} PCIE_POWER_CONTROL_INFO;
+
+typedef enum
+{
+    PCIEPOWERCONTROL_KEY_ORDER_CHIPSET_GPU_ID = 1,
+    PCIEPOWERCONTROL_KEY_ORDER_WILDCARD,
+    PCIEPOWERCONTROL_KEY_ORDER_CHIPSET_ID,
+    PCIEPOWERCONTROL_KEY_ORDER_MAX
+} PCIEPOWERCONTROL_KEY_ORDER;
+
+typedef enum _PCIEPOWERCONTROL_KEY_LOCATION
+{
+    PCIEPOWERCONTROL_KEY_LOCATION_NOT_PRESENT = 0,
+    PCIEPOWERCONTROL_KEY_LOCATION_GLOBAL,
+    PCIEPOWERCONTROL_KEY_LOCATION_ADAPTER,
+    PCIEPOWERCONTROL_KEY_LOCATION_UEFI,
+    PCIEPOWERCONTROL_KEY_LOCATION_DR,
+    PCIEPOWERCONTROL_KEY_LOCATION_COOKIE,
+} PCIEPOWERCONTROL_KEY_LOCATION;
+
+typedef struct
+{
+    union 
+    {
+        struct
+        {
+            // Enables the RTD3
+            NvU32 enable             : 1;
+            // Overrides the checking for RM's support (VBIOS)
+            NvU32 overrideRM         : 1;
+            // Overrides the platform checking (_DSM support)
+            NvU32 overridePlaform    : 1;
+            // Allow core power to be turned ON always
+            NvU32 turnONCorePower    : 1;
+            // Enables ASPM
+            //  0x1 = Enables only L0s
+            //  0x2 = Enables only L1
+            //  0x3 = Enables both L0s and L1
+            NvU32 enableASPM         : 2;
+            NvU32 reserved           : 25;
+            NvU32 notInRegistry      : 1;
+        };
+        NvU32  value;
+    };
+    PCIEPOWERCONTROL_KEY_ORDER        identifiedKeyOrder;
+    PCIEPOWERCONTROL_KEY_LOCATION     identifiedKeyLocation;
+} PCIEPOWERCONTROL;
+
 typedef struct KERNEL_HOST_VGPU_DEVICE KERNEL_HOST_VGPU_DEVICE;
 
 
@@ -186,71 +262,81 @@ struct KernelBif {
     struct OBJENGSTATE *__nvoc_pbase_OBJENGSTATE;    // engstate super
     struct KernelBif *__nvoc_pbase_KernelBif;    // kbif
 
-    // Vtable with 62 per-object function pointers
+    // Vtable with 71 per-object function pointers
     NV_STATUS (*__kbifStatePostLoad__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32);  // virtual halified (2 hals) override (engstate) base (engstate) body
-    NvU32 (*__kbifGetBusIntfType__)(struct KernelBif * /*this*/);  // halified (2 hals) body
-    void (*__kbifInitLtr__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
+    void (*__kbifDestruct__)(struct KernelBif * /*this*/);  // halified (2 hals) override (engstate) base (engstate) body
+    void (*__kbifInitLtr__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    NV_STATUS (*__kbifGetLtrEnable__)(struct OBJGPU *, struct KernelBif * /*this*/, NvBool *);  // halified (4 hals) body
+    NV_STATUS (*__kbifSetLtrEnable__)(struct OBJGPU *, struct KernelBif * /*this*/, NvBool);  // halified (4 hals) body
+    void (*__kbifCacheDeviceControlStatus2Reg__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
     void (*__kbifInitDmaCaps__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals)
-    NV_STATUS (*__kbifSavePcieConfigRegisters__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
-    NV_STATUS (*__kbifRestorePcieConfigRegisters__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
+    NV_STATUS (*__kbifSavePcieConfigRegisters__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    NV_STATUS (*__kbifRestorePcieConfigRegisters__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
     NV_STATUS (*__kbifSavePcieConfigRegistersFn1__)(struct OBJGPU *, struct KernelBif * /*this*/, const PKBIF_XVE_REGMAP_REF, NvU32);  // halified (2 hals) body
     NV_STATUS (*__kbifRestorePcieConfigRegistersFn1__)(struct OBJGPU *, struct KernelBif * /*this*/, const PKBIF_XVE_REGMAP_REF, NvU32);  // halified (2 hals) body
     NV_STATUS (*__kbifPollBarFirewallDisengage__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
-    NV_STATUS (*__kbifGetXveStatusBits__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32 *, NvU32 *);  // halified (3 hals) body
-    NV_STATUS (*__kbifClearXveStatus__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32 *);  // halified (3 hals) body
-    NV_STATUS (*__kbifGetXveAerBits__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32 *);  // halified (3 hals) body
-    NV_STATUS (*__kbifClearXveAer__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32);  // halified (3 hals) body
+    NV_STATUS (*__kbifGetXveStatusBits__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32 *, NvU32 *);  // halified (4 hals) body
+    NV_STATUS (*__kbifClearXveStatus__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32 *);  // halified (4 hals) body
+    NV_STATUS (*__kbifGetXveAerBits__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32 *);  // halified (4 hals) body
+    NvU32 (*__kbifGetIdeInfo__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32);  // halified (2 hals) body
+    NV_STATUS (*__kbifClearXveAer__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32);  // halified (4 hals) body
     void (*__kbifGetPcieConfigAccessTestRegisters__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32 *, NvU32 *);  // halified (2 hals) body
     NV_STATUS (*__kbifVerifyPcieConfigAccessTestRegisters__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32, NvU32);  // halified (2 hals) body
-    void (*__kbifRearmMSI__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
+    void (*__kbifRearmMSI__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
     NvBool (*__kbifIsMSIEnabledInHW__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
-    NvBool (*__kbifIsMSIXEnabledInHW__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    NvBool (*__kbifIsMSIXEnabledInHW__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (4 hals) body
     NvBool (*__kbifIsPciIoAccessEnabled__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
-    NvBool (*__kbifIs3dController__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    NvBool (*__kbifIs3dController__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (4 hals) body
     void (*__kbifExecC73War__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
     void (*__kbifEnableExtendedTagSupport__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
-    void (*__kbifPcieConfigEnableRelaxedOrdering__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
-    void (*__kbifPcieConfigDisableRelaxedOrdering__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    void (*__kbifPcieConfigEnableRelaxedOrdering__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (4 hals) body
+    void (*__kbifPcieConfigDisableRelaxedOrdering__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (4 hals) body
     void (*__kbifInitRelaxedOrderingFromEmulatedConfigSpace__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
-    NV_STATUS (*__kbifEnableNoSnoop__)(struct OBJGPU *, struct KernelBif * /*this*/, NvBool);  // halified (3 hals) body
-    void (*__kbifApplyWARBug3208922__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
+    NV_STATUS (*__kbifEnableNoSnoop__)(struct OBJGPU *, struct KernelBif * /*this*/, NvBool);  // halified (4 hals) body
+    void (*__kbifDisableP2PTransactions__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
+    NV_STATUS (*__kbifGetVFSparseMmapRegions__)(struct OBJGPU *, struct KernelBif * /*this*/, KERNEL_HOST_VGPU_DEVICE *, NvU64, NvU32 *, NvU64 *, NvU64 *);  // halified (2 hals) body
     void (*__kbifProbePcieReqAtomicCaps__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
     void (*__kbifEnablePcieAtomics__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
     void (*__kbifProbePcieCplAtomicCaps__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
     void (*__kbifReadPcieCplCapsFromConfigSpace__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32 *);  // halified (3 hals) body
-    NV_STATUS (*__kbifDoFunctionLevelReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
-    NV_STATUS (*__kbifInitXveRegMap__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU8);  // halified (3 hals) body
-    NvU32 (*__kbifGetMSIXTableVectorControlSize__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    NV_STATUS (*__kbifDoFunctionLevelReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    NV_STATUS (*__kbifInitXveRegMap__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU8);  // halified (5 hals) body
+    NvU32 (*__kbifGetMSIXTableVectorControlSize__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (4 hals) body
     NV_STATUS (*__kbifConfigAccessWait__)(struct OBJGPU *, struct KernelBif * /*this*/, RMTIMEOUT *);  // halified (3 hals) body
-    NV_STATUS (*__kbifGetPciConfigSpacePriMirror__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32 *, NvU32 *);  // halified (2 hals) body
-    NV_STATUS (*__kbifGetBusOptionsAddr__)(struct OBJGPU *, struct KernelBif * /*this*/, BUS_OPTIONS, NvU32 *);  // halified (3 hals) body
+    NV_STATUS (*__kbifGetPciConfigSpacePriMirror__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32 *, NvU32 *);  // halified (4 hals) body
+    NV_STATUS (*__kbifGetBusOptionsAddr__)(struct OBJGPU *, struct KernelBif * /*this*/, BUS_OPTIONS, NvU32 *);  // halified (4 hals) body
     NV_STATUS (*__kbifPreOsGlobalErotGrantRequest__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
-    NV_STATUS (*__kbifStopSysMemRequests__)(struct OBJGPU *, struct KernelBif * /*this*/, NvBool);  // halified (4 hals) body
+    NV_STATUS (*__kbifStopSysMemRequests__)(struct OBJGPU *, struct KernelBif * /*this*/, NvBool);  // halified (5 hals) body
+    NV_STATUS (*__kbifDisableSysmemAccess__)(struct OBJGPU *, struct KernelBif * /*this*/, NvBool);  // halified (2 hals) body
     NV_STATUS (*__kbifWaitForTransactionsComplete__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
-    NV_STATUS (*__kbifTriggerFlr__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
-    void (*__kbifCacheFlrSupport__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    NV_STATUS (*__kbifTriggerFlr__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (4 hals) body
+    void (*__kbifCacheFlrSupport__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (5 hals) body
     void (*__kbifCache64bBar0Support__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (4 hals) body
-    void (*__kbifCacheMnocSupport__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
-    void (*__kbifCacheVFInfo__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    void (*__kbifCacheMnocSupport__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    void (*__kbifCacheVFInfo__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (5 hals) body
     void (*__kbifRestoreBar0__)(struct OBJGPU *, struct KernelBif * /*this*/, void *, NvU32 *);  // halified (3 hals) body
-    NvBool (*__kbifAnyBarsAreValid__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
-    NV_STATUS (*__kbifRestoreBarsAndCommand__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    NvBool (*__kbifAnyBarsAreValid__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    NV_STATUS (*__kbifRestoreBarsAndCommand__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (5 hals) body
     void (*__kbifStoreBarRegOffsets__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32);  // halified (2 hals) body
-    NV_STATUS (*__kbifInit__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
-    void (*__kbifPrepareForFullChipReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    NV_STATUS (*__kbifInit__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    void (*__kbifPrepareForFullChipReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (4 hals) body
+    NvBool (*__kbifIsC2CP2PSupported__)(struct OBJGPU *, struct KernelBif * /*this*/, struct OBJGPU *);  // halified (2 hals) body
     NV_STATUS (*__kbifPrepareForXveReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
-    NV_STATUS (*__kbifDoFullChipReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    NV_STATUS (*__kbifDoFullChipReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (4 hals) body
     void (*__kbifResetHostEngines__)(struct OBJGPU *, struct KernelBif * /*this*/, struct KernelMc *);  // halified (2 hals) body
-    NvU32 (*__kbifGetValidEnginesToReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
+    NvU32 (*__kbifGetValidEnginesToReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (4 hals) body
     NvU32 (*__kbifGetValidDeviceEnginesToReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
     NV_STATUS (*__kbifGetMigrationBandwidth__)(struct OBJGPU *, struct KernelBif * /*this*/, NvU32 *);  // halified (2 hals)
     NvU32 (*__kbifGetEccCounts__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
     NvBool (*__kbifAllowGpuReqPcieAtomics__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (4 hals) body
     NvBool (*__kbifAllowGpuCplPcieAtomics__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
     void (*__kbifClearDownstreamReadCounter__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
-    NV_STATUS (*__kbifDoSecondaryBusHotReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
+    NV_STATUS (*__kbifDoSecondaryBusResetOrFunctionLevelReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (2 hals) body
+    NV_STATUS (*__kbifDoSecondaryBusHotReset__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (3 hals) body
+    void (*__kbifConstructXtlAperture__)(struct OBJGPU *, struct KernelBif * /*this*/);  // halified (4 hals) body
 
     // 26 PDB properties
+//  NvBool PDB_PROP_KBIF_IS_MISSING inherited from OBJENGSTATE
     NvBool PDB_PROP_KBIF_CHECK_IF_GPU_EXISTS_DEF;
     NvBool PDB_PROP_KBIF_IS_MSI_ENABLED;
     NvBool PDB_PROP_KBIF_IS_MSI_CACHED;
@@ -287,6 +373,8 @@ struct KernelBif {
     KBIF_CACHE_DATA cacheData;
     NvBool bPreparingFunctionLevelReset;
     NvBool bInFunctionLevelReset;
+    PCIE_POWER_CONTROL_INFO pciePowerControlInfo;
+    NvU32 pf0DeviceControl2Reg;
     NvU32 osPcieAtomicsOpMask;
     NvU32 pcieAtomicsCplDeviceCapMask;
     NvBool bForceDisableFLR;
@@ -296,6 +384,7 @@ struct KernelBif {
     NvU32 chipsetL1ssEnable;
     NvU32 barRegOffsets[7];
     KBIF_CACHE_PCIE_CONFIG_REG pcieConfigReg;
+    struct IoAperture pBifXtlAperture;
 };
 
 
@@ -323,13 +412,9 @@ struct NVOC_METADATA__KernelBif {
     const struct NVOC_VTABLE__KernelBif vtable;
 };
 
-#ifndef __NVOC_CLASS_KernelBif_TYPEDEF__
-#define __NVOC_CLASS_KernelBif_TYPEDEF__
-typedef struct KernelBif KernelBif;
-#endif /* __NVOC_CLASS_KernelBif_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_KernelBif
-#define __nvoc_class_id_KernelBif 0xdbe523
+#define __nvoc_class_id_KernelBif 0xdbe523u
+typedef struct KernelBif KernelBif;
 #endif /* __nvoc_class_id_KernelBif */
 
 // Casting support
@@ -346,67 +431,259 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_KernelBif;
 #endif //__nvoc_kernel_bif_h_disabled
 
 // Property macros
-#define PDB_PROP_KBIF_CHECK_IF_GPU_EXISTS_DEF_BASE_CAST
-#define PDB_PROP_KBIF_CHECK_IF_GPU_EXISTS_DEF_BASE_NAME PDB_PROP_KBIF_CHECK_IF_GPU_EXISTS_DEF
-#define PDB_PROP_KBIF_IS_C2C_LINK_UP_BASE_CAST
-#define PDB_PROP_KBIF_IS_C2C_LINK_UP_BASE_NAME PDB_PROP_KBIF_IS_C2C_LINK_UP
-#define PDB_PROP_KBIF_USE_CONFIG_SPACE_TO_REARM_MSI_BASE_CAST
-#define PDB_PROP_KBIF_USE_CONFIG_SPACE_TO_REARM_MSI_BASE_NAME PDB_PROP_KBIF_USE_CONFIG_SPACE_TO_REARM_MSI
-#define PDB_PROP_KBIF_IS_MSI_ENABLED_BASE_CAST
-#define PDB_PROP_KBIF_IS_MSI_ENABLED_BASE_NAME PDB_PROP_KBIF_IS_MSI_ENABLED
-#define PDB_PROP_KBIF_FORCE_PCIE_CONFIG_SAVE_BASE_CAST
-#define PDB_PROP_KBIF_FORCE_PCIE_CONFIG_SAVE_BASE_NAME PDB_PROP_KBIF_FORCE_PCIE_CONFIG_SAVE
 #define PDB_PROP_KBIF_IS_MISSING_BASE_CAST __nvoc_base_OBJENGSTATE.
 #define PDB_PROP_KBIF_IS_MISSING_BASE_NAME PDB_PROP_ENGSTATE_IS_MISSING
-#define PDB_PROP_KBIF_PCIE_GEN4_CAPABLE_BASE_CAST
-#define PDB_PROP_KBIF_PCIE_GEN4_CAPABLE_BASE_NAME PDB_PROP_KBIF_PCIE_GEN4_CAPABLE
+#define PDB_PROP_KBIF_CHECK_IF_GPU_EXISTS_DEF_BASE_CAST
+#define PDB_PROP_KBIF_CHECK_IF_GPU_EXISTS_DEF_BASE_NAME PDB_PROP_KBIF_CHECK_IF_GPU_EXISTS_DEF
+#define PDB_PROP_KBIF_IS_MSI_ENABLED_BASE_CAST
+#define PDB_PROP_KBIF_IS_MSI_ENABLED_BASE_NAME PDB_PROP_KBIF_IS_MSI_ENABLED
 #define PDB_PROP_KBIF_IS_MSI_CACHED_BASE_CAST
 #define PDB_PROP_KBIF_IS_MSI_CACHED_BASE_NAME PDB_PROP_KBIF_IS_MSI_CACHED
-#define PDB_PROP_KBIF_DEVICE_IS_MULTIFUNCTION_BASE_CAST
-#define PDB_PROP_KBIF_DEVICE_IS_MULTIFUNCTION_BASE_NAME PDB_PROP_KBIF_DEVICE_IS_MULTIFUNCTION
-#define PDB_PROP_KBIF_ALLOW_REARM_MSI_FOR_VF_BASE_CAST
-#define PDB_PROP_KBIF_ALLOW_REARM_MSI_FOR_VF_BASE_NAME PDB_PROP_KBIF_ALLOW_REARM_MSI_FOR_VF
-#define PDB_PROP_KBIF_SUPPORT_NONCOHERENT_BASE_CAST
-#define PDB_PROP_KBIF_SUPPORT_NONCOHERENT_BASE_NAME PDB_PROP_KBIF_SUPPORT_NONCOHERENT
 #define PDB_PROP_KBIF_IS_MSIX_ENABLED_BASE_CAST
 #define PDB_PROP_KBIF_IS_MSIX_ENABLED_BASE_NAME PDB_PROP_KBIF_IS_MSIX_ENABLED
-#define PDB_PROP_KBIF_P2P_WRITES_DISABLED_BASE_CAST
-#define PDB_PROP_KBIF_P2P_WRITES_DISABLED_BASE_NAME PDB_PROP_KBIF_P2P_WRITES_DISABLED
-#define PDB_PROP_KBIF_FLR_SUPPORTED_BASE_CAST
-#define PDB_PROP_KBIF_FLR_SUPPORTED_BASE_NAME PDB_PROP_KBIF_FLR_SUPPORTED
-#define PDB_PROP_KBIF_SYSTEM_ACCESS_DISABLED_BASE_CAST
-#define PDB_PROP_KBIF_SYSTEM_ACCESS_DISABLED_BASE_NAME PDB_PROP_KBIF_SYSTEM_ACCESS_DISABLED
-#define PDB_PROP_KBIF_FLR_PRE_CONDITIONING_REQUIRED_BASE_CAST
-#define PDB_PROP_KBIF_FLR_PRE_CONDITIONING_REQUIRED_BASE_NAME PDB_PROP_KBIF_FLR_PRE_CONDITIONING_REQUIRED
-#define PDB_PROP_KBIF_PCIE_RELAXED_ORDERING_SET_IN_EMULATED_CONFIG_SPACE_BASE_CAST
-#define PDB_PROP_KBIF_PCIE_RELAXED_ORDERING_SET_IN_EMULATED_CONFIG_SPACE_BASE_NAME PDB_PROP_KBIF_PCIE_RELAXED_ORDERING_SET_IN_EMULATED_CONFIG_SPACE
-#define PDB_PROP_KBIF_GCX_PMU_CFG_SPACE_RESTORE_BASE_CAST
-#define PDB_PROP_KBIF_GCX_PMU_CFG_SPACE_RESTORE_BASE_NAME PDB_PROP_KBIF_GCX_PMU_CFG_SPACE_RESTORE
-#define PDB_PROP_KBIF_FLR_HANDLED_BY_OS_BASE_CAST
-#define PDB_PROP_KBIF_FLR_HANDLED_BY_OS_BASE_NAME PDB_PROP_KBIF_FLR_HANDLED_BY_OS
-#define PDB_PROP_KBIF_64BIT_BAR0_SUPPORTED_BASE_CAST
-#define PDB_PROP_KBIF_64BIT_BAR0_SUPPORTED_BASE_NAME PDB_PROP_KBIF_64BIT_BAR0_SUPPORTED
-#define PDB_PROP_KBIF_UPSTREAM_LTR_SUPPORT_WAR_BUG_200634944_BASE_CAST
-#define PDB_PROP_KBIF_UPSTREAM_LTR_SUPPORT_WAR_BUG_200634944_BASE_NAME PDB_PROP_KBIF_UPSTREAM_LTR_SUPPORT_WAR_BUG_200634944
 #define PDB_PROP_KBIF_IS_MSIX_CACHED_BASE_CAST
 #define PDB_PROP_KBIF_IS_MSIX_CACHED_BASE_NAME PDB_PROP_KBIF_IS_MSIX_CACHED
-#define PDB_PROP_KBIF_P2P_READS_DISABLED_BASE_CAST
-#define PDB_PROP_KBIF_P2P_READS_DISABLED_BASE_NAME PDB_PROP_KBIF_P2P_READS_DISABLED
-#define PDB_PROP_KBIF_SECONDARY_BUS_RESET_SUPPORTED_BASE_CAST
-#define PDB_PROP_KBIF_SECONDARY_BUS_RESET_SUPPORTED_BASE_NAME PDB_PROP_KBIF_SECONDARY_BUS_RESET_SUPPORTED
 #define PDB_PROP_KBIF_IS_FMODEL_MSI_BROKEN_BASE_CAST
 #define PDB_PROP_KBIF_IS_FMODEL_MSI_BROKEN_BASE_NAME PDB_PROP_KBIF_IS_FMODEL_MSI_BROKEN
+#define PDB_PROP_KBIF_USE_CONFIG_SPACE_TO_REARM_MSI_BASE_CAST
+#define PDB_PROP_KBIF_USE_CONFIG_SPACE_TO_REARM_MSI_BASE_NAME PDB_PROP_KBIF_USE_CONFIG_SPACE_TO_REARM_MSI
+#define PDB_PROP_KBIF_ALLOW_REARM_MSI_FOR_VF_BASE_CAST
+#define PDB_PROP_KBIF_ALLOW_REARM_MSI_FOR_VF_BASE_NAME PDB_PROP_KBIF_ALLOW_REARM_MSI_FOR_VF
+#define PDB_PROP_KBIF_IS_C2C_LINK_UP_BASE_CAST
+#define PDB_PROP_KBIF_IS_C2C_LINK_UP_BASE_NAME PDB_PROP_KBIF_IS_C2C_LINK_UP
+#define PDB_PROP_KBIF_P2P_READS_DISABLED_BASE_CAST
+#define PDB_PROP_KBIF_P2P_READS_DISABLED_BASE_NAME PDB_PROP_KBIF_P2P_READS_DISABLED
+#define PDB_PROP_KBIF_P2P_WRITES_DISABLED_BASE_CAST
+#define PDB_PROP_KBIF_P2P_WRITES_DISABLED_BASE_NAME PDB_PROP_KBIF_P2P_WRITES_DISABLED
+#define PDB_PROP_KBIF_UPSTREAM_LTR_SUPPORT_WAR_BUG_200634944_BASE_CAST
+#define PDB_PROP_KBIF_UPSTREAM_LTR_SUPPORT_WAR_BUG_200634944_BASE_NAME PDB_PROP_KBIF_UPSTREAM_LTR_SUPPORT_WAR_BUG_200634944
+#define PDB_PROP_KBIF_SUPPORT_NONCOHERENT_BASE_CAST
+#define PDB_PROP_KBIF_SUPPORT_NONCOHERENT_BASE_NAME PDB_PROP_KBIF_SUPPORT_NONCOHERENT
+#define PDB_PROP_KBIF_PCIE_GEN4_CAPABLE_BASE_CAST
+#define PDB_PROP_KBIF_PCIE_GEN4_CAPABLE_BASE_NAME PDB_PROP_KBIF_PCIE_GEN4_CAPABLE
+#define PDB_PROP_KBIF_PCIE_RELAXED_ORDERING_SET_IN_EMULATED_CONFIG_SPACE_BASE_CAST
+#define PDB_PROP_KBIF_PCIE_RELAXED_ORDERING_SET_IN_EMULATED_CONFIG_SPACE_BASE_NAME PDB_PROP_KBIF_PCIE_RELAXED_ORDERING_SET_IN_EMULATED_CONFIG_SPACE
+#define PDB_PROP_KBIF_SYSTEM_ACCESS_DISABLED_BASE_CAST
+#define PDB_PROP_KBIF_SYSTEM_ACCESS_DISABLED_BASE_NAME PDB_PROP_KBIF_SYSTEM_ACCESS_DISABLED
+#define PDB_PROP_KBIF_FLR_SUPPORTED_BASE_CAST
+#define PDB_PROP_KBIF_FLR_SUPPORTED_BASE_NAME PDB_PROP_KBIF_FLR_SUPPORTED
+#define PDB_PROP_KBIF_64BIT_BAR0_SUPPORTED_BASE_CAST
+#define PDB_PROP_KBIF_64BIT_BAR0_SUPPORTED_BASE_NAME PDB_PROP_KBIF_64BIT_BAR0_SUPPORTED
+#define PDB_PROP_KBIF_DEVICE_IS_MULTIFUNCTION_BASE_CAST
+#define PDB_PROP_KBIF_DEVICE_IS_MULTIFUNCTION_BASE_NAME PDB_PROP_KBIF_DEVICE_IS_MULTIFUNCTION
+#define PDB_PROP_KBIF_GCX_PMU_CFG_SPACE_RESTORE_BASE_CAST
+#define PDB_PROP_KBIF_GCX_PMU_CFG_SPACE_RESTORE_BASE_NAME PDB_PROP_KBIF_GCX_PMU_CFG_SPACE_RESTORE
+#define PDB_PROP_KBIF_SECONDARY_BUS_RESET_SUPPORTED_BASE_CAST
+#define PDB_PROP_KBIF_SECONDARY_BUS_RESET_SUPPORTED_BASE_NAME PDB_PROP_KBIF_SECONDARY_BUS_RESET_SUPPORTED
 #define PDB_PROP_KBIF_SECONDARY_BUS_RESET_ENABLED_BASE_CAST
 #define PDB_PROP_KBIF_SECONDARY_BUS_RESET_ENABLED_BASE_NAME PDB_PROP_KBIF_SECONDARY_BUS_RESET_ENABLED
+#define PDB_PROP_KBIF_FORCE_PCIE_CONFIG_SAVE_BASE_CAST
+#define PDB_PROP_KBIF_FORCE_PCIE_CONFIG_SAVE_BASE_NAME PDB_PROP_KBIF_FORCE_PCIE_CONFIG_SAVE
+#define PDB_PROP_KBIF_FLR_PRE_CONDITIONING_REQUIRED_BASE_CAST
+#define PDB_PROP_KBIF_FLR_PRE_CONDITIONING_REQUIRED_BASE_NAME PDB_PROP_KBIF_FLR_PRE_CONDITIONING_REQUIRED
+#define PDB_PROP_KBIF_FLR_HANDLED_BY_OS_BASE_CAST
+#define PDB_PROP_KBIF_FLR_HANDLED_BY_OS_BASE_NAME PDB_PROP_KBIF_FLR_HANDLED_BY_OS
+
 
 NV_STATUS __nvoc_objCreateDynamic_KernelBif(KernelBif**, Dynamic*, NvU32, va_list);
 
 NV_STATUS __nvoc_objCreate_KernelBif(KernelBif**, Dynamic*, NvU32);
-#define __objCreate_KernelBif(ppNewObj, pParent, createFlags) \
-    __nvoc_objCreate_KernelBif((ppNewObj), staticCast((pParent), Dynamic), (createFlags))
+#define __objCreate_KernelBif(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags) \
+    __nvoc_objCreate_KernelBif((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags))
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS kbifStaticInfoInit_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NV_STATUS kbifStaticInfoInit(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifStaticInfoInit(pGpu, pKernelBif) kbifStaticInfoInit_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+void kbifInitPcieDeviceControlStatus_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline void kbifInitPcieDeviceControlStatus(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifInitPcieDeviceControlStatus(pGpu, pKernelBif) kbifInitPcieDeviceControlStatus_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+void kbifCheckAndRearmMSI_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline void kbifCheckAndRearmMSI(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifCheckAndRearmMSI(pGpu, pKernelBif) kbifCheckAndRearmMSI_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+NvBool kbifIsMSIEnabled_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NvBool kbifIsMSIEnabled(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return NV_FALSE;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifIsMSIEnabled(pGpu, pKernelBif) kbifIsMSIEnabled_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+NvBool kbifIsMSIXEnabled_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NvBool kbifIsMSIXEnabled(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return NV_FALSE;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifIsMSIXEnabled(pGpu, pKernelBif) kbifIsMSIXEnabled_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+NV_STATUS kbifPollDeviceOnBus_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NV_STATUS kbifPollDeviceOnBus(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifPollDeviceOnBus(pGpu, pKernelBif) kbifPollDeviceOnBus_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NvU32 kbifGetGpuLinkCapabilities(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return 0;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifGetGpuLinkCapabilities(pGpu, pKernelBif) kbifGetGpuLinkCapabilities_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NvU32 kbifGetGpuLinkControlStatus(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return 0;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifGetGpuLinkControlStatus(pGpu, pKernelBif) kbifGetGpuLinkControlStatus_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NvU32 kbifGetGpuDevControlStatus(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return 0;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifGetGpuDevControlStatus(pGpu, pKernelBif) kbifGetGpuDevControlStatus_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NvU32 kbifGetGpuDevControlStatus2(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return 0;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifGetGpuDevControlStatus2(pGpu, pKernelBif) kbifGetGpuDevControlStatus2_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NvU32 kbifGetGpuL1PmSubstatesCtrl1(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return 0;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifGetGpuL1PmSubstatesCtrl1(pGpu, pKernelBif) kbifGetGpuL1PmSubstatesCtrl1_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+NV_STATUS kbifGetPciLinkMaxSpeedByPciGenInfo_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 pciLinkGenInfo, NvU32 *pciLinkMaxSpeed);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NV_STATUS kbifGetPciLinkMaxSpeedByPciGenInfo(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 pciLinkGenInfo, NvU32 *pciLinkMaxSpeed) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifGetPciLinkMaxSpeedByPciGenInfo(pGpu, pKernelBif, pciLinkGenInfo, pciLinkMaxSpeed) kbifGetPciLinkMaxSpeedByPciGenInfo_IMPL(pGpu, pKernelBif, pciLinkGenInfo, pciLinkMaxSpeed)
+#endif // __nvoc_kernel_bif_h_disabled
+
+void kbifCacheChipsetL1SubstatesEnable_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline void kbifCacheChipsetL1SubstatesEnable(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifCacheChipsetL1SubstatesEnable(pGpu, pKernelBif) kbifCacheChipsetL1SubstatesEnable_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+NV_STATUS kbifGetPciePowerControlValue_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pPciePowerControlValue);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NV_STATUS kbifGetPciePowerControlValue(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pPciePowerControlValue) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifGetPciePowerControlValue(pGpu, pKernelBif, pPciePowerControlValue) kbifGetPciePowerControlValue_IMPL(pGpu, pKernelBif, pPciePowerControlValue)
+#endif // __nvoc_kernel_bif_h_disabled
+
+NV_STATUS kbifWaitForConfigAccessAfterReset_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NV_STATUS kbifWaitForConfigAccessAfterReset(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifWaitForConfigAccessAfterReset(pGpu, pKernelBif) kbifWaitForConfigAccessAfterReset_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+NV_STATUS kbifControlGetPCIEInfo_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NV2080_CTRL_BUS_INFO *pBusInfo);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NV_STATUS kbifControlGetPCIEInfo(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NV2080_CTRL_BUS_INFO *pBusInfo) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifControlGetPCIEInfo(pGpu, pKernelBif, pBusInfo) kbifControlGetPCIEInfo_IMPL(pGpu, pKernelBif, pBusInfo)
+#endif // __nvoc_kernel_bif_h_disabled
+
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NV_STATUS kbifGetConfigRegData(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NV2080_CTRL_BIF_GET_DATA_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifGetConfigRegData(pGpu, pKernelBif, pParams) kbifGetConfigRegData_IMPL(pGpu, pKernelBif, pParams)
+#endif // __nvoc_kernel_bif_h_disabled
+
+NvU32 kbifGetDmaCaps_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NvU32 kbifGetDmaCaps(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return 0;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifGetDmaCaps(pGpu, pKernelBif) kbifGetDmaCaps_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline void kbifClearConfigErrors(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool arg3, NvU32 arg4) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifClearConfigErrors(pGpu, pKernelBif, arg3, arg4) kbifClearConfigErrors_IMPL(pGpu, pKernelBif, arg3, arg4)
+#endif // __nvoc_kernel_bif_h_disabled
+
+NV_STATUS kbifResetFromTimeoutFullChip_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+#ifdef __nvoc_kernel_bif_h_disabled
+static inline NV_STATUS kbifResetFromTimeoutFullChip(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_bif_h_disabled
+#define kbifResetFromTimeoutFullChip(pGpu, pKernelBif) kbifResetFromTimeoutFullChip_IMPL(pGpu, pKernelBif)
+#endif // __nvoc_kernel_bif_h_disabled
+
+
+// Wrapper macros for halified functions
 #define kbifConstructEngine_FNPTR(pKernelBif) pKernelBif->__nvoc_metadata_ptr->vtable.__kbifConstructEngine__
 #define kbifConstructEngine(pGpu, pKernelBif, arg3) kbifConstructEngine_DISPATCH(pGpu, pKernelBif, arg3)
 #define kbifStateInitLocked_FNPTR(pKernelBif) pKernelBif->__nvoc_metadata_ptr->vtable.__kbifStateInitLocked__
@@ -420,12 +697,26 @@ NV_STATUS __nvoc_objCreate_KernelBif(KernelBif**, Dynamic*, NvU32);
 #define kbifStateUnload_FNPTR(pKernelBif) pKernelBif->__nvoc_metadata_ptr->vtable.__kbifStateUnload__
 #define kbifStateUnload(pGpu, pKernelBif, arg3) kbifStateUnload_DISPATCH(pGpu, pKernelBif, arg3)
 #define kbifStateUnload_HAL(pGpu, pKernelBif, arg3) kbifStateUnload_DISPATCH(pGpu, pKernelBif, arg3)
-#define kbifGetBusIntfType_FNPTR(pKernelBif) pKernelBif->__kbifGetBusIntfType__
-#define kbifGetBusIntfType(pKernelBif) kbifGetBusIntfType_DISPATCH(pKernelBif)
-#define kbifGetBusIntfType_HAL(pKernelBif) kbifGetBusIntfType_DISPATCH(pKernelBif)
+#define kbifDestruct_FNPTR(pKernelBif) pKernelBif->__kbifDestruct__
+#define __nvoc_kbifDestruct(pKernelBif) kbifDestruct_DISPATCH(pKernelBif)
+#define kbifGetGpuLinkCapabilities_HAL(pGpu, pKernelBif) kbifGetGpuLinkCapabilities(pGpu, pKernelBif)
+#define kbifGetGpuLinkControlStatus_HAL(pGpu, pKernelBif) kbifGetGpuLinkControlStatus(pGpu, pKernelBif)
+#define kbifGetGpuDevControlStatus_HAL(pGpu, pKernelBif) kbifGetGpuDevControlStatus(pGpu, pKernelBif)
+#define kbifGetGpuDevControlStatus2_HAL(pGpu, pKernelBif) kbifGetGpuDevControlStatus2(pGpu, pKernelBif)
+#define kbifGetGpuL1PmSubstatesCtrl1_HAL(pGpu, pKernelBif) kbifGetGpuL1PmSubstatesCtrl1(pGpu, pKernelBif)
+#define kbifGetConfigRegData_HAL(pGpu, pKernelBif, pParams) kbifGetConfigRegData(pGpu, pKernelBif, pParams)
 #define kbifInitLtr_FNPTR(pKernelBif) pKernelBif->__kbifInitLtr__
 #define kbifInitLtr(pGpu, pKernelBif) kbifInitLtr_DISPATCH(pGpu, pKernelBif)
 #define kbifInitLtr_HAL(pGpu, pKernelBif) kbifInitLtr_DISPATCH(pGpu, pKernelBif)
+#define kbifGetLtrEnable_FNPTR(pKernelBif) pKernelBif->__kbifGetLtrEnable__
+#define kbifGetLtrEnable(pGpu, pKernelBif, arg3) kbifGetLtrEnable_DISPATCH(pGpu, pKernelBif, arg3)
+#define kbifGetLtrEnable_HAL(pGpu, pKernelBif, arg3) kbifGetLtrEnable_DISPATCH(pGpu, pKernelBif, arg3)
+#define kbifSetLtrEnable_FNPTR(pKernelBif) pKernelBif->__kbifSetLtrEnable__
+#define kbifSetLtrEnable(pGpu, pKernelBif, arg3) kbifSetLtrEnable_DISPATCH(pGpu, pKernelBif, arg3)
+#define kbifSetLtrEnable_HAL(pGpu, pKernelBif, arg3) kbifSetLtrEnable_DISPATCH(pGpu, pKernelBif, arg3)
+#define kbifCacheDeviceControlStatus2Reg_FNPTR(pKernelBif) pKernelBif->__kbifCacheDeviceControlStatus2Reg__
+#define kbifCacheDeviceControlStatus2Reg(pGpu, pKernelBif) kbifCacheDeviceControlStatus2Reg_DISPATCH(pGpu, pKernelBif)
+#define kbifCacheDeviceControlStatus2Reg_HAL(pGpu, pKernelBif) kbifCacheDeviceControlStatus2Reg_DISPATCH(pGpu, pKernelBif)
 #define kbifInitDmaCaps_FNPTR(pKernelBif) pKernelBif->__kbifInitDmaCaps__
 #define kbifInitDmaCaps(pGpu, pKernelBif) kbifInitDmaCaps_DISPATCH(pGpu, pKernelBif)
 #define kbifInitDmaCaps_HAL(pGpu, pKernelBif) kbifInitDmaCaps_DISPATCH(pGpu, pKernelBif)
@@ -444,6 +735,7 @@ NV_STATUS __nvoc_objCreate_KernelBif(KernelBif**, Dynamic*, NvU32);
 #define kbifPollBarFirewallDisengage_FNPTR(pKernelBif) pKernelBif->__kbifPollBarFirewallDisengage__
 #define kbifPollBarFirewallDisengage(pGpu, pKernelBif) kbifPollBarFirewallDisengage_DISPATCH(pGpu, pKernelBif)
 #define kbifPollBarFirewallDisengage_HAL(pGpu, pKernelBif) kbifPollBarFirewallDisengage_DISPATCH(pGpu, pKernelBif)
+#define kbifClearConfigErrors_HAL(pGpu, pKernelBif, arg3, arg4) kbifClearConfigErrors(pGpu, pKernelBif, arg3, arg4)
 #define kbifGetXveStatusBits_FNPTR(pKernelBif) pKernelBif->__kbifGetXveStatusBits__
 #define kbifGetXveStatusBits(pGpu, pKernelBif, pBits, pStatus) kbifGetXveStatusBits_DISPATCH(pGpu, pKernelBif, pBits, pStatus)
 #define kbifGetXveStatusBits_HAL(pGpu, pKernelBif, pBits, pStatus) kbifGetXveStatusBits_DISPATCH(pGpu, pKernelBif, pBits, pStatus)
@@ -453,6 +745,9 @@ NV_STATUS __nvoc_objCreate_KernelBif(KernelBif**, Dynamic*, NvU32);
 #define kbifGetXveAerBits_FNPTR(pKernelBif) pKernelBif->__kbifGetXveAerBits__
 #define kbifGetXveAerBits(pGpu, pKernelBif, pBits) kbifGetXveAerBits_DISPATCH(pGpu, pKernelBif, pBits)
 #define kbifGetXveAerBits_HAL(pGpu, pKernelBif, pBits) kbifGetXveAerBits_DISPATCH(pGpu, pKernelBif, pBits)
+#define kbifGetIdeInfo_FNPTR(pKernelBif) pKernelBif->__kbifGetIdeInfo__
+#define kbifGetIdeInfo(pGpu, pKernelBif, counterType) kbifGetIdeInfo_DISPATCH(pGpu, pKernelBif, counterType)
+#define kbifGetIdeInfo_HAL(pGpu, pKernelBif, counterType) kbifGetIdeInfo_DISPATCH(pGpu, pKernelBif, counterType)
 #define kbifClearXveAer_FNPTR(pKernelBif) pKernelBif->__kbifClearXveAer__
 #define kbifClearXveAer(pGpu, pKernelBif, bits) kbifClearXveAer_DISPATCH(pGpu, pKernelBif, bits)
 #define kbifClearXveAer_HAL(pGpu, pKernelBif, bits) kbifClearXveAer_DISPATCH(pGpu, pKernelBif, bits)
@@ -495,9 +790,12 @@ NV_STATUS __nvoc_objCreate_KernelBif(KernelBif**, Dynamic*, NvU32);
 #define kbifEnableNoSnoop_FNPTR(pKernelBif) pKernelBif->__kbifEnableNoSnoop__
 #define kbifEnableNoSnoop(pGpu, pKernelBif, bEnable) kbifEnableNoSnoop_DISPATCH(pGpu, pKernelBif, bEnable)
 #define kbifEnableNoSnoop_HAL(pGpu, pKernelBif, bEnable) kbifEnableNoSnoop_DISPATCH(pGpu, pKernelBif, bEnable)
-#define kbifApplyWARBug3208922_FNPTR(pKernelBif) pKernelBif->__kbifApplyWARBug3208922__
-#define kbifApplyWARBug3208922(pGpu, pKernelBif) kbifApplyWARBug3208922_DISPATCH(pGpu, pKernelBif)
-#define kbifApplyWARBug3208922_HAL(pGpu, pKernelBif) kbifApplyWARBug3208922_DISPATCH(pGpu, pKernelBif)
+#define kbifDisableP2PTransactions_FNPTR(pKernelBif) pKernelBif->__kbifDisableP2PTransactions__
+#define kbifDisableP2PTransactions(pGpu, pKernelBif) kbifDisableP2PTransactions_DISPATCH(pGpu, pKernelBif)
+#define kbifDisableP2PTransactions_HAL(pGpu, pKernelBif) kbifDisableP2PTransactions_DISPATCH(pGpu, pKernelBif)
+#define kbifGetVFSparseMmapRegions_FNPTR(pKernelBif) pKernelBif->__kbifGetVFSparseMmapRegions__
+#define kbifGetVFSparseMmapRegions(pGpu, pKernelBif, pKernelHostVgpuDevice, osPageSize, pNumAreas, pOffsets, pSizes) kbifGetVFSparseMmapRegions_DISPATCH(pGpu, pKernelBif, pKernelHostVgpuDevice, osPageSize, pNumAreas, pOffsets, pSizes)
+#define kbifGetVFSparseMmapRegions_HAL(pGpu, pKernelBif, pKernelHostVgpuDevice, osPageSize, pNumAreas, pOffsets, pSizes) kbifGetVFSparseMmapRegions_DISPATCH(pGpu, pKernelBif, pKernelHostVgpuDevice, osPageSize, pNumAreas, pOffsets, pSizes)
 #define kbifProbePcieReqAtomicCaps_FNPTR(pKernelBif) pKernelBif->__kbifProbePcieReqAtomicCaps__
 #define kbifProbePcieReqAtomicCaps(pGpu, pKernelBif) kbifProbePcieReqAtomicCaps_DISPATCH(pGpu, pKernelBif)
 #define kbifProbePcieReqAtomicCaps_HAL(pGpu, pKernelBif) kbifProbePcieReqAtomicCaps_DISPATCH(pGpu, pKernelBif)
@@ -534,6 +832,9 @@ NV_STATUS __nvoc_objCreate_KernelBif(KernelBif**, Dynamic*, NvU32);
 #define kbifStopSysMemRequests_FNPTR(pKernelBif) pKernelBif->__kbifStopSysMemRequests__
 #define kbifStopSysMemRequests(pGpu, pKernelBif, bStop) kbifStopSysMemRequests_DISPATCH(pGpu, pKernelBif, bStop)
 #define kbifStopSysMemRequests_HAL(pGpu, pKernelBif, bStop) kbifStopSysMemRequests_DISPATCH(pGpu, pKernelBif, bStop)
+#define kbifDisableSysmemAccess_FNPTR(pKernelBif) pKernelBif->__kbifDisableSysmemAccess__
+#define kbifDisableSysmemAccess(pGpu, pKernelBif, bDisable) kbifDisableSysmemAccess_DISPATCH(pGpu, pKernelBif, bDisable)
+#define kbifDisableSysmemAccess_HAL(pGpu, pKernelBif, bDisable) kbifDisableSysmemAccess_DISPATCH(pGpu, pKernelBif, bDisable)
 #define kbifWaitForTransactionsComplete_FNPTR(pKernelBif) pKernelBif->__kbifWaitForTransactionsComplete__
 #define kbifWaitForTransactionsComplete(pGpu, pKernelBif) kbifWaitForTransactionsComplete_DISPATCH(pGpu, pKernelBif)
 #define kbifWaitForTransactionsComplete_HAL(pGpu, pKernelBif) kbifWaitForTransactionsComplete_DISPATCH(pGpu, pKernelBif)
@@ -570,6 +871,9 @@ NV_STATUS __nvoc_objCreate_KernelBif(KernelBif**, Dynamic*, NvU32);
 #define kbifPrepareForFullChipReset_FNPTR(pKernelBif) pKernelBif->__kbifPrepareForFullChipReset__
 #define kbifPrepareForFullChipReset(pGpu, pKernelBif) kbifPrepareForFullChipReset_DISPATCH(pGpu, pKernelBif)
 #define kbifPrepareForFullChipReset_HAL(pGpu, pKernelBif) kbifPrepareForFullChipReset_DISPATCH(pGpu, pKernelBif)
+#define kbifIsC2CP2PSupported_FNPTR(pKernelBif0) pKernelBif0->__kbifIsC2CP2PSupported__
+#define kbifIsC2CP2PSupported(pGpu0, pKernelBif0, pGpu1) kbifIsC2CP2PSupported_DISPATCH(pGpu0, pKernelBif0, pGpu1)
+#define kbifIsC2CP2PSupported_HAL(pGpu0, pKernelBif0, pGpu1) kbifIsC2CP2PSupported_DISPATCH(pGpu0, pKernelBif0, pGpu1)
 #define kbifPrepareForXveReset_FNPTR(pKernelBif) pKernelBif->__kbifPrepareForXveReset__
 #define kbifPrepareForXveReset(pGpu, pKernelBif) kbifPrepareForXveReset_DISPATCH(pGpu, pKernelBif)
 #define kbifPrepareForXveReset_HAL(pGpu, pKernelBif) kbifPrepareForXveReset_DISPATCH(pGpu, pKernelBif)
@@ -600,9 +904,15 @@ NV_STATUS __nvoc_objCreate_KernelBif(KernelBif**, Dynamic*, NvU32);
 #define kbifClearDownstreamReadCounter_FNPTR(pKernelBif) pKernelBif->__kbifClearDownstreamReadCounter__
 #define kbifClearDownstreamReadCounter(pGpu, pKernelBif) kbifClearDownstreamReadCounter_DISPATCH(pGpu, pKernelBif)
 #define kbifClearDownstreamReadCounter_HAL(pGpu, pKernelBif) kbifClearDownstreamReadCounter_DISPATCH(pGpu, pKernelBif)
+#define kbifDoSecondaryBusResetOrFunctionLevelReset_FNPTR(pKernelBif) pKernelBif->__kbifDoSecondaryBusResetOrFunctionLevelReset__
+#define kbifDoSecondaryBusResetOrFunctionLevelReset(pGpu, pKernelBif) kbifDoSecondaryBusResetOrFunctionLevelReset_DISPATCH(pGpu, pKernelBif)
+#define kbifDoSecondaryBusResetOrFunctionLevelReset_HAL(pGpu, pKernelBif) kbifDoSecondaryBusResetOrFunctionLevelReset_DISPATCH(pGpu, pKernelBif)
 #define kbifDoSecondaryBusHotReset_FNPTR(pKernelBif) pKernelBif->__kbifDoSecondaryBusHotReset__
 #define kbifDoSecondaryBusHotReset(pGpu, pKernelBif) kbifDoSecondaryBusHotReset_DISPATCH(pGpu, pKernelBif)
 #define kbifDoSecondaryBusHotReset_HAL(pGpu, pKernelBif) kbifDoSecondaryBusHotReset_DISPATCH(pGpu, pKernelBif)
+#define kbifConstructXtlAperture_FNPTR(pKernelBif) pKernelBif->__kbifConstructXtlAperture__
+#define kbifConstructXtlAperture(pGpu, pKernelBif) kbifConstructXtlAperture_DISPATCH(pGpu, pKernelBif)
+#define kbifConstructXtlAperture_HAL(pGpu, pKernelBif) kbifConstructXtlAperture_DISPATCH(pGpu, pKernelBif)
 #define kbifInitMissing_FNPTR(pEngstate) pEngstate->__nvoc_base_OBJENGSTATE.__nvoc_metadata_ptr->vtable.__engstateInitMissing__
 #define kbifInitMissing(pGpu, pEngstate) kbifInitMissing_DISPATCH(pGpu, pEngstate)
 #define kbifStatePreInitLocked_FNPTR(pEngstate) pEngstate->__nvoc_base_OBJENGSTATE.__nvoc_metadata_ptr->vtable.__engstateStatePreInitLocked__
@@ -643,12 +953,24 @@ static inline NV_STATUS kbifStateUnload_DISPATCH(struct OBJGPU *pGpu, struct Ker
     return pKernelBif->__nvoc_metadata_ptr->vtable.__kbifStateUnload__(pGpu, pKernelBif, arg3);
 }
 
-static inline NvU32 kbifGetBusIntfType_DISPATCH(struct KernelBif *pKernelBif) {
-    return pKernelBif->__kbifGetBusIntfType__(pKernelBif);
+static inline void kbifDestruct_DISPATCH(struct KernelBif *pKernelBif) {
+    pKernelBif->__kbifDestruct__(pKernelBif);
 }
 
 static inline void kbifInitLtr_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
     pKernelBif->__kbifInitLtr__(pGpu, pKernelBif);
+}
+
+static inline NV_STATUS kbifGetLtrEnable_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool *arg3) {
+    return pKernelBif->__kbifGetLtrEnable__(pGpu, pKernelBif, arg3);
+}
+
+static inline NV_STATUS kbifSetLtrEnable_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool arg3) {
+    return pKernelBif->__kbifSetLtrEnable__(pGpu, pKernelBif, arg3);
+}
+
+static inline void kbifCacheDeviceControlStatus2Reg_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    pKernelBif->__kbifCacheDeviceControlStatus2Reg__(pGpu, pKernelBif);
 }
 
 static inline void kbifInitDmaCaps_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
@@ -685,6 +1007,10 @@ static inline NV_STATUS kbifClearXveStatus_DISPATCH(struct OBJGPU *pGpu, struct 
 
 static inline NV_STATUS kbifGetXveAerBits_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pBits) {
     return pKernelBif->__kbifGetXveAerBits__(pGpu, pKernelBif, pBits);
+}
+
+static inline NvU32 kbifGetIdeInfo_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 counterType) {
+    return pKernelBif->__kbifGetIdeInfo__(pGpu, pKernelBif, counterType);
 }
 
 static inline NV_STATUS kbifClearXveAer_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 bits) {
@@ -743,8 +1069,12 @@ static inline NV_STATUS kbifEnableNoSnoop_DISPATCH(struct OBJGPU *pGpu, struct K
     return pKernelBif->__kbifEnableNoSnoop__(pGpu, pKernelBif, bEnable);
 }
 
-static inline void kbifApplyWARBug3208922_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    pKernelBif->__kbifApplyWARBug3208922__(pGpu, pKernelBif);
+static inline void kbifDisableP2PTransactions_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    pKernelBif->__kbifDisableP2PTransactions__(pGpu, pKernelBif);
+}
+
+static inline NV_STATUS kbifGetVFSparseMmapRegions_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, KERNEL_HOST_VGPU_DEVICE *pKernelHostVgpuDevice, NvU64 osPageSize, NvU32 *pNumAreas, NvU64 *pOffsets, NvU64 *pSizes) {
+    return pKernelBif->__kbifGetVFSparseMmapRegions__(pGpu, pKernelBif, pKernelHostVgpuDevice, osPageSize, pNumAreas, pOffsets, pSizes);
 }
 
 static inline void kbifProbePcieReqAtomicCaps_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
@@ -795,6 +1125,10 @@ static inline NV_STATUS kbifStopSysMemRequests_DISPATCH(struct OBJGPU *pGpu, str
     return pKernelBif->__kbifStopSysMemRequests__(pGpu, pKernelBif, bStop);
 }
 
+static inline NV_STATUS kbifDisableSysmemAccess_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bDisable) {
+    return pKernelBif->__kbifDisableSysmemAccess__(pGpu, pKernelBif, bDisable);
+}
+
 static inline NV_STATUS kbifWaitForTransactionsComplete_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
     return pKernelBif->__kbifWaitForTransactionsComplete__(pGpu, pKernelBif);
 }
@@ -843,6 +1177,10 @@ static inline void kbifPrepareForFullChipReset_DISPATCH(struct OBJGPU *pGpu, str
     pKernelBif->__kbifPrepareForFullChipReset__(pGpu, pKernelBif);
 }
 
+static inline NvBool kbifIsC2CP2PSupported_DISPATCH(struct OBJGPU *pGpu0, struct KernelBif *pKernelBif0, struct OBJGPU *pGpu1) {
+    return pKernelBif0->__kbifIsC2CP2PSupported__(pGpu0, pKernelBif0, pGpu1);
+}
+
 static inline NV_STATUS kbifPrepareForXveReset_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
     return pKernelBif->__kbifPrepareForXveReset__(pGpu, pKernelBif);
 }
@@ -883,8 +1221,16 @@ static inline void kbifClearDownstreamReadCounter_DISPATCH(struct OBJGPU *pGpu, 
     pKernelBif->__kbifClearDownstreamReadCounter__(pGpu, pKernelBif);
 }
 
+static inline NV_STATUS kbifDoSecondaryBusResetOrFunctionLevelReset_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    return pKernelBif->__kbifDoSecondaryBusResetOrFunctionLevelReset__(pGpu, pKernelBif);
+}
+
 static inline NV_STATUS kbifDoSecondaryBusHotReset_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
     return pKernelBif->__kbifDoSecondaryBusHotReset__(pGpu, pKernelBif);
+}
+
+static inline void kbifConstructXtlAperture_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
+    pKernelBif->__kbifConstructXtlAperture__(pGpu, pKernelBif);
 }
 
 static inline void kbifInitMissing_DISPATCH(struct OBJGPU *pGpu, struct KernelBif *pEngstate) {
@@ -923,135 +1269,50 @@ static inline NvBool kbifIsPresent_DISPATCH(struct OBJGPU *pGpu, struct KernelBi
     return pEngstate->__nvoc_metadata_ptr->vtable.__kbifIsPresent__(pGpu, pEngstate);
 }
 
-void kbifDestruct_GM107(struct KernelBif *pKernelBif);
-
-
-#define __nvoc_kbifDestruct(pKernelBif) kbifDestruct_GM107(pKernelBif)
-NvU32 kbifGetGpuLinkCapabilities_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NvU32 kbifGetGpuLinkCapabilities(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-    return 0;
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifGetGpuLinkCapabilities(pGpu, pKernelBif) kbifGetGpuLinkCapabilities_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
-
-#define kbifGetGpuLinkCapabilities_HAL(pGpu, pKernelBif) kbifGetGpuLinkCapabilities(pGpu, pKernelBif)
-
-void kbifClearConfigErrors_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool arg3, NvU32 arg4);
-
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline void kbifClearConfigErrors(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool arg3, NvU32 arg4) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifClearConfigErrors(pGpu, pKernelBif, arg3, arg4) kbifClearConfigErrors_IMPL(pGpu, pKernelBif, arg3, arg4)
-#endif //__nvoc_kernel_bif_h_disabled
-
-#define kbifClearConfigErrors_HAL(pGpu, pKernelBif, arg3, arg4) kbifClearConfigErrors(pGpu, pKernelBif, arg3, arg4)
-
-void kbifDisableP2PTransactions_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline void kbifDisableP2PTransactions(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifDisableP2PTransactions(pGpu, pKernelBif) kbifDisableP2PTransactions_TU102(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
-
-#define kbifDisableP2PTransactions_HAL(pGpu, pKernelBif) kbifDisableP2PTransactions(pGpu, pKernelBif)
-
-NV_STATUS kbifGetVFSparseMmapRegions_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, KERNEL_HOST_VGPU_DEVICE *pKernelHostVgpuDevice, NvU64 osPageSize, NvU32 *pNumAreas, NvU64 *pOffsets, NvU64 *pSizes);
-
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NV_STATUS kbifGetVFSparseMmapRegions(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, KERNEL_HOST_VGPU_DEVICE *pKernelHostVgpuDevice, NvU64 osPageSize, NvU32 *pNumAreas, NvU64 *pOffsets, NvU64 *pSizes) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifGetVFSparseMmapRegions(pGpu, pKernelBif, pKernelHostVgpuDevice, osPageSize, pNumAreas, pOffsets, pSizes) kbifGetVFSparseMmapRegions_TU102(pGpu, pKernelBif, pKernelHostVgpuDevice, osPageSize, pNumAreas, pOffsets, pSizes)
-#endif //__nvoc_kernel_bif_h_disabled
-
-#define kbifGetVFSparseMmapRegions_HAL(pGpu, pKernelBif, pKernelHostVgpuDevice, osPageSize, pNumAreas, pOffsets, pSizes) kbifGetVFSparseMmapRegions(pGpu, pKernelBif, pKernelHostVgpuDevice, osPageSize, pNumAreas, pOffsets, pSizes)
-
-NV_STATUS kbifDisableSysmemAccess_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bDisable);
-
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NV_STATUS kbifDisableSysmemAccess(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bDisable) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifDisableSysmemAccess(pGpu, pKernelBif, bDisable) kbifDisableSysmemAccess_GM107(pGpu, pKernelBif, bDisable)
-#endif //__nvoc_kernel_bif_h_disabled
-
-#define kbifDisableSysmemAccess_HAL(pGpu, pKernelBif, bDisable) kbifDisableSysmemAccess(pGpu, pKernelBif, bDisable)
-
-static inline NV_STATUS kbifApplyWarForBug1511451_56cd7a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return NV_OK;
-}
-
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NV_STATUS kbifApplyWarForBug1511451(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifApplyWarForBug1511451(pGpu, pKernelBif) kbifApplyWarForBug1511451_56cd7a(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
-
-#define kbifApplyWarForBug1511451_HAL(pGpu, pKernelBif) kbifApplyWarForBug1511451(pGpu, pKernelBif)
-
-NV_STATUS kbifDoSecondaryBusResetOrFunctionLevelReset_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NV_STATUS kbifDoSecondaryBusResetOrFunctionLevelReset(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifDoSecondaryBusResetOrFunctionLevelReset(pGpu, pKernelBif) kbifDoSecondaryBusResetOrFunctionLevelReset_TU102(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
-
-#define kbifDoSecondaryBusResetOrFunctionLevelReset_HAL(pGpu, pKernelBif) kbifDoSecondaryBusResetOrFunctionLevelReset(pGpu, pKernelBif)
-
+// Virtual method declarations and/or inline definitions
 NV_STATUS kbifConstructEngine_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, ENGDESCRIPTOR arg3);
 
 NV_STATUS kbifStateInitLocked_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
 NV_STATUS kbifStateLoad_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 arg3);
-
-static inline NV_STATUS kbifStatePostLoad_56cd7a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 arg3) {
-    return NV_OK;
-}
 
 NV_STATUS kbifStatePostLoad_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 arg3);
 
 NV_STATUS kbifStateUnload_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 arg3);
 
-static inline NvU32 kbifGetBusIntfType_28ceda(struct KernelBif *pKernelBif) {
-    return (1);
-}
+void kbifDestruct_GM107(struct KernelBif *pKernelBif);
 
-static inline NvU32 kbifGetBusIntfType_2f2c74(struct KernelBif *pKernelBif) {
-    return (3);
-}
+NvU32 kbifGetGpuLinkCapabilities_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline void kbifInitLtr_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return;
-}
+NvU32 kbifGetGpuLinkControlStatus_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+
+NvU32 kbifGetGpuDevControlStatus_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+
+NvU32 kbifGetGpuDevControlStatus2_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+
+NvU32 kbifGetGpuL1PmSubstatesCtrl1_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+
+NV_STATUS kbifGetConfigRegData_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NV2080_CTRL_BIF_GET_DATA_PARAMS *pParams);
 
 void kbifInitLtr_GB202(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+
+void kbifInitLtr_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+
+NV_STATUS kbifGetLtrEnable_GB202(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool *arg3);
+
+NV_STATUS kbifGetLtrEnable_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool *arg3);
+
+NV_STATUS kbifGetLtrEnable_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool *arg3);
+
+NV_STATUS kbifSetLtrEnable_GB202(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool arg3);
+
+NV_STATUS kbifSetLtrEnable_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool arg3);
+
+NV_STATUS kbifSetLtrEnable_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool arg3);
+
+void kbifCacheDeviceControlStatus2Reg_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifInitDmaCaps_VF(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
@@ -1065,155 +1326,101 @@ NV_STATUS kbifRestorePcieConfigRegisters_GM107(struct OBJGPU *pGpu, struct Kerne
 
 NV_STATUS kbifRestorePcieConfigRegisters_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline NV_STATUS kbifSavePcieConfigRegistersFn1_56cd7a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, const PKBIF_XVE_REGMAP_REF pRegmapRef, NvU32 maxSize) {
-    return NV_OK;
-}
-
 NV_STATUS kbifSavePcieConfigRegistersFn1_GB202(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, const PKBIF_XVE_REGMAP_REF pRegmapRef, NvU32 maxSize);
-
-static inline NV_STATUS kbifRestorePcieConfigRegistersFn1_56cd7a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, const PKBIF_XVE_REGMAP_REF pRegmapRef, NvU32 maxSize) {
-    return NV_OK;
-}
 
 NV_STATUS kbifRestorePcieConfigRegistersFn1_GB202(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, const PKBIF_XVE_REGMAP_REF pRegmapRef, NvU32 maxSize);
 
 NV_STATUS kbifPollBarFirewallDisengage_GB202(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline NV_STATUS kbifPollBarFirewallDisengage_56cd7a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return NV_OK;
-}
+void kbifClearConfigErrors_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool arg3, NvU32 arg4);
 
 NV_STATUS kbifGetXveStatusBits_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pBits, NvU32 *pStatus);
 
-NV_STATUS kbifGetXveStatusBits_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pBits, NvU32 *pStatus);
-
 NV_STATUS kbifGetXveStatusBits_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pBits, NvU32 *pStatus);
+
+NV_STATUS kbifGetXveStatusBits_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pBits, NvU32 *pStatus);
 
 NV_STATUS kbifClearXveStatus_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pStatus);
 
-NV_STATUS kbifClearXveStatus_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pStatus);
-
 NV_STATUS kbifClearXveStatus_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pStatus);
+
+NV_STATUS kbifClearXveStatus_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pStatus);
 
 NV_STATUS kbifGetXveAerBits_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pBits);
 
+NV_STATUS kbifGetXveAerBits_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pBits);
+
 NV_STATUS kbifGetXveAerBits_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pBits);
 
-NV_STATUS kbifGetXveAerBits_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pBits);
+NvU32 kbifGetIdeInfo_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 counterType);
 
 NV_STATUS kbifClearXveAer_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 bits);
 
-NV_STATUS kbifClearXveAer_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 bits);
-
 NV_STATUS kbifClearXveAer_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 bits);
+
+NV_STATUS kbifClearXveAer_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 bits);
 
 void kbifGetPcieConfigAccessTestRegisters_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pciStart, NvU32 *pcieStart);
 
-static inline void kbifGetPcieConfigAccessTestRegisters_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pciStart, NvU32 *pcieStart) {
-    return;
-}
-
 NV_STATUS kbifVerifyPcieConfigAccessTestRegisters_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 nvXveId, NvU32 nvXveVccapHdr);
 
-static inline NV_STATUS kbifVerifyPcieConfigAccessTestRegisters_56cd7a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 nvXveId, NvU32 nvXveVccapHdr) {
-    return NV_OK;
-}
-
 void kbifRearmMSI_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-static inline void kbifRearmMSI_f2d351(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_PRECOMP(0);
-}
 
 NvBool kbifIsMSIEnabledInHW_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 NvBool kbifIsMSIEnabledInHW_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline NvBool kbifIsMSIEnabledInHW_3dd2c9(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return NV_FALSE;
-}
-
 NvBool kbifIsMSIXEnabledInHW_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-NvBool kbifIsMSIXEnabledInHW_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 NvBool kbifIsMSIXEnabledInHW_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
+NvBool kbifIsMSIXEnabledInHW_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+
 NvBool kbifIsPciIoAccessEnabled_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-NvBool kbifIsPciIoAccessEnabled_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-static inline NvBool kbifIsPciIoAccessEnabled_3dd2c9(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return NV_FALSE;
-}
+NvBool kbifIsPciIoAccessEnabled_GB202(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 NvBool kbifIs3dController_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-NvBool kbifIs3dController_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
 NvBool kbifIs3dController_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+
+NvBool kbifIs3dController_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifExecC73War_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline void kbifExecC73War_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return;
-}
+void kbifEnableExtendedTagSupport_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifEnableExtendedTagSupport_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-void kbifEnableExtendedTagSupport_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-static inline void kbifEnableExtendedTagSupport_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return;
-}
-
 void kbifPcieConfigEnableRelaxedOrdering_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-void kbifPcieConfigEnableRelaxedOrdering_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifPcieConfigEnableRelaxedOrdering_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-void kbifPcieConfigDisableRelaxedOrdering_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+void kbifPcieConfigEnableRelaxedOrdering_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-void kbifPcieConfigDisableRelaxedOrdering_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+void kbifPcieConfigDisableRelaxedOrdering_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifPcieConfigDisableRelaxedOrdering_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline void kbifInitRelaxedOrderingFromEmulatedConfigSpace_b3696a(struct OBJGPU *pGpu, struct KernelBif *pBif) {
-    return;
-}
+void kbifPcieConfigDisableRelaxedOrdering_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifInitRelaxedOrderingFromEmulatedConfigSpace_GA100(struct OBJGPU *pGpu, struct KernelBif *pBif);
 
 NV_STATUS kbifEnableNoSnoop_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bEnable);
 
-NV_STATUS kbifEnableNoSnoop_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bEnable);
-
 NV_STATUS kbifEnableNoSnoop_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bEnable);
 
-void kbifApplyWARBug3208922_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+NV_STATUS kbifEnableNoSnoop_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bEnable);
 
-static inline void kbifApplyWARBug3208922_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return;
-}
+void kbifDisableP2PTransactions_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline void kbifProbePcieReqAtomicCaps_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return;
-}
+NV_STATUS kbifGetVFSparseMmapRegions_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, KERNEL_HOST_VGPU_DEVICE *pKernelHostVgpuDevice, NvU64 osPageSize, NvU32 *pNumAreas, NvU64 *pOffsets, NvU64 *pSizes);
 
 void kbifProbePcieReqAtomicCaps_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-void kbifEnablePcieAtomics_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
 void kbifEnablePcieAtomics_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline void kbifEnablePcieAtomics_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return;
-}
-
-static inline void kbifProbePcieCplAtomicCaps_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return;
-}
+void kbifEnablePcieAtomics_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifProbePcieCplAtomicCaps_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
@@ -1221,33 +1428,27 @@ void kbifReadPcieCplCapsFromConfigSpace_GB100(struct OBJGPU *pGpu, struct Kernel
 
 void kbifReadPcieCplCapsFromConfigSpace_GB10B(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *bifAtomicsmask);
 
-static inline void kbifReadPcieCplCapsFromConfigSpace_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *bifAtomicsmask) {
-    return;
-}
-
 NV_STATUS kbifDoFunctionLevelReset_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 NV_STATUS kbifDoFunctionLevelReset_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
+NV_STATUS kbifInitXveRegMap_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU8 arg3);
+
 NV_STATUS kbifInitXveRegMap_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU8 arg3);
 
-NV_STATUS kbifInitXveRegMap_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU8 arg3);
+NV_STATUS kbifInitXveRegMap_AD102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU8 arg3);
 
 NV_STATUS kbifInitXveRegMap_GA102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU8 arg3);
 
 NvU32 kbifGetMSIXTableVectorControlSize_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-NvU32 kbifGetMSIXTableVectorControlSize_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
 NvU32 kbifGetMSIXTableVectorControlSize_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-NV_STATUS kbifConfigAccessWait_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, RMTIMEOUT *pTimeout);
+NvU32 kbifGetMSIXTableVectorControlSize_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 NV_STATUS kbifConfigAccessWait_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, RMTIMEOUT *pTimeout);
 
-static inline NV_STATUS kbifConfigAccessWait_46f6a7(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, RMTIMEOUT *pTimeout) {
-    return NV_ERR_NOT_SUPPORTED;
-}
+NV_STATUS kbifConfigAccessWait_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, RMTIMEOUT *pTimeout);
 
 NV_STATUS kbifGetPciConfigSpacePriMirror_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pMirrorBase, NvU32 *pMirrorSize);
 
@@ -1255,75 +1456,53 @@ NV_STATUS kbifGetPciConfigSpacePriMirror_GH100(struct OBJGPU *pGpu, struct Kerne
 
 NV_STATUS kbifGetBusOptionsAddr_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, BUS_OPTIONS options, NvU32 *addrReg);
 
-NV_STATUS kbifGetBusOptionsAddr_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, BUS_OPTIONS options, NvU32 *addrReg);
-
 NV_STATUS kbifGetBusOptionsAddr_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, BUS_OPTIONS options, NvU32 *addrReg);
+
+NV_STATUS kbifGetBusOptionsAddr_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, BUS_OPTIONS options, NvU32 *addrReg);
 
 NV_STATUS kbifPreOsGlobalErotGrantRequest_AD102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline NV_STATUS kbifPreOsGlobalErotGrantRequest_56cd7a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return NV_OK;
-}
-
-static inline NV_STATUS kbifStopSysMemRequests_56cd7a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bStop) {
-    return NV_OK;
-}
-
 NV_STATUS kbifStopSysMemRequests_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bStop);
+
+NV_STATUS kbifStopSysMemRequests_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bStop);
 
 NV_STATUS kbifStopSysMemRequests_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bStop);
 
-NV_STATUS kbifStopSysMemRequests_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bStop);
+NV_STATUS kbifDisableSysmemAccess_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bDisable);
 
 NV_STATUS kbifWaitForTransactionsComplete_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 NV_STATUS kbifWaitForTransactionsComplete_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline NV_STATUS kbifWaitForTransactionsComplete_46f6a7(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return NV_ERR_NOT_SUPPORTED;
-}
-
 NV_STATUS kbifTriggerFlr_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-NV_STATUS kbifTriggerFlr_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 NV_STATUS kbifTriggerFlr_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-void kbifCacheFlrSupport_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+NV_STATUS kbifTriggerFlr_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-void kbifCacheFlrSupport_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+void kbifCacheFlrSupport_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifCacheFlrSupport_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline void kbifCache64bBar0Support_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return;
-}
+void kbifCacheFlrSupport_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifCache64bBar0Support_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-void kbifCache64bBar0Support_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
 void kbifCache64bBar0Support_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline void kbifCacheMnocSupport_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return;
-}
+void kbifCache64bBar0Support_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifCacheMnocSupport_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifCacheVFInfo_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-void kbifCacheVFInfo_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
 void kbifCacheVFInfo_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+
+void kbifCacheVFInfo_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifRestoreBar0_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, void *arg3, NvU32 *arg4);
 
 void kbifRestoreBar0_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, void *arg3, NvU32 *arg4);
-
-static inline void kbifRestoreBar0_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, void *arg3, NvU32 *arg4) {
-    return;
-}
 
 NvBool kbifAnyBarsAreValid_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
@@ -1333,19 +1512,13 @@ NV_STATUS kbifRestoreBarsAndCommand_GM107(struct OBJGPU *pGpu, struct KernelBif 
 
 NV_STATUS kbifRestoreBarsAndCommand_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
+NV_STATUS kbifRestoreBarsAndCommand_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+
 NV_STATUS kbifRestoreBarsAndCommand_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 void kbifStoreBarRegOffsets_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 arg3);
 
-static inline void kbifStoreBarRegOffsets_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 arg3) {
-    return;
-}
-
 NV_STATUS kbifInit_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-static inline NV_STATUS kbifInit_56cd7a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return NV_OK;
-}
 
 void kbifPrepareForFullChipReset_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
@@ -1353,11 +1526,9 @@ void kbifPrepareForFullChipReset_GA100(struct OBJGPU *pGpu, struct KernelBif *pK
 
 void kbifPrepareForFullChipReset_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-NV_STATUS kbifPrepareForXveReset_GP100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+NvBool kbifIsC2CP2PSupported_GH100(struct OBJGPU *pGpu0, struct KernelBif *pKernelBif0, struct OBJGPU *pGpu1);
 
-static inline NV_STATUS kbifPrepareForXveReset_56cd7a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return NV_OK;
-}
+NV_STATUS kbifPrepareForXveReset_GP100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 NV_STATUS kbifDoFullChipReset_GP10X(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
@@ -1367,19 +1538,13 @@ NV_STATUS kbifDoFullChipReset_GH100(struct OBJGPU *pGpu, struct KernelBif *pKern
 
 void kbifResetHostEngines_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, struct KernelMc *arg3);
 
-static inline void kbifResetHostEngines_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, struct KernelMc *arg3) {
-    return;
-}
-
 NvU32 kbifGetValidEnginesToReset_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 NvU32 kbifGetValidEnginesToReset_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-NvU32 kbifGetValidDeviceEnginesToReset_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+NvU32 kbifGetValidEnginesToReset_GB100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline NvU32 kbifGetValidDeviceEnginesToReset_15a734(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return 0U;
-}
+NvU32 kbifGetValidDeviceEnginesToReset_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 NV_STATUS kbifGetMigrationBandwidth_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pBandwidth);
 
@@ -1387,224 +1552,327 @@ NV_STATUS kbifGetMigrationBandwidth_GM107(struct OBJGPU *pGpu, struct KernelBif 
 
 NvU32 kbifGetEccCounts_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline NvU32 kbifGetEccCounts_4a4dee(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return 0;
-}
-
 NvBool kbifAllowGpuReqPcieAtomics_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-static inline NvBool kbifAllowGpuReqPcieAtomics_88bc07(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return NV_TRUE;
-}
 
 NvBool kbifAllowGpuReqPcieAtomics_GB202(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline NvBool kbifAllowGpuReqPcieAtomics_3dd2c9(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return NV_FALSE;
-}
-
-static inline NvBool kbifAllowGpuCplPcieAtomics_88bc07(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return NV_TRUE;
-}
-
-static inline NvBool kbifAllowGpuCplPcieAtomics_3dd2c9(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return NV_FALSE;
-}
-
 void kbifClearDownstreamReadCounter_GA100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-static inline void kbifClearDownstreamReadCounter_b3696a(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    return;
-}
+NV_STATUS kbifDoSecondaryBusResetOrFunctionLevelReset_TU102(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 NV_STATUS kbifDoSecondaryBusHotReset_GM107(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
 NV_STATUS kbifDoSecondaryBusHotReset_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-NV_STATUS kbifStaticInfoInit_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+void kbifConstructXtlAperture_GH100(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
 
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NV_STATUS kbifStaticInfoInit(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+void kbifConstructXtlAperture_GB202(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+
+void kbifConstructXtlAperture_GB10B(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+
+// Inline HAL method definitions
+static inline NV_STATUS kbifStatePostLoad_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 arg3){
+    return NV_OK;
+}
+
+static inline void kbifDestruct_d44104(struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifInitLtr_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline NV_STATUS kbifGetLtrEnable_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool *arg3){
     return NV_ERR_NOT_SUPPORTED;
 }
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifStaticInfoInit(pGpu, pKernelBif) kbifStaticInfoInit_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
 
-void kbifInitPcieDeviceControlStatus_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline void kbifInitPcieDeviceControlStatus(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+static inline NV_STATUS kbifSetLtrEnable_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool arg3){
+    return NV_ERR_NOT_SUPPORTED;
 }
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifInitPcieDeviceControlStatus(pGpu, pKernelBif) kbifInitPcieDeviceControlStatus_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
 
-void kbifCheckAndRearmMSI_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline void kbifCheckAndRearmMSI(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+static inline void kbifCacheDeviceControlStatus2Reg_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
 }
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifCheckAndRearmMSI(pGpu, pKernelBif) kbifCheckAndRearmMSI_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
 
-NvBool kbifIsMSIEnabled_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+static inline NV_STATUS kbifSavePcieConfigRegisters_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_OK;
+}
 
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NvBool kbifIsMSIEnabled(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+static inline NV_STATUS kbifRestorePcieConfigRegisters_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_OK;
+}
+
+static inline NV_STATUS kbifSavePcieConfigRegistersFn1_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, const PKBIF_XVE_REGMAP_REF pRegmapRef, NvU32 maxSize){
+    return NV_OK;
+}
+
+static inline NV_STATUS kbifRestorePcieConfigRegistersFn1_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, const PKBIF_XVE_REGMAP_REF pRegmapRef, NvU32 maxSize){
+    return NV_OK;
+}
+
+static inline NV_STATUS kbifPollBarFirewallDisengage_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_OK;
+}
+
+static inline NV_STATUS kbifGetXveStatusBits_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pBits, NvU32 *pStatus){
+    return NV_OK;
+}
+
+static inline NV_STATUS kbifClearXveStatus_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pStatus){
+    return NV_OK;
+}
+
+static inline NV_STATUS kbifGetXveAerBits_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pBits){
+    return NV_OK;
+}
+
+static inline NvU32 kbifGetIdeInfo_b2b553(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 counterType){
+    return 0;
+}
+
+static inline NV_STATUS kbifClearXveAer_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 bits){
+    return NV_OK;
+}
+
+static inline void kbifGetPcieConfigAccessTestRegisters_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pciStart, NvU32 *pcieStart){
+    return;
+}
+
+static inline NV_STATUS kbifVerifyPcieConfigAccessTestRegisters_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 nvXveId, NvU32 nvXveVccapHdr){
+    return NV_OK;
+}
+
+static inline void kbifRearmMSI_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifRearmMSI_f2d351(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    NV_ASSERT_PRECOMP(0);
+}
+
+static inline NvBool kbifIsMSIEnabledInHW_d69453(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
     return NV_FALSE;
 }
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifIsMSIEnabled(pGpu, pKernelBif) kbifIsMSIEnabled_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
 
-NvBool kbifIsMSIXEnabled_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NvBool kbifIsMSIXEnabled(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+static inline NvBool kbifIsMSIXEnabledInHW_d69453(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
     return NV_FALSE;
 }
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifIsMSIXEnabled(pGpu, pKernelBif) kbifIsMSIXEnabled_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
 
-NV_STATUS kbifPollDeviceOnBus_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NV_STATUS kbifPollDeviceOnBus(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifPollDeviceOnBus(pGpu, pKernelBif) kbifPollDeviceOnBus_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
-
-NvU32 kbifGetGpuLinkControlStatus_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NvU32 kbifGetGpuLinkControlStatus(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-    return 0;
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifGetGpuLinkControlStatus(pGpu, pKernelBif) kbifGetGpuLinkControlStatus_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
-
-NvU32 kbifGetGpuDevControlStatus_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NvU32 kbifGetGpuDevControlStatus(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-    return 0;
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifGetGpuDevControlStatus(pGpu, pKernelBif) kbifGetGpuDevControlStatus_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
-
-NvU32 kbifGetGpuDevControlStatus2_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NvU32 kbifGetGpuDevControlStatus2(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-    return 0;
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifGetGpuDevControlStatus2(pGpu, pKernelBif) kbifGetGpuDevControlStatus2_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
-
-NvU32 kbifGetGpuL1PmSubstatesCtrl1_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NvU32 kbifGetGpuL1PmSubstatesCtrl1(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-    return 0;
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifGetGpuL1PmSubstatesCtrl1(pGpu, pKernelBif) kbifGetGpuL1PmSubstatesCtrl1_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
-
-NV_STATUS kbifGetPciLinkMaxSpeedByPciGenInfo_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 pciLinkGenInfo, NvU32 *pciLinkMaxSpeed);
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NV_STATUS kbifGetPciLinkMaxSpeedByPciGenInfo(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 pciLinkGenInfo, NvU32 *pciLinkMaxSpeed) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifGetPciLinkMaxSpeedByPciGenInfo(pGpu, pKernelBif, pciLinkGenInfo, pciLinkMaxSpeed) kbifGetPciLinkMaxSpeedByPciGenInfo_IMPL(pGpu, pKernelBif, pciLinkGenInfo, pciLinkMaxSpeed)
-#endif //__nvoc_kernel_bif_h_disabled
-
-void kbifCacheChipsetL1SubstatesEnable_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline void kbifCacheChipsetL1SubstatesEnable(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifCacheChipsetL1SubstatesEnable(pGpu, pKernelBif) kbifCacheChipsetL1SubstatesEnable_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
-
-NV_STATUS kbifWaitForConfigAccessAfterReset_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NV_STATUS kbifWaitForConfigAccessAfterReset(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifWaitForConfigAccessAfterReset(pGpu, pKernelBif) kbifWaitForConfigAccessAfterReset_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
-
-NvBool kbifIsPciBusFamily_IMPL(struct KernelBif *pKernelBif);
-
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NvBool kbifIsPciBusFamily(struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+static inline NvBool kbifIsPciIoAccessEnabled_d69453(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
     return NV_FALSE;
 }
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifIsPciBusFamily(pKernelBif) kbifIsPciBusFamily_IMPL(pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
 
-NV_STATUS kbifControlGetPCIEInfo_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NV2080_CTRL_BUS_INFO *pBusInfo);
+static inline NvBool kbifIs3dController_d69453(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_FALSE;
+}
 
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NV_STATUS kbifControlGetPCIEInfo(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NV2080_CTRL_BUS_INFO *pBusInfo) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+static inline void kbifExecC73War_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifEnableExtendedTagSupport_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifPcieConfigEnableRelaxedOrdering_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifPcieConfigDisableRelaxedOrdering_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifInitRelaxedOrderingFromEmulatedConfigSpace_d44104(struct OBJGPU *pGpu, struct KernelBif *pBif){
+    return;
+}
+
+static inline NV_STATUS kbifEnableNoSnoop_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bEnable){
     return NV_ERR_NOT_SUPPORTED;
 }
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifControlGetPCIEInfo(pGpu, pKernelBif, pBusInfo) kbifControlGetPCIEInfo_IMPL(pGpu, pKernelBif, pBusInfo)
-#endif //__nvoc_kernel_bif_h_disabled
 
-NvU32 kbifGetDmaCaps_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+static inline void kbifDisableP2PTransactions_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
 
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NvU32 kbifGetDmaCaps(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+static inline NV_STATUS kbifGetVFSparseMmapRegions_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, KERNEL_HOST_VGPU_DEVICE *pKernelHostVgpuDevice, NvU64 osPageSize, NvU32 *pNumAreas, NvU64 *pOffsets, NvU64 *pSizes){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static inline void kbifProbePcieReqAtomicCaps_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifEnablePcieAtomics_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifProbePcieCplAtomicCaps_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifReadPcieCplCapsFromConfigSpace_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *bifAtomicsmask){
+    return;
+}
+
+static inline NV_STATUS kbifDoFunctionLevelReset_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static inline NV_STATUS kbifInitXveRegMap_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU8 arg3){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static inline NvU32 kbifGetMSIXTableVectorControlSize_b3787c(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    NV_ASSERT_OR_RETURN_PRECOMP(0, 0U);
+}
+
+static inline NV_STATUS kbifConfigAccessWait_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, RMTIMEOUT *pTimeout){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static inline NV_STATUS kbifGetPciConfigSpacePriMirror_d91cdc(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pMirrorBase, NvU32 *pMirrorSize){
+    return NV_ERR_NO_SUCH_DOMAIN;
+}
+
+static inline NV_STATUS kbifGetPciConfigSpacePriMirror_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 *pMirrorBase, NvU32 *pMirrorSize){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static inline NV_STATUS kbifGetBusOptionsAddr_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, BUS_OPTIONS options, NvU32 *addrReg){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static inline NV_STATUS kbifPreOsGlobalErotGrantRequest_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_OK;
+}
+
+static inline NV_STATUS kbifStopSysMemRequests_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bStop){
+    return NV_OK;
+}
+
+static inline NV_STATUS kbifStopSysMemRequests_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bStop){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static inline NV_STATUS kbifDisableSysmemAccess_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvBool bDisable){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static inline NV_STATUS kbifWaitForTransactionsComplete_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static inline NV_STATUS kbifTriggerFlr_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static inline void kbifCacheFlrSupport_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifCache64bBar0Support_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifCacheMnocSupport_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifCacheVFInfo_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline void kbifRestoreBar0_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, void *arg3, NvU32 *arg4){
+    return;
+}
+
+static inline NvBool kbifAnyBarsAreValid_d69453(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_FALSE;
+}
+
+static inline NV_STATUS kbifRestoreBarsAndCommand_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static inline void kbifStoreBarRegOffsets_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, NvU32 arg3){
+    return;
+}
+
+static inline NV_STATUS kbifInit_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+static inline NV_STATUS kbifInit_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_OK;
+}
+
+static inline void kbifPrepareForFullChipReset_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline NvBool kbifIsC2CP2PSupported_d69453(struct OBJGPU *pGpu0, struct KernelBif *pKernelBif0, struct OBJGPU *pGpu1){
+    return NV_FALSE;
+}
+
+static inline NV_STATUS kbifPrepareForXveReset_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_OK;
+}
+
+static inline NV_STATUS kbifDoFullChipReset_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_OK;
+}
+
+static inline void kbifResetHostEngines_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif, struct KernelMc *arg3){
+    return;
+}
+
+static inline NvU32 kbifGetValidEnginesToReset_edd98b(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return 0U;
+}
+
+static inline NvU32 kbifGetValidDeviceEnginesToReset_edd98b(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return 0U;
+}
+
+static inline NvU32 kbifGetEccCounts_b2b553(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
     return 0;
 }
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifGetDmaCaps(pGpu, pKernelBif) kbifGetDmaCaps_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
 
-NV_STATUS kbifResetFromTimeoutFullChip_IMPL(struct OBJGPU *pGpu, struct KernelBif *pKernelBif);
+static inline NvBool kbifAllowGpuReqPcieAtomics_e661f0(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_TRUE;
+}
 
-#ifdef __nvoc_kernel_bif_h_disabled
-static inline NV_STATUS kbifResetFromTimeoutFullChip(struct OBJGPU *pGpu, struct KernelBif *pKernelBif) {
-    NV_ASSERT_FAILED_PRECOMP("KernelBif was disabled!");
+static inline NvBool kbifAllowGpuReqPcieAtomics_d69453(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_FALSE;
+}
+
+static inline NvBool kbifAllowGpuCplPcieAtomics_e661f0(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_TRUE;
+}
+
+static inline NvBool kbifAllowGpuCplPcieAtomics_d69453(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_FALSE;
+}
+
+static inline void kbifClearDownstreamReadCounter_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+static inline NV_STATUS kbifDoSecondaryBusResetOrFunctionLevelReset_395e98(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
     return NV_ERR_NOT_SUPPORTED;
 }
-#else //__nvoc_kernel_bif_h_disabled
-#define kbifResetFromTimeoutFullChip(pGpu, pKernelBif) kbifResetFromTimeoutFullChip_IMPL(pGpu, pKernelBif)
-#endif //__nvoc_kernel_bif_h_disabled
 
+static inline NV_STATUS kbifDoSecondaryBusHotReset_ac1694(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return NV_OK;
+}
+
+static inline void kbifConstructXtlAperture_d44104(struct OBJGPU *pGpu, struct KernelBif *pKernelBif){
+    return;
+}
+
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

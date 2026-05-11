@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -125,6 +125,12 @@ _krcInitRegistryOverrides
     {
         dword = NV_REG_STR_RM_BREAK_ON_RC_DEFAULT;
     }
+    else
+    {
+        NV_PRINTF(LEVEL_INFO,
+            "BreakOnRc set by regkey " NV_REG_STR_RM_BREAK_ON_RC "= 0x%08x\n",
+            dword);
+    }
 
     pKernelRc->bBreakOnRc = (dword == NV_REG_STR_RM_BREAK_ON_RC_ENABLE);
 
@@ -132,9 +138,11 @@ _krcInitRegistryOverrides
     if (DRF_VAL(_DEBUG, _BREAK_FLAGS, _RC, SYS_GET_INSTANCE()->debugFlags) ==
         NV_DEBUG_BREAK_FLAGS_RC_ENABLE)
     {
+        NV_PRINTF(LEVEL_INFO,
+                  "BreakOnRc overridden by NV_DEBUG_BREAK_FLAGS_RC\n");
         pKernelRc->bBreakOnRc = NV_TRUE;
     }
-
+    NV_PRINTF(LEVEL_INFO, "BreakOnRc = %d\n", pKernelRc->bBreakOnRc);
 
     if (osReadRegistryDword(pGpu,
                             NV_REG_STR_RM_WATCHDOG_TIMEOUT,
@@ -145,6 +153,29 @@ _krcInitRegistryOverrides
         pKernelRc->watchdogPersistent.timeoutSecs =
             NV_REG_STR_RM_WATCHDOG_TIMEOUT_DEFAULT;
     }
+
+    NvU32 data32 = 0;
+    NvU32 bug5203024OverrideTimeouts = (
+        (osReadRegistryDword(pGpu, NV_REG_STR_RM_BUG5203024_OVERRIDE_TIMEOUT,
+                             &data32) == NV_OK) ?
+        data32 :
+        0);
+
+    NvBool bOverrideWatchdogTimeout = (DRF_VAL(_REG_STR,
+                                               _RM_BUG5203024_OVERRIDE_TIMEOUT,
+                                               _FLAGS_SET_RC_WATCHDOG_TIMEOUT,
+                                               bug5203024OverrideTimeouts) ==
+                                       1);
+    if (bOverrideWatchdogTimeout)
+    {
+        pKernelRc->watchdogPersistent.timeoutSecs =
+            DRF_VAL(_REG_STR, _RM_BUG5203024_OVERRIDE_TIMEOUT, _VALUE_MS,
+                    bug5203024OverrideTimeouts) / 1000;
+
+        NV_PRINTF(LEVEL_NOTICE, "RC Watchdog timeout forced to %d seconds.\n",
+                  pKernelRc->watchdogPersistent.timeoutSecs);
+    }
+
     if (osReadRegistryDword(pGpu,
                             NV_REG_STR_RM_WATCHDOG_INTERVAL,
                             &pKernelRc->watchdogPersistent.intervalSecs) !=
@@ -286,6 +317,12 @@ krcReportXid_IMPL
         char          *allocProcName = NULL;
         const char    *procName = NULL;
         char           pidStr[12] = "";
+
+        if (pKernelChannel == NULL && context.pChannelInfo != NULL)
+        {
+            KernelFifo *pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
+            pKernelChannel = kfifoKernelChannelFromInfo(pGpu, pKernelFifo, *(FIFO_CHANNEL_INFO*)context.pChannelInfo);
+        }
 
         //
         // When the channel context is available, use the allocating process'
@@ -429,9 +466,8 @@ krcCheckBusError_KERNEL
     NvU32             clDevCtrlStatus          = 0;
     PcieAerCapability clAer;
 
-
     // PCI-E provides extended error reporting
-    if (pKernelBif == NULL || kbifGetBusIntfType_HAL(pKernelBif) !=
+    if (pKernelBif == NULL || gpuGetBusIntfType_HAL(pGpu) !=
                                   NV2080_CTRL_BUS_INFO_TYPE_PCI_EXPRESS)
     {
         return NV_OK;
@@ -481,48 +517,48 @@ krcCheckBusError_KERNEL
 
     // Corelogic AER
     if (pCl != NULL && clPcieReadAerCapability(pGpu, pCl, &clAer) == NV_OK &&
-        (clAer.UncorrErrStatusReg != 0 || 
+        (clAer.UncorrErrStatusReg != 0 ||
          (clAer.RooErrStatus & ~CL_AER_ROOT_ERROR_STATUS_ERR_COR_SUBCLASS_MASK) != 0))
     {
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "PCI-E Advanced Error Reporting Corelogic Info:\n");
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Uncorr Error Status Register    : %08X\n",
                   clAer.UncorrErrStatusReg);
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Uncorr Error Mask Register      : %08X\n",
                   clAer.UncorrErrMaskReg);
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Uncorr Error Severity Register  : %08X\n",
                   clAer.UncorrErrSeverityReg);
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Corr Error Status Register      : %08X\n",
                   clAer.CorrErrStatusReg);
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Corr Error Mask Register        : %08X\n",
                   clAer.CorrErrMaskReg);
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Advanced Err Cap & Ctrl Register: %08X\n",
                   clAer.AEcapCrtlReg);
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Header Log [0-3]                : %08X\n",
                   clAer.HeaderLogReg.Header[0]);
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Header Log [4-7]                : %08X\n",
                   clAer.HeaderLogReg.Header[1]);
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Header Log [8-B]                : %08X\n",
                   clAer.HeaderLogReg.Header[2]);
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Header Log [C-F]                : %08X\n",
                   clAer.HeaderLogReg.Header[3]);
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Root Error Command Register     : %08X\n",
                   clAer.RootErrCmd);
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Root Error Status               : %08X\n",
                   clAer.RooErrStatus);
-        NV_PRINTF(LEVEL_ERROR,
+        NV_PRINTF(LEVEL_NOTICE,
                   "     Error Source ID Register        : %08X\n",
                   clAer.ErrSrcReg);
 
@@ -564,7 +600,7 @@ _krcValidateAndDumpToKernelLog(NvU64 *lastXidTimestamp)
 {
     NvU32 sec, usec;
 
-    if (((osGetCurrentTime(&sec, &usec) == NV_OK) &&
+    if (((osGetSystemTime(&sec, &usec) == NV_OK) &&
        ((((sec * 1000000) + usec) - *lastXidTimestamp) > 1000000)))
     {
         nvlogDumpToKernelLog(NV_TRUE);
@@ -633,4 +669,93 @@ void krcDumpNvLog(OBJGPU *pGpu,
         }
     }
 #endif //!(DEBUG || DEVELOP)
+}
+
+/*!
+ * !!!
+ * This function touches registers that usually only GSP-RM touches to halt all engines
+ * and should be called only when GSP is known to be in a bad state and isn't running.
+ * Otherwise, Kernel-RM and GSP-RM could get out of sync.
+ * !!!
+ *
+ * This function is called on critical FW crash to RC and notify an error code to
+ * all user-mode and (optionally) kernel-mode channels, allowing the user mode
+ * apps to fail deterministically.
+ *
+ * @param[in] exceptType           Error code to send to the RC notifiers
+ * @param[in] bSkipKernelChannels  Don't RC and notify kernel channels
+ *
+ */
+void
+krcRcAndNotifyAllChannels_IMPL
+(
+    OBJGPU   *pGpu,
+    KernelRc *pKernelRc,
+    NvU32     exceptType,
+    NvBool    bSkipKernelChannels
+)
+{
+    //
+    // Bug 4503046: UVM currently attributes all errors as global and fails
+    // operations on all GPUs, in addition to the current failing GPU. Right now, the only
+    // case where we should also RC kernel channels is when the GPU has fallen off the bus.
+    //
+
+    KernelFifo       *pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
+    KernelChannel    *pKernelChannel;
+    CHANNEL_ITERATOR  chanIt;
+    RMTIMEOUT         timeout;
+
+    NV_ASSERT_OR_RETURN_VOID(pKernelFifo != NULL);
+
+    NV_PRINTF(LEVEL_ERROR, "RC all %schannels for critical error %d.\n",
+              bSkipKernelChannels ? MAKE_NV_PRINTF_STR("user ") : MAKE_NV_PRINTF_STR(""),
+              exceptType);
+
+    // Pass 1: halt all channels.
+    kfifoGetChannelIterator(pGpu, pKernelFifo, &chanIt, INVALID_RUNLIST_ID);
+    while (kfifoGetNextKernelChannel(pGpu, pKernelFifo, &chanIt, &pKernelChannel) == NV_OK)
+    {
+        if (kchannelCheckIsKernel(pKernelChannel) && bSkipKernelChannels)
+        {
+            continue;
+        }
+
+        kfifoStartChannelHalt(pGpu, pKernelFifo, pKernelChannel);
+    }
+
+    //
+    // Pass 2: Wait for the halts to complete, and RC notify the channels.
+    // The channel halts require a preemption, which may not be able to complete
+    // since the GSP is no longer servicing interrupts. Wait for up to the
+    // default GPU timeout value for the preemptions to complete.
+    //
+    gpuSetTimeout(pGpu, GPU_TIMEOUT_DEFAULT, &timeout, 0);
+    kfifoGetChannelIterator(pGpu, pKernelFifo, &chanIt, INVALID_RUNLIST_ID);
+    while (kfifoGetNextKernelChannel(pGpu, pKernelFifo, &chanIt, &pKernelChannel) == NV_OK)
+    {
+        if (kchannelCheckIsKernel(pKernelChannel) && bSkipKernelChannels)
+        {
+            continue;
+        }
+
+        kfifoCompleteChannelHalt(pGpu, pKernelFifo, pKernelChannel, &timeout);
+
+        NV_ASSERT_OK(
+            krcErrorSetNotifier(pGpu, pKernelRc,
+                                pKernelChannel,
+                                exceptType,
+                                kchannelGetEngineType(pKernelChannel),
+                                RC_NOTIFIER_SCOPE_CHANNEL));
+
+        NV_ASSERT_OK(
+            krcErrorSendEventNotifications_HAL(pGpu, pKernelRc,
+                                               pKernelChannel,
+                                               kchannelGetEngineType(pKernelChannel),
+                                               0,
+                                               exceptType,
+                                               RC_NOTIFIER_SCOPE_CHANNEL,
+                                               0,
+                                               NV_FALSE));
+    }
 }

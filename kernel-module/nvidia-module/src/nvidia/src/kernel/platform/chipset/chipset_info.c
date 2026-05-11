@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2004-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2004-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -83,6 +83,9 @@ RPINFO rootPortInfo[] =
     {PCI_VENDOR_ID_INTEL, DEVICE_ID_INTEL_2F08_ROOT_PORT, RP_INTEL_2F08, Intel_RP2F0X_setupFunc},
     {PCI_VENDOR_ID_INTEL, DEVICE_ID_INTEL_0C01_ROOT_PORT, RP_INTEL_0C01, Intel_RP0C0X_setupFunc},
 
+    {PCI_VENDOR_ID_QUALCOMM, DEVICE_ID_QUALCOMM_SNAPDRAGON_010E_ROOT_PORT, RP_QUALCOMM_010E, Qualcomm_Snapdragon8cx_RP_setupFunc},
+    {PCI_VENDOR_ID_QUALCOMM, DEVICE_ID_QUALCOMM_SNAPDRAGON_0111_ROOT_PORT, RP_QUALCOMM_0111, Qualcomm_Snapdragon8cx_RP_setupFunc},
+
 // last element must have zero vendor id and device id
     {0,                   0,                              RP_UNKNOWN,    NULL}
 };
@@ -102,6 +105,28 @@ BRINFO upstreamPortInfo[] =
     // last element must have zero vendor id and device id
     {0, 0, NULL}
 };
+
+static NV_STATUS
+AMD_14D8_setupFunc
+(
+    OBJCL *pCl
+)
+{
+    pCl->setProperty(pCl, PDB_PROP_CL_WAR_4802761_ENABLED, NV_TRUE);
+
+    return NV_OK;
+}
+
+static NV_STATUS
+Intel_A70D_setupFunc
+(
+    OBJCL *pCl
+)
+{
+    pCl->setProperty(pCl, PDB_PROP_CL_WAR_4802761_ENABLED, NV_TRUE);
+
+    return NV_OK;
+}
 
 static NV_STATUS
 Intel_25XX_setupFunc
@@ -886,7 +911,7 @@ Intel_7A82_setupFunc
 static NV_STATUS
 Intel_7A04_setupFunc
 (
-    OBJCL *pCl
+    OBJCL* pCl
 )
 {
     pCl->setProperty(pCl, PDB_PROP_CL_HAS_RESIZABLE_BAR_ISSUE, NV_TRUE);
@@ -894,28 +919,18 @@ Intel_7A04_setupFunc
     return NV_OK;
 }
 
+
+// Intel Z790 platform (Raptor Lake)
 static NV_STATUS
-Intel_5795_setupFunc
+Intel_7D06_setupFunc
 (
-    OBJCL *pCl
+    OBJCL* pCl
 )
 {
-    pCl->setProperty(pCl, PDB_PROP_CL_RELAXED_ORDERING_NOT_CAPABLE, NV_TRUE);
+    pCl->setProperty(pCl, PDB_PROP_CL_HAS_RESIZABLE_BAR_ISSUE, NV_TRUE);
 
     return NV_OK;
 }
-
-static NV_STATUS
-Intel_1B81_setupFunc
-(
-    OBJCL *pCl
-)
-{
-    pCl->setProperty(pCl, PDB_PROP_CL_RELAXED_ORDERING_NOT_CAPABLE, NV_TRUE);
-
-    return NV_OK;
-}
-
 
 static NV_STATUS
 Nvidia_T210_setupFunc
@@ -1138,6 +1153,9 @@ AMD_X370_setupFunc
 )
 {
 
+    // WAR for bug 5107271 handling
+    pCl->setProperty(pCl, PDB_PROP_CL_WAR_AMD_5107271, NV_TRUE);
+
     // Set ASPM L0S\L1 properties
     _Set_ASPM_L0S_L1(pCl, NV_FALSE, NV_FALSE);
 
@@ -1312,6 +1330,16 @@ Arm_NeoverseN1_setupFunc
 {
     // TODO Need to check if any more PDB properties should be set
     pCl->setProperty(pCl, PDB_PROP_CL_IS_CHIPSET_IO_COHERENT, NV_TRUE);
+    return NV_OK;
+}
+
+static NV_STATUS
+Qualcomm_Snapdragon_setupFunc
+(
+    OBJCL *pCl
+)
+{
+
     return NV_OK;
 }
 

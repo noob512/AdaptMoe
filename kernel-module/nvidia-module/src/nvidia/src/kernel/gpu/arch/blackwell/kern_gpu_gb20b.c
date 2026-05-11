@@ -33,8 +33,11 @@
 #include "os/os.h"
 #include "gpu/eng_desc.h"
 #include "nverror.h"
+#include "gpu/hfrp/kernel_hfrp.h"
+#include "kernel/gpu/hfrp/kern_hfrp_common.h"
+#include "kernel/gpu/hfrp/kern_hfrp_commands_responses.h"
 
-#include "published/blackwell/gb20b/dev_boot.h"
+#include "published/blackwell/gb20b/dev_boot_zb.h"
 #include "published/blackwell/gb20b/dev_xtl_ep_pcfg_gpu.h"
 
 //
@@ -75,11 +78,13 @@ static const GPUCHILDPRESENT gpuChildrenPresent_GB20B[] =
     GPU_CHILD_PRESENT(SwIntr, 1),
     GPU_CHILD_PRESENT(KernelPerf, 1),
     GPU_CHILD_PRESENT(KernelPmu, 1),
+    GPU_CHILD_PRESENT(KernelSec2, 1),
     GPU_CHILD_PRESENT(Spdm, 1),
     GPU_CHILD_PRESENT(ConfidentialCompute, 1),
-    GPU_CHILD_PRESENT(KernelFsp, 1),
+    GPU_CHILD_PRESENT(OBJGRIDDISPLAYLESS, 1),
     GPU_CHILD_PRESENT(KernelGsp, 1),
     GPU_CHILD_PRESENT(KernelGsplite, 1),
+    GPU_CHILD_PRESENT(KernelHFRP, 1),
 };
 
 const GPUCHILDPRESENT *
@@ -163,7 +168,7 @@ gpuHandleSecFault_GB20B
     // handleGpuLost first to setGpuDisconnectedProperties so that another reg read does not
     // happen when the notifier is sent below.
     //
-    osHandleGpuLost(pGpu);
+    osHandleGpuLost(pGpu, NV_FALSE);
 
     //
     // Send SEC_FAULT notification. This should tells any MODS test testing for this
@@ -175,5 +180,250 @@ gpuHandleSecFault_GB20B
                             0,
                             0,
                             SEC_FAULT_ERROR);
+}
+
+/*!
+ * @brief Power on GPU
+ *
+ * This function implements HFRP command to power on the GPU.
+ *
+ * @param[in] pGpu      GPU object pointer
+ *
+ * @return  NV_OK
+ *     If GPU showed up on the bus.
+ *
+ * @return   Bubbles up errors from HFRP command failure.
+ */
+NV_STATUS
+gpuPowerOn_GB20B(OBJGPU *pGpu)
+{
+
+    NV_STATUS   status       = NV_OK;
+    NvU32       responseSize = 0;
+    NvU16       responseStatus = 0U;
+    KernelHFRP *pKernelHfrp  = GPU_GET_KERNEL_HFRP(pGpu);
+
+    CMD_SOC_SET_DEVICE_POWER_STATE_PARAMS powerState;
+    powerState.deviceId   = NV_CMD_SOC_SET_DEVICE_POWER_STATE_PARAM_DEVICE_ID_IGPU;
+    powerState.powerState = NV_CMD_SOC_SET_DEVICE_POWER_STATE_PARAM_POWER_STATE_D0;
+
+    NV_ASSERT_OR_RETURN(pKernelHfrp != NULL, NV_ERR_INVALID_POINTER);
+
+    if (!pKernelHfrp->getProperty(pKernelHfrp, PDB_PROP_KHFRP_IS_ENABLED))
+    {
+        return NV_OK;
+    }
+
+    status = khfrpPostCommandBlocking(pKernelHfrp, HFRP_CMD_SOC_SET_DEVICE_POWER_STATE, &powerState, sizeof(powerState),
+                 &responseStatus, NULL, &responseSize);
+
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "ERROR: HFRP_CMD_fialed to turn on iGPU power with status = 0x%x\n",
+                  status);
+        return status;
+    }
+
+    if (responseStatus != 0U)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "ERROR: HFRP_CMD_fialed to turn on iGPU power with HFRP response status = 0x%x\n",
+                  responseStatus);
+        return NV_ERR_GENERIC;
+    }
+
+    status = gpuPowerOnHda_HAL(pGpu);
+    if (status != NV_OK)
+    {
+        // Logging the error but not blocking iGPU D0 so reset to NV_OK
+        NV_PRINTF(LEVEL_ERROR,
+                  "ERROR: HFRP_CMD_fialed to turn on HDA power\n");
+        status = NV_OK;
+    }
+
+    return status;
+}
+/*!
+ * @brief Power off GPU
+ *
+ * This function implements HFRP command to power off the GPU.
+ *
+ * @param[in] pGpu      GPU object pointer
+ *
+ * @return  NV_OK
+ *     If GPU showed up on the bus.
+ *
+ * @return   Bubbles up errors from HFRP command failure.
+ */
+NV_STATUS
+gpuPowerOff_GB20B(OBJGPU *pGpu)
+{
+    NV_STATUS   status       = NV_OK;
+    NvU32       responseSize = 0;
+    NvU16       responseStatus = 0U;
+    KernelHFRP *pKernelHfrp  = GPU_GET_KERNEL_HFRP(pGpu);
+
+    CMD_SOC_SET_DEVICE_POWER_STATE_PARAMS powerState;
+    powerState.deviceId = NV_CMD_SOC_SET_DEVICE_POWER_STATE_PARAM_DEVICE_ID_IGPU;
+    powerState.powerState = NV_CMD_SOC_SET_DEVICE_POWER_STATE_PARAM_POWER_STATE_D3;
+
+    NV_ASSERT_OR_RETURN(pKernelHfrp != NULL, NV_ERR_INVALID_POINTER);
+
+    if (!pKernelHfrp->getProperty(pKernelHfrp, PDB_PROP_KHFRP_IS_ENABLED))
+    {
+        return NV_OK;
+    }
+
+    status = khfrpPostCommandBlocking(pKernelHfrp, HFRP_CMD_SOC_SET_DEVICE_POWER_STATE, &powerState, sizeof(powerState),
+                 &responseStatus, NULL, &responseSize);
+
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "ERROR: HFRP_CMD_fialed to turn off iGPU power with status = 0x%x\n",
+                  status);
+        return status;
+    }
+
+    if (responseStatus != 0U)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "ERROR: HFRP_CMD_fialed to turn off iGPU power with HFRP response status = 0x%x\n",
+                  responseStatus);
+        return NV_ERR_GENERIC;
+    }
+
+    return status;
+}
+
+/*!
+ * @brief Power on iGPU HDA
+ *
+ * This function implements HFRP command to power on the iGPU HDA.
+ *
+ * @param[in] pGpu      GPU object pointer
+ *
+ * @return  NV_OK
+ *     If GPU showed up on the bus.
+ *
+ * @return   Bubbles up errors from HFRP command failure.
+ */
+NV_STATUS
+gpuPowerOnHda_GB20B(OBJGPU *pGpu)
+{
+
+    NV_STATUS   status       = NV_OK;
+    NvU32       responseSize = 0;
+    NvU16       responseStatus = 0U;
+    KernelHFRP *pKernelHfrp  = GPU_GET_KERNEL_HFRP(pGpu);
+
+
+    CMD_SOC_SET_DEVICE_POWER_STATE_PARAMS powerState;
+    powerState.deviceId   = NV_CMD_SOC_SET_DEVICE_POWER_STATE_PARAM_DEVICE_ID_HDA;
+    powerState.powerState = NV_CMD_SOC_SET_DEVICE_POWER_STATE_PARAM_POWER_STATE_D0;
+
+    NV_ASSERT_OR_RETURN(pKernelHfrp != NULL, NV_ERR_INVALID_POINTER);
+
+    if (!pKernelHfrp->getProperty(pKernelHfrp, PDB_PROP_KHFRP_IS_ENABLED))
+    {
+        return NV_OK;
+    }
+
+    if (!pKernelHfrp->getProperty(pKernelHfrp, PDB_PROP_KHFRP_HDA_IS_ENABLED))
+    {
+        return NV_OK;
+    }
+
+    status = khfrpPostCommandBlocking(pKernelHfrp, HFRP_CMD_SOC_SET_DEVICE_POWER_STATE, &powerState, sizeof(powerState),
+                 &responseStatus, NULL, &responseSize);
+
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "ERROR: HFRP_CMD_fialed to turn on iGPU HDA power with status = 0x%x\n",
+                  status);
+        return status;
+    }
+
+    if (responseStatus != 0U)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "ERROR: HFRP_CMD_fialed to turn on iGPU HDA power with HFRP response status = 0x%x\n",
+                  responseStatus);
+        return NV_ERR_GENERIC;
+    }
+
+    return status;
+}
+/*!
+ * @brief Power off GPU
+ *
+ * This function implements HFRP command to power off the iGPU.HDA
+ *
+ * @param[in] pGpu      GPU object pointer
+ *
+ * @return  NV_OK
+ *     If GPU showed up on the bus.
+ *
+ * @return   Bubbles up errors from HFRP command failure.
+ */
+NV_STATUS
+gpuPowerOffHda_GB20B(OBJGPU *pGpu)
+{
+    NV_STATUS   status       = NV_OK;
+    NvU32       responseSize = 0;
+    NvU16       responseStatus = 0U;
+    KernelHFRP *pKernelHfrp  = GPU_GET_KERNEL_HFRP(pGpu);
+
+    CMD_SOC_SET_DEVICE_POWER_STATE_PARAMS powerState;
+    powerState.deviceId   = NV_CMD_SOC_SET_DEVICE_POWER_STATE_PARAM_DEVICE_ID_HDA;
+    powerState.powerState = NV_CMD_SOC_SET_DEVICE_POWER_STATE_PARAM_POWER_STATE_D3;
+
+    NV_ASSERT_OR_RETURN(pKernelHfrp != NULL, NV_ERR_INVALID_POINTER);
+
+    if (!pKernelHfrp->getProperty(pKernelHfrp, PDB_PROP_KHFRP_IS_ENABLED))
+    {
+        return NV_OK;
+    }
+
+    if (!pKernelHfrp->getProperty(pKernelHfrp, PDB_PROP_KHFRP_HDA_IS_ENABLED))
+    {
+        return NV_OK;
+    }
+
+    status = khfrpPostCommandBlocking(pKernelHfrp, HFRP_CMD_SOC_SET_DEVICE_POWER_STATE, &powerState, sizeof(powerState),
+                 &responseStatus, NULL, &responseSize);
+
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "ERROR: HFRP_CMD_fialed to turn off iGPU HDA power with status = 0x%x\n",
+                  status);
+        return status;
+    }
+
+    if (responseStatus != 0U)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "ERROR: HFRP_CMD_fialed to turn off iGPU HDA power with HFRP response status = 0x%x\n",
+                  responseStatus);
+        return NV_ERR_GENERIC;
+    }
+
+    return status;
+}
+
+/* @brief This function returns if SDM mode is enabled on iGPU
+ *
+ * @param[in]  pGpu   OBJGPU pointer
+ *
+ * @returns           The function returns if device is in SDM mode
+ */
+NvBool
+gpuIsSocSdmEnabled_GB20B(OBJGPU *pGpu)
+{
+
+    return NV_TRUE;
 }
 

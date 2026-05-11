@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2013-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2013-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -83,12 +83,18 @@ struct OBJHOSTENG {
 
     // Ancestor object pointers for `staticCast` feature
     struct OBJHOSTENG *__nvoc_pbase_OBJHOSTENG;    // hosteng
+
+    // 1 PDB property
+    NvBool PDB_PROP_HOSTENG_ENSURE_HALT_SUCCEEDS_BEFORE_RESET;
+
+    // Data members
+    NvBool bHostengHaltBeforeResetFailed;
 };
 
 
 // Vtable with 1 per-class function pointer
 struct NVOC_VTABLE__OBJHOSTENG {
-    NV_STATUS (*__hostengHaltAndReset__)(struct OBJGPU *, struct OBJHOSTENG * /*this*/, RMTIMEOUT *);  // virtual
+    NV_STATUS (*__hostengHaltAndReset__)(struct OBJGPU *, struct OBJHOSTENG * /*this*/, FIFO_CHANNEL_INFO, RMTIMEOUT *);  // virtual
 };
 
 // Metadata with per-class RTTI and vtable
@@ -97,13 +103,9 @@ struct NVOC_METADATA__OBJHOSTENG {
     const struct NVOC_VTABLE__OBJHOSTENG vtable;
 };
 
-#ifndef __NVOC_CLASS_OBJHOSTENG_TYPEDEF__
-#define __NVOC_CLASS_OBJHOSTENG_TYPEDEF__
-typedef struct OBJHOSTENG OBJHOSTENG;
-#endif /* __NVOC_CLASS_OBJHOSTENG_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_OBJHOSTENG
-#define __nvoc_class_id_OBJHOSTENG 0xb356e7
+#define __nvoc_class_id_OBJHOSTENG 0xb356e7u
+typedef struct OBJHOSTENG OBJHOSTENG;
 #endif /* __nvoc_class_id_OBJHOSTENG */
 
 // Casting support
@@ -119,24 +121,37 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_OBJHOSTENG;
     ((OBJHOSTENG*) __nvoc_dynamicCast(staticCast((pThis), Dynamic), classInfo(OBJHOSTENG)))
 #endif //__nvoc_host_eng_h_disabled
 
+// Property macros
+#define PDB_PROP_HOSTENG_ENSURE_HALT_SUCCEEDS_BEFORE_RESET_BASE_CAST
+#define PDB_PROP_HOSTENG_ENSURE_HALT_SUCCEEDS_BEFORE_RESET_BASE_NAME PDB_PROP_HOSTENG_ENSURE_HALT_SUCCEEDS_BEFORE_RESET
+
+
 NV_STATUS __nvoc_objCreateDynamic_OBJHOSTENG(OBJHOSTENG**, Dynamic*, NvU32, va_list);
 
 NV_STATUS __nvoc_objCreate_OBJHOSTENG(OBJHOSTENG**, Dynamic*, NvU32);
-#define __objCreate_OBJHOSTENG(ppNewObj, pParent, createFlags) \
-    __nvoc_objCreate_OBJHOSTENG((ppNewObj), staticCast((pParent), Dynamic), (createFlags))
+#define __objCreate_OBJHOSTENG(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags) \
+    __nvoc_objCreate_OBJHOSTENG((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags))
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+
+// Wrapper macros for halified functions
 #define hostengHaltAndReset_FNPTR(pHosteng) pHosteng->__nvoc_metadata_ptr->vtable.__hostengHaltAndReset__
-#define hostengHaltAndReset(pGpu, pHosteng, pRmTimeout) hostengHaltAndReset_DISPATCH(pGpu, pHosteng, pRmTimeout)
+#define hostengHaltAndReset(pGpu, pHosteng, rcChannelInfo, pRmTimeout) hostengHaltAndReset_DISPATCH(pGpu, pHosteng, rcChannelInfo, pRmTimeout)
 
 // Dispatch functions
-static inline NV_STATUS hostengHaltAndReset_DISPATCH(struct OBJGPU *pGpu, struct OBJHOSTENG *pHosteng, RMTIMEOUT *pRmTimeout) {
-    return pHosteng->__nvoc_metadata_ptr->vtable.__hostengHaltAndReset__(pGpu, pHosteng, pRmTimeout);
+static inline NV_STATUS hostengHaltAndReset_DISPATCH(struct OBJGPU *pGpu, struct OBJHOSTENG *pHosteng, FIFO_CHANNEL_INFO rcChannelInfo, RMTIMEOUT *pRmTimeout) {
+    return pHosteng->__nvoc_metadata_ptr->vtable.__hostengHaltAndReset__(pGpu, pHosteng, rcChannelInfo, pRmTimeout);
 }
 
-NV_STATUS hostengHaltAndReset_IMPL(struct OBJGPU *pGpu, struct OBJHOSTENG *pHosteng, RMTIMEOUT *pRmTimeout);
+// Virtual method declarations and/or inline definitions
+NV_STATUS hostengHaltAndReset_IMPL(struct OBJGPU *pGpu, struct OBJHOSTENG *pHosteng, FIFO_CHANNEL_INFO rcChannelInfo, RMTIMEOUT *pRmTimeout);
 
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

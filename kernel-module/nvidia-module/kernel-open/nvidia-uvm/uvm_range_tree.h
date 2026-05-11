@@ -25,6 +25,7 @@
 #define __UVM_RANGE_TREE_H__
 
 #include "uvm_linux.h"
+#include "nv-list-helpers.h" // list_is_first
 #include "nvstatus.h"
 
 // Tree-based data structure for looking up and iterating over objects with

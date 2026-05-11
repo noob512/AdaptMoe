@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2014-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2014-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -542,7 +542,7 @@ NV_STATUS NV_API_CALL nv_vgpu_update_sysfs_info
     nv_state_t          *pNv,
     const NvU8          *pVgpuDevName,
     NvU32                mode,
-    NvU32                sysfs_val
+    NvU32                *sysfs_val
 )
 {
     THREAD_STATE_NODE       threadState;
@@ -576,9 +576,11 @@ NV_STATUS NV_API_CALL nv_vgpu_update_sysfs_info
     }
 
     if (updateMode == SET_GPU_INSTANCE_ID)
-        rmStatus = kvgpumgrSetGpuInstanceId(pRequestVgpu, sysfs_val);
+        rmStatus = kvgpumgrSetGpuInstanceId(pRequestVgpu, *sysfs_val);
     else if (updateMode == SET_PLACEMENT_ID)
-        rmStatus = kvgpumgrSetPlacementId(pRequestVgpu, sysfs_val);
+        rmStatus = kvgpumgrSetPlacementId(pRequestVgpu, *sysfs_val);
+    else if (updateMode == GET_PLACEMENT_ID)
+       *sysfs_val = pRequestVgpu->placementId;
 
 release_lock:
     // UNLOCK: release API lock
@@ -913,6 +915,10 @@ void osWakeRemoveVgpu(NvU32 gpuId, NvU32 returnStatus)
     os_call_vgpu_vfio((void *)&vgpu_info, CMD_VFIO_WAKE_REMOVE_GPU);
 }
 
+NvBool osIsGridSupported(OBJGPU *pGpu)
+{
+    return (os_is_grid_supported() || os_get_grid_csp_support() || hypervisorIsVgxHyper());
+}
 
 NvU32 osGetGridCspSupport(void)
 {
@@ -974,7 +980,6 @@ NV_STATUS rm_is_vgpu_supported_device(
         for (i = 0; i < NV_ARRAY_ELEMENTS(sVgpuUsmTypes); i++)
         {
             if (pOsGpuInfo->pci_info.device_id == sVgpuUsmTypes[i].ulDevID &&
-                    pOsGpuInfo->subsystem_vendor == sVgpuUsmTypes[i].ulSubSystemVendorID &&
                     pOsGpuInfo->subsystem_id == sVgpuUsmTypes[i].ulSubID)
             {
                 return NV_OK;

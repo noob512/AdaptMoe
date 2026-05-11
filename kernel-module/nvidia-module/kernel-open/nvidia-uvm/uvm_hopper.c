@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2020-2024 NVIDIA Corporation
+    Copyright (c) 2020-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -41,10 +41,6 @@ static uvm_gpu_peer_copy_mode_t hopper_peer_copy_mode(uvm_parent_gpu_t *parent_g
 
 void uvm_hal_hopper_arch_init_properties(uvm_parent_gpu_t *parent_gpu)
 {
-    parent_gpu->tlb_batch.va_invalidate_supported = true;
-
-    parent_gpu->tlb_batch.va_range_invalidate_supported = true;
-
     // TODO: Bug 1767241: Run benchmarks to figure out a good number
     parent_gpu->tlb_batch.max_ranges = 8;
 
@@ -82,22 +78,9 @@ void uvm_hal_hopper_arch_init_properties(uvm_parent_gpu_t *parent_gpu)
 
     parent_gpu->max_host_va = 1ull << 57;
 
-    // Hopper can map sysmem with any page size
-    parent_gpu->can_map_sysmem_with_large_pages = true;
+    parent_gpu->access_counters_serialize_clear_ops_by_type = false;
 
-    // Prefetch instructions will generate faults
-    parent_gpu->prefetch_fault_supported = true;
-
-    // Hopper can place GPFIFO in vidmem
-    parent_gpu->gpfifo_in_vidmem_supported = true;
-
-    parent_gpu->replayable_faults_supported = true;
-
-    parent_gpu->non_replayable_faults_supported = true;
-
-    parent_gpu->fault_cancel_va_supported = true;
-
-    parent_gpu->scoped_atomics_supported = true;
+    parent_gpu->access_bits_supported = false;
 
     parent_gpu->has_clear_faulted_channel_sw_method = true;
 
@@ -105,13 +88,18 @@ void uvm_hal_hopper_arch_init_properties(uvm_parent_gpu_t *parent_gpu)
 
     parent_gpu->smc.supported = true;
 
-    parent_gpu->sparse_mappings_supported = true;
-
     parent_gpu->map_remap_larger_page_promotion = false;
 
-    parent_gpu->plc_supported = true;
+    parent_gpu->ats.no_ats_range_required = true;
 
-    parent_gpu->no_ats_range_required = true;
+    parent_gpu->ats.gmmu_pt_depth0_init_required = false;
+
+    // Hopper doesn't prefetch translations for physical requests, so the only
+    // concern would be if we enabled physical ATS with 4K pages. In that case
+    // we could see a mix of cached valid and invalid translations in the same
+    // 64K region, which would require invalidation. But we don't enable
+    // physical ATS with 4K pages for this reason, see gpu_get_internal_pasid().
+    parent_gpu->ats.dma_map_invalidation = UVM_DMA_MAP_INVALIDATION_NONE;
 
     // In Hopper there are not enough HW key slots available to support
     // individual channel encryption keys, so channels on the same engine share

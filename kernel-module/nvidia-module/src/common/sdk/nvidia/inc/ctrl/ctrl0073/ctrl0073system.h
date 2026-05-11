@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2005-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2005-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -30,6 +30,7 @@
 // Source file:      ctrl/ctrl0073/ctrl0073system.finn
 //
 
+#include "nvlimits.h"
 #include "ctrl/ctrl0073/ctrl0073base.h"
 
 /* NV04_DISPLAY_COMMON system-level control commands and parameters */
@@ -849,6 +850,175 @@ typedef struct NV0073_CTRL_SYSTEM_ACPI_SUBSYSTEM_ACTIVATED_PARAMS {
 
 #define NV0073_CTRL_CMD_SYSTEM_ACPI_SUBSYSTEM_ACTIVATED (0x730117U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_ACPI_SUBSYSTEM_ACTIVATED_PARAMS_MESSAGE_ID" */
 
+/*
+ * To support RMCTRLs for BOARDOBJGRP_E255, we were required to increase the
+ * XAPI limit to 16K. It was observed that XP does NOT allow the static array
+ * size greater then 10K and this was causing the DVS failure. So we are using
+ * the OLD XAPI value i.e. 4K for NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX while
+ * internally we are using the new updated XAPI value i.e. 16K.
+ */
+#define XAPI_ENVELOPE_MAX_PAYLOAD_SIZE_OLD              4096U
+
+/*
+ * NV0073_CTRL_SYSTEM_SRM_CHUNK
+ *
+ * Several control commands require an SRM, which may be larger than the
+ * available buffer. Therefore, this structure is used to transfer the needed
+ * data.
+ *
+ *   startByte
+ *     Index of the byte in the SRM buffer at which the current chunk of data
+ *     starts. If this value is 0, it indicates the start of a new SRM. A
+ *     value other than 0 indicates additional data for an SRM.
+ *   numBytes
+ *     Size in bytes of the current chunk of data.
+ *   totalBytes
+ *     Size in bytes of the entire SRM.
+ *   srmBuffer
+ *     Buffer containing the current chunk of SRM data.
+ */
+/* Set max SRM size to the XAPI max, minus some space for other fields */
+#define NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX               (0xe00U) /* finn: Evaluated from "(XAPI_ENVELOPE_MAX_PAYLOAD_SIZE_OLD - 512)" */
+
+typedef struct NV0073_CTRL_SYSTEM_SRM_CHUNK {
+    NvU32 startByte;
+    NvU32 numBytes;
+    NvU32 totalBytes;
+
+    /* C form: NvU8    srmBuffer[NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX]; */
+    NvU8  srmBuffer[NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX];
+} NV0073_CTRL_SYSTEM_SRM_CHUNK;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_VALIDATE_SRM
+ *
+ * Instructs the RM to validate the SRM for use by HDCP revocation. The SRM
+ * may be larger than the buffer provided by the API. In that case, the SRM is
+ * sent in chunks no larger than NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX bytes.
+ *
+ * Upon completion of the validation, which is an asynchronous operation, the
+ * client will receive a <PLACE_HOLDER_EVENT> event. Alternatively, the client
+ * may poll for completion of SRM validation via
+ * NV0073_CTRL_CMD_SYSTEM_GET_SRM_STATUS.
+ *
+ *   subDeviceInstance
+ *     This parameter specifies the subdevice instance within the
+ *     NV04_DISPLAY_COMMON parent device to which the operation should be
+ *     directed.  This parameter must specify a value between zero and the
+ *     total number of subdevices within the parent device.  This parameter
+ *     should be set to zero for default behavior.
+ *   srm
+ *     A chunk of the SRM.
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_NOT_SUPPORTED
+ *   NV_ERR_NOT_READY
+ *   NV_ERR_INVALID_ARGUMENT
+ *   NV_WARN_MORE_PROCESSING_REQUIRED
+ *   NV_ERR_INSUFFICIENT_RESOURCES
+ */
+#define NV0073_CTRL_CMD_SYSTEM_VALIDATE_SRM (0x730118U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_VALIDATE_SRM_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_SYSTEM_VALIDATE_SRM_PARAMS_MESSAGE_ID (0x18U)
+
+typedef struct NV0073_CTRL_SYSTEM_VALIDATE_SRM_PARAMS {
+    NvU32                        subDeviceInstance;
+    NV0073_CTRL_SYSTEM_SRM_CHUNK srm;
+} NV0073_CTRL_SYSTEM_VALIDATE_SRM_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_GET_SRM_STATUS
+ *
+ * Retrieves the status of the request to validate the SRM. If a request to
+ * validate an SRM is still pending, NV_ERR_NOT_READY will be
+ * returned and the status will not be updated.
+ *
+ *   subDeviceInstance
+ *     This parameter specifies the subdevice instance within the
+ *     NV04_DISPLAY_COMMON parent device to which the operation should be
+ *     directed.  This parameter must specify a value between zero and the
+ *     total number of subdevices within the parent device.  This parameter
+ *     should be set to zero for default behavior.
+ *   status
+ *     Result of the last SRM validation request.
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_NOT_SUPPORTED
+ *   NV_ERR_NOT_READY
+ */
+#define NV0073_CTRL_CMD_SYSTEM_GET_SRM_STATUS (0x730119U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_GET_SRM_STATUS_PARAMS_MESSAGE_ID" */
+
+typedef enum NV0073_CTRL_SYSTEM_SRM_STATUS {
+    NV0073_CTRL_SYSTEM_SRM_STATUS_OK = 0,      // Validation succeeded
+    NV0073_CTRL_SYSTEM_SRM_STATUS_FAIL = 1,        // Validation request failed
+    NV0073_CTRL_SYSTEM_SRM_STATUS_BAD_FORMAT = 2,  // Bad SRM format
+    NV0073_CTRL_SYSTEM_SRM_STATUS_INVALID = 3,      // Bad SRM signature
+} NV0073_CTRL_SYSTEM_SRM_STATUS;
+
+#define NV0073_CTRL_SYSTEM_GET_SRM_STATUS_PARAMS_MESSAGE_ID (0x19U)
+
+typedef struct NV0073_CTRL_SYSTEM_GET_SRM_STATUS_PARAMS {
+    NvU32 subDeviceInstance;
+    NvU32 status;
+} NV0073_CTRL_SYSTEM_GET_SRM_STATUS_PARAMS;
+
+
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_HDCP_REVOCATION_CHECK
+ *
+ * Performs the HDCP revocation process. Given the supplied SRM, all attached
+ * devices will be checked to see if they are on the revocation list or not.
+ *
+ *   srm
+ *     The SRM to do the revocation check against. For SRMs larger than
+ *     NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX, the caller will need to break up the
+ *     SRM into chunks and make multiple calls.
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_NOT_SUPPORTED
+ *   NV_ERR_NOT_READY
+ *   NV_ERR_INVALID_ARGUMENT
+ *   NV_WARN_MORE_PROCESSING_REQUIRED
+ *   NV_ERR_INSUFFICIENT_RESOURCES
+ */
+#define NV0073_CTRL_CMD_SYSTEM_HDCP_REVOCATION_CHECK (0x73011bU) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_HDCP_REVOCATE_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_SYSTEM_HDCP_REVOCATE_PARAMS_MESSAGE_ID (0x1BU)
+
+typedef struct NV0073_CTRL_SYSTEM_HDCP_REVOCATE_PARAMS {
+    NV0073_CTRL_SYSTEM_SRM_CHUNK srm;
+} NV0073_CTRL_SYSTEM_HDCP_REVOCATE_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_UPDATE_SRM
+ *
+ * Updates the SRM used by RM for HDCP revocation checks. The SRM must have
+ * been previously validated as authentic.
+ *
+ *   srm
+ *     The SRM data. For SRMs larger than NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX,
+ *     the caller will need to break up the SRM into chunks and make multiple
+ *     calls.
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_NOT_SUPPORTED
+ *   NV_ERR_NOT_READY
+ *   NV_ERR_INVALID_ARGUMENT
+ *   NV_WARN_MORE_PROCESSING_REQUIRED
+ *   NV_ERR_INSUFFICIENT_RESOURCES
+ */
+#define NV0073_CTRL_CMD_SYSTEM_UPDATE_SRM (0x73011cU) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_UPDATE_SRM_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_SYSTEM_UPDATE_SRM_PARAMS_MESSAGE_ID (0x1CU)
+
+typedef struct NV0073_CTRL_SYSTEM_UPDATE_SRM_PARAMS {
+    NV0073_CTRL_SYSTEM_SRM_CHUNK srm;
+} NV0073_CTRL_SYSTEM_UPDATE_SRM_PARAMS;
 
 /*
  * NV0073_CTRL_SYSTEM_CONNECTOR_INFO
@@ -1502,38 +1672,6 @@ typedef struct NV0073_CTRL_SYSTEM_CONFIG_VRR_PSTATE_SWITCH_PARAMS {
     NvU32  minVblankExtension;
 } NV0073_CTRL_SYSTEM_CONFIG_VRR_PSTATE_SWITCH_PARAMS;
 
-/*
- * NV0073_CTRL_CMD_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR
- *
- * This command engages the WAR when VR devices are connected,
- * where the Pstate switching can cause delay in Vblank callbacks
- * reported to KMD, by servicing disp interrupts inline and reporting the
- * callbacks to KMD. Without the WAR, there can be stutters during pstate switch.
- * Bug#1778552
- *
- *   subDeviceInstance
- *     This parameter specifies the subdevice instance within the
- *     NV04_DISPLAY_COMMON parent device to which the operation should be
- *     directed.
- *   bEngageWAR
- *     Indicates if inline disp interrupt serving WAR has to be engaged or
- *     disengaged.
- *
- * Possible status values returned are:
- *   NV_OK
- *   NV_ERR_INVALID_PARAM_STRUCT
- *   NV_ERR_INVALID_ARGUMENT
- */
-
-#define NV0073_CTRL_CMD_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR (0x730187U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR_PARAMS_MESSAGE_ID" */
-
-#define NV0073_CTRL_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR_PARAMS_MESSAGE_ID (0x87U)
-
-typedef struct NV0073_CTRL_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR_PARAMS {
-    NvU32  subDeviceInstance;
-    NvBool bEngageWAR;
-} NV0073_CTRL_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR_PARAMS;
-
 
 
 /*
@@ -1912,6 +2050,7 @@ typedef struct NV0073_CTRL_CMD_SYSTEM_GET_LOADV_COUNTER_INFO_PARAMS {
 #define NV0073_CTRL_DISP_LPWR_FEATURE_ID_CLK_GATING_DISPCLK     0x0007
 #define NV0073_CTRL_DISP_LPWR_FEATURE_ID_CLK_GATING_POSTRG_CLKS 0x0008
 #define NV0073_CTRL_DISP_LPWR_FEATURE_ID_MSCG                   0x0009
+#define NV0073_CTRL_DISP_LPWR_FEATURE_ID_GEN_STATS              0x0010
 
 // Parameter/characteristics of Display ALPM
 #define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_ALPM_INVALID         0x0000
@@ -2091,6 +2230,25 @@ typedef struct NV0073_CTRL_CMD_SYSTEM_GET_LOADV_COUNTER_INFO_PARAMS {
  * (This property allows Get operation)
  */
 #define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_MSCG_DPS2_VBLANK_TIME_US          (0x0007)
+
+/*!
+ * @brief Parameter/characteristics of General Display Stats
+ *
+ * Following are the Parameter/characteristics for General Display Stats
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_GEN_STATS_INVALID                 (0x0000)
+
+/*!
+ * Property specifies the frame counter for display.
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_GEN_STATS_FRAME_COUNTER           (0x0001)
+
+/*!
+ * Property specifies the LOADV counter for display.
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_GEN_STATS_LOADV_COUNTER           (0x0002)
 
 /*!
  * @brief Structure to identify display low power feature
@@ -2429,6 +2587,158 @@ typedef struct NV0073_CTRL_CMD_SYSTEM_GET_CRASH_LOCK_COUNTER_INFO_PARAMS {
     NvU32 head;
     NvU32 counterValueV;
 } NV0073_CTRL_CMD_SYSTEM_GET_CRASH_LOCK_COUNTER_INFO_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_GSYNC_SET_EXACT_REFRESH_RATE
+ *
+ * DD sends this command to RM to control the exact refresh rate for framelock.
+ * RM will adjust the pixel clock to this precise value during the next modeset
+ * if framelock is enabled.
+ * The refresh rate is given in the form of (refreshRateNumerator / refreshRateDenominator) * Hz
+ *
+ *   subDeviceInstance
+ *     This parameter specifies the subdevice instance within the
+ *     NV04_DISPLAY_COMMON parent device to which the operation should be
+ *     directed.
+ *   displayId
+ *     This specifies a display to configure
+ *   refreshRateNumerator
+ *     This specifies the numerator of the refresh rate fraction
+ *   refreshRateDenominator
+ *     This specifies the denominator of the refresh rate fraction
+ *   hTotal
+ *     This specifies the hTotal of the display
+ *   vTotal
+ *     This specifies the vTotal of the display
+ *
+ *   Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_INVALID_PARAMETER
+ */
+
+#define NV0073_CTRL_CMD_SYSTEM_GSYNC_SET_EXACT_REFRESH_RATE (0x7301a4U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_GSYNC_SET_EXACT_REFRESH_RATE_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_MAX_GSYNC_DISPLAYS                      32
+
+#define NV0073_CTRL_SYSTEM_GSYNC_SET_EXACT_REFRESH_RATE_PARAMS_MESSAGE_ID (0xA4U)
+
+typedef struct NV0073_CTRL_SYSTEM_GSYNC_SET_EXACT_REFRESH_RATE_PARAMS {
+    NvU32 subDeviceInstance;
+    NvU32 displayId;
+    NV_DECLARE_ALIGNED(NvU64 refreshRateNumerator, 8);
+    NV_DECLARE_ALIGNED(NvU64 refreshRateDenominator, 8);
+    NvU32 hTotal;
+    NvU32 vTotal;
+} NV0073_CTRL_SYSTEM_GSYNC_SET_EXACT_REFRESH_RATE_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_GSYNC_GET_EXACT_PIXEL_CLOCK
+ *
+ * Diagnostic query to get the exact pixel clock from RM
+ * The pixel clock rate is given in the form of (refreshRateNumerator / refreshRateDenominator) * Hz
+ *
+ *   displayId
+ *     This specifies a display to query
+ *   pixelClockNumerator
+ *     This specifies the numerator of the pixel clock fraction
+ *   pixelClockDenominator
+ *     This specifies the denominator of the pixel clock fraction
+ *
+ *   Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_INVALID_PARAMETER
+ *   NV_ERR_NOT_SUPPORTED
+ *   NV_ERR_NOT_READY
+ *   NV_ERR_INVALID_STATE
+ */
+#define NV0073_CTRL_CMD_SYSTEM_GSYNC_GET_EXACT_PIXEL_CLOCK (0x7301a6U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_GSYNC_GET_EXACT_PIXEL_CLOCK_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_SYSTEM_GSYNC_GET_EXACT_PIXEL_CLOCK_PARAMS_MESSAGE_ID (0xA6U)
+
+typedef struct NV0073_CTRL_SYSTEM_GSYNC_GET_EXACT_PIXEL_CLOCK_PARAMS {
+    NvU32 displayId;
+    NV_DECLARE_ALIGNED(NvU64 pixelClockNumerator, 8);
+    NV_DECLARE_ALIGNED(NvU64 pixelClockDenominator, 8);
+} NV0073_CTRL_SYSTEM_GSYNC_GET_EXACT_PIXEL_CLOCK_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_GET_RASTER_FRAME_LINE_PIXEL
+ *
+ * Diagnostic query to get the raster position that is currently being output on a display
+ *
+ *   displayCount
+ *     This specifies how many displays are included
+ *   displayId
+ *     This specifies a display to query
+ *   timestampBeginning
+ *     This is returned by RM to specify the kernel timestamp when reading the values was started
+ *     in units of nanoseconds
+ *   frame
+ *     This is returned by RM to give the current frame counter
+ *   line
+ *     This is returned by RM to give the current line number
+ *   pixel
+ *     This is returned by RM to give the current column in the line
+ *   timestampEnd
+ *     This is returned by RM to specify the kernel timestamp when reading the values was finished
+ *     in units of nanoseconds
+ *   timestampFrequency
+ *     This is returned by RM to specify how many times the kernel timestamp changes per second
+ *     (according to the OS)
+ *
+ *   Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_INVALID_ARGUMENT
+ *   NV_ERR_NOT_SUPPORTED
+ */
+
+#define NV0073_CTRL_CMD_SYSTEM_GET_RASTER_FRAME_LINE_PIXEL (0x7301a5U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_GET_RASTER_FRAME_LINE_PIXEL_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_SYSTEM_GET_RASTER_FRAME_LINE_PIXEL_PARAMS_MESSAGE_ID (0xA5U)
+
+typedef struct NV0073_CTRL_SYSTEM_GET_RASTER_FRAME_LINE_PIXEL_PARAMS {
+    NvU32 displayCount;
+    struct {
+        NvU32 displayId;
+        NV_DECLARE_ALIGNED(NvU64 timestampBeginning, 8);
+        NvU32 frame;
+        NvU32 line;
+        NvU32 pixel;
+        NV_DECLARE_ALIGNED(NvU64 timestampEnd, 8);
+    } displays[NV_MAX_HEADS];
+    NV_DECLARE_ALIGNED(NvU64 timestampFrequency, 8);
+} NV0073_CTRL_SYSTEM_GET_RASTER_FRAME_LINE_PIXEL_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH
+ *
+ * Queries the UEFI allocated ISO BW and Floor BW for Display.
+ *
+ *   subDeviceInstance
+ *     This parameter specifies the subdevice instance within the
+ *     NV04_DISPLAY_COMMON parent device to which the operation should be
+ *     directed.
+ *   isoBandwidthKBPS
+ *     ISO BW set by UEFI to initialize display
+ *   floorBandwidthKBPS
+ *     Floor BW set by UEFI to initialize display
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_INVALID_ARGUMENT
+ *   NV_ERR_NOT_SUPPORTED
+ *   NV_ERR_GENERIC
+ */
+
+#define NV0073_CTRL_CMD_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH (0x730161U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH_PARAMS_MESSAGE_ID (0x61U)
+
+typedef struct NV0073_CTRL_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH_PARAMS {
+    NvU32 subDeviceInstance;
+    NvU32 isoBandwidthKBPS;
+    NvU32 floorBandwidthKBPS;
+} NV0073_CTRL_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH_PARAMS;
 
 /* _ctrl0073system_h_ */
 

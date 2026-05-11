@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -75,7 +75,6 @@ memlistConstruct_IMPL
     NvU32                             src_hHwResDevice;
     NvU32                             src_hHwResHandle;
     NvU32                             result;
-    RS_PRIV_LEVEL                     privLevel = pCallContext->secInfo.privLevel;
 
     // Copy-construction has already been done by the base Memory class
     if (RS_IS_COPY_CTOR(pParams))
@@ -89,6 +88,7 @@ memlistConstruct_IMPL
     //
     if (!hypervisorIsVgxHyper())
     {
+        RS_PRIV_LEVEL privLevel = pCallContext->secInfo.privLevel;
         if (IS_VIRTUAL(pGpu) && privLevel >= RS_PRIV_LEVEL_KERNEL)
         {
             goto continue_alloc_object;
@@ -262,6 +262,7 @@ continue_alloc_object:
     if (addressSpace == ADDR_SYSMEM)
     {
         NvU32 attr2 = 0;
+        NvU64 tmpActualSize = 0;
 
         NV_CHECK_OR_RETURN(LEVEL_ERROR, src_pMemDesc == NULL, NV_ERR_NOT_SUPPORTED);
 
@@ -281,7 +282,7 @@ continue_alloc_object:
 
         pPteArray = memdescGetPteArray(pMemDesc, AT_GPU);
 
-        if ((pAllocParams->pageCount > pMemDesc->PageCount) ||
+        if ((pAllocParams->pageCount > pMemDesc->pageArraySize) ||
             !portSafeMulU32(sizeof(NvU64), pAllocParams->pageCount, &result))
         {
             memdescDestroy(pMemDesc);
@@ -300,6 +301,21 @@ continue_alloc_object:
             return status;
         }
 
+        tmpActualSize = pMemDesc->Size;
+        status = memdescCalculateActualSize(pMemDesc, pMemDesc->Size, &tmpActualSize);
+        if (status != NV_OK) {
+            memdescDestroy(pMemDesc);
+            return status;
+        }
+
+        // TODO: Bug 5272046 will track the removal of this hardcoded RM_PAGE_SIZE with the desired pageArrayGranularity, such as 64K, 128KB, etc.
+        status = memdescSetAllocSizeFields(pMemDesc, NV_ALIGN_UP64(tmpActualSize, RM_PAGE_SIZE), RM_PAGE_SIZE);
+        if (status != NV_OK)
+        {
+            memdescDestroy(pMemDesc);
+            return status;
+        }
+
         if (RMCFG_MODULE_KERNEL_BUS)
         {
             KernelBus  *pKernelBus = GPU_GET_KERNEL_BUS(pGpu);
@@ -309,8 +325,8 @@ continue_alloc_object:
                 RmPhysAddr barOffset = pKernelBus->pciBars[i];
                 NvU64      barSize   = pKernelBus->pciBarSizes[i];
 
-                if ((pPteArray[0] >= barOffset >> RM_PAGE_SHIFT) &&
-                    (pPteArray[0] <  (barOffset + barSize) >> RM_PAGE_SHIFT))
+                if ((pPteArray[0] >= barOffset >> GET_PAGE_SHIFT(pMemDesc->pageArrayGranularity)) &&
+                    (pPteArray[0] <  (barOffset + barSize) >> GET_PAGE_SHIFT(pMemDesc->pageArrayGranularity)))
                 {
                     /*
                      * For SYSMEM address space when creating descriptor for
@@ -336,7 +352,7 @@ continue_alloc_object:
         {
             i--;
             memdescSetPte(pMemDesc, AT_GPU, i,
-                      pPteArray[i] << RM_PAGE_SHIFT);
+                      pPteArray[i] << GET_PAGE_SHIFT(pMemDesc->pageArrayGranularity));
         }
 
         // this will fake a memory allocation at
@@ -415,6 +431,7 @@ continue_alloc_object:
         Heap                              *pHeap;
         NvBool                             bCallingContextPlugin;
         RsResourceRef                     *pDeviceRef;
+        NvU64                              tmpActualSize       = 0;
 
         NV_ASSERT_OK_OR_RETURN(
             refFindAncestorOfType(pResourceRef, classId(Device), &pDeviceRef));
@@ -505,9 +522,22 @@ continue_alloc_object:
             goto done_fbmem;
         }
 
+        tmpActualSize = pMemDesc->Size;
+        status = memdescCalculateActualSize(pMemDesc, pMemDesc->Size, &tmpActualSize);
+        if (status != NV_OK) {
+            goto done_fbmem;
+        }
+
+        // TODO: Bug 5272046 will track the removal of this workaround with the desired pageArrayGranularity, such as 64K, 128KB, etc.
+        status = memdescSetAllocSizeFields(pMemDesc, NV_ALIGN_UP64(tmpActualSize, RM_PAGE_SIZE), RM_PAGE_SIZE);
+        if (status != NV_OK)
+        {
+            goto done_fbmem;
+        }
+
         if (bContig)
         {
-            newBase = (pPteArray[0] << RM_PAGE_SHIFT) + pAllocParams->pteAdjust;
+            newBase = (pPteArray[0] << GET_PAGE_SHIFT(pMemDesc->pageArrayGranularity)) + pAllocParams->pteAdjust;
 
             if ((newBase + memSize) > trueLength)
             {
@@ -523,8 +553,8 @@ continue_alloc_object:
         for (i = pAllocParams->pageCount; i > 0;)
         {
             i--;
-            newBase = (pPteArray[i] << RM_PAGE_SHIFT);
-            if ((newBase + RM_PAGE_SIZE) > trueLength)
+            newBase = (pPteArray[i] << GET_PAGE_SHIFT(pMemDesc->pageArrayGranularity));
+            if ((newBase + pMemDesc->pageArrayGranularity) > trueLength)
             {
                 NV_PRINTF(LEVEL_ERROR,
                           "Out of range page address 0x%016llx\n", newBase);
@@ -570,19 +600,6 @@ continue_alloc_object:
             pFbAllocInfo->ctagOffset        = pAllocParams->ctagOffset;
             pFbAllocInfo->hClient           = hClient;
             pFbAllocInfo->hDevice           = hParent;    /* device */
-            pFbAllocInfo->bIsKernelAlloc    = NV_FALSE;
-
-            // only a kernel client can request for a protected allocation
-            if (pFbAllocInfo->pageFormat->flags & NVOS32_ALLOC_FLAGS_ALLOCATE_KERNEL_PRIVILEGED)
-            {
-                if (privLevel < RS_PRIV_LEVEL_KERNEL)
-                {
-                    status = NV_ERR_INSUFFICIENT_PERMISSIONS;
-                    NV_PRINTF(LEVEL_ERROR, "only kernel clients may request for a protected allocation\n");
-                    goto done_fbmem;
-                }
-                pFbAllocInfo->bIsKernelAlloc = NV_TRUE;
-            }
 
             if ((pAllocParams->flags & NVOS32_ALLOC_FLAGS_ALIGNMENT_HINT) ||
                 (pAllocParams->flags & NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE))
@@ -591,7 +608,7 @@ continue_alloc_object:
             }
             else
             {
-                pFbAllocInfo->align = RM_PAGE_SIZE;
+                pFbAllocInfo->align = pMemDesc->pageArrayGranularity;
             }
 
             // Fetch RM page size
@@ -670,15 +687,6 @@ continue_alloc_object:
                       pFbAllocInfo->hwResId);
 
             hwResId = pFbAllocInfo->hwResId;
-
-            //
-            // For Linux Guest, we allocate hardware resources on the host through
-            // NV01_MEMORY_LIST_OBJECT or NV01_MEMORY_LIST_FBMEM class objects.
-            // isGuestAllocated flag when set TRUE indicates that hardware resource
-            // is allocated for Linux Guest and we will free it in
-            // memDestructCommon.
-            //
-            pHwResource->isGuestAllocated = NV_TRUE;
         }
         else if (src_hHwResHandle != 0)
         {
@@ -749,6 +757,14 @@ continue_alloc_object:
             pHwResource = NULL;
         }
 
+        if (src_hHwResHandle != 0 && pHwResource != NULL)
+        {
+            /* Increment the refCount for HW resource which is not allocated inside memlistConstruct_IMPL.
+             * This is to avoid freeing up of HwResource while source HW resource handle is still active.
+             */
+            pMemory->pHwResource->refCount += 1;
+        }
+
         memdescSetPteKind(pMemory->pMemDesc, pAllocParams->format);
         memdescSetHwResId(pMemory->pMemDesc, hwResId);
 
@@ -757,7 +773,9 @@ done_fbmem:
         {
             memdescDestroy(pMemDesc);
 
-            if (src_hHwResHandle == 0)
+            if ((src_hHwResHandle == 0) &&
+                (pFbAllocInfo != NULL) &&
+                (pFbAllocPageFormat != NULL))
             {
                 portMemFree(pHwResource);
 

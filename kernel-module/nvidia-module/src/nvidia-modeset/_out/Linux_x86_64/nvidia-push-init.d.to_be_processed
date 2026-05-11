@@ -19,18 +19,13 @@ _out/Linux_x86_64/nvidia-push-init.o: \
  ../common/sdk/nvidia/inc/class/cl9010.h \
  ../common/sdk/nvidia/inc/class/cl9010_callback.h \
  ../common/unix/nvidia-push/interface/nvidia-push-utils.h \
- ../common/sdk/nvidia/inc/class/cla16f.h \
+ ../common/sdk/nvidia/inc/class/clc46f.h \
  ../common/unix/nvidia-push/include/nvidia-push-priv.h \
  ../common/unix/nvidia-push/include/nvidia-push-priv-imports.h \
  ../common/unix/nvidia-push/interface/nvidia-push-types.h \
  ../common/sdk/nvidia/inc/class/cl0002.h \
  ../common/sdk/nvidia/inc/class/cl003e.h \
  ../common/sdk/nvidia/inc/class/cl0040.h \
- ../common/sdk/nvidia/inc/class/cla26f.h \
- ../common/sdk/nvidia/inc/class/clb06f.h \
- ../common/sdk/nvidia/inc/class/clc06f.h \
- ../common/sdk/nvidia/inc/class/clc36f.h \
- ../common/sdk/nvidia/inc/class/clc46f.h \
  ../common/sdk/nvidia/inc/class/cl50a0.h \
  ../common/sdk/nvidia/inc/class/clc56f.h \
  ../common/sdk/nvidia/inc/class/clc86f.h \
@@ -38,11 +33,9 @@ _out/Linux_x86_64/nvidia-push-init.o: \
  ../common/sdk/nvidia/inc/class/clca6f.h \
  ../common/sdk/nvidia/inc/class/clc361.h \
  ../common/sdk/nvidia/inc/class/clc661.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080fifo.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h \
- ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080bus.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
  ../common/sdk/nvidia/inc/ctrl/ctrla06f/ctrla06fgpfifo.h \
  ../common/sdk/nvidia/inc/ctrl/ctrla06f/ctrla06fbase.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl906f.h \
@@ -72,18 +65,13 @@ _out/Linux_x86_64/nvidia-push-init.o: \
 ../common/sdk/nvidia/inc/class/cl9010.h:
 ../common/sdk/nvidia/inc/class/cl9010_callback.h:
 ../common/unix/nvidia-push/interface/nvidia-push-utils.h:
-../common/sdk/nvidia/inc/class/cla16f.h:
+../common/sdk/nvidia/inc/class/clc46f.h:
 ../common/unix/nvidia-push/include/nvidia-push-priv.h:
 ../common/unix/nvidia-push/include/nvidia-push-priv-imports.h:
 ../common/unix/nvidia-push/interface/nvidia-push-types.h:
 ../common/sdk/nvidia/inc/class/cl0002.h:
 ../common/sdk/nvidia/inc/class/cl003e.h:
 ../common/sdk/nvidia/inc/class/cl0040.h:
-../common/sdk/nvidia/inc/class/cla26f.h:
-../common/sdk/nvidia/inc/class/clb06f.h:
-../common/sdk/nvidia/inc/class/clc06f.h:
-../common/sdk/nvidia/inc/class/clc36f.h:
-../common/sdk/nvidia/inc/class/clc46f.h:
 ../common/sdk/nvidia/inc/class/cl50a0.h:
 ../common/sdk/nvidia/inc/class/clc56f.h:
 ../common/sdk/nvidia/inc/class/clc86f.h:
@@ -91,11 +79,9 @@ _out/Linux_x86_64/nvidia-push-init.o: \
 ../common/sdk/nvidia/inc/class/clca6f.h:
 ../common/sdk/nvidia/inc/class/clc361.h:
 ../common/sdk/nvidia/inc/class/clc661.h:
-../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080fifo.h:
-../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h:
-../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080bus.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h:
+../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
 ../common/sdk/nvidia/inc/ctrl/ctrla06f/ctrla06fgpfifo.h:
 ../common/sdk/nvidia/inc/ctrl/ctrla06f/ctrla06fbase.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl906f.h:

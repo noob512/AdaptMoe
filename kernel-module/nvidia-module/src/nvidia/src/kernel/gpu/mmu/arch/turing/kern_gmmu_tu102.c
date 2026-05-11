@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -58,14 +58,20 @@ kgmmuCheckPendingInvalidates_TU102
 
     while (1)
     {
-        NvU32 regVal = GPU_VREG_RD32(pGpu, NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE);
+        NvU32 regVal;
+
+        if (API_GPU_IN_RESET_SANITY_CHECK(pGpu)) 
+        {
+            status = NV_ERR_GPU_IN_FULLCHIP_RESET;
+            break;
+        }
+
+        regVal = GPU_VREG_RD32(pGpu, NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE);
 
         if (FLD_TEST_DRF(_VIRTUAL_FUNCTION_PRIV, _MMU_INVALIDATE, _TRIGGER, _FALSE, regVal))
             break;
 
-        if (API_GPU_IN_RESET_SANITY_CHECK(pGpu))
-            status = NV_ERR_GPU_IN_FULLCHIP_RESET;
-        else if (!API_GPU_ATTACHED_SANITY_CHECK(pGpu))
+       if (!API_GPU_ATTACHED_SANITY_CHECK(pGpu))
             status = NV_ERR_GPU_IS_LOST;
         else
             status = gpuCheckTimeout(pGpu, pTimeOut);
@@ -176,6 +182,35 @@ kgmmuSetTlbInvalidateMembarWarParameters_TU102
     pParams->regVal = FLD_SET_DRF(_VIRTUAL_FUNCTION_PRIV, _MMU_INVALIDATE, _ACK,    _GLOBALLY, pParams->regVal);
 
     return 0;
+}
+
+/*!
+ * @brief Wrapper for kgmmuSetTlbInvalidateMembarWarParameters_TU102 on chips where it is disabled.
+ * 
+ * NOTE: THIS WRAPPER CAN BE CALLED ONLY IN THE GSP TIMEOUT DETECTION PATH!
+ *
+ * kgmmuSetTlbInvalidateMembarWarParameters is currently disabled on Ampere+, 
+ * but it should ideally be enabled according to CL 25254668 description, where the 
+ * function was originally added. We need a way to call this function for memory
+ * error detection, but enabling the HAL on all Ampere+ chips is out of the scope of
+ * the feature. This wrapper to call kgmmuSetTlbInvalidateMembarWarParameters_TU102 
+ * is being added as a stop gap measure till kgmmuSetTlbInvalidateMembarWarParameters
+ * is enabled on all Ampere+ chips.
+ *
+ * @param[in] pGpu
+ * @param[in] pKernelGmmu
+ * @param[in] pParams     Tlb invalidation parameter structure.
+ *
+ */
+void
+kgmmuSetTlbInvalidateMembarParameters_TU102
+(
+    OBJGPU                *pGpu,
+    KernelGmmu            *pKernelGmmu,
+    TLB_INVALIDATE_PARAMS *pParams
+)
+{
+    kgmmuSetTlbInvalidateMembarWarParameters_TU102(pGpu, pKernelGmmu, pParams);
 }
 
 NV_STATUS

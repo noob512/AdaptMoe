@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -23,13 +23,24 @@
 
 #include "gpu/hwpm/profiler_v2.h"
 #include "gpu/hwpm/kern_hwpm.h"
+#include "rmapi/rs_utils.h"
 #include "vgpu/rpc.h"
+#include "kernel/gpu/fifo/kernel_channel_group_api.h"
+#include "kernel/gpu/fifo/kernel_channel_group.h"
 
 static NV_INLINE NvBool
-_isNonAdminProfilingPermitted(OBJGPU *pGpu)
+_isDevTracingPermitted
+(
+    OBJGPU *pGpu, 
+    ProfilerBase *pProf, 
+    NVB2CC_ALLOC_PARAMETERS *pUserParams,
+    API_SECURITY_INFO *pSecInfo,
+    ProfilerBase *pProfBase,
+    RmClient *pRmClient
+)
 {
-    // Any non-priv clients with RS_ACCESS_PERFMON capability are allowed
-    if (osCheckAccess(RS_ACCESS_PERFMON))
+    // Admins are always allowed to access device profiling
+    if (pSecInfo->privLevel >= RS_PRIV_LEVEL_USER_ROOT)
     {
         return NV_TRUE;
     }
@@ -40,11 +51,25 @@ _isNonAdminProfilingPermitted(OBJGPU *pGpu)
         return NV_TRUE;
     }
 
+    // Any non-priv clients with RS_ACCESS_PERFMON capability are allowed
+    if (osCheckAccess(RS_ACCESS_PERFMON))
+    {
+        return NV_TRUE;
+    }
+
     return NV_FALSE;
 }
 
 static NV_INLINE NvBool
-_isProfilingPermitted(OBJGPU *pGpu, ProfilerBase *pProf, API_SECURITY_INFO *pSecInfo)
+_isDevProfilingPermitted
+(
+    OBJGPU *pGpu, 
+    ProfilerBase *pProf, 
+    NVB2CC_ALLOC_PARAMETERS *pUserParams,
+    API_SECURITY_INFO *pSecInfo,
+    ProfilerBase *pProfBase,
+    RmClient *pRmClient
+)
 {
     // Admins are always allowed to access device profiling
     if (pSecInfo->privLevel >= RS_PRIV_LEVEL_USER_ROOT)
@@ -52,8 +77,48 @@ _isProfilingPermitted(OBJGPU *pGpu, ProfilerBase *pProf, API_SECURITY_INFO *pSec
         return NV_TRUE;
     }
 
-    // Non-priv clients may device profile only in special cases
-    if (_isNonAdminProfilingPermitted(pGpu))
+    // Otherwise, allowed only if profiling is deprivileged for all users
+    if (!gpuIsRmProfilingPrivileged(pGpu))
+    {
+        return NV_TRUE;
+    }
+
+
+    // Any non-priv clients with RS_ACCESS_PERFMON capability are allowed
+    if (osCheckAccess(RS_ACCESS_PERFMON))
+    {
+        return NV_TRUE;
+    }
+
+    return NV_FALSE;
+}
+
+static NV_INLINE NvBool
+_isContextProfilingPermitted
+(
+    OBJGPU *pGpu, 
+    ProfilerBase *pProf, 
+    NVB2CC_ALLOC_PARAMETERS *pUserParams,
+    API_SECURITY_INFO *pSecInfo,
+    ProfilerBase *pProfBase,
+    RmClient *pRmClient
+)
+{
+    
+    // Admins are always allowed to access device profiling
+    if (pSecInfo->privLevel >= RS_PRIV_LEVEL_USER_ROOT)
+    {
+        return NV_TRUE;
+    }
+
+    // Any non-priv clients with RS_ACCESS_PERFMON capability are allowed
+    if (osCheckAccess(RS_ACCESS_PERFMON))
+    {
+        return NV_TRUE;
+    }
+
+    // Otherwise, allowed only if profiling is deprivileged for all users
+    if (!gpuIsRmProfilingPrivileged(pGpu))
     {
         return NV_TRUE;
     }
@@ -274,7 +339,7 @@ profilerBaseDestructState_VF
 
         if (pProf->pPmaStreamList[pmaChIdx].pNumBytesCpuAddr != NvP64_NULL )
         {
-            memdescUnmap(pProf->pPmaStreamList[pmaChIdx].pNumBytesBufDesc, NV_TRUE, osGetCurrentProcess(),
+            memdescUnmap(pProf->pPmaStreamList[pmaChIdx].pNumBytesBufDesc, NV_TRUE,
                          pProf->pPmaStreamList[pmaChIdx].pNumBytesCpuAddr,
                          pProf->pPmaStreamList[pmaChIdx].pNumBytesCpuAddrPriv);
         }
@@ -289,7 +354,6 @@ profilerBaseDestructState_VF
     }
 
     portMemFree(pProf->pPmaStreamList);
-    portMemFree(pProf->pBindPointAllocated);
 }
 
 NV_STATUS
@@ -338,10 +402,15 @@ profilerBaseQueryCapabilities_IMPL
     API_SECURITY_INFO   *pSecInfo               = pParams->pSecInfo;
     NvBool               bAnyProfilingPermitted = NV_FALSE;
     KernelHwpm *pKernelHwpm = GPU_GET_KERNEL_HWPM(pGpu);
+    RmClient *pRmClient = dynamicCast(RES_GET_CLIENT(pProfBase), RmClient);
+    NVB2CC_ALLOC_PARAMETERS *pUserParams = pParams->pAllocParams;
 
-    // SYS memory profiling is permitted if video memory profiling is permitted.
+    NV_ASSERT_OR_RETURN(NULL != pRmClient, NV_ERR_INVALID_CLIENT);
+
+    // SYS memory profiling and Async CE profiling is permitted if video memory profiling is permitted.
     pClientPermissions->bVideoMemoryProfilingPermitted = _isMemoryProfilingPermitted(pGpu, pProfBase);
     pClientPermissions->bSysMemoryProfilingPermitted = pClientPermissions->bVideoMemoryProfilingPermitted;
+    pClientPermissions->bAsyncCeProfilingPermitted = pClientPermissions->bVideoMemoryProfilingPermitted;
 
     //
     // bAdminProfilingPermitted controls access to privileged profiling registers.
@@ -354,11 +423,21 @@ profilerBaseQueryCapabilities_IMPL
         pClientPermissions->bAdminProfilingPermitted = NV_TRUE;
     }
 
-    pClientPermissions->bDevProfilingPermitted = _isProfilingPermitted(pGpu, pProfBase, pSecInfo);
-    pClientPermissions->bCtxProfilingPermitted = _isProfilingPermitted(pGpu, pProfBase, pSecInfo);
-
-    if (pClientPermissions->bDevProfilingPermitted || pClientPermissions->bCtxProfilingPermitted)
+    if (_isDevProfilingPermitted(pGpu, pProfBase, pUserParams, pSecInfo, pProfBase, pRmClient))
     {
+        pClientPermissions->bDevProfilingPermitted = NV_TRUE;
+        bAnyProfilingPermitted = NV_TRUE;
+    }
+
+    if (_isContextProfilingPermitted(pGpu, pProfBase, pUserParams, pSecInfo, pProfBase, pRmClient))
+    {
+        pClientPermissions->bCtxProfilingPermitted = NV_TRUE;
+        bAnyProfilingPermitted = NV_TRUE;
+    }
+
+    if (_isDevTracingPermitted(pGpu, pProfBase, pUserParams, pSecInfo, pProfBase, pRmClient))
+    {
+        pClientPermissions->bDevTracingPermitted = NV_TRUE;
         bAnyProfilingPermitted = NV_TRUE;
     }
 
@@ -377,7 +456,7 @@ profilerBaseQueryCapabilities_IMPL
  * Initialize pPmaStreamList on guest to store details PMA stream
  */
 static NV_STATUS
-_profilerDevConstructVgpuGuest
+_profilerBaseConstructVgpuGuest
 (
     ProfilerBase *pProfBase,
     RS_RES_ALLOC_PARAMS_INTERNAL *pParams
@@ -385,7 +464,6 @@ _profilerDevConstructVgpuGuest
 {
     OBJGPU *pGpu = GPU_RES_GET_GPU(pProfBase);
     HWPM_PMA_STREAM *pPmaStreamList = NULL;
-    NvBool *pBindPointAllocated = NULL;
 
     // Allocate the pPmaStreamList to store info about memaddr buffer CPU mapping
     pPmaStreamList = portMemAllocNonPaged(sizeof(HWPM_PMA_STREAM) * GPU_GET_KERNEL_HWPM(pGpu)->maxPmaChannels);
@@ -396,17 +474,7 @@ _profilerDevConstructVgpuGuest
 
     portMemSet(pPmaStreamList, 0, sizeof(HWPM_PMA_STREAM) * GPU_GET_KERNEL_HWPM(pGpu)->maxPmaChannels);
 
-    pBindPointAllocated = portMemAllocNonPaged(sizeof(NvBool) * GPU_GET_KERNEL_HWPM(pGpu)->maxPmaChannels);
-    if (pBindPointAllocated == NULL)
-    {
-        portMemFree(pPmaStreamList);
-        return NV_ERR_NO_MEMORY;
-    }
-
-    portMemSet(pBindPointAllocated, NV_FALSE, sizeof(NvBool) * GPU_GET_KERNEL_HWPM(pGpu)->maxPmaChannels);
-
     pProfBase->pPmaStreamList = pPmaStreamList;
-    pProfBase->pBindPointAllocated = pBindPointAllocated;
 
     return NV_OK;
 }
@@ -425,7 +493,7 @@ profilerDevConstructState_VF
     NV_STATUS        rmStatus   = NV_OK;
 
     NV_ASSERT_OK_OR_GOTO(rmStatus,
-                         _profilerDevConstructVgpuGuest(pProfBase, pParams),
+                         _profilerBaseConstructVgpuGuest(pProfBase, pParams),
                          profilerDevConstruct_VF_exit);
 
     // Issue RPC to allocate Profiler object on vGPU host as well
@@ -501,8 +569,11 @@ profilerDevConstructStateInterlude_IMPL
     NVB0CC_CTRL_INTERNAL_PERMISSIONS_INIT_PARAMS params = {0};
 
     params.bDevProfilingPermitted = clientPermissions.bDevProfilingPermitted;
+    params.bCtxProfilingPermitted = clientPermissions.bCtxProfilingPermitted;
+    params.bDevTracePermitted = clientPermissions.bDevTracingPermitted;
     params.bAdminProfilingPermitted = clientPermissions.bAdminProfilingPermitted;
     params.bVideoMemoryProfilingPermitted = clientPermissions.bVideoMemoryProfilingPermitted;
+    params.bAsyncCeProfilingPermitted = clientPermissions.bAsyncCeProfilingPermitted;
     params.bSysMemoryProfilingPermitted = clientPermissions.bSysMemoryProfilingPermitted;
 
     return pRmApi->Control(pRmApi,
@@ -531,6 +602,7 @@ profilerCtxConstructStateInterlude_IMPL
     params.bCtxProfilingPermitted = clientPermissions.bCtxProfilingPermitted;
     params.bAdminProfilingPermitted = clientPermissions.bAdminProfilingPermitted;
     params.bVideoMemoryProfilingPermitted = clientPermissions.bVideoMemoryProfilingPermitted;
+    params.bAsyncCeProfilingPermitted = clientPermissions.bAsyncCeProfilingPermitted;
     params.bSysMemoryProfilingPermitted = clientPermissions.bSysMemoryProfilingPermitted;
 
     return pRmApi->Control(pRmApi,
@@ -548,12 +620,9 @@ profilerDevConstructStateEpilogue_FWCLIENT
     RS_RES_ALLOC_PARAMS_INTERNAL *pParams
 )
 {
-    ProfilerBase *pProfBase = staticCast(pProfDev, ProfilerBase);
     RsResourceRef *pParentRef = pCallContext->pResourceRef->pParentRef;
 
     NV_ASSERT_OR_RETURN((pParentRef->internalClassId == classId(Subdevice)), NV_ERR_INVALID_OBJECT_PARENT);
-
-    pProfBase->hSubDevice = pParentRef->hResource;
 
     return NV_OK;
 }
@@ -590,6 +659,37 @@ profilerDevDestructState_FWCLIENT
 }
 
 NV_STATUS
+profilerCtxConstructState_VF
+(
+    ProfilerCtx *pProfCtx,
+    CALL_CONTEXT *pCallContext,
+    RS_RES_ALLOC_PARAMS_INTERNAL *pParams,
+    PROFILER_CLIENT_PERMISSIONS clientPermissions
+)
+{
+    OBJGPU          *pGpu       = GPU_RES_GET_GPU(pProfCtx);
+    ProfilerBase    *pProfBase  = staticCast(pProfCtx, ProfilerBase);
+    NV_STATUS        rmStatus   = NV_OK;
+
+    NV_ASSERT_OK_OR_GOTO(rmStatus,
+                         _profilerBaseConstructVgpuGuest(pProfBase, pParams),
+                         profilerCtxConstruct_VF_exit);
+
+    // Issue RPC to allocate Profiler object on vGPU host as well
+    NV_RM_RPC_ALLOC_OBJECT(pGpu,
+                           pCallContext->pClient->hClient,
+                           pCallContext->pResourceRef->pParentRef->hResource,
+                           pCallContext->pResourceRef->hResource,
+                           MAXWELL_PROFILER_CONTEXT,
+                           pParams->pAllocParams,
+                           pParams->paramsSize,
+                           rmStatus);
+
+profilerCtxConstruct_VF_exit:
+    return rmStatus;
+}
+
+NV_STATUS
 profilerCtxConstructState_IMPL
 (
     ProfilerCtx *pProfCtx,
@@ -615,13 +715,47 @@ profilerCtxConstruct_IMPL
     RS_RES_ALLOC_PARAMS_INTERNAL *pParams
 )
 {
-    ProfilerBase      *pProfBase  = staticCast(pProfCtx, ProfilerBase);
+    OBJGPU            *pGpu        = GPU_RES_GET_GPU(pProfCtx);
+    KernelHwpm        *pKernelHwpm = GPU_GET_KERNEL_HWPM(pGpu);
+    ProfilerBase      *pProfBase   = staticCast(pProfCtx, ProfilerBase);
+    RsResourceRef     *pParentRef  = pCallContext->pResourceRef->pParentRef;
+    RmClient          *pClient     = serverutilGetClientUnderLock(pCallContext->pClient->hClient);
     PROFILER_CLIENT_PERMISSIONS clientPermissions = {0};
 
-    if (!profilerBaseQueryCapabilities_HAL(pProfBase, pCallContext, pParams,
-                                            &clientPermissions))
+    if (!pKernelHwpm->getProperty(pKernelHwpm, PDB_PROP_KHWPM_PROFILING_B1CC_SUPPORTED))
+    {
+        NV_PRINTF(LEVEL_ERROR, "Context level profiler is not supported\n");
+        return NV_ERR_NOT_SUPPORTED;
+    }
+
+    if (!profilerBaseQueryCapabilities_HAL(pProfBase, pCallContext, pParams, &clientPermissions))
     {
         return NV_ERR_INSUFFICIENT_PERMISSIONS;
+    }
+
+    //
+    // Bug: 5225901
+    // Restrict B1CC HES the profiler session to user with profiling permission
+    // when TSG is shared between multiple processes (MPS mode).
+    //
+    if (pParentRef->internalClassId == classId(KernelChannelGroupApi) && pClient)
+    {
+        API_SECURITY_INFO   *pSecInfo   = pParams->pSecInfo;
+
+        if (!_isDevProfilingPermitted(pGpu, pProfBase, NULL, pSecInfo, pProfBase, pClient))
+        {
+            CHANNEL_NODE   *pChanNode;
+            KernelChannelGroupApi *pKernelChannelGroupApi = dynamicCast(pParentRef->pResource,
+                                                                KernelChannelGroupApi);
+            KernelChannelGroup *pKernelChannelGroup = pKernelChannelGroupApi->pKernelChannelGroup;
+
+            for (pChanNode = pKernelChannelGroup->pChanList->pHead; pChanNode; pChanNode = pChanNode->pNext)
+            {
+                KernelChannel *pChannel = pChanNode->pKernelChannel;
+
+                NV_CHECK_OR_RETURN(LEVEL_NOTICE, (pClient->ProcID == pChannel->ProcessID),  NV_ERR_INSUFFICIENT_PERMISSIONS);
+            }
+        }
     }
 
     return profilerCtxConstructState(pProfCtx, pCallContext, pParams, clientPermissions);

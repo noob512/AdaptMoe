@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2014-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2014-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -43,11 +43,12 @@
 #define NVA081_CTRL_VGPU_CONFIG              (0x01)
 
 #define NVA081_CTRL_VGPU_CONFIG_INVALID_TYPE 0x00
-#define NVA081_MAX_VGPU_TYPES_PER_PGPU       0x64
-#define NVA081_MAX_VGPU_PER_PGPU             32
+#define NVA081_MAX_VGPU_TYPES_PER_PGPU       0x80
+#define NVA081_MAX_VGPU_PER_PGPU             48
+#define NVA081_MAX_VGPU_PER_PGPU_NON_MIG     32
 #define NVA081_MAX_VGPU_PER_GI               12
 #define NVA081_VM_UUID_SIZE                  16
-#define NVA081_VGPU_STRING_BUFFER_SIZE       32
+#define NVA081_VGPU_STRING_BUFFER_SIZE       64
 #define NVA081_VGPU_SIGNATURE_SIZE           128
 #define NVA081_VM_NAME_SIZE                  128
 #define NVA081_PCI_CONFIG_SPACE_SIZE         0x100
@@ -101,6 +102,7 @@ typedef struct NVA081_CTRL_VGPU_INFO {
     NvU32 cudaEnabled;
     NvU32 eccSupported;
     NvU32 gpuInstanceSize;
+    NvU32 nominalFbRegionSize;
     NvU32 multiVgpuSupported;
     NV_DECLARE_ALIGNED(NvU64 vdevId, 8);
     NV_DECLARE_ALIGNED(NvU64 pdevId, 8);
@@ -112,6 +114,7 @@ typedef struct NVA081_CTRL_VGPU_INFO {
     NvU32 encoderCapacity;
     NV_DECLARE_ALIGNED(NvU64 bar1Length, 8);
     NvU32 frlEnable;
+    NvU16 vgpuSsvid;
     NvU8  adapterName[NV2080_GPU_MAX_NAME_STRING_LENGTH];
     NvU16 adapterName_Unicode[NV2080_GPU_MAX_NAME_STRING_LENGTH];
     NvU8  shortGpuNameString[NV2080_GPU_MAX_NAME_STRING_LENGTH];
@@ -263,6 +266,7 @@ typedef struct NVA081_HOST_VGPU_DEVICE {
     NvBool bDriverLoaded;
     NvU32  swizzId;
     NvU32  placementId;
+    NvU32  accountingPid;
 } NVA081_HOST_VGPU_DEVICE;
 
 /* ECC state values */
@@ -1055,5 +1059,20 @@ typedef struct NVA081_CTRL_VGPU_CONFIG_ENUMERATE_VGPU_PER_GPU_INSTANCE_PARAMS {
     NvU32 numVgpu;
     NvU32 vgpuInstanceIds[NVA081_MAX_VGPU_PER_GI];
 } NVA081_CTRL_VGPU_CONFIG_ENUMERATE_VGPU_PER_GPU_INSTANCE_PARAMS;
+
+/*
+ * NVA081_CTRL_CMD_VGPU_CONFIG_CLEAR_SWIZZID_MASK
+ *
+ * This Command Clears the Assigned SwizzId Mask during vGPU destroy
+ *
+ * swizzId [IN]
+ * This parameter specifies the SwizzId of vGPU device
+ */
+#define NVA081_CTRL_CMD_VGPU_CONFIG_CLEAR_SWIZZID_MASK (0xa0810125) /* finn: Evaluated from "(FINN_NVA081_VGPU_CONFIG_VGPU_CONFIG_INTERFACE_ID << 8) | NVA081_CTRL_CMD_VGPU_CONFIG_CLEAR_SWIZZID_MASK_PARAMS_MESSAGE_ID" */
+#define NVA081_CTRL_CMD_VGPU_CONFIG_CLEAR_SWIZZID_MASK_PARAMS_MESSAGE_ID (0x25U)
+
+typedef struct NVA081_CTRL_CMD_VGPU_CONFIG_CLEAR_SWIZZID_MASK_PARAMS {
+    NvU32 swizzId;
+} NVA081_CTRL_CMD_VGPU_CONFIG_CLEAR_SWIZZID_MASK_PARAMS;
 
 /* _ctrlA081vgpuconfig_h_ */

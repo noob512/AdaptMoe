@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2015-2024 NVIDIA Corporation
+    Copyright (c) 2015-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -212,12 +212,12 @@ struct uvm_mmu_mode_hal_struct
     // This is an optimization which reduces TLB pressure, reduces the number of
     // TLB invalidates we must issue, and means we don't have to initialize the
     // 4k PTEs which are covered by big PTEs since the MMU will never read them.
-    NvU64 (*unmapped_pte)(NvU64 page_size);
+    NvU64 (*unmapped_pte)(void);
 
     // Bit pattern used for debug purposes to clobber PTEs which ought to be
     // unused. In practice this will generate a PRIV violation or a physical
     // memory out-of-range error so we can immediately identify bad PTE usage.
-    NvU64 (*poisoned_pte)(void);
+    NvU64 (*poisoned_pte)(uvm_page_tree_t *tree);
 
     // Write a PDE bit-pattern to entry based on the data in allocs (which may
     // point to two items for dual PDEs).
@@ -228,7 +228,7 @@ struct uvm_mmu_mode_hal_struct
     // invalid/clean PDE entries.
     void (*make_pde)(void *entry, uvm_mmu_page_table_alloc_t **allocs, uvm_page_directory_t *dir, NvU32 child_index);
 
-    // size of an entry in a directory/table.  Generally either 8 or 16 bytes.
+    // size of an entry in a directory/table. Generally either 8 or 16 bytes.
     // (in the case of Pascal dual PDEs)
     NvLength (*entry_size)(NvU32 depth);
 
@@ -279,7 +279,6 @@ struct uvm_page_tree_struct
     uvm_page_directory_t *root;
     uvm_mmu_mode_hal_t *hal;
     uvm_page_tree_type_t type;
-    NvU64 big_page_size;
 
     // Pointer to the GPU VA space containing the page tree.
     // This pointer is set only for page trees of type
@@ -296,8 +295,26 @@ struct uvm_page_tree_struct
     bool location_sys_fallback;
 
     // When the pagetables are located in sysmem, RM is responsible for the DMA
-    // mapping used as the pdb. This address is returned from
+    // mapping used as the PDB. This address is returned to UVM via
     // nvUvmInterfaceSetPageDirectory().
+    //
+    // However, for code base simplicity, UVM performs TLB invalidations using
+    // the page directory base before it has been actually programmed as the
+    // GPU's PDB. This is harmless - hardware will drop an invalidate targeting
+    // a PDB that is not in the PDB cache. This occurs in page_tree_ats_init()
+    // which issues TLB invalidates in process of writing GPU PTEs before
+    // nvUvmInterfaceSetPageDirectory() has been called.
+    //
+    // To accomodate this code structure, prior to calling
+    // nvUvmInterfaceSetPageDirectory(), pdb_rm_dma_address holds UVM's DMA
+    // address of the page directory as a dummy PDB address. This is used for
+    // TLB invalidations that are not required but performed to avoid adding
+    // special cases. Using UVM's DMA address is OK as the DMA mapping created
+    // for the page directory is unique and so cannot be already in use as a PDB
+    // and thus must not be in the TLB.
+    //
+    // After calling nvUvmInterfaceSetPageDirectory(), pdb_rm_dma_address holds
+    // the GPU's PDB as programmed by RM and required for TLB invalidations.
     uvm_gpu_phys_address_t pdb_rm_dma_address;
 
     struct
@@ -361,7 +378,6 @@ void uvm_mmu_init_gpu_peer_addresses(uvm_gpu_t *gpu);
 NV_STATUS uvm_page_tree_init(uvm_gpu_t *gpu,
                              uvm_gpu_va_space_t *gpu_va_space,
                              uvm_page_tree_type_t type,
-                             NvU64 big_page_size,
                              uvm_aperture_t location,
                              uvm_page_tree_t *tree_out);
 
@@ -699,6 +715,13 @@ static uvm_aperture_t uvm_page_table_range_aperture(uvm_page_table_range_t *rang
 // if virtual mappings are required for other accesses. This is only needed when
 // CE has system-wide physical addressing restrictions.
 uvm_gpu_address_t uvm_mmu_gpu_address(uvm_gpu_t *gpu, uvm_gpu_phys_address_t phys_addr);
+
+// Synchronously invalidate cached physical mappings if the gpu requires it (aka
+// dma addresses, IOVAs, and GPAs). See uvm_dma_map_invalidation_t.
+NV_STATUS uvm_mmu_tlb_invalidate_phys(uvm_gpu_t *gpu);
+
+// Invalidate L2 cache for peer or system memory.
+NV_STATUS uvm_mmu_l2_invalidate(uvm_gpu_t *gpu, uvm_aperture_t aperture);
 
 NV_STATUS uvm_test_invalidate_tlb(UVM_TEST_INVALIDATE_TLB_PARAMS *params, struct file *filp);
 

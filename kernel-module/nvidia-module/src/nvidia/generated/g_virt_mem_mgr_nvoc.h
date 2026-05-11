@@ -52,13 +52,9 @@ extern "C" {
 
 typedef struct OBJVMM *POBJVMM;
 
-#ifndef __NVOC_CLASS_OBJVMM_TYPEDEF__
-#define __NVOC_CLASS_OBJVMM_TYPEDEF__
-typedef struct OBJVMM OBJVMM;
-#endif /* __NVOC_CLASS_OBJVMM_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_OBJVMM
-#define __nvoc_class_id_OBJVMM 0xa030ab
+#define __nvoc_class_id_OBJVMM 0xa030abu
+typedef struct OBJVMM OBJVMM;
 #endif /* __nvoc_class_id_OBJVMM */
 
 
@@ -102,13 +98,9 @@ struct NVOC_METADATA__OBJVMM {
     const struct NVOC_METADATA__Object metadata__Object;
 };
 
-#ifndef __NVOC_CLASS_OBJVMM_TYPEDEF__
-#define __NVOC_CLASS_OBJVMM_TYPEDEF__
-typedef struct OBJVMM OBJVMM;
-#endif /* __NVOC_CLASS_OBJVMM_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_OBJVMM
-#define __nvoc_class_id_OBJVMM 0xa030ab
+#define __nvoc_class_id_OBJVMM 0xa030abu
+typedef struct OBJVMM OBJVMM;
 #endif /* __nvoc_class_id_OBJVMM */
 
 // Casting support
@@ -127,45 +119,50 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_OBJVMM;
 NV_STATUS __nvoc_objCreateDynamic_OBJVMM(OBJVMM**, Dynamic*, NvU32, va_list);
 
 NV_STATUS __nvoc_objCreate_OBJVMM(OBJVMM**, Dynamic*, NvU32);
-#define __objCreate_OBJVMM(ppNewObj, pParent, createFlags) \
-    __nvoc_objCreate_OBJVMM((ppNewObj), staticCast((pParent), Dynamic), (createFlags))
+#define __objCreate_OBJVMM(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags) \
+    __nvoc_objCreate_OBJVMM((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags))
 
 
-// Wrapper macros
-
-// Dispatch functions
+// Wrapper macros for implementation functions
 NV_STATUS vmmCreateVaspace_IMPL(struct OBJVMM *pVmm, NvU32 _class, NvU32 vaspaceId, NvU32 gpuMask, NvU64 vaStart, NvU64 vaLimit, NvU64 vaInternalStart, NvU64 vaInternalEnd, struct OBJVASPACE *pPteSpaceMap, NvU32 flags, struct OBJVASPACE **ppVAS);
-
 #ifdef __nvoc_virt_mem_mgr_h_disabled
 static inline NV_STATUS vmmCreateVaspace(struct OBJVMM *pVmm, NvU32 _class, NvU32 vaspaceId, NvU32 gpuMask, NvU64 vaStart, NvU64 vaLimit, NvU64 vaInternalStart, NvU64 vaInternalEnd, struct OBJVASPACE *pPteSpaceMap, NvU32 flags, struct OBJVASPACE **ppVAS) {
     NV_ASSERT_FAILED_PRECOMP("OBJVMM was disabled!");
     return NV_ERR_NOT_SUPPORTED;
 }
-#else //__nvoc_virt_mem_mgr_h_disabled
+#else // __nvoc_virt_mem_mgr_h_disabled
 #define vmmCreateVaspace(pVmm, _class, vaspaceId, gpuMask, vaStart, vaLimit, vaInternalStart, vaInternalEnd, pPteSpaceMap, flags, ppVAS) vmmCreateVaspace_IMPL(pVmm, _class, vaspaceId, gpuMask, vaStart, vaLimit, vaInternalStart, vaInternalEnd, pPteSpaceMap, flags, ppVAS)
-#endif //__nvoc_virt_mem_mgr_h_disabled
+#endif // __nvoc_virt_mem_mgr_h_disabled
 
 void vmmDestroyVaspace_IMPL(struct OBJVMM *pVmm, struct OBJVASPACE *pVAS);
-
 #ifdef __nvoc_virt_mem_mgr_h_disabled
 static inline void vmmDestroyVaspace(struct OBJVMM *pVmm, struct OBJVASPACE *pVAS) {
     NV_ASSERT_FAILED_PRECOMP("OBJVMM was disabled!");
 }
-#else //__nvoc_virt_mem_mgr_h_disabled
+#else // __nvoc_virt_mem_mgr_h_disabled
 #define vmmDestroyVaspace(pVmm, pVAS) vmmDestroyVaspace_IMPL(pVmm, pVAS)
-#endif //__nvoc_virt_mem_mgr_h_disabled
+#endif // __nvoc_virt_mem_mgr_h_disabled
 
 NV_STATUS vmmGetVaspaceFromId_IMPL(struct OBJVMM *pVmm, NvU32 vaspaceId, NvU32 classId, struct OBJVASPACE **ppVAS);
-
 #ifdef __nvoc_virt_mem_mgr_h_disabled
 static inline NV_STATUS vmmGetVaspaceFromId(struct OBJVMM *pVmm, NvU32 vaspaceId, NvU32 classId, struct OBJVASPACE **ppVAS) {
     NV_ASSERT_FAILED_PRECOMP("OBJVMM was disabled!");
     return NV_ERR_NOT_SUPPORTED;
 }
-#else //__nvoc_virt_mem_mgr_h_disabled
+#else // __nvoc_virt_mem_mgr_h_disabled
 #define vmmGetVaspaceFromId(pVmm, vaspaceId, classId, ppVAS) vmmGetVaspaceFromId_IMPL(pVmm, vaspaceId, classId, ppVAS)
-#endif //__nvoc_virt_mem_mgr_h_disabled
+#endif // __nvoc_virt_mem_mgr_h_disabled
 
+
+// Wrapper macros for halified functions
+
+// Dispatch functions
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

@@ -21,7 +21,7 @@ _out/Linux_x86_64/nvidia-3d-volta.o: \
  ../common/sdk/nvidia/inc/nvcfg_sdk.h \
  ../common/sdk/nvidia/inc/class/cl9010.h \
  ../common/sdk/nvidia/inc/class/cl9010_callback.h \
- ../common/sdk/nvidia/inc/class/cla16f.h \
+ ../common/sdk/nvidia/inc/class/clc46f.h \
  ../common/unix/nvidia-3d/interface/nvidia-3d-shaders.h \
  ../common/sdk/nvidia/inc/class/cl9097.h \
  ../common/unix/nvidia-3d/interface/nvidia-3d.h \
@@ -55,7 +55,7 @@ _out/Linux_x86_64/nvidia-3d-volta.o: \
 ../common/sdk/nvidia/inc/nvcfg_sdk.h:
 ../common/sdk/nvidia/inc/class/cl9010.h:
 ../common/sdk/nvidia/inc/class/cl9010_callback.h:
-../common/sdk/nvidia/inc/class/cla16f.h:
+../common/sdk/nvidia/inc/class/clc46f.h:
 ../common/unix/nvidia-3d/interface/nvidia-3d-shaders.h:
 ../common/sdk/nvidia/inc/class/cl9097.h:
 ../common/unix/nvidia-3d/interface/nvidia-3d.h:

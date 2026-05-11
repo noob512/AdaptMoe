@@ -37,11 +37,6 @@
 #include "class/cl003e.h" // NV01_MEMORY_SYSTEM
 #include "class/cl0040.h" // NV01_MEMORY_LOCAL_USER
 
-#include "class/cla16f.h" // KEPLER_CHANNEL_GPFIFO_B
-#include "class/cla26f.h" // KEPLER_CHANNEL_GPFIFO_C
-#include "class/clb06f.h" // MAXWELL_CHANNEL_GPFIFO_A
-#include "class/clc06f.h" // PASCAL_CHANNEL_GPFIFO_A
-#include "class/clc36f.h" // VOLTA_CHANNEL_GPFIFO_A
 #include "class/clc46f.h" // TURING_CHANNEL_GPFIFO_A
 #include "class/cl50a0.h" // NV50_MEMORY_VIRTUAL
 #include "class/clc56f.h" // AMPERE_CHANNEL_GPFIFO_A
@@ -51,7 +46,6 @@
 #include "class/clc361.h" // VOLTA_USERMODE_A
 #include "class/clc661.h" // HOPPER_USERMODE_A
 
-#include "ctrl/ctrl0080/ctrl0080fifo.h" // NV0080_CTRL_CMD_FIFO_GET_CAPS_V2
 #include "ctrl/ctrl2080/ctrl2080bus.h" // NV2080_CTRL_CMD_BUS_GET_INFO
 #include "ctrl/ctrla06f/ctrla06fgpfifo.h" // KEPLER_CHANNEL_GPFIFO_A
 #include "ctrl/ctrlc36f.h" // VOLTA_CHANNEL_GPFIFO_A
@@ -636,31 +630,6 @@ static NvBool GetChannelClassAndUserDSize(
           NV_AMODEL_TURING },
         sizeof(TuringAControlGPFifo)
     },
-    {
-        { VOLTA_CHANNEL_GPFIFO_A,
-          NV_AMODEL_VOLTA },
-        sizeof(VoltaAControlGPFifo)
-    },
-    {
-        { PASCAL_CHANNEL_GPFIFO_A,
-          NV_AMODEL_PASCAL },
-        sizeof(PascalAControlGPFifo)
-    },
-    {
-        { MAXWELL_CHANNEL_GPFIFO_A,
-          NV_AMODEL_MAXWELL },
-        sizeof(MaxwellAControlGPFifo)
-    },
-    {
-        { KEPLER_CHANNEL_GPFIFO_C,
-          NV_AMODEL_KEPLER_SM35 },
-        sizeof(KeplerCControlGPFifo)
-    },
-    {
-        { KEPLER_CHANNEL_GPFIFO_B,
-          NV_AMODEL_KEPLER },
-        sizeof(KeplerBControlGPFifo)
-    },
 
     };
 
@@ -1037,35 +1006,6 @@ fail:
     FreeUserMode(pDevice);
     return FALSE;
 }
-
-static void CheckCaps(NvPushDevicePtr pDevice)
-{
-    int deviceIndex;
-
-    pDevice->hostLBoverflowBug1667921 = FALSE;
-
-    for (deviceIndex = 0;
-         deviceIndex < __nvPushGetNumDevices(pDevice);
-         deviceIndex++) {
-        NV0080_CTRL_FIFO_GET_CAPS_V2_PARAMS fifoCapsParams = { 0 };
-        NvU32 ret;
-
-        ret = nvPushImportRmApiControl(pDevice,
-                                   pDevice->subDevice[deviceIndex].deviceHandle,
-                                   NV0080_CTRL_CMD_FIFO_GET_CAPS_V2,
-                                   &fifoCapsParams,
-                                   sizeof(fifoCapsParams));
-        if (ret != NVOS_STATUS_SUCCESS) {
-            nvAssert(!"Failed to determine chip fifo capabilities");
-            return;
-        }
-
-        pDevice->hostLBoverflowBug1667921 |=
-            !!NV0080_CTRL_FIFO_GET_CAP(fifoCapsParams.capsTbl,
-              NV0080_CTRL_FIFO_CAPS_HAS_HOST_LB_OVERFLOW_BUG_1667921);
-    }
-}
-
 
 static void FreeNotifiers(
     NvPushChannelPtr pChannel)
@@ -1530,15 +1470,13 @@ NvBool nvPushAllocDevice(
         pDevice->subDevice[sd].handle = pParams->subDevice[sd].handle;
         pDevice->subDevice[sd].deviceHandle = pParams->subDevice[sd].deviceHandle;
         pDevice->subDevice[sd].gpuVASpaceObject = pParams->subDevice[sd].gpuVASpaceObject;
-        pDevice->subDevice[sd].gpuVASpaceCtxDma = pParams->subDevice[sd].gpuVASpace;
+        pDevice->subDevice[sd].gpuVASpaceCtxDma = pParams->subDevice[sd].gpuVASpaceCtxDma;
     }
 
     if (pParams->amodel.config != NV_AMODEL_NONE) {
         nvAssert(!"Ignoring AModel configuration on non-XAMODEL build");
     }
     pDevice->amodelConfig = pParams->amodel.config;
-
-    CheckCaps(pDevice);
 
     if (!GetChannelClassAndUserDSize(pDevice, pParams)) {
         nvPushImportLogError(pDevice,

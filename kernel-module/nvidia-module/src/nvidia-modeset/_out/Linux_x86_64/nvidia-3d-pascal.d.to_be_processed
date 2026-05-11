@@ -21,16 +21,13 @@ _out/Linux_x86_64/nvidia-3d-pascal.o: \
  ../common/sdk/nvidia/inc/nvcfg_sdk.h \
  ../common/sdk/nvidia/inc/class/cl9010.h \
  ../common/sdk/nvidia/inc/class/cl9010_callback.h \
- ../common/sdk/nvidia/inc/class/cla16f.h \
+ ../common/sdk/nvidia/inc/class/clc46f.h \
  ../common/unix/nvidia-3d/interface/nvidia-3d-shaders.h \
  ../common/sdk/nvidia/inc/class/cl9097.h \
- ../common/unix/nvidia-3d/include/nvidia-3d-maxwell.h \
  ../common/unix/nvidia-3d/interface/nvidia-3d.h \
  ../common/unix/nvidia-push/interface/nvidia-push-types.h \
  ../common/unix/nvidia-3d/interface/nvidia-3d-types.h \
- ../common/sdk/nvidia/inc/class/clc197.h \
- ../common/sdk/nvidia/inc/class/clc097tex.h \
- ../common/sdk/nvidia/inc/class/cla06fsubch.h
+ ../common/sdk/nvidia/inc/class/clc097tex.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 ../common/unix/nvidia-3d/include/nvidia-3d-pascal.h:
 ../common/unix/nvidia-3d/interface/nvidia-3d-types.h:
@@ -57,13 +54,10 @@ _out/Linux_x86_64/nvidia-3d-pascal.o: \
 ../common/sdk/nvidia/inc/nvcfg_sdk.h:
 ../common/sdk/nvidia/inc/class/cl9010.h:
 ../common/sdk/nvidia/inc/class/cl9010_callback.h:
-../common/sdk/nvidia/inc/class/cla16f.h:
+../common/sdk/nvidia/inc/class/clc46f.h:
 ../common/unix/nvidia-3d/interface/nvidia-3d-shaders.h:
 ../common/sdk/nvidia/inc/class/cl9097.h:
-../common/unix/nvidia-3d/include/nvidia-3d-maxwell.h:
 ../common/unix/nvidia-3d/interface/nvidia-3d.h:
 ../common/unix/nvidia-push/interface/nvidia-push-types.h:
 ../common/unix/nvidia-3d/interface/nvidia-3d-types.h:
-../common/sdk/nvidia/inc/class/clc197.h:
 ../common/sdk/nvidia/inc/class/clc097tex.h:
-../common/sdk/nvidia/inc/class/cla06fsubch.h:

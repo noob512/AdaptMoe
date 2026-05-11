@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -34,12 +34,6 @@
 #define NV_EVO3_X_EMULATED_SURFACE_MEMORY_FORMATS_C6        \
     (NVBIT64(NvKmsSurfaceMemoryFormatRF16GF16BF16XF16) |    \
      NVBIT64(NvKmsSurfaceMemoryFormatX2B10G10R10))
-
-#define NV_EVO3_SUPPORTED_DITHERING_MODES                               \
-    ((1 << NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_MODE_AUTO)        | \
-     (1 << NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_MODE_DYNAMIC_2X2) | \
-     (1 << NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_MODE_STATIC_2X2)  | \
-     (1 << NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_MODE_TEMPORAL))
 
 #define NV_EVO3_SUPPORTED_CURSOR_COMP_BLEND_MODES              \
     ((1 << NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE)                    | \
@@ -128,8 +122,6 @@ nvEvoIsModePossibleC3(NVDispEvoPtr pDispEvo,
                     const NVEvoIsModePossibleDispInput *pInput,
                     NVEvoIsModePossibleDispOutput *pOutput);
 
-void nvEvoPrePostIMPC3(NVDispEvoPtr pDispEvo, NvBool isPre);
-
 void nvEvoSetNotifierC3(NVDevEvoRec *pDevEvo,
                              const NvBool notify,
                              const NvBool awaken,
@@ -152,6 +144,9 @@ void nvEvoParseCapabilityNotifier6(NVDevEvoPtr pDevEvo,
                                    volatile const NvU32 *pCaps);
 
 NvU32 nvHwFormatFromKmsFormatC6(const enum NvKmsSurfaceMemoryFormat format);
+
+NvU32 nvEvoGetRasterParamsHBlankDelayC6(const NVHwModeTimingsEvo *pTimings,
+                                        const NVDscInfoEvoRec *pDscInfo);
 
 NvBool nvEvoGetCapabilitiesC6(NVDevEvoPtr pDevEvo);
 
@@ -257,7 +252,6 @@ void nvEvoSetImmPointOutC3(NVDevEvoPtr pDevEvo,
 
 NvBool nvEvoQueryHeadCRC32_C3(NVDevEvoPtr pDevEvo,
                                    NVEvoDmaPtr pDma,
-                                   NvU32 sd,
                                    NvU32 entry_count,
                                    CRC32NotifierCrcOut *crc32,
                                    NvU32 *numCRC32);
@@ -313,5 +307,21 @@ static inline NvU32 nvGetMaxPixelsFetchedPerLine(NvU16 inWidth,
      */
     return (((inWidth + 14) * maxHDownscaleFactor + 1023) >> 10) + 8;
 }
+
+void nvEvoSendHdmiInfoFrameC8(const NVDispEvoRec *pDispEvo,
+                              const NvU32 head,
+                              const NvEvoInfoFrameTransmitControl transmitCtrl,
+                              const NVT_INFOFRAME_HEADER *pInfoFrameHeader,
+                              const NvU32 infoFrameSize,
+                              NvBool needChecksum);
+
+void nvEvoDisableHdmiInfoFrameC8(const NVDispEvoRec *pDispEvo,
+                                 const NvU32 head,
+                                 const NvU8 nvtInfoFrameType);
+
+void nvEvoSendDpInfoFrameSdpC8(const NVDispEvoRec *pDispEvo,
+                               const NvU32 head,
+                               const NvEvoInfoFrameTransmitControl transmitCtrl,
+                               const DPSDP_DESCRIPTOR *sdp);
 
 #endif /* __NVKMS_EVO_3_H__ */

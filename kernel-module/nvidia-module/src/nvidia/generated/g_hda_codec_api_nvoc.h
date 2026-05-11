@@ -124,13 +124,9 @@ struct NVOC_METADATA__Hdacodec {
     const struct NVOC_VTABLE__Hdacodec vtable;
 };
 
-#ifndef __NVOC_CLASS_Hdacodec_TYPEDEF__
-#define __NVOC_CLASS_Hdacodec_TYPEDEF__
-typedef struct Hdacodec Hdacodec;
-#endif /* __NVOC_CLASS_Hdacodec_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_Hdacodec
-#define __nvoc_class_id_Hdacodec 0xf59a20
+#define __nvoc_class_id_Hdacodec 0xf59a20u
+typedef struct Hdacodec Hdacodec;
 #endif /* __nvoc_class_id_Hdacodec */
 
 // Casting support
@@ -148,12 +144,17 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_Hdacodec;
 
 NV_STATUS __nvoc_objCreateDynamic_Hdacodec(Hdacodec**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_Hdacodec(Hdacodec**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_Hdacodec(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_Hdacodec((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_Hdacodec(Hdacodec**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_Hdacodec(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_Hdacodec((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS hdacodecConstruct_IMPL(struct Hdacodec *pHdacodecApi, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_hdacodecConstruct(pHdacodecApi, pCallContext, pParams) hdacodecConstruct_IMPL(pHdacodecApi, pCallContext, pParams)
+
+
+// Wrapper macros for halified functions
 #define hdacodecControl_FNPTR(pGpuResource) pGpuResource->__nvoc_base_GpuResource.__nvoc_metadata_ptr->vtable.__gpuresControl__
 #define hdacodecControl(pGpuResource, pCallContext, pParams) hdacodecControl_DISPATCH(pGpuResource, pCallContext, pParams)
 #define hdacodecMap_FNPTR(pGpuResource) pGpuResource->__nvoc_base_GpuResource.__nvoc_metadata_ptr->vtable.__gpuresMap__
@@ -306,9 +307,12 @@ static inline void hdacodecAddAdditionalDependants_DISPATCH(struct RsClient *pCl
     pResource->__nvoc_metadata_ptr->vtable.__hdacodecAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
-NV_STATUS hdacodecConstruct_IMPL(struct Hdacodec *arg_pHdacodecApi, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_hdacodecConstruct(arg_pHdacodecApi, arg_pCallContext, arg_pParams) hdacodecConstruct_IMPL(arg_pHdacodecApi, arg_pCallContext, arg_pParams)
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

@@ -34,22 +34,68 @@ static NvU32 ce_aperture(uvm_aperture_t aperture)
                  HWCONST(C8B5, SET_DST_PHYS_MODE, TARGET, LOCAL_FB));
     BUILD_BUG_ON(HWCONST(C8B5, SET_SRC_PHYS_MODE, TARGET, COHERENT_SYSMEM) !=
                  HWCONST(C8B5, SET_DST_PHYS_MODE, TARGET, COHERENT_SYSMEM));
+    BUILD_BUG_ON(HWCONST(C8B5, SET_SRC_PHYS_MODE, TARGET, NONCOHERENT_SYSMEM) !=
+                 HWCONST(C8B5, SET_DST_PHYS_MODE, TARGET, NONCOHERENT_SYSMEM));
     BUILD_BUG_ON(HWCONST(C8B5, SET_SRC_PHYS_MODE, TARGET, PEERMEM) !=
                  HWCONST(C8B5, SET_DST_PHYS_MODE, TARGET, PEERMEM));
 
     if (aperture == UVM_APERTURE_SYS) {
         return HWCONST(C8B5, SET_SRC_PHYS_MODE, TARGET, COHERENT_SYSMEM);
     }
+    else if (aperture == UVM_APERTURE_SYS_NON_COHERENT) {
+        // SYS_NON_COHERENT aperture is currently only used for certain
+        // BAR1 P2P addresses. The use of SYS vs. SYS_NON_COHERENT aperture
+        // controls the ability to use PCIe atomics to access the BAR1 region.
+        // The only way to potentially use atomic operations in UVM is a
+        // semaphore reduction operation.
+        // Since UVM doesn't use semaphore operations on peer (or physical)
+        // addresses, it'd be safe to encode SYS_NON_COHERENT aperture as
+        // COHERENT_SYSMEM for CE methods.
+        // NONCOHERENT_SYSMEM encoding is used for correctness and potential
+        // future use of SYS_NON_COHERENT aperture outside of atomics control
+        // in BAR1 P2P.
+        return HWCONST(C8B5, SET_SRC_PHYS_MODE, TARGET, NONCOHERENT_SYSMEM);
+    }
     else if (aperture == UVM_APERTURE_VID) {
         return HWCONST(C8B5, SET_SRC_PHYS_MODE, TARGET, LOCAL_FB);
     }
     else {
+        UVM_ASSERT(uvm_aperture_is_peer(aperture));
         return HWCONST(C8B5, SET_SRC_PHYS_MODE, TARGET, PEERMEM) |
                HWVALUE(C8B5, SET_SRC_PHYS_MODE, FLA, 0) |
                HWVALUE(C8B5, SET_SRC_PHYS_MODE, PEER_ID, UVM_APERTURE_PEER_ID(aperture));
     }
 }
 
+// Push SET_{SRC,DST}_PHYS mode if needed and return LAUNCH_DMA_{SRC,DST}_TYPE
+// flags
+NvU32 uvm_hal_hopper_ce_phys_mode(uvm_push_t *push, uvm_gpu_address_t dst, uvm_gpu_address_t src)
+{
+    NvU32 launch_dma_src_dst_type = 0;
+
+    if (src.is_virtual)
+        launch_dma_src_dst_type |= HWCONST(C8B5, LAUNCH_DMA, SRC_TYPE, VIRTUAL);
+    else
+        launch_dma_src_dst_type |= HWCONST(C8B5, LAUNCH_DMA, SRC_TYPE, PHYSICAL);
+
+    if (dst.is_virtual)
+        launch_dma_src_dst_type |= HWCONST(C8B5, LAUNCH_DMA, DST_TYPE, VIRTUAL);
+    else
+        launch_dma_src_dst_type |= HWCONST(C8B5, LAUNCH_DMA, DST_TYPE, PHYSICAL);
+
+    if (!src.is_virtual && !dst.is_virtual) {
+        NV_PUSH_2U(C8B5, SET_SRC_PHYS_MODE, ce_aperture(src.aperture),
+                         SET_DST_PHYS_MODE, ce_aperture(dst.aperture));
+    }
+    else if (!src.is_virtual) {
+        NV_PUSH_1U(C8B5, SET_SRC_PHYS_MODE, ce_aperture(src.aperture));
+    }
+    else if (!dst.is_virtual) {
+        NV_PUSH_1U(C8B5, SET_DST_PHYS_MODE, ce_aperture(dst.aperture));
+    }
+
+    return launch_dma_src_dst_type;
+}
 void uvm_hal_hopper_ce_offset_out(uvm_push_t *push, NvU64 offset_out)
 {
     NV_PUSH_2U(C8B5, OFFSET_OUT_UPPER, HWVALUE(C8B5, OFFSET_OUT_UPPER, UPPER, NvOffset_HI32(offset_out)),

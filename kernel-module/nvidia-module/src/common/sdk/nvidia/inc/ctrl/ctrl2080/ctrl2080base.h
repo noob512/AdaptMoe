@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -55,6 +55,7 @@
 #define NV2080_CTRL_FIFO                          (0x11)
 #define NV2080_CTRL_GR                            (0x12)
 #define NV2080_CTRL_FB                            (0x13)
+#define NV2080_CTRL_NOISE                         (0x15)
 #define NV2080_CTRL_MC                            (0x17)
 #define NV2080_CTRL_BUS                           (0x18)
 #define NV2080_CTRL_PERF_LEGACY_PRIVILEGED        (0xe0) /* finn: Evaluated from "(NV2080_CTRL_PERF | NVxxxx_CTRL_LEGACY_PRIVILEGED)" */
@@ -93,6 +94,8 @@
 #define NV2080_CTRL_UCODE_FUZZER                  (0x39)
 #define NV2080_CTRL_DMABUF                        (0x3A)
 #define NV2080_CTRL_BIF                           (0x3B)
+
+
 
 // per-OS categories start at highest category and work backwards
 #define NV2080_CTRL_OS_WINDOWS                    (0x3F)

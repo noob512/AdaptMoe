@@ -94,8 +94,10 @@ struct KernelGraphicsObject {
     struct ChannelDescendant *__nvoc_pbase_ChannelDescendant;    // chandes super
     struct KernelGraphicsObject *__nvoc_pbase_KernelGraphicsObject;    // kgrobj
 
-    // Vtable with 1 per-object function pointer
+    // Vtable with 3 per-object function pointers
     void (*__kgrobjGetPromoteIds__)(struct OBJGPU *, struct KernelGraphicsObject * /*this*/, NvU32, NvU32 *, NvU32 *, NvBool *);  // halified (2 hals)
+    NV_STATUS (*__kgrobjSetComputeMmio__)(struct OBJGPU *, struct KernelGraphicsObject * /*this*/);  // halified (2 hals) body
+    void (*__kgrobjFreeComputeMmio__)(struct OBJGPU *, struct KernelGraphicsObject * /*this*/);  // halified (2 hals) body
 
     // Data members
     MEMORY_DESCRIPTOR *PRIVATE_FIELD(pMmioMemDesc);
@@ -125,8 +127,10 @@ struct KernelGraphicsObject_PRIVATE {
     struct ChannelDescendant *__nvoc_pbase_ChannelDescendant;    // chandes super
     struct KernelGraphicsObject *__nvoc_pbase_KernelGraphicsObject;    // kgrobj
 
-    // Vtable with 1 per-object function pointer
+    // Vtable with 3 per-object function pointers
     void (*__kgrobjGetPromoteIds__)(struct OBJGPU *, struct KernelGraphicsObject * /*this*/, NvU32, NvU32 *, NvU32 *, NvBool *);  // halified (2 hals)
+    NV_STATUS (*__kgrobjSetComputeMmio__)(struct OBJGPU *, struct KernelGraphicsObject * /*this*/);  // halified (2 hals) body
+    void (*__kgrobjFreeComputeMmio__)(struct OBJGPU *, struct KernelGraphicsObject * /*this*/);  // halified (2 hals) body
 
     // Data members
     MEMORY_DESCRIPTOR *pMmioMemDesc;
@@ -177,13 +181,9 @@ struct NVOC_METADATA__KernelGraphicsObject {
     const struct NVOC_VTABLE__KernelGraphicsObject vtable;
 };
 
-#ifndef __NVOC_CLASS_KernelGraphicsObject_TYPEDEF__
-#define __NVOC_CLASS_KernelGraphicsObject_TYPEDEF__
-typedef struct KernelGraphicsObject KernelGraphicsObject;
-#endif /* __NVOC_CLASS_KernelGraphicsObject_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_KernelGraphicsObject
-#define __nvoc_class_id_KernelGraphicsObject 0x097648
+#define __nvoc_class_id_KernelGraphicsObject 0x097648u
+typedef struct KernelGraphicsObject KernelGraphicsObject;
 #endif /* __nvoc_class_id_KernelGraphicsObject */
 
 // Casting support
@@ -201,17 +201,51 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_KernelGraphicsObject;
 
 NV_STATUS __nvoc_objCreateDynamic_KernelGraphicsObject(KernelGraphicsObject**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_KernelGraphicsObject(KernelGraphicsObject**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_KernelGraphicsObject(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_KernelGraphicsObject((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_KernelGraphicsObject(KernelGraphicsObject**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_KernelGraphicsObject(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_KernelGraphicsObject((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS kgrobjConstruct_IMPL(struct KernelGraphicsObject *pKernelGraphicsObject, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_kgrobjConstruct(pKernelGraphicsObject, pCallContext, pParams) kgrobjConstruct_IMPL(pKernelGraphicsObject, pCallContext, pParams)
+
+void kgrobjDestruct_IMPL(struct KernelGraphicsObject *pKernelGraphicsObject);
+#define __nvoc_kgrobjDestruct(pKernelGraphicsObject) kgrobjDestruct_IMPL(pKernelGraphicsObject)
+
+NV_STATUS kgrobjPromoteContext_IMPL(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this, struct KernelGraphics *arg3);
+#ifdef __nvoc_kernel_graphics_object_h_disabled
+static inline NV_STATUS kgrobjPromoteContext(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this, struct KernelGraphics *arg3) {
+    NV_ASSERT_FAILED_PRECOMP("KernelGraphicsObject was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_graphics_object_h_disabled
+#define kgrobjPromoteContext(arg1, arg_this, arg3) kgrobjPromoteContext_IMPL(arg1, arg_this, arg3)
+#endif // __nvoc_kernel_graphics_object_h_disabled
+
+#ifdef __nvoc_kernel_graphics_object_h_disabled
+static inline NvBool kgrobjShouldCleanup(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this) {
+    NV_ASSERT_FAILED_PRECOMP("KernelGraphicsObject was disabled!");
+    return NV_FALSE;
+}
+#else // __nvoc_kernel_graphics_object_h_disabled
+#define kgrobjShouldCleanup(arg1, arg_this) kgrobjShouldCleanup_KERNEL(arg1, arg_this)
+#endif // __nvoc_kernel_graphics_object_h_disabled
+
+
+// Wrapper macros for halified functions
 #define kgrobjGetMemInterMapParams_FNPTR(arg_this) arg_this->__nvoc_metadata_ptr->vtable.__kgrobjGetMemInterMapParams__
 #define kgrobjGetMemInterMapParams(arg_this, arg2) kgrobjGetMemInterMapParams_DISPATCH(arg_this, arg2)
 #define kgrobjGetPromoteIds_FNPTR(arg_this) arg_this->__kgrobjGetPromoteIds__
 #define kgrobjGetPromoteIds(arg1, arg_this, maxPromoteIds, pPromoteIds, pNumEntries, pbPromote) kgrobjGetPromoteIds_DISPATCH(arg1, arg_this, maxPromoteIds, pPromoteIds, pNumEntries, pbPromote)
 #define kgrobjGetPromoteIds_HAL(arg1, arg_this, maxPromoteIds, pPromoteIds, pNumEntries, pbPromote) kgrobjGetPromoteIds_DISPATCH(arg1, arg_this, maxPromoteIds, pPromoteIds, pNumEntries, pbPromote)
+#define kgrobjShouldCleanup_HAL(arg1, arg_this) kgrobjShouldCleanup(arg1, arg_this)
+#define kgrobjSetComputeMmio_FNPTR(arg_this) arg_this->__kgrobjSetComputeMmio__
+#define kgrobjSetComputeMmio(arg1, arg_this) kgrobjSetComputeMmio_DISPATCH(arg1, arg_this)
+#define kgrobjSetComputeMmio_HAL(arg1, arg_this) kgrobjSetComputeMmio_DISPATCH(arg1, arg_this)
+#define kgrobjFreeComputeMmio_FNPTR(arg_this) arg_this->__kgrobjFreeComputeMmio__
+#define kgrobjFreeComputeMmio(arg1, arg_this) kgrobjFreeComputeMmio_DISPATCH(arg1, arg_this)
+#define kgrobjFreeComputeMmio_HAL(arg1, arg_this) kgrobjFreeComputeMmio_DISPATCH(arg1, arg_this)
 #define kgrobjGetSwMethods_FNPTR(pChannelDescendant) pChannelDescendant->__nvoc_base_ChannelDescendant.__nvoc_metadata_ptr->vtable.__chandesGetSwMethods__
 #define kgrobjGetSwMethods(pChannelDescendant, ppMethods, pNumMethods) kgrobjGetSwMethods_DISPATCH(pChannelDescendant, ppMethods, pNumMethods)
 #define kgrobjIsSwMethodStalling_FNPTR(pChannelDescendant) pChannelDescendant->__nvoc_base_ChannelDescendant.__nvoc_metadata_ptr->vtable.__chandesIsSwMethodStalling__
@@ -282,6 +316,14 @@ static inline NV_STATUS kgrobjGetMemInterMapParams_DISPATCH(struct KernelGraphic
 
 static inline void kgrobjGetPromoteIds_DISPATCH(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this, NvU32 maxPromoteIds, NvU32 *pPromoteIds, NvU32 *pNumEntries, NvBool *pbPromote) {
     arg_this->__kgrobjGetPromoteIds__(arg1, arg_this, maxPromoteIds, pPromoteIds, pNumEntries, pbPromote);
+}
+
+static inline NV_STATUS kgrobjSetComputeMmio_DISPATCH(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this) {
+    return arg_this->__kgrobjSetComputeMmio__(arg1, arg_this);
+}
+
+static inline void kgrobjFreeComputeMmio_DISPATCH(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this) {
+    arg_this->__kgrobjFreeComputeMmio__(arg1, arg_this);
 }
 
 static inline NV_STATUS kgrobjGetSwMethods_DISPATCH(struct KernelGraphicsObject *pChannelDescendant, const METHOD **ppMethods, NvU32 *pNumMethods) {
@@ -408,74 +450,36 @@ static inline NV_STATUS kgrobjGetOrAllocNotifShare_DISPATCH(struct KernelGraphic
     return pNotifier->__nvoc_metadata_ptr->vtable.__kgrobjGetOrAllocNotifShare__(pNotifier, hNotifierClient, hNotifierResource, ppNotifShare);
 }
 
-NvBool kgrobjShouldCleanup_KERNEL(struct OBJGPU *arg1, struct KernelGraphicsObject *arg2);
+// Virtual method declarations and/or inline definitions
+NV_STATUS kgrobjGetMemInterMapParams_IMPL(struct KernelGraphicsObject *arg_this, RMRES_MEM_INTER_MAP_PARAMS *arg2);
 
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+void kgrobjGetPromoteIds_VF(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this, NvU32 maxPromoteIds, NvU32 *pPromoteIds, NvU32 *pNumEntries, NvBool *pbPromote);
 
-#ifdef __nvoc_kernel_graphics_object_h_disabled
-static inline NvBool kgrobjShouldCleanup(struct OBJGPU *arg1, struct KernelGraphicsObject *arg2) {
-    NV_ASSERT_FAILED_PRECOMP("KernelGraphicsObject was disabled!");
-    return NV_FALSE;
+void kgrobjGetPromoteIds_FWCLIENT(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this, NvU32 maxPromoteIds, NvU32 *pPromoteIds, NvU32 *pNumEntries, NvBool *pbPromote);
+
+NvBool kgrobjShouldCleanup_KERNEL(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this);
+
+NV_STATUS kgrobjSetComputeMmio_IMPL(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this);
+
+void kgrobjFreeComputeMmio_IMPL(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this);
+
+// Inline HAL method definitions
+static inline NV_STATUS kgrobjSetComputeMmio_ac1694(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this){
+    return NV_OK;
 }
-#else //__nvoc_kernel_graphics_object_h_disabled
-#define kgrobjShouldCleanup(arg1, arg2) kgrobjShouldCleanup_KERNEL(arg1, arg2)
-#endif //__nvoc_kernel_graphics_object_h_disabled
 
-#define kgrobjShouldCleanup_HAL(arg1, arg2) kgrobjShouldCleanup(arg1, arg2)
-
-NV_STATUS kgrobjSetComputeMmio_IMPL(struct OBJGPU *arg1, struct KernelGraphicsObject *arg2);
-
-
-#ifdef __nvoc_kernel_graphics_object_h_disabled
-static inline NV_STATUS kgrobjSetComputeMmio(struct OBJGPU *arg1, struct KernelGraphicsObject *arg2) {
-    NV_ASSERT_FAILED_PRECOMP("KernelGraphicsObject was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
+static inline void kgrobjFreeComputeMmio_d44104(struct OBJGPU *arg1, struct KernelGraphicsObject *arg_this){
+    return;
 }
-#else //__nvoc_kernel_graphics_object_h_disabled
-#define kgrobjSetComputeMmio(arg1, arg2) kgrobjSetComputeMmio_IMPL(arg1, arg2)
-#endif //__nvoc_kernel_graphics_object_h_disabled
 
-#define kgrobjSetComputeMmio_HAL(arg1, arg2) kgrobjSetComputeMmio(arg1, arg2)
-
-void kgrobjFreeComputeMmio_IMPL(struct OBJGPU *arg1, struct KernelGraphicsObject *arg2);
-
-
-#ifdef __nvoc_kernel_graphics_object_h_disabled
-static inline void kgrobjFreeComputeMmio(struct OBJGPU *arg1, struct KernelGraphicsObject *arg2) {
-    NV_ASSERT_FAILED_PRECOMP("KernelGraphicsObject was disabled!");
-}
-#else //__nvoc_kernel_graphics_object_h_disabled
-#define kgrobjFreeComputeMmio(arg1, arg2) kgrobjFreeComputeMmio_IMPL(arg1, arg2)
-#endif //__nvoc_kernel_graphics_object_h_disabled
-
-#define kgrobjFreeComputeMmio_HAL(arg1, arg2) kgrobjFreeComputeMmio(arg1, arg2)
-
-NV_STATUS kgrobjGetMemInterMapParams_IMPL(struct KernelGraphicsObject *arg1, RMRES_MEM_INTER_MAP_PARAMS *arg2);
-
-void kgrobjGetPromoteIds_VF(struct OBJGPU *arg1, struct KernelGraphicsObject *arg2, NvU32 maxPromoteIds, NvU32 *pPromoteIds, NvU32 *pNumEntries, NvBool *pbPromote);
-
-void kgrobjGetPromoteIds_FWCLIENT(struct OBJGPU *arg1, struct KernelGraphicsObject *arg2, NvU32 maxPromoteIds, NvU32 *pPromoteIds, NvU32 *pNumEntries, NvBool *pbPromote);
-
-static inline struct KernelGraphicsContext *kgrobjGetKernelGraphicsContext(struct OBJGPU *pGpu, struct KernelGraphicsObject *pKernelGraphicsObject) {
+// Static dispatch method declarations
+// Static inline method definitions
+static inline struct KernelGraphicsContext * kgrobjGetKernelGraphicsContext(struct OBJGPU *pGpu, struct KernelGraphicsObject *pKernelGraphicsObject){
     struct KernelGraphicsObject_PRIVATE *pKernelGraphicsObject_PRIVATE = (struct KernelGraphicsObject_PRIVATE *)pKernelGraphicsObject;
     return pKernelGraphicsObject_PRIVATE->pKernelGraphicsContext;
 }
-
-NV_STATUS kgrobjConstruct_IMPL(struct KernelGraphicsObject *arg_pKernelGraphicsObject, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_kgrobjConstruct(arg_pKernelGraphicsObject, arg_pCallContext, arg_pParams) kgrobjConstruct_IMPL(arg_pKernelGraphicsObject, arg_pCallContext, arg_pParams)
-void kgrobjDestruct_IMPL(struct KernelGraphicsObject *pKernelGraphicsObject);
-
-#define __nvoc_kgrobjDestruct(pKernelGraphicsObject) kgrobjDestruct_IMPL(pKernelGraphicsObject)
-NV_STATUS kgrobjPromoteContext_IMPL(struct OBJGPU *arg1, struct KernelGraphicsObject *arg2, struct KernelGraphics *arg3);
-
-#ifdef __nvoc_kernel_graphics_object_h_disabled
-static inline NV_STATUS kgrobjPromoteContext(struct OBJGPU *arg1, struct KernelGraphicsObject *arg2, struct KernelGraphics *arg3) {
-    NV_ASSERT_FAILED_PRECOMP("KernelGraphicsObject was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_kernel_graphics_object_h_disabled
-#define kgrobjPromoteContext(arg1, arg2, arg3) kgrobjPromoteContext_IMPL(arg1, arg2, arg3)
-#endif //__nvoc_kernel_graphics_object_h_disabled
 
 #undef PRIVATE_FIELD
 

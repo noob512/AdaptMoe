@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2009-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2009-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -306,6 +306,7 @@ typedef struct NV208F_CTRL_CMD_FB_ECC_GET_FORWARD_MAP_ADDRESS_PARAMS {
     NvU32 col;
     NvU32 extBank;
     NvU32 rank;
+    NvU32 pseudoChannel;
     NvU32 physicalSublocation;
     NvU32 physicalPartition;
     NvU32 logicalSublocation;
@@ -454,6 +455,9 @@ typedef struct NV208F_CTRL_FB_ECC_INJECTION_SUPPORTED_PARAMS {
  *
  *   address
  *      The physical DRAM address to be targeted by the write kill
+ *
+ *   bProdInjection
+ *      Whether the write kill is set through the production injection flow or not
  */
 #define NV208F_CTRL_CMD_FB_ECC_SET_WRITE_KILL            (0x208f0511) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_DIAG_FB_INTERFACE_ID << 8) | NV208F_CTRL_FB_ECC_SET_WRITE_KILL_PARAMS_MESSAGE_ID" */
 
@@ -461,6 +465,7 @@ typedef struct NV208F_CTRL_FB_ECC_INJECTION_SUPPORTED_PARAMS {
 
 typedef struct NV208F_CTRL_FB_ECC_SET_WRITE_KILL_PARAMS {
     NvBool setWriteKill;
+    NvBool bProdInjection;
     NV_DECLARE_ALIGNED(NvU64 address, 8);
 } NV208F_CTRL_FB_ECC_SET_WRITE_KILL_PARAMS;
 
@@ -470,10 +475,11 @@ typedef struct NV208F_CTRL_FB_REMAPPING_RBC_ADDRESS_INFO {
     NvU32 row;
     NvU32 partition;
     NvU32 sublocation;
+    NvU32 pseudoChannel;
 } NV208F_CTRL_FB_REMAPPING_RBC_ADDRESS_INFO;
 
-#define NV208F_CTRL_FB_REMAP_ROW_ADDRESS_TYPE_PHYSICAL 0x0
-#define NV208F_CTRL_FB_REMAP_ROW_ADDRESS_TYPE_RBC      0x1
+#define NV208F_CTRL_FB_REMAP_ADDRESS_TYPE_PHYSICAL 0x0
+#define NV208F_CTRL_FB_REMAP_ADDRESS_TYPE_RBC      0x1
 
 /*
  * NV208F_CTRL_FB_REMAPPING_ADDRESS_INFO
@@ -495,9 +501,9 @@ typedef struct NV208F_CTRL_FB_REMAPPING_RBC_ADDRESS_INFO {
  *         Some other RM failure
  *   addressType
  *     Type of address passed. Valid values are:
- *       NV208F_CTRL_FB_REMAP_ROW_ADDRESS_TYPE_PHYSICAL
+ *       NV208F_CTRL_FB_REMAP_ADDRESS_TYPE_PHYSICAL
  *         The specified address is physical address.
- *       NV208F_CTRL_FB_REMAP_ROW_ADDRESS_TYPE_RBC
+ *       NV208F_CTRL_FB_REMAP_ADDRESS_TYPE_RBC
  *         The specified address is DRAM Row Bank Column address.
  *   address
  *     Union of physicalAddress and rbcAddress. Set the appropriate one based on the address type.
@@ -513,11 +519,27 @@ typedef struct NV208F_CTRL_FB_REMAPPING_ADDRESS_INFO {
 } NV208F_CTRL_FB_REMAPPING_ADDRESS_INFO;
 
 /* valid values for status */
-#define NV208F_CTRL_FB_REMAP_ROW_STATUS_OK                (0x00000000)
-#define NV208F_CTRL_FB_REMAP_ROW_STATUS_REMAPPING_PENDING (0x00000001)
-#define NV208F_CTRL_FB_REMAP_ROW_STATUS_TABLE_FULL        (0x00000002)
-#define NV208F_CTRL_FB_REMAP_ROW_STATUS_ALREADY_REMAPPED  (0x00000003)
-#define NV208F_CTRL_FB_REMAP_ROW_STATUS_INTERNAL_ERROR    (0x00000004)
+#define NV208F_CTRL_FB_REMAP_STATUS_OK                (0x00000000)
+#define NV208F_CTRL_FB_REMAP_STATUS_REMAPPING_PENDING (0x00000001)
+#define NV208F_CTRL_FB_REMAP_STATUS_TABLE_FULL        (0x00000002)
+#define NV208F_CTRL_FB_REMAP_STATUS_ALREADY_REMAPPED  (0x00000003)
+#define NV208F_CTRL_FB_REMAP_STATUS_INTERNAL_ERROR    (0x00000004)
+#define NV208F_CTRL_FB_REMAP_STATUS_NO_SPARE          (0x00000005)
+#define NV208F_CTRL_FB_REMAP_STATUS_INVALID_ARGUMENT  (0x00000006)
+
+typedef NV208F_CTRL_FB_REMAPPING_ADDRESS_INFO NV208F_CTRL_FB_REMAPPING_ROW_ADDRESS_INFO;
+
+#define NV208F_CTRL_FB_REMAP_ROW_ADDRESS_TYPE_PHYSICAL    NV208F_CTRL_FB_REMAP_ADDRESS_TYPE_PHYSICAL
+#define NV208F_CTRL_FB_REMAP_ROW_ADDRESS_TYPE_RBC         NV208F_CTRL_FB_REMAP_ADDRESS_TYPE_RBC
+
+/* valid values for status */
+#define NV208F_CTRL_FB_REMAP_ROW_STATUS_OK                NV208F_CTRL_FB_REMAP_STATUS_OK
+#define NV208F_CTRL_FB_REMAP_ROW_STATUS_REMAPPING_PENDING NV208F_CTRL_FB_REMAP_STATUS_REMAPPING_PENDING
+#define NV208F_CTRL_FB_REMAP_ROW_STATUS_TABLE_FULL        NV208F_CTRL_FB_REMAP_STATUS_TABLE_FULL
+#define NV208F_CTRL_FB_REMAP_ROW_STATUS_ALREADY_REMAPPED  NV208F_CTRL_FB_REMAP_STATUS_ALREADY_REMAPPED
+#define NV208F_CTRL_FB_REMAP_ROW_STATUS_INTERNAL_ERROR    NV208F_CTRL_FB_REMAP_STATUS_INTERNAL_ERROR
+#define NV208F_CTRL_FB_REMAP_ROW_STATUS_NO_SPARE          NV208F_CTRL_FB_REMAP_STATUS_NO_SPARE
+#define NV208F_CTRL_FB_REMAP_ROW_STATUS_INVALID_ARGUMENT  NV208F_CTRL_FB_REMAP_STATUS_INVALID_ARGUMENT
 
 #define NV208F_CTRL_FB_REMAPPED_ROWS_MAX_ROWS             (0x00000200)
 /*
@@ -546,7 +568,7 @@ typedef struct NV208F_CTRL_FB_REMAPPING_ADDRESS_INFO {
 #define NV208F_CTRL_FB_REMAP_ROW_PARAMS_MESSAGE_ID (0x12U)
 
 typedef struct NV208F_CTRL_FB_REMAP_ROW_PARAMS {
-    NV_DECLARE_ALIGNED(NV208F_CTRL_FB_REMAPPING_ADDRESS_INFO addressList[NV208F_CTRL_FB_REMAPPED_ROWS_MAX_ROWS], 8);
+    NV_DECLARE_ALIGNED(NV208F_CTRL_FB_REMAPPING_ROW_ADDRESS_INFO addressList[NV208F_CTRL_FB_REMAPPED_ROWS_MAX_ROWS], 8);
     NvU32 validEntries;
     NvU32 numEntriesAdded;
 } NV208F_CTRL_FB_REMAP_ROW_PARAMS;
@@ -698,30 +720,123 @@ typedef struct NV208F_CTRL_FB_GET_FBPA_PAC_MASKS_PARAMS {
 } NV208F_CTRL_FB_GET_FBPA_PAC_MASKS_PARAMS;
 
 /*
- * NV208F_CTRL_CMD_FB_CONVERT_CHANNEL
+ * NV208F_CTRL_CMD_FB_CONVERT_SUBLOCATION
  *
- * This API converts either a channel from physical to logical or vice-versa
+ * This API converts either the given sublocation from physical to logical or vice-versa
  *
  *   conversionType:
- *      See NV208F_CTRL_FB_CHANNEL_CONVERSION_TYPE
+ *      See NV208F_CTRL_FB_SUBLOCATION_CONVERSION_TYPE
  *   fbpa:
- *      The physical fbpa the channel resides
+ *      The physical fbpa the sublocation resides
  *   input:
- *      Input channel
+ *      Input sublocation
  *   output:
- *      Output channel
+ *      Output sublocation
  */
-#define NV208F_CTRL_CMD_FB_CONVERT_CHANNEL (0x208f0519) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_DIAG_FB_INTERFACE_ID << 8) | NV208F_CTRL_FB_CONVERT_CHANNEL_PARAMS_MESSAGE_ID" */
+#define NV208F_CTRL_CMD_FB_CONVERT_SUBLOCATION (0x208f0519) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_DIAG_FB_INTERFACE_ID << 8) | NV208F_CTRL_FB_CONVERT_SUBLOCATION_PARAMS_MESSAGE_ID" */
 
-#define NV208F_CTRL_FB_CONVERT_CHANNEL_PARAMS_MESSAGE_ID (0x19U)
+#define NV208F_CTRL_FB_CONVERT_SUBLOCATION_PARAMS_MESSAGE_ID (0x19U)
 
-typedef struct NV208F_CTRL_FB_CONVERT_CHANNEL_PARAMS {
+typedef struct NV208F_CTRL_FB_CONVERT_SUBLOCATION_PARAMS {
     NvU32 conversionType;
     NvU32 fbpa;
     NvU32 input;
     NvU32 output;
-} NV208F_CTRL_FB_CONVERT_CHANNEL_PARAMS;
+} NV208F_CTRL_FB_CONVERT_SUBLOCATION_PARAMS;
 
-#define NV208F_CTRL_FB_CHANNEL_CONVERSION_TYPE_LOGICAL_TO_PHYSICAL (0x00000000U)
-#define NV208F_CTRL_FB_CHANNEL_CONVERSION_TYPE_PHYSICAL_TO_LOGICAL (0x00000001U)
+#define NV208F_CTRL_FB_SUBLOCATION_CONVERSION_TYPE_LOGICAL_TO_PHYSICAL (0x00000000U)
+#define NV208F_CTRL_FB_SUBLOCATION_CONVERSION_TYPE_PHYSICAL_TO_LOGICAL (0x00000001U)
+
+#define NV208F_CTRL_FB_REMAPPED_BANKS_MAX_BANKS                        (0x00000200)
+
+typedef NV208F_CTRL_FB_REMAPPING_ADDRESS_INFO NV208F_CTRL_FB_REMAPPING_BANK_ADDRESS_INFO;
+
+#define NV208F_CTRL_FB_REMAP_BANK_ADDRESS_TYPE_PHYSICAL    NV208F_CTRL_FB_REMAP_ADDRESS_TYPE_PHYSICAL
+#define NV208F_CTRL_FB_REMAP_BANK_ADDRESS_TYPE_RBC         NV208F_CTRL_FB_REMAP_ADDRESS_TYPE_RBC
+
+/* valid values for status */
+#define NV208F_CTRL_FB_REMAP_BANK_STATUS_OK                NV208F_CTRL_FB_REMAP_STATUS_OK
+#define NV208F_CTRL_FB_REMAP_BANK_STATUS_REMAPPING_PENDING NV208F_CTRL_FB_REMAP_STATUS_REMAPPING_PENDING
+#define NV208F_CTRL_FB_REMAP_BANK_STATUS_TABLE_FULL        NV208F_CTRL_FB_REMAP_STATUS_TABLE_FULL
+#define NV208F_CTRL_FB_REMAP_BANK_STATUS_NO_SPARE          NV208F_CTRL_FB_REMAP_STATUS_NO_SPARE
+#define NV208F_CTRL_FB_REMAP_BANK_STATUS_INTERNAL_ERROR    NV208F_CTRL_FB_REMAP_STATUS_INTERNAL_ERROR
+#define NV208F_CTRL_FB_REMAP_BANK_STATUS_INVALID_ARGUMENT  NV208F_CTRL_FB_REMAP_STATUS_INVALID_ARGUMENT
+
+/*
+ * NV208F_CTRL_CMD_FB_REMAP_BANK
+ *
+ * This command will write entries to Inforom. During init the entries will be
+ * read and used to remap banks.
+ *
+ *   addressList
+ *     This input parameter is an array of NV208F_CTRL_FB_REMAPPING_BANK_ADDRESS_INFO
+ *     structures containing information used for row remapping. Valid entries
+ *     are adjacent. The row field is ignored if RBC address info is given.
+ *   validEntries
+ *     This input parameter specifies the number of valid entries in the
+ *     address array
+ *   numEntriesAdded
+ *     This output parameter specifies how many validEntries were successfully
+ *     added to the Inforom
+ *
+ *   Possible status values returned are:
+ *     NV_OK
+ *     NV_ERR_INVALID_ARGUMENT
+ */
+#define NV208F_CTRL_CMD_FB_REMAP_BANK                      (0x208f051a) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_DIAG_FB_INTERFACE_ID << 8) | NV208F_CTRL_FB_REMAP_BANK_PARAMS_MESSAGE_ID" */
+
+#define NV208F_CTRL_FB_REMAP_BANK_PARAMS_MESSAGE_ID (0x1aU)
+
+typedef struct NV208F_CTRL_FB_REMAP_BANK_PARAMS {
+    NV_DECLARE_ALIGNED(NV208F_CTRL_FB_REMAPPING_BANK_ADDRESS_INFO addressList[NV208F_CTRL_FB_REMAPPED_BANKS_MAX_BANKS], 8);
+    NvU32 validEntries;
+    NvU32 numEntriesAdded;
+} NV208F_CTRL_FB_REMAP_BANK_PARAMS;
+
+/*
+ * NV208F_CTRL_CMD_FB_CLEAR_REMAPPED_BANKS
+ *
+ * This command clears remapping entries from the Inforom's bank remapping table.
+ *
+ *   sourceMask
+ *     This is a bit mask of NV2080_CTRL_FB_REMAPPED_BANK_SOURCE. Rows
+ *     remapped from the specified sources will be cleared/removed from the
+ *     Inforom RRL object entries list.
+ *
+ *   bForcePurge
+ *     This flag will force purge the BRL object and associated data structures
+ *
+ *   Possbile status values returned are:
+ *     NV_OK
+ *     NV_ERR_NOT_SUPPORTED
+ */
+#define NV208F_CTRL_CMD_FB_CLEAR_REMAPPED_BANKS (0x208f051b) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_DIAG_FB_INTERFACE_ID << 8) | NV208F_CTRL_FB_CLEAR_REMAPPED_BANKS_PARAMS_MESSAGE_ID" */
+
+#define NV208F_CTRL_FB_CLEAR_REMAPPED_BANKS_PARAMS_MESSAGE_ID (0x1bU)
+
+typedef struct NV208F_CTRL_FB_CLEAR_REMAPPED_BANKS_PARAMS {
+    NvU32  sourceMask;
+    NvBool bForcePurge;
+} NV208F_CTRL_FB_CLEAR_REMAPPED_BANKS_PARAMS;
+
+/*
+ * NV208F_CTRL_CMD_FB_SET_ROW_REMAP_FAILURE_FLAG
+ *
+ * This command sets the status of row remap failure flag to the passed value.
+ *
+ *  value
+ *    The value to set for row remap failure flag
+ *
+ *  Possible status values returned are:
+ *    NV_OK
+ *    NV_ERR_NOT_SUPPORTED
+ */
+#define NV208F_CTRL_CMD_FB_SET_ROW_REMAP_FAILURE_FLAG (0x208f051cU) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_DIAG_FB_INTERFACE_ID << 8) | NV208F_CTRL_FB_SET_ROW_REMAP_FAILURE_FLAG_PARAMS_MESSAGE_ID" */
+
+#define NV208F_CTRL_FB_SET_ROW_REMAP_FAILURE_FLAG_PARAMS_MESSAGE_ID (0x1cU)
+
+typedef struct NV208F_CTRL_FB_SET_ROW_REMAP_FAILURE_FLAG_PARAMS {
+    NvBool value;
+} NV208F_CTRL_FB_SET_ROW_REMAP_FAILURE_FLAG_PARAMS;
+
 /* _ctrl208ffb_h_ */

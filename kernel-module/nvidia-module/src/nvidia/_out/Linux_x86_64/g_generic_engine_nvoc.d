@@ -4,7 +4,7 @@ _out/Linux_x86_64/g_generic_engine_nvoc.o: \
  ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
  ../common/sdk/nvidia/inc/nvstatus.h ../common/sdk/nvidia/inc/nvtypes.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
@@ -44,16 +44,16 @@ _out/Linux_x86_64/g_generic_engine_nvoc.o: \
  inc/kernel/gpu/mem_mgr/mem_desc.h generated/g_mem_desc_nvoc.h \
  inc/libraries/poolalloc.h inc/libraries/nvport/nvport.h \
  inc/libraries/containers/list.h inc/libraries/containers/type_safety.h \
- inc/kernel/rmapi/resource.h generated/g_resource_nvoc.h \
- inc/libraries/resserv/rs_resource.h generated/g_rs_resource_nvoc.h \
- inc/libraries/resserv/resserv.h generated/g_resserv_nvoc.h \
- inc/libraries/containers/list.h inc/libraries/containers/map.h \
- inc/libraries/containers/multimap.h \
+ inc/kernel/gpu/mem_mgr/rm_page_size.h inc/kernel/os/nv_memory_iterator.h \
+ inc/kernel/os/nv_memory_area.h inc/kernel/rmapi/resource.h \
+ generated/g_resource_nvoc.h inc/libraries/resserv/rs_resource.h \
+ generated/g_rs_resource_nvoc.h inc/libraries/resserv/resserv.h \
+ generated/g_resserv_nvoc.h inc/libraries/containers/list.h \
+ inc/libraries/containers/map.h inc/libraries/containers/multimap.h \
  ../common/sdk/nvidia/inc/nvsecurityinfo.h \
  inc/libraries/resserv/rs_access_map.h \
  inc/libraries/resserv/rs_access_rights.h inc/kernel/rmapi/control.h \
- inc/kernel/rmapi/param_copy.h inc/kernel/os/nv_memory_area.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl90e6.h \
+ inc/kernel/rmapi/param_copy.h ../common/sdk/nvidia/inc/ctrl/ctrl90e6.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl90e7.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl90e7/ctrl90e7bbx.h \
@@ -69,7 +69,7 @@ inc/libraries/nvport/nvport.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -135,6 +135,9 @@ inc/libraries/poolalloc.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/containers/list.h:
 inc/libraries/containers/type_safety.h:
+inc/kernel/gpu/mem_mgr/rm_page_size.h:
+inc/kernel/os/nv_memory_iterator.h:
+inc/kernel/os/nv_memory_area.h:
 inc/kernel/rmapi/resource.h:
 generated/g_resource_nvoc.h:
 inc/libraries/resserv/rs_resource.h:
@@ -149,7 +152,6 @@ inc/libraries/resserv/rs_access_map.h:
 inc/libraries/resserv/rs_access_rights.h:
 inc/kernel/rmapi/control.h:
 inc/kernel/rmapi/param_copy.h:
-inc/kernel/os/nv_memory_area.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl90e6.h:
 ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl90e7.h:

@@ -16,7 +16,7 @@
 
 
 #ifdef DEBUG
-char __nvoc_class_id_uniqueness_check__0x4c1997 = 1;
+char __nvoc_class_id_uniqueness_check__4c1997 = 1;
 #endif
 
 extern const struct NVOC_CLASS_DEF __nvoc_class_def_VblankCallback;
@@ -30,7 +30,7 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_GpuResource;
 void __nvoc_init__GpuResource(GpuResource*);
 void __nvoc_init__VblankCallback(VblankCallback*);
 void __nvoc_init_funcTable_VblankCallback(VblankCallback*);
-NV_STATUS __nvoc_ctor_VblankCallback(VblankCallback*, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
+NV_STATUS __nvoc_ctor_VblankCallback(VblankCallback*, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
 void __nvoc_init_dataField_VblankCallback(VblankCallback*);
 void __nvoc_dtor_VblankCallback(VblankCallback*);
 
@@ -106,32 +106,33 @@ NV_STATUS __nvoc_up_thunk_RsResource_vblcbUnmapFrom(struct VblankCallback *pReso
 NvU32 __nvoc_up_thunk_RsResource_vblcbGetRefCount(struct VblankCallback *pResource);    // this
 void __nvoc_up_thunk_RsResource_vblcbAddAdditionalDependants(struct RsClient *pClient, struct VblankCallback *pResource, RsResourceRef *pReference);    // this
 
+// Class-specific details for VblankCallback
 const struct NVOC_CLASS_DEF __nvoc_class_def_VblankCallback = 
 {
-    /*classInfo=*/ {
-        /*size=*/               sizeof(VblankCallback),
-        /*classId=*/            classId(VblankCallback),
-        /*providerId=*/         &__nvoc_rtti_provider,
+    .classInfo.size =               sizeof(VblankCallback),
+    .classInfo.classId =            classId(VblankCallback),
+    .classInfo.providerId =         &__nvoc_rtti_provider,
 #if NV_PRINTF_STRINGS_ALLOWED
-        /*name=*/               "VblankCallback",
+    .classInfo.name =               "VblankCallback",
 #endif
-    },
-    /*objCreatefn=*/        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_VblankCallback,
-    /*pCastInfo=*/          &__nvoc_castinfo__VblankCallback,
-    /*pExportInfo=*/        &__nvoc_export_info__VblankCallback
+    .objCreatefn =        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_VblankCallback,
+    .pCastInfo =          &__nvoc_castinfo__VblankCallback,
+    .pExportInfo =        &__nvoc_export_info__VblankCallback
 };
 
+// By default, all exported methods are enabled.
 #if !defined(NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG)
 #define NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(x)      (0)
 #endif
 
+// Exported method array
 static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_VblankCallback[] = 
 {
     {               /*  [0] */
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x0u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) vblcbCtrlSetVBlankNotification_IMPL,
+        /*pFunc=*/      (void (*)(void)) &vblcbCtrlSetVBlankNotification_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x0u)
         /*flags=*/      0x0u,
         /*accessRight=*/0x0u,
@@ -142,7 +143,6 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_VblankCa
         /*func=*/       "vblcbCtrlSetVBlankNotification"
 #endif
     },
-
 };
 
 
@@ -402,55 +402,62 @@ void __nvoc_up_thunk_RsResource_vblcbAddAdditionalDependants(struct RsClient *pC
 
 const struct NVOC_EXPORT_INFO __nvoc_export_info__VblankCallback = 
 {
-    /*numEntries=*/     1,
-    /*pExportEntries=*/ __nvoc_exported_method_def_VblankCallback
+    .numEntries=     1,
+    .pExportEntries= __nvoc_exported_method_def_VblankCallback
 };
 
+
+// Destruct VblankCallback object.
+void __nvoc_vblcbDestruct(VblankCallback*);
 void __nvoc_dtor_GpuResource(GpuResource*);
-void __nvoc_dtor_VblankCallback(VblankCallback *pThis) {
+void __nvoc_dtor_VblankCallback(VblankCallback* pThis) {
+
+// Call destructor.
     __nvoc_vblcbDestruct(pThis);
+
+// Recurse to superclass destructors.
     __nvoc_dtor_GpuResource(&pThis->__nvoc_base_GpuResource);
+
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
-
 void __nvoc_init_dataField_VblankCallback(VblankCallback *pThis) {
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
 
-NV_STATUS __nvoc_ctor_GpuResource(GpuResource* , CALL_CONTEXT *, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
-NV_STATUS __nvoc_ctor_VblankCallback(VblankCallback *pThis, CALL_CONTEXT * arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams) {
-    NV_STATUS status = NV_OK;
-    status = __nvoc_ctor_GpuResource(&pThis->__nvoc_base_GpuResource, arg_pCallContext, arg_pParams);
-    if (status != NV_OK) goto __nvoc_ctor_VblankCallback_fail_GpuResource;
-    __nvoc_init_dataField_VblankCallback(pThis);
 
-    status = __nvoc_vblcbConstruct(pThis, arg_pCallContext, arg_pParams);
+// Construct VblankCallback object.
+NV_STATUS __nvoc_ctor_GpuResource(GpuResource *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);    // inline
+NV_STATUS __nvoc_ctor_VblankCallback(VblankCallback *pVblankCallback, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {    // inline
+    NV_STATUS status = NV_OK;
+
+    // Recurse to ancestor constructor(s).
+    status = __nvoc_ctor_GpuResource(&pVblankCallback->__nvoc_base_GpuResource, pCallContext, pParams);
+    if (status != NV_OK) goto __nvoc_ctor_VblankCallback_fail_GpuResource;
+
+    // Initialize data fields.
+    __nvoc_init_dataField_VblankCallback(pVblankCallback);
+
+    // Call the constructor for this class.
+    status = __nvoc_vblcbConstruct(pVblankCallback, pCallContext, pParams);
     if (status != NV_OK) goto __nvoc_ctor_VblankCallback_fail__init;
     goto __nvoc_ctor_VblankCallback_exit; // Success
 
+    // Unwind on error.
 __nvoc_ctor_VblankCallback_fail__init:
-    __nvoc_dtor_GpuResource(&pThis->__nvoc_base_GpuResource);
+    __nvoc_dtor_GpuResource(&pVblankCallback->__nvoc_base_GpuResource);
 __nvoc_ctor_VblankCallback_fail_GpuResource:
 __nvoc_ctor_VblankCallback_exit:
-
     return status;
 }
 
 // Vtable initialization
 static void __nvoc_init_funcTable_VblankCallback_1(VblankCallback *pThis) {
     PORT_UNREFERENCED_VARIABLE(pThis);
-
-    // vblcbCtrlSetVBlankNotification -- exported (id=0x90100101)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x0u)
-    pThis->__vblcbCtrlSetVBlankNotification__ = &vblcbCtrlSetVBlankNotification_IMPL;
-#endif
-} // End __nvoc_init_funcTable_VblankCallback_1 with approximately 1 basic block(s).
+} // End __nvoc_init_funcTable_VblankCallback_1
 
 
-// Initialize vtable(s) for 26 virtual method(s).
+// Initialize vtable(s) for 25 virtual method(s).
 void __nvoc_init_funcTable_VblankCallback(VblankCallback *pThis) {
-
-    // Initialize vtable(s) with 1 per-object function pointer(s).
     __nvoc_init_funcTable_VblankCallback_1(pThis);
 }
 
@@ -480,68 +487,82 @@ void __nvoc_init__VblankCallback(VblankCallback *pThis) {
     __nvoc_init_funcTable_VblankCallback(pThis);
 }
 
-NV_STATUS __nvoc_objCreate_VblankCallback(VblankCallback **ppThis, Dynamic *pParent, NvU32 createFlags, CALL_CONTEXT * arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams)
+NV_STATUS __nvoc_objCreate_VblankCallback(VblankCallback **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams)
 {
-    NV_STATUS status;
-    Object *pParentObj = NULL;
-    VblankCallback *pThis;
+    NV_STATUS __nvoc_status;
+    Object *__nvoc_pParentObj = NULL;
+    VblankCallback *__nvoc_pThis;
 
-    // Assign `pThis`, allocating memory unless suppressed by flag.
-    status = __nvoc_handleObjCreateMemAlloc(createFlags, sizeof(VblankCallback), (void**)&pThis, (void**)ppThis);
-    if (status != NV_OK)
-        return status;
+    // Don't allocate memory if the caller has already done so.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+    {
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_ppThis != NULL && *__nvoc_ppThis != NULL, NV_ERR_INVALID_PARAMETER);
+        __nvoc_pThis = *__nvoc_ppThis;
+    }
+
+    // Allocate memory
+    else
+    {
+        __nvoc_pThis = portMemAllocNonPaged(sizeof(VblankCallback));
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_pThis != NULL, NV_ERR_NO_MEMORY);
+    }
 
     // Zero is the initial value for everything.
-    portMemSet(pThis, 0, sizeof(VblankCallback));
+    portMemSet(__nvoc_pThis, 0, sizeof(VblankCallback));
 
-    pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.createFlags = createFlags;
+    __nvoc_pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.createFlags = __nvoc_createFlags;
 
     // Link the child into the parent if there is one unless flagged not to do so.
-    if (pParent != NULL && !(createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
+    if (__nvoc_pParent != NULL && !(__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
     {
-        pParentObj = dynamicCast(pParent, Object);
-        objAddChild(pParentObj, &pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
+        __nvoc_pParentObj = dynamicCast(__nvoc_pParent, Object);
+        objAddChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
     }
     else
     {
-        pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.pParent = NULL;
+        __nvoc_pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.pParent = NULL;
     }
 
-    __nvoc_init__VblankCallback(pThis);
-    status = __nvoc_ctor_VblankCallback(pThis, arg_pCallContext, arg_pParams);
-    if (status != NV_OK) goto __nvoc_objCreate_VblankCallback_cleanup;
+    // Initialize vtable, RTTI, etc., then call constructor.
+    __nvoc_init__VblankCallback(__nvoc_pThis);
+    __nvoc_status = __nvoc_ctor_VblankCallback(__nvoc_pThis, pCallContext, pParams);
+    if (__nvoc_status != NV_OK) goto __nvoc_objCreate_VblankCallback_cleanup;
 
     // Assignment has no effect if NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT is set.
-    *ppThis = pThis;
+    *__nvoc_ppThis = __nvoc_pThis;
 
+    // Success
     return NV_OK;
 
+    // Do not call destructors here since the constructor already called them.
 __nvoc_objCreate_VblankCallback_cleanup:
 
     // Unlink the child from the parent if it was linked above.
-    if (pParentObj != NULL)
-        objRemoveChild(pParentObj, &pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
+    if (__nvoc_pParentObj != NULL)
+        objRemoveChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
 
-    // Do not call destructors here since the constructor already called them.
-    if (createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
-        portMemSet(pThis, 0, sizeof(VblankCallback));
+    // Zero out memory that was allocated by caller.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+        portMemSet(__nvoc_pThis, 0, sizeof(VblankCallback));
+
+    // Free memory allocated by `__nvoc_handleObjCreateMemAlloc`.
     else
     {
-        portMemFree(pThis);
-        *ppThis = NULL;
+        portMemFree(__nvoc_pThis);
+        *__nvoc_ppThis = NULL;
     }
 
-    // coverity[leaked_storage:FALSE]
-    return status;
+    // Failure
+    return __nvoc_status;
 }
 
-NV_STATUS __nvoc_objCreateDynamic_VblankCallback(VblankCallback **ppThis, Dynamic *pParent, NvU32 createFlags, va_list args) {
-    NV_STATUS status;
-    CALL_CONTEXT * arg_pCallContext = va_arg(args, CALL_CONTEXT *);
-    struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams = va_arg(args, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
+NV_STATUS __nvoc_objCreateDynamic_VblankCallback(VblankCallback **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, va_list __nvoc_args) {
+    NV_STATUS __nvoc_status;
+    CALL_CONTEXT *pCallContext = va_arg(__nvoc_args, CALL_CONTEXT *);
+    struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams = va_arg(__nvoc_args, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
 
-    status = __nvoc_objCreate_VblankCallback(ppThis, pParent, createFlags, arg_pCallContext, arg_pParams);
+    __nvoc_status = __nvoc_objCreate_VblankCallback(__nvoc_ppThis, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams);
 
-    return status;
+    return __nvoc_status;
 }
 

@@ -26,43 +26,10 @@
 #include <linux/list.h>
 #include "conftest.h"
 
-/*
- * list_first_entry_or_null added by commit 6d7581e62f8b ("list: introduce
- * list_first_entry_or_null") in v3.10 (2013-05-29).
- */
-#if !defined(list_first_entry_or_null)
-    #define list_first_entry_or_null(ptr, type, member) \
-        (!list_empty(ptr) ? list_first_entry(ptr, type, member) : NULL)
-#endif
-
-/*
- * Added by commit 93be3c2eb337 ("list: introduce list_last_entry(), use
- * list_{first,last}_entry()") in v3.13 (2013-11-12).
- */
-#if !defined(list_last_entry)
-    #define list_last_entry(ptr, type, member) \
-        list_entry((ptr)->prev, type, member)
-#endif
-
 /* list_last_entry_or_null() doesn't actually exist in the kernel */
 #if !defined(list_last_entry_or_null)
     #define list_last_entry_or_null(ptr, type, member) \
         (!list_empty(ptr) ? list_last_entry(ptr, type, member) : NULL)
-#endif
-
-/*
- * list_prev_entry() and list_next_entry added by commit 008208c6b26f
- * ("list: introduce list_next_entry() and list_prev_entry()") in
- * v3.13 (2013-11-12).
- */
-#if !defined(list_prev_entry)
-    #define list_prev_entry(pos, member) \
-        list_entry((pos)->member.prev, typeof(*(pos)), member)
-#endif
-
-#if !defined(list_next_entry)
-    #define list_next_entry(pos, member) \
-        list_entry((pos)->member.next, typeof(*(pos)), member)
 #endif
 
 #if !defined(NV_LIST_IS_FIRST_PRESENT)

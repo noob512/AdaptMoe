@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -104,6 +104,14 @@ namespace DisplayPort
         connectorDVI,
         connectorVGA
     };
+
+    typedef enum
+    {
+        // Read DID2x first, then read EDID regardless of DID2x availability.
+        DISPLAYID2_MST_POLICY_DID2X_THEN_EDID = 0,
+        // Read DID2x first, then read EDID only if DID2x is not available.
+        DISPLAYID2_MST_POLICY_DID2X_ONLY = 1,
+    } DISPLAYID2_MST_POLICY;
 
     typedef struct portMap
     {
@@ -230,6 +238,8 @@ namespace DisplayPort
         // Copies RawEDID into client buffer. Fails if the buffer is too small
         virtual bool            getRawEDID(char * buffer, unsigned size) const = 0;
 
+        virtual unsigned        getDisplayId2xSize() const = 0;
+        virtual bool            getDisplayId2x(char * buffer, unsigned size) const = 0;
         virtual bool            getPCONCaps(PCONCaps *pPCONCaps) = 0;
 
         virtual bool            isFallbackEdid() = 0;           // is the device edid a fallback one?
@@ -288,6 +298,9 @@ namespace DisplayPort
 
         virtual bool getRawDscCaps(NvU8 *buffer, NvU32 bufferSize) = 0;
         virtual bool setRawDscCaps(const NvU8 *buffer, NvU32 bufferSize) = 0;
+        virtual bool setValidatedRawDscCaps(NvU8 *buffer, NvU32 bufferSize) = 0;
+        virtual bool validatePPSData(DSCPPSDATA *pPps) = 0;
+        virtual bool readAndParseDSCCaps() = 0;
 
         // This interface is still nascent. Please don't use it. Read size limit is 16 bytes.
         virtual AuxBus::status getDpcdData(unsigned offset, NvU8 * buffer,
@@ -381,6 +394,7 @@ namespace DisplayPort
         virtual void destroy() = 0;                 // Destroy the group object
 
         // Toggles the encryption status for the stream.
+        virtual bool hdcpSetEncrypted(bool encrypted, NvU8 streamType = NV0073_CTRL_SPECIFIC_HDCP_CTRL_HDCP22_TYPE_0, NvBool bForceClear = NV_FALSE, NvBool bAddStreamBack = NV_FALSE) = 0;
         // Returns whether encryption is currently enabled.
         virtual bool hdcpGetEncrypted() = 0;
 
@@ -439,6 +453,9 @@ namespace DisplayPort
 
         // Get the clock calculation supported by the GPU
         virtual unsigned getGpuDataClockMultiplier() = 0;
+
+        // Power Down the link
+        virtual void powerdownLink(bool bPowerdownPanel = false) = 0;
 
         // Resume from standby/initial boot notification
         //   The library is considered to start up in the suspended state.  You must make this
@@ -664,6 +681,15 @@ namespace DisplayPort
         virtual void setPolicyForceLTAtNAB(bool enabled) = 0;
 
         //
+        //  Set the policy of reading DID2x on MST devices.
+        //  Valid values are 0-1.
+        //  0 - DID2x then EDID.    - DPLib will read DID2x then EDID before reporting device to client.
+        //  1 - DID2x only.         - DPLib will only read DID2x and ignore EDID.
+        //  Default value is 0.
+        //  All other values are reserved.
+        //
+        virtual void setDisplayId2MSTPolicy(DISPLAYID2_MST_POLICY policy) = 0;
+        //
         //  There are cases where OS does not detach heads from connector immediately after hot-unplug,
         //  on next hot-plug there is no guarantee that newly connected sink is capable to drive existing
         //  raster timings. Flush mode has following restriction
@@ -716,6 +742,8 @@ namespace DisplayPort
         virtual void resetDp11ProtocolForced() = 0;
         virtual bool isDp11ProtocolForced() = 0;
 
+        // Operates at the Link Level. Causes reauthentication of the entire link.
+        virtual void hdcpRenegotiate(NvU64 cN, NvU64 cKsv) = 0;
         virtual bool getHDCPAbortCodesDP12(NvU32 &hdcpAbortCodesDP12) = 0;
 
         virtual bool getOuiSink(unsigned &ouiId, unsigned char * modelName,
@@ -774,6 +802,10 @@ namespace DisplayPort
     virtual bool willLinkSupportModeSST(const LinkConfiguration &linkConfig,
                                         const ModesetInfo &modesetInfo,
                                         const DscParams *pDscParams = NULL) = 0;
+    virtual bool isDpInTunnelingSupported() = 0;
+    virtual bool isDpInTunnelingPanelReplayOptimizationSupported() = 0;
+    virtual bool isDpInTunnelingBwAllocationSupported() = 0;
+    virtual bool getUSBDpInAdapterInfo(NvU32 displayId, NV0073_CTRL_DP_USB4_INFO *pInfo) = 0;
 
     protected:
            virtual ~Connector() {}

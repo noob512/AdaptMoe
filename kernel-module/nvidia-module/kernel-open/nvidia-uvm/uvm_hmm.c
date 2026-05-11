@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2016-2024 NVIDIA Corporation
+    Copyright (c) 2016-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -74,6 +74,19 @@ module_param(uvm_disable_hmm, bool, 0444);
 #include "uvm_va_policy.h"
 #include "uvm_tools.h"
 
+//
+// Pass 0 as the order, when actual large order support is added this
+// function will need to be revisited
+//
+static __always_inline void nv_zone_device_page_init(struct page *page)
+{
+#if defined(NV_ZONE_DEVICE_PAGE_INIT_HAS_PGMAP_AND_ORDER_ARGS)
+    zone_device_page_init(page, page_pgmap(page), 0);
+#else
+    zone_device_page_init(page);
+#endif
+}
+
 // The function nv_PageSwapCache() wraps the check for page swap cache flag in
 // order to support a wide variety of kernel versions.
 // The function PageSwapCache() is removed after 32f51ead3d77 ("mm: remove
@@ -91,10 +104,6 @@ static __always_inline bool nv_PageSwapCache(struct page *page)
     return PageSwapCache(page);
 #endif
 }
-
-static NV_STATUS gpu_chunk_add(uvm_va_block_t *va_block,
-                               uvm_page_index_t page_index,
-                               struct page *page);
 
 typedef struct
 {
@@ -131,6 +140,8 @@ typedef struct
 
 bool uvm_hmm_is_enabled_system_wide(void)
 {
+    // TODO: Bug 4103580: Once aarch64 supports HMM this condition will no
+    // longer be true.
     if (uvm_disable_hmm)
         return false;
 
@@ -207,6 +218,7 @@ static NV_STATUS hmm_copy_devmem_page(struct page *dst_page, struct page *src_pa
                                  PAGE_SIZE);
     uvm_push_end(&push);
     status = uvm_tracker_add_push_safe(&tracker, &push);
+
     if (status == NV_OK)
         status = uvm_tracker_wait_deinit(&tracker);
 
@@ -248,6 +260,7 @@ static NV_STATUS uvm_hmm_pmm_gpu_evict_pfn(unsigned long pfn)
         // in data loss in the application but failures are not expected.
         if (hmm_copy_devmem_page(dst_page, migrate_pfn_to_page(src_pfn)) != NV_OK)
             memzero_page(dst_page, 0, PAGE_SIZE);
+
         dst_pfn = migrate_pfn(page_to_pfn(dst_page));
         migrate_device_pages(&src_pfn, &dst_pfn, 1);
     }
@@ -270,6 +283,7 @@ void uvm_hmm_va_space_initialize(uvm_va_space_t *va_space)
 
     uvm_range_tree_init(&hmm_va_space->blocks);
     uvm_mutex_init(&hmm_va_space->blocks_lock, UVM_LOCK_ORDER_LEAF);
+    atomic64_set(&hmm_va_space->allocated_page_count, 0);
 
     return;
 }
@@ -349,14 +363,20 @@ void uvm_hmm_unregister_gpu(uvm_va_space_t *va_space, uvm_gpu_t *gpu, struct mm_
         for (pfn = __phys_to_pfn(devmem_start); pfn <= __phys_to_pfn(devmem_end); pfn++) {
             struct page *page = pfn_to_page(pfn);
 
+            // No need to keep scanning if no HMM pages are allocated for this
+            // va_space.
+            if (!atomic64_read(&va_space->hmm.allocated_page_count))
+                break;
+
             UVM_ASSERT(is_device_private_page(page));
 
             // This check is racy because nothing stops the page being freed and
             // even reused. That doesn't matter though - worst case the
             // migration fails, we retry and find the va_space doesn't match.
-            if (uvm_pmm_devmem_page_to_va_space(page) == va_space)
+            if (uvm_pmm_devmem_page_to_va_space(page) == va_space) {
                 if (uvm_hmm_pmm_gpu_evict_pfn(pfn) != NV_OK)
                     retry = true;
+            }
         }
     } while (retry);
 
@@ -946,7 +966,6 @@ static NV_STATUS split_block_if_needed(uvm_va_block_t *va_block,
     uvm_va_space_t *va_space;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
-    uvm_va_block_region_t region;
     NvU64 addr, from, to;
     uvm_va_block_t *new;
     NV_STATUS status = NV_OK;
@@ -988,7 +1007,6 @@ static NV_STATUS split_block_if_needed(uvm_va_block_t *va_block,
 
         from = max(addr, (NvU64)vma->vm_start);
         to = min(va_block->end, (NvU64)vma->vm_end - 1);
-        region = uvm_va_block_region_from_start_end(va_block, from, to);
 
         if (!uvm_hmm_vma_is_valid(vma, from, false))
             continue;
@@ -1248,7 +1266,6 @@ static NV_STATUS hmm_set_accessed_by_start_end_locked(uvm_va_block_t *va_block,
                                                       NvU64 end,
                                                       uvm_tracker_t *out_tracker)
 {
-    uvm_va_space_t *va_space = va_block->hmm.va_space;
     uvm_va_policy_node_t *node;
     uvm_va_block_region_t region;
     NV_STATUS status = NV_OK;
@@ -1256,7 +1273,7 @@ static NV_STATUS hmm_set_accessed_by_start_end_locked(uvm_va_block_t *va_block,
     uvm_for_each_va_policy_node_in(node, va_block, start, end) {
         // Read duplication takes precedence over SetAccessedBy.
         // Do not add mappings if read duplication is enabled.
-        if (uvm_va_policy_is_read_duplicate(&node->policy, va_space))
+        if (uvm_va_policy_is_read_duplicate(&node->policy))
             continue;
 
         region = uvm_va_block_region_from_start_end(va_block,
@@ -1345,6 +1362,7 @@ void uvm_hmm_block_add_eviction_mappings(uvm_va_space_t *va_space,
     uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
     uvm_va_policy_node_t *node;
     uvm_va_block_region_t region;
+    const uvm_va_policy_t *policy;
     uvm_processor_mask_t *map_processors = &block_context->hmm.map_processors_eviction;
     uvm_processor_id_t id;
     NV_STATUS tracker_status;
@@ -1356,8 +1374,8 @@ void uvm_hmm_block_add_eviction_mappings(uvm_va_space_t *va_space,
 
     uvm_mutex_lock(&va_block->lock);
 
-    uvm_for_each_va_policy_node_in(node, va_block, va_block->start, va_block->end) {
-        for_each_id_in_mask(id, &node->policy.accessed_by) {
+    uvm_for_each_va_policy_in(policy, va_block, va_block->start, va_block->end, node, region) {
+        for_each_id_in_mask(id, &policy->accessed_by) {
             status = hmm_set_accessed_by_start_end_locked(va_block,
                                                           block_context,
                                                           id,
@@ -1372,7 +1390,7 @@ void uvm_hmm_block_add_eviction_mappings(uvm_va_space_t *va_space,
 
             // Exclude the processors that have been already mapped due to
             // AccessedBy.
-            uvm_processor_mask_andnot(map_processors, &va_block->evicted_gpus, &node->policy.accessed_by);
+            uvm_processor_mask_andnot(map_processors, &va_block->evicted_gpus, &policy->accessed_by);
 
             for_each_gpu_id_in_mask(id, map_processors) {
                 uvm_gpu_t *gpu = uvm_gpu_get(id);
@@ -1564,6 +1582,31 @@ uvm_va_block_region_t uvm_hmm_get_prefetch_region(uvm_va_block_t *va_block,
     return uvm_va_block_region_from_start_end(va_block, start, end);
 }
 
+uvm_prot_t uvm_hmm_compute_mapping_prot(uvm_va_block_t *va_block,
+                                        uvm_processor_id_t processor_id,
+                                        uvm_page_index_t page_index)
+{
+    if (!uvm_processor_mask_test(&va_block->mapped, UVM_ID_CPU))
+        return UVM_PROT_NONE;
+
+    if (uvm_page_mask_test(&va_block->cpu.pte_bits[UVM_PTE_BITS_CPU_WRITE], page_index)) {
+        if (uvm_processor_mask_test(&va_block->hmm.va_space->has_native_atomics[uvm_id_value(UVM_ID_CPU)],
+                                    processor_id))
+            // If the CPU has write access it also has atomic access, so it's
+            // fine for any GPU with HW support to do atomic accesses.
+            return UVM_PROT_READ_WRITE_ATOMIC;
+        else
+            // Otherwise the GPU needs to fault on atomic access to ensure the
+            // CPU is unmapped.
+            return UVM_PROT_READ_WRITE;
+    }
+
+    if (uvm_page_mask_test(&va_block->cpu.pte_bits[UVM_PTE_BITS_CPU_READ], page_index))
+        return UVM_PROT_READ_ONLY;
+
+    return UVM_PROT_NONE;
+}
+
 uvm_prot_t uvm_hmm_compute_logical_prot(uvm_va_block_t *va_block,
                                         struct vm_area_struct *vma,
                                         NvU64 addr)
@@ -1603,9 +1646,9 @@ static NV_STATUS hmm_va_block_cpu_page_populate(uvm_va_block_t *va_block,
         return status;
     }
 
-    status = uvm_va_block_map_cpu_chunk_on_gpus(va_block, chunk, page_index);
+    status = uvm_va_block_map_cpu_chunk_on_gpus(va_block, chunk);
     if (status != NV_OK) {
-        uvm_cpu_chunk_remove_from_block(va_block, page_to_nid(page), page_index);
+        uvm_cpu_chunk_remove_from_block(va_block, chunk, page_to_nid(page), page_index);
         uvm_cpu_chunk_free(chunk);
     }
 
@@ -1624,7 +1667,7 @@ static void hmm_va_block_cpu_unpopulate_chunk(uvm_va_block_t *va_block,
                !uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index));
     UVM_ASSERT(uvm_cpu_chunk_get_size(chunk) == PAGE_SIZE);
 
-    uvm_cpu_chunk_remove_from_block(va_block, chunk_nid, page_index);
+    uvm_cpu_chunk_remove_from_block(va_block, chunk, chunk_nid, page_index);
     uvm_va_block_unmap_cpu_chunk_on_gpus(va_block, chunk);
     uvm_cpu_chunk_free(chunk);
 }
@@ -1649,14 +1692,45 @@ static void hmm_va_block_cpu_page_unpopulate(uvm_va_block_t *va_block, uvm_page_
     }
 }
 
-static bool hmm_va_block_cpu_page_is_same(uvm_va_block_t *va_block,
-                                          uvm_page_index_t page_index,
-                                          struct page *page)
+// Insert the given sysmem page.
+// Note that we might have a driver allocated sysmem page for staged GPU to GPU
+// copies and that Linux may independently have allocated a page.
+// If so, we have to free the driver page and use the one from Linux.
+static NV_STATUS hmm_va_block_cpu_page_insert_or_replace(uvm_va_block_t *va_block,
+                                                         uvm_page_index_t page_index,
+                                                         struct page *page,
+                                                         uvm_page_mask_t *populated_page_mask)
 {
-    struct page *old_page = uvm_va_block_get_cpu_page(va_block, page_index);
+    NV_STATUS status;
 
-    UVM_ASSERT(uvm_cpu_chunk_is_hmm(uvm_cpu_chunk_get_chunk_for_page(va_block, page_to_nid(page), page_index)));
-    return old_page == page;
+    if (uvm_page_mask_test(&va_block->cpu.allocated, page_index)) {
+        uvm_cpu_chunk_t *cpu_chunk = uvm_cpu_chunk_get_chunk_for_page(va_block, page_to_nid(page), page_index);
+
+        // Check to see if the CPU chunk already refers to the given page.
+        if (cpu_chunk &&
+            uvm_cpu_chunk_is_hmm(cpu_chunk) &&
+            uvm_cpu_chunk_get_cpu_page(va_block, cpu_chunk, page_index) == page) {
+
+            UVM_ASSERT(uvm_processor_mask_test(&va_block->resident, UVM_ID_CPU));
+            UVM_ASSERT(uvm_va_block_cpu_is_page_resident_on(va_block, page_to_nid(page), page_index));
+
+            return NV_OK;
+        }
+
+        // A driver allocated CPU chunk could have a different NUMA node ID.
+        hmm_va_block_cpu_page_unpopulate(va_block, page_index, NULL);
+    }
+
+    status = hmm_va_block_cpu_page_populate(va_block, page_index, page);
+    if (status != NV_OK)
+        return status;
+
+    // Record that we populated this page. hmm_block_cpu_fault_locked()
+    // uses this to ensure pages that don't migrate get remote mapped.
+    if (populated_page_mask)
+        uvm_page_mask_set(populated_page_mask, page_index);
+
+    return NV_OK;
 }
 
 // uvm_va_block_service_copy() and uvm_va_block_service_finish() expect the
@@ -1710,6 +1784,66 @@ static void cpu_mapping_clear(uvm_va_block_t *va_block, uvm_page_index_t page_in
         uvm_processor_mask_clear(&va_block->mapped, UVM_ID_CPU);
 }
 
+static void gpu_chunk_free(uvm_va_block_t *va_block,
+                           uvm_va_block_retry_t *va_block_retry,
+                           uvm_va_block_gpu_state_t *gpu_state,
+                           uvm_page_index_t page_index)
+{
+    uvm_gpu_chunk_t *gpu_chunk = gpu_state->chunks[page_index];
+
+    if (gpu_chunk->state != UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED || gpu_chunk->is_referenced)
+        return;
+
+    UVM_ASSERT(gpu_chunk->va_block == va_block);
+
+    uvm_mmu_chunk_unmap(gpu_chunk, &va_block->tracker);
+    gpu_state->chunks[page_index] = NULL;
+    if (va_block_retry) {
+        list_move_tail(&gpu_chunk->list, &va_block_retry->free_chunks);
+    }
+    else {
+        list_del_init(&gpu_chunk->list);
+        uvm_pmm_gpu_free(&uvm_gpu_chunk_get_gpu(gpu_chunk)->pmm, gpu_chunk, NULL);
+    }
+}
+
+static void gpu_chunk_free_region(uvm_va_block_t *va_block,
+                                  uvm_va_block_retry_t *va_block_retry,
+                                  uvm_gpu_id_t gpu_id,
+                                  uvm_va_block_region_t region,
+                                  const uvm_page_mask_t *page_mask)
+{
+    uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu_id);
+    uvm_page_index_t page_index;
+
+    for_each_va_block_page_in_region_mask(page_index, page_mask, region)
+        gpu_chunk_free(va_block, va_block_retry, gpu_state, page_index);
+}
+
+static void gpu_chunk_free_preallocated(uvm_va_block_t *va_block,
+                                        uvm_va_block_retry_t *va_block_retry)
+{
+    uvm_gpu_chunk_t *gpu_chunk, *next_chunk;
+
+    list_for_each_entry_safe(gpu_chunk, next_chunk, &va_block_retry->used_chunks, list) {
+        uvm_gpu_t *gpu = uvm_gpu_chunk_get_gpu(gpu_chunk);
+        uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+        uvm_page_index_t page_index = gpu_chunk->va_block_page_index;
+
+        UVM_ASSERT(gpu_state);
+
+        UVM_ASSERT(gpu_chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
+        UVM_ASSERT(gpu_chunk->va_block == va_block);
+        UVM_ASSERT(!gpu_chunk->is_referenced);
+
+        uvm_mmu_chunk_unmap(gpu_chunk, &va_block->tracker);
+        gpu_state->chunks[page_index] = NULL;
+
+        list_del_init(&gpu_chunk->list);
+        uvm_pmm_gpu_free(&gpu->pmm, gpu_chunk, NULL);
+    }
+}
+
 static void gpu_chunk_remove(uvm_va_block_t *va_block,
                              uvm_page_index_t page_index,
                              struct page *page)
@@ -1718,20 +1852,23 @@ static void gpu_chunk_remove(uvm_va_block_t *va_block,
     uvm_gpu_chunk_t *gpu_chunk;
     uvm_gpu_id_t id;
 
-    id = uvm_gpu_chunk_get_gpu(uvm_pmm_devmem_page_to_chunk(page))->id;
+    gpu_chunk = uvm_pmm_devmem_page_to_chunk(page);
+    id = uvm_gpu_chunk_get_gpu(gpu_chunk)->id;
     gpu_state = uvm_va_block_gpu_state_get(va_block, id);
     UVM_ASSERT(gpu_state);
 
-    gpu_chunk = gpu_state->chunks[page_index];
-    if (!gpu_chunk) {
+    if (!gpu_state->chunks[page_index]) {
         // If we didn't find a chunk it's because the page was unmapped for
         // mremap and no fault has established a new mapping.
         UVM_ASSERT(!uvm_page_mask_test(&gpu_state->resident, page_index));
         return;
     }
 
-    UVM_ASSERT(gpu_chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
+    UVM_ASSERT(gpu_chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED ||
+               gpu_chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
+    UVM_ASSERT(gpu_chunk->va_block == va_block);
     UVM_ASSERT(gpu_chunk->is_referenced);
+    UVM_ASSERT(gpu_chunk == gpu_state->chunks[page_index]);
 
     uvm_page_mask_clear(&gpu_state->resident, page_index);
 
@@ -1740,42 +1877,41 @@ static void gpu_chunk_remove(uvm_va_block_t *va_block,
 }
 
 static NV_STATUS gpu_chunk_add(uvm_va_block_t *va_block,
+                               uvm_va_block_retry_t *va_block_retry,
                                uvm_page_index_t page_index,
                                struct page *page)
 {
     uvm_va_block_gpu_state_t *gpu_state;
     uvm_gpu_chunk_t *gpu_chunk;
-    uvm_gpu_id_t id;
+    uvm_gpu_t *gpu;
     NV_STATUS status;
 
-    id = uvm_gpu_chunk_get_gpu(uvm_pmm_devmem_page_to_chunk(page))->id;
-    gpu_state = uvm_va_block_gpu_state_get(va_block, id);
+    gpu_chunk = uvm_pmm_devmem_page_to_chunk(page);
+    gpu = uvm_gpu_chunk_get_gpu(gpu_chunk);
+    gpu_state = uvm_va_block_gpu_state_get_alloc(va_block, gpu);
 
-    // It's possible that this is a fresh va_block we're trying to add an
-    // existing gpu_chunk to. This occurs for example when a GPU faults on a
-    // virtual address that has been remapped with mremap().
-    if (!gpu_state) {
-        status = uvm_va_block_gpu_state_alloc(va_block);
-        if (status != NV_OK)
-            return status;
-        gpu_state = uvm_va_block_gpu_state_get(va_block, id);
-    }
-
-    UVM_ASSERT(gpu_state);
+    if (!gpu_state)
+            return NV_ERR_NO_MEMORY;
 
     // Note that a mremap() might be to a CPU virtual address that is nolonger
     // aligned with a larger GPU chunk size. We would need to allocate a new
     // aligned GPU chunk and copy from old to new.
     // TODO: Bug 3368756: add support for large GPU pages.
-    gpu_chunk = uvm_pmm_devmem_page_to_chunk(page);
     UVM_ASSERT(gpu_chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
     UVM_ASSERT(gpu_chunk->is_referenced);
     UVM_ASSERT(uvm_pmm_devmem_page_to_va_space(page) == va_block->hmm.va_space);
 
-    if (gpu_state->chunks[page_index] == gpu_chunk)
+    if (gpu_state->chunks[page_index] == gpu_chunk) {
+        UVM_ASSERT(gpu_chunk->va_block == va_block);
         return NV_OK;
+    }
 
-    UVM_ASSERT(!gpu_state->chunks[page_index]);
+    if (gpu_state->chunks[page_index]) {
+        // In the mremap() case, if we pre-allocated a new GPU chunk for the
+        // destination of a potential migration but we need to free it because
+        // we are replacing it with the old chunk from the mremap() source.
+        gpu_chunk_free(va_block, va_block_retry, gpu_state, page_index);
+    }
 
     // In some configurations such as SR-IOV heavy, the chunk cannot be
     // referenced using its physical address. Create a virtual mapping.
@@ -1783,14 +1919,10 @@ static NV_STATUS gpu_chunk_add(uvm_va_block_t *va_block,
     if (status != NV_OK)
         return status;
 
-    uvm_processor_mask_set(&va_block->resident, id);
+    uvm_processor_mask_set(&va_block->resident, gpu->id);
     uvm_page_mask_set(&gpu_state->resident, page_index);
 
-    // It is safe to modify the page index field without holding any PMM locks
-    // because the chunk is allocated, which means that none of the other
-    // fields in the bitmap can change.
     gpu_chunk->va_block = va_block;
-    gpu_chunk->va_block_page_index = page_index;
 
     gpu_state->chunks[page_index] = gpu_chunk;
 
@@ -1818,34 +1950,50 @@ static NV_STATUS sync_page_and_chunk_state(uvm_va_block_t *va_block,
 
     // Wait for the GPU to finish. migrate_vma_finalize() will release the
     // migrated source pages (or non migrating destination pages), so GPU
-    // opererations must be finished by then.
+    // opererations must be finished by then. Also, we unmap the source or
+    // destination so DMAs must be complete before DMA unmapping.
     status = uvm_tracker_wait(&va_block->tracker);
 
     for_each_va_block_page_in_region(page_index, region) {
-        struct page *page;
+        struct page *src_page;
+        struct page *dst_page;
 
         if (uvm_page_mask_test(same_devmem_page_mask, page_index))
             continue;
 
-        // If a page migrated, clean up the source page.
-        // Otherwise, clean up the destination page.
-        if (uvm_page_mask_test(migrated_pages, page_index))
-            page = migrate_pfn_to_page(src_pfns[page_index]);
-        else
-            page = migrate_pfn_to_page(dst_pfns[page_index]);
-
-        if (!page)
-            continue;
-
-        if (is_device_private_page(page)) {
-            gpu_chunk_remove(va_block, page_index, page);
+        // If the source page migrated, we have to remove our pointers to it
+        // because migrate_vma_finalize() will release the reference.
+        // TODO: Bug 3660922: Need to handle read duplication at some point.
+        src_page = migrate_pfn_to_page(src_pfns[page_index]);
+        if (src_page && uvm_page_mask_test(migrated_pages, page_index)) {
+            if (is_device_private_page(src_page))
+                gpu_chunk_remove(va_block, page_index, src_page);
+            else
+                hmm_va_block_cpu_page_unpopulate(va_block, page_index, src_page);
         }
-        else {
-            // If the source page is a system memory page,
-            // migrate_vma_finalize() will release the reference so we should
-            // clear our pointer to it.
-            // TODO: Bug 3660922: Need to handle read duplication at some point.
-            hmm_va_block_cpu_page_unpopulate(va_block, page_index, page);
+
+        dst_page = migrate_pfn_to_page(dst_pfns[page_index]);
+        if (dst_page) {
+            if (is_device_private_page(dst_page)) {
+                uvm_gpu_chunk_t *gpu_chunk = uvm_pmm_devmem_page_to_chunk(dst_page);
+
+                UVM_ASSERT(gpu_chunk);
+                UVM_ASSERT(gpu_chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED ||
+                           gpu_chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
+                UVM_ASSERT(gpu_chunk->is_referenced);
+
+                // If a page migrated to the GPU, we have to unpin the
+                // gpu_chunk. Otherwise, clear pointers to temporary pinned
+                // pages that aren't migrating.
+                if (uvm_page_mask_test(migrated_pages, page_index))
+                    uvm_pmm_gpu_unpin_allocated(&uvm_gpu_chunk_get_gpu(gpu_chunk)->pmm, gpu_chunk, va_block);
+                else
+                    gpu_chunk_remove(va_block, page_index, dst_page);
+            }
+            else if (!uvm_page_mask_test(migrated_pages, page_index)) {
+                // Clear pointer to sysmem page that will be released.
+                hmm_va_block_cpu_page_unpopulate(va_block, page_index, dst_page);
+            }
         }
     }
 
@@ -1854,7 +2002,6 @@ static NV_STATUS sync_page_and_chunk_state(uvm_va_block_t *va_block,
 
 // Update va_block state to reflect that the page isn't migrating.
 static void clean_up_non_migrating_page(uvm_va_block_t *va_block,
-                                        const unsigned long *src_pfns,
                                         unsigned long *dst_pfns,
                                         uvm_page_index_t page_index)
 {
@@ -1880,10 +2027,9 @@ static void clean_up_non_migrating_page(uvm_va_block_t *va_block,
 }
 
 static void clean_up_non_migrating_pages(uvm_va_block_t *va_block,
-                                         const unsigned long *src_pfns,
                                          unsigned long *dst_pfns,
                                          uvm_va_block_region_t region,
-                                         uvm_page_mask_t *page_mask)
+                                         const uvm_page_mask_t *page_mask)
 {
     uvm_page_index_t page_index;
     NV_STATUS status;
@@ -1892,23 +2038,47 @@ static void clean_up_non_migrating_pages(uvm_va_block_t *va_block,
     UVM_ASSERT(status == NV_OK);
 
     for_each_va_block_page_in_region_mask(page_index, page_mask, region) {
-        clean_up_non_migrating_page(va_block, src_pfns, dst_pfns, page_index);
+        clean_up_non_migrating_page(va_block, dst_pfns, page_index);
     }
 }
 
 // CPU page fault handling.
 
-// Fill in the dst_pfns[page_index] entry given that there is an allocated
-// CPU page.
-static void lock_block_cpu_page(uvm_va_block_t *va_block,
-                                uvm_page_index_t page_index,
-                                struct page *src_page,
-                                unsigned long *dst_pfns,
-                                uvm_page_mask_t *same_devmem_page_mask)
+// Fill in the dst_pfns[page_index] entry with a CPU page.
+// The src_pfns[page_index] page, if present, is page locked.
+static NV_STATUS alloc_page_on_cpu(uvm_va_block_t *va_block,
+                                   uvm_va_block_retry_t *va_block_retry,
+                                   uvm_page_index_t page_index,
+                                   const unsigned long *src_pfns,
+                                   unsigned long *dst_pfns,
+                                   uvm_page_mask_t *same_devmem_page_mask,
+                                   uvm_va_block_context_t *block_context)
 {
-    uvm_cpu_chunk_t *chunk = uvm_cpu_chunk_get_any_chunk_for_page(va_block, page_index);
-    uvm_va_block_region_t chunk_region;
+    struct page *src_page;
     struct page *dst_page;
+    uvm_cpu_chunk_t *chunk;
+    uvm_va_block_region_t chunk_region;
+
+    if (!uvm_page_mask_test(&va_block->cpu.allocated, page_index)) {
+        NV_STATUS status;
+
+        UVM_ASSERT(!uvm_processor_mask_test(&va_block->resident, UVM_ID_CPU) ||
+                   !uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index));
+
+        status = uvm_va_block_populate_page_cpu(va_block, page_index, block_context);
+        if (status != NV_OK)
+            return status;
+    }
+
+    // This is the page that will be copied to system memory.
+    src_page = migrate_pfn_to_page(src_pfns[page_index]);
+
+    // mremap may have caused us to lose the gpu_chunk associated with
+    // this va_block/page_index so make sure we have the correct chunk.
+    if (src_page && is_device_private_page(src_page))
+        gpu_chunk_add(va_block, va_block_retry, page_index, src_page);
+
+    chunk = uvm_cpu_chunk_get_any_chunk_for_page(va_block, page_index);
 
     UVM_ASSERT(chunk);
     UVM_ASSERT(chunk->page);
@@ -1924,61 +2094,63 @@ static void lock_block_cpu_page(uvm_va_block_t *va_block,
     // remote mapped system memory page. It could also be a driver allocated
     // page for GPU-to-GPU staged copies (i.e., not a resident copy and owned
     // by the driver).
-    if (is_device_private_page(src_page)) {
-        // Since the page isn't mirrored, it was allocated by alloc_pages()
+    if (!src_page || is_device_private_page(src_page)) {
+        UVM_ASSERT(!uvm_processor_mask_test(&va_block->resident, UVM_ID_CPU) ||
+                   !uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index));
+
+        // If the page isn't mirrored, it was allocated by alloc_pages()
         // and UVM owns the reference. We leave the reference count unchanged
         // and mark the page pointer as mirrored since UVM is transferring
         // ownership to Linux and we don't want UVM to double free the page in
         // hmm_va_block_cpu_page_unpopulate() or block_kill(). If the page
         // does not migrate, it will be freed though.
-        UVM_ASSERT(!uvm_processor_mask_test(&va_block->resident, UVM_ID_CPU) ||
-                   !uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index));
-        UVM_ASSERT(chunk->type == UVM_CPU_CHUNK_TYPE_PHYSICAL);
-        UVM_ASSERT(page_ref_count(dst_page) == 1);
-        uvm_cpu_chunk_make_hmm(chunk);
+        if (chunk->type == UVM_CPU_CHUNK_TYPE_PHYSICAL) {
+            UVM_ASSERT(page_ref_count(dst_page) == 1);
+            uvm_cpu_chunk_make_hmm(chunk);
+        }
+
+        lock_page(dst_page);
+        dst_pfns[page_index] = migrate_pfn(page_to_pfn(dst_page));
     }
     else {
+        if (src_page != dst_page) {
+            // This must be a driver allocated staging page that doesn't match
+            // the page that migrate_vma_setup() locked.
+            hmm_va_block_cpu_unpopulate_chunk(va_block, chunk, page_to_nid(dst_page), page_index);
+            hmm_va_block_cpu_page_populate(va_block, page_index, src_page);
+        }
+
+        UVM_ASSERT(uvm_cpu_chunk_is_hmm(chunk));
         UVM_ASSERT(same_devmem_page_mask);
-        UVM_ASSERT(src_page == dst_page);
         uvm_page_mask_set(same_devmem_page_mask, page_index);
 
         // The call to migrate_vma_setup() will have inserted a migration PTE
         // so the CPU has no access.
         cpu_mapping_clear(va_block, page_index);
-        return;
     }
 
-    lock_page(dst_page);
-    dst_pfns[page_index] = migrate_pfn(page_to_pfn(dst_page));
-}
-
-static void hmm_mark_gpu_chunk_referenced(uvm_va_block_t *va_block,
-                                          uvm_gpu_t *gpu,
-                                          uvm_gpu_chunk_t *gpu_chunk)
-{
-    // Tell PMM to expect a callback from Linux to free the page since the
-    // device private struct page reference count will determine when the
-    // GPU chunk is free.
-    UVM_ASSERT(gpu_chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
-    list_del_init(&gpu_chunk->list);
-    uvm_pmm_gpu_unpin_referenced(&gpu->pmm, gpu_chunk, va_block);
+    return NV_OK;
 }
 
 static void fill_dst_pfn(uvm_va_block_t *va_block,
+                         uvm_va_block_gpu_state_t *gpu_state,
                          uvm_gpu_t *gpu,
                          const unsigned long *src_pfns,
                          unsigned long *dst_pfns,
                          uvm_page_index_t page_index,
+                         const uvm_page_mask_t *page_mask,
                          uvm_page_mask_t *same_devmem_page_mask)
 {
     unsigned long src_pfn = src_pfns[page_index];
-    uvm_gpu_chunk_t *gpu_chunk;
+    uvm_gpu_chunk_t *gpu_chunk = gpu_state->chunks[page_index];
     unsigned long pfn;
     struct page *dpage;
 
-    gpu_chunk = uvm_va_block_lookup_gpu_chunk(va_block, gpu, uvm_va_block_cpu_page_address(va_block, page_index));
     UVM_ASSERT(gpu_chunk);
+    UVM_ASSERT(uvm_gpu_chunk_is_user(gpu_chunk));
     UVM_ASSERT(gpu_chunk->log2_size == PAGE_SHIFT);
+    UVM_ASSERT(gpu_chunk->va_block == va_block);
+
     pfn = uvm_pmm_gpu_devmem_get_pfn(&gpu->pmm, gpu_chunk);
 
     // If the same GPU page is both source and destination, migrate_vma_pages()
@@ -1986,6 +2158,8 @@ static void fill_dst_pfn(uvm_va_block_t *va_block,
     // mark it as not migrating but we keep track of this so we don't confuse
     // it with a page that migrate_vma_pages() actually does not migrate.
     if ((src_pfn & MIGRATE_PFN_VALID) && (src_pfn >> MIGRATE_PFN_SHIFT) == pfn) {
+        UVM_ASSERT(gpu_chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
+        UVM_ASSERT(gpu_chunk->is_referenced);
         uvm_page_mask_set(same_devmem_page_mask, page_index);
         return;
     }
@@ -1994,90 +2168,32 @@ static void fill_dst_pfn(uvm_va_block_t *va_block,
     UVM_ASSERT(is_device_private_page(dpage));
     UVM_ASSERT(page_pgmap(dpage)->owner == &g_uvm_global);
 
-    hmm_mark_gpu_chunk_referenced(va_block, gpu, gpu_chunk);
-    UVM_ASSERT(!page_count(dpage));
-    zone_device_page_init(dpage);
-    dpage->zone_device_data = gpu_chunk;
+    if (gpu_chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED) {
+        UVM_ASSERT(!gpu_chunk->is_referenced);
+        gpu_chunk->is_referenced = true;
+
+        // Remove the GPU chunk from the retry->used_chunks list.
+        list_del_init(&gpu_chunk->list);
+
+        UVM_ASSERT(!page_count(dpage));
+        UVM_ASSERT(!dpage->zone_device_data);
+        nv_zone_device_page_init(dpage);
+        dpage->zone_device_data = gpu_chunk;
+        atomic64_inc(&va_block->hmm.va_space->hmm.allocated_page_count);
+    }
+    else {
+        UVM_ASSERT(gpu_chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
+        UVM_ASSERT(gpu_chunk->is_referenced);
+        UVM_ASSERT(uvm_pmm_devmem_page_to_chunk(dpage) == gpu_chunk);
+        UVM_ASSERT(page_count(dpage) == 1);
+    }
 
     dst_pfns[page_index] = migrate_pfn(pfn);
 }
 
-static void fill_dst_pfns(uvm_va_block_t *va_block,
-                          const unsigned long *src_pfns,
-                          unsigned long *dst_pfns,
-                          uvm_va_block_region_t region,
-                          uvm_page_mask_t *page_mask,
-                          uvm_page_mask_t *same_devmem_page_mask,
-                          uvm_processor_id_t dest_id)
-{
-    uvm_gpu_t *gpu = uvm_gpu_get(dest_id);
-    uvm_page_index_t page_index;
-
-    uvm_page_mask_zero(same_devmem_page_mask);
-
-    for_each_va_block_page_in_region_mask(page_index, page_mask, region) {
-        if (!(src_pfns[page_index] & MIGRATE_PFN_MIGRATE))
-            continue;
-
-        fill_dst_pfn(va_block,
-                     gpu,
-                     src_pfns,
-                     dst_pfns,
-                     page_index,
-                     same_devmem_page_mask);
-    }
-}
-
-static NV_STATUS alloc_page_on_cpu(uvm_va_block_t *va_block,
-                                   uvm_page_index_t page_index,
-                                   const unsigned long *src_pfns,
-                                   unsigned long *dst_pfns,
-                                   uvm_page_mask_t *same_devmem_page_mask,
-                                   uvm_va_block_context_t *block_context)
-{
-    NV_STATUS status;
-    struct page *src_page;
-    struct page *dst_page;
-
-    // This is the page that will be copied to system memory.
-    src_page = migrate_pfn_to_page(src_pfns[page_index]);
-
-    if (src_page) {
-        // mremap may have caused us to lose the gpu_chunk associated with
-        // this va_block/page_index so make sure we have the correct chunk.
-        if (is_device_private_page(src_page))
-            gpu_chunk_add(va_block, page_index, src_page);
-
-        if (uvm_page_mask_test(&va_block->cpu.allocated, page_index)) {
-            lock_block_cpu_page(va_block, page_index, src_page, dst_pfns, same_devmem_page_mask);
-            return NV_OK;
-        }
-    }
-
-    UVM_ASSERT(!uvm_processor_mask_test(&va_block->resident, UVM_ID_CPU) ||
-                !uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index));
-
-    status = uvm_va_block_populate_page_cpu(va_block, page_index, block_context);
-    if (status != NV_OK)
-        return status;
-
-    // TODO: Bug 3368756: add support for transparent huge pages
-    // Support for large CPU pages means the page_index may need fixing
-    dst_page = migrate_pfn_to_page(block_context->hmm.dst_pfns[page_index]);
-
-    // Note that we don't call get_page(dst_page) since alloc_page_vma()
-    // returns with a page reference count of one and we are passing
-    // ownership to Linux. Also, uvm_va_block_cpu_page_populate() recorded
-    // the page as "mirrored" so that migrate_vma_finalize() and
-    // hmm_va_block_cpu_page_unpopulate() don't double free the page.
-    lock_page(dst_page);
-    dst_pfns[page_index] = migrate_pfn(page_to_pfn(dst_page));
-
-    return NV_OK;
-}
-
 // Allocates pages on the CPU to handle migration due to a page fault
 static NV_STATUS fault_alloc_on_cpu(uvm_va_block_t *va_block,
+                                    uvm_va_block_retry_t *va_block_retry,
                                     const unsigned long *src_pfns,
                                     unsigned long *dst_pfns,
                                     uvm_va_block_region_t region,
@@ -2110,7 +2226,13 @@ static NV_STATUS fault_alloc_on_cpu(uvm_va_block_t *va_block,
             goto clr_mask;
         }
 
-        status = alloc_page_on_cpu(va_block, page_index, src_pfns, dst_pfns, same_devmem_page_mask, service_context->block_context);
+        status = alloc_page_on_cpu(va_block,
+                                   va_block_retry,
+                                   page_index,
+                                   src_pfns,
+                                   dst_pfns,
+                                   same_devmem_page_mask,
+                                   service_context->block_context);
         if (status != NV_OK) {
             // Ignore errors if the page is only for prefetching.
             if (service_context &&
@@ -2127,7 +2249,7 @@ static NV_STATUS fault_alloc_on_cpu(uvm_va_block_t *va_block,
     }
 
     if (status != NV_OK)
-        clean_up_non_migrating_pages(va_block, src_pfns, dst_pfns, region, page_mask);
+        clean_up_non_migrating_pages(va_block, dst_pfns, region, page_mask);
     else if (uvm_page_mask_empty(page_mask))
         return NV_WARN_MORE_PROCESSING_REQUIRED;
 
@@ -2136,6 +2258,7 @@ static NV_STATUS fault_alloc_on_cpu(uvm_va_block_t *va_block,
 
 // Allocates pages on the CPU for explicit migration calls.
 static NV_STATUS migrate_alloc_on_cpu(uvm_va_block_t *va_block,
+                                      uvm_va_block_retry_t *va_block_retry,
                                       const unsigned long *src_pfns,
                                       unsigned long *dst_pfns,
                                       uvm_va_block_region_t region,
@@ -2158,11 +2281,18 @@ static NV_STATUS migrate_alloc_on_cpu(uvm_va_block_t *va_block,
             continue;
         }
 
-        status = alloc_page_on_cpu(va_block, page_index, src_pfns, dst_pfns, same_devmem_page_mask, block_context);
+        status = alloc_page_on_cpu(va_block, va_block_retry, page_index, src_pfns, dst_pfns, same_devmem_page_mask, block_context);
+        if (status != NV_OK) {
+            // Try to migrate other pages if we can't allocate this one.
+            if (status != NV_ERR_NO_MEMORY)
+                break;
+
+            uvm_page_mask_clear(page_mask, page_index);
+        }
     }
 
     if (status != NV_OK)
-        clean_up_non_migrating_pages(va_block, src_pfns, dst_pfns, region, page_mask);
+        clean_up_non_migrating_pages(va_block, dst_pfns, region, page_mask);
     else if (uvm_page_mask_empty(page_mask))
         return NV_WARN_MORE_PROCESSING_REQUIRED;
 
@@ -2195,6 +2325,7 @@ static NV_STATUS uvm_hmm_devmem_fault_alloc_and_copy(uvm_hmm_devmem_fault_contex
     uvm_page_mask_copy(page_mask, &service_context->per_processor_masks[UVM_ID_CPU_VALUE].new_residency);
 
     status = fault_alloc_on_cpu(va_block,
+                                va_block_retry,
                                 src_pfns,
                                 dst_pfns,
                                 service_context->region,
@@ -2209,7 +2340,7 @@ static NV_STATUS uvm_hmm_devmem_fault_alloc_and_copy(uvm_hmm_devmem_fault_contex
     // location yet.
     status = uvm_va_block_service_copy(processor_id, UVM_ID_CPU, va_block, va_block_retry, service_context);
     if (status != NV_OK)
-        clean_up_non_migrating_pages(va_block, src_pfns, dst_pfns, service_context->region, page_mask);
+        clean_up_non_migrating_pages(va_block, dst_pfns, service_context->region, page_mask);
 
     return status;
 }
@@ -2218,10 +2349,8 @@ static NV_STATUS uvm_hmm_devmem_fault_finalize_and_map(uvm_hmm_devmem_fault_cont
 {
     uvm_processor_id_t processor_id;
     uvm_service_block_context_t *service_context;
-    uvm_perf_prefetch_hint_t *prefetch_hint;
-    uvm_va_block_retry_t *va_block_retry;
     const unsigned long *src_pfns;
-    unsigned long *dst_pfns;
+    const unsigned long *dst_pfns;
     uvm_page_mask_t *page_mask;
     uvm_va_block_t *va_block;
     uvm_va_block_region_t region;
@@ -2230,9 +2359,7 @@ static NV_STATUS uvm_hmm_devmem_fault_finalize_and_map(uvm_hmm_devmem_fault_cont
 
     processor_id = devmem_fault_context->processor_id;
     service_context = devmem_fault_context->service_context;
-    prefetch_hint = &service_context->prefetch_hint;
     va_block = devmem_fault_context->va_block;
-    va_block_retry = devmem_fault_context->va_block_retry;
     src_pfns = service_context->block_context->hmm.src_pfns;
     dst_pfns = service_context->block_context->hmm.dst_pfns;
     region = service_context->region;
@@ -2271,18 +2398,13 @@ static NV_STATUS uvm_hmm_devmem_fault_finalize_and_map(uvm_hmm_devmem_fault_cont
 }
 
 static NV_STATUS populate_region(uvm_va_block_t *va_block,
+                                 uvm_va_block_retry_t *va_block_retry,
                                  unsigned long *pfns,
                                  uvm_va_block_region_t region,
                                  uvm_page_mask_t *populated_page_mask)
 {
     uvm_page_index_t page_index;
     NV_STATUS status;
-
-    // Make sure GPU state is allocated or else the GPU DMA mappings to
-    // system memory won't be saved.
-    status = uvm_va_block_gpu_state_alloc(va_block);
-    if (status != NV_OK)
-        return status;
 
     for_each_va_block_page_in_region(page_index, region) {
         struct page *page;
@@ -2317,30 +2439,18 @@ static NV_STATUS populate_region(uvm_va_block_t *va_block,
             // not release the device private struct page reference. Since
             // hmm_range_fault() did find a device private PTE, we can
             // re-establish the GPU chunk pointer.
-            status = gpu_chunk_add(va_block, page_index, page);
+            status = gpu_chunk_add(va_block, va_block_retry, page_index, page);
             if (status != NV_OK)
                 return status;
             continue;
         }
 
-        // If a CPU chunk is already allocated, check to see it matches what
-        // hmm_range_fault() found.
-        if (uvm_page_mask_test(&va_block->cpu.allocated, page_index)) {
-            UVM_ASSERT(hmm_va_block_cpu_page_is_same(va_block, page_index, page));
-        }
-        else {
-            status = hmm_va_block_cpu_page_populate(va_block, page_index, page);
-            if (status != NV_OK)
-                return status;
+        status = hmm_va_block_cpu_page_insert_or_replace(va_block, page_index, page, populated_page_mask);
+        if (status != NV_OK)
+            return status;
 
-            // Record that we populated this page. hmm_block_cpu_fault_locked()
-            // uses this to ensure pages that don't migrate get remote mapped.
-            if (populated_page_mask)
-                uvm_page_mask_set(populated_page_mask, page_index);
-        }
-
-        // Since we have a stable snapshot of the CPU pages, we can
-        // update the residency and protection information.
+        // Since we have a stable snapshot of the CPU pages, we can update the
+        // residency and mapping information.
         uvm_va_block_cpu_set_resident_page(va_block, page_to_nid(page), page_index);
 
         cpu_mapping_set(va_block, pfns[page_index] & HMM_PFN_WRITE, page_index);
@@ -2368,6 +2478,7 @@ static bool hmm_range_fault_retry(uvm_va_block_t *va_block)
 // Make the region be resident on the CPU by calling hmm_range_fault() to fault
 // in CPU pages.
 static NV_STATUS hmm_make_resident_cpu(uvm_va_block_t *va_block,
+                                       uvm_va_block_retry_t *va_block_retry,
                                        struct vm_area_struct *vma,
                                        unsigned long *hmm_pfns,
                                        uvm_va_block_region_t region,
@@ -2415,6 +2526,7 @@ static NV_STATUS hmm_make_resident_cpu(uvm_va_block_t *va_block,
         return NV_WARN_MORE_PROCESSING_REQUIRED;
 
     return populate_region(va_block,
+                           va_block_retry,
                            hmm_pfns,
                            region,
                            populated_page_mask);
@@ -2549,27 +2661,15 @@ static NV_STATUS hmm_block_atomic_fault_locked(uvm_processor_id_t processor_id,
     for_each_va_block_page_in_region(page_index, region) {
         struct page *page = pages[page_index];
 
-        if (!page) {
+        if (!page || hmm_va_block_cpu_page_insert_or_replace(va_block, page_index, page, NULL) != NV_OK) {
             // Record that one of the pages isn't exclusive but keep converting
             // the others.
             status = NV_WARN_MORE_PROCESSING_REQUIRED;
             continue;
         }
 
-        // If a CPU chunk is already allocated, check to see it matches what
-        // make_device_exclusive_range() found.
-        if (uvm_page_mask_test(&va_block->cpu.allocated, page_index)) {
-            UVM_ASSERT(hmm_va_block_cpu_page_is_same(va_block, page_index, page));
-            UVM_ASSERT(uvm_processor_mask_test(&va_block->resident, UVM_ID_CPU));
-            UVM_ASSERT(uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index));
-        }
-        else {
-            NV_STATUS s = hmm_va_block_cpu_page_populate(va_block, page_index, page);
-
-            if (s == NV_OK)
-                uvm_va_block_cpu_set_resident_page(va_block, page_to_nid(page), page_index);
-        }
-
+        // Since we have a stable snapshot of the CPU pages, we can update the
+        // mapping information.
         cpu_mapping_clear(va_block, page_index);
     }
 
@@ -2630,6 +2730,7 @@ static NV_STATUS hmm_block_cpu_fault_locked(uvm_processor_id_t processor_id,
         .va_block = va_block,
         .va_block_retry = va_block_retry,
         .service_context = service_context,
+        .same_devmem_page_mask = {}
     };
 
     // Normally the source page will be a device private page that is being
@@ -2656,6 +2757,7 @@ static NV_STATUS hmm_block_cpu_fault_locked(uvm_processor_id_t processor_id,
         }
 
         status = hmm_make_resident_cpu(va_block,
+                                       va_block_retry,
                                        service_context->block_context->hmm.vma,
                                        service_context->block_context->hmm.src_pfns,
                                        region,
@@ -2725,19 +2827,26 @@ static NV_STATUS hmm_block_cpu_fault_locked(uvm_processor_id_t processor_id,
     return status;
 }
 
-static NV_STATUS dmamap_src_sysmem_pages(uvm_va_block_t *va_block,
-                                         struct vm_area_struct *vma,
-                                         const unsigned long *src_pfns,
-                                         unsigned long *dst_pfns,
-                                         uvm_va_block_region_t region,
-                                         uvm_page_mask_t *page_mask,
-                                         uvm_processor_id_t dest_id,
-                                         uvm_service_block_context_t *service_context)
+static NV_STATUS dmamap_src_sysmem_and_fill_dst(uvm_va_block_t *va_block,
+                                                uvm_va_block_retry_t *va_block_retry,
+                                                const unsigned long *src_pfns,
+                                                unsigned long *dst_pfns,
+                                                uvm_va_block_region_t region,
+                                                uvm_page_mask_t *page_mask,
+                                                uvm_page_mask_t *same_devmem_page_mask,
+                                                uvm_processor_id_t dest_id,
+                                                uvm_service_block_context_t *service_context)
 {
+    uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, dest_id);
+    uvm_gpu_t *gpu = uvm_gpu_get(dest_id);
     uvm_page_index_t page_index;
     NV_STATUS status = NV_OK;
 
+    UVM_ASSERT(gpu_state);
+    UVM_ASSERT(gpu);
     UVM_ASSERT(service_context);
+
+    uvm_page_mask_zero(same_devmem_page_mask);
 
     for_each_va_block_page_in_region_mask(page_index, page_mask, region) {
         struct page *src_page;
@@ -2753,46 +2862,28 @@ static NV_STATUS dmamap_src_sysmem_pages(uvm_va_block_t *va_block,
         src_page = migrate_pfn_to_page(src_pfns[page_index]);
         if (src_page) {
             if (is_device_private_page(src_page)) {
-                status = gpu_chunk_add(va_block, page_index, src_page);
+                status = gpu_chunk_add(va_block, va_block_retry, page_index, src_page);
                 if (status != NV_OK)
-                    break;
-                continue;
+                    goto clr_mask;
+
+                goto fill_dst;
             }
 
             if (nv_PageSwapCache(src_page)) {
                 // TODO: Bug 4050579: Remove this when swap cached pages can be
                 // migrated.
+                gpu_chunk_free_region(va_block, va_block_retry, dest_id, region, page_mask);
                 status = NV_WARN_MISMATCHED_TARGET;
                 break;
             }
 
-            // If the page is already allocated, it is most likely a mirrored
-            // page. Check to be sure it matches what we have recorded. The
-            // page shouldn't be a staging page from a GPU to GPU migration
-            // or a remote mapped atomic sysmem page because migrate_vma_setup()
-            // found a normal page and non-mirrored pages are only known
-            // privately to the UVM driver.
-            if (uvm_page_mask_test(&va_block->cpu.allocated, page_index)) {
-                UVM_ASSERT(hmm_va_block_cpu_page_is_same(va_block, page_index, src_page));
-                UVM_ASSERT(uvm_processor_mask_test(&va_block->resident, UVM_ID_CPU));
-                UVM_ASSERT(uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index));
-            }
-            else {
-                status = hmm_va_block_cpu_page_populate(va_block, page_index, src_page);
-                if (status != NV_OK)
-                    goto clr_mask;
+            status = hmm_va_block_cpu_page_insert_or_replace(va_block, page_index, src_page, NULL);
+            if (status != NV_OK)
+                goto clr_mask;
 
-                // Since there is a CPU resident page, there shouldn't be one
-                // anywhere else. TODO: Bug 3660922: Need to handle read
-                // duplication at some point.
-                UVM_ASSERT(!uvm_va_block_page_resident_processors_count(va_block,
-                                                                        service_context->block_context,
-                                                                        page_index));
-
-                // migrate_vma_setup() was able to isolate and lock the page;
-                // therefore, it is CPU resident and not mapped.
-                uvm_va_block_cpu_set_resident_page(va_block, page_to_nid(src_page), page_index);
-            }
+            // Since we have a stable snapshot of the CPU pages, we can update
+            // the residency information.
+            uvm_va_block_cpu_set_resident_page(va_block, page_to_nid(src_page), page_index);
 
             // The call to migrate_vma_setup() will have inserted a migration
             // PTE so the CPU has no access.
@@ -2811,33 +2902,43 @@ static NV_STATUS dmamap_src_sysmem_pages(uvm_va_block_t *va_block,
             }
         }
 
+    fill_dst:
+        fill_dst_pfn(va_block,
+                     gpu_state,
+                     gpu,
+                     src_pfns,
+                     dst_pfns,
+                     page_index,
+                     page_mask,
+                     same_devmem_page_mask);
+
         continue;
 
     clr_mask:
+        // Free the pre-allocated GPU chunk for non-migrating pages.
+        gpu_chunk_free(va_block, va_block_retry, gpu_state, page_index);
+
         // TODO: Bug 3900774: clean up murky mess of mask clearing.
         uvm_page_mask_clear(page_mask, page_index);
         if (service_context)
             clear_service_context_masks(service_context, dest_id, page_index);
     }
 
-    if (uvm_page_mask_empty(page_mask))
-        status = NV_WARN_MORE_PROCESSING_REQUIRED;
+    gpu_chunk_free_preallocated(va_block, va_block_retry);
 
-    if (status != NV_OK)
-        clean_up_non_migrating_pages(va_block, src_pfns, dst_pfns, region, page_mask);
+    if (status == NV_OK && uvm_page_mask_empty(page_mask))
+        status = NV_WARN_MORE_PROCESSING_REQUIRED;
 
     return status;
 }
 
-static NV_STATUS uvm_hmm_gpu_fault_alloc_and_copy(struct vm_area_struct *vma,
-                                                  uvm_hmm_gpu_fault_event_t *uvm_hmm_gpu_fault_event)
+static NV_STATUS uvm_hmm_gpu_fault_alloc_and_copy(uvm_hmm_gpu_fault_event_t *uvm_hmm_gpu_fault_event)
 {
     uvm_processor_id_t processor_id;
     uvm_processor_id_t new_residency;
     uvm_va_block_t *va_block;
     uvm_va_block_retry_t *va_block_retry;
     uvm_service_block_context_t *service_context;
-    uvm_perf_prefetch_hint_t *prefetch_hint;
     const unsigned long *src_pfns;
     unsigned long *dst_pfns;
     uvm_va_block_region_t region;
@@ -2850,7 +2951,6 @@ static NV_STATUS uvm_hmm_gpu_fault_alloc_and_copy(struct vm_area_struct *vma,
     va_block_retry = uvm_hmm_gpu_fault_event->va_block_retry;
     service_context = uvm_hmm_gpu_fault_event->service_context;
     region = service_context->region;
-    prefetch_hint = &service_context->prefetch_hint;
     src_pfns = service_context->block_context->hmm.src_pfns;
     dst_pfns = service_context->block_context->hmm.dst_pfns;
 
@@ -2861,14 +2961,15 @@ static NV_STATUS uvm_hmm_gpu_fault_alloc_and_copy(struct vm_area_struct *vma,
     uvm_page_mask_copy(page_mask,
                        &service_context->per_processor_masks[uvm_id_value(new_residency)].new_residency);
 
-    status = dmamap_src_sysmem_pages(va_block,
-                                     vma,
-                                     src_pfns,
-                                     dst_pfns,
-                                     region,
-                                     page_mask,
-                                     new_residency,
-                                     service_context);
+    status = dmamap_src_sysmem_and_fill_dst(va_block,
+                                            va_block_retry,
+                                            src_pfns,
+                                            dst_pfns,
+                                            region,
+                                            page_mask,
+                                            &uvm_hmm_gpu_fault_event->same_devmem_page_mask,
+                                            new_residency,
+                                            service_context);
     if (status != NV_OK)
         return status;
 
@@ -2876,17 +2977,7 @@ static NV_STATUS uvm_hmm_gpu_fault_alloc_and_copy(struct vm_area_struct *vma,
     // new location yet.
     status = uvm_va_block_service_copy(processor_id, new_residency, va_block, va_block_retry, service_context);
     if (status != NV_OK)
-        return status;
-
-    // Record the destination PFNs of device private struct pages now that
-    // uvm_va_block_service_copy() has populated the GPU destination pages.
-    fill_dst_pfns(va_block,
-                  src_pfns,
-                  dst_pfns,
-                  region,
-                  page_mask,
-                  &uvm_hmm_gpu_fault_event->same_devmem_page_mask,
-                  new_residency);
+        clean_up_non_migrating_pages(va_block, dst_pfns, region, page_mask);
 
     return status;
 }
@@ -2896,10 +2987,9 @@ static NV_STATUS uvm_hmm_gpu_fault_finalize_and_map(uvm_hmm_gpu_fault_event_t *u
     uvm_processor_id_t processor_id;
     uvm_processor_id_t new_residency;
     uvm_va_block_t *va_block;
-    uvm_va_block_retry_t *va_block_retry;
     uvm_service_block_context_t *service_context;
     const unsigned long *src_pfns;
-    unsigned long *dst_pfns;
+    const unsigned long *dst_pfns;
     uvm_va_block_region_t region;
     uvm_page_index_t page_index;
     uvm_page_mask_t *page_mask;
@@ -2908,7 +2998,6 @@ static NV_STATUS uvm_hmm_gpu_fault_finalize_and_map(uvm_hmm_gpu_fault_event_t *u
     processor_id = uvm_hmm_gpu_fault_event->processor_id;
     new_residency = uvm_hmm_gpu_fault_event->new_residency;
     va_block = uvm_hmm_gpu_fault_event->va_block;
-    va_block_retry = uvm_hmm_gpu_fault_event->va_block_retry;
     service_context = uvm_hmm_gpu_fault_event->service_context;
     src_pfns = service_context->block_context->hmm.src_pfns;
     dst_pfns = service_context->block_context->hmm.dst_pfns;
@@ -2959,6 +3048,8 @@ NV_STATUS uvm_hmm_va_block_service_locked(uvm_processor_id_t processor_id,
     uvm_va_block_region_t region = service_context->region;
     uvm_hmm_gpu_fault_event_t uvm_hmm_gpu_fault_event;
     struct migrate_vma *args = &service_context->block_context->hmm.migrate_vma_args;
+    const uvm_page_mask_t *new_residency_mask =
+        &service_context->per_processor_masks[uvm_id_value(new_residency)].new_residency;
     int ret;
     NV_STATUS status = NV_ERR_INVALID_ADDRESS;
 
@@ -2972,8 +3063,66 @@ NV_STATUS uvm_hmm_va_block_service_locked(uvm_processor_id_t processor_id,
     UVM_ASSERT(vma);
 
     // If the desired destination is the CPU, try to fault in CPU pages.
-    if (UVM_ID_IS_CPU(new_residency))
+    if (UVM_ID_IS_CPU(new_residency)) {
+        if (va_block_retry && !list_empty(&va_block_retry->used_chunks))
+            gpu_chunk_free_preallocated(va_block, va_block_retry);
+
         return hmm_block_cpu_fault_locked(processor_id, va_block, va_block_retry, service_context);
+    }
+
+    UVM_ASSERT(va_block_retry);
+
+    // The overall process here is to migrate pages from the CPU or GPUs to the
+    // faulting GPU. This is only safe because we hold the va_block lock across
+    // the calls to migrate_vma_pages(), uvm_hmm_gpu_fault_alloc_and_copy(),
+    // uvm_hmm_gpu_fault_finalize_and_map(), and migrate_vma_finalize().
+    // If the va_block lock were to be dropped, eviction callbacks from RM,
+    // migration callbacks from CPU faults, or invalidation callbacks from
+    // Linux could change the va_block state which would require careful
+    // revalidation of the state. Also, pages are page locked which leads to
+    // inefficiency or potential deadlocks.
+
+    // We pre-allocate the destination GPU pages because otherwise,
+    // migrate_vma_setup() could page lock the source pages and then try to
+    // allocate destination pages with block_alloc_gpu_chunk() which might
+    // unlock the va_block lock and try to evict the source page and fail.
+    // Note that by preallocating, we introduce 3 states instead of 2 for
+    // GPU chunks:
+    //   UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED, !is_referenced
+    //   UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED, is_referenced
+    //   UVM_PMM_GPU_CHUNK_STATE_ALLOCATED,   is_referenced
+    // The first state is when uvm_va_block_populate_pages_gpu() returns and
+    // we should call uvm_pmm_gpu_free() if the chunk isn't needed.
+    // The second state is after the source pages are pinned and we know which
+    // chunks will be used for DMA and passed to migrate_vma_pages() dst_pfns[].
+    // The third state is when migrate_vma_pages() commits to the migration and
+    // the GPU chunk will be marked resident.
+    // The is_referenced flag is just for sanity checking so it is clear when
+    // ownership for freeing the chunk changes from the driver to Linux's
+    // page_free() callback. The TEMP_PINNED/is_referenced state could be
+    // replaced with ALLOCATED/is_referenced but ALLOCATED implies the chunk
+    // could be evicted (except we hold the va_block lock) and seems safer
+    // to leave it in the pinned state until we are about to call
+    // migrate_vma_finalize().
+    // Also note that we have to free any pre-allocated pages because otherwise
+    // they would be marked ALLOCATED in uvm_va_block_retry_deinit() and
+    // we can't free them in uvm_va_block_retry_deinit() because the va_block
+    // lock might not be held and freeing the GPU chunk requires unmapping and
+    // clearing the gpu_state->chunks[] entry.
+    // Also note that the new_residency and new_residency_mask can change each
+    // time uvm_va_block_populate_pages_gpu() returns
+    // NV_ERR_MORE_PROCESSING_REQUIRED (based on thrashing and other reasons)
+    // so there might be pre-allocated chunks not in region.
+    status = uvm_va_block_populate_pages_gpu(va_block,
+                                             va_block_retry,
+                                             new_residency,
+                                             region,
+                                             new_residency_mask);
+    if (status != NV_OK) {
+        if (status != NV_ERR_MORE_PROCESSING_REQUIRED)
+            gpu_chunk_free_preallocated(va_block, va_block_retry);
+        return status;
+    }
 
     uvm_hmm_gpu_fault_event.processor_id = processor_id;
     uvm_hmm_gpu_fault_event.new_residency = new_residency;
@@ -2993,21 +3142,7 @@ NV_STATUS uvm_hmm_va_block_service_locked(uvm_processor_id_t processor_id,
     ret = migrate_vma_setup_locked(args, va_block);
     UVM_ASSERT(!ret);
 
-    // The overall process here is to migrate pages from the CPU or GPUs to the
-    // faulting GPU.
-    // This is safe because we hold the va_block lock across the calls to
-    // uvm_hmm_gpu_fault_alloc_and_copy(), migrate_vma_pages(),
-    // uvm_hmm_gpu_fault_finalize_and_map(), and migrate_vma_finalize().
-    // If uvm_hmm_gpu_fault_alloc_and_copy() needs to drop the va_block
-    // lock, a sequence number is used to tell if an invalidate() callback
-    // occurred while not holding the lock. If the sequence number changes,
-    // all the locks need to be dropped (mm, va_space, va_block) and the whole
-    // uvm_va_block_service_locked() called again. Otherwise, there were no
-    // conflicting invalidate callbacks and our snapshots of the CPU page
-    // tables are accurate and can be used to DMA pages and update GPU page
-    // tables. TODO: Bug 3901904: there might be better ways of handling no
-    // page being migrated.
-    status = uvm_hmm_gpu_fault_alloc_and_copy(vma, &uvm_hmm_gpu_fault_event);
+    status = uvm_hmm_gpu_fault_alloc_and_copy(&uvm_hmm_gpu_fault_event);
     if (status == NV_WARN_MORE_PROCESSING_REQUIRED) {
         migrate_vma_finalize(args);
 
@@ -3016,12 +3151,16 @@ NV_STATUS uvm_hmm_va_block_service_locked(uvm_processor_id_t processor_id,
         // We do know that none of the pages in the region are zero pages
         // since migrate_vma_setup() would have reported that information.
         // Try to make it resident in system memory and retry the migration.
+        // TODO: Bug 3901904: there might be better ways of handling no page
+        // being migrated.
         status = hmm_make_resident_cpu(va_block,
+                                       va_block_retry,
                                        service_context->block_context->hmm.vma,
                                        service_context->block_context->hmm.src_pfns,
                                        region,
                                        service_context->access_type,
                                        NULL);
+
         return NV_WARN_MORE_PROCESSING_REQUIRED;
     }
 
@@ -3038,8 +3177,7 @@ NV_STATUS uvm_hmm_va_block_service_locked(uvm_processor_id_t processor_id,
     return status;
 }
 
-static NV_STATUS uvm_hmm_migrate_alloc_and_copy(struct vm_area_struct *vma,
-                                                uvm_hmm_migrate_event_t *uvm_hmm_migrate_event)
+static NV_STATUS uvm_hmm_migrate_alloc_and_copy(uvm_hmm_migrate_event_t *uvm_hmm_migrate_event)
 {
     uvm_va_block_t *va_block;
     uvm_va_block_retry_t *va_block_retry;
@@ -3066,6 +3204,7 @@ static NV_STATUS uvm_hmm_migrate_alloc_and_copy(struct vm_area_struct *vma,
 
     if (UVM_ID_IS_CPU(dest_id)) {
         status = migrate_alloc_on_cpu(va_block,
+                                      va_block_retry,
                                       src_pfns,
                                       dst_pfns,
                                       region,
@@ -3074,14 +3213,15 @@ static NV_STATUS uvm_hmm_migrate_alloc_and_copy(struct vm_area_struct *vma,
                                       service_context->block_context);
     }
     else {
-        status = dmamap_src_sysmem_pages(va_block,
-                                         vma,
-                                         src_pfns,
-                                         dst_pfns,
-                                         region,
-                                         page_mask,
-                                         dest_id,
-                                         service_context);
+        status = dmamap_src_sysmem_and_fill_dst(va_block,
+                                                va_block_retry,
+                                                src_pfns,
+                                                dst_pfns,
+                                                region,
+                                                page_mask,
+                                                &uvm_hmm_migrate_event->same_devmem_page_mask,
+                                                dest_id,
+                                                service_context);
     }
 
     if (status != NV_OK)
@@ -3096,20 +3236,7 @@ static NV_STATUS uvm_hmm_migrate_alloc_and_copy(struct vm_area_struct *vma,
                                              NULL,
                                              uvm_hmm_migrate_event->cause);
     if (status != NV_OK)
-        return status;
-
-    if (!UVM_ID_IS_CPU(dest_id)) {
-        // Record the destination PFNs of device private struct pages now that
-        // uvm_va_block_make_resident_copy() has populated the GPU destination
-        // pages.
-        fill_dst_pfns(va_block,
-                      src_pfns,
-                      dst_pfns,
-                      region,
-                      page_mask,
-                      &uvm_hmm_migrate_event->same_devmem_page_mask,
-                      dest_id);
-    }
+        clean_up_non_migrating_pages(va_block, dst_pfns, region, page_mask);
 
     return status;
 }
@@ -3117,17 +3244,15 @@ static NV_STATUS uvm_hmm_migrate_alloc_and_copy(struct vm_area_struct *vma,
 static NV_STATUS uvm_hmm_migrate_finalize(uvm_hmm_migrate_event_t *uvm_hmm_migrate_event)
 {
     uvm_va_block_t *va_block;
-    uvm_va_block_retry_t *va_block_retry;
     uvm_va_block_context_t *va_block_context;
     uvm_va_block_region_t region;
     uvm_processor_id_t dest_id;
     uvm_page_index_t page_index;
     uvm_page_mask_t *page_mask;
     const unsigned long *src_pfns;
-    unsigned long *dst_pfns;
+    const unsigned long *dst_pfns;
 
     va_block = uvm_hmm_migrate_event->va_block;
-    va_block_retry = uvm_hmm_migrate_event->va_block_retry;
     va_block_context = uvm_hmm_migrate_event->service_context->block_context;
     region = uvm_hmm_migrate_event->region;
     dest_id = uvm_hmm_migrate_event->dest_id;
@@ -3190,6 +3315,45 @@ NV_STATUS uvm_hmm_va_block_migrate_locked(uvm_va_block_t *va_block,
     uvm_assert_mutex_locked(&va_block->hmm.migrate_lock);
     uvm_assert_mutex_locked(&va_block->lock);
 
+    // Save some time and effort if we can't migrate to a GPU.
+    if (UVM_ID_IS_GPU(dest_id) && uvm_hmm_must_use_sysmem(va_block, vma)) {
+        return hmm_make_resident_cpu(va_block,
+                                     va_block_retry,
+                                     vma,
+                                     va_block_context->hmm.src_pfns,
+                                     region,
+                                     NULL,
+                                     NULL);
+    }
+
+    // The overall process here is to migrate pages from the CPU or GPUs to the
+    // destination processor. Note that block_migrate_add_mappings() handles
+    // updating GPU mappings after the migration.
+    // This is only safe because we hold the va_block lock across the calls to
+    // uvm_hmm_migrate_alloc_and_copy(), migrate_vma_pages(),
+    // uvm_hmm_migrate_finalize(), migrate_vma_finalize() and
+    // block_migrate_add_mappings().
+    // If the va_block lock were to be dropped, eviction callbacks from RM,
+    // migration callbacks from CPU faults, or invalidation callbacks from
+    // Linux could change the va_block state which would require careful
+    // revalidation of the state. Also, pages are page locked which leads to
+    // inefficiency or potential deadlocks.
+    // tables are accurate and can be used to DMA pages and update GPU page
+    // tables.
+
+    // We pre-allocate the destination GPU pages because otherwise,
+    // migrate_vma_setup() could page lock the source pages and then try to
+    // allocate destination pages with block_alloc_gpu_chunk() which might
+    // unlock the va_block lock and try to evict the source page and fail.
+    if (UVM_ID_IS_GPU(dest_id)) {
+        status = uvm_va_block_populate_pages_gpu(va_block, va_block_retry, dest_id, region, NULL);
+        if (status != NV_OK) {
+            if (status != NV_ERR_MORE_PROCESSING_REQUIRED)
+                gpu_chunk_free_preallocated(va_block, va_block_retry);
+            return status;
+        }
+    }
+
     start = uvm_va_block_region_start(va_block, region);
     end = uvm_va_block_region_end(va_block, region);
     UVM_ASSERT(vma->vm_start <= start && end < vma->vm_end);
@@ -3215,30 +3379,20 @@ NV_STATUS uvm_hmm_va_block_migrate_locked(uvm_va_block_t *va_block,
     // VMAs so if UvmMigrate() tries to migrate such a region, -EINVAL will
     // be returned and we will only try to make the pages be CPU resident.
     ret = migrate_vma_setup_locked(args, va_block);
-    if (ret)
+    if (ret) {
+        if (va_block_retry && !list_empty(&va_block_retry->used_chunks))
+            gpu_chunk_free_preallocated(va_block, va_block_retry);
+
         return hmm_make_resident_cpu(va_block,
+                                     va_block_retry,
                                      vma,
                                      va_block_context->hmm.src_pfns,
                                      region,
                                      NULL,
                                      NULL);
+    }
 
-    // The overall process here is to migrate pages from the CPU or GPUs to the
-    // destination processor. Note that block_migrate_add_mappings() handles
-    // updating GPU mappings after the migration.
-    // This is safe because we hold the va_block lock across the calls to
-    // uvm_hmm_migrate_alloc_and_copy(), migrate_vma_pages(),
-    // uvm_hmm_migrate_finalize(), migrate_vma_finalize() and
-    // block_migrate_add_mappings().
-    // If uvm_hmm_migrate_alloc_and_copy() needs to drop the va_block
-    // lock, a sequence number is used to tell if an invalidate() callback
-    // occurred while not holding the lock. If the sequence number changes,
-    // all the locks need to be dropped (mm, va_space, va_block) and the whole
-    // uvm_hmm_va_block_migrate_locked() called again. Otherwise, there were no
-    // conflicting invalidate callbacks and our snapshots of the CPU page
-    // tables are accurate and can be used to DMA pages and update GPU page
-    // tables.
-    status = uvm_hmm_migrate_alloc_and_copy(vma, &uvm_hmm_migrate_event);
+    status = uvm_hmm_migrate_alloc_and_copy(&uvm_hmm_migrate_event);
     if (status == NV_WARN_MORE_PROCESSING_REQUIRED) {
         uvm_processor_id_t id;
         uvm_page_mask_t *page_mask;
@@ -3261,6 +3415,7 @@ NV_STATUS uvm_hmm_va_block_migrate_locked(uvm_va_block_t *va_block,
         }
 
         return hmm_make_resident_cpu(va_block,
+                                     va_block_retry,
                                      vma,
                                      va_block_context->hmm.src_pfns,
                                      region,
@@ -3351,6 +3506,17 @@ NV_STATUS uvm_hmm_va_block_evict_chunk_prep(uvm_va_block_t *va_block,
     if (ret)
         return errno_to_nv_status(ret);
 
+    if (!(src_pfns[page_index] & MIGRATE_PFN_MIGRATE))
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    if (UVM_IS_DEBUG()) {
+        struct page *src_page = migrate_pfn_to_page(src_pfns[page_index]);
+
+        UVM_ASSERT(is_device_private_page(src_page));
+        UVM_ASSERT(page_pgmap(src_page)->owner == &g_uvm_global);
+        UVM_ASSERT(uvm_pmm_devmem_page_to_chunk(src_page) == gpu_chunk);
+    }
+
     return NV_OK;
 }
 
@@ -3375,6 +3541,7 @@ static NV_STATUS hmm_va_block_evict_chunks(uvm_va_block_t *va_block,
         .region = region,
         .dest_id = UVM_ID_CPU,
         .cause = cause,
+        .same_devmem_page_mask = {},
     };
     uvm_page_mask_t *page_mask = &uvm_hmm_migrate_event.page_mask;
     const uvm_va_policy_t *policy;
@@ -3391,7 +3558,7 @@ static NV_STATUS hmm_va_block_evict_chunks(uvm_va_block_t *va_block,
     // Note that there is no VMA available when evicting HMM pages.
     va_block_context->hmm.vma = NULL;
 
-    uvm_page_mask_copy(page_mask, pages_to_evict);
+    uvm_page_mask_init_from_region(page_mask, region, pages_to_evict);
 
     uvm_for_each_va_policy_in(policy, va_block, start, end, node, region) {
         npages = uvm_va_block_region_num_pages(region);
@@ -3402,9 +3569,16 @@ static NV_STATUS hmm_va_block_evict_chunks(uvm_va_block_t *va_block,
         // Pages resident on the GPU should not have a resident page in system
         // memory.
         // TODO: Bug 3660922: Need to handle read duplication at some point.
-        UVM_ASSERT(uvm_page_mask_region_empty(cpu_resident_mask, region));
+        UVM_ASSERT(!uvm_page_mask_intersects(cpu_resident_mask, page_mask));
 
-        status = migrate_alloc_on_cpu(va_block, src_pfns, dst_pfns, region, page_mask, NULL, va_block_context);
+        status = migrate_alloc_on_cpu(va_block,
+                                      NULL,
+                                      src_pfns,
+                                      dst_pfns,
+                                      region,
+                                      page_mask,
+                                      &uvm_hmm_migrate_event.same_devmem_page_mask,
+                                      va_block_context);
         if (status != NV_OK)
             goto err;
 
@@ -3429,6 +3603,13 @@ static NV_STATUS hmm_va_block_evict_chunks(uvm_va_block_t *va_block,
 
         migrate_device_finalize(src_pfns + region.first, dst_pfns + region.first, npages);
     }
+
+    // TODO: Bug 5167764: Evictions can't handle partial migrations.
+    uvm_page_mask_init_from_region(&va_block_context->scratch_page_mask, region, pages_to_evict);
+    if (uvm_page_mask_andnot(&va_block_context->scratch_page_mask,
+                             &va_block_context->scratch_page_mask,
+                             page_mask))
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
 
     return NV_OK;
 
@@ -3506,7 +3687,7 @@ NV_STATUS uvm_hmm_remote_cpu_fault(struct vm_fault *vmf)
     args.vma = vmf->vma;
     args.src = &src_pfn;
     args.dst = &dst_pfn;
-    args.start = nv_page_fault_va(vmf);
+    args.start = vmf->address;
     args.end = args.start + PAGE_SIZE;
     args.pgmap_owner = &g_uvm_global;
     args.flags = MIGRATE_VMA_SELECT_DEVICE_PRIVATE;
@@ -3540,6 +3721,7 @@ NV_STATUS uvm_hmm_remote_cpu_fault(struct vm_fault *vmf)
 out:
     if (status == NV_OK)
         migrate_vma_pages(&args);
+
     migrate_vma_finalize(&args);
 
     return status;
@@ -3664,12 +3846,12 @@ NV_STATUS uvm_hmm_va_block_update_residency_info(uvm_va_block_t *va_block,
     // Update the va_block CPU state based on the snapshot.
     // Note that we have to adjust the pfns address since it will be indexed
     // by region.first.
-    status = populate_region(va_block, &pfn - region.first, region, NULL);
+    status = populate_region(va_block, NULL, &pfn - region.first, region, NULL);
 
     uvm_mutex_unlock(&va_block->lock);
     uvm_hmm_migrate_finish(va_block);
 
-    return NV_OK;
+    return status;
 }
 
 NV_STATUS uvm_test_split_invalidate_delay(UVM_TEST_SPLIT_INVALIDATE_DELAY_PARAMS *params, struct file *filp)

@@ -41,7 +41,7 @@
 #define NV_VGPU_GUEST_OS_TYPE_OS                                7:3 /* -W-4F */
 #define NV_VGPU_GUEST_OS_TYPE_OS_UNKNOWN                          0 /* -W--V */
 #define NV_VGPU_GUEST_OS_TYPE_OS_LINUX                            1 /* -W--V */
-#define NV_VGPU_GUEST_OS_TYPE_OS_WINDOWS7                         2 /* -W--V */
+#define NV_VGPU_GUEST_OS_TYPE_OS_WINDOWS7_DEPRECATED              2 /* -W--V */
 #define NV_VGPU_GUEST_OS_TYPE_OS_WINDOWS10                        3 /* -W--V */
 #define NV_VGPU_GUEST_OS_TYPE_OS_INVALID                          4 /* -W--V */
 // All remaining values for NV_VGPU_GUEST_OS_TYPE_OS are reserved/not supported.

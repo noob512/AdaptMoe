@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2014-2016 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2014-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -28,50 +28,41 @@
 
 
 
-#include "class/cl9470.h" // NV9470_DISPLAY
-#include "class/cl9570.h" // NV9570_DISPLAY
-#include "class/cl9770.h" // NV9770_DISPLAY
-#include "class/cl9870.h" // NV9870_DISPLAY
-#include "class/clc370.h" // NVC370_DISPLAY
 #include "class/clc570.h" // NVC570_DISPLAY
 #include "class/clc670.h" // NVC670_DISPLAY
 #include "class/clc770.h" // NVC770_DISPLAY
+#include "class/clc970.h" // NVC970_DISPLAY
 #include "class/clca70.h" // NVCA70_DISPLAY
 #include "class/clcb70.h" // NVCB70_DISPLAY
+#include "class/clcc70.h" // NVCC70_DISPLAY
 
-#include "class/cl947d.h" // NV947D_CORE_CHANNEL_DMA
-#include "class/cl957d.h" // NV957D_CORE_CHANNEL_DMA
-#include "class/cl977d.h" // NV977D_CORE_CHANNEL_DMA
-#include "class/cl987d.h" // NV987D_CORE_CHANNEL_DMA
-#include "class/clc37d.h" // NVC37D_CORE_CHANNEL_DMA
-#include "class/clc37e.h" // NVC37E_WINDOW_CHANNEL_DMA
+#include "class/cla083.h" // NVA083_GRID_DISPLAYLESS
 #include "class/clc57d.h" // NVC57D_CORE_CHANNEL_DMA
 #include "class/clc57e.h" // NVC57E_WINDOW_CHANNEL_DMA
 #include "class/clc67d.h" // NVC67D_CORE_CHANNEL_DMA
 #include "class/clc67e.h" // NVC67E_WINDOW_CHANNEL_DMA
 #include "class/clc77d.h" // NVC67D_CORE_CHANNEL_DMA
+#include "class/clc97d.h" // NVC97D_CORE_CHANNEL_DMA
+#include "class/clc97e.h" // NVC97E_WINDOW_CHANNEL_DMA
 #include "class/clca7d.h" // NVCA7D_CORE_CHANNEL_DMA
 #include "class/clca7e.h" // NVCA7E_WINDOW_CHANNEL_DMA
 #include "class/clcb7d.h" // NVCB7D_CORE_CHANNEL_DMA
 #include "class/clcb7e.h" // NVCB7E_WINDOW_CHANNEL_DMA
+#include "class/clcc7d.h" // NVCC7D_CORE_CHANNEL_DMA
+#include "class/clcc7e.h" // NVCC7E_WINDOW_CHANNEL_DMA
 
-extern NVEvoHAL nvEvo94;
-extern NVEvoHAL nvEvo97;
-extern NVEvoHAL nvEvoC3;
 extern NVEvoHAL nvEvoC5;
 extern NVEvoHAL nvEvoC6;
+extern NVEvoHAL nvEvoC9;
 extern NVEvoHAL nvEvoCA;
+extern NVEvoHAL nvDisplayless;
 
 enum NvKmsAllocDeviceStatus nvAssignEvoCaps(NVDevEvoPtr pDevEvo)
 {
 #define ENTRY(_classPrefix,                                               \
               _pEvoHal,                                                   \
-              _supportsDP13,                                              \
-              _supportsHDMI20,                                            \
-              _supportsYUV2020,                                           \
-              _inputLutAppliesToBase,                                     \
-              _dpYCbCr422MaxBpc,                                          \
-              _hdmiYCbCr422MaxBpc,                                        \
+              _hdmiTmds10BpcMaxPClkMHz,                                   \
+              _rasterLockAcrossProtocolsAllowed,                          \
               _validNIsoFormatMask,                                       \
               _maxPitch,                                                  \
               _maxWidthInBytes,                                           \
@@ -90,40 +81,17 @@ enum NvKmsAllocDeviceStatus nvAssignEvoCaps(NVDevEvoPtr pDevEvo)
                 _coreChannelDmaArmedOffset,                               \
         },                                                                \
         .evoCaps = {                                                      \
-            .supportsDP13              = _supportsDP13,                   \
-            .supportsHDMI20            = _supportsHDMI20,                 \
-            .supportsYUV2020           = _supportsYUV2020,                \
             .validNIsoFormatMask       = _validNIsoFormatMask,            \
-            .inputLutAppliesToBase     = _inputLutAppliesToBase,          \
             .maxPitchValue             = _maxPitch,                       \
             .maxWidthInBytes           = _maxWidthInBytes,                \
             .maxWidthInPixels          = _maxWidthInPixels,               \
             .maxHeight                 = _maxHeight,                      \
             .maxRasterWidth  = DRF_MASK(NV ## _classPrefix ## 7D_HEAD_SET_RASTER_SIZE_WIDTH), \
             .maxRasterHeight = DRF_MASK(NV ## _classPrefix ## 7D_HEAD_SET_RASTER_SIZE_HEIGHT),\
-            .dpYCbCr422MaxBpc = _dpYCbCr422MaxBpc,                        \
-            .hdmiYCbCr422MaxBpc = _hdmiYCbCr422MaxBpc,                    \
+            .hdmiTmds10BpcMaxPClkMHz = _hdmiTmds10BpcMaxPClkMHz,          \
+            .rasterLockAcrossProtocolsAllowed = _rasterLockAcrossProtocolsAllowed, \
         }                                                                 \
     }
-
-#define EVO_CORE_CHANNEL_DMA_ARMED_OFFSET 0x0
-
-#define EVO_CORE_CHANNEL_DMA_ARMED_SIZE 0x1000
-
-
-/* Pre-NVDisplay EVO entries */
-#define ENTRY_EVO(_classPrefix, ...) \
-    ENTRY(_classPrefix, __VA_ARGS__,  \
-          ((1 << NVKMS_NISO_FORMAT_LEGACY) | \
-           (1 << NVKMS_NISO_FORMAT_FOUR_WORD)), \
-          DRF_MASK(NV ## _classPrefix ## 7D_HEAD_SET_STORAGE_PITCH), \
-          DRF_MASK(NV ## _classPrefix ## 7D_HEAD_SET_STORAGE_PITCH) * \
-                   NVKMS_BLOCK_LINEAR_GOB_WIDTH, \
-          DRF_MASK(NV ## _classPrefix ## 7D_HEAD_SET_SIZE_WIDTH), \
-          DRF_MASK(NV ## _classPrefix ## 7D_HEAD_SET_SIZE_HEIGHT), \
-          EVO_CORE_CHANNEL_DMA_ARMED_OFFSET, \
-          EVO_CORE_CHANNEL_DMA_ARMED_SIZE)
-
 
 /*
  * The file
@@ -163,39 +131,48 @@ enum NvKmsAllocDeviceStatus nvAssignEvoCaps(NVDevEvoPtr pDevEvo)
         const NVEvoCapsRec evoCaps;
     } dispTable[] = {
         /*
-         * hdmiYCbCr422MaxBpc-----------------------+
-         * dpYCbCr422MaxBpc---------------------+   |
-         * inputLutAppliesToBase ------------+  |   |
-         * supportsYUV2020 ---------------+  |  |   |
-         * supportsHDMI20 -------------+  |  |  |   |
-         * supportsDP13 ------------+  |  |  |  |   |
-         * pEvoHal --------------+  |  |  |  |  |   |
-         * windowClassPrefix     |  |  |  |  |  |   |
-         * classPrefix |         |  |  |  |  |  |   |
-         *         |   |         |  |  |  |  |  |   |
+         * rasterLockAcrossProtocolsAllowed
+         * hdmiTmds10BpcMaxPClkMHz--+    |
+         * pEvoHal --------------+  |    |
+         * windowClassPrefix     |  |    |
+         * classPrefix |         |  |    |
+         *         |   |         |  |    |
          */
-        ENTRY_NVD(CB, CB, &nvEvoCA, 1, 1, 1, 0, 12, 12),
+        ENTRY_NVD(CC, CC, &nvEvoCA, 324, 0),
+        ENTRY_NVD(CB, CB, &nvEvoCA, 324, 0),
         /* Blackwell GB20X */
-        ENTRY_NVD(CA, CA, &nvEvoCA, 1, 1, 1, 0, 12, 12),
+        ENTRY_NVD(CA, CA, &nvEvoCA, 324, 1),
+        /* Blackwell */
+        ENTRY_NVD(C9, C9, &nvEvoC9, 324, 1),
         /* Ada */
-        ENTRY_NVD(C7, C6, &nvEvoC6, 1, 1, 1, 0, 12, 12),
+        ENTRY_NVD(C7, C6, &nvEvoC6, 324, 1),
         /* Ampere */
-        ENTRY_NVD(C6, C6, &nvEvoC6, 1, 1, 1, 0, 12, 12),
+        ENTRY_NVD(C6, C6, &nvEvoC6, 324, 1),
         /* Turing */
-        ENTRY_NVD(C5, C5, &nvEvoC5, 1, 1, 1, 0, 12, 12),
-        /* Volta */
-        ENTRY_NVD(C3, C3, &nvEvoC3, 1, 1, 1, 0, 12, 12),
-        /* gp10x */
-        ENTRY_EVO(98,     &nvEvo97, 1, 1, 1, 1, 12, 12),
-        /* gp100 */
-        ENTRY_EVO(97,     &nvEvo97, 1, 1, 1, 1, 12, 12),
-        /* gm20x */
-        ENTRY_EVO(95,     &nvEvo94, 0, 1, 0, 1, 8,  0),
-        /* gm10x */
-        ENTRY_EVO(94,     &nvEvo94, 0, 0, 0, 1, 8,  0),
+        ENTRY_NVD(C5, C5, &nvEvoC5, 0,   1),
+        /* GRID displayless */
+        {
+            .class = NVA083_GRID_DISPLAYLESS,
+            .pEvoHal = &nvDisplayless,
+            .coreChannelDma = { },
+            .evoCaps = {
+                .validNIsoFormatMask     = (1 << NVKMS_NISO_FORMAT_FOUR_WORD_NVDISPLAY),
+                .maxPitchValue           = DRF_MASK(12:0),
+                .maxWidthInBytes         = 0,
+                .maxWidthInPixels        = 0,
+                .maxHeight               = 0,
+                .maxRasterWidth          = DRF_MASK(15:0),
+                .maxRasterHeight         = DRF_MASK(31:16),
+                .hdmiTmds10BpcMaxPClkMHz = 0,
+            }
+        },
     };
 
     int i;
+
+    if (nvkms_test_fail_alloc_core_channel(FAIL_ALLOC_CORE_CHANNEL_NO_CLASS)) {
+        return NVKMS_ALLOC_DEVICE_STATUS_NO_HARDWARE_AVAILABLE;
+    }
 
     for (i = 0; i < ARRAY_LEN(dispTable); i++) {
         if (nvRmEvoClassListCheck(pDevEvo, dispTable[i].class)) {

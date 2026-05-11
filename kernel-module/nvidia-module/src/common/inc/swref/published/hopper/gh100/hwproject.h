@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2003-2022 NVIDIA CORPORATION & AFFILIATES
+ * SPDX-FileCopyrightText: Copyright (c) 2003-2025 NVIDIA CORPORATION & AFFILIATES
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -28,5 +28,10 @@
 #define NV_XPL_BASE_ADDRESS                    540672
 #define NV_XTL_BASE_ADDRESS                    593920
 #define NV_FBPA_PRI_STRIDE                      16384
+#define NV_FUSE0_PRI_BASE                      8519680
+#define NV_XAL_BASE_ADDRESS                    1110016
+#define NV_XAL_FUNC_BASE_ADDRESS               8585216
+#define NV_XAL_P2P_BASE_ADDRESS                8544256
+#define NV_FBPA_PRI_STRIDE                     16384
 
 #endif // GH100_HWPROJECT_H_INCLUDED

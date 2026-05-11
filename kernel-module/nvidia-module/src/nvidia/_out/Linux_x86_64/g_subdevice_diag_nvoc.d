@@ -4,7 +4,7 @@ _out/Linux_x86_64/g_subdevice_diag_nvoc.o: \
  ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
  ../common/sdk/nvidia/inc/nvstatus.h ../common/sdk/nvidia/inc/nvtypes.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
@@ -23,7 +23,6 @@ _out/Linux_x86_64/g_subdevice_diag_nvoc.o: \
  inc/libraries/nvlog/nvlog_printf.h \
  inc/libraries/nvlog/internal/nvlog_printf_internal.h \
  generated/g_subdevice_diag_nvoc.h \
- ../common/sdk/nvidia/inc/class/cl208f.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl208f.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fpower.h \
@@ -33,7 +32,6 @@ _out/Linux_x86_64/g_subdevice_diag_nvoc.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208ffbio.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fbif.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fbus.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fevent.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fgpu.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h \
@@ -41,12 +39,12 @@ _out/Linux_x86_64/g_subdevice_diag_nvoc.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h \
  ../common/sdk/nvidia/inc/nvcfg_sdk.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fgr.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fclk.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fpmgr.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fdma.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fmmu.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fucodecoverage.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fucodeinstrumentation.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fnvlink.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fpmu.h \
  inc/kernel/gpu/gpu_resource.h generated/g_gpu_resource_nvoc.h \
  inc/kernel/core/core.h inc/kernel/core/prelude.h \
@@ -69,16 +67,17 @@ _out/Linux_x86_64/g_subdevice_diag_nvoc.o: \
  inc/kernel/gpu/mem_mgr/mem_desc.h generated/g_mem_desc_nvoc.h \
  inc/libraries/poolalloc.h inc/libraries/nvport/nvport.h \
  inc/libraries/containers/list.h inc/libraries/containers/type_safety.h \
- inc/kernel/rmapi/resource.h generated/g_resource_nvoc.h \
- inc/libraries/resserv/rs_resource.h generated/g_rs_resource_nvoc.h \
- inc/libraries/resserv/resserv.h generated/g_resserv_nvoc.h \
- inc/libraries/containers/list.h inc/libraries/containers/map.h \
- inc/libraries/containers/multimap.h \
+ inc/kernel/gpu/mem_mgr/rm_page_size.h inc/kernel/os/nv_memory_iterator.h \
+ inc/kernel/os/nv_memory_area.h inc/kernel/rmapi/resource.h \
+ generated/g_resource_nvoc.h inc/libraries/resserv/rs_resource.h \
+ generated/g_rs_resource_nvoc.h inc/libraries/resserv/resserv.h \
+ generated/g_resserv_nvoc.h inc/libraries/containers/list.h \
+ inc/libraries/containers/map.h inc/libraries/containers/multimap.h \
  ../common/sdk/nvidia/inc/nvsecurityinfo.h \
  inc/libraries/resserv/rs_access_map.h \
  inc/libraries/resserv/rs_access_rights.h inc/kernel/rmapi/control.h \
- inc/kernel/rmapi/param_copy.h inc/kernel/os/nv_memory_area.h \
- inc/kernel/rmapi/event.h generated/g_event_nvoc.h \
+ inc/kernel/rmapi/param_copy.h inc/kernel/rmapi/event_api.h \
+ generated/g_event_api_nvoc.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000event.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h \
  ../common/sdk/nvidia/inc/class/cl0000.h \
@@ -101,7 +100,7 @@ inc/libraries/nvport/nvport.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -130,7 +129,6 @@ inc/libraries/utils/nvprintf_level.h:
 inc/libraries/nvlog/nvlog_printf.h:
 inc/libraries/nvlog/internal/nvlog_printf_internal.h:
 generated/g_subdevice_diag_nvoc.h:
-../common/sdk/nvidia/inc/class/cl208f.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl208f.h:
 ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fpower.h:
@@ -140,7 +138,6 @@ generated/g_subdevice_diag_nvoc.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208ffbio.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fbif.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fbus.h:
-../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fevent.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fgpu.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h:
@@ -148,12 +145,12 @@ generated/g_subdevice_diag_nvoc.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h:
 ../common/sdk/nvidia/inc/nvcfg_sdk.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fgr.h:
-../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fclk.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fpmgr.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fdma.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fmmu.h:
-../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fucodecoverage.h:
+../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fucodeinstrumentation.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fnvlink.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl208f/ctrl208fpmu.h:
 inc/kernel/gpu/gpu_resource.h:
 generated/g_gpu_resource_nvoc.h:
@@ -191,6 +188,9 @@ inc/libraries/poolalloc.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/containers/list.h:
 inc/libraries/containers/type_safety.h:
+inc/kernel/gpu/mem_mgr/rm_page_size.h:
+inc/kernel/os/nv_memory_iterator.h:
+inc/kernel/os/nv_memory_area.h:
 inc/kernel/rmapi/resource.h:
 generated/g_resource_nvoc.h:
 inc/libraries/resserv/rs_resource.h:
@@ -205,9 +205,8 @@ inc/libraries/resserv/rs_access_map.h:
 inc/libraries/resserv/rs_access_rights.h:
 inc/kernel/rmapi/control.h:
 inc/kernel/rmapi/param_copy.h:
-inc/kernel/os/nv_memory_area.h:
-inc/kernel/rmapi/event.h:
-generated/g_event_nvoc.h:
+inc/kernel/rmapi/event_api.h:
+generated/g_event_api_nvoc.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000event.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h:
 ../common/sdk/nvidia/inc/class/cl0000.h:

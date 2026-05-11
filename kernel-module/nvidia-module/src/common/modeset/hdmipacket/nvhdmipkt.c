@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2012-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -19,10 +19,10 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
- *
- * File:      nvhdmipkt.c
- *
- * Purpose:   Provide initialization functions for HDMI library
+ */
+
+/** @file  nvhdmipkt.c
+ ** @brief Provide initialization functions for HDMI library
  */
 
 #include <stddef.h>
@@ -56,6 +56,8 @@
 #include "class/clca7d.h"
 #include "class/clcb70.h"
 #include "class/clcb7d.h"
+#include "class/clcc70.h"
+#include "class/clcc7d.h"
 
 #include "hdmi_spec.h"
 
@@ -223,11 +225,21 @@ static const NVHDMIPKT_CLASS_HIERARCHY hierarchy[] =
         NVHDMIPKT_CB71_CLASS,             // classId
         NVHDMIPKT_C971_CLASS,             // parentClassId
         NV_FALSE,                         // isRootClass
-        initializeHdmiPktInterfaceC971,   // initInterface
+        initializeHdmiPktInterfaceCB71,   // initInterface
         hdmiConstructorC971,              // constructor
         hdmiDestructorC971,               // destructor
         NVCB70_DISPLAY,                   // displayClass
         NVCB7D_CORE_CHANNEL_DMA           // coreDmaClass
+    },
+    [NVHDMIPKT_CC71_CLASS] = {// Index 13==NVHDMIPKT_CC71_CLASS
+        NVHDMIPKT_CC71_CLASS,             // classId
+        NVHDMIPKT_C971_CLASS,             // parentClassId
+        NV_FALSE,                         // isRootClass
+        initializeHdmiPktInterfaceCC71,   // initInterface
+        hdmiConstructorC971,              // constructor
+        hdmiDestructorC971,               // destructor
+        NVCC70_DISPLAY,                   // displayClass
+        NVCC7D_CORE_CHANNEL_DMA           // coreDmaClass
     },
 };
 
@@ -373,6 +385,28 @@ NvHdmi_AssessLinkCapabilities(NvHdmiPkt_Handle             libHandle,
                               HDMI_SRC_CAPS               *pSrcCaps,
                               HDMI_SINK_CAPS              *pSinkCaps)
 {
+    return NvHdmi_AssessLinkCapabilities2(libHandle,
+                                          subDevice,
+                                          displayId,
+                                          pSinkEdid,
+                                          NV_FALSE /* bPerformLinkTrainingToAssess */,
+                                          NV_FALSE /* bIsDisplayActive */,
+                                          HDMI_FRL_DATA_RATE_NONE /* currFRLRate */,
+                                          pSrcCaps,
+                                          pSinkCaps);
+}
+
+NVHDMIPKT_RESULT
+NvHdmi_AssessLinkCapabilities2(NvHdmiPkt_Handle             libHandle,
+                               NvU32                        subDevice,
+                               NvU32                        displayId,
+                               NVT_EDID_INFO         const * const pSinkEdid,
+                               const NvBool                 bPerformLinkTrainingToAssess,
+                               const NvBool                 bIsDisplayActive,
+                               const HDMI_FRL_DATA_RATE     currFRLRate,
+                               HDMI_SRC_CAPS               *pSrcCaps,
+                               HDMI_SINK_CAPS              *pSinkCaps)
+{
     if (libHandle == NVHDMIPKT_INVALID_HANDLE)
     {
         return NVHDMIPKT_LIBRARY_INIT_FAIL;
@@ -390,9 +424,13 @@ NvHdmi_AssessLinkCapabilities(NvHdmiPkt_Handle             libHandle,
                                               subDevice,
                                               displayId,
                                               pSinkEdid,
+                                              bPerformLinkTrainingToAssess,
+                                              bIsDisplayActive,
+                                              currFRLRate,
                                               pSrcCaps,
                                               pSinkCaps);
 }
+
 /*
  * NvHdmi_QueryFRLConfig
  */
@@ -573,6 +611,14 @@ NvHdmiPkt_CallConstructors(NVHDMIPKT_CLASS_ID const thisClassId,
     return NV_TRUE;
 }
 
+static void
+NvHdmiPkt_NullPrint(NvHdmiPkt_CBHandle handle,
+                    const char *format, ...)
+{
+    // Noop implementation.  Avoids having to check for NULL on every call.
+}
+
+
 /******************************** HDMI Library Init functions ***********************************/
 /*
  * NvHdmiPkt_InitializeLibrary
@@ -674,8 +720,16 @@ NvHdmiPkt_InitializeLibrary(NvU32                              const hwClass,
     pClass->callback.checkTimeout    = pCallbacks->checkTimeout;
 #endif
 
+    if (pCallbacks->print == NULL)
+    {
+        pClass->callback.print = NvHdmiPkt_NullPrint;
+    }
+    else
+    {
+        pClass->callback.print = pCallbacks->print;
+    }
+
 #if defined (DEBUG)
-    pClass->callback.print           = pCallbacks->print;
     pClass->callback.assert          = pCallbacks->assert;
 #endif
 

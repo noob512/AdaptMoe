@@ -88,6 +88,7 @@
 #define NV_PCI_SUBID_VENDOR_PC_PARTNER    0x174B
 #define NV_PCI_SUBID_VENDOR_CAVIUM        0x177D
 #define NV_PCI_SUBID_VENDOR_NZXT          0x1D96
+#define NV_PCI_SUBID_VENDOR_QUALCOMM      0x17CB
 
 // XXX CKEANUP TO REMOVE IN FAVOR OF NV_PCI_SUBID_VENDOR_*
 #define PCI_VENDOR_ID_AMD           0x1022
@@ -147,6 +148,7 @@
 #define PCI_VENDOR_ID_ARM           0x13B5
 #define PCI_VENDOR_ID_HYGON         0x1D94
 #define PCI_VENDOR_ID_ALIBABA       0x1DED
+#define PCI_VENDOR_ID_QUALCOMM      0x17CB
 #define PCI_VENDOR_ID_SIFIVE        0xF15E
 #define PCI_VENDOR_ID_PLDA          0x1556
 #define PCI_VENDOR_ID_PHYTIUM       0x1DB7
@@ -171,6 +173,11 @@
 
 // A16
 #define NV_PCI_SUBID_DEVICE_PG171_SKU200             0x14A9
+
+// NVIDIA B200
+#define NV_PCI_SUBID_DEVICE_PG525_SKU220             0x1999
+#define NV_PCI_SUBID_DEVICE_PG525_SKU225             0x199B
+#define NV_PCI_SUBID_DEVICE_PG525_SKU230             0x20DA
 
 ///////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -344,6 +351,10 @@
 #define DEVICE_ID_AMD_1480_ROOT_PORT        0x1480
 // AMD Renoir-H definition
 #define DEVICE_ID_AMD_1630_ROOT_PORT        0x1630
+
+// Qualcomm Snapdragon definitions
+#define DEVICE_ID_QUALCOMM_SNAPDRAGON_010E_ROOT_PORT    0x010E
+#define DEVICE_ID_QUALCOMM_SNAPDRAGON_0111_ROOT_PORT    0x0111
 
 // Dell SkullTrail definitions
 #define DELL_4003_SUBDEVICE_ID              0x021D
@@ -576,6 +587,7 @@ enum {
 ,     CS_INTEL_0685
 ,     CS_INTEL_4381
 ,     CS_INTEL_7A82
+,     CS_INTEL_7D06
 ,     CS_NVIDIA_CK804
 ,     CS_NVIDIA_C19
 ,     CS_NVIDIA_C51
@@ -639,16 +651,24 @@ enum {
 ,     CS_INTEL_18DC
 ,     CS_INTEL_7A04
 ,     CS_INTEL_5795
-,     CS_RESERVED_1
+,     CS_SNAPDRAGON_8CX
 ,     CS_SIFIVE_FU740_C000
 ,     CS_PLDA_XPRESSRICH_AXI_REF
 ,     CS_AMPERE_AMPEREONE160
 ,     CS_PHYTIUM_S5000
 ,     CS_RESERVED_2
 ,     CS_RESERVED_3
+,     CS_AMD_RPH
+,     CS_INTEL_B660
+,     CS_RESERVED_4
 ,     CS_AMPERE_AMPEREONE192
+,     CS_NVIDIA_T254
+,     CS_RESERVED_5
 ,     CS_MAX_PCIE
 };
+
+// Chip IDs for Tegra SoCs
+#define NV_CHIP_ID_T234 0x2350
 
 enum {
     RP_UNKNOWN = 0
@@ -693,6 +713,8 @@ enum {
 ,   RP_NVIDIA_MCP61
 ,   RP_NVIDIA_C55
 ,   RP_NVIDIA_MCP65
+,   RP_QUALCOMM_010E
+,   RP_QUALCOMM_0111
 };
 
 #endif //NVDEVID_H

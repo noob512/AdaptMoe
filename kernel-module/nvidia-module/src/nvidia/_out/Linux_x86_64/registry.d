@@ -9,10 +9,8 @@ _out/Linux_x86_64/registry.o: \
  ../common/sdk/nvidia/inc/nvmisc.h arch/nvalloc/unix/include/nv-ioctl.h \
  arch/nvalloc/unix/include/nv-ioctl-numbers.h \
  arch/nvalloc/unix/include/nv-ioctl-numa.h inc/kernel/os/nv_memory_area.h \
- arch/nvalloc/unix/include/nv-priv.h inc/kernel/os/os.h \
- generated/g_os_nvoc.h inc/libraries/nvoc/runtime.h \
  inc/libraries/nvport/nvport.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  inc/libraries/nvport/util.h inc/libraries/nvport/inline/util_generic.h \
@@ -23,6 +21,9 @@ _out/Linux_x86_64/registry.o: \
  inc/libraries/nvport/safe.h inc/libraries/nvport/inline/safe_generic.h \
  inc/libraries/nvport/thread.h inc/libraries/nvport/crypto.h \
  inc/libraries/nvport/string.h inc/libraries/nvport/cpu.h \
+ ../common/sdk/nvidia/inc/nvi2c.h ../common/sdk/nvidia/inc/nvimpshared.h \
+ arch/nvalloc/unix/include/nv-priv.h inc/kernel/os/os.h \
+ generated/g_os_nvoc.h inc/libraries/nvoc/runtime.h \
  inc/libraries/nvoc/prelude.h inc/libraries/utils/nvmacro.h \
  inc/libraries/nvoc/rtti.h inc/kernel/core/core.h \
  inc/kernel/core/prelude.h arch/nvalloc/common/inc/nvrangetypes.h \
@@ -50,10 +51,10 @@ _out/Linux_x86_64/registry.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073common.h \
+ inc/libraries/utils/nvbitvector.h inc/libraries/utils/nvrange.h \
  ../common/sdk/nvidia/inc/nvsecurityinfo.h interface/nvacpitypes.h \
- ../common/sdk/nvidia/inc/nvimpshared.h ../common/sdk/nvidia/inc/nvi2c.h \
- inc/kernel/os/nv_memory_type.h inc/kernel/os/capability.h \
- arch/nvalloc/unix/include/os_custom.h \
+ inc/kernel/os/capability.h inc/kernel/os/nv_memory_type.h \
+ inc/kernel/os/workitem.h arch/nvalloc/unix/include/os_custom.h \
  arch/nvalloc/unix/include/os-interface.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl402c.h \
  inc/kernel/gpu/disp/kern_disp_max.h inc/kernel/gpu/disp/kern_disp_type.h
@@ -74,14 +75,10 @@ arch/nvalloc/unix/include/nv-ioctl.h:
 arch/nvalloc/unix/include/nv-ioctl-numbers.h:
 arch/nvalloc/unix/include/nv-ioctl-numa.h:
 inc/kernel/os/nv_memory_area.h:
-arch/nvalloc/unix/include/nv-priv.h:
-inc/kernel/os/os.h:
-generated/g_os_nvoc.h:
-inc/libraries/nvoc/runtime.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 inc/libraries/nvport/util.h:
@@ -98,6 +95,12 @@ inc/libraries/nvport/thread.h:
 inc/libraries/nvport/crypto.h:
 inc/libraries/nvport/string.h:
 inc/libraries/nvport/cpu.h:
+../common/sdk/nvidia/inc/nvi2c.h:
+../common/sdk/nvidia/inc/nvimpshared.h:
+arch/nvalloc/unix/include/nv-priv.h:
+inc/kernel/os/os.h:
+generated/g_os_nvoc.h:
+inc/libraries/nvoc/runtime.h:
 inc/libraries/nvoc/prelude.h:
 inc/libraries/utils/nvmacro.h:
 inc/libraries/nvoc/rtti.h:
@@ -140,12 +143,13 @@ inc/libraries/containers/btree.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073common.h:
+inc/libraries/utils/nvbitvector.h:
+inc/libraries/utils/nvrange.h:
 ../common/sdk/nvidia/inc/nvsecurityinfo.h:
 interface/nvacpitypes.h:
-../common/sdk/nvidia/inc/nvimpshared.h:
-../common/sdk/nvidia/inc/nvi2c.h:
-inc/kernel/os/nv_memory_type.h:
 inc/kernel/os/capability.h:
+inc/kernel/os/nv_memory_type.h:
+inc/kernel/os/workitem.h:
 arch/nvalloc/unix/include/os_custom.h:
 arch/nvalloc/unix/include/os-interface.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl402c.h:

@@ -37,7 +37,7 @@
 // DATA SIZE (bytes): 7424
 // COMPRESSED SIZE (bytes): 6233
 //
-static BINDATA_CONST NvU8 ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_IMAGE_DBG_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_IMAGE_DBG_data[] = 
 {
     0xed, 0x99, 0x45, 0x54, 0x1c, 0x80, 0xd2, 0xa5, 0x71, 0x97, 0x20, 0xc1, 0x35, 0x58, 0x68, 0x20,
     0x34, 0x81, 0xc6, 0x35, 0xb8, 0xbb, 0x05, 0x77, 0x0d, 0x2e, 0xc1, 0xdd, 0xdd, 0xa1, 0x1b, 0x0f,
@@ -459,7 +459,7 @@ BINDATA_STORAGE_PVT ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_IMAGE_DB
 // DATA SIZE (bytes): 36
 // COMPRESSED SIZE (bytes): 27
 //
-static BINDATA_CONST NvU8 ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_HEADER_DBG_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_HEADER_DBG_data[] = 
 {
     0x63, 0x60, 0x00, 0x02, 0x46, 0x20, 0x96, 0x02, 0x62, 0x66, 0x08, 0x13, 0x4c, 0x48, 0x42, 0x69,
     0x20, 0x00, 0x00, 0x30, 0x39, 0x0a, 0xfc, 0x24, 0x00, 0x00, 0x00,
@@ -493,7 +493,7 @@ BINDATA_STORAGE_PVT ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_HEADER_D
 // DATA SIZE (bytes): 7424
 // COMPRESSED SIZE (bytes): 6233
 //
-static BINDATA_CONST NvU8 ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_IMAGE_PROD_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_IMAGE_PROD_data[] = 
 {
     0xed, 0x99, 0x45, 0x54, 0x1b, 0x00, 0xd3, 0xae, 0x8b, 0x3b, 0x14, 0xd7, 0x02, 0x25, 0x78, 0x71,
     0x97, 0xe0, 0x12, 0x4a, 0x71, 0x2d, 0xee, 0xee, 0x2e, 0xc5, 0xbd, 0xc5, 0xad, 0x01, 0x8a, 0x35,
@@ -915,7 +915,7 @@ BINDATA_STORAGE_PVT ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_IMAGE_PR
 // DATA SIZE (bytes): 36
 // COMPRESSED SIZE (bytes): 27
 //
-static BINDATA_CONST NvU8 ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_HEADER_PROD_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_HEADER_PROD_data[] = 
 {
     0x63, 0x60, 0x00, 0x02, 0x46, 0x20, 0x96, 0x02, 0x62, 0x66, 0x08, 0x13, 0x4c, 0x48, 0x42, 0x69,
     0x20, 0x00, 0x00, 0x30, 0x39, 0x0a, 0xfc, 0x24, 0x00, 0x00, 0x00,
@@ -949,7 +949,7 @@ BINDATA_STORAGE_PVT ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_HEADER_P
 // DATA SIZE (bytes): 768
 // COMPRESSED SIZE (bytes): N/A
 //
-static BINDATA_CONST NvU8 ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_SIG_DBG_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_SIG_DBG_data[] = 
 {
     0x01, 0x79, 0xe0, 0x78, 0x6b, 0x9e, 0x0a, 0xc3, 0x60, 0x08, 0xc3, 0xe1, 0xdc, 0x1b, 0x86, 0x71,
     0x79, 0x40, 0x1d, 0xdf, 0x82, 0x85, 0xf9, 0x41, 0xb6, 0x96, 0xe9, 0x9d, 0x63, 0xb9, 0x08, 0x7c,
@@ -1029,7 +1029,7 @@ BINDATA_STORAGE_PVT ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_SIG_DBG_
 // DATA SIZE (bytes): 768
 // COMPRESSED SIZE (bytes): N/A
 //
-static BINDATA_CONST NvU8 ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_SIG_PROD_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_SIG_PROD_data[] = 
 {
     0xdb, 0xf1, 0x66, 0x7a, 0x97, 0x53, 0x53, 0x3b, 0x46, 0x68, 0xaa, 0xec, 0x8d, 0x3c, 0x5e, 0xc3,
     0x36, 0x87, 0xcf, 0x2e, 0xcd, 0xf3, 0xa6, 0xd3, 0xc8, 0xb0, 0x50, 0x0e, 0x38, 0xed, 0xc6, 0x4b,
@@ -1109,7 +1109,7 @@ BINDATA_STORAGE_PVT ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_SIG_PROD
 // DATA SIZE (bytes): 4
 // COMPRESSED SIZE (bytes): N/A
 //
-static BINDATA_CONST NvU8 ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_PATCH_LOC_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_PATCH_LOC_data[] = 
 {
     0x00, 0x1a, 0x00, 0x00,
 };
@@ -1142,7 +1142,7 @@ BINDATA_STORAGE_PVT ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_PATCH_LO
 // DATA SIZE (bytes): 4
 // COMPRESSED SIZE (bytes): N/A
 //
-static BINDATA_CONST NvU8 ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_PATCH_SIG_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_PATCH_SIG_data[] = 
 {
     0x00, 0x00, 0x00, 0x00,
 };
@@ -1175,7 +1175,7 @@ BINDATA_STORAGE_PVT ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_PATCH_SI
 // DATA SIZE (bytes): 12
 // COMPRESSED SIZE (bytes): N/A
 //
-static BINDATA_CONST NvU8 ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_PATCH_META_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_PATCH_META_data[] = 
 {
     0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00,
 };
@@ -1208,7 +1208,7 @@ BINDATA_STORAGE_PVT ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_PATCH_ME
 // DATA SIZE (bytes): 4
 // COMPRESSED SIZE (bytes): N/A
 //
-static BINDATA_CONST NvU8 ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_NUM_SIGS_data[] = 
+static BINDATA_CONST NV_DECLARE_ALIGNED(NvU8, 8) ksec2BinArchiveSecurescrubUcode_AD10X_BINDATA_LABEL_NUM_SIGS_data[] = 
 {
     0x02, 0x00, 0x00, 0x00,
 };

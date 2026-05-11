@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2015-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2015-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -251,7 +251,7 @@ NV_STATUS serverFreeResourceTreeUnderLock(RsServer *pServer, RS_RES_FREE_PARAMS 
         pLockInfo->pResRefToBackRef = pResourceRef;
         pLockInfo->traceOp = RS_LOCK_TRACE_FREE;
         pLockInfo->traceClassId = pResourceRef->externalClassId;
-        status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pLockInfo, &releaseFlags);
+        status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pLockInfo, &releaseFlags, 0);
         if (status != NV_OK)
             goto done;
 
@@ -695,7 +695,7 @@ _serverFreeClient
         return NV_ERR_INVALID_OBJECT_HANDLE;
 
     status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE,
-        pParams->pResFreeParams->pLockInfo, &releaseFlags);
+        pParams->pResFreeParams->pLockInfo, &releaseFlags, 0);
     if (status != NV_OK)
         goto done;
 
@@ -891,7 +891,7 @@ serverAllocResourceUnderLock
     if (!pServer->bConstructed)
         return NV_ERR_NOT_READY;
 
-    status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pParams->pLockInfo, &releaseFlags);
+    status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pParams->pLockInfo, &releaseFlags, 0);
     if (status != NV_OK)
         goto done;
 
@@ -1062,8 +1062,8 @@ NV_STATUS serverFreeDisabledClients
     // while another tries to flush disabled clients immediately.
     // It doesn't matter which one ends up running, they all free everything
     //
-    static volatile NvU32 inProgress;
-    if (!portAtomicCompareAndSwapU32(&inProgress, 1, 0))
+    static PORT_ATOMIC NvU32 inProgress;
+    if (!portAtomicCompareAndSwapU32(&inProgress, 1U, 0U))
         return NV_ERR_IN_USE;
 
     portMemSet(&params,   0, sizeof(params));
@@ -1698,7 +1698,10 @@ serverCopyResource
 
     status = clientGetResourceRef(pClientSrc, pParams->hResourceSrc, &pResourceRefSrc);
     if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_NOTICE, "Failed to find handle 0x%x under client 0x%x\n", pParams->hResourceSrc, pParams->hClientSrc);
         goto done;
+    }
 
     if (pResourceRefSrc->bInvalidated)
     {
@@ -1708,7 +1711,10 @@ serverCopyResource
 
     status = clientGetResourceRef(pClientDst, pParams->hParentDst, &pParams->pDstParentRef);
     if (status != NV_OK)
-        return status;
+    {
+        NV_PRINTF(LEVEL_NOTICE, "Failed to find handle 0x%x under client 0x%x\n", pParams->hParentDst, pParams->hClientDst);
+        goto done;
+    }
 
     if (!resCanCopy(pResourceRefSrc->pResource))
     {
@@ -1726,9 +1732,9 @@ serverCopyResource
 
     status = serverUpdateLockFlagsForCopy(pServer, pParams);
     if (status != NV_OK)
-        return status;
+        goto done;
 
-    status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pParams->pLockInfo, &releaseFlags);
+    status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pParams->pLockInfo, &releaseFlags, 0);
     if (status != NV_OK)
         goto done;
 
@@ -2032,7 +2038,7 @@ serverMap
     if (status != NV_OK)
         goto done;
 
-    status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pLockInfo, &releaseFlags);
+    status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pLockInfo, &releaseFlags, 0);
     if (status != NV_OK)
         goto done;
 
@@ -2155,7 +2161,7 @@ serverUnmap
     if (status != NV_OK)
         goto done;
 
-    status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pLockInfo, &releaseFlags);
+    status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pLockInfo, &releaseFlags, 0);
     if (status != NV_OK)
         goto done;
 
@@ -2257,10 +2263,6 @@ serverInterMap
 
     bRestoreCallContext = NV_TRUE;
 
-    status = refAddInterMapping(pMapperRef, pMappableRef, pContextRef, &pMapping);
-    if (status != NV_OK)
-        goto done;
-
     // serverResLock_Prologue should be called during serverInterMap_Prologue
     status = serverInterMap_Prologue(pServer, pMapperRef, pMappableRef, pParams, &releaseFlags);
     if (status != NV_OK)
@@ -2270,9 +2272,16 @@ serverInterMap
     if (status != NV_OK)
         goto done;
 
-    pMapping->flags = pParams->flags;
-    pMapping->dmaOffset = pParams->dmaOffset;
+    NV_ASSERT_OK_OR_GOTO(status, refCreateInterMapping(pMapperRef, &pMapping), done);
+
     pMapping->size = pParams->length;
+
+    status = refAddInterMapping(pMapperRef, pMappableRef, pParams->dmaOffset, pContextRef, pMapping);
+    if (status != NV_OK)
+        goto done;
+
+    pMapping->flags = pParams->flags;
+    pMapping->flags2 = pParams->flags2;
     pMapping->pMemDesc = pParams->pMemDesc;
 
 done:
@@ -2284,7 +2293,10 @@ done:
     if (status != NV_OK)
     {
         if (pMapping != NULL)
-            refRemoveInterMapping(pMapperRef, pMapping);
+        {
+            refRemoveInterMapping(pMapperRef, pMapping, NV_FALSE);
+            refDestroyInterMapping(pMapperRef, pMapping);
+        }
     }
 
     if (pClientEntry != NULL)
@@ -2307,46 +2319,93 @@ serverInterUnmapMapping
     NvBool                 bPartialUnmap
 )
 {
-    RsInterMapping *pNewMappingLeft  = NULL;
-    RsInterMapping *pNewMappingRight = NULL;
-    NV_STATUS       status           = NV_OK;
+    RsInterMapping *pNewMappingLeft   = NULL;
+    RsInterMapping *pNewMappingRight  = NULL;
+    NV_STATUS       status            = NV_OK;
+    NvBool          bMappingReadded   = NV_FALSE;
+
+    // Keep the context-level map allocated. Otherwise refAddInterMapping() can OOM, resulting in an invalid state
+    refRemoveInterMapping(pMapperRef, pMapping, NV_TRUE);
 
     if (pParams->dmaOffset > pMapping->dmaOffset)
     {
-        NV_ASSERT_OK_OR_GOTO(status, refAddInterMapping(pMapperRef, pMapping->pMappableRef, pMapping->pContextRef, &pNewMappingLeft), done);
+        NV_ASSERT_OK_OR_GOTO(status, refCreateInterMapping(pMapperRef, &pNewMappingLeft), done);
 
-        pNewMappingLeft->flags = pMapping->flags;
-        pNewMappingLeft->dmaOffset = pMapping->dmaOffset;
         pNewMappingLeft->size = pParams->dmaOffset - pMapping->dmaOffset;
+
+        NV_ASSERT_OK_OR_GOTO(status, refAddInterMapping(pMapperRef,
+                                                        pMapping->pMappableRef,
+                                                        pMapping->dmaOffset,
+                                                        pMapping->pContextRef,
+                                                        pNewMappingLeft),
+                             done);
+
+        pNewMappingLeft->flags  = pMapping->flags;
+        pNewMappingLeft->flags2 = pMapping->flags2;
     }
 
     if (pParams->dmaOffset + pParams->size < pMapping->dmaOffset + pMapping->size)
     {
-        NV_ASSERT_OK_OR_GOTO(status, refAddInterMapping(pMapperRef, pMapping->pMappableRef, pMapping->pContextRef, &pNewMappingRight), done);
+        NvU64 newMappingRightDmaOffset = pParams->dmaOffset + pParams->size;
 
-        pNewMappingRight->flags = pMapping->flags;
-        pNewMappingRight->dmaOffset = pParams->dmaOffset + pParams->size;
-        pNewMappingRight->size = pMapping->dmaOffset + pMapping->size - pNewMappingRight->dmaOffset;
+        NV_ASSERT_OK_OR_GOTO(status, refCreateInterMapping(pMapperRef, &pNewMappingRight), done);
+
+        pNewMappingRight->size = pMapping->dmaOffset + pMapping->size - newMappingRightDmaOffset;
+
+        NV_ASSERT_OK_OR_GOTO(status, refAddInterMapping(pMapperRef,
+                                                        pMapping->pMappableRef,
+                                                        newMappingRightDmaOffset,
+                                                        pMapping->pContextRef,
+                                                        pNewMappingRight),
+                             done);
+
+        pNewMappingRight->flags  = pMapping->flags;
+        pNewMappingRight->flags2 = pMapping->flags2;
     }
 
     pParams->hMappable = pMapping->pMappableRef->hResource;
-    pParams->pMemDesc = pMapping->pMemDesc;
+    pParams->pMemDesc  = pMapping->pMemDesc;
     status = clientInterUnmap(pClient, pMapperRef, pParams);
 
 done:
     if (bPartialUnmap && status != NV_OK)
     {
         if (pNewMappingLeft != NULL)
-            refRemoveInterMapping(pMapperRef, pNewMappingLeft);
+        {
+            refRemoveInterMapping(pMapperRef, pNewMappingLeft, NV_TRUE);
+            refDestroyInterMapping(pMapperRef, pNewMappingLeft);
+        }
 
         if (pNewMappingRight != NULL)
-            refRemoveInterMapping(pMapperRef, pNewMappingRight);
+        {
+            refRemoveInterMapping(pMapperRef, pNewMappingRight, NV_TRUE);
+            refDestroyInterMapping(pMapperRef, pNewMappingRight);
+        }
+
+        // Add the original mapping back if we couldn't split it up
+        NV_ASSERT_OK_OR_RETURN(refAddInterMapping(pMapping->pMapperRef,
+                                                  pMapping->pMappableRef,
+                                                  pMapping->dmaOffset,
+                                                  pMapping->pContextRef,
+                                                  pMapping));
+        bMappingReadded = NV_TRUE;
     }
-    else
+
+    if (!bMappingReadded)
     {
-        // Regular unmap should never fail when the range is found
-        NV_ASSERT(status == NV_OK);
-        refRemoveInterMapping(pMapperRef, pMapping);
+        if (pNewMappingLeft == NULL && pNewMappingRight == NULL)
+        {
+            RsInterMappingMap *pInterMappings = mapFind(&pMapperRef->interMappingContextMap, pMapping->pContextRef->hResource);
+
+            NV_ASSERT(pInterMappings != NULL);
+            if (mapCount(pInterMappings) == 0)
+            {
+                // clean up the context-level map manually, as we prevented it to avoid malloc/free
+                mapDestroy(pInterMappings);
+                mapRemove(&pMapperRef->interMappingContextMap, pInterMappings);
+            }
+        }
+        refDestroyInterMapping(pMapperRef, pMapping);
     }
 
     return status;
@@ -2363,66 +2422,94 @@ serverInterUnmapInternal
 
 )
 {
-    RsInterMapping *pNextMapping   = listHead(&pMapperRef->interMappings);
-    NvU64           unmapDmaOffset = pParams->dmaOffset;
-    NvU64           unmapSize      = pParams->size;
-    NvBool          bPartialUnmap  = (unmapSize != 0);
-    NV_STATUS       unmapStatus    = NV_OK;
-    NV_STATUS       status         = bPartialUnmap ? NV_OK : NV_ERR_OBJECT_NOT_FOUND;
-    NvU64           unmapEnd;
+    NvU64     unmapDmaOffset = pParams->dmaOffset;
+    NvU64     unmapSize      = pParams->size;
+    NvBool    bPartialUnmap  = (unmapSize != 0);
+    NV_STATUS status         = NV_OK;
+    RsInterMappingMap *pInterMappings = mapFind(&pMapperRef->interMappingContextMap, pContextRef->hResource);
+    RsInterMapping *pMapping;
 
-    NV_CHECK_OR_RETURN(LEVEL_ERROR, portSafeAddU64(unmapDmaOffset, unmapSize, &unmapEnd), NV_ERR_INVALID_ARGUMENT);
-
-    while (pNextMapping != NULL)
+    if (!bPartialUnmap)
     {
-        RsInterMapping *pMapping = pNextMapping;
-        pNextMapping = listNext(&pMapperRef->interMappings, pMapping);
+        if (pInterMappings == NULL)
+            return NV_ERR_OBJECT_NOT_FOUND;
 
-        if (pMapping->pContextRef != pContextRef)
-            continue;
+        pMapping = mapFind(pInterMappings, unmapDmaOffset);
 
-        NvU64 mappingEnd;
-        NV_ASSERT_OR_RETURN(portSafeAddU64(pMapping->dmaOffset, pMapping->size, &mappingEnd), NV_ERR_INVALID_STATE);
+        if (pMapping == NULL)
+            return NV_ERR_OBJECT_NOT_FOUND;
 
-        if (bPartialUnmap &&
-            mappingEnd > unmapDmaOffset &&
-            pMapping->dmaOffset < unmapEnd)
+        pParams->dmaOffset = pMapping->dmaOffset;
+        pParams->size = pMapping->size;
+
+        NV_ASSERT_OK_OR_GOTO(status,
+                             serverInterUnmapMapping(pClient, pMapperRef, pMapping, pParams, bPartialUnmap),
+                             done);
+    }
+    else
+    {
+        NvU64 unmapEnd = 0;
+
+        if (pInterMappings == NULL)
+            return NV_OK;
+
+        pMapping = mapFindLEQ(pInterMappings, unmapDmaOffset);
+        if (pMapping == NULL)
         {
-            if (pMapping->dmaOffset < unmapDmaOffset || mappingEnd > unmapEnd)
+            //
+            // unmapped region might start from the middle of the mapping
+            // if no mappings precede such mapping, mapFindLEQ() returns NULL
+            //
+            pMapping = mapFindGEQ(pInterMappings, unmapDmaOffset);
+        }
+
+        NV_CHECK_OR_RETURN(LEVEL_ERROR,
+                           portSafeAddU64(unmapDmaOffset, unmapSize, &unmapEnd),
+                           NV_ERR_INVALID_ARGUMENT);
+
+        while ((pMapping != NULL) && (pMapping->dmaOffset < unmapEnd))
+        {
+            RsInterMapping *pNextMapping = mapNext(pInterMappings, pMapping);
+
+            NvU64 mappingEnd;
+            NV_ASSERT_OR_RETURN(portSafeAddU64(pMapping->dmaOffset, pMapping->size, &mappingEnd),
+                                NV_ERR_INVALID_STATE);
+
+            if (mappingEnd > unmapDmaOffset)
             {
-                // If the mapping does not lie entirely in the unmapped range, we are in the "true" partial unmap path
-                NV_CHECK_TRUE_OR_GOTO(unmapStatus, LEVEL_ERROR, resIsPartialUnmapSupported(pMapperRef->pResource), NV_ERR_INVALID_ARGUMENT, done);
-                // It is unclear what to do with pMemDesc when the mapping is split
-                NV_ASSERT_TRUE_OR_GOTO(unmapStatus, pMapping->pMemDesc == NULL, NV_ERR_INVALID_STATE, done);
+                if (pMapping->dmaOffset < unmapDmaOffset || mappingEnd > unmapEnd)
+                {
+                    //
+                    // If the mapping does not lie entirely in the unmapped range,
+                    // we are in the "true" partial unmap path
+                    //
+                    NV_CHECK_TRUE_OR_GOTO(status,
+                                          LEVEL_ERROR,
+                                          resIsPartialUnmapSupported(pMapperRef->pResource),
+                                          NV_ERR_INVALID_ARGUMENT,
+                                          done);
+                    // It is unclear what to do with pMemDesc when the mapping is split
+                    NV_ASSERT_TRUE_OR_GOTO(status, pMapping->pMemDesc == NULL, NV_ERR_INVALID_STATE, done);
+                }
+
+                pParams->dmaOffset = NV_MAX(pMapping->dmaOffset, unmapDmaOffset);
+                pParams->size = NV_MIN(unmapEnd, mappingEnd) - pParams->dmaOffset;
+            }
+            else
+            {
+                pMapping = pNextMapping;
+                continue;
             }
 
-            pParams->dmaOffset = NV_MAX(pMapping->dmaOffset, unmapDmaOffset);
-            pParams->size = NV_MIN(unmapEnd, mappingEnd) - pParams->dmaOffset;
-        }
-        else if (!bPartialUnmap && pMapping->dmaOffset == unmapDmaOffset)
-        {
-            pParams->dmaOffset = pMapping->dmaOffset;
-            pParams->size = pMapping->size;
-        }
-        else
-        {
-            continue;
-        }
+            NV_ASSERT_OK_OR_GOTO(status,
+                                 serverInterUnmapMapping(pClient, pMapperRef, pMapping, pParams, bPartialUnmap),
+                                 done);
 
-        NV_ASSERT_OK_OR_GOTO(unmapStatus, serverInterUnmapMapping(pClient, pMapperRef, pMapping, pParams, bPartialUnmap), done);
-
-        if (!bPartialUnmap)
-        {
-            // non-partial unmap always touches a single mapping
-            status = NV_OK;
-            break;
+            pMapping = pNextMapping;
         }
     }
 
 done:
-    if (unmapStatus != NV_OK)
-        status = unmapStatus;
-
     return status;
 }
 
@@ -2501,7 +2588,7 @@ serverInterUnmap
 
     bRestoreCallContext = NV_TRUE;
 
-    status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pLockInfo, &releaseFlags);
+    status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pLockInfo, &releaseFlags, 0);
     if (status != NV_OK)
         goto done;
 
@@ -4473,7 +4560,8 @@ serverResLock_Prologue
     RsServer *pServer,
     LOCK_ACCESS_TYPE access,
     RS_LOCK_INFO *pLockInfo,
-    NvU32 *pReleaseFlags
+    NvU32 *pReleaseFlags,
+    NvU32 gpuMask
 )
 {
     if (!(pLockInfo->state & RS_LOCK_STATE_CUSTOM_LOCK_1_ACQUIRED))
@@ -4574,7 +4662,7 @@ serverInterMap_Prologue
 {
     NV_STATUS status;
 
-    status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pMapParams->pLockInfo, pReleaseFlags);
+    status = serverResLock_Prologue(pServer, LOCK_ACCESS_WRITE, pMapParams->pLockInfo, pReleaseFlags, 0);
 
     return status;
 }
@@ -4959,7 +5047,7 @@ NV_STATUS serverControl_Prologue
 
     pLockInfo->traceOp = RS_LOCK_TRACE_CTRL;
     pLockInfo->traceClassId = pParams->cmd;
-    status = serverResLock_Prologue(pServer, *pAccess, pParams->pLockInfo, pReleaseFlags);
+    status = serverResLock_Prologue(pServer, *pAccess, pParams->pLockInfo, pReleaseFlags, 0);
     if (status != NV_OK)
         return status;
 

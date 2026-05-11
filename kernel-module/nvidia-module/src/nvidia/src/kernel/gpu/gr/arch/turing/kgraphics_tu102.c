@@ -172,6 +172,9 @@ kgraphicsAllocGrGlobalCtxBuffers_TU102
             memmgrSetMemDescPageSize_HAL(pGpu, pMemoryManager, *ppMemDesc, AT_GPU, RM_ATTR_PAGE_SIZE_4KB);
             NV_ASSERT_OK_OR_RETURN(memdescSetCtxBufPool(*ppMemDesc, pCtxBufPool));
         }
+
+        kgraphicsSetContextBufferPteKind(pGpu, pKernelGraphics, ppMemDesc, GR_GLOBALCTX_BUFFER_RTV_CB, NV_TRUE, memmgrGetPteKindGenericMemoryCompressible_HAL(pGpu, GPU_GET_MEMORY_MANAGER(pGpu)));
+
         memdescTagAllocList(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_113,
                     (*ppMemDesc), pCtxAttr[GR_GLOBALCTX_BUFFER_RTV_CB].pAllocList);
         NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, status);
@@ -179,6 +182,51 @@ kgraphicsAllocGrGlobalCtxBuffers_TU102
     status = kgraphicsAllocGrGlobalCtxBuffers_GP100(pGpu, pKernelGraphics, gfid, pKernelGraphicsContext);
 
     return status;
+}
+
+/*!
+ * @brief Teardown bug 4208224 client and memory
+ */
+void 
+kgraphicsTeardownBug4208224State_TU102
+(
+    OBJGPU *pGpu,
+    KernelGraphics *pKernelGraphics
+)
+{
+    NV_ASSERT_OR_RETURN_VOID(gpumgrIsParentGPU(pGpu));
+    if (pKernelGraphics->bug4208224Info.bConstructed && !IS_VIRTUAL(pGpu) && gpumgrIsParentGPU(pGpu))
+    {
+        RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+        NV0080_CTRL_INTERNAL_KGR_INIT_BUG4208224_WAR_PARAMS params = {0};
+        NvBool      bBcStatus;
+        NvU32       sliLoopReentrancy;
+
+        //
+        // Forcing BC state to enabled here is most likely superfluous 
+        // as the rmapi control stack should detect a call with a device
+        // handle and automatically enable BC mode. This is force is left
+        // as a code-maintence reminder, that if linked-SLI is being used,
+        // we MUST perform this as a broadcast call.
+        //
+        bBcStatus = gpumgrGetBcEnabledStatus(pGpu);
+        gpumgrSetBcEnabledStatus(pGpu, NV_TRUE);        
+        sliLoopReentrancy = gpumgrSLILoopReentrancyPop(pGpu);
+
+        params.bTeardown = NV_TRUE;
+        NV_ASSERT_OK(pRmApi->Control(pRmApi,
+                     pKernelGraphics->bug4208224Info.hClient,
+                     pKernelGraphics->bug4208224Info.hDeviceId,
+                     NV0080_CTRL_CMD_INTERNAL_KGR_INIT_BUG4208224_WAR,
+                     &params,
+                     sizeof(params)));
+        NV_ASSERT_OK(pRmApi->Free(pRmApi, pKernelGraphics->bug4208224Info.hClient, pKernelGraphics->bug4208224Info.hClient));
+
+        gpumgrSLILoopReentrancyPush(pGpu, sliLoopReentrancy);
+        gpumgrSetBcEnabledStatus(pGpu, bBcStatus);
+
+        pKernelGraphics->bug4208224Info.bConstructed = NV_FALSE;
+    }
 }
 
 /**
@@ -196,9 +244,11 @@ kgraphicsInitializeBug4208224WAR_TU102
 {
     NV_STATUS   status = NV_OK;
     RM_API     *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
-    NV2080_CTRL_INTERNAL_KGR_INIT_BUG4208224_WAR_PARAMS params = {0};
+    NV0080_CTRL_INTERNAL_KGR_INIT_BUG4208224_WAR_PARAMS params = {0};
+    NvBool      bBcStatus;
+    NvU32       sliLoopReentrancy;
 
-    if (pKernelGraphics->bug4208224Info.bConstructed)
+    if ((pKernelGraphics->bug4208224Info.bConstructed) || !gpumgrIsParentGPU(pGpu))
     {
         return NV_OK;
     }
@@ -206,11 +256,23 @@ kgraphicsInitializeBug4208224WAR_TU102
     NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
         kgraphicsCreateBug4208224Channel_HAL(pGpu, pKernelGraphics));
 
+    //
+    // Forcing BC state to enabled here is most likely superfluous 
+    // as the rmapi control stack should detect a call with a device
+    // handle and automatically enable BC mode. This is force is left
+    // as a code-maintence reminder, that if linked-SLI is being used,
+    // we MUST perform this as a broadcast call.
+    //
+    bBcStatus = gpumgrGetBcEnabledStatus(pGpu);
+    gpumgrSetBcEnabledStatus(pGpu, NV_TRUE);
+
+    // As we have forced here SLI broadcast mode, temporarily reset the reentrancy count
+    sliLoopReentrancy = gpumgrSLILoopReentrancyPop(pGpu);
     params.bTeardown = NV_FALSE;
     status =  pRmApi->Control(pRmApi,
                         pKernelGraphics->bug4208224Info.hClient,
-                        pKernelGraphics->bug4208224Info.hSubdeviceId,
-                        NV2080_CTRL_CMD_INTERNAL_KGR_INIT_BUG4208224_WAR,
+                        pKernelGraphics->bug4208224Info.hDeviceId,
+                        NV0080_CTRL_CMD_INTERNAL_KGR_INIT_BUG4208224_WAR,
                         &params,
                         sizeof(params));
 
@@ -220,6 +282,10 @@ kgraphicsInitializeBug4208224WAR_TU102
             pKernelGraphics->bug4208224Info.hClient,
             pKernelGraphics->bug4208224Info.hClient));
     }
+
+    // Restore the reentrancy count
+    gpumgrSLILoopReentrancyPush(pGpu, sliLoopReentrancy);
+    gpumgrSetBcEnabledStatus(pGpu, bBcStatus);
 
     return status;
 }
@@ -252,7 +318,6 @@ kgraphicsCreateBug4208224Channel_TU102
     RM_API                                *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
     RsClient                              *pClientId;
     NvBool                                 bBcStatus;
-    NvBool                                 bClientUserd = IsVOLTAorBetter(pGpu);
     NvBool                                 bAcquireLock = NV_FALSE;
     NvU32                                  sliLoopReentrancy;
     NV_VASPACE_ALLOCATION_PARAMETERS       vaParams;
@@ -360,7 +425,6 @@ kgraphicsCreateBug4208224Channel_TU102
         cleanup);
 
     // Allocate Userd
-    if (bClientUserd)
     {
         NvU32 userdMemClass = NV01_MEMORY_LOCAL_USER;
         NvU32 ctrlSize;
@@ -424,10 +488,7 @@ kgraphicsCreateBug4208224Channel_TU102
     // provide a valid offset here.
     //
     channelGPFIFOAllocParams.gpFifoOffset  = 0;
-    if (bClientUserd)
-    {
-        channelGPFIFOAllocParams.hUserdMemory[0] = hUserdId;
-    }
+    channelGPFIFOAllocParams.hUserdMemory[0] = hUserdId;
 
     channelGPFIFOAllocParams.engineType = gpuGetNv2080EngineType(RM_ENGINE_TYPE_GR0);
 

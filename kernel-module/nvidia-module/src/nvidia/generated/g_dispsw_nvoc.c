@@ -16,7 +16,7 @@
 
 
 #ifdef DEBUG
-char __nvoc_class_id_uniqueness_check__0x99ad6d = 1;
+char __nvoc_class_id_uniqueness_check__99ad6d = 1;
 #endif
 
 extern const struct NVOC_CLASS_DEF __nvoc_class_def_DispSwObject;
@@ -33,7 +33,7 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_ChannelDescendant;
 void __nvoc_init__ChannelDescendant(ChannelDescendant*, RmHalspecOwner *pRmhalspecowner);
 void __nvoc_init__DispSwObject(DispSwObject*, RmHalspecOwner *pRmhalspecowner);
 void __nvoc_init_funcTable_DispSwObject(DispSwObject*, RmHalspecOwner *pRmhalspecowner);
-NV_STATUS __nvoc_ctor_DispSwObject(DispSwObject*, RmHalspecOwner *pRmhalspecowner, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
+NV_STATUS __nvoc_ctor_DispSwObject(DispSwObject*, RmHalspecOwner *pRmhalspecowner, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
 void __nvoc_init_dataField_DispSwObject(DispSwObject*, RmHalspecOwner *pRmhalspecowner);
 void __nvoc_dtor_DispSwObject(DispSwObject*);
 
@@ -151,32 +151,33 @@ void __nvoc_up_thunk_Notifier_dispswSetNotificationShare(struct DispSwObject *pN
 NV_STATUS __nvoc_up_thunk_Notifier_dispswUnregisterEvent(struct DispSwObject *pNotifier, NvHandle hNotifierClient, NvHandle hNotifierResource, NvHandle hEventClient, NvHandle hEvent);    // this
 NV_STATUS __nvoc_up_thunk_Notifier_dispswGetOrAllocNotifShare(struct DispSwObject *pNotifier, NvHandle hNotifierClient, NvHandle hNotifierResource, struct NotifShare **ppNotifShare);    // this
 
+// Class-specific details for DispSwObject
 const struct NVOC_CLASS_DEF __nvoc_class_def_DispSwObject = 
 {
-    /*classInfo=*/ {
-        /*size=*/               sizeof(DispSwObject),
-        /*classId=*/            classId(DispSwObject),
-        /*providerId=*/         &__nvoc_rtti_provider,
+    .classInfo.size =               sizeof(DispSwObject),
+    .classInfo.classId =            classId(DispSwObject),
+    .classInfo.providerId =         &__nvoc_rtti_provider,
 #if NV_PRINTF_STRINGS_ALLOWED
-        /*name=*/               "DispSwObject",
+    .classInfo.name =               "DispSwObject",
 #endif
-    },
-    /*objCreatefn=*/        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_DispSwObject,
-    /*pCastInfo=*/          &__nvoc_castinfo__DispSwObject,
-    /*pExportInfo=*/        &__nvoc_export_info__DispSwObject
+    .objCreatefn =        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_DispSwObject,
+    .pCastInfo =          &__nvoc_castinfo__DispSwObject,
+    .pExportInfo =        &__nvoc_export_info__DispSwObject
 };
 
+// By default, all exported methods are enabled.
 #if !defined(NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG)
 #define NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(x)      (0)
 #endif
 
+// Exported method array
 static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_DispSwObject[] = 
 {
     {               /*  [0] */
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x48u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) dispswCtrlCmdNotifyOnVblank_IMPL,
+        /*pFunc=*/      (void (*)(void)) &dispswCtrlCmdNotifyOnVblank_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x48u)
         /*flags=*/      0x48u,
         /*accessRight=*/0x0u,
@@ -187,7 +188,6 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_DispSwOb
         /*func=*/       "dispswCtrlCmdNotifyOnVblank"
 #endif
     },
-
 };
 
 
@@ -221,7 +221,7 @@ static const struct NVOC_METADATA__DispSwObject __nvoc_metadata__DispSwObject = 
     .metadata__ChannelDescendant.metadata__Notifier.metadata__INotifier.rtti.dtor      = &__nvoc_destructFromBase,
     .metadata__ChannelDescendant.metadata__Notifier.metadata__INotifier.rtti.offset    = NV_OFFSETOF(DispSwObject, __nvoc_base_ChannelDescendant.__nvoc_base_Notifier.__nvoc_base_INotifier),
 
-    .vtable.__dispswGetSwMethods__ = &dispswGetSwMethods_46f6a7,    // virtual halified (singleton optimized) override (chandes) base (chandes) body
+    .vtable.__dispswGetSwMethods__ = &dispswGetSwMethods_395e98,    // virtual halified (singleton optimized) override (chandes) base (chandes) body
     .metadata__ChannelDescendant.vtable.__chandesGetSwMethods__ = &__nvoc_down_thunk_DispSwObject_chandesGetSwMethods,    // virtual
     .vtable.__dispswIsSwMethodStalling__ = &__nvoc_up_thunk_ChannelDescendant_dispswIsSwMethodStalling,    // virtual inherited (chandes) base (chandes)
     .metadata__ChannelDescendant.vtable.__chandesIsSwMethodStalling__ = &chandesIsSwMethodStalling_IMPL,    // virtual
@@ -546,17 +546,24 @@ NV_STATUS __nvoc_up_thunk_Notifier_dispswGetOrAllocNotifShare(struct DispSwObjec
 
 const struct NVOC_EXPORT_INFO __nvoc_export_info__DispSwObject = 
 {
-    /*numEntries=*/     1,
-    /*pExportEntries=*/ __nvoc_exported_method_def_DispSwObject
+    .numEntries=     1,
+    .pExportEntries= __nvoc_exported_method_def_DispSwObject
 };
 
+
+// Destruct DispSwObject object.
+void __nvoc_dispswDestruct(DispSwObject*);
 void __nvoc_dtor_ChannelDescendant(ChannelDescendant*);
-void __nvoc_dtor_DispSwObject(DispSwObject *pThis) {
+void __nvoc_dtor_DispSwObject(DispSwObject* pThis) {
+
+// Call destructor.
     __nvoc_dispswDestruct(pThis);
+
+// Recurse to superclass destructors.
     __nvoc_dtor_ChannelDescendant(&pThis->__nvoc_base_ChannelDescendant);
+
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
-
 void __nvoc_init_dataField_DispSwObject(DispSwObject *pThis, RmHalspecOwner *pRmhalspecowner) {
     RmVariantHal *rmVariantHal = &pRmhalspecowner->rmVariantHal;
     const unsigned long rmVariantHal_HalVarIdx = (unsigned long)rmVariantHal->__nvoc_HalVarIdx;
@@ -566,22 +573,29 @@ void __nvoc_init_dataField_DispSwObject(DispSwObject *pThis, RmHalspecOwner *pRm
     PORT_UNREFERENCED_VARIABLE(rmVariantHal_HalVarIdx);
 }
 
-NV_STATUS __nvoc_ctor_ChannelDescendant(ChannelDescendant* , RmHalspecOwner* , CALL_CONTEXT *, struct RS_RES_ALLOC_PARAMS_INTERNAL *, PARAM_TO_ENGDESC_FUNCTION *);
-NV_STATUS __nvoc_ctor_DispSwObject(DispSwObject *pThis, RmHalspecOwner *pRmhalspecowner, CALL_CONTEXT * arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams) {
-    NV_STATUS status = NV_OK;
-    status = __nvoc_ctor_ChannelDescendant(&pThis->__nvoc_base_ChannelDescendant, pRmhalspecowner, arg_pCallContext, arg_pParams, ((void *)0));
-    if (status != NV_OK) goto __nvoc_ctor_DispSwObject_fail_ChannelDescendant;
-    __nvoc_init_dataField_DispSwObject(pThis, pRmhalspecowner);
 
-    status = __nvoc_dispswConstruct(pThis, arg_pCallContext, arg_pParams);
+// Construct DispSwObject object.
+NV_STATUS __nvoc_ctor_ChannelDescendant(ChannelDescendant *pChannelDescendant, RmHalspecOwner *pRmhalspecowner, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams, PARAM_TO_ENGDESC_FUNCTION *pParamToEngDescFn);    // inline
+NV_STATUS __nvoc_ctor_DispSwObject(DispSwObject *pDispSw, RmHalspecOwner *pRmhalspecowner, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {    // inline
+    NV_STATUS status = NV_OK;
+
+    // Recurse to ancestor constructor(s).
+    status = __nvoc_ctor_ChannelDescendant(&pDispSw->__nvoc_base_ChannelDescendant, pRmhalspecowner, pCallContext, pParams, ((void *)0));
+    if (status != NV_OK) goto __nvoc_ctor_DispSwObject_fail_ChannelDescendant;
+
+    // Initialize data fields.
+    __nvoc_init_dataField_DispSwObject(pDispSw, pRmhalspecowner);
+
+    // Call the constructor for this class.
+    status = __nvoc_dispswConstruct(pDispSw, pCallContext, pParams);
     if (status != NV_OK) goto __nvoc_ctor_DispSwObject_fail__init;
     goto __nvoc_ctor_DispSwObject_exit; // Success
 
+    // Unwind on error.
 __nvoc_ctor_DispSwObject_fail__init:
-    __nvoc_dtor_ChannelDescendant(&pThis->__nvoc_base_ChannelDescendant);
+    __nvoc_dtor_ChannelDescendant(&pDispSw->__nvoc_base_ChannelDescendant);
 __nvoc_ctor_DispSwObject_fail_ChannelDescendant:
 __nvoc_ctor_DispSwObject_exit:
-
     return status;
 }
 
@@ -593,18 +607,11 @@ static void __nvoc_init_funcTable_DispSwObject_1(DispSwObject *pThis, RmHalspecO
     PORT_UNREFERENCED_VARIABLE(pRmhalspecowner);
     PORT_UNREFERENCED_VARIABLE(rmVariantHal);
     PORT_UNREFERENCED_VARIABLE(rmVariantHal_HalVarIdx);
-
-    // dispswCtrlCmdNotifyOnVblank -- exported (id=0x90720101)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x48u)
-    pThis->__dispswCtrlCmdNotifyOnVblank__ = &dispswCtrlCmdNotifyOnVblank_IMPL;
-#endif
-} // End __nvoc_init_funcTable_DispSwObject_1 with approximately 1 basic block(s).
+} // End __nvoc_init_funcTable_DispSwObject_1
 
 
-// Initialize vtable(s) for 33 virtual method(s).
+// Initialize vtable(s) for 32 virtual method(s).
 void __nvoc_init_funcTable_DispSwObject(DispSwObject *pThis, RmHalspecOwner *pRmhalspecowner) {
-
-    // Initialize vtable(s) with 1 per-object function pointer(s).
     __nvoc_init_funcTable_DispSwObject_1(pThis, pRmhalspecowner);
 }
 
@@ -640,76 +647,91 @@ void __nvoc_init__DispSwObject(DispSwObject *pThis, RmHalspecOwner *pRmhalspecow
     __nvoc_init_funcTable_DispSwObject(pThis, pRmhalspecowner);
 }
 
-NV_STATUS __nvoc_objCreate_DispSwObject(DispSwObject **ppThis, Dynamic *pParent, NvU32 createFlags, CALL_CONTEXT * arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams)
+NV_STATUS __nvoc_objCreate_DispSwObject(DispSwObject **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams)
 {
-    NV_STATUS status;
-    Object *pParentObj = NULL;
-    DispSwObject *pThis;
+    NV_STATUS __nvoc_status;
+    Object *__nvoc_pParentObj = NULL;
+    DispSwObject *__nvoc_pThis;
     RmHalspecOwner *pRmhalspecowner;
 
-    // Assign `pThis`, allocating memory unless suppressed by flag.
-    status = __nvoc_handleObjCreateMemAlloc(createFlags, sizeof(DispSwObject), (void**)&pThis, (void**)ppThis);
-    if (status != NV_OK)
-        return status;
+    // Don't allocate memory if the caller has already done so.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+    {
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_ppThis != NULL && *__nvoc_ppThis != NULL, NV_ERR_INVALID_PARAMETER);
+        __nvoc_pThis = *__nvoc_ppThis;
+    }
+
+    // Allocate memory
+    else
+    {
+        __nvoc_pThis = portMemAllocNonPaged(sizeof(DispSwObject));
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_pThis != NULL, NV_ERR_NO_MEMORY);
+    }
 
     // Zero is the initial value for everything.
-    portMemSet(pThis, 0, sizeof(DispSwObject));
+    portMemSet(__nvoc_pThis, 0, sizeof(DispSwObject));
 
-    pThis->__nvoc_base_ChannelDescendant.__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.createFlags = createFlags;
+    __nvoc_pThis->__nvoc_base_ChannelDescendant.__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.createFlags = __nvoc_createFlags;
 
     // pParent must be a valid object that derives from a halspec owner class.
-    NV_ASSERT_OR_RETURN(pParent != NULL, NV_ERR_INVALID_ARGUMENT);
+    NV_CHECK_TRUE_OR_GOTO(__nvoc_status, LEVEL_ERROR, __nvoc_pParent != NULL, NV_ERR_INVALID_ARGUMENT, __nvoc_objCreate_DispSwObject_cleanup);
 
     // Link the child into the parent unless flagged not to do so.
-    if (!(createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
+    if (!(__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
     {
-        pParentObj = dynamicCast(pParent, Object);
-        objAddChild(pParentObj, &pThis->__nvoc_base_ChannelDescendant.__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
+        __nvoc_pParentObj = dynamicCast(__nvoc_pParent, Object);
+        objAddChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_ChannelDescendant.__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
     }
     else
     {
-        pThis->__nvoc_base_ChannelDescendant.__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.pParent = NULL;
+        __nvoc_pThis->__nvoc_base_ChannelDescendant.__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.pParent = NULL;
     }
 
-    if ((pRmhalspecowner = dynamicCast(pParent, RmHalspecOwner)) == NULL)
-        pRmhalspecowner = objFindAncestorOfType(RmHalspecOwner, pParent);
-    NV_ASSERT_OR_RETURN(pRmhalspecowner != NULL, NV_ERR_INVALID_ARGUMENT);
+    // HALs are defined by the parent or the first super class.
+    if ((pRmhalspecowner = dynamicCast(__nvoc_pParent, RmHalspecOwner)) == NULL)
+        pRmhalspecowner = objFindAncestorOfType(RmHalspecOwner, __nvoc_pParent);
+    NV_CHECK_TRUE_OR_GOTO(__nvoc_status, LEVEL_ERROR, pRmhalspecowner != NULL, NV_ERR_INVALID_ARGUMENT, __nvoc_objCreate_DispSwObject_cleanup);
 
-    __nvoc_init__DispSwObject(pThis, pRmhalspecowner);
-    status = __nvoc_ctor_DispSwObject(pThis, pRmhalspecowner, arg_pCallContext, arg_pParams);
-    if (status != NV_OK) goto __nvoc_objCreate_DispSwObject_cleanup;
+    // Initialize vtable, RTTI, etc., then call constructor.
+    __nvoc_init__DispSwObject(__nvoc_pThis, pRmhalspecowner);
+    __nvoc_status = __nvoc_ctor_DispSwObject(__nvoc_pThis, pRmhalspecowner, pCallContext, pParams);
+    if (__nvoc_status != NV_OK) goto __nvoc_objCreate_DispSwObject_cleanup;
 
     // Assignment has no effect if NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT is set.
-    *ppThis = pThis;
+    *__nvoc_ppThis = __nvoc_pThis;
 
+    // Success
     return NV_OK;
 
+    // Do not call destructors here since the constructor already called them.
 __nvoc_objCreate_DispSwObject_cleanup:
 
     // Unlink the child from the parent if it was linked above.
-    if (pParentObj != NULL)
-        objRemoveChild(pParentObj, &pThis->__nvoc_base_ChannelDescendant.__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
+    if (__nvoc_pParentObj != NULL)
+        objRemoveChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_ChannelDescendant.__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
 
-    // Do not call destructors here since the constructor already called them.
-    if (createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
-        portMemSet(pThis, 0, sizeof(DispSwObject));
+    // Zero out memory that was allocated by caller.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+        portMemSet(__nvoc_pThis, 0, sizeof(DispSwObject));
+
+    // Free memory allocated by `__nvoc_handleObjCreateMemAlloc`.
     else
     {
-        portMemFree(pThis);
-        *ppThis = NULL;
+        portMemFree(__nvoc_pThis);
+        *__nvoc_ppThis = NULL;
     }
 
-    // coverity[leaked_storage:FALSE]
-    return status;
+    // Failure
+    return __nvoc_status;
 }
 
-NV_STATUS __nvoc_objCreateDynamic_DispSwObject(DispSwObject **ppThis, Dynamic *pParent, NvU32 createFlags, va_list args) {
-    NV_STATUS status;
-    CALL_CONTEXT * arg_pCallContext = va_arg(args, CALL_CONTEXT *);
-    struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams = va_arg(args, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
+NV_STATUS __nvoc_objCreateDynamic_DispSwObject(DispSwObject **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, va_list __nvoc_args) {
+    NV_STATUS __nvoc_status;
+    CALL_CONTEXT *pCallContext = va_arg(__nvoc_args, CALL_CONTEXT *);
+    struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams = va_arg(__nvoc_args, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
 
-    status = __nvoc_objCreate_DispSwObject(ppThis, pParent, createFlags, arg_pCallContext, arg_pParams);
+    __nvoc_status = __nvoc_objCreate_DispSwObject(__nvoc_ppThis, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams);
 
-    return status;
+    return __nvoc_status;
 }
 

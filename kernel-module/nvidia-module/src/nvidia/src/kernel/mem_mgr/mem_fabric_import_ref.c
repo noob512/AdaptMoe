@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -147,6 +147,8 @@ _createTempMemDesc
     pMemdescData->physAttrs = *pPhysAttrs;
     pMemdescData->memFlags = memFlags;
     pMemdescData->cliqueId = pAttrs->cliqueId;
+    pMemdescData->bwMode = pAttrs->bwMode;
+    pMemdescData->bwModeEpoch = pAttrs->bwModeEpoch;
 
     // Associate the memdesc data release callback function.
     memdescSetMemData(pMemDesc, (void *)pMemdescData, NULL);
@@ -200,6 +202,11 @@ memoryfabricimportedrefCtrlValidate_IMPL
     if ((pParams->totalPfns == 0) ||
         (pMemoryFabricImportedRef->numUpdatedPfns >= pParams->totalPfns))
         return NV_ERR_INVALID_ARGUMENT;
+
+    if (pParams->numPfns > NV_ARRAY_ELEMENTS(pParams->pfnArray))
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
 
     if (!portSafeAddU64(pParams->offset, pParams->numPfns, &result) ||
         (result > pParams->totalPfns))

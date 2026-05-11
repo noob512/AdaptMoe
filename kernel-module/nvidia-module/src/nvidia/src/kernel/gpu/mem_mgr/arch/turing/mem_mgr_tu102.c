@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2017-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2017-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -28,7 +28,6 @@
 #include "gpu/mem_mgr/mem_desc.h"
 
 #include "virtualization/hypervisor/hypervisor.h"
-#include "vgpu/vgpu_events.h"
 
 #include "published/turing/tu102/dev_mmu.h"
 #include "published/turing/tu102/kind_macros.h"
@@ -245,6 +244,7 @@ memmgrChooseKind_TU102
                 case NVOS32_TYPE_NOTIFIER:
                 case NVOS32_TYPE_RESERVED:
                 case NVOS32_TYPE_PMA:
+                case NVOS32_TYPE_SYNCPOINT:
                 {
                     if (comprAttr == NVOS32_ATTR_COMPR_NONE || pMemorySystemConfig->bDisableCompbitBacking)
                     {
@@ -685,4 +685,14 @@ memmgrCalculateHeapOffsetWithGSP_TU102
     }
 
     return NV_OK;
+}
+
+NvU32
+memmgrGetPteKindGenericMemoryCompressible_TU102
+(
+    OBJGPU* pGpu,
+    MemoryManager* pMemoryManager
+)
+{
+    return NV_MMU_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE;
 }

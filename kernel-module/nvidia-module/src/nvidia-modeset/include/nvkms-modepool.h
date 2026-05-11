@@ -51,7 +51,9 @@ NvBool nvValidateModeForModeset(NVDpyEvoRec *pDpyEvo,
                                 const struct NvKmsRect *pViewPortOut,
                                 NVDpyAttributeColor *pDpyColor,
                                 NVHwModeTimingsEvo *pTimingsEvo,
-                                NVT_VIDEO_INFOFRAME_CTRL *pInfoFrameCtrl);
+                                NVT_VIDEO_INFOFRAME_CTRL *pInfoFrameCtrl,
+                                NVT_VENDOR_SPECIFIC_INFOFRAME_CTRL *pVSInfoFrameCtrl,
+                                NVT_EXTENDED_METADATA_PACKET_INFOFRAME_CTRL *pEmpInfoFrameCtrl);
 
 const NVT_TIMING *nvFindEdidNVT_TIMING(
     const NVDpyEvoRec *pDpyEvo,

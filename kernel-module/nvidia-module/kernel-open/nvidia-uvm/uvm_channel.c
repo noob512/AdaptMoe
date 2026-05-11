@@ -34,8 +34,9 @@
 #include "uvm_kvmalloc.h"
 
 #include "nv_uvm_types.h"
+#include "nv_uvm_user_types.h"
 #include "nv_uvm_interface.h"
-#include "clb06f.h"
+#include "clc46f.h"
 #include "uvm_conf_computing.h"
 
 
@@ -381,7 +382,9 @@ static void lock_channel_for_push(uvm_channel_t *channel)
     __set_bit(index, channel->pool->conf_computing.push_locks);
 }
 
-static bool test_claim_and_lock_channel(uvm_channel_t *channel, NvU32 num_gpfifo_entries)
+static bool test_claim_and_lock_channel(uvm_channel_t *channel,
+                                        NvU32 num_gpfifo_entries,
+                                        uvm_channel_reserve_type_t reserve_type)
 {
     UVM_ASSERT(g_uvm_global.conf_computing_enabled);
     uvm_channel_pool_assert_locked(channel->pool);
@@ -390,8 +393,7 @@ static bool test_claim_and_lock_channel(uvm_channel_t *channel, NvU32 num_gpfifo
     if (uvm_channel_is_locked_for_push(channel))
         return false;
 
-    // Confidential compute is not using p2p ops, reserve without p2p
-    if (try_claim_channel_locked(channel, num_gpfifo_entries, UVM_CHANNEL_RESERVE_NO_P2P)) {
+    if (try_claim_channel_locked(channel, num_gpfifo_entries, reserve_type)) {
         lock_channel_for_push(channel);
         return true;
     }
@@ -504,7 +506,9 @@ NV_STATUS uvm_channel_pool_rotate_key(uvm_channel_pool_t *pool)
 
 // Reserve a channel in the specified pool. The channel is locked until the push
 // ends
-static NV_STATUS channel_reserve_and_lock_in_pool(uvm_channel_pool_t *pool, uvm_channel_t **channel_out)
+static NV_STATUS channel_reserve_and_lock_in_pool(uvm_channel_pool_t *pool,
+                                                  uvm_channel_reserve_type_t reserve_type,
+                                                  uvm_channel_t **channel_out)
 {
     uvm_channel_t *channel;
     uvm_spin_loop_t spin;
@@ -533,8 +537,7 @@ static NV_STATUS channel_reserve_and_lock_in_pool(uvm_channel_pool_t *pool, uvm_
     for_each_clear_bit(index, pool->conf_computing.push_locks, pool->num_channels) {
         channel = &pool->channels[index];
 
-        // Confidential compute is not using p2p ops, reserve without p2p
-        if (try_claim_channel_locked(channel, 1, UVM_CHANNEL_RESERVE_NO_P2P)) {
+        if (try_claim_channel_locked(channel, 1, reserve_type)) {
             lock_channel_for_push(channel);
             goto done;
         }
@@ -551,7 +554,7 @@ static NV_STATUS channel_reserve_and_lock_in_pool(uvm_channel_pool_t *pool, uvm_
 
             channel_pool_lock(pool);
 
-            if (test_claim_and_lock_channel(channel, 1))
+            if (test_claim_and_lock_channel(channel, 1, reserve_type))
                 goto done;
 
             channel_pool_unlock(pool);
@@ -560,6 +563,11 @@ static NV_STATUS channel_reserve_and_lock_in_pool(uvm_channel_pool_t *pool, uvm_
             if (status != NV_OK) {
                 uvm_up(&pool->conf_computing.push_sem);
                 return status;
+            }
+
+            if (reserve_type == UVM_CHANNEL_RESERVE_WITH_P2P && channel->suspended_p2p) {
+                uvm_up(&pool->conf_computing.push_sem);
+                return NV_ERR_BUSY_RETRY;
             }
 
             UVM_SPIN_LOOP(&spin);
@@ -583,7 +591,7 @@ static NV_STATUS channel_reserve_in_pool(uvm_channel_pool_t *pool,
     UVM_ASSERT(pool);
 
     if (g_uvm_global.conf_computing_enabled)
-        return channel_reserve_and_lock_in_pool(pool, channel_out);
+        return channel_reserve_and_lock_in_pool(pool, reserve_type, channel_out);
 
     uvm_for_each_channel_in_pool(channel, pool) {
         // TODO: Bug 1764953: Prefer idle/less busy channels
@@ -981,7 +989,7 @@ static void internal_channel_submit_work(uvm_push_t *push, NvU32 push_size, NvU3
     uvm_pushbuffer_t *pushbuffer = uvm_channel_get_pushbuffer(channel);
     uvm_gpu_t *gpu = uvm_channel_get_gpu(channel);
 
-    BUILD_BUG_ON(sizeof(*gpfifo_entry) != NVB06F_GP_ENTRY__SIZE);
+    BUILD_BUG_ON(sizeof(*gpfifo_entry) != NVC46F_GP_ENTRY__SIZE);
     UVM_ASSERT(!uvm_channel_is_proxy(channel));
 
     gpfifo_entry = (NvU64*)channel->channel_info.gpFifoEntries + channel->cpu_put;
@@ -1799,7 +1807,9 @@ NV_STATUS uvm_channel_write_ctrl_gpfifo(uvm_channel_t *channel, NvU64 ctrl_fifo_
     return NV_OK;
 }
 
-static NV_STATUS channel_reserve_and_lock(uvm_channel_t *channel, NvU32 num_gpfifo_entries)
+static NV_STATUS channel_reserve_and_lock(uvm_channel_t *channel,
+                                          NvU32 num_gpfifo_entries,
+                                          uvm_channel_reserve_type_t reserve_type)
 {
     NV_STATUS status;
     uvm_spin_loop_t spin;
@@ -1822,7 +1832,7 @@ static NV_STATUS channel_reserve_and_lock(uvm_channel_t *channel, NvU32 num_gpfi
 
     channel_pool_lock(pool);
 
-    if (test_claim_and_lock_channel(channel, num_gpfifo_entries))
+    if (test_claim_and_lock_channel(channel, num_gpfifo_entries, reserve_type))
         goto out;
 
     channel_pool_unlock(pool);
@@ -1833,7 +1843,7 @@ static NV_STATUS channel_reserve_and_lock(uvm_channel_t *channel, NvU32 num_gpfi
 
         channel_pool_lock(pool);
 
-        if (test_claim_and_lock_channel(channel, num_gpfifo_entries))
+        if (test_claim_and_lock_channel(channel, num_gpfifo_entries, reserve_type))
             goto out;
 
         channel_pool_unlock(pool);
@@ -1857,8 +1867,9 @@ NV_STATUS uvm_channel_reserve(uvm_channel_t *channel, NvU32 num_gpfifo_entries)
     NV_STATUS status = NV_OK;
     uvm_spin_loop_t spin;
 
+    // Direct channel reservations don't use p2p
     if (g_uvm_global.conf_computing_enabled)
-        return channel_reserve_and_lock(channel, num_gpfifo_entries);
+        return channel_reserve_and_lock(channel, num_gpfifo_entries, UVM_CHANNEL_RESERVE_NO_P2P);
 
     // Direct channel reservations don't use p2p
     if (try_claim_channel(channel, num_gpfifo_entries, UVM_CHANNEL_RESERVE_NO_P2P))
@@ -3007,10 +3018,16 @@ static int compare_ce_for_channel_type(const UvmGpuCopyEngineCaps *ce_caps,
 
             break;
 
-        // For GPU_INTERNAL we want the max possible bandwidth for CEs. For now
-        // assume that the number of PCEs is a good measure.
+        // For GPU_INTERNAL we opt for an LCE optimized for scrubbing, if
+        // available. Otherwise, we want the max possible bandwidth for CEs. For
+        // now assume that the number of PCEs is a good measure.
+        // If not, we fall back to less-used LCEs.
         // TODO: Bug 1735254: Add a direct CE query for local FB bandwidth
         case UVM_CHANNEL_TYPE_GPU_INTERNAL:
+            // Always prefer a scrub-optimized LCE.
+            if (cap0->scrub != cap1->scrub)
+                return cap1->scrub - cap0->scrub;
+
             {
                 int pce_diff = (int)hweight32(cap1->cePceMask) - (int)hweight32(cap0->cePceMask);
 
@@ -3029,6 +3046,7 @@ static int compare_ce_for_channel_type(const UvmGpuCopyEngineCaps *ce_caps,
         // system-wide) so just break out to get the default ordering which
         // prioritizes usage count.
         case UVM_CHANNEL_TYPE_MEMOPS:
+
         // For WLC we only care about using a dedicated CE, which requires
         // knowing the global CE mappings. For now just rely on the default
         // ordering, which results on selecting an unused CE (if available).
@@ -3058,7 +3076,7 @@ static int compare_ce_for_channel_type(const UvmGpuCopyEngineCaps *ce_caps,
 // Select the preferred CE for the given channel types.
 static void pick_ces_for_channel_types(uvm_channel_manager_t *manager,
                                        const UvmGpuCopyEngineCaps *ce_caps,
-                                       uvm_channel_type_t *channel_types,
+                                       const uvm_channel_type_t *channel_types,
                                        unsigned num_channel_types,
                                        unsigned *preferred_ce)
 {
@@ -3067,7 +3085,7 @@ static void pick_ces_for_channel_types(uvm_channel_manager_t *manager,
     for (i = 0; i < num_channel_types; ++i) {
         unsigned ce;
         unsigned best_ce = UVM_COPY_ENGINE_COUNT_MAX;
-        uvm_channel_type_t type = channel_types[i];
+        const uvm_channel_type_t type = channel_types[i];
 
         for (ce = 0; ce < UVM_COPY_ENGINE_COUNT_MAX; ++ce) {
             if (!ce_is_usable(ce_caps + ce))
@@ -3104,11 +3122,11 @@ static void pick_ces(uvm_channel_manager_t *manager, const UvmGpuCopyEngineCaps 
     // the usage count of each CE and it increases every time a CE
     // is selected. MEMOPS has the least priority as it only cares about
     // low usage of the CE to improve latency
-    uvm_channel_type_t types[] = {UVM_CHANNEL_TYPE_CPU_TO_GPU,
-                                  UVM_CHANNEL_TYPE_GPU_TO_CPU,
-                                  UVM_CHANNEL_TYPE_GPU_INTERNAL,
-                                  UVM_CHANNEL_TYPE_GPU_TO_GPU,
-                                  UVM_CHANNEL_TYPE_MEMOPS};
+    static const uvm_channel_type_t types[] = { UVM_CHANNEL_TYPE_CPU_TO_GPU,
+                                                UVM_CHANNEL_TYPE_GPU_TO_CPU,
+                                                UVM_CHANNEL_TYPE_GPU_INTERNAL,
+                                                UVM_CHANNEL_TYPE_GPU_TO_GPU,
+                                                UVM_CHANNEL_TYPE_MEMOPS };
 
     UVM_ASSERT(!g_uvm_global.conf_computing_enabled);
 
@@ -3123,19 +3141,31 @@ static void pick_ces_conf_computing(uvm_channel_manager_t *manager,
     uvm_gpu_t *gpu = manager->gpu;
 
     // The WLC type must go last so an unused CE is chosen, if available
-    uvm_channel_type_t types[] = {UVM_CHANNEL_TYPE_CPU_TO_GPU,
-                                  UVM_CHANNEL_TYPE_GPU_TO_CPU,
-                                  UVM_CHANNEL_TYPE_GPU_INTERNAL,
-                                  UVM_CHANNEL_TYPE_MEMOPS,
-                                  UVM_CHANNEL_TYPE_WLC};
+    static const uvm_channel_type_t types[] = { UVM_CHANNEL_TYPE_CPU_TO_GPU,
+                                                UVM_CHANNEL_TYPE_GPU_TO_CPU,
+                                                UVM_CHANNEL_TYPE_GPU_INTERNAL,
+                                                UVM_CHANNEL_TYPE_MEMOPS,
+                                                UVM_CHANNEL_TYPE_WLC };
+
+    static const uvm_channel_type_t types_p2p[] = { UVM_CHANNEL_TYPE_CPU_TO_GPU,
+                                                    UVM_CHANNEL_TYPE_GPU_TO_CPU,
+                                                    UVM_CHANNEL_TYPE_GPU_INTERNAL,
+                                                    UVM_CHANNEL_TYPE_GPU_TO_GPU,
+                                                    UVM_CHANNEL_TYPE_MEMOPS,
+                                                    UVM_CHANNEL_TYPE_WLC };
 
     UVM_ASSERT(g_uvm_global.conf_computing_enabled);
 
-    pick_ces_for_channel_types(manager, ce_caps, types, ARRAY_SIZE(types), preferred_ce);
+    if (gpu->parent->peer_copy_mode == UVM_GPU_PEER_COPY_MODE_UNSUPPORTED) {
+        pick_ces_for_channel_types(manager, ce_caps, types, ARRAY_SIZE(types), preferred_ce);
 
-    // Direct transfers between GPUs are disallowed in Confidential Computing,
-    // but the preferred CE is still set to an arbitrary value for consistency.
-    preferred_ce[UVM_CHANNEL_TYPE_GPU_TO_GPU] = preferred_ce[UVM_CHANNEL_TYPE_GPU_TO_CPU];
+        // If direct transfers between GPUs are disallowed, the preferred
+        // CE is still set to an arbitrary value for consistency.
+        preferred_ce[UVM_CHANNEL_TYPE_GPU_TO_GPU] = preferred_ce[UVM_CHANNEL_TYPE_GPU_TO_CPU];
+    }
+    else {
+        pick_ces_for_channel_types(manager, ce_caps, types_p2p, ARRAY_SIZE(types_p2p), preferred_ce);
+    }
 
     best_wlc_ce = preferred_ce[UVM_CHANNEL_TYPE_WLC];
 
@@ -3323,21 +3353,6 @@ static void init_channel_manager_conf(uvm_channel_manager_t *manager)
         else {
             manager->conf.pushbuffer_loc = UVM_BUFFER_LOCATION_VID;
         }
-    }
-
-    // 3- GPFIFO/GPPut location
-    // Only support the knobs for GPFIFO/GPPut on Volta+
-    if (!gpu->parent->gpfifo_in_vidmem_supported) {
-        if (manager->conf.gpput_loc == UVM_BUFFER_LOCATION_SYS) {
-            UVM_INFO_PRINT("CAUTION: allocating GPPut in sysmem is NOT supported and may crash the system, using %s "
-                           "instead\n",
-                           buffer_location_to_string(UVM_BUFFER_LOCATION_DEFAULT));
-        }
-
-        manager->conf.gpfifo_loc = UVM_BUFFER_LOCATION_DEFAULT;
-        manager->conf.gpput_loc = UVM_BUFFER_LOCATION_DEFAULT;
-
-        return;
     }
 
     gpfifo_loc_value = uvm_channel_gpfifo_loc;
@@ -4095,6 +4110,26 @@ static const char *get_gpput_location_string(uvm_channel_t *channel)
         return buffer_location_to_string(UVM_BUFFER_LOCATION_SYS);
 
     return buffer_location_to_string(channel->pool->manager->conf.gpput_loc);
+}
+
+void uvm_gpu_print_ce_mapping(const uvm_gpu_t *gpu, struct seq_file *s)
+{
+    uvm_channel_type_t type;
+
+    UVM_SEQ_OR_DBG_PRINT(s, "CE channel_type to engine index mapping:\n");
+    for (type = 0; type < UVM_CHANNEL_TYPE_CE_COUNT; type++) {
+        // For the UVM_CHANNEL_TYPE_GPU_TO_GPU type, we print the default pool,
+        // which may not be the optimal CE (in gpu_to_gpu) on NVLINK-based
+        // systems, as we may have different CEs per peer GPU.
+        uvm_channel_pool_t *channel_pool = gpu->channel_manager->pool_to_use.default_for_type[type];
+
+        if (channel_pool) {
+            UVM_SEQ_OR_DBG_PRINT(s, " %-30s ce %-2u #channels %-2u\n",
+                                    uvm_channel_type_to_string(type),
+                                    channel_pool->engine_index,
+                                    channel_pool->num_channels);
+        }
+    }
 }
 
 static void uvm_channel_print_info(uvm_channel_t *channel, struct seq_file *s)

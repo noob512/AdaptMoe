@@ -30,19 +30,14 @@
 
 #define RPC_VERSION_FROM_VGX_VERSION(major, minor) (DRF_NUM(_RPC, _VERSION_NUMBER, _MAJOR, major) | \
                                                     DRF_NUM(_RPC, _VERSION_NUMBER, _MINOR, minor))
-#define VGX_MAJOR_VERSION_NUMBER 0x2A
-#define VGX_MINOR_VERSION_NUMBER 0x09
+#define VGX_MAJOR_VERSION_NUMBER 0x2D
+#define VGX_MINOR_VERSION_NUMBER 0x03
 
-#define VGX_MAJOR_VERSION_NUMBER_VGPU_12_0 0x1A
-#define VGX_MINOR_VERSION_NUMBER_VGPU_12_0 0x18
-#define VGX_MAJOR_VERSION_NUMBER_VGPU_13_0 0x1C
-#define VGX_MINOR_VERSION_NUMBER_VGPU_13_0 0x0A
-#define VGX_MAJOR_VERSION_NUMBER_VGPU_16_0 0x23
 #define VGX_MAJOR_VERSION_NUMBER_VGPU_17_0 0x25
 #define VGX_MAJOR_VERSION_NUMBER_VGPU_18_0 0x29
 #define VGX_MINOR_VERSION_NUMBER_VGPU_18_0 0x0B
-
-#define VGX_MAJOR_VERSION_WITH_FB_COPY_LARGE_BLOCKSZ_SUPPORT 0x28
+#define VGX_MAJOR_VERSION_NUMBER_VGPU_19_0 0x2B
+#define VGX_MINOR_VERSION_NUMBER_VGPU_19_0 0x13
 
 /**
  * This macro have the mapping between internal (RPC) and external version
@@ -55,7 +50,10 @@
  * 2. This is the first break in migration compatibility after a release.
  */
 #define NV_VGPU_GRIDSW_INTERNAL_TO_EXTERNAL_VERSION_MAPPING \
-    {{0x2A, 0x00}, {0x2A, 0x09}, {0x19, 0x01}},             \
+    {{0x2D, 0x00}, {0x2D, 0x03}, {0x1C, 0x01}},             \
+    {{0x2C, 0x00}, {0x2C, 0x07}, {0x1B, 0x01}},             \
+    {{0x2B, 0x00}, {0x2B, 0x13}, {0x1A, 0x01}},             \
+    {{0x2A, 0x00}, {0x2A, 0x08}, {0x19, 0x01}},             \
     {{0x29, 0x00}, {0x29, 0x0B}, {0x18, 0x01}},             \
     {{0x29, 0x0C}, {0x29, 0x0C}, {0x18, 0x02}},             \
     {{0x28, 0x00}, {0x28, 0x09}, {0x17, 0x01}},             \
@@ -109,13 +107,13 @@
 
 /* WARNING: Should be updated with each vGPU release, if there is a break in
  * migration compatibility during the development of that release. */
-#define NV_VGPU_MAX_SUPPORTED_GRIDSW_VERSION_EXTERNAL_MAJOR 0x19
+#define NV_VGPU_MAX_SUPPORTED_GRIDSW_VERSION_EXTERNAL_MAJOR 0x1C
 #define NV_VGPU_MAX_SUPPORTED_GRIDSW_VERSION_EXTERNAL_MINOR 0x1
 
 /* WARNING: Should be updated with each vGPU release, if minimum supported
  * version change on the host.
  */
-#define NV_VGPU_MIN_SUPPORTED_GRIDSW_VERSION_EXTERNAL_MAJOR 0x7
+#define NV_VGPU_MIN_SUPPORTED_GRIDSW_VERSION_EXTERNAL_MAJOR 0x18
 #define NV_VGPU_MIN_SUPPORTED_GRIDSW_VERSION_EXTERNAL_MINOR 0x1
 
 #endif // __vgpu_vgpu_version_h__

@@ -16,7 +16,7 @@
 
 
 #ifdef DEBUG
-char __nvoc_class_id_uniqueness_check__0xe803b6 = 1;
+char __nvoc_class_id_uniqueness_check__e803b6 = 1;
 #endif
 
 extern const struct NVOC_CLASS_DEF __nvoc_class_def_OBJHAL;
@@ -38,19 +38,18 @@ extern const struct NVOC_EXPORT_INFO __nvoc_export_info__OBJHAL;
 
 // Up-thunk(s) to bridge OBJHAL methods to ancestors (if any)
 
+// Class-specific details for OBJHAL
 const struct NVOC_CLASS_DEF __nvoc_class_def_OBJHAL = 
 {
-    /*classInfo=*/ {
-        /*size=*/               sizeof(OBJHAL),
-        /*classId=*/            classId(OBJHAL),
-        /*providerId=*/         &__nvoc_rtti_provider,
+    .classInfo.size =               sizeof(OBJHAL),
+    .classInfo.classId =            classId(OBJHAL),
+    .classInfo.providerId =         &__nvoc_rtti_provider,
 #if NV_PRINTF_STRINGS_ALLOWED
-        /*name=*/               "OBJHAL",
+    .classInfo.name =               "OBJHAL",
 #endif
-    },
-    /*objCreatefn=*/        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_OBJHAL,
-    /*pCastInfo=*/          &__nvoc_castinfo__OBJHAL,
-    /*pExportInfo=*/        &__nvoc_export_info__OBJHAL
+    .objCreatefn =        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_OBJHAL,
+    .pCastInfo =          &__nvoc_castinfo__OBJHAL,
+    .pExportInfo =        &__nvoc_export_info__OBJHAL
 };
 
 
@@ -76,31 +75,41 @@ const struct NVOC_CASTINFO __nvoc_castinfo__OBJHAL = {
 
 const struct NVOC_EXPORT_INFO __nvoc_export_info__OBJHAL = 
 {
-    /*numEntries=*/     0,
-    /*pExportEntries=*/  0
+    .numEntries=     0,
+    .pExportEntries= 0
 };
 
+
+// Destruct OBJHAL object.
 void __nvoc_dtor_Object(Object*);
-void __nvoc_dtor_OBJHAL(OBJHAL *pThis) {
+void __nvoc_dtor_OBJHAL(OBJHAL* pThis) {
+
+// Recurse to superclass destructors.
     __nvoc_dtor_Object(&pThis->__nvoc_base_Object);
+
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
-
 void __nvoc_init_dataField_OBJHAL(OBJHAL *pThis) {
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
 
-NV_STATUS __nvoc_ctor_Object(Object* );
+
+// Construct OBJHAL object.
+NV_STATUS __nvoc_ctor_Object(Object *);
 NV_STATUS __nvoc_ctor_OBJHAL(OBJHAL *pThis) {
     NV_STATUS status = NV_OK;
+
+    // Recurse to ancestor constructor(s).
     status = __nvoc_ctor_Object(&pThis->__nvoc_base_Object);
     if (status != NV_OK) goto __nvoc_ctor_OBJHAL_fail_Object;
+
+    // Initialize data fields.
     __nvoc_init_dataField_OBJHAL(pThis);
     goto __nvoc_ctor_OBJHAL_exit; // Success
 
+    // Unwind on error.
 __nvoc_ctor_OBJHAL_fail_Object:
 __nvoc_ctor_OBJHAL_exit:
-
     return status;
 }
 
@@ -133,66 +142,80 @@ void __nvoc_init__OBJHAL(OBJHAL *pThis) {
     __nvoc_init_funcTable_OBJHAL(pThis);
 }
 
-NV_STATUS __nvoc_objCreate_OBJHAL(OBJHAL **ppThis, Dynamic *pParent, NvU32 createFlags)
+NV_STATUS __nvoc_objCreate_OBJHAL(OBJHAL **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags)
 {
-    NV_STATUS status;
-    Object *pParentObj = NULL;
-    OBJHAL *pThis;
+    NV_STATUS __nvoc_status;
+    Object *__nvoc_pParentObj = NULL;
+    OBJHAL *__nvoc_pThis;
 
-    // Assign `pThis`, allocating memory unless suppressed by flag.
-    status = __nvoc_handleObjCreateMemAlloc(createFlags, sizeof(OBJHAL), (void**)&pThis, (void**)ppThis);
-    if (status != NV_OK)
-        return status;
+    // Don't allocate memory if the caller has already done so.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+    {
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_ppThis != NULL && *__nvoc_ppThis != NULL, NV_ERR_INVALID_PARAMETER);
+        __nvoc_pThis = *__nvoc_ppThis;
+    }
+
+    // Allocate memory
+    else
+    {
+        __nvoc_pThis = portMemAllocNonPaged(sizeof(OBJHAL));
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_pThis != NULL, NV_ERR_NO_MEMORY);
+    }
 
     // Zero is the initial value for everything.
-    portMemSet(pThis, 0, sizeof(OBJHAL));
+    portMemSet(__nvoc_pThis, 0, sizeof(OBJHAL));
 
-    pThis->__nvoc_base_Object.createFlags = createFlags;
+    __nvoc_pThis->__nvoc_base_Object.createFlags = __nvoc_createFlags;
 
     // Link the child into the parent if there is one unless flagged not to do so.
-    if (pParent != NULL && !(createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
+    if (__nvoc_pParent != NULL && !(__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
     {
-        pParentObj = dynamicCast(pParent, Object);
-        objAddChild(pParentObj, &pThis->__nvoc_base_Object);
+        __nvoc_pParentObj = dynamicCast(__nvoc_pParent, Object);
+        objAddChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_Object);
     }
     else
     {
-        pThis->__nvoc_base_Object.pParent = NULL;
+        __nvoc_pThis->__nvoc_base_Object.pParent = NULL;
     }
 
-    __nvoc_init__OBJHAL(pThis);
-    status = __nvoc_ctor_OBJHAL(pThis);
-    if (status != NV_OK) goto __nvoc_objCreate_OBJHAL_cleanup;
+    // Initialize vtable, RTTI, etc., then call constructor.
+    __nvoc_init__OBJHAL(__nvoc_pThis);
+    __nvoc_status = __nvoc_ctor_OBJHAL(__nvoc_pThis);
+    if (__nvoc_status != NV_OK) goto __nvoc_objCreate_OBJHAL_cleanup;
 
     // Assignment has no effect if NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT is set.
-    *ppThis = pThis;
+    *__nvoc_ppThis = __nvoc_pThis;
 
+    // Success
     return NV_OK;
 
+    // Do not call destructors here since the constructor already called them.
 __nvoc_objCreate_OBJHAL_cleanup:
 
     // Unlink the child from the parent if it was linked above.
-    if (pParentObj != NULL)
-        objRemoveChild(pParentObj, &pThis->__nvoc_base_Object);
+    if (__nvoc_pParentObj != NULL)
+        objRemoveChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_Object);
 
-    // Do not call destructors here since the constructor already called them.
-    if (createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
-        portMemSet(pThis, 0, sizeof(OBJHAL));
+    // Zero out memory that was allocated by caller.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+        portMemSet(__nvoc_pThis, 0, sizeof(OBJHAL));
+
+    // Free memory allocated by `__nvoc_handleObjCreateMemAlloc`.
     else
     {
-        portMemFree(pThis);
-        *ppThis = NULL;
+        portMemFree(__nvoc_pThis);
+        *__nvoc_ppThis = NULL;
     }
 
-    // coverity[leaked_storage:FALSE]
-    return status;
+    // Failure
+    return __nvoc_status;
 }
 
-NV_STATUS __nvoc_objCreateDynamic_OBJHAL(OBJHAL **ppThis, Dynamic *pParent, NvU32 createFlags, va_list args) {
-    NV_STATUS status;
+NV_STATUS __nvoc_objCreateDynamic_OBJHAL(OBJHAL **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, va_list __nvoc_args) {
+    NV_STATUS __nvoc_status;
 
-    status = __nvoc_objCreate_OBJHAL(ppThis, pParent, createFlags);
+    __nvoc_status = __nvoc_objCreate_OBJHAL(__nvoc_ppThis, __nvoc_pParent, __nvoc_createFlags);
 
-    return status;
+    return __nvoc_status;
 }
 

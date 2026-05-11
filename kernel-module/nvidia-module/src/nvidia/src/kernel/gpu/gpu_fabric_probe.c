@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -45,8 +45,8 @@
 // Structure to hold gpu probe information
 typedef struct GPU_FABRIC_PROBE_INFO_KERNEL
 {
-    volatile NvU32 probeRespRcvd;
-    NvU8 bwMode;
+    PORT_ATOMIC NvU32 probeRespRcvd;
+    NvU16 bwMode;
 
     OBJGPU *pGpu;
 
@@ -102,6 +102,22 @@ _gpuFabricProbeInvalidate
 
     if (pFabricVAS != NULL)
         fabricvaspaceClearUCRange(pFabricVAS);
+}
+
+static void
+_gpuFabricProbeCheckResetRequired
+(
+    OBJGPU *pGpu,
+    nvlink_inband_gpu_probe_rsp_msg_t *pProbeRespMsg
+)
+{
+    if (REF_VAL(NVLINK_INBAND_FABRIC_HEALTH_MASK_INCORRECT_CONFIGURATION, pProbeRespMsg->probeRsp.fabricHealthMask) ==
+        NVLINK_INBAND_FABRIC_HEALTH_MASK_INCORRECT_CONFIGURATION_GPU_STATE_INVALID)
+    {
+        pGpu->setProperty(pGpu, PDB_PROP_GPU_RECOVERY_SQUASH_XID154, NV_TRUE);
+        gpuMarkDeviceForDrainAndReset(pGpu);
+        pGpu->setProperty(pGpu, PDB_PROP_GPU_RECOVERY_SQUASH_XID154, NV_FALSE);
+    }
 }
 
 NV_STATUS
@@ -524,7 +540,7 @@ _gpuFabricProbeSendCliqueIdChangeEvent
 }
 
 static void
-_gpuFrabricProbeUpdateSupportedBwModes
+_gpuFabricProbeUpdateSupportedBwModes
 (
     OBJGPU *pGpu,
     GPU_FABRIC_PROBE_INFO_KERNEL *pGpuFabricProbeInfoKernel
@@ -537,12 +553,12 @@ _gpuFrabricProbeUpdateSupportedBwModes
     {
         // Check if maxRbmLinks is within max supported links
         NV_ASSERT_OR_RETURN_VOID(maxRbmLinks <= NVLINK_MAX_LINKS_SW);
-        pKernelNvlink->maxRbmLinks = maxRbmLinks;
+        knvlinkSetMaxBWModeLinks(pGpu, pKernelNvlink, maxRbmLinks);
     }
 }
 
 static void
-_gpuFrabricProbeRbmSleepLinks
+_gpuFabricProbeRbmSleepLinks
 (
     OBJGPU *pGpu,
     GPU_FABRIC_PROBE_INFO_KERNEL *pGpuFabricProbeInfoKernel
@@ -552,23 +568,32 @@ _gpuFrabricProbeRbmSleepLinks
     NV_STATUS status = NV_OK;
     NvU32 enabledLinkMask;
     NvU32 linkMask;
+    NVLINK_BIT_VECTOR sleepLinkVec;
+    NvBool bEnableABM = knvlinkGetAbmEnabled(pGpu, pKernelNvlink);
 
-    // Check if probe request has rbmRequested set
-    if (DRF_VAL(_GPU, _NVLINK, _BW_MODE, pGpuFabricProbeInfoKernel->bwMode) !=
-        GPU_NVLINK_BW_MODE_LINK_COUNT)
+    // Bail if RBM was not requested and ABM is not enabled/advertised
+    if ((DRF_VAL(_GPU, _NVLINK, _BW_MODE, pGpuFabricProbeInfoKernel->bwMode) != GPU_NVLINK_BW_MODE_LINK_COUNT) &&
+        (!bEnableABM ||
+         !(pGpuFabricProbeInfoKernel->probeResponseMsg.probeRsp.fmCaps & NVLINK_INBAND_GPU_PROBE_CAPS_ADAPTIVE_BANDWIDTH_SUPPORT)))
     {
         return;
     }
 
     // Set links requested in linkMaskToBeReduced to sleep
-    enabledLinkMask = knvlinkGetEnabledLinkMask(pGpu, pKernelNvlink);
+    NVLINK_BIT_VECTOR *pEnabledLinksVec = knvlinkGetEnabledLinkMask(pGpu, pKernelNvlink);
+    NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+        convertBitVectorToLinkMasks(pEnabledLinksVec, &enabledLinkMask, sizeof(enabledLinkMask), NULL),
+        return);
     linkMask = pGpuFabricProbeInfoKernel->probeResponseMsg.probeRsp.linkMaskToBeReduced &
                             enabledLinkMask;
-    status = knvlinkEnterExitSleep(pGpu, pKernelNvlink, linkMask, NV_TRUE);
+    NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+        convertLinkMasksToBitVector(&linkMask, sizeof(linkMask), NULL, &sleepLinkVec),
+        return);
+    status = knvlinkEnterExitSleep(pGpu, pKernelNvlink, &sleepLinkVec, NV_TRUE);
     if (status != NV_OK)
     {
-        NV_PRINTF(LEVEL_ERROR, "Error setting links to sleep on linkmask 0x%x\n",
-                  linkMask);
+        NV_PRINTF(LEVEL_ERROR, "Error setting links to sleep on linkmask "NV_BITVECTOR_INLINE_FMTX"\n",
+                  NV_BITVECTOR_INLINE_PRINTF_ARG(&sleepLinkVec));
     }
 }
 
@@ -627,13 +652,15 @@ gpuFabricProbeReceiveKernelCallback
     portAtomicSetU32(&pGpuFabricProbeInfoKernel->probeRespRcvd, 1);
 
     status = _gpuFabricProbeFullSanityCheck(pGpuFabricProbeInfoKernel);
-    NV_CHECK_OR_RETURN(LEVEL_ERROR, status == NV_OK, status);
+    NV_CHECK_OR_RETURN(LEVEL_INFO, status == NV_OK, status);
 
     _gpuFabricProbeSetupGpaRange(pGpu, pGpuFabricProbeInfoKernel);
     _gpuFabricProbeSetupFlaRange(pGpu, pGpuFabricProbeInfoKernel);
 
     // Update supported bandwidth modes from probe response
-    _gpuFrabricProbeUpdateSupportedBwModes(pGpu, pGpuFabricProbeInfoKernel);
+    _gpuFabricProbeUpdateSupportedBwModes(pGpu, pGpuFabricProbeInfoKernel);
+
+    _gpuFabricProbeCheckResetRequired(pGpu, pProbeRespMsg);
 
     pKernelNvlink = GPU_GET_KERNEL_NVLINK(pGpu);
     if (pKernelNvlink != NULL)
@@ -641,12 +668,36 @@ gpuFabricProbeReceiveKernelCallback
         if (pKernelNvlink->getProperty(pKernelNvlink, PDB_PROP_KNVLINK_RBM_LINK_COUNT_ENABLED))
         {
             // Set links to sleep based on probe response
-            _gpuFrabricProbeRbmSleepLinks(pGpu, pGpuFabricProbeInfoKernel);
+            _gpuFabricProbeRbmSleepLinks(pGpu, pGpuFabricProbeInfoKernel);
         }
     }
 
 
     return NV_OK;
+}
+
+static void
+_gpuFabricProbeUpdateABMLinkMask
+(
+    OBJGPU *pGpu,
+    GPU_FABRIC_PROBE_INFO_KERNEL *pGpuFabricProbeInfoKernel,
+    NvU8 action
+)
+{
+    KernelNvlink *pKernelNvlink = GPU_GET_KERNEL_NVLINK(pGpu);
+    NvBool bNeedsRCRecovery = NV_FALSE;
+
+    if (pKernelNvlink == NULL)
+        return;
+
+    if ((action != NVLINK_INBAND_GPU_PROBE_UPDATE_ACTION_CHANGE_AMAP) &&
+        (action != NVLINK_INBAND_GPU_PROBE_UPDATE_ACTION_CHANGE_AMAP_AND_QUIESCE))
+    {
+        return;
+    }
+
+    bNeedsRCRecovery = (action == NVLINK_INBAND_GPU_PROBE_UPDATE_ACTION_CHANGE_AMAP_AND_QUIESCE);
+    knvlinkABMLinkMaskUpdate(pGpu, pKernelNvlink, bNeedsRCRecovery);
 }
 
 NV_STATUS
@@ -662,6 +713,10 @@ gpuFabricProbeReceiveUpdateKernelCallback
     nvlink_inband_gpu_probe_update_req_msg_t *pProbeUpdateReqMsg;
     nvlink_inband_gpu_probe_rsp_msg_t *pProbeRespMsg;
     GPU_FABRIC_PROBE_INFO_KERNEL *pGpuFabricProbeInfoKernel;
+    NVLINK_BIT_VECTOR *pEnabledLinksVec;
+    KernelNvlink *pKernelNvlink;
+    NvU32 enabledLinkMask;
+    NvBool bEnableABM;
     NV_STATUS status;
 
     if ((pGpu = gpumgrGetGpu(gpuInstance)) == NULL)
@@ -669,6 +724,8 @@ gpuFabricProbeReceiveUpdateKernelCallback
         NV_ASSERT_FAILED("Invalid GPU instance");
         return NV_ERR_INVALID_ARGUMENT;
     }
+    pKernelNvlink = GPU_GET_KERNEL_NVLINK(pGpu);
+    bEnableABM = knvlinkGetAbmEnabled(pGpu, pKernelNvlink);
 
     NV_CHECK_OR_RETURN(LEVEL_ERROR, pGpu->pGpuFabricProbeInfoKernel != NULL, NV_OK);
 
@@ -697,6 +754,31 @@ gpuFabricProbeReceiveUpdateKernelCallback
             pProbeUpdateReqMsg->probeUpdate.cliqueId;
         _gpuFabricProbeSendCliqueIdChangeEvent(pGpu,
                                                pProbeRespMsg->probeRsp.cliqueId);
+    }
+
+    // Support for fabric attributes enhancements (Bug: 5345385)
+    if (pProbeUpdateReqMsg->probeUpdate.action == NVLINK_INBAND_GPU_PROBE_UPDATE_ACTION_PROBE_REQUEST_NEEDED)
+    {
+        if (pKernelNvlink != NULL)
+        {
+            knvlinkTriggerProbeRequest(pGpu, pKernelNvlink);
+        }
+    }
+
+    _gpuFabricProbeCheckResetRequired(pGpu, pProbeRespMsg);
+
+    if (bEnableABM)
+    {
+        // Reuse linkMaskToBeReduced so RBM/ABM flows are the same
+        pEnabledLinksVec = knvlinkGetEnabledLinkMask(pGpu, pKernelNvlink);
+        NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+                           convertBitVectorToLinkMasks(pEnabledLinksVec, &enabledLinkMask, sizeof(enabledLinkMask), NULL),
+                           return status);
+        pProbeRespMsg->probeRsp.linkMaskToBeReduced = (NvU32)(enabledLinkMask & ~pProbeUpdateReqMsg->probeUpdate.linkMask);
+
+        _gpuFabricProbeUpdateABMLinkMask(pGpu,
+                                         pGpuFabricProbeInfoKernel,
+                                         pProbeUpdateReqMsg->probeUpdate.action);
     }
 
     return NV_OK;
@@ -780,7 +862,7 @@ gpuFabricProbeResume
 
     NV_ASSERT(rmDeviceGpuLockIsOwner(gpuGetInstance(pGpu)));
 
-    params.bwMode = pGpuFabricProbeInfoKernel->bwMode;
+    params.bwMode  = pGpuFabricProbeInfoKernel->bwMode;
 
     NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
               pRmApi->Control(pRmApi,
@@ -802,15 +884,16 @@ _gpuFabricProbeRbmWakeLinks
     RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);
     KernelNvlink *pKernelNvlink = GPU_GET_KERNEL_NVLINK(pGpu);
     NV2080_CTRL_NVLINK_GET_POWER_STATE_PARAMS powerStatusParams = {0};
-    NvU32 enabledLinkMask = knvlinkGetEnabledLinkMask(pGpu, pKernelNvlink);
-    NvU32 linkMask = 0;
+    NVLINK_BIT_VECTOR *pEnabledLinksVec = knvlinkGetEnabledLinkMask(pGpu, pKernelNvlink);
     NV_STATUS status;
     NvU32 i;
+    NVLINK_BIT_VECTOR wakeLinkVec;
+    bitVectorClrAll(&wakeLinkVec);
 
-    FOR_EACH_INDEX_IN_MASK(32, i, enabledLinkMask)
+    FOR_EACH_IN_BITVECTOR(pEnabledLinksVec, i)
     {
         powerStatusParams.linkId = i;
-        NV_CHECK_OK(status, LEVEL_ERROR,
+        NV_CHECK_OK(status, LEVEL_INFO,
             pRmApi->Control(pRmApi,
                             pGpu->hInternalClient,
                             pGpu->hInternalSubdevice,
@@ -818,19 +901,19 @@ _gpuFabricProbeRbmWakeLinks
                             &powerStatusParams, sizeof(powerStatusParams)));
         if (powerStatusParams.powerState == NV2080_CTRL_NVLINK_POWER_STATE_L2)
         {
-            linkMask |= NVBIT32(i);
+            bitVectorSet(&wakeLinkVec, i);
         }
     }
-    FOR_EACH_INDEX_IN_MASK_END;
+    FOR_EACH_IN_BITVECTOR_END();
 
-    if (linkMask)
+    if (!bitVectorTestAllCleared(&wakeLinkVec))
     {
         // Wake all sleeping links
-        status = knvlinkEnterExitSleep(pGpu, pKernelNvlink, linkMask, NV_FALSE);
+        status = knvlinkEnterExitSleep(pGpu, pKernelNvlink, &wakeLinkVec, NV_FALSE);
         if (status != NV_OK)
         {
-            NV_PRINTF(LEVEL_ERROR, "Error waking links on linkmask 0x%x\n",
-                      linkMask);
+            NV_PRINTF(LEVEL_ERROR, "Error waking links on linkmask "NV_BITVECTOR_INLINE_FMTX"\n",
+                      NV_BITVECTOR_INLINE_PRINTF_ARG(&wakeLinkVec));
         }
     }
 }
@@ -854,7 +937,7 @@ gpuFabricProbeStart
     NvU8 pStr[32];
     NvU32 linkCount;
 
-    NV_ASSERT_OR_RETURN(rmDeviceGpuLockIsOwner(gpuGetInstance(pGpu)), 
+    NV_ASSERT_OR_RETURN(rmDeviceGpuLockIsOwner(gpuGetInstance(pGpu)),
         NV_ERR_INVALID_LOCK_STATE);
 
     // Check if NVSwitch based system. If not return without doing anything
@@ -878,7 +961,7 @@ gpuFabricProbeStart
     {
         if (pKernelNvlink != NULL)
         {
-            pGpuFabricProbeInfoKernel->bwMode = pKernelNvlink->nvlinkBwMode;
+            pGpuFabricProbeInfoKernel->bwMode = knvlinkGetBWMode(pGpu, pKernelNvlink);
         }
     }
     else
@@ -1006,7 +1089,7 @@ NV_STATUS
 gpuFabricProbeSetBwModePerGpu
 (
     OBJGPU *pGpu,
-    NvU8 mode
+    NvU16 mode
 )
 {
     GPU_FABRIC_PROBE_INFO_KERNEL *pGpuFabricProbeInfoKernel =
@@ -1035,7 +1118,7 @@ gpuFabricProbeSetBwModePerGpu
         if (pKernelNvlink->getProperty(pKernelNvlink, PDB_PROP_KNVLINK_RBM_LINK_COUNT_ENABLED))
         {
             _gpuFabricProbeRbmWakeLinks(pGpu, pGpuFabricProbeInfoKernel);
-            pKernelNvlink->nvlinkBwMode = mode;
+            knvlinkSetBWMode(pGpu, pKernelNvlink, mode);
         }
     }
 
@@ -1047,7 +1130,7 @@ gpuFabricProbeSetBwModePerGpu
 NV_STATUS
 gpuFabricProbeSetBwMode
 (
-    NvU8 mode
+    NvU16 mode
 )
 {
     NvU32 attachedGpuCount;

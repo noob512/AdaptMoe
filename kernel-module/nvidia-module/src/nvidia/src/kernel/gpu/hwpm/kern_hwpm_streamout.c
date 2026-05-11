@@ -71,7 +71,7 @@ _hwpmStreamoutAllocPmaMapping
     }
 
     // Map it in PMA VA
-    return dmaAllocMapping_HAL(pGpu, pDma, pPmaVAS, pMemDesc, &virtualAddress, flags, NULL, KMIGMGR_SWIZZID_INVALID);
+    return dmaAllocMapping_HAL(pGpu, pDma, pPmaVAS, pMemDesc, &virtualAddress, flags, 0, NULL, KMIGMGR_SWIZZID_INVALID);
 }
 
 static NV_STATUS
@@ -142,7 +142,7 @@ _hwpmStreamoutFreeCpuMapping
         }
         else
         {
-            memdescUnmap(pMemDesc, NV_TRUE, osGetCurrentProcess(), pCpuAddr, pPriv);
+            memdescUnmap(pMemDesc, NV_TRUE, pCpuAddr, pPriv);
         }
     }
 }
@@ -405,7 +405,7 @@ khwpmInstBlkConstruct(OBJGPU *pGpu, KernelHwpm *pKernelHwpm, NvU32 bpcIdx)
     NV_STATUS          status;
     NvU32              allocFlags      = MEMDESC_FLAGS_NONE;
     MEMORY_DESCRIPTOR *pInstBlkMemDesc = NULL;
-    NvU32              addrSpace       = pGpu->getProperty(pGpu, PDB_PROP_GPU_ZERO_FB) ? ADDR_SYSMEM : ADDR_FBMEM;
+    NvU32              addrSpace       = pGpu->pGpuArch->bGpuArchIsZeroFb ? ADDR_SYSMEM : ADDR_FBMEM;
     NvU32              attr            = NV_MEMORY_WRITECOMBINED;
 
     memdescOverrideInstLoc(DRF_VAL(_REG_STR_RM, _INST_LOC_4, _HWPM_PMA, pGpu->instLocOverrides4),

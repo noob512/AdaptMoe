@@ -535,11 +535,11 @@ typedef struct VesaPsrEventIndicator
 typedef struct VesaPsrSinkCaps
 {
     NvU8  psrVersion;
-    NvU8  linkTrainingRequired : 1;
-    NvU8  psrSetupTime : 3;
-    NvU8  yCoordinateRequired : 1;
-    NvU8  psr2UpdateGranularityRequired : 1;
-    NvU8  reserved : 2;
+    NvU32 linkTrainingRequired : 1;
+    NvU32 psrSetupTime : 16;
+    NvU32 yCoordinateRequired : 1;
+    NvU32 psr2UpdateGranularityRequired : 1;
+    NvU32 reserved : 13;
     NvU16 suXGranularity;
     NvU8  suYGranularity;
 } vesaPsrSinkCaps;

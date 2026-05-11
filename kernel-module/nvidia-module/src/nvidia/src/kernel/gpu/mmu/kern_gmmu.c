@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -44,6 +44,8 @@
 #include "nvrm_registry.h"
 #include "vgpu/rpc.h"
 #include "kernel/gpu/intr/engine_idx.h"
+#include "kernel/gpu/intr/intr.h"
+#include "nv_sriov_defines.h"
 
 #include "kernel/gpu/conf_compute/ccsl.h"
 
@@ -101,7 +103,6 @@ kgmmuConstructEngine_IMPL(OBJGPU *pGpu, KernelGmmu *pKernelGmmu, ENGDESCRIPTOR e
             pKernelGmmu->pFmtFamilies[v] = NULL;
         }
     }
-
     NV_ASSERT_OK_OR_RETURN(kgmmuFmtInit(pKernelGmmu));
 
     //
@@ -175,6 +176,7 @@ NV_STATUS kgmmuStateInitLocked_IMPL
 )
 {
     NV_STATUS  status;
+    NvU32 data32 = 0;
 
     status = _kgmmuInitStaticInfo(pGpu, pKernelGmmu);
     if (status != NV_OK)
@@ -196,7 +198,9 @@ NV_STATUS kgmmuStateInitLocked_IMPL
 
     if (gpuIsSelfHosted(pGpu) &&
         pGpu->getProperty(pGpu, PDB_PROP_GPU_COHERENT_CPU_MAPPING) &&
-        IsdBLACKWELL(pGpu))
+        (IsdBLACKWELL(pGpu) || 
+        ((osReadRegistryDword(pGpu, NV_REG_STR_RM_BUG_4686457_WAR, &data32) == NV_OK) && 
+        (data32 == NV_REG_STR_RM_BUG_4686457_WAR_ENABLE))))
     {
         pKernelGmmu->bBug4686457WAR = NV_TRUE;
     }
@@ -388,6 +392,7 @@ kgmmuDestruct_IMPL(KernelGmmu *pKernelGmmu)
             portMemFree(pKernelGmmu->pFmtFamilies[v]);
         }
     }
+
 }
 
 void
@@ -518,7 +523,7 @@ _kgmmuInitRegistryOverrides(OBJGPU *pGpu, KernelGmmu *pKernelGmmu)
     //
     // Check if we want to disable big page size per address space
     //
-    pKernelGmmu->bEnablePerVaspaceBigPage = IsGM20X(pGpu);
+    pKernelGmmu->bEnablePerVaspaceBigPage = NV_FALSE; // TODO: MPV - Remove as nowehere used
     if (NV_OK == osReadRegistryDword(pGpu,
                    NV_REG_STR_RM_DISABLE_BIG_PAGE_PER_ADDRESS_SPACE, &data))
     {
@@ -1146,7 +1151,7 @@ kgmmuFaultBufferAlloc_IMPL
         return status;
     }
 
-    memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_31, 
+    memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_31,
                     pMemDesc);
     if (status != NV_OK)
     {
@@ -1244,9 +1249,9 @@ kgmmuFaultBufferReplayableAllocate_IMPL
             return NV_ERR_BUFFER_TOO_SMALL;
         }
 
-        memdescGetPhysAddrs(pFaultBuffer->pFaultBufferMemDesc,
-                            AT_GPU, 0, RM_PAGE_SIZE,
-                            numBufferPages, pParams->faultBufferPteArray);
+        memdescGetPtePhysAddrs(pFaultBuffer->pFaultBufferMemDesc,
+                               AT_GPU, 0, RM_PAGE_SIZE,
+                               numBufferPages, pParams->faultBufferPteArray);
 
         pParams->hClient            = hClient;
         pParams->hObject            = hObject;
@@ -1412,20 +1417,12 @@ kgmmuEncodePhysAddrs_IMPL
 {
     NV_ASSERT(aperture != GMMU_APERTURE_INVALID);
 
-    if (aperture == GMMU_APERTURE_SYS_COH ||
-        aperture == GMMU_APERTURE_SYS_NONCOH)
-    {
-        kgmmuEncodeSysmemAddrs_HAL(pKernelGmmu, pAddresses, count);
-    }
-    else if (aperture == GMMU_APERTURE_PEER)
+    if (aperture == GMMU_APERTURE_PEER)
     {
         _kgmmuEncodePeerAddrs(pAddresses, fabricBaseAddress, count);
     }
-    else
-    {
-        return;
-    }
 }
+
 
 NvU64
 kgmmuEncodePhysAddr_IMPL
@@ -1507,7 +1504,7 @@ _kgmmuClientShadowFaultBufferQueueAllocate
         return status;
     }
 
-    memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_32, 
+    memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_32,
                     pQueueMemDesc);
     if (status != NV_OK)
     {
@@ -1606,8 +1603,17 @@ _kgmmuClientShadowFaultBufferPagesAllocate
     }
 
     memdescSetPageSize(pMemDesc, AT_GPU, RM_PAGE_SIZE_HUGE);
-    memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_33, 
+    memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_33,
                     pMemDesc);
+
+    // TODO: Bug 5042223
+    if (status == NV_ERR_NO_MEMORY)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Allocation failed with big page size, retrying with default page size\n");
+        memdescSetPageSize(pMemDesc, AT_GPU, RM_PAGE_SIZE);
+        memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_33, pMemDesc);
+    }
+
     if (status != NV_OK)
     {
         memdescDestroy(pMemDesc);
@@ -1654,7 +1660,7 @@ kgmmuClientShadowFaultBufferPagesDestroy_IMPL
     if (bFreePages)
     {
         memdescUnmap(pMemDesc,
-                     NV_TRUE, osGetCurrentProcess(),
+                     NV_TRUE,
                      pClientShadowFaultBuffer->pBufferAddress,
                      pClientShadowFaultBuffer->pBufferPriv);
 
@@ -1666,7 +1672,7 @@ kgmmuClientShadowFaultBufferPagesDestroy_IMPL
         {
             pBufferPage = &pClientShadowFaultBuffer->pBufferPages[i];
 
-            memdescUnmap(pMemDesc, NV_TRUE, osGetCurrentProcess(),
+            memdescUnmap(pMemDesc, NV_TRUE,
                          pBufferPage->pAddress, pBufferPage->pPriv);
         }
         portMemFree(pClientShadowFaultBuffer->pBufferPages);
@@ -2235,11 +2241,13 @@ kgmmuRegisterIntrService_IMPL
     static NvU16 engineIdxList[] = {
         MC_ENGINE_IDX_REPLAYABLE_FAULT,
         MC_ENGINE_IDX_REPLAYABLE_FAULT_ERROR,
+        MC_ENGINE_IDX_INFO_FAULT
     };
 
     static NvU16 engineIdxListForCC[] = {
         MC_ENGINE_IDX_REPLAYABLE_FAULT_CPU,
         MC_ENGINE_IDX_NON_REPLAYABLE_FAULT_CPU,
+        MC_ENGINE_IDX_INFO_FAULT
     };
 
     if (IS_GSP_CLIENT(pGpu) && gpuIsCCFeatureEnabled(pGpu) && gpuIsGspOwnedFaultBuffersEnabled(pGpu))
@@ -2272,8 +2280,7 @@ kgmmuRegisterIntrService_IMPL
 
         static NvU16 physicalEngineIdxList[] = {
             MC_ENGINE_IDX_NON_REPLAYABLE_FAULT,
-            MC_ENGINE_IDX_NON_REPLAYABLE_FAULT_ERROR,
-            MC_ENGINE_IDX_INFO_FAULT
+            MC_ENGINE_IDX_NON_REPLAYABLE_FAULT_ERROR
         };
 
         for (NvU32 tableIdx = 0; tableIdx < NV_ARRAY_ELEMENTS(physicalEngineIdxList); tableIdx++)
@@ -2416,10 +2423,22 @@ kgmmuServiceInterrupt_IMPL
         }
         case MC_ENGINE_IDX_INFO_FAULT:
         {
-            status = kgmmuServicePriFaults_HAL(pGpu, pKernelGmmu);
-            if (status != NV_OK)
+            if (IS_GSP_CLIENT(pGpu) && !IS_VIRTUAL(pGpu))
             {
-                NV_ASSERT_OK_FAILED("Failed to service PRI fault error", status);
+                // In case of PF Kernel RM, bounce the interrupt to GSP for handling.
+                status = intrTriggerPrivDoorbell_HAL(pGpu, GPU_GET_INTR(pGpu), NV_DOORBELL_NOTIFY_LEAF_SERVICE_MMU_INFO_FAULT_HANDLE);
+                if (status != NV_OK)
+                {
+                    NV_ASSERT_OK_FAILED("Failed to trigger INFO_FAULT doorbell", status);
+                }
+            }
+            else
+            {
+                status = kgmmuServicePriFaults_HAL(pGpu, pKernelGmmu);
+                if (status != NV_OK)
+                {
+                    NV_ASSERT_OK_FAILED("Failed to service PRI fault error", status);
+                }
             }
             break;
         }
@@ -2633,7 +2652,7 @@ kgmmuExtractPteInfo_IMPL
     }
 }
 
-NvS32*
+PORT_ATOMIC NvS32*
 kgmmuGetFatalFaultIntrPendingState_IMPL
 (
     KernelGmmu *pKernelGmmu,
@@ -2790,7 +2809,7 @@ kgmmuFaultBufferMap_IMPL
                     {
                         pBufferPage = &pFaultBuffer->pBufferPages[j];
 
-                        memdescUnmap(pMemDesc, NV_TRUE, osGetCurrentProcess(),
+                        memdescUnmap(pMemDesc, NV_TRUE,
                                      pBufferPage->pAddress, pBufferPage->pPriv);
                     }
 
@@ -2860,7 +2879,7 @@ kgmmuFaultBufferUnmap_IMPL
             {
                 if (memdescGetContiguity(pFaultBuffer->pFaultBufferMemDesc, AT_GPU))
                 {
-                    memdescUnmap(pFaultBuffer->pFaultBufferMemDesc, NV_TRUE, osGetCurrentProcess(),
+                    memdescUnmap(pFaultBuffer->pFaultBufferMemDesc, NV_TRUE,
                                  pFaultBuffer->kernelVaddr, pFaultBuffer->hCpuFaultBuffer);
                 }
                 else
@@ -2876,7 +2895,7 @@ kgmmuFaultBufferUnmap_IMPL
 
                             pBufferPage = &pFaultBuffer->pBufferPages[i];
 
-                            memdescUnmap(pFaultBuffer->pFaultBufferMemDesc, NV_TRUE, osGetCurrentProcess(),
+                            memdescUnmap(pFaultBuffer->pFaultBufferMemDesc, NV_TRUE,
                                          pBufferPage->pAddress, pBufferPage->pPriv);
                         }
 
@@ -3171,4 +3190,73 @@ subdeviceCtrlCmdGmmuCommitTlbInvalidate_IMPL
 
     return kgmmuCommitInvalidateTlbTest_HAL(pGpu, pKernelGmmu, &params);
 
+}
+
+/**
+ * @brief Check if there is a memory subsystem HW error
+ * @details Check if memory subsystem HW hit an error by issuing mem operations 
+ *          through TLB invalidates and membars. More detials in function comments
+ *
+ * @return  Returns NV_ERR_MEMORY_ERROR if there is a memory HW error
+ */
+NV_STATUS
+kgmmuCheckMemSubsysError_IMPL
+(
+    OBJGPU               *pGpu,
+    KernelGmmu           *pKernelGmmu
+)
+{
+    NV_STATUS status = NV_OK;
+
+    KernelBus  *pKernelBus  = GPU_GET_KERNEL_BUS(pGpu);
+
+    if (!pGpu->bMemsubsysErrDetectionEnabled)
+    {
+        NV_PRINTF(LEVEL_WARNING, "Memory Subsystem Error detection disabled.\n");
+        return status;
+    }
+
+    //
+    // 1. Issue a TLB invalidate without membar. This would ensure that GMMU is not blocked. 
+    //    A failure at this step indicates MMU is most likely stuck in a previously issued membar.
+    //
+    status = kgmmuInvalidateTlb_HAL(pGpu, pKernelGmmu, NULL, VASPACE_FLAGS_NONE,
+                                    PTE_DOWNGRADE, GPU_GFID_PF, NV_GMMU_INVAL_SCOPE_ALL_TLBS, NV_FALSE);
+    if (status == NV_ERR_TIMEOUT)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Memory Subsystem Error detected. kgmmuInvalidateTlb failed.\n");
+        goto done;
+    }
+
+    //
+    // 2. If 1 passes, issue membar / UFLUSH. UFLUSH does a flush/membar from HUB side
+    //    A failure here would indicate an issue in FBHUB, HSHUBs, VidL2, SysL2 or NvLink
+    //
+    status = kbusSendSysmembarSingle(pGpu, pKernelBus);
+    if (status == NV_ERR_TIMEOUT)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Memory Subsystem Error detected. kbusSendSysmembarSingle failed.\n");
+        goto done;
+    }
+
+    //
+    // 3. If 1 and 2 pass, issue another TLBI, WITH sysmembar. This involves TLBI from GMMU 
+    //    as well as FLUSH/Membar (at the completion of TLBI) for all the clients in GPU (both GPC and HUB side)
+    //    If the GPU's memory subsystem is stuck anywhere that was missed by previous 2 steps, 
+    //    it should be caught here.
+    //
+
+    status = kgmmuInvalidateTlb_HAL(pGpu, pKernelGmmu, NULL, VASPACE_FLAGS_NONE,
+                                    PTE_DOWNGRADE, GPU_GFID_PF, NV_GMMU_INVAL_SCOPE_ALL_TLBS, NV_TRUE);
+
+    if (status == NV_ERR_TIMEOUT)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Memory Subsystem Error detected. kgmmuInvalidateTlb with sysmembar failed.\n");
+    }
+
+done:
+    // Set status to NV_ERR_MEMORY_ERROR if any of the above mem operations timed out
+    status = (status == NV_ERR_TIMEOUT) ? NV_ERR_MEMORY_ERROR : status;
+
+    return status;
 }

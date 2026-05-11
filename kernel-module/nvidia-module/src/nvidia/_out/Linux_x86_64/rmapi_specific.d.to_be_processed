@@ -7,7 +7,7 @@ _out/Linux_x86_64/rmapi_specific.o: src/kernel/rmapi/rmapi_specific.c \
  ../common/sdk/nvidia/inc/nvtypes.h inc/libraries/resserv/rs_resource.h \
  generated/g_rs_resource_nvoc.h inc/libraries/nvoc/runtime.h \
  inc/libraries/nvport/nvport.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
@@ -39,8 +39,8 @@ _out/Linux_x86_64/rmapi_specific.o: src/kernel/rmapi/rmapi_specific.c \
  ../common/sdk/nvidia/inc/class/cl9010_callback.h \
  ../common/sdk/nvidia/inc/nvsecurityinfo.h \
  inc/libraries/resserv/rs_access_map.h \
- inc/libraries/resserv/rs_access_rights.h inc/kernel/rmapi/event.h \
- generated/g_event_nvoc.h \
+ inc/libraries/resserv/rs_access_rights.h inc/kernel/rmapi/event_api.h \
+ generated/g_event_api_nvoc.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000event.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
@@ -91,8 +91,10 @@ _out/Linux_x86_64/rmapi_specific.o: src/kernel/rmapi/rmapi_specific.c \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080msenc.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080bsp.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fifo.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080mc.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl90f1.h \
  ../common/sdk/nvidia/inc/mmu_fmt_types.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl30f1.h
@@ -111,7 +113,7 @@ inc/libraries/nvoc/runtime.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -161,8 +163,8 @@ inc/libraries/containers/multimap.h:
 ../common/sdk/nvidia/inc/nvsecurityinfo.h:
 inc/libraries/resserv/rs_access_map.h:
 inc/libraries/resserv/rs_access_rights.h:
-inc/kernel/rmapi/event.h:
-generated/g_event_nvoc.h:
+inc/kernel/rmapi/event_api.h:
+generated/g_event_api_nvoc.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000event.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
@@ -228,8 +230,10 @@ src/kernel/rmapi/resource_desc_flags.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080msenc.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080bsp.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fifo.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080mc.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073base.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl90f1.h:
 ../common/sdk/nvidia/inc/mmu_fmt_types.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl30f1.h:

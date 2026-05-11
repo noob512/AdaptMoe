@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1999-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1999-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -72,7 +72,7 @@ nvidia_vma_open(struct vm_area_struct *vma)
 
     if (at != NULL)
     {
-        NV_ATOMIC_INC(at->usage_count);
+        atomic64_inc(&at->usage_count);
 
         NV_PRINT_AT(NV_DBG_MEMINFO, at);
     }
@@ -126,8 +126,11 @@ nvidia_vma_access(
     nv_state_t *nv = NV_STATE_PTR(nvlfp->nvptr);
     NvU32 pageIndex, pageOffset;
     void *kernel_mapping;
-    const nv_alloc_mapping_context_t *mmap_context = &nvlfp->mmap_context;
+    nv_alloc_mapping_list_node_t **pfile_mapping_list = NULL;
+    nv_alloc_mapping_context_t *mmap_context = NULL;
     NvU64 offsInVma = addr - vma->vm_start;
+    int ret = -EINVAL;
+    NvBool has_pages;
 
     pageIndex = (offsInVma >> PAGE_SHIFT);
     pageOffset = (offsInVma & ~PAGE_MASK);
@@ -137,15 +140,22 @@ nvidia_vma_access(
         return -EINVAL;
     }
 
-    if (!mmap_context->valid)
+    pfile_mapping_list = nv_acquire_file_va(&nvlfp->nvfp, NV_FALSE);
+
+    if (*pfile_mapping_list == NULL)
     {
         nv_printf(NV_DBG_ERRORS, "NVRM: VM: invalid mmap context\n");
-        return -EINVAL;
+        goto done;
     }
+
+    mmap_context = &(*pfile_mapping_list)->context;
+
+    has_pages = (mmap_context->num_pages != 0);
 
     if (write && !(mmap_context->prot & NV_PROTECT_WRITEABLE))
     {
-        return -EACCES;
+        ret = -EACCES;
+        goto done;
     }
 
     if (nv->flags & NV_FLAG_CONTROL)
@@ -156,18 +166,31 @@ nvidia_vma_access(
          * at can be NULL for peer IO mem.
          */
         if (!at)
-            return -EINVAL;
+        {
+            ret = -EINVAL;
+            goto done;
+        }
 
         if (pageIndex >= at->num_pages)
-            return -EINVAL;
+        {
+            ret = -EINVAL;
+            goto done;
+        }
 
         pageIndex = nv_array_index_no_speculate(pageIndex, at->num_pages);
-        kernel_mapping = (void *)(at->page_table[pageIndex]->virt_addr + pageOffset);
+        kernel_mapping = (void *)(at->page_table[pageIndex].virt_addr + pageOffset);
+    }
+    else if (has_pages)
+    {
+        struct page *pPage = NV_GET_PAGE_STRUCT(mmap_context->page_array[pageIndex]);
+        NvU8 *pPagePtr = (NvU8 *) page_address(pPage);
+        kernel_mapping = &pPagePtr[pageOffset];
     }
     else
     {
         NvU64 idx = 0;
         NvU64 curOffs = 0;
+        
         for(; idx < mmap_context->memArea.numRanges; idx++)
         {
             NvU64 nextOffs = mmap_context->memArea.pRanges[idx].size + curOffs;
@@ -179,41 +202,49 @@ nvidia_vma_access(
             }
             curOffs = nextOffs;
         }
-        return -EINVAL;
+        ret = -EINVAL;
+        goto done;
 found:
         kernel_mapping = os_map_kernel_space(addr, PAGE_SIZE, NV_MEMORY_UNCACHED);
         if (kernel_mapping == NULL)
-            return -ENOMEM;
+        {
+            ret = -ENOMEM;
+            goto done;
+        }
 
         kernel_mapping = ((char *)kernel_mapping + pageOffset);
     }
 
     length = NV_MIN(length, (int)(PAGE_SIZE - pageOffset));
+    ret = length;
 
+#if defined(NVCPU_AARCH64)
+    if (write)
+        memcpy_toio(kernel_mapping, buffer, length);
+    else
+        memcpy_fromio(buffer, kernel_mapping, length);
+#else
     if (write)
         memcpy(kernel_mapping, buffer, length);
     else
         memcpy(buffer, kernel_mapping, length);
+#endif // defined(NVCPU_AARCH64)
 
-    if (at == NULL)
+    if (at == NULL && !has_pages)
     {
         kernel_mapping = ((char *)kernel_mapping - pageOffset);
         os_unmap_kernel_space(kernel_mapping, PAGE_SIZE);
     }
-
-    return length;
+done: 
+    nv_release_file_va(&nvlfp->nvfp, NV_FALSE);
+    return ret;
 }
 
 static vm_fault_t nvidia_fault(
-#if !defined(NV_VM_OPS_FAULT_REMOVED_VMA_ARG)
-    struct vm_area_struct *vma,
-#endif
     struct vm_fault *vmf
 )
 {
-#if defined(NV_VM_OPS_FAULT_REMOVED_VMA_ARG)
     struct vm_area_struct *vma = vmf->vma;
-#endif
     nv_linux_file_private_t *nvlfp = NV_GET_LINUX_FILE_PRIVATE(NV_VMA_FILE(vma));
     nv_linux_state_t *nvl = nvlfp->nvptr;
     nv_state_t *nv = NV_STATE_PTR(nvl);
@@ -276,7 +307,13 @@ static vm_fault_t nvidia_fault(
         NvU64 idx;
         NvU64 curOffs = 0;
         NvBool bRevoked = NV_TRUE;
-        nv_alloc_mapping_context_t *mmap_context = &nvlfp->mmap_context;
+        nv_alloc_mapping_list_node_t **pfile_mapping_list = NULL;
+        nv_alloc_mapping_context_t *mmap_context = NULL;
+
+        pfile_mapping_list = nv_acquire_file_va(&nvlfp->nvfp, NV_FALSE);
+
+        mmap_context = &(*pfile_mapping_list)->context;
+
         for(idx = 0; idx < mmap_context->memArea.numRanges; idx++)
         {
             NvU64 nextOffs = curOffs + mmap_context->memArea.pRanges[idx].size;
@@ -297,6 +334,7 @@ static vm_fault_t nvidia_fault(
             curOffs = nextOffs;
         }
 err:
+        nv_release_file_va(&nvlfp->nvfp, NV_FALSE);
         nvl->all_mappings_revoked &= bRevoked;
     }
 
@@ -339,15 +377,21 @@ int nv_encode_caching(
                     NV_PGPROT_UNCACHED(*prot) :
                     NV_PGPROT_UNCACHED_DEVICE(*prot);
             break;
-#if defined(NV_PGPROT_WRITE_COMBINED) && \
-    defined(NV_PGPROT_WRITE_COMBINED_DEVICE)
+#if defined(NV_PGPROT_WRITE_COMBINED)
         case NV_MEMORY_DEFAULT:
         case NV_MEMORY_WRITECOMBINED:
             if (NV_ALLOW_WRITE_COMBINING(memory_type))
             {
+#if defined(NVCPU_RISCV64)
+                /* 
+                 * Don't attempt to mark sysmem pages as write combined on riscv.
+                 * Bug 5404055 to clean up this check.
+                 */
                 *prot = (memory_type == NV_MEMORY_TYPE_FRAMEBUFFER) ?
-                        NV_PGPROT_WRITE_COMBINED_DEVICE(*prot) :
-                        NV_PGPROT_WRITE_COMBINED(*prot);
+                    NV_PGPROT_WRITE_COMBINED(*prot) : *prot;
+#else
+                *prot = NV_PGPROT_WRITE_COMBINED(*prot);
+#endif
                 break;
             }
 
@@ -394,7 +438,7 @@ static int nvidia_mmap_peer_io(
 
     BUG_ON(!at->flags.contig);
 
-    start = at->page_table[page_index]->phys_addr;
+    start = at->page_table[page_index].phys_addr;
     size = pages * PAGE_SIZE;
 
     ret = nv_io_remap_page_range(vma, start, size, vma->vm_start);
@@ -413,20 +457,29 @@ static int nvidia_mmap_sysmem(
     int ret = 0;
     unsigned long start = 0;
 
-    NV_ATOMIC_INC(at->usage_count);
+    atomic64_inc(&at->usage_count);
 
     start = vma->vm_start;
     for (j = page_index; j < (page_index + pages); j++)
     {
         j = nv_array_index_no_speculate(j, (page_index + pages));
 
+        //
+        // nv_remap_page_range() map a contiguous physical address space
+        // into the user virtual space.
+        // Use PFN based mapping api to create the mapping for
+        // reserved carveout (OS invisible memory, not managed by OS) too.
+        // Basically nv_remap_page_range() works for all kind of memory regions.
+        // Imported buffer can be either from OS or Non OS managed regions (reserved carveout).
+        // nv_remap_page_range() works well for all type of import buffers.
+        //
         if (
 #if defined(NV_VGPU_KVM_BUILD)
             at->flags.guest ||
 #endif
-            at->flags.carveout)
+            at->flags.carveout || at->import_sgt)
         {
-            ret = nv_remap_page_range(vma, start, at->page_table[j]->phys_addr,
+            ret = nv_remap_page_range(vma, start, at->page_table[j].phys_addr,
                                       PAGE_SIZE, vma->vm_page_prot);
         }
         else
@@ -435,12 +488,14 @@ static int nvidia_mmap_sysmem(
                 vma->vm_page_prot = nv_adjust_pgprot(vma->vm_page_prot);
 
             ret = vm_insert_page(vma, start,
-                                 NV_GET_PAGE_STRUCT(at->page_table[j]->phys_addr));
+                                 NV_GET_PAGE_STRUCT(at->page_table[j].phys_addr));
         }
 
         if (ret)
         {
-            NV_ATOMIC_DEC(at->usage_count);
+            atomic64_dec(&at->usage_count);
+            nv_printf(NV_DBG_ERRORS,
+                      "NVRM: Userspace mapping creation failed [%d]!\n", ret);
             return -EAGAIN;
         }
         start += PAGE_SIZE;
@@ -489,27 +544,33 @@ int nvidia_mmap_helper(
 )
 {
     NvU32 prot = 0;
-    int ret;
-    const nv_alloc_mapping_context_t *mmap_context = &nvlfp->mmap_context;
+    nv_alloc_mapping_list_node_t **pfile_mapping_list = NULL;
+    nv_alloc_mapping_context_t *mmap_context = NULL;
+
     nv_linux_state_t *nvl = NV_GET_NVL_FROM_NV_STATE(nv);
     NV_STATUS status;
+    int ret = -EINVAL;
 
     if (nvlfp == NULL)
         return NV_ERR_INVALID_ARGUMENT;
+
+    pfile_mapping_list = nv_acquire_file_va(&nvlfp->nvfp, NV_FALSE);
 
     /*
      * If mmap context is not valid on this file descriptor, this mapping wasn't
      * previously validated with the RM so it must be rejected.
      */
-    if (!mmap_context->valid)
+    if (*pfile_mapping_list == NULL)
     {
-        nv_printf(NV_DBG_ERRORS, "NVRM: VM: invalid mmap\n");
-        return -EINVAL;
+        nv_printf(NV_DBG_ERRORS, "NVRM: VM: invalid mmap context\n");
+        goto done;
     }
+
+    mmap_context = &(*pfile_mapping_list)->context;
 
     if (vma->vm_pgoff != 0)
     {
-        return -EINVAL;
+        goto done;
     }
 
     NV_PRINT_VMA(NV_DBG_MEMINFO, vma);
@@ -519,7 +580,7 @@ int nvidia_mmap_helper(
     {
         NV_DEV_PRINTF(NV_DBG_INFO, nv,
             "GPU is lost, skipping nvidia_mmap_helper\n");
-        return status;
+        goto done;
     }
 
     NV_VMA_PRIVATE(vma) = vm_priv;
@@ -538,7 +599,8 @@ int nvidia_mmap_helper(
         // Ensure size is correct.
         if (NV_VMA_SIZE(vma) != memareaSize(mmap_context->memArea))
         {
-            return -ENXIO;
+            ret = -ENXIO;
+            goto done;
         }
 
         if (IS_REG_OFFSET(nv, access_start, access_len))
@@ -546,7 +608,8 @@ int nvidia_mmap_helper(
             if (nv_encode_caching(&vma->vm_page_prot, NV_MEMORY_UNCACHED,
                         NV_MEMORY_TYPE_REGISTERS))
             {
-                return -ENXIO;
+                ret = -ENXIO;
+                goto done;
             }
         }
         else if (IS_FB_OFFSET(nv, access_start, access_len))
@@ -556,7 +619,8 @@ int nvidia_mmap_helper(
                 if (nv_encode_caching(&vma->vm_page_prot, NV_MEMORY_UNCACHED,
                             NV_MEMORY_TYPE_FRAMEBUFFER))
                 {
-                    return -ENXIO;
+                    ret = -ENXIO;
+                    goto done;
                 }
             }
             else
@@ -568,7 +632,8 @@ int nvidia_mmap_helper(
                     if (nv_encode_caching(&vma->vm_page_prot,
                             NV_MEMORY_UNCACHED_WEAK, NV_MEMORY_TYPE_FRAMEBUFFER))
                     {
-                        return -ENXIO;
+                        ret = -ENXIO;
+                        goto done;
                     }
                 }
             }
@@ -584,14 +649,15 @@ int nvidia_mmap_helper(
             // TODO: Refactor is needed as part of bug#2001704.
             //
             if ((nv_get_numa_status(nvl) == NV_NUMA_STATUS_ONLINE) &&
-                !IS_REG_OFFSET(nv, access_start, access_len) &&
+                pfn_to_page(__phys_to_pfn(access_start)) != NULL &&
+                pfn_to_page(__phys_to_pfn(access_start + access_len - 1)) != NULL &&
                 (mmap_context->num_pages != 0))
             {
                 ret = nvidia_mmap_numa(vma, mmap_context);
                 if (ret)
                 {
                     up(&nvl->mmap_lock);
-                    return ret;
+                    goto done;
                 }
             }
             else
@@ -607,7 +673,8 @@ int nvidia_mmap_helper(
                             vma->vm_start + curOffs) != 0)
                     {
                         up(&nvl->mmap_lock);
-                        return -EAGAIN;
+                        ret = -EAGAIN;
+                        goto done;
                     }
                     curOffs = nextOffs;
                 }
@@ -631,7 +698,8 @@ int nvidia_mmap_helper(
 
         if ((page_index + pages) > at->num_pages)
         {
-            return -ERANGE;
+            ret = -ERANGE;
+            goto done;
         }
 
         /*
@@ -646,7 +714,8 @@ int nvidia_mmap_helper(
                                   at->cache_type,
                                   NV_MEMORY_TYPE_DEVICE_MMIO))
             {
-                return -ENXIO;
+                ret = -ENXIO;
+                goto done;
             }
 
             /*
@@ -663,7 +732,7 @@ int nvidia_mmap_helper(
 
             if (ret)
             {
-                return ret;
+                goto done;
             }
 
             NV_PRINT_AT(NV_DBG_MEMINFO, at);
@@ -677,7 +746,8 @@ int nvidia_mmap_helper(
                                   at->cache_type,
                                   NV_MEMORY_TYPE_SYSTEM))
             {
-                return -ENXIO;
+                ret = -ENXIO;
+                goto done;
             }
 
             NV_VMA_PRIVATE(vma) = at;
@@ -686,7 +756,7 @@ int nvidia_mmap_helper(
 
             if (ret)
             {
-                return ret;
+                goto done;
             }
 
             NV_PRINT_AT(NV_DBG_MEMINFO, at);
@@ -708,8 +778,10 @@ int nvidia_mmap_helper(
     }
 
     vma->vm_ops = &nv_vm_ops;
-
-    return 0;
+    ret = 0;
+done: 
+    nv_release_file_va(&nvlfp->nvfp, NV_FALSE);
+    return ret;
 }
 
 int nvidia_mmap(
@@ -797,6 +869,42 @@ NV_STATUS NV_API_CALL nv_revoke_gpu_mappings(
     return NV_OK;
 }
 
+nv_alloc_mapping_list_node_t** NV_API_CALL
+nv_acquire_file_va
+(
+    nv_file_private_t *nvfp,
+    NvBool bWrite
+)
+{
+    nv_linux_file_private_t *nvlfp = nv_get_nvlfp_from_nvfp(nvfp);
+    if (bWrite)
+    {
+        down_write(&nvlfp->fileVaLock);
+    }
+    else
+    {
+        down_read(&nvlfp->fileVaLock);
+    }
+    return &nvlfp->file_mapping_list;
+}
+
+void NV_API_CALL nv_release_file_va
+(
+    nv_file_private_t *nvfp,
+    NvBool bWrite
+)
+{
+    nv_linux_file_private_t *nvlfp = nv_get_nvlfp_from_nvfp(nvfp);
+    if (bWrite)
+    {
+        up_write(&nvlfp->fileVaLock);
+    }
+    else
+    {
+        up_read(&nvlfp->fileVaLock);
+    }
+}
+
 void NV_API_CALL nv_acquire_mmap_lock(
     nv_state_t *nv
 )
@@ -847,3 +955,82 @@ void NV_API_CALL nv_set_safe_to_mmap_locked(
 
     nvl->safe_to_mmap = safe_to_mmap;
 }
+
+#if !NV_CAN_CALL_VMA_START_WRITE
+
+#if defined(VM_REFCNT_EXCLUDE_READERS_FLAG)
+#define NV_VMA_LOCK_OFFSET VM_REFCNT_EXCLUDE_READERS_FLAG
+#else
+#define NV_VMA_LOCK_OFFSET VMA_LOCK_OFFSET
+#endif
+
+static NvBool nv_vma_enter_locked(struct vm_area_struct *vma, NvBool detaching)
+{
+    NvU32 tgt_refcnt = NV_VMA_LOCK_OFFSET;
+    NvBool interrupted = NV_FALSE;
+    if (!detaching)
+    {
+        tgt_refcnt++;
+    }
+    if (!refcount_add_not_zero(NV_VMA_LOCK_OFFSET, &vma->vm_refcnt))
+    {
+        return NV_FALSE;
+    }
+
+    rwsem_acquire(&vma->vmlock_dep_map, 0, 0, _RET_IP_);
+    prepare_to_rcuwait(&vma->vm_mm->vma_writer_wait);
+
+    for (;;)
+    {
+        set_current_state(TASK_UNINTERRUPTIBLE);
+        if (refcount_read(&vma->vm_refcnt) == tgt_refcnt)
+            break;
+
+        if (signal_pending_state(TASK_UNINTERRUPTIBLE, current))
+        {
+            interrupted = NV_TRUE;
+            break;
+        }
+
+        schedule();
+    }
+
+    // This is an open-coded version of finish_rcuwait().
+    rcu_assign_pointer(vma->vm_mm->vma_writer_wait.task, NULL);
+    __set_current_state(TASK_RUNNING);
+
+    if (interrupted)
+    {
+        // Clean up on error: release refcount and dep_map
+        refcount_sub_and_test(NV_VMA_LOCK_OFFSET, &vma->vm_refcnt);
+        rwsem_release(&vma->vmlock_dep_map, _RET_IP_);
+        return NV_FALSE;
+    }
+
+    lock_acquired(&vma->vmlock_dep_map, _RET_IP_);
+    return NV_TRUE;
+}
+
+/*
+ * Helper function to handle VMA locking and refcount management.
+ */
+void nv_vma_start_write(struct vm_area_struct *vma)
+{
+    NvU32 mm_lock_seq;
+    NvBool locked;
+    if (nv_is_vma_write_locked(vma, &mm_lock_seq))
+        return;
+
+    locked = nv_vma_enter_locked(vma, NV_FALSE);
+
+    WRITE_ONCE(vma->vm_lock_seq, mm_lock_seq);
+    if (locked)
+    {
+        NvBool detached;
+        detached = refcount_sub_and_test(NV_VMA_LOCK_OFFSET, &vma->vm_refcnt);
+        rwsem_release(&vma->vmlock_dep_map, _RET_IP_);
+        WARN_ON_ONCE(detached);
+    }
+}
+EXPORT_SYMBOL(nv_vma_start_write);
+#endif // !NV_CAN_CALL_VMA_START_WRITE

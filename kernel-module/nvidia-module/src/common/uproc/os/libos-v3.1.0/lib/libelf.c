@@ -33,11 +33,18 @@
 
 #include "libelf.h"
 #include <nvtypes.h>
+#include <nvmisc.h>
+
+ct_assert(sizeof(LibosElf32Header) == 52);
+ct_assert(sizeof(LibosElf64Header) == 64);
+
+ct_assert(sizeof(LibosElf32ProgramHeader) == 32);
+ct_assert(sizeof(LibosElf64ProgramHeader) == 56);
 
 static void * elfSimpleAccess(LibosElfImage * image, NvU64 offset, NvU64 size)
 {
     if ((offset + size) <= image->size)
-        return (NvU8 *)image->elf + offset;
+        return image->raw + offset;
     return 0;
 }
 
@@ -55,18 +62,33 @@ LibosStatus LibosElfImageConstruct(LibosElfImage * image, void * elf, NvU64 size
     if (size < sizeof(LibosElf64Header))
         return LibosErrorIncomplete;
 
-
 #ifdef LIBOS_TOOL_BAKE
-    image->elf = malloc(size);
-    memcpy(image->elf, elf, size);
+    image->elf64 = malloc(size);
+    memcpy(image->elf64, elf, size);
 #else
-    image->elf = (LibosElf64Header *) elf;
+    image->raw = elf;
 #endif
+
+    if (LibosElfGetClass(image) != ELFCLASS32 &&
+        LibosElfGetClass(image) != ELFCLASS64)
+    {
+        return LibosErrorArgument;
+    }
 
     image->size = size;
     image->map = elfSimpleAccess;
 
     return LibosOk;
+}
+
+#define EI_CLASS 4
+
+NvU8 LibosElfGetClass(const LibosElfImage * image)
+{
+    ct_assert(NV_OFFSETOF(LibosElf32Header, ident) == NV_OFFSETOF(LibosElf64Header, ident));
+    ct_assert(sizeof(image->elf32->ident) == sizeof(image->elf64->ident));
+
+    return image->elf64->ident[EI_CLASS];
 }
 
 /**
@@ -86,13 +108,20 @@ LibosStatus LibosElfImageConstruct(LibosElfImage * image, void * elf, NvU64 size
  */
 NvBool LibosTinyElfGetBootEntry(LibosElfImage * image, NvU64 * physicalEntry)
 {
-    NvU64 entryVa = image->elf->entry;
+    NvU64 entryVa;
+
+    if (LibosElfGetClass(image) != ELFCLASS64)
+    {
+        return NV_FALSE;
+    }
+
+    entryVa = image->elf64->entry;
 
     // Find the phdr containing the entry point
-    LibosElf64ProgramHeader * phdr = LibosElfProgramHeaderForRange(image, entryVa, entryVa);
-    if (phdr)
+    LibosElfProgramHeaderPtr phdr = LibosElfProgramHeaderForRange(image, entryVa, entryVa);
+    if (phdr.raw != NULL)
     {
-        *physicalEntry = phdr->paddr + entryVa - phdr->vaddr;
+        *physicalEntry = phdr.phdr64->paddr + entryVa - phdr.phdr64->vaddr;
         return NV_TRUE;
     }
 
@@ -110,21 +139,47 @@ NvBool LibosTinyElfGetBootEntry(LibosElfImage * image, NvU64 * physicalEntry)
  * @param[in] previous
  *   Previous returned program header. Pass null to get first header.
  */
-LibosElf64ProgramHeader * LibosElfProgramHeaderNext(LibosElfImage * image, LibosElf64ProgramHeader * previous)
+LibosElfProgramHeaderPtr LibosElfProgramHeaderNext(LibosElfImage * image, LibosElfProgramHeaderPtr previous)
 {
-    LibosElf64ProgramHeader * phdrTable = (LibosElf64ProgramHeader *) image->map(image, image->elf->phoff, sizeof(LibosElf64ProgramHeader) * image->elf->phnum);
-    LibosElf64ProgramHeader * phdrTableEnd = phdrTable + image->elf->phnum;
+    NvU8 *phdrTable = NULL, * phdrTableEnd = NULL;
+    NvU64 phoff = 0, phnum = 0;
+    size_t phdrSz = 0;
 
-    LibosElf64ProgramHeader * next;
-    if (!previous)
+    switch (LibosElfGetClass(image))
+    {
+        case ELFCLASS32:
+        {
+            phoff = image->elf32->phoff;
+            phnum = image->elf32->phnum;
+            phdrSz = sizeof(LibosElf32ProgramHeader);
+            break;
+        }
+
+        case ELFCLASS64:
+        {
+            phoff = image->elf64->phoff;
+            phnum = image->elf64->phnum;
+            phdrSz = sizeof(LibosElf64ProgramHeader);
+            break;
+        }
+
+        default:
+            return (LibosElfProgramHeaderPtr){NULL};
+    }
+
+    phdrTable = image->map(image, phoff, phdrSz * phnum);
+    phdrTableEnd = phdrTable + phdrSz * phnum;
+
+    NvU8 * next;
+    if (previous.phdr32 == NULL)
         next = phdrTable;
     else
-        next = previous + 1;
+        next = previous.raw + phdrSz;
 
     if (next == phdrTableEnd)
-        return 0;
+        return (LibosElfProgramHeaderPtr){0};
 
-    return next;
+    return (LibosElfProgramHeaderPtr){.raw = next};
 }
 
 /**
@@ -136,84 +191,48 @@ LibosElf64ProgramHeader * LibosElfProgramHeaderNext(LibosElfImage * image, Libos
  * @param[in] previous
  *   Previous returned section header. Pass null to get first header.
  */
-LibosElf64SectionHeader * LibosElfSectionHeaderNext(LibosElfImage * image, LibosElf64SectionHeader * previous)
+LibosElfSectionHeaderPtr LibosElfSectionHeaderNext(LibosElfImage * image, LibosElfSectionHeaderPtr previous)
 {
-    LibosElf64SectionHeader * shdrTable = (LibosElf64SectionHeader *) image->map(image, image->elf->shoff, sizeof(LibosElf64SectionHeader) * image->elf->shnum);
-    LibosElf64SectionHeader * shdrTableEnd = shdrTable + image->elf->shnum;
+    NvU8 *shdrTable = NULL, * shdrTableEnd = NULL;
+    NvU64 shoff = 0, shnum = 0;
+    size_t shdrSz = 0;
 
-    LibosElf64SectionHeader * next;
-    if (!previous)
+    switch (LibosElfGetClass(image))
+    {
+        case ELFCLASS32:
+        {
+            shoff = image->elf32->shoff;
+            shnum = image->elf32->shnum;
+            shdrSz = sizeof(LibosElf32SectionHeader);
+            break;
+        }
+
+        case ELFCLASS64:
+        {
+            shoff = image->elf64->shoff;
+            shnum = image->elf64->shnum;
+            shdrSz = sizeof(LibosElf64SectionHeader);
+            break;
+        }
+
+        default:
+            return (LibosElfSectionHeaderPtr){NULL};
+    }
+
+
+    shdrTable = image->map(image, shoff, shdrSz * shnum);
+    shdrTableEnd = shdrTable + shdrSz * shnum;
+
+    NvU8 * next;
+    if (previous.raw == NULL)
         next = shdrTable;
     else
-        next = previous + 1;
+        next = previous.raw + shdrSz;
 
     if (next == shdrTableEnd)
-        return 0;
+        return (LibosElfSectionHeaderPtr){NULL};
 
-    return next;
-}
-
-
-/**
- *
- * @brief Locates the dynamic loader section
- *
- *  This section contains dependency information, import/export symbols,
- *  and relocations.
- *
- * @param[in] image
- * @param[in] previous
- *   Previous returned section header. Pass null to get first header.
- */
-LibosElf64ProgramHeader * LibosElfHeaderDynamic(LibosElfImage * image)
-{
-    LibosElf64ProgramHeader * phdr;
-    for (phdr = LibosElfProgramHeaderNext(image, 0); phdr; phdr = LibosElfProgramHeaderNext(image, phdr))
-        if (phdr->type == PT_DYNAMIC)
-            return phdr;
-    return 0;
-}
-
-/**
- *
- * @brief Iterates resources in dynamic loader section
- *
- *  LibosElf64Dynamic::tag must contain
- *      DT_HASH
- *      DT_STRTAB
- *      DT_SYMTAB
- *      DT_RELA
- *      DT_RELASZ
- *      DT_RELAENT
- *      DT_STRSZ
- *      DT_SYMENT
- *      DT_REL
- *      DT_RELSZ
- *      DT_RELENT
- *  It may also contain
- *      DT_NEEDED - List of dynamic libraries this image depends on
- *      ptr is an offset in DT_STRTAB table for image name
- *
- * @param[in] dynamicTableHeader
- *   @see LibosElfHeaderDynamic
- * @param[in] previous
- *   Previous returned dynamic table entry. Pass null to get first entry.
- */
-LibosElf64Dynamic * LibosElfDynamicEntryNext(LibosElfImage * image, LibosElf64ProgramHeader * dynamicTableHeader, LibosElf64Dynamic * previous)
-{
-    LibosElf64Dynamic * dynamicTable = (LibosElf64Dynamic *) image->map(image, dynamicTableHeader->offset, dynamicTableHeader->filesz);
-    LibosElf64Dynamic * dynamicTableEnd = dynamicTable + (dynamicTableHeader->filesz / sizeof(LibosElf64Dynamic));
-
-    LibosElf64Dynamic * next;
-    if (!previous)
-        next = dynamicTable;
-    else
-        next = previous + 1;
-
-    if (previous == dynamicTableEnd)
-        return 0;
-
-    return next;
+    return (LibosElfSectionHeaderPtr){.raw = next};
 }
 
 /**
@@ -225,19 +244,28 @@ LibosElf64Dynamic * LibosElfDynamicEntryNext(LibosElfImage * image, LibosElf64Pr
  * @param[in] vaLastByte
  *   The program header must contain all bytes in the range [va, vaLastByte] inclusive.
  */
-LibosElf64ProgramHeader * LibosElfProgramHeaderForRange(LibosElfImage * image, NvU64 va, NvU64 vaLastByte)
+LibosElfProgramHeaderPtr LibosElfProgramHeaderForRange(LibosElfImage * image, NvU64 va, NvU64 vaLastByte)
 {
-    LibosElf64ProgramHeader * phdr;
-    for (phdr = LibosElfProgramHeaderNext(image, 0);
-         phdr;
+    LibosElfProgramHeaderPtr phdr;
+    for (phdr = LibosElfProgramHeaderNext(image, (LibosElfProgramHeaderPtr){NULL});
+         phdr.raw != NULL;
          phdr = LibosElfProgramHeaderNext(image, phdr))
     {
         // Is this memory region within this PHDR?
-        if (va >= phdr->vaddr && (vaLastByte - phdr->vaddr) < phdr->memsz)
+        if (LibosElfGetClass(image) == ELFCLASS32 &&
+            va >= phdr.phdr32->vaddr && (vaLastByte - phdr.phdr32->vaddr) < phdr.phdr32->memsz)
+        {
             return phdr;
+        }
+
+        if (LibosElfGetClass(image) == ELFCLASS64 &&
+            va >= phdr.phdr64->vaddr && (vaLastByte - phdr.phdr64->vaddr) < phdr.phdr64->memsz)
+        {
+            return phdr;
+        }
     }
 
-    return 0;
+    return (LibosElfProgramHeaderPtr){NULL};
 }
 
 /**
@@ -248,36 +276,82 @@ LibosElf64ProgramHeader * LibosElfProgramHeaderForRange(LibosElfImage * image, N
  * @param[in] image
  * @param[in] sectionName
  *   The section to find such as .text or .data
- * @param[out] start, end
- *   The start and end of the section in the loaded ELF file
- *   e.g   validPtr >= start && validPtr < end
  */
-LibosElf64SectionHeader * LibosElfFindSectionByName(LibosElfImage * image, const char *targetName)
+LibosElfSectionHeaderPtr LibosElfFindSectionByName(LibosElfImage * image, const char *targetName)
 {
     // @todo: Enumerate, and introduce function for kth section header
-    LibosElf64SectionHeader * shdr = (LibosElf64SectionHeader *) image->map(image, image->elf->shoff, image->elf->shnum * sizeof(LibosElf64SectionHeader));
-    NvU32 i;
+    NvU32 i = 0;
+    LibosElfSectionHeaderPtr shdr;
+    NvU32 shstrndx, shnum;
+    const char *shstr = NULL;
+    size_t      shstrSize = 0;
 
-    if (!shdr || image->elf->shstrndx >= image->elf->shnum)
-        return 0;
+    shdr.raw = NULL;
 
-    const char *shstr = (const char *) image->map(image, shdr[image->elf->shstrndx].offset, shdr[image->elf->shstrndx].size);
-    size_t      shstrSize = shdr[image->elf->shstrndx].size;
-
-    for (i = 0; i < image->elf->shnum; i++, shdr++)
+    switch (LibosElfGetClass(image))
     {
-        if (shdr->name >= shstrSize)
-            return 0;
+        case ELFCLASS32:
+        {
+            shstrndx = image->elf32->shstrndx;
+            shnum = image->elf32->shnum;
+            break;
+        }
 
-        const char *name = shstr + shdr->name;
+        case ELFCLASS64:
+        {
+            shstrndx = image->elf64->shstrndx;
+            shnum = image->elf64->shnum;
+            break;
+        }
 
-        if (strncmp(name, targetName, shstrSize - shdr->name) == 0)
+        default:
+        {
+            return (LibosElfSectionHeaderPtr){NULL};
+        }
+    }
+
+    if (shstrndx >= shnum)
+        return (LibosElfSectionHeaderPtr){NULL};
+
+    for (shdr = LibosElfSectionHeaderNext(image, shdr); shdr.shdr32 != NULL; shdr = LibosElfSectionHeaderNext(image, shdr), i++)
+    {
+        const char * name = NULL;
+        NvU32 shdrName = 0;
+
+        if (LibosElfGetClass(image) == ELFCLASS32)
+        {
+            if (i == 0)
+            {
+                shstr = (const char *) image->map(image, shdr.shdr32[image->elf32->shstrndx].offset, shdr.shdr32[image->elf32->shstrndx].size);
+                shstrSize = shdr.shdr32[shstrndx].size;
+            }
+
+            shdrName = shdr.shdr32->name;
+        }
+        else if (LibosElfGetClass(image) == ELFCLASS64)
+        {
+            if (i == 0)
+            {
+                shstr = (const char *) image->map(image, shdr.shdr64[image->elf64->shstrndx].offset, shdr.shdr64[image->elf64->shstrndx].size);
+                shstrSize = shdr.shdr64[shstrndx].size;
+            }
+
+            shdrName = shdr.shdr64->name;
+        }
+
+        if (shdrName >= shstrSize)
+        {
+            return (LibosElfSectionHeaderPtr){NULL};
+        }
+
+        name = shstr + shdrName;
+        if (strncmp(name, targetName, shstrSize - shdrName) == 0)
         {
             return shdr;
         }
     }
 
-    return 0;
+    return (LibosElfSectionHeaderPtr){NULL};
 }
 
 /**
@@ -293,17 +367,46 @@ LibosElf64SectionHeader * LibosElfFindSectionByName(LibosElfImage * image, const
  *   The start and end of the section in the loaded ELF file
  *   e.g   validPtr >= start && validPtr < end
  */
-LibosStatus LibosElfMapSection(LibosElfImage * image, LibosElf64SectionHeader * shdr, NvU8 ** start, NvU8 ** end)
+LibosStatus LibosElfMapSection(LibosElfImage * image, LibosElfSectionHeaderPtr shdr, NvU8 ** start, NvU8 ** end)
 {
     NvU8 * mapping;
+    NvU32 type;
+    NvU64 addr, size, offset;
 
-    if (shdr->type == SHT_NOBITS)
+    switch (LibosElfGetClass(image))
+    {
+        case ELFCLASS32:
+        {
+            type = shdr.shdr32->type;
+            addr = shdr.shdr32->addr;
+            size = shdr.shdr32->size;
+            offset = shdr.shdr32->offset;
+            break;
+        }
+
+        case ELFCLASS64:
+        {
+            type = shdr.shdr64->type;
+            addr = shdr.shdr64->addr;
+            size = shdr.shdr64->size;
+            offset = shdr.shdr64->offset;
+            break;
+        }
+
+        default:
+        {
+            return LibosErrorFailed;
+        }
+    }
+
+    if (type == SHT_NOBITS)
         // Try mapping through the PHDR as a last ditch approach
-        mapping = (NvU8 *) LibosElfMapVirtual(image, shdr->addr, shdr->size);
+        mapping = LibosElfMapVirtual(image, addr, size);
     else
-        mapping = (NvU8 *) image->map(image, shdr->offset, shdr->size);
+        mapping = image->map(image, offset, size);
+
     *start   = mapping;
-    *end     = mapping + shdr->size;
+    *end     = mapping + size;
 
     return LibosOk;
 }
@@ -317,14 +420,42 @@ LibosStatus LibosElfMapSection(LibosElfImage * image, LibosElf64SectionHeader * 
  * @param[in] address
  *   Query the section containing the requested byte
  */
-LibosElf64SectionHeader * LibosElfFindSectionByAddress(LibosElfImage * image, NvU64 address)
+LibosElfSectionHeaderPtr LibosElfFindSectionByAddress(LibosElfImage * image, NvU64 address)
 {
-    LibosElf64SectionHeader * shdr;
-    for (shdr = LibosElfSectionHeaderNext(image, 0); shdr; shdr = LibosElfSectionHeaderNext(image, shdr))
-        if (address >= shdr->addr && address < (shdr->addr + shdr->size))
-            return shdr;
+    LibosElfSectionHeaderPtr shdr;
+    for (shdr = LibosElfSectionHeaderNext(image, (LibosElfSectionHeaderPtr){0});
+        shdr.shdr32 != NULL;
+        shdr = LibosElfSectionHeaderNext(image, shdr))
+    {
+        NvU64 shdrAddr, shdrSize;
 
-    return 0;
+        switch (LibosElfGetClass(image))
+        {
+            case ELFCLASS32:
+            {
+                shdrAddr = shdr.shdr32->addr;
+                shdrSize = shdr.shdr32->size;
+                break;
+            }
+
+            case ELFCLASS64:
+            {
+                shdrAddr = shdr.shdr64->addr;
+                shdrSize = shdr.shdr64->size;
+                break;
+            }
+
+            default:
+            {
+                return (LibosElfSectionHeaderPtr){0};
+            }
+        }
+
+        if (address >= shdrAddr && address < (shdrAddr + shdrSize))
+            return shdr;
+    }
+
+    return (LibosElfSectionHeaderPtr){0};
 }
 
 /**
@@ -343,17 +474,69 @@ LibosElf64SectionHeader * LibosElfFindSectionByAddress(LibosElfImage * image, Nv
  */
 void *LibosElfMapVirtual(LibosElfImage * image, NvU64 address, NvU64 size)
 {
-    LibosElf64ProgramHeader * phdr = LibosElfProgramHeaderForRange(image, address, address + size - 1);
+    LibosElfProgramHeaderPtr phdr = LibosElfProgramHeaderForRange(image, address, address + size - 1);
 
-    if (phdr != NULL)
-        return image->map(image, address - phdr->vaddr + phdr->offset, size);
-
-    LibosElf64SectionHeader *shdr = LibosElfFindSectionByAddress(image, address);
-
-    if (shdr != NULL)
+    if (phdr.raw != NULL)
     {
-        NvU64 section_end = shdr->offset + shdr->size;
-        NvU64 section_offset = address - shdr->addr;
+        NvU64 vaddr, offset;
+
+        switch (LibosElfGetClass(image))
+        {
+            case ELFCLASS32:
+            {
+                vaddr = phdr.phdr32->vaddr;
+                offset = phdr.phdr32->offset;
+                break;
+            }
+
+            case ELFCLASS64:
+            {
+                vaddr = phdr.phdr64->vaddr;
+                offset = phdr.phdr64->offset;
+                break;
+            }
+
+            default:
+            {
+                return NULL;
+            }
+        }
+
+        return image->map(image, address - vaddr + offset, size);
+    }
+
+    LibosElfSectionHeaderPtr shdr = LibosElfFindSectionByAddress(image, address);
+
+    if (shdr.raw != NULL)
+    {
+        NvU64 shdrOffset, shdrSize, shdrAddr;
+
+        switch (LibosElfGetClass(image))
+        {
+            case ELFCLASS32:
+            {
+                shdrOffset = shdr.shdr32->offset;
+                shdrSize = shdr.shdr32->size;
+                shdrAddr = shdr.shdr32->addr;
+                break;
+            }
+
+            case ELFCLASS64:
+            {
+                shdrOffset = shdr.shdr64->offset;
+                shdrSize = shdr.shdr64->size;
+                shdrAddr = shdr.shdr64->addr;
+                break;
+            }
+
+            default:
+            {
+                return NULL;
+            }
+        }
+
+        NvU64 section_end = shdrOffset + shdrSize;
+        NvU64 section_offset = address - shdrAddr;
 
         // Compute section offset (overflow check)
         NvU64 section_offset_tail = section_offset + size;
@@ -361,10 +544,10 @@ void *LibosElfMapVirtual(LibosElfImage * image, NvU64 address, NvU64 size)
             return NULL;
 
         // Bounds check the tail
-        if (section_offset_tail > (NvLength)(section_end - shdr->offset))
+        if (section_offset_tail > (NvLength)(section_end - shdrOffset))
             return NULL;
 
-        return image->map(image, address - shdr->addr + shdr->offset, size);
+        return image->map(image, address - shdrAddr + shdrOffset, size);
     }
 
     return NULL;
@@ -390,23 +573,67 @@ const char *LibosElfMapVirtualString(LibosElfImage * image, NvU64 address, NvBoo
 
     do
     {
+        NvU64 offset = 0, vaddr = 0;
+
         // Ensure the entire string is in the same PHDR
-        LibosElf64ProgramHeader * phdr = LibosElfProgramHeaderForRange(image, address, address + stringOffset);
+        LibosElfProgramHeaderPtr phdr = LibosElfProgramHeaderForRange(image, address, address + stringOffset);
 
-        if (phdr == NULL && checkShdrs)
+        if (phdr.raw == NULL && checkShdrs)
         {
-            LibosElf64SectionHeader * shdr = LibosElfFindSectionByAddress(image, address);
+            LibosElfSectionHeaderPtr shdr = LibosElfFindSectionByAddress(image, address);
 
-            if (shdr == NULL)
+            if (shdr.raw == NULL)
                 return NULL;
 
-            string = (const char *) image->map(image, shdr->offset + (address - shdr->addr), stringOffset+1);
+            switch (LibosElfGetClass(image))
+            {
+                case ELFCLASS32:
+                {
+                    offset = shdr.shdr32->offset;
+                    vaddr = shdr.shdr32->addr;
+                    break;
+                }
+
+                case ELFCLASS64:
+                {
+                    offset = shdr.shdr64->offset;
+                    vaddr = shdr.shdr64->addr;
+                    break;
+                }
+
+                default:
+                {
+                    return NULL;
+                }
+            }
         }
-        else if (phdr)
+        else if (phdr.raw != NULL)
         {
             // Update the mapping
-            string = (const char *) image->map(image, phdr->offset + (address - phdr->vaddr), stringOffset+1);
+            switch (LibosElfGetClass(image))
+            {
+                case ELFCLASS32:
+                {
+                    offset = phdr.phdr32->offset;
+                    vaddr = phdr.phdr32->vaddr;
+                    break;
+                }
+
+                case ELFCLASS64:
+                {
+                    offset = phdr.phdr64->offset;
+                    vaddr = phdr.phdr64->vaddr;
+                    break;
+                }
+
+                default:
+                {
+                    return NULL;
+                }
+            }
         }
+
+        string = (const char *) image->map(image, offset + (address - vaddr), stringOffset+1);
 
         if (!string)
             return NULL;
@@ -425,46 +652,51 @@ NvBool LibosElfCommitData(LibosElfImage *elf, NvU64 commitVirtualAddress, NvU64 
     if (!commitSize)
         return NV_FALSE;
 
+    if (LibosElfGetClass(elf) != ELFCLASS64)
+        return NV_FALSE;
+
     // Ensure the commit size doesn't wrap
     NvU64 lastByte;
     if (__builtin_add_overflow(commitVirtualAddress, commitSize - 1, &lastByte))
         return NV_FALSE;
 
     // Ensure that the commit region doesn't partially overlap any sections
-    for (LibosElf64SectionHeader * psec = LibosElfSectionHeaderNext(elf, 0); psec; psec = LibosElfSectionHeaderNext(elf, psec))
-        if (lastByte >= psec->addr && (lastByte - psec->addr) < psec->size)
-            lastByte = psec->addr + psec->size - 1;
+    for (LibosElfSectionHeaderPtr psec = LibosElfSectionHeaderNext(elf, (LibosElfSectionHeaderPtr){0});
+        psec.shdr64 != NULL;
+        psec = LibosElfSectionHeaderNext(elf, psec))
+        if (lastByte >= psec.shdr64->addr && (lastByte - psec.shdr64->addr) < psec.shdr64->size)
+            lastByte = psec.shdr64->addr + psec.shdr64->size - 1;
 
     // Find the containing PHDR
-    LibosElf64ProgramHeader * phdr = LibosElfProgramHeaderForRange(elf, commitVirtualAddress, lastByte);
+    LibosElfProgramHeaderPtr phdr = LibosElf64ProgramHeaderForRange(elf, commitVirtualAddress, lastByte);
 
     // Is the area already committed?
-    if (lastByte < (phdr->vaddr + phdr->filesz))
+    if (lastByte < (phdr.phdr64->vaddr + phdr.phdr64->filesz))
         return NV_TRUE;
 
     // Find insertion point in the ELF image
-    NvU64 insertionOffset = phdr->offset + phdr->filesz;
-    NvU64 insertionCount  = (lastByte + 1) - (phdr->vaddr + phdr->filesz);
+    NvU64 insertionOffset = phdr.phdr64->offset + phdr.phdr64->filesz;
+    NvU64 insertionCount  = (lastByte + 1) - (phdr.phdr64->vaddr + phdr.phdr64->filesz);
 
     // Update the file backed size
-    phdr->filesz = lastByte - phdr->vaddr + 1;
+    phdr.phdr64->filesz = lastByte - phdr.phdr64->vaddr + 1;
 
     // Update all PHDR offsets
-    for (LibosElf64ProgramHeader * phdr = LibosElfProgramHeaderNext(elf, 0); phdr; phdr = LibosElfProgramHeaderNext(elf, phdr))
-        if (phdr->offset > insertionOffset)
-            phdr->offset += insertionCount;
+    for (LibosElfProgramHeaderPtr phdr = LibosElfProgramHeaderNext(elf, 0); phdr.raw != NULL; phdr = LibosElfProgramHeaderNext(elf, phdr))
+        if (phdr.phdr64->offset > insertionOffset)
+            phdr.phdr64->offset += insertionCount;
 
     // Update all section offsets
-    for (LibosElf64SectionHeader * psec = LibosElfSectionHeaderNext(elf, 0); psec; psec = LibosElfSectionHeaderNext(elf, psec))
+    for (LibosElfSectionHeaderPtr psec = LibosElfSectionHeaderNext(elf, 0); psec.raw != NULL; psec = LibosElfSectionHeaderNext(elf, psec))
     {
-        if (psec->offset > insertionOffset)
-            psec->offset += insertionCount;
+        if (psec.shdr64->offset > insertionOffset)
+            psec.shdr64->offset += insertionCount;
 
         // Did we just commit a section? Convert from nobits to progbits
-        if (psec->addr >= phdr->vaddr && (psec->addr+psec->size) <= (phdr->vaddr + phdr->filesz))
-            if (psec->type == SHT_NOBITS) {
+        if (psec.shdr64->addr >= phdr->vaddr && (psec.shdr64->addr+psec.shdr64->size) <= (phdr.phdr64->vaddr + phdr.phdr64->filesz))
+            if (psec.shdr64->type == SHT_NOBITS) {
                 // @todo: Set the offset field
-                psec->type = SHT_PROGBITS;
+                psec.shdr64->type = SHT_PROGBITS;
             }
     }
 

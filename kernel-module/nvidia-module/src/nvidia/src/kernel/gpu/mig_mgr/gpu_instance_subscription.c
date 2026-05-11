@@ -41,6 +41,8 @@
 #include "kernel/gpu/mig_mgr/gpu_instance_subscription.h"
 #include "kernel/gpu/mig_mgr/compute_instance_subscription.h"
 #include "kernel/gpu/mig_mgr/kernel_mig_manager.h"
+#include "kernel/gpu/gr/kernel_watchdog.h"
+#include "kernel/gpu/rc/kernel_rc.h"
 
 #include "ctrl/ctrlc637.h"
 #include "core/locks.h"
@@ -162,8 +164,8 @@ gisubscriptionConstruct_IMPL
     if (swizzId == NVC637_DEVICE_PROFILING_SWIZZID)
     {
         // Check if this is a root-client or un-privileged device profiling is allowed
-        if (gpuIsRmProfilingPrivileged(pGpu) &&
-            !rmclientIsAdmin(pRmClient, pCallContext->secInfo.privLevel))
+        if (gpuIsRmProfilingPrivileged(pGpu)
+            && !rmclientIsAdmin(pRmClient, pCallContext->secInfo.privLevel))
         {
             return NV_ERR_INSUFFICIENT_PERMISSIONS;
         }
@@ -389,6 +391,7 @@ gisubscriptionCtrlCmdExecPartitionsCreate_IMPL
     OBJGPU *pGpu = GPU_RES_GET_GPU(pGPUInstanceSubscription);
     KernelMIGManager *pKernelMIGManager = GPU_GET_KERNEL_MIG_MANAGER(pGpu);
     KERNEL_MIG_GPU_INSTANCE *pKernelMIGGpuInstance = pGPUInstanceSubscription->pKernelMIGGpuInstance;
+    NvU32 i;
 
     NV_ASSERT_OR_RETURN(rmapiLockIsOwner() && rmGpuLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
 
@@ -413,17 +416,17 @@ gisubscriptionCtrlCmdExecPartitionsCreate_IMPL
     NV_ASSERT_OR_RETURN(IS_MIG_IN_USE(pGpu), NV_ERR_INVALID_STATE);
 
     // Check whether CI Manipulation is disabled for vGPU.
-    if (IS_VIRTUAL(pGpu)) 
-    { 
+    if (IS_VIRTUAL(pGpu))
+    {
         VGPU_STATIC_INFO *pVSI = GPU_GET_STATIC_INFO(pGpu);
- 
-        NV_ASSERT_OR_RETURN(pVSI != NULL, NV_ERR_INVALID_ARGUMENT); 
+
+        NV_ASSERT_OR_RETURN(pVSI != NULL, NV_ERR_INVALID_ARGUMENT);
 
         if (FLD_TEST_DRF(A080, _CTRL_CMD_VGPU_GET_CONFIG, _PARAMS_VGPU_DEV_CAPS_CI_MANIPULATION_ENABLED, _FALSE,
-                         pVSI->vgpuConfig.vgpuDeviceCapsBits)) 
-        { 
-            return NV_ERR_NOT_SUPPORTED; 
-        } 
+                         pVSI->vgpuConfig.vgpuDeviceCapsBits))
+        {
+            return NV_ERR_NOT_SUPPORTED;
+        }
     }
 
     NV_CHECK_OR_RETURN(LEVEL_SILENT, (pParams->execPartCount <= NVC637_CTRL_MAX_EXEC_PARTITIONS),
@@ -456,7 +459,7 @@ gisubscriptionCtrlCmdExecPartitionsCreate_IMPL
             .inst.request.requestFlags = pParams->flags
         };
 
-        if (!hypervisorIsVgxHyper())
+        if (!gpuIsSriovEnabled(pGpu))
         {
             request.inst.request.requestFlags = FLD_SET_DRF(C637_CTRL, _DMA_EXEC_PARTITIONS_CREATE_REQUEST, _WITH_PART_ID, _FALSE, request.inst.request.requestFlags);
         }
@@ -465,7 +468,6 @@ gisubscriptionCtrlCmdExecPartitionsCreate_IMPL
         {
             if (pGpu->getProperty(pGpu, PDB_PROP_GPU_MIG_MIRROR_HOST_CI_ON_GUEST))
             {
-                NvU32 i;
                 NVC637_CTRL_EXEC_PARTITIONS_IMPORT_EXPORT_PARAMS export;
                 GPUMGR_SAVE_COMPUTE_INSTANCE save;
 
@@ -512,8 +514,6 @@ gisubscriptionCtrlCmdExecPartitionsCreate_IMPL
         }
 
         {
-            NvU32 i;
-
             for (i = 0; i < pParams->execPartCount; i++)
             {
                 gpumgrCacheCreateComputeInstance(pGpu, pKernelMIGGpuInstance->swizzId,
@@ -523,8 +523,6 @@ gisubscriptionCtrlCmdExecPartitionsCreate_IMPL
     }
     else
     {
-        NvU32 i;
-
         for (i = 0; i < pParams->execPartCount; i++)
         {
             RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);
@@ -621,14 +619,14 @@ gisubscriptionCtrlCmdExecPartitionsDelete_IMPL
     if (IS_VIRTUAL(pGpu))
     {
         VGPU_STATIC_INFO *pVSI = GPU_GET_STATIC_INFO(pGpu);
-        
+
         NV_ASSERT_OR_RETURN(pVSI != NULL, NV_ERR_INVALID_ARGUMENT);
-        
-        if (FLD_TEST_DRF(A080, _CTRL_CMD_VGPU_GET_CONFIG, _PARAMS_VGPU_DEV_CAPS_CI_MANIPULATION_ENABLED, _FALSE, 
+
+        if (FLD_TEST_DRF(A080, _CTRL_CMD_VGPU_GET_CONFIG, _PARAMS_VGPU_DEV_CAPS_CI_MANIPULATION_ENABLED, _FALSE,
                          pVSI->vgpuConfig.vgpuDeviceCapsBits))
-        {   
+        {
             return NV_ERR_NOT_SUPPORTED;
-        }   
+        }
     }
 
     NV_CHECK_OR_RETURN(LEVEL_SILENT, pParams->execPartCount <= NVC637_CTRL_MAX_EXEC_PARTITIONS,
@@ -651,9 +649,10 @@ gisubscriptionCtrlCmdExecPartitionsDelete_IMPL
 
     for (execPartIdx = 0; execPartIdx < pParams->execPartCount; ++execPartIdx)
     {
+        KernelMIGManager *pKernelMIGManager = GPU_GET_KERNEL_MIG_MANAGER(pGpu);
+
         if (IS_VIRTUAL(pGpu) || IS_GSP_CLIENT(pGpu))
         {
-            KernelMIGManager *pKernelMIGManager = GPU_GET_KERNEL_MIG_MANAGER(pGpu);
             NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
                 kmigmgrDeleteComputeInstance(pGpu, pKernelMIGManager, pKernelMIGGpuInstance,
                                              pParams->execPartId[execPartIdx],
@@ -1170,9 +1169,11 @@ gisubscriptionCtrlCmdExecPartitionsGetProfileCapacity_IMPL
     OBJGPU *pGpu = GPU_RES_GET_GPU(pGPUInstanceSubscription);
     KERNEL_MIG_GPU_INSTANCE *pKernelMIGGpuInstance = pGPUInstanceSubscription->pKernelMIGGpuInstance;
     KernelMIGManager *pKernelMIGManager = GPU_GET_KERNEL_MIG_MANAGER(pGpu);
+    Subdevice *pSubdevice = GPU_RES_GET_SUBDEVICE(pGPUInstanceSubscription);
 
     return kmigmgrComputeProfileGetCapacity(pGpu, pKernelMIGManager, pKernelMIGGpuInstance->pProfile,
-                                            pKernelMIGGpuInstance, pParams);
+                                            pKernelMIGGpuInstance, RES_GET_CLIENT_HANDLE(pGPUInstanceSubscription),
+                                            RES_GET_HANDLE(pSubdevice), pParams);
 }
 
 NV_STATUS

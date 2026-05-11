@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -36,22 +36,7 @@
 
 #include "published/blackwell/gb10b/hwproject.h"
 #include "published/blackwell/gb10b/dev_xtl_ep_pcfg_gpu.h"
-#include "published/blackwell/gb10b/dev_boot.h"
-
-/*!
- * @brief Returns the physical address width for the given @ref NV_ADDRESS_SPACE
- */
-NvU32 gpuGetPhysAddrWidth_GB10B
-(
-    OBJGPU          *pGpu,
-    NV_ADDRESS_SPACE addrSp
-)
-{
-    // Currently this function supports only sysmem addresses
-    NV_ASSERT_OR_RETURN(ADDR_SYSMEM == addrSp, 0);
-
-    return NV_CHIP_EXTENDED_SYSTEM_PHYSICAL_ADDRESS_BITS;
-}
+#include "published/blackwell/gb10b/dev_boot_zb.h"
 
 //
 // List of GPU children that present for the chip. List entries contain$
@@ -94,7 +79,9 @@ static const GPUCHILDPRESENT gpuChildrenPresent_GB10B[] =
     GPU_CHILD_PRESENT(Spdm, 1),
     GPU_CHILD_PRESENT(ConfidentialCompute, 1),
     GPU_CHILD_PRESENT(KernelFsp, 1),
+    GPU_CHILD_PRESENT(OBJGRIDDISPLAYLESS, 1),
     GPU_CHILD_PRESENT(KernelGsp, 1),
+    GPU_CHILD_PRESENT(KernelSec2, 1),
 };
 
 const GPUCHILDPRESENT *
@@ -175,7 +162,7 @@ gpuHandleSecFault_GB10B
     // handleGpuLost first to setGpuDisconnectedProperties so that another reg read does not
     // happen when the notifier is sent below.
     //
-    osHandleGpuLost(pGpu);
+    osHandleGpuLost(pGpu, NV_FALSE);
 
     //
     // Send SEC_FAULT notification. This should tells any MODS test testing for this

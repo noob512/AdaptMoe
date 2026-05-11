@@ -46,8 +46,9 @@ extern "C" {
 
 #include "gpu/gpu.h"
 #include "gpu/gpu_resource.h"
-#include "rmapi/event.h"
+#include "rmapi/event_api.h"
 #include "ctrl/ctrlc763.h"
+#include "class/clc863.h"
 
 typedef struct
 {
@@ -68,12 +69,10 @@ typedef struct
 #define NV_VAB_SIZE_TO_BIT_COUNT(vabSize)   ((vabSize)*8)
 #define NV_VAB_SIZE_TO_NVU64_COUNT(vabSize) ((vabSize)/8)
 
-
 /*
  * Maximum length of access bit mask and access bit buffer in NvU64s. Legacy define used in the old interface. To be deleted once MODS transitions to V2.
  */
-#define AMPERE_VIDMEM_BIT_BUF_SIZE 512
-#define NV_VAB_BUFFER_MAX_NVU64_COUNT NV_VAB_SIZE_TO_NVU64_COUNT(AMPERE_VIDMEM_BIT_BUF_SIZE)
+#define NV_VAB_BUFFER_MAX_NVU64_COUNT NV_VAB_SIZE_TO_NVU64_COUNT(NVC863_SIZE)
 
 /*
  * These values are returned from gmmuVidmemAccessBitBufferVersion_HAL to indicate
@@ -125,9 +124,6 @@ struct VidmemAccessBitBuffer {
     struct INotifier *__nvoc_pbase_INotifier;    // inotify super^2
     struct Notifier *__nvoc_pbase_Notifier;    // notify super
     struct VidmemAccessBitBuffer *__nvoc_pbase_VidmemAccessBitBuffer;    // vidmemAccessBitBuf
-
-    // Vtable with 1 per-object function pointer
-    NV_STATUS (*__vidmemAccessBitBufCtrlCmdVidmemAccessBitDump__)(struct VidmemAccessBitBuffer * /*this*/, NVC763_CTRL_VIDMEM_ACCESS_BIT_BUFFER_DUMP_PARAMS *);  // exported (id=0xc7630103)
 };
 
 
@@ -173,13 +169,9 @@ struct NVOC_METADATA__VidmemAccessBitBuffer {
     const struct NVOC_VTABLE__VidmemAccessBitBuffer vtable;
 };
 
-#ifndef __NVOC_CLASS_VidmemAccessBitBuffer_TYPEDEF__
-#define __NVOC_CLASS_VidmemAccessBitBuffer_TYPEDEF__
-typedef struct VidmemAccessBitBuffer VidmemAccessBitBuffer;
-#endif /* __NVOC_CLASS_VidmemAccessBitBuffer_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_VidmemAccessBitBuffer
-#define __nvoc_class_id_VidmemAccessBitBuffer 0xebb6da
+#define __nvoc_class_id_VidmemAccessBitBuffer 0xebb6dau
+typedef struct VidmemAccessBitBuffer VidmemAccessBitBuffer;
 #endif /* __nvoc_class_id_VidmemAccessBitBuffer */
 
 // Casting support
@@ -197,14 +189,36 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_VidmemAccessBitBuffer;
 
 NV_STATUS __nvoc_objCreateDynamic_VidmemAccessBitBuffer(VidmemAccessBitBuffer**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_VidmemAccessBitBuffer(VidmemAccessBitBuffer**, Dynamic*, NvU32, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_VidmemAccessBitBuffer(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_VidmemAccessBitBuffer((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_VidmemAccessBitBuffer(VidmemAccessBitBuffer**, Dynamic*, NvU32, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_VidmemAccessBitBuffer(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_VidmemAccessBitBuffer((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
-#define vidmemAccessBitBufCtrlCmdVidmemAccessBitDump_FNPTR(pVidmemAccessBitBuffer) pVidmemAccessBitBuffer->__vidmemAccessBitBufCtrlCmdVidmemAccessBitDump__
-#define vidmemAccessBitBufCtrlCmdVidmemAccessBitDump(pVidmemAccessBitBuffer, pParams) vidmemAccessBitBufCtrlCmdVidmemAccessBitDump_DISPATCH(pVidmemAccessBitBuffer, pParams)
+// Wrapper macros for implementation functions
+#ifdef __nvoc_vidmem_access_bit_buffer_h_disabled
+static inline NV_STATUS vidmemAccessBitBufConstructHelper(struct VidmemAccessBitBuffer *pVidmem, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("VidmemAccessBitBuffer was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_vidmem_access_bit_buffer_h_disabled
+#define vidmemAccessBitBufConstructHelper(pVidmem, pCallContext, pParams) vidmemAccessBitBufConstructHelper_ac1694(pVidmem, pCallContext, pParams)
+#endif // __nvoc_vidmem_access_bit_buffer_h_disabled
+
+#define __nvoc_vidmemAccessBitBufDestruct(pVidmemAccessBitBuffer) vidmemAccessBitBufDestruct_d44104(pVidmemAccessBitBuffer)
+
+NV_STATUS vidmemAccessBitBufCtrlCmdVidmemAccessBitDump_IMPL(struct VidmemAccessBitBuffer *pVidmemAccessBitBuffer, NVC763_CTRL_VIDMEM_ACCESS_BIT_BUFFER_DUMP_PARAMS *pParams);
+#ifdef __nvoc_vidmem_access_bit_buffer_h_disabled
+static inline NV_STATUS vidmemAccessBitBufCtrlCmdVidmemAccessBitDump(struct VidmemAccessBitBuffer *pVidmemAccessBitBuffer, NVC763_CTRL_VIDMEM_ACCESS_BIT_BUFFER_DUMP_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("VidmemAccessBitBuffer was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_vidmem_access_bit_buffer_h_disabled
+#define vidmemAccessBitBufCtrlCmdVidmemAccessBitDump(pVidmemAccessBitBuffer, pParams) vidmemAccessBitBufCtrlCmdVidmemAccessBitDump_IMPL(pVidmemAccessBitBuffer, pParams)
+#endif // __nvoc_vidmem_access_bit_buffer_h_disabled
+
+
+// Wrapper macros for halified functions
+#define vidmemAccessBitBufConstructHelper_HAL(pVidmem, pCallContext, pParams) vidmemAccessBitBufConstructHelper(pVidmem, pCallContext, pParams)
 #define vidmemAccessBitBufControl_FNPTR(pGpuResource) pGpuResource->__nvoc_base_GpuResource.__nvoc_metadata_ptr->vtable.__gpuresControl__
 #define vidmemAccessBitBufControl(pGpuResource, pCallContext, pParams) vidmemAccessBitBufControl_DISPATCH(pGpuResource, pCallContext, pParams)
 #define vidmemAccessBitBufMap_FNPTR(pGpuResource) pGpuResource->__nvoc_base_GpuResource.__nvoc_metadata_ptr->vtable.__gpuresMap__
@@ -267,10 +281,6 @@ NV_STATUS __nvoc_objCreate_VidmemAccessBitBuffer(VidmemAccessBitBuffer**, Dynami
 #define vidmemAccessBitBufGetOrAllocNotifShare(pNotifier, hNotifierClient, hNotifierResource, ppNotifShare) vidmemAccessBitBufGetOrAllocNotifShare_DISPATCH(pNotifier, hNotifierClient, hNotifierResource, ppNotifShare)
 
 // Dispatch functions
-static inline NV_STATUS vidmemAccessBitBufCtrlCmdVidmemAccessBitDump_DISPATCH(struct VidmemAccessBitBuffer *pVidmemAccessBitBuffer, NVC763_CTRL_VIDMEM_ACCESS_BIT_BUFFER_DUMP_PARAMS *pParams) {
-    return pVidmemAccessBitBuffer->__vidmemAccessBitBufCtrlCmdVidmemAccessBitDump__(pVidmemAccessBitBuffer, pParams);
-}
-
 static inline NV_STATUS vidmemAccessBitBufControl_DISPATCH(struct VidmemAccessBitBuffer *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams) {
     return pGpuResource->__nvoc_metadata_ptr->vtable.__vidmemAccessBitBufControl__(pGpuResource, pCallContext, pParams);
 }
@@ -391,32 +401,24 @@ static inline NV_STATUS vidmemAccessBitBufGetOrAllocNotifShare_DISPATCH(struct V
     return pNotifier->__nvoc_metadata_ptr->vtable.__vidmemAccessBitBufGetOrAllocNotifShare__(pNotifier, hNotifierClient, hNotifierResource, ppNotifShare);
 }
 
-static inline NV_STATUS vidmemAccessBitBufConstructHelper_56cd7a(struct VidmemAccessBitBuffer *pVidmem, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+NV_STATUS vidmemAccessBitBufCtrlCmdVidmemAccessBitDump_IMPL(struct VidmemAccessBitBuffer *pVidmemAccessBitBuffer, NVC763_CTRL_VIDMEM_ACCESS_BIT_BUFFER_DUMP_PARAMS *pParams);
+
+// HAL method declarations without bodies
+// Inline HAL method definitions
+static inline NV_STATUS vidmemAccessBitBufConstructHelper_ac1694(struct VidmemAccessBitBuffer *pVidmem, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams){
     return NV_OK;
 }
 
-
-#ifdef __nvoc_vidmem_access_bit_buffer_h_disabled
-static inline NV_STATUS vidmemAccessBitBufConstructHelper(struct VidmemAccessBitBuffer *pVidmem, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {
-    NV_ASSERT_FAILED_PRECOMP("VidmemAccessBitBuffer was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_vidmem_access_bit_buffer_h_disabled
-#define vidmemAccessBitBufConstructHelper(pVidmem, pCallContext, pParams) vidmemAccessBitBufConstructHelper_56cd7a(pVidmem, pCallContext, pParams)
-#endif //__nvoc_vidmem_access_bit_buffer_h_disabled
-
-#define vidmemAccessBitBufConstructHelper_HAL(pVidmem, pCallContext, pParams) vidmemAccessBitBufConstructHelper(pVidmem, pCallContext, pParams)
-
-static inline void vidmemAccessBitBufDestruct_b3696a(struct VidmemAccessBitBuffer *pVidmemAccessBitBuffer) {
+static inline void vidmemAccessBitBufDestruct_d44104(struct VidmemAccessBitBuffer *pVidmemAccessBitBuffer){
     return;
 }
 
-
-#define __nvoc_vidmemAccessBitBufDestruct(pVidmemAccessBitBuffer) vidmemAccessBitBufDestruct_b3696a(pVidmemAccessBitBuffer)
-NV_STATUS vidmemAccessBitBufCtrlCmdVidmemAccessBitDump_IMPL(struct VidmemAccessBitBuffer *pVidmemAccessBitBuffer, NVC763_CTRL_VIDMEM_ACCESS_BIT_BUFFER_DUMP_PARAMS *pParams);
-
-static inline NV_STATUS __nvoc_vidmemAccessBitBufConstruct(struct VidmemAccessBitBuffer *arg_pVidmemAccessBitBuffer, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams) {
-    return vidmemAccessBitBufConstructHelper(arg_pVidmemAccessBitBuffer, arg_pCallContext, arg_pParams);
+// Static dispatch method declarations
+// Static inline method definitions
+static inline NV_STATUS __nvoc_vidmemAccessBitBufConstruct(struct VidmemAccessBitBuffer *pVidmemAccessBitBuffer, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams){
+    return vidmemAccessBitBufConstructHelper(pVidmemAccessBitBuffer, pCallContext, pParams);
 }
 
 #undef PRIVATE_FIELD

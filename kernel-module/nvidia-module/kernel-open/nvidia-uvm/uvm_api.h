@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2015-2019 NVIDIA Corporation
+    Copyright (c) 2015-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -32,7 +32,7 @@
 #include "uvm_thread_context.h"
 #include "uvm_kvmalloc.h"
 #include "uvm_va_space.h"
-#include "nv_uvm_types.h"
+#include "nv_uvm_user_types.h"
 
 // This weird number comes from UVM_PREVENT_MIGRATION_RANGE_GROUPS_PARAMS. That
 // ioctl is called frequently so we don't want to allocate a copy every time.
@@ -188,6 +188,16 @@ static bool uvm_api_range_invalid(NvU64 base, NvU64 length)
     return uvm_api_range_invalid_aligned(base, length, PAGE_SIZE);
 }
 
+// Similar to uvm_api_range_invalid() but also validates that an offset is
+// aligned and that the offset and length won't overflow.
+static bool uvm_api_range_offset_invalid(NvU64 base, NvU64 offset, NvU64 length)
+{
+    return uvm_api_range_invalid(base, offset + length) ||
+            !IS_ALIGNED(offset, PAGE_SIZE)     ||
+            !IS_ALIGNED(length, PAGE_SIZE)     ||
+            offset + length < offset;
+}
+
 // Some APIs can only enforce 4K alignment as it's the smallest GPU page size
 // even when the smallest host page is larger.
 static bool uvm_api_range_invalid_4k(NvU64 base, NvU64 length)
@@ -212,6 +222,10 @@ typedef enum
 // If the interval [base, base + length) is fully covered by VMAs which all have
 // the same uvm_api_range_type_t, that range type is returned.
 //
+// If the platform supports ATS but no GPU has yet been registered and a
+// possible ATS range is identified then the VA space state is updated such that
+// it will only be possible to register GPUs that support ATS.
+//
 // LOCKING: va_space->lock must be held in at least read mode. If mm != NULL,
 //          mm->mmap_lock must also be held in at least read mode.
 uvm_api_range_type_t uvm_api_range_type_check(uvm_va_space_t *va_space, struct mm_struct *mm, NvU64 base, NvU64 length);
@@ -228,6 +242,7 @@ NV_STATUS uvm_api_create_external_range(UVM_CREATE_EXTERNAL_RANGE_PARAMS *params
 NV_STATUS uvm_api_map_external_allocation(UVM_MAP_EXTERNAL_ALLOCATION_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_map_external_sparse(UVM_MAP_EXTERNAL_SPARSE_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_free(UVM_FREE_PARAMS *params, struct file *filp);
+NV_STATUS uvm_api_discard(UVM_DISCARD_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_prevent_migration_range_groups(UVM_PREVENT_MIGRATION_RANGE_GROUPS_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_allow_migration_range_groups(UVM_ALLOW_MIGRATION_RANGE_GROUPS_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_set_preferred_location(const UVM_SET_PREFERRED_LOCATION_PARAMS *params, struct file *filp);
@@ -241,8 +256,6 @@ NV_STATUS uvm_api_unregister_channel(UVM_UNREGISTER_CHANNEL_PARAMS *params, stru
 NV_STATUS uvm_api_enable_read_duplication(const UVM_ENABLE_READ_DUPLICATION_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_disable_read_duplication(const UVM_DISABLE_READ_DUPLICATION_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp);
-NV_STATUS uvm_api_enable_system_wide_atomics(UVM_ENABLE_SYSTEM_WIDE_ATOMICS_PARAMS *params, struct file *filp);
-NV_STATUS uvm_api_disable_system_wide_atomics(UVM_DISABLE_SYSTEM_WIDE_ATOMICS_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_tools_init_event_tracker(UVM_TOOLS_INIT_EVENT_TRACKER_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_tools_init_event_tracker_v2(UVM_TOOLS_INIT_EVENT_TRACKER_V2_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_tools_set_notification_threshold(UVM_TOOLS_SET_NOTIFICATION_THRESHOLD_PARAMS *params, struct file *filp);

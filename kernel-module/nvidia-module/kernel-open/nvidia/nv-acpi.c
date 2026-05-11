@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1999-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1999-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -28,6 +28,7 @@
 #include "nv-reg.h"
 
 #include <linux/acpi.h>
+#include <acpi/video.h>
 
 #if defined(NV_LINUX_ACPI_EVENTS_SUPPORTED)
 static NV_STATUS   nv_acpi_extract_integer (const union acpi_object *, void *, NvU32, NvU32 *);
@@ -55,16 +56,6 @@ static NvBool battery_present = NV_FALSE;
 #define BIX_BATTERY_TECHNOLOGY_OFFSET 0x4
 #define BIF_BATTERY_TECHNOLOGY_OFFSET 0x3
 #define BATTERY_RECHARGABLE           0x1
-
-/* Moved into acpi/video.h in Linux 4.10 */
-#ifndef ACPI_VIDEO_NOTIFY_PROBE
-#define ACPI_VIDEO_NOTIFY_PROBE    0x81
-#endif
-
-/* Added to acpi/video.h in Linux 3.1 */
-#ifndef ACPI_VIDEO_CLASS
-#define ACPI_VIDEO_CLASS    "video"
-#endif
 
 /* Maximum size of ACPI _DSM method's 4th argument */
 #define NV_MAX_ACPI_DSM_PARAM_SIZE     1024
@@ -737,8 +728,6 @@ static NV_STATUS nv_acpi_evaluate_dsm_method(
 
         rmStatus = nv_acpi_extract_object(dsm, pOutData, *pSize, &data_size);
         *pSize = data_size;
-
-        kfree(output.pointer);
     }
     else
     {
@@ -751,6 +740,7 @@ static NV_STATUS nv_acpi_evaluate_dsm_method(
                   "NVRM: %s: DSM data invalid!\n", __FUNCTION__);
     }
 
+    kfree(output.pointer);
     return rmStatus;
 }
 
@@ -1183,6 +1173,7 @@ NvBool nv_acpi_power_resource_method_present(
         (object_package->package.count != 0x1))
     {
         nv_printf(NV_DBG_ERRORS,"NVRM: _PR3 object is not a type 'package'\n");
+        kfree(buf.pointer);
         return NV_FALSE;
     }
 
@@ -1194,8 +1185,10 @@ NvBool nv_acpi_power_resource_method_present(
     {
         nv_printf(NV_DBG_ERRORS,
                      "NVRM: _PR3 object does not contain POWER Reference\n");
+        kfree(buf.pointer);
         return NV_FALSE;
     }
+    kfree(buf.pointer);
     return NV_TRUE;
 }
 
@@ -1325,6 +1318,7 @@ static acpi_status nv_acpi_find_battery_info(
     if (object_package->type != ACPI_TYPE_PACKAGE)
     {
         nv_printf(NV_DBG_INFO, "NVRM: Battery method output is not package\n");
+        kfree(buf.pointer);
         return AE_OK;
     }
 
@@ -1350,11 +1344,13 @@ static acpi_status nv_acpi_find_battery_info(
     if ((object_package->package.elements[battery_technology_offset].type != ACPI_TYPE_INTEGER) ||
         (object_package->package.elements[battery_technology_offset].integer.value != BATTERY_RECHARGABLE))
     {
+        kfree(buf.pointer);
         return AE_OK;
     }
 
     battery_present = NV_TRUE;
 
+    kfree(buf.pointer);
     /* Stop traversing acpi tree. */
     return AE_CTRL_TERMINATE;
 }

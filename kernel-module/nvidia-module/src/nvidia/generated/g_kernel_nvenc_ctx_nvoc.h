@@ -135,13 +135,9 @@ struct NVOC_METADATA__MsencContext {
     const struct NVOC_VTABLE__MsencContext vtable;
 };
 
-#ifndef __NVOC_CLASS_MsencContext_TYPEDEF__
-#define __NVOC_CLASS_MsencContext_TYPEDEF__
-typedef struct MsencContext MsencContext;
-#endif /* __NVOC_CLASS_MsencContext_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_MsencContext
-#define __nvoc_class_id_MsencContext 0x88c92a
+#define __nvoc_class_id_MsencContext 0x88c92au
+typedef struct MsencContext MsencContext;
 #endif /* __nvoc_class_id_MsencContext */
 
 // Casting support
@@ -159,12 +155,33 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_MsencContext;
 
 NV_STATUS __nvoc_objCreateDynamic_MsencContext(MsencContext**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_MsencContext(MsencContext**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_MsencContext(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_MsencContext((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_MsencContext(MsencContext**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_MsencContext(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_MsencContext((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+#ifdef __nvoc_kernel_nvenc_ctx_h_disabled
+static inline NV_STATUS msencctxConstructHal(struct MsencContext *pMsencContext, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("MsencContext was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_nvenc_ctx_h_disabled
+#define msencctxConstructHal(pMsencContext, pCallContext, pParams) msencctxConstructHal_KERNEL(pMsencContext, pCallContext, pParams)
+#endif // __nvoc_kernel_nvenc_ctx_h_disabled
+
+#ifdef __nvoc_kernel_nvenc_ctx_h_disabled
+static inline void msencctxDestructHal(struct MsencContext *pMsencContext) {
+    NV_ASSERT_FAILED_PRECOMP("MsencContext was disabled!");
+}
+#else // __nvoc_kernel_nvenc_ctx_h_disabled
+#define msencctxDestructHal(pMsencContext) msencctxDestructHal_KERNEL(pMsencContext)
+#endif // __nvoc_kernel_nvenc_ctx_h_disabled
+
+
+// Wrapper macros for halified functions
+#define msencctxConstructHal_HAL(pMsencContext, pCallContext, pParams) msencctxConstructHal(pMsencContext, pCallContext, pParams)
+#define msencctxDestructHal_HAL(pMsencContext) msencctxDestructHal(pMsencContext)
 #define msencctxGetSwMethods_FNPTR(pChannelDescendant) pChannelDescendant->__nvoc_base_ChannelDescendant.__nvoc_metadata_ptr->vtable.__chandesGetSwMethods__
 #define msencctxGetSwMethods(pChannelDescendant, ppMethods, pNumMethods) msencctxGetSwMethods_DISPATCH(pChannelDescendant, ppMethods, pNumMethods)
 #define msencctxIsSwMethodStalling_FNPTR(pChannelDescendant) pChannelDescendant->__nvoc_base_ChannelDescendant.__nvoc_metadata_ptr->vtable.__chandesIsSwMethodStalling__
@@ -359,38 +376,21 @@ static inline NV_STATUS msencctxGetOrAllocNotifShare_DISPATCH(struct MsencContex
     return pNotifier->__nvoc_metadata_ptr->vtable.__msencctxGetOrAllocNotifShare__(pNotifier, hNotifierClient, hNotifierResource, ppNotifShare);
 }
 
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
 NV_STATUS msencctxConstructHal_KERNEL(struct MsencContext *pMsencContext, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
-
-
-#ifdef __nvoc_kernel_nvenc_ctx_h_disabled
-static inline NV_STATUS msencctxConstructHal(struct MsencContext *pMsencContext, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {
-    NV_ASSERT_FAILED_PRECOMP("MsencContext was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_kernel_nvenc_ctx_h_disabled
-#define msencctxConstructHal(pMsencContext, pCallContext, pParams) msencctxConstructHal_KERNEL(pMsencContext, pCallContext, pParams)
-#endif //__nvoc_kernel_nvenc_ctx_h_disabled
-
-#define msencctxConstructHal_HAL(pMsencContext, pCallContext, pParams) msencctxConstructHal(pMsencContext, pCallContext, pParams)
 
 void msencctxDestructHal_KERNEL(struct MsencContext *pMsencContext);
 
-
-#ifdef __nvoc_kernel_nvenc_ctx_h_disabled
-static inline void msencctxDestructHal(struct MsencContext *pMsencContext) {
-    NV_ASSERT_FAILED_PRECOMP("MsencContext was disabled!");
-}
-#else //__nvoc_kernel_nvenc_ctx_h_disabled
-#define msencctxDestructHal(pMsencContext) msencctxDestructHal_KERNEL(pMsencContext)
-#endif //__nvoc_kernel_nvenc_ctx_h_disabled
-
-#define msencctxDestructHal_HAL(pMsencContext) msencctxDestructHal(pMsencContext)
-
-static inline NV_STATUS __nvoc_msencctxConstruct(struct MsencContext *arg_pMsencContext, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams) {
-    return msencctxConstructHal(arg_pMsencContext, arg_pCallContext, arg_pParams);
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
+static inline NV_STATUS __nvoc_msencctxConstruct(struct MsencContext *pMsencContext, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams){
+    return msencctxConstructHal(pMsencContext, pCallContext, pParams);
 }
 
-static inline void __nvoc_msencctxDestruct(struct MsencContext *pMsencContext) {
+static inline void __nvoc_msencctxDestruct(struct MsencContext *pMsencContext){
     msencctxDestructHal(pMsencContext);
 }
 

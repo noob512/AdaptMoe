@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2006-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2006-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -66,90 +66,6 @@ typedef struct NV2080_CTRL_CMD_SET_GPFIFO_PARAMS {
 } NV2080_CTRL_CMD_SET_GPFIFO_PARAMS;
 
 /*
- * NV2080_CTRL_FIFO_BIND_CHANNEL
- *
- * This structure is used to describe a channel that is to have
- * it's bindable engines bound to those of other channels.
- *
- * hClient
- *  This structure member contains the handle of the client object
- *  that owns the channel object specified by hChannel.
- *
- * hChannel
- *  This structure member contains the channel handle of the channel
- *  object.
- */
-
-typedef struct NV2080_CTRL_FIFO_BIND_CHANNEL {
-    NvHandle hClient;
-    NvHandle hChannel;
-} NV2080_CTRL_FIFO_BIND_CHANNEL;
-
-/*
- * NV2080_CTRL_CMD_FIFO_BIND_ENGINES
- *
- * This control call is now deprecated.
- * This command can be used to bind different video engines on G8X from separate
- * channels together for operations such as idling.  The set of bindable engines
- * includes the NV2080_ENGINE_TYPE_BSP, NV2080_ENGINE_TYPE_VP and
- * NV2080_ENGINE_TYPE_PPP engines.
- *
- * bindChannelCount
- *  This parameter specifies the number of channels to bind together.  This
- *  parameter cannot exceed NV2080_CTRL_FIFO_BIND_ENGINES_MAX_CHANNELS.
- *
- * bindChannels
- *  The parameter specifies the array of channels to bind together.  The first
- *  bindChannelCount entries are used in the bind channel operation.
- *
- * Possible status values returned are:
- *  NV_OK
- *  NV_ERR_INVALID_DEVICE
- *  NV_ERR_INVALID_CHANNEL
- *  NV_ERR_INVALID_ARGUMENT
- *  NV_ERR_NOT_SUPPORTED
- */
-#define NV2080_CTRL_FIFO_BIND_ENGINES_MAX_CHANNELS (16)
-
-#define NV2080_CTRL_FIFO_BIND_ENGINES_PARAMS_MESSAGE_ID (0x3U)
-
-typedef struct NV2080_CTRL_FIFO_BIND_ENGINES_PARAMS {
-    NvU32                         bindChannelCount;
-    NV2080_CTRL_FIFO_BIND_CHANNEL bindChannels[NV2080_CTRL_FIFO_BIND_ENGINES_MAX_CHANNELS];
-} NV2080_CTRL_FIFO_BIND_ENGINES_PARAMS;
-
-#define NV2080_CTRL_CMD_FIFO_BIND_ENGINES          (0x20801103) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_0_FIFO_INTERFACE_ID << 8) | NV2080_CTRL_FIFO_BIND_ENGINES_PARAMS_MESSAGE_ID" */
-
-/*
- * NV2080_CTRL_CMD_SET_OPERATIONAL_PROPERTIES
- *
- * This command is used for a client to setup specialized custom operational
- * properties that may be specific to an environment, or properties that
- * should be set generally but are not for reasons of backward compatibility
- * with previous chip generations
- *
- *  flags
- *   This field specifies the operational properties to be applied
- *
- * Possible return status values returned are
- *   NV_OK
- *   NV_ERR_INVALID_CHANNEL
- *   NV_ERR_INVALID_ARGUMENT
- *
- */
-#define NV2080_CTRL_CMD_SET_OPERATIONAL_PROPERTIES (0x20801104) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_0_FIFO_INTERFACE_ID << 8) | NV2080_CTRL_CMD_SET_OPERATIONAL_PROPERTIES_PARAMS_MESSAGE_ID" */
-
-#define NV2080_CTRL_CMD_SET_OPERATIONAL_PROPERTIES_PARAMS_MESSAGE_ID (0x4U)
-
-typedef struct NV2080_CTRL_CMD_SET_OPERATIONAL_PROPERTIES_PARAMS {
-    NvU32 flags;
-} NV2080_CTRL_CMD_SET_OPERATIONAL_PROPERTIES_PARAMS;
-
-#define NV2080_CTRL_CMD_SET_OPERATIONAL_PROPERTIES_FLAGS_ERROR_ON_STUCK_SEMAPHORE                 0:0
-#define NV2080_CTRL_CMD_SET_OPERATIONAL_PROPERTIES_FLAGS_ERROR_ON_STUCK_SEMAPHORE_FALSE (0x00000000)
-#define NV2080_CTRL_CMD_SET_OPERATIONAL_PROPERTIES_FLAGS_ERROR_ON_STUCK_SEMAPHORE_TRUE  (0x00000001)
-
-/*
  * NV2080_CTRL_CMD_FIFO_GET_PHYSICAL_CHANNEL_COUNT
  *
  * This command returns the maximum number of physical channels available for
@@ -166,7 +82,7 @@ typedef struct NV2080_CTRL_CMD_SET_OPERATIONAL_PROPERTIES_PARAMS {
  *   NV_OK
  *
  */
-#define NV2080_CTRL_CMD_FIFO_GET_PHYSICAL_CHANNEL_COUNT                                 (0x20801108) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_0_FIFO_INTERFACE_ID << 8) | NV2080_CTRL_FIFO_GET_PHYSICAL_CHANNEL_COUNT_PARAMS_MESSAGE_ID" */
+#define NV2080_CTRL_CMD_FIFO_GET_PHYSICAL_CHANNEL_COUNT (0x20801108) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_0_FIFO_INTERFACE_ID << 8) | NV2080_CTRL_FIFO_GET_PHYSICAL_CHANNEL_COUNT_PARAMS_MESSAGE_ID" */
 
 #define NV2080_CTRL_FIFO_GET_PHYSICAL_CHANNEL_COUNT_PARAMS_MESSAGE_ID (0x8U)
 
@@ -539,20 +455,24 @@ typedef struct NV2080_CTRL_CMD_FIFO_GET_USERD_LOCATION_PARAMS {
 #define NV2080_CTRL_FIFO_OBJSCHED_SW_NCOUNTERS                          8
 #define NV2080_CTRL_FIFO_OBJSCHED_SW_GET_LOG_ENTRIES                    200
 
+typedef struct NV2080_CTRL_FIFO_OBJSCHED_SW_GET_LOG_ENTRY {
+    NV_DECLARE_ALIGNED(NvU64 timestampNs, 8);
+    NV_DECLARE_ALIGNED(NvS64 timeRunTotalNs, 8);
+    NvU32 timeRunNs;
+    NvU32 swrlId;
+    NvU32 targetTimeSlice;
+    NV_DECLARE_ALIGNED(NvU64 cumulativePreemptionTime, 8);
+    NV_DECLARE_ALIGNED(NvU64 cumulativeIdleTime, 8);
+    NvU32 weight;
+    NV_DECLARE_ALIGNED(NvU64 counters[NV2080_CTRL_FIFO_OBJSCHED_SW_NCOUNTERS], 8);
+} NV2080_CTRL_FIFO_OBJSCHED_SW_GET_LOG_ENTRY;
+
 #define NV2080_CTRL_FIFO_OBJSCHED_SW_GET_LOG_PARAMS_MESSAGE_ID (0xEU)
 
 typedef struct NV2080_CTRL_FIFO_OBJSCHED_SW_GET_LOG_PARAMS {
     NvU32 engineId;
     NvU32 count;
-    struct {
-        NV_DECLARE_ALIGNED(NvU64 timestampNs, 8);
-        NV_DECLARE_ALIGNED(NvS64 timeRunTotalNs, 8);
-        NvU32 timeRunNs;
-        NvU32 swrlId;
-        NvU32 targetTimeSlice;
-        NV_DECLARE_ALIGNED(NvU64 cumulativePreemptionTime, 8);
-        NV_DECLARE_ALIGNED(NvU64 counters[NV2080_CTRL_FIFO_OBJSCHED_SW_NCOUNTERS], 8);
-    } entry[NV2080_CTRL_FIFO_OBJSCHED_SW_GET_LOG_ENTRIES];
+    NV_DECLARE_ALIGNED(NV2080_CTRL_FIFO_OBJSCHED_SW_GET_LOG_ENTRY entry[NV2080_CTRL_FIFO_OBJSCHED_SW_GET_LOG_ENTRIES], 8);
     NvU32 schedPolicy;
     NvU32 arrEnabled;
     NvU32 arrAvgFactor;
@@ -560,6 +480,31 @@ typedef struct NV2080_CTRL_FIFO_OBJSCHED_SW_GET_LOG_PARAMS {
 } NV2080_CTRL_FIFO_OBJSCHED_SW_GET_LOG_PARAMS;
 
 
+
+
+/*
+ * NV2080_CTRL_CMD_FIFO_CONFIG_CTXSW_TIMEOUT
+ *
+ * This command can be used to enable and set the engine
+ * context switch timeout
+ *
+ * timeout: Timeout in number of microsec PTIMER ticks
+ * 1 microsec PTIMER tick = 1024 PTIMER nanoseconds
+ * bEnable: TRUE/FALSE
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_INVALID_ARGUMENT
+*/
+
+#define NV2080_CTRL_CMD_FIFO_CONFIG_CTXSW_TIMEOUT (0x20801110) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_0_FIFO_INTERFACE_ID << 8) | NV2080_CTRL_FIFO_CONFIG_CTXSW_TIMEOUT_PARAMS_MESSAGE_ID" */
+
+#define NV2080_CTRL_FIFO_CONFIG_CTXSW_TIMEOUT_PARAMS_MESSAGE_ID (0x10U)
+
+typedef struct NV2080_CTRL_FIFO_CONFIG_CTXSW_TIMEOUT_PARAMS {
+    NvU32  timeout;
+    NvBool bEnable;
+} NV2080_CTRL_FIFO_CONFIG_CTXSW_TIMEOUT_PARAMS;
 
 /*
  *  NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE
@@ -937,6 +882,38 @@ typedef struct NV2080_CTRL_FIFO_DISABLE_CHANNELS_FOR_KEY_ROTATION_V2_PARAMS {
     NvHandle hChannelList[NV2080_CTRL_FIFO_DISABLE_CHANNELS_FOR_KEY_ROTATION_MAX_ENTRIES];
     NvBool   bEnableAfterKeyRotation;
 } NV2080_CTRL_FIFO_DISABLE_CHANNELS_FOR_KEY_ROTATION_V2_PARAMS;
+
+/*
+ * NV2080_CTRL_CMD_FIFO_ROTATE_KEYS
+ *
+ * This command will disable and preempt channels described in the
+ * list provided and force key rotation on these channels.
+ * hClient <-> hChannel pairs should use the same index in the arrays.
+ * This control call is only for Blackwell and newer GPUs.
+ *
+ *  numChannels
+ *      The number of valid entries in hChannelList array.
+ *  hClientList
+ *      An array of NvHandle listing the client handles
+ *  hChannelList
+ *      An array of NvHandle listing the channel handles
+ *      to be stopped.
+ *  bEnableAfterKeyRotation
+ *      This determines if channel is enabled by RM after it completes key rotation.
+ * Possible status values returned are:
+ *    NV_OK
+ *    NVOS_INVALID_STATE
+ */
+#define NV2080_CTRL_CMD_FIFO_ROTATE_KEYS (0x2080111c) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_0_FIFO_INTERFACE_ID << 8) | NV2080_CTRL_CMD_FIFO_ROTATE_KEYS_PARAMS_MESSAGE_ID" */
+
+#define NV2080_CTRL_CMD_FIFO_ROTATE_KEYS_PARAMS_MESSAGE_ID (0x1CU)
+
+typedef struct NV2080_CTRL_CMD_FIFO_ROTATE_KEYS_PARAMS {
+    NvU32    numChannels;
+    NvHandle hClientList[NV2080_CTRL_FIFO_DISABLE_CHANNELS_FOR_KEY_ROTATION_MAX_ENTRIES];
+    NvHandle hChannelList[NV2080_CTRL_FIFO_DISABLE_CHANNELS_FOR_KEY_ROTATION_MAX_ENTRIES];
+    NvBool   bEnableAfterKeyRotation;
+} NV2080_CTRL_CMD_FIFO_ROTATE_KEYS_PARAMS;
 
 
 

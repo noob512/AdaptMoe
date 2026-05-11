@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -27,7 +27,6 @@
 #include "class/clc8b5.h"  // HOPPER_DMA_COPY_A
 #include "class/clc9b5.h"
 #include "class/clcab5.h"
-
 
 /*!
  * Function to verify which memory scubber (fast/slow) has to use in Hopper+ for scrubbering

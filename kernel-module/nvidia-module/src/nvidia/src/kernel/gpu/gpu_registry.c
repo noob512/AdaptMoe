@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -29,6 +29,7 @@
 #include "core/thread_state.h"
 #include "nvdevid.h"
 #include "nvrm_registry.h"
+#include "gpu/conf_compute/conf_compute.h"
 
 #include "virtualization/hypervisor/hypervisor.h"
 
@@ -57,7 +58,7 @@ gpuInitRegistryOverrides_KERNEL
     }
 
     // for 0FB set as though FB memory is broken to cover all the tests
-    if (pGpu->getProperty(pGpu, PDB_PROP_GPU_ZERO_FB))
+    if (pGpu->pGpuArch->bGpuArchIsZeroFb)
     {
         data32 = FLD_SET_DRF(_REG_STR_GPU, _BROKEN_FB, _MEMORY, _BROKEN, data32);
     }
@@ -89,16 +90,14 @@ gpuInitRegistryOverrides_KERNEL
     // Check to see if we have any ThreadState registry overrides
     threadStateInitRegistryOverrides(pGpu);
 
-    // Check to see if we enable surprise removal support
-    // Enable SR support by default, disable if the regkey is set to 0
-    pGpu->bSurpriseRemovalSupported = NV_TRUE;
+    // Check whether surprise removal support is enabled
+    // Surprise removal support is enabled by default
+    // Disable if the regkey is set to NV_REG_STR_RM_GPU_SURPRISE_REMOVAL_DISABLE
+    pGpu->bSurpriseRemovalSupported = NV_REG_STR_RM_GPU_SURPRISE_REMOVAL_DEFAULT;
     if (osReadRegistryDword(pGpu,
                             NV_REG_STR_RM_GPU_SURPRISE_REMOVAL, &data32) == NV_OK)
     {
-        if (data32 == 0)
-        {
-            pGpu->bSurpriseRemovalSupported = NV_FALSE;
-        }
+        pGpu->bSurpriseRemovalSupported = (data32 == NV_REG_STR_RM_GPU_SURPRISE_REMOVAL_ENABLE);
     }
 
     if (pGpu->bSriovCapable)
@@ -154,7 +153,7 @@ gpuInitRegistryOverrides_KERNEL
     {
         pGpu->bClientRmAllocatedCtxBuffer = NV_TRUE;
     }
-    else if (pGpu->getProperty(pGpu, PDB_PROP_GPU_ZERO_FB) &&
+    else if (pGpu->pGpuArch->bGpuArchIsZeroFb &&
         (pGpu->bSriovEnabled || IS_VIRTUAL_WITH_SRIOV(pGpu)))
     {
         // For zero-FB config + SRIOV
@@ -217,19 +216,31 @@ gpuInitRegistryOverrides_KERNEL
             data32 = NV_REG_STR_RM_RUSD_POLLING_INTERVAL_MIN;
         if (data32 > NV_REG_STR_RM_RUSD_POLLING_INTERVAL_MAX)
             data32 = NV_REG_STR_RM_RUSD_POLLING_INTERVAL_MAX;
-        pGpu->userSharedData.pollingFrequencyMs = data32;
-        pGpu->userSharedData.bPollFrequencyOverridden = NV_TRUE;
+        pGpu->userSharedData.pollingIntervalMs = data32;
+        pGpu->userSharedData.bPollIntervalOverridden = NV_TRUE;
     }
     else
     {
-        pGpu->userSharedData.pollingFrequencyMs = NV_REG_STR_RM_RUSD_POLLING_INTERVAL_DEFAULT;
-        pGpu->userSharedData.bPollFrequencyOverridden = NV_FALSE;
+        if (RMCFG_FEATURE_PLATFORM_WINDOWS && IS_GSP_CLIENT(pGpu))
+        {
+            pGpu->userSharedData.pollingIntervalMs = NV_REG_STR_RM_RUSD_POLLING_INTERVAL_WINDOWS_GSP;
+        }
+        else
+        {
+            pGpu->userSharedData.pollingIntervalMs = NV_REG_STR_RM_RUSD_POLLING_INTERVAL_DEFAULT;
+        }
+        pGpu->userSharedData.bPollIntervalOverridden = NV_FALSE;
     }
     
     if ((osReadRegistryDword(pGpu, NV_REG_STR_RM_INIT_MEM_REUSE, &data32) == NV_OK) &&
         (data32 == NV_REG_STR_RM_INIT_MEM_REUSE_DISABLE))
     {
         pGpu->setProperty(pGpu, PDB_PROP_GPU_REUSE_INIT_CONTING_MEM, NV_FALSE);
+    }
+
+    if (osReadRegistryDword(pGpu, NV_REG_STR_RM_MEMORY_SUBSYSTEM_ERROR_DETECTION, &data32) == NV_OK)
+    {
+        pGpu->bMemsubsysErrDetectionEnabled = (data32 == NV_REG_STR_RM_MEMORY_SUBSYSTEM_ERROR_DETECTION_ENABLE);
     }
 
     return NV_OK;
@@ -245,16 +256,19 @@ gpuInitInstLocOverrides_IMPL
 )
 {
     NvU32 data32 = 0;
+    NvBool bRegKeyCCEnabled = 
+        ((osReadRegistryDword(pGpu, NV_REG_STR_RM_CONFIDENTIAL_COMPUTE, &data32) == NV_OK) &&
+          FLD_TEST_DRF(_REG_STR, _RM_CONFIDENTIAL_COMPUTE, _ENABLED, _YES, data32));
+
     //
     // If Hopper CC mode or protected pcie is enabled, move all except few buffers to FB
+    // Exception: when TDISP mode is enabled.
     //
-    if (((osReadRegistryDword(pGpu, NV_REG_STR_RM_CONFIDENTIAL_COMPUTE, &data32) == NV_OK) &&
-         FLD_TEST_DRF(_REG_STR, _RM_CONFIDENTIAL_COMPUTE, _ENABLED, _YES, data32) &&
-         pGpu->getProperty(pGpu, PDB_PROP_GPU_CC_FEATURE_CAPABLE)) ||
-        gpuIsCCEnabledInHw_HAL(pGpu) ||
-        gpuIsMultiGpuNvleEnabledInHw_HAL(pGpu))
+    if ((bRegKeyCCEnabled ||
+         gpuIsCCEnabledInHw_HAL(pGpu) ||
+         gpuIsMultiGpuNvleEnabledInHw_HAL(pGpu))
+        )
     {
-
         pGpu->instLocOverrides  = NV_REG_STR_RM_INST_LOC_ALL_VID;
         pGpu->instLocOverrides2 = NV_REG_STR_RM_INST_LOC_ALL_VID;
         pGpu->instLocOverrides3 = NV_REG_STR_RM_INST_LOC_ALL_VID;
@@ -320,6 +334,7 @@ gpuInitInstLocOverrides_IMPL
         pGpu->instLocOverrides4 = FLD_SET_DRF(_REG_STR, _RM_INST_LOC_4, _BAR, _NCOH, pGpu->instLocOverrides4);
         pGpu->setProperty(pGpu, PDB_PROP_GPU_IS_ALL_INST_IN_SYSMEM, NV_TRUE);
         pGpu->instCacheOverride = NV_MEMORY_UNCACHED;
+
     }
     else if (((pGpu->instLocOverrides == NV_REG_STR_RM_INST_LOC_ALL_COH) ||
               (pGpu->instLocOverrides == 0x95555555)) &&
@@ -331,6 +346,7 @@ gpuInitInstLocOverrides_IMPL
         pGpu->instLocOverrides4 = FLD_SET_DRF(_REG_STR, _RM_INST_LOC_4, _BAR, _COH, pGpu->instLocOverrides4);
         pGpu->setProperty(pGpu, PDB_PROP_GPU_IS_ALL_INST_IN_SYSMEM, NV_TRUE);
         pGpu->instCacheOverride = NV_MEMORY_CACHED;
+
     }
 
     //
@@ -372,7 +388,7 @@ _gpuInitGlobalSurfaceOverride
     OBJGPU *pGpu
 )
 {
-    NvU32 globalOverride;
+    NvU32 globalOverride = 0;
 
     //
     // Precedence of global overrides.
@@ -387,7 +403,7 @@ _gpuInitGlobalSurfaceOverride
             (pGpu->instLocOverrides3 != 0) ||
             (pGpu->instLocOverrides4 != 0))
         {
-            NV_PRINTF(LEVEL_ERROR,
+            NV_PRINTF(LEVEL_INFO,
                 "INSTLOC overrides may not work with large mem systems on GP100+\n");
         }
         else

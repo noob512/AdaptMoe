@@ -24,7 +24,6 @@ _out/Linux_x86_64/rmapi_deprecated_allocmemory.o: \
  ../common/sdk/nvidia/inc/class/cl84a0.h \
  ../common/sdk/nvidia/inc/class/cl84a0_deprecated.h \
  ../common/sdk/nvidia/inc/class/cl0076.h \
- ../common/sdk/nvidia/inc/class/cl00f3.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h
@@ -57,7 +56,6 @@ interface/deprecated/rmapi_deprecated.h:
 ../common/sdk/nvidia/inc/class/cl84a0.h:
 ../common/sdk/nvidia/inc/class/cl84a0_deprecated.h:
 ../common/sdk/nvidia/inc/class/cl0076.h:
-../common/sdk/nvidia/inc/class/cl00f3.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:

@@ -28,8 +28,6 @@
 
 void _nv3dSetSpaVersionKepler(Nv3dChannelRec *p3dChannel);
 
-void _nv3dInitChannelKepler(Nv3dChannelRec *p3dChannel);
-
 void _nv3dUploadDataInlineKepler(
     Nv3dChannelRec *p3dChannel,
     NvU64 gpuBaseAddress,

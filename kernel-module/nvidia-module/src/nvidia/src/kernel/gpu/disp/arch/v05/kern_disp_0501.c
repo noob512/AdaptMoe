@@ -206,7 +206,9 @@ static NvU32 _getDpAudioSymbolSST
                     cyclesPerPacketInc  = 5;
                     break;
             }
+            break;
         }
+
         case EIGHT_CHANNELS:
         {
             switch (laneCount)
@@ -224,6 +226,7 @@ static NvU32 _getDpAudioSymbolSST
                     cyclesPerPacketInc  = 10;
                     break;
             }
+            break;
         }
     }
 
@@ -459,7 +462,7 @@ kdispComputeDpModeSettings_v05_01
     // depth is multiplied by 16 in case of DSC enable
     NvU32  dscFactor            = pDpModesetData->bDscEnable ? 16U : 1U;
     NvU64  linkDataRate         = 0U;
-    NvS32  hBlankSym            = 0U;
+    NvS64  hBlankSym            = 0U;
     NvS32  vBlankSym            = 0U;
     NvU32  msaSym               = 0U;
 
@@ -493,7 +496,6 @@ kdispComputeDpModeSettings_v05_01
     linkDataRate = _convertLinkRateToDataRate(pDpModesetData->dp2LinkBw,
                                              pDpModesetData->bDP2xChannelCoding,
                                              pDpModesetData->bFecEnable);
-
     dpInfo->linkTotalDataRate = 8 * linkDataRate * pDpModesetData->laneCount;
 
     // SST
@@ -512,12 +514,13 @@ kdispComputeDpModeSettings_v05_01
             else
             {
                 effectiveBppxScaler = _calcEffectiveBppxScalerNonDsc(hActive, pDpModesetData->bpp, pDpModesetData->bDP2xChannelCoding,
-                                                                     pDpModesetData->bMultiStream, pDpModesetData->laneCount);        
+                                                                     pDpModesetData->bMultiStream, pDpModesetData->laneCount);
             }
         }
     }
     else
     {
+
         effectiveBppxScaler = pDpModesetData->bpp;
     }
 
@@ -631,10 +634,10 @@ kdispComputeDpModeSettings_v05_01
             rgPacketMode = DEFAULT_RG_PACKET_MODE;
         }
 
-        hBlankSym = (hBlank - dpInfo->minHBlank - 3 * (1 << pclkFactor)) * HBLANK_SYMBOLS_SCALE;
+        hBlankSym = (NvS64)(hBlank - dpInfo->minHBlank - (3 * pclkFactor)) * HBLANK_SYMBOLS_SCALE;
         if (pDpModesetData->bDscEnable)
         {
-            hBlankSym -= ((1 << pclkFactor) * 32 * dscFactor * HBLANK_SYMBOLS_SCALE / pDpModesetData->bpp) - 1;
+            hBlankSym -= (rgPacketMode * 32 * dscFactor * HBLANK_SYMBOLS_SCALE / pDpModesetData->bpp);
         }
         hBlankSym = hBlankSym * linkFreqHz * 994 / (DP1_CODING_SIZE * HBLANK_SYMBOLS_SCALE * pDpModesetData->PClkFreqHz * 1000);
         if (pDpModesetData->bFecEnable)
@@ -643,14 +646,18 @@ kdispComputeDpModeSettings_v05_01
                 (NvU32)NV_CEIL((NvU64)(hBlank * linkFreqHz * 994),
                                ((NvU64)DP1_CODING_SIZE * pDpModesetData->PClkFreqHz * 1000));
             hBlankSym -= FEC_PARITY_SYM(pDpModesetData->laneCount, totalHBlankSymbols);
+        }
+
             hBlankSym -= 1;
             hBlankSym -= 3;
             hBlankSym -= 3;
 
-        }
-
         // Bug 5042450 clamp min_hBlankSym value
-        NvS32 hBlankSymMin = pDpModesetData->laneCount==4 ? 12 : ( pDpModesetData->laneCount==2 ? 19 : 43 );
+        NvS32 hBlankSymMin = (pDpModesetData->laneCount == 4) ? 12 : ((pDpModesetData->laneCount == 2) ? 19 : 43 );
+        if (pDpModesetData->eightChannelAudioHz != 0)
+        {
+            hBlankSymMin = (pDpModesetData->laneCount == 4) ? 17 : ((pDpModesetData->laneCount == 2) ? 29 : 63 );
+        }
         if (hBlankSym < hBlankSymMin)
         {
             hBlankSym = hBlankSymMin;
@@ -679,7 +686,7 @@ kdispComputeDpModeSettings_v05_01
         {
             dpInfo->vBlankSym = vBlankSym;
         }
-        
+
         dpInfo->waterMark = _calcWatermark8b10bSST(pDpModesetData->PClkFreqHz,
                                                    linkFreqHz,
                                                    pDpModesetData->laneCount,

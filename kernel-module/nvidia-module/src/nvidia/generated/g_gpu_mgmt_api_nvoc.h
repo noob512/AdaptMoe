@@ -91,9 +91,6 @@ struct GpuManagementApi {
     struct RmResourceCommon *__nvoc_pbase_RmResourceCommon;    // rmrescmn super^2
     struct RmResource *__nvoc_pbase_RmResource;    // rmres super
     struct GpuManagementApi *__nvoc_pbase_GpuManagementApi;    // gpumgmtapi
-
-    // Vtable with 1 per-object function pointer
-    NV_STATUS (*__gpumgmtapiCtrlCmdSetShutdownState__)(struct GpuManagementApi * /*this*/, NV0020_CTRL_GPU_MGMT_SET_SHUTDOWN_STATE_PARAMS *);  // exported (id=0x200101)
 };
 
 
@@ -129,13 +126,9 @@ struct NVOC_METADATA__GpuManagementApi {
     const struct NVOC_VTABLE__GpuManagementApi vtable;
 };
 
-#ifndef __NVOC_CLASS_GpuManagementApi_TYPEDEF__
-#define __NVOC_CLASS_GpuManagementApi_TYPEDEF__
-typedef struct GpuManagementApi GpuManagementApi;
-#endif /* __NVOC_CLASS_GpuManagementApi_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_GpuManagementApi
-#define __nvoc_class_id_GpuManagementApi 0x376305
+#define __nvoc_class_id_GpuManagementApi 0x376305u
+typedef struct GpuManagementApi GpuManagementApi;
 #endif /* __nvoc_class_id_GpuManagementApi */
 
 // Casting support
@@ -153,14 +146,30 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_GpuManagementApi;
 
 NV_STATUS __nvoc_objCreateDynamic_GpuManagementApi(GpuManagementApi**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_GpuManagementApi(GpuManagementApi**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_GpuManagementApi(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_GpuManagementApi((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_GpuManagementApi(GpuManagementApi**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_GpuManagementApi(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_GpuManagementApi((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
-#define gpumgmtapiCtrlCmdSetShutdownState_FNPTR(pGpuMgmt) pGpuMgmt->__gpumgmtapiCtrlCmdSetShutdownState__
-#define gpumgmtapiCtrlCmdSetShutdownState(pGpuMgmt, pParams) gpumgmtapiCtrlCmdSetShutdownState_DISPATCH(pGpuMgmt, pParams)
+// Wrapper macros for implementation functions
+NV_STATUS gpumgmtapiConstruct_IMPL(struct GpuManagementApi *pGpuMgmt, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_gpumgmtapiConstruct(pGpuMgmt, pCallContext, pParams) gpumgmtapiConstruct_IMPL(pGpuMgmt, pCallContext, pParams)
+
+void gpumgmtapiDestruct_IMPL(struct GpuManagementApi *pGpuMgmt);
+#define __nvoc_gpumgmtapiDestruct(pGpuMgmt) gpumgmtapiDestruct_IMPL(pGpuMgmt)
+
+NV_STATUS gpumgmtapiCtrlCmdSetShutdownState_IMPL(struct GpuManagementApi *pGpuMgmt, NV0020_CTRL_GPU_MGMT_SET_SHUTDOWN_STATE_PARAMS *pParams);
+#ifdef __nvoc_gpu_mgmt_api_h_disabled
+static inline NV_STATUS gpumgmtapiCtrlCmdSetShutdownState(struct GpuManagementApi *pGpuMgmt, NV0020_CTRL_GPU_MGMT_SET_SHUTDOWN_STATE_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("GpuManagementApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_gpu_mgmt_api_h_disabled
+#define gpumgmtapiCtrlCmdSetShutdownState(pGpuMgmt, pParams) gpumgmtapiCtrlCmdSetShutdownState_IMPL(pGpuMgmt, pParams)
+#endif // __nvoc_gpu_mgmt_api_h_disabled
+
+
+// Wrapper macros for halified functions
 #define gpumgmtapiAccessCallback_FNPTR(pResource) pResource->__nvoc_base_RmResource.__nvoc_metadata_ptr->vtable.__rmresAccessCallback__
 #define gpumgmtapiAccessCallback(pResource, pInvokingClient, pAllocParams, accessRight) gpumgmtapiAccessCallback_DISPATCH(pResource, pInvokingClient, pAllocParams, accessRight)
 #define gpumgmtapiShareCallback_FNPTR(pResource) pResource->__nvoc_base_RmResource.__nvoc_metadata_ptr->vtable.__rmresShareCallback__
@@ -205,10 +214,6 @@ NV_STATUS __nvoc_objCreate_GpuManagementApi(GpuManagementApi**, Dynamic*, NvU32,
 #define gpumgmtapiAddAdditionalDependants(pClient, pResource, pReference) gpumgmtapiAddAdditionalDependants_DISPATCH(pClient, pResource, pReference)
 
 // Dispatch functions
-static inline NV_STATUS gpumgmtapiCtrlCmdSetShutdownState_DISPATCH(struct GpuManagementApi *pGpuMgmt, NV0020_CTRL_GPU_MGMT_SET_SHUTDOWN_STATE_PARAMS *pParams) {
-    return pGpuMgmt->__gpumgmtapiCtrlCmdSetShutdownState__(pGpuMgmt, pParams);
-}
-
 static inline NvBool gpumgmtapiAccessCallback_DISPATCH(struct GpuManagementApi *pResource, struct RsClient *pInvokingClient, void *pAllocParams, RsAccessRight accessRight) {
     return pResource->__nvoc_metadata_ptr->vtable.__gpumgmtapiAccessCallback__(pResource, pInvokingClient, pAllocParams, accessRight);
 }
@@ -293,14 +298,14 @@ static inline void gpumgmtapiAddAdditionalDependants_DISPATCH(struct RsClient *p
     pResource->__nvoc_metadata_ptr->vtable.__gpumgmtapiAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
 NV_STATUS gpumgmtapiCtrlCmdSetShutdownState_IMPL(struct GpuManagementApi *pGpuMgmt, NV0020_CTRL_GPU_MGMT_SET_SHUTDOWN_STATE_PARAMS *pParams);
 
-NV_STATUS gpumgmtapiConstruct_IMPL(struct GpuManagementApi *arg_pGpuMgmt, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_gpumgmtapiConstruct(arg_pGpuMgmt, arg_pCallContext, arg_pParams) gpumgmtapiConstruct_IMPL(arg_pGpuMgmt, arg_pCallContext, arg_pParams)
-void gpumgmtapiDestruct_IMPL(struct GpuManagementApi *pGpuMgmt);
-
-#define __nvoc_gpumgmtapiDestruct(pGpuMgmt) gpumgmtapiDestruct_IMPL(pGpuMgmt)
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

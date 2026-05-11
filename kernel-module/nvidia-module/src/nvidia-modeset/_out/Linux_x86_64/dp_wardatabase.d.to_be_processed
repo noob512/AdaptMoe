@@ -62,13 +62,17 @@ _out/Linux_x86_64/dp_wardatabase.o: \
  ../common/displayport/inc/dp_connectorimpl.h \
  ../common/displayport/inc/dp_edid.h \
  ../common/displayport/inc/dp_discovery.h \
+ ../common/displayport/inc/dp_displayid2.h \
  ../common/displayport/inc/dp_groupimpl.h \
  ../common/displayport/inc/dp_deviceimpl.h \
+ ../common/displayport/inc/dp_qse.h \
  ../common/displayport/inc/dp_linkedlist.h \
  ../common/displayport/inc/./dptestutil/dp_testmessage.h \
  ../common/displayport/inc/dp_auxdefs.h \
+ ../common/displayport/inc/dp_qse.h \
  ../common/displayport/inc/dp_connector.h \
  ../common/displayport/inc/dp_connectorimpl2x.h \
+ ../common/displayport/inc/dp_hashmap.h \
  ../common/displayport/inc/dp_printf.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 ../common/displayport/inc/dp_wardatabase.h:
@@ -138,11 +142,15 @@ _out/Linux_x86_64/dp_wardatabase.o: \
 ../common/displayport/inc/dp_connectorimpl.h:
 ../common/displayport/inc/dp_edid.h:
 ../common/displayport/inc/dp_discovery.h:
+../common/displayport/inc/dp_displayid2.h:
 ../common/displayport/inc/dp_groupimpl.h:
 ../common/displayport/inc/dp_deviceimpl.h:
+../common/displayport/inc/dp_qse.h:
 ../common/displayport/inc/dp_linkedlist.h:
 ../common/displayport/inc/./dptestutil/dp_testmessage.h:
 ../common/displayport/inc/dp_auxdefs.h:
+../common/displayport/inc/dp_qse.h:
 ../common/displayport/inc/dp_connector.h:
 ../common/displayport/inc/dp_connectorimpl2x.h:
+../common/displayport/inc/dp_hashmap.h:
 ../common/displayport/inc/dp_printf.h:

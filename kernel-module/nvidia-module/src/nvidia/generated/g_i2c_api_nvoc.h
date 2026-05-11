@@ -86,13 +86,6 @@ struct I2cApi {
     struct RmResource *__nvoc_pbase_RmResource;    // rmres super^2
     struct GpuResource *__nvoc_pbase_GpuResource;    // gpures super
     struct I2cApi *__nvoc_pbase_I2cApi;    // i2capi
-
-    // Vtable with 5 per-object function pointers
-    NV_STATUS (*__i2capiCtrlCmdI2cGetPortInfo__)(struct I2cApi * /*this*/, NV402C_CTRL_I2C_GET_PORT_INFO_PARAMS *);  // exported (id=0x402c0101)
-    NV_STATUS (*__i2capiCtrlCmdI2cIndexed__)(struct I2cApi * /*this*/, NV402C_CTRL_I2C_INDEXED_PARAMS *);  // exported (id=0x402c0102)
-    NV_STATUS (*__i2capiCtrlCmdI2cGetPortSpeed__)(struct I2cApi * /*this*/, NV402C_CTRL_I2C_GET_PORT_SPEED_PARAMS *);  // exported (id=0x402c0103)
-    NV_STATUS (*__i2capiCtrlCmdI2cTableGetDevInfo__)(struct I2cApi * /*this*/, NV402C_CTRL_I2C_TABLE_GET_DEV_INFO_PARAMS *);  // exported (id=0x402c0104)
-    NV_STATUS (*__i2capiCtrlCmdI2cTransaction__)(struct I2cApi * /*this*/, NV402C_CTRL_I2C_TRANSACTION_PARAMS *);  // exported (id=0x402c0105)
 };
 
 
@@ -132,13 +125,9 @@ struct NVOC_METADATA__I2cApi {
     const struct NVOC_VTABLE__I2cApi vtable;
 };
 
-#ifndef __NVOC_CLASS_I2cApi_TYPEDEF__
-#define __NVOC_CLASS_I2cApi_TYPEDEF__
-typedef struct I2cApi I2cApi;
-#endif /* __NVOC_CLASS_I2cApi_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_I2cApi
-#define __nvoc_class_id_I2cApi 0xceb8f6
+#define __nvoc_class_id_I2cApi 0xceb8f6u
+typedef struct I2cApi I2cApi;
 #endif /* __nvoc_class_id_I2cApi */
 
 // Casting support
@@ -156,22 +145,70 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_I2cApi;
 
 NV_STATUS __nvoc_objCreateDynamic_I2cApi(I2cApi**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_I2cApi(I2cApi**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_I2cApi(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_I2cApi((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_I2cApi(I2cApi**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_I2cApi(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_I2cApi((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
-#define i2capiCtrlCmdI2cGetPortInfo_FNPTR(pI2cApi) pI2cApi->__i2capiCtrlCmdI2cGetPortInfo__
-#define i2capiCtrlCmdI2cGetPortInfo(pI2cApi, pParams) i2capiCtrlCmdI2cGetPortInfo_DISPATCH(pI2cApi, pParams)
-#define i2capiCtrlCmdI2cIndexed_FNPTR(pI2cApi) pI2cApi->__i2capiCtrlCmdI2cIndexed__
-#define i2capiCtrlCmdI2cIndexed(pI2cApi, pParams) i2capiCtrlCmdI2cIndexed_DISPATCH(pI2cApi, pParams)
-#define i2capiCtrlCmdI2cGetPortSpeed_FNPTR(pI2cApi) pI2cApi->__i2capiCtrlCmdI2cGetPortSpeed__
-#define i2capiCtrlCmdI2cGetPortSpeed(pI2cApi, pParams) i2capiCtrlCmdI2cGetPortSpeed_DISPATCH(pI2cApi, pParams)
-#define i2capiCtrlCmdI2cTableGetDevInfo_FNPTR(pI2cApi) pI2cApi->__i2capiCtrlCmdI2cTableGetDevInfo__
-#define i2capiCtrlCmdI2cTableGetDevInfo(pI2cApi, pParams) i2capiCtrlCmdI2cTableGetDevInfo_DISPATCH(pI2cApi, pParams)
-#define i2capiCtrlCmdI2cTransaction_FNPTR(pI2cApi) pI2cApi->__i2capiCtrlCmdI2cTransaction__
-#define i2capiCtrlCmdI2cTransaction(pI2cApi, pParams) i2capiCtrlCmdI2cTransaction_DISPATCH(pI2cApi, pParams)
+// Wrapper macros for implementation functions
+NV_STATUS i2capiConstruct_IMPL(struct I2cApi *pI2cApi, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_i2capiConstruct(pI2cApi, pCallContext, pParams) i2capiConstruct_IMPL(pI2cApi, pCallContext, pParams)
+
+void i2capiDestruct_IMPL(struct I2cApi *pI2cApi);
+#define __nvoc_i2capiDestruct(pI2cApi) i2capiDestruct_IMPL(pI2cApi)
+
+NV_STATUS i2capiCtrlCmdI2cGetPortInfo_IMPL(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_GET_PORT_INFO_PARAMS *pParams);
+#ifdef __nvoc_i2c_api_h_disabled
+static inline NV_STATUS i2capiCtrlCmdI2cGetPortInfo(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_GET_PORT_INFO_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("I2cApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_i2c_api_h_disabled
+#define i2capiCtrlCmdI2cGetPortInfo(pI2cApi, pParams) i2capiCtrlCmdI2cGetPortInfo_IMPL(pI2cApi, pParams)
+#endif // __nvoc_i2c_api_h_disabled
+
+NV_STATUS i2capiCtrlCmdI2cIndexed_IMPL(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_INDEXED_PARAMS *pParams);
+#ifdef __nvoc_i2c_api_h_disabled
+static inline NV_STATUS i2capiCtrlCmdI2cIndexed(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_INDEXED_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("I2cApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_i2c_api_h_disabled
+#define i2capiCtrlCmdI2cIndexed(pI2cApi, pParams) i2capiCtrlCmdI2cIndexed_IMPL(pI2cApi, pParams)
+#endif // __nvoc_i2c_api_h_disabled
+
+NV_STATUS i2capiCtrlCmdI2cGetPortSpeed_IMPL(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_GET_PORT_SPEED_PARAMS *pParams);
+#ifdef __nvoc_i2c_api_h_disabled
+static inline NV_STATUS i2capiCtrlCmdI2cGetPortSpeed(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_GET_PORT_SPEED_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("I2cApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_i2c_api_h_disabled
+#define i2capiCtrlCmdI2cGetPortSpeed(pI2cApi, pParams) i2capiCtrlCmdI2cGetPortSpeed_IMPL(pI2cApi, pParams)
+#endif // __nvoc_i2c_api_h_disabled
+
+NV_STATUS i2capiCtrlCmdI2cTableGetDevInfo_IMPL(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_TABLE_GET_DEV_INFO_PARAMS *pParams);
+#ifdef __nvoc_i2c_api_h_disabled
+static inline NV_STATUS i2capiCtrlCmdI2cTableGetDevInfo(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_TABLE_GET_DEV_INFO_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("I2cApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_i2c_api_h_disabled
+#define i2capiCtrlCmdI2cTableGetDevInfo(pI2cApi, pParams) i2capiCtrlCmdI2cTableGetDevInfo_IMPL(pI2cApi, pParams)
+#endif // __nvoc_i2c_api_h_disabled
+
+NV_STATUS i2capiCtrlCmdI2cTransaction_IMPL(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_TRANSACTION_PARAMS *pParams);
+#ifdef __nvoc_i2c_api_h_disabled
+static inline NV_STATUS i2capiCtrlCmdI2cTransaction(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_TRANSACTION_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("I2cApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_i2c_api_h_disabled
+#define i2capiCtrlCmdI2cTransaction(pI2cApi, pParams) i2capiCtrlCmdI2cTransaction_IMPL(pI2cApi, pParams)
+#endif // __nvoc_i2c_api_h_disabled
+
+
+// Wrapper macros for halified functions
 #define i2capiControl_FNPTR(pGpuResource) pGpuResource->__nvoc_base_GpuResource.__nvoc_metadata_ptr->vtable.__gpuresControl__
 #define i2capiControl(pGpuResource, pCallContext, pParams) i2capiControl_DISPATCH(pGpuResource, pCallContext, pParams)
 #define i2capiMap_FNPTR(pGpuResource) pGpuResource->__nvoc_base_GpuResource.__nvoc_metadata_ptr->vtable.__gpuresMap__
@@ -224,26 +261,6 @@ NV_STATUS __nvoc_objCreate_I2cApi(I2cApi**, Dynamic*, NvU32, struct CALL_CONTEXT
 #define i2capiAddAdditionalDependants(pClient, pResource, pReference) i2capiAddAdditionalDependants_DISPATCH(pClient, pResource, pReference)
 
 // Dispatch functions
-static inline NV_STATUS i2capiCtrlCmdI2cGetPortInfo_DISPATCH(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_GET_PORT_INFO_PARAMS *pParams) {
-    return pI2cApi->__i2capiCtrlCmdI2cGetPortInfo__(pI2cApi, pParams);
-}
-
-static inline NV_STATUS i2capiCtrlCmdI2cIndexed_DISPATCH(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_INDEXED_PARAMS *pParams) {
-    return pI2cApi->__i2capiCtrlCmdI2cIndexed__(pI2cApi, pParams);
-}
-
-static inline NV_STATUS i2capiCtrlCmdI2cGetPortSpeed_DISPATCH(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_GET_PORT_SPEED_PARAMS *pParams) {
-    return pI2cApi->__i2capiCtrlCmdI2cGetPortSpeed__(pI2cApi, pParams);
-}
-
-static inline NV_STATUS i2capiCtrlCmdI2cTableGetDevInfo_DISPATCH(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_TABLE_GET_DEV_INFO_PARAMS *pParams) {
-    return pI2cApi->__i2capiCtrlCmdI2cTableGetDevInfo__(pI2cApi, pParams);
-}
-
-static inline NV_STATUS i2capiCtrlCmdI2cTransaction_DISPATCH(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_TRANSACTION_PARAMS *pParams) {
-    return pI2cApi->__i2capiCtrlCmdI2cTransaction__(pI2cApi, pParams);
-}
-
 static inline NV_STATUS i2capiControl_DISPATCH(struct I2cApi *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams) {
     return pGpuResource->__nvoc_metadata_ptr->vtable.__i2capiControl__(pGpuResource, pCallContext, pParams);
 }
@@ -344,6 +361,8 @@ static inline void i2capiAddAdditionalDependants_DISPATCH(struct RsClient *pClie
     pResource->__nvoc_metadata_ptr->vtable.__i2capiAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
 NV_STATUS i2capiCtrlCmdI2cGetPortInfo_IMPL(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_GET_PORT_INFO_PARAMS *pParams);
 
 NV_STATUS i2capiCtrlCmdI2cIndexed_IMPL(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_INDEXED_PARAMS *pParams);
@@ -354,12 +373,10 @@ NV_STATUS i2capiCtrlCmdI2cTableGetDevInfo_IMPL(struct I2cApi *pI2cApi, NV402C_CT
 
 NV_STATUS i2capiCtrlCmdI2cTransaction_IMPL(struct I2cApi *pI2cApi, NV402C_CTRL_I2C_TRANSACTION_PARAMS *pParams);
 
-NV_STATUS i2capiConstruct_IMPL(struct I2cApi *arg_pI2cApi, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_i2capiConstruct(arg_pI2cApi, arg_pCallContext, arg_pParams) i2capiConstruct_IMPL(arg_pI2cApi, arg_pCallContext, arg_pParams)
-void i2capiDestruct_IMPL(struct I2cApi *pI2cApi);
-
-#define __nvoc_i2capiDestruct(pI2cApi) i2capiDestruct_IMPL(pI2cApi)
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 #endif // _I2CAPI_H_

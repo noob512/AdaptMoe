@@ -59,14 +59,17 @@ _out/Linux_x86_64/dp_testmessage.o: \
  ../common/displayport/inc/../../modeset/timing/nvtiming.h \
  ../common/displayport/inc/dp_crc.h \
  ../common/displayport/inc/dptestutil/dp_testmessage.h \
+ ../common/displayport/inc/dp_qse.h \
+ ../common/displayport/inc/dp_messagecodings.h \
+ ../common/displayport/inc/dp_messages.h \
  ../common/displayport/inc/dp_connector.h \
  ../common/displayport/inc/dp_connectorimpl.h \
  ../common/displayport/inc/dp_edid.h \
- ../common/displayport/inc/dp_messages.h \
- ../common/displayport/inc/dp_messagecodings.h \
  ../common/displayport/inc/dp_discovery.h \
+ ../common/displayport/inc/dp_displayid2.h \
  ../common/displayport/inc/dp_groupimpl.h \
  ../common/displayport/inc/dp_deviceimpl.h \
+ ../common/displayport/inc/dp_qse.h \
  ../common/displayport/inc/dp_linkedlist.h \
  ../common/displayport/inc/./dptestutil/dp_testmessage.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
@@ -134,13 +137,16 @@ _out/Linux_x86_64/dp_testmessage.o: \
 ../common/displayport/inc/../../modeset/timing/nvtiming.h:
 ../common/displayport/inc/dp_crc.h:
 ../common/displayport/inc/dptestutil/dp_testmessage.h:
+../common/displayport/inc/dp_qse.h:
+../common/displayport/inc/dp_messagecodings.h:
+../common/displayport/inc/dp_messages.h:
 ../common/displayport/inc/dp_connector.h:
 ../common/displayport/inc/dp_connectorimpl.h:
 ../common/displayport/inc/dp_edid.h:
-../common/displayport/inc/dp_messages.h:
-../common/displayport/inc/dp_messagecodings.h:
 ../common/displayport/inc/dp_discovery.h:
+../common/displayport/inc/dp_displayid2.h:
 ../common/displayport/inc/dp_groupimpl.h:
 ../common/displayport/inc/dp_deviceimpl.h:
+../common/displayport/inc/dp_qse.h:
 ../common/displayport/inc/dp_linkedlist.h:
 ../common/displayport/inc/./dptestutil/dp_testmessage.h:

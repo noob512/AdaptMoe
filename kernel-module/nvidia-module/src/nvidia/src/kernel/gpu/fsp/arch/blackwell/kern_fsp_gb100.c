@@ -27,6 +27,7 @@
  * @brief   Provides the implementation for BLACKWELL chip specific FSP HAL
  *          interfaces.
  */
+#include "kernel/gpu/gpu.h"
 #include "gpu/fsp/kern_fsp.h"
 #include "gpu/fsp/kern_fsp_retval.h"
 #include "gpu/gsp/kernel_gsp.h"
@@ -38,25 +39,37 @@
 #include "published/blackwell/gb100/dev_therm_addendum.h"
 #include "published/blackwell/gb100/dev_fsp_pri.h"
 #include "published/blackwell/gb100/dev_fsp_addendum.h"
+#include "published/blackwell/gb100/dev_gsp.h"
+#include "published/blackwell/gb100/dev_oob_pri.h"
+#include "published/blackwell/gb100/dev_bus_zb.h"
+#include "published/blackwell/gb100/dev_bus_zb_addendum.h"
+#include "published/blackwell/gb100/dev_top_zb.h"
+#include "published/blackwell/gb100/hwproject.h"
 
 #include "os/os.h"
 #include "nvRmReg.h"
 #include "nverror.h"
 
-static NvBool _kfspWaitBootCond_GB100(OBJGPU *pGpu, void *pArg);
+#define KERNEL_FSP_MBOX_PORT 2
 
-static NvBool
-_kfspWaitBootCond_GB100
+#define CMS2_LOG_START   0x50U
+#define CMS2_LOG_END     0x7FU
+#define CMS2_LOG_DWORDS  (CMS2_LOG_END - CMS2_LOG_START + 1)
+#define CMS2_LOG_BYTES   (CMS2_LOG_DWORDS * sizeof(NvU32))
+
+static void _kfspPrintCms2Log_GB100(OBJGPU *pGpu, KernelFsp *pKernelFsp, NvU8 *cms2Log);
+static NvBool _kfspWaitBootCond_GB100(OBJGPU *pGpu, void *pArg);
+static void _kfspGatherCms2Log_GB100(OBJGPU *pGpu, NvU32  *cms2Log);
+
+NV_STATUS
+kfspConstructHal_GB100
 (
-    OBJGPU *pGpu,
-    void   *pArg
+    OBJGPU    *pGpu,
+    KernelFsp *pKernelFsp
 )
 {
-    //
-    // In GB100, Bootfsm triggers FSP execution out of chip reset.
-    // FSP writes 0xFF value in NV_THERM_I2CS_SCRATCH register after completion of boot
-    //
-    return GPU_FLD_TEST_DRF_DEF(pGpu, _THERM_I2CS_SCRATCH, _FSP_BOOT_COMPLETE, _STATUS, _SUCCESS);
+    return ioaprtInit(&pKernelFsp->mboxAperture, pGpu->pIOApertures[DEVICE_INDEX_GPU],
+                      NV_PFSP_MNOC_RX_FIFO_DATA(0), 0x200);
 }
 
 NV_STATUS
@@ -92,6 +105,8 @@ kfspWaitForSecureBoot_GB100
                      GPU_REG_RD32(pGpu, NV_PFSP_FALCON_COMMON_SCRATCH_GROUP_2(1)),
                      GPU_REG_RD32(pGpu, NV_PFSP_FALCON_COMMON_SCRATCH_GROUP_2(2)),
                      GPU_REG_RD32(pGpu, NV_PFSP_FALCON_COMMON_SCRATCH_GROUP_2(3)));
+
+        kfspDumpDebugState_HAL(pGpu, pKernelFsp);
     }
 
     if (GPU_FLD_TEST_DRF_DEF(pGpu, _PFSP, _FUSE_ERROR_CHECK, _STATUS, _SUCCESS))
@@ -145,6 +160,61 @@ kfspCheckForClockBoostCapability_GB100
     }
 }
 
+/*!
+ * @brief Dump debug registers for FSP
+ *
+ * @param[in] pGpu       OBJGPU pointer
+ * @param[in] pKernelFsp KernelFsp pointer
+ *
+ * @return NV_OK, or error if failed
+ */
+void
+kfspDumpDebugState_GB100
+(
+    OBJGPU    *pGpu,
+    KernelFsp *pKernelFsp
+)
+{
+    NvU32 i;
+    NvU32 cms2Log[CMS2_LOG_DWORDS];
+    const NvU32 fspUcodeVersion = GPU_REG_RD_DRF(pGpu, _GFW, _FSP_UCODE_VERSION, _FULL);
+    //
+    // Older microcodes did not have the version populated in scratch.
+    // They will report a version of 0.
+    //
+    if (fspUcodeVersion > 0)
+    {
+        NV_PRINTF(LEVEL_ERROR, "FSP microcode v%u.%u\n",
+                  DRF_VAL(_GFW, _FSP_UCODE_VERSION, _MAJOR, fspUcodeVersion),
+                  DRF_VAL(_GFW, _FSP_UCODE_VERSION, _MINOR, fspUcodeVersion));
+    }
+
+    NV_PRINTF(LEVEL_ERROR, "GPU %04x:%02x:%02x\n",
+              gpuGetDomain(pGpu), gpuGetBus(pGpu), gpuGetDevice(pGpu));
+
+    NV_PRINTF(LEVEL_ERROR, "NV_PFSP_FALCON_COMMON_SCRATCH_GROUP_2(0) = 0x%x\n",
+              GPU_REG_RD32(pGpu, NV_PFSP_FALCON_COMMON_SCRATCH_GROUP_2(0)));
+    NV_PRINTF(LEVEL_ERROR, "NV_PFSP_FALCON_COMMON_SCRATCH_GROUP_2(1) = 0x%x\n",
+              GPU_REG_RD32(pGpu, NV_PFSP_FALCON_COMMON_SCRATCH_GROUP_2(1)));
+    NV_PRINTF(LEVEL_ERROR, "NV_PFSP_FALCON_COMMON_SCRATCH_GROUP_2(2) = 0x%x\n",
+              GPU_REG_RD32(pGpu, NV_PFSP_FALCON_COMMON_SCRATCH_GROUP_2(2)));
+    NV_PRINTF(LEVEL_ERROR, "NV_PFSP_FALCON_COMMON_SCRATCH_GROUP_2(3) = 0x%x\n",
+              GPU_REG_RD32(pGpu, NV_PFSP_FALCON_COMMON_SCRATCH_GROUP_2(3)));
+
+    NV_PRINTF(LEVEL_ERROR, "NV_PGSP_FALCON_MAILBOX0 = 0x%x\n",
+              GPU_REG_RD32(pGpu, NV_PGSP_FALCON_MAILBOX0));
+    NV_PRINTF(LEVEL_ERROR, "NV_PGSP_FALCON_MAILBOX1 = 0x%x\n",
+              GPU_REG_RD32(pGpu, NV_PGSP_FALCON_MAILBOX1));
+    for(i = 0; i < NV_PGSP_MAILBOX__SIZE_1; i++)
+    {
+        NV_PRINTF(LEVEL_ERROR, "NV_PGSP_MAILBOX(%d) = 0x%x\n",
+                  i, GPU_REG_RD32(pGpu, NV_PGSP_MAILBOX(i)));
+    }
+
+    _kfspGatherCms2Log_GB100(pGpu, cms2Log);
+    _kfspPrintCms2Log_GB100(pGpu, pKernelFsp, (NvU8*) cms2Log);
+}
+
 NV_STATUS
 kfspSendClockBoostRpc_GB100
 (
@@ -158,4 +228,209 @@ kfspSendClockBoostRpc_GB100
 
     return kfspSendAndReadMessage(pGpu, pKernelFsp, (NvU8*) &inputPayload, sizeof(inputPayload),
                                   NVDM_TYPE_CLOCK_BOOST, NULL, 0);
+}
+
+static void
+_kfspPrintCms2Log_GB100
+(
+    OBJGPU    *pGpu,
+    KernelFsp *pKernelFsp,
+    NvU8      *cms2Log
+)
+{
+    NV_PRINTF(LEVEL_ERROR, "CMS2 Log:\n");
+    nvDbgDumpBufferBytes(cms2Log, CMS2_LOG_BYTES);
+}
+
+static NvBool
+_kfspWaitBootCond_GB100
+(
+    OBJGPU *pGpu,
+    void   *pArg
+)
+{
+    //
+    // In GB100, Bootfsm triggers FSP execution out of chip reset.
+    // FSP writes 0xFF value in NV_THERM_I2CS_SCRATCH register after completion of boot
+    //
+    return GPU_FLD_TEST_DRF_DEF(pGpu, _THERM_I2CS_SCRATCH, _FSP_BOOT_COMPLETE, _STATUS, _SUCCESS);
+}
+
+static void
+_kfspGatherCms2Log_GB100
+(
+    OBJGPU *pGpu,
+    NvU32  *cms2Log
+)
+{
+    NvU32 index;
+
+    for (index = 0; index < CMS2_LOG_DWORDS; index++)
+    {
+        GPU_REG_WR32(pGpu, NV_POOBHUB_RCV_INDIRECT_CMS2_MEM_RD_ADDR, CMS2_LOG_START + index);
+        cms2Log[index] = GPU_REG_RD32(pGpu, NV_POOBHUB_RCV_INDIRECT_CMS2_MEM_RD_DATA);
+    }
+}
+
+NV_STATUS
+kfspSendPacket_GB100
+(
+    OBJGPU    *pGpu,
+    KernelFsp *pKernelFsp,
+    NvU8      *pPacket,
+    NvU32      packetSize
+)
+{
+   if (pKernelFsp->getProperty(pKernelFsp, PDB_PROP_KFSP_USE_MNOC_CPU))
+   {
+        RMTIMEOUT timeout;
+
+        gpuSetTimeout(pGpu, GPU_TIMEOUT_DEFAULT, &timeout, 0);
+
+        return gpuMnocMboxSend_HAL(pGpu, &pKernelFsp->mboxAperture, KERNEL_FSP_MBOX_PORT,
+                                   &timeout, pPacket, packetSize);
+    }
+
+    return kfspSendPacket_GH100(pGpu, pKernelFsp, pPacket, packetSize);
+}
+
+NV_STATUS
+kfspReadPacket_GB100
+(
+    OBJGPU    *pGpu,
+    KernelFsp *pKernelFsp,
+    NvU8      *pPacket,
+    NvU32      maxPacketSize,
+    NvU32     *pBytesRead
+)
+{
+    NV_ASSERT_OR_RETURN(pBytesRead != NULL, NV_ERR_INVALID_POINTER);
+
+    if (pKernelFsp->getProperty(pKernelFsp, PDB_PROP_KFSP_USE_MNOC_CPU))
+    {
+        NvU32 recvSize = maxPacketSize;
+        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+                              gpuMnocMboxRecv_HAL(pGpu, &pKernelFsp->mboxAperture,
+                                                  KERNEL_FSP_MBOX_PORT,
+                                                  pPacket, &recvSize));
+        *pBytesRead = recvSize;
+
+        return NV_OK;
+    }
+
+    return kfspReadPacket_GH100(pGpu, pKernelFsp, pPacket, maxPacketSize, pBytesRead);
+}
+
+NvBool
+kfspCanSendPacket_GB100
+(
+    OBJGPU    *pGpu,
+    KernelFsp *pKernelFsp
+)
+{
+    if (pKernelFsp->getProperty(pKernelFsp, PDB_PROP_KFSP_USE_MNOC_CPU))
+    {
+        // SendPacket is a blocking call
+        return NV_TRUE;
+    }
+
+    return kfspCanSendPacket_GH100(pGpu, pKernelFsp);
+}
+
+NvBool
+kfspIsResponseAvailable_GB100
+(
+    OBJGPU    *pGpu,
+    KernelFsp *pKernelFsp
+)
+{
+    if (pKernelFsp->getProperty(pKernelFsp, PDB_PROP_KFSP_USE_MNOC_CPU))
+    {
+        return gpuMnocMboxIsMsgAvailable_HAL(pGpu, &pKernelFsp->mboxAperture, KERNEL_FSP_MBOX_PORT);
+    }
+
+    return kfspIsResponseAvailable_GH100(pGpu, pKernelFsp);
+}
+
+NvU32
+kfspGetMaxSendPacketSize_GB100
+(
+    OBJGPU    *pGpu,
+    KernelFsp *pKernelFsp
+)
+{
+    if (pKernelFsp->getProperty(pKernelFsp, PDB_PROP_KFSP_USE_MNOC_CPU))
+    {
+        return gpuMnocMboxMaxMessageSize_HAL(pGpu);
+    }
+
+    return kfspGetMaxSendPacketSize_GH100(pGpu, pKernelFsp);
+}
+
+NvU32
+kfspGetMaxRecvPacketSize_GB100
+(
+    OBJGPU    *pGpu,
+    KernelFsp *pKernelFsp
+)
+{
+    if (pKernelFsp->getProperty(pKernelFsp, PDB_PROP_KFSP_USE_MNOC_CPU))
+    {
+        return gpuMnocMboxMaxMessageSize_HAL(pGpu);
+    }
+
+    return kfspGetMaxRecvPacketSize_GH100(pGpu, pKernelFsp);
+}
+
+void
+kfspFrtsSysmemLocationClear_GB100
+(
+    OBJGPU *pGpu,
+    KernelFsp *pKernelFsp
+)
+{
+    const DEVICE_INFO_ENTRY *pEntry;
+    NV_STATUS status = gpuGetOneDeviceEntry(pGpu,
+                                            NV_PTOP_ZB_DEVICE_INFO_DEV_TYPE_ENUM_PBUS,
+                                            DEVICE_INFO_DIELET_INSTANCE_ANY,
+                                            0,
+                                            DEVICE_INFO_DIE_LOCAL_INSTANCE_ID_ANY,
+                                            &pEntry);
+
+    NV_ASSERT_OR_RETURN_VOID(status == NV_OK);
+
+    GPU_REG_WR32(
+        pGpu,
+        pEntry->devicePriBase + NV_PBUS_ZB_SW_FRTS_INSECURE_CONFIG,
+        REF_DEF(NV_PBUS_ZB_SW_FRTS_INSECURE_CONFIG_SIZE_4K, _INVALID));
+    GPU_REG_WR32(
+        pGpu, pEntry->devicePriBase + NV_PBUS_ZB_SW_FRTS_INSECURE_ADDR_HI32, 0U);
+    GPU_REG_WR32(
+        pGpu, pEntry->devicePriBase + NV_PBUS_ZB_SW_FRTS_INSECURE_ADDR_LO32, 0U);
+}
+
+NV_STATUS
+kfspFrtsSysmemLocationProgram_GB100
+(
+    OBJGPU *pGpu,
+    KernelFsp *pKernelFsp
+)
+{
+    NV_ASSERT_OR_RETURN(pKernelFsp->pSysmemFrtsMemdesc != NULL, NV_ERR_INVALID_STATE);
+    RmPhysAddr frtsSysmemAddr = memdescGetPhysAddr(pKernelFsp->pSysmemFrtsMemdesc, AT_GPU, 0U);
+
+    GPU_REG_WR32(
+        pGpu, NV_PBUS0_PRI_BASE + NV_PBUS_ZB_SW_FRTS_INSECURE_ADDR_LO32, NvU64_LO32(frtsSysmemAddr));
+    GPU_REG_WR32(
+        pGpu, NV_PBUS0_PRI_BASE + NV_PBUS_ZB_SW_FRTS_INSECURE_ADDR_HI32, NvU64_HI32(frtsSysmemAddr));
+    GPU_REG_WR32(
+        pGpu,
+        NV_PBUS0_PRI_BASE + NV_PBUS_ZB_SW_FRTS_INSECURE_CONFIG,
+        FLD_SET_DRF(
+            _PBUS_ZB, _SW_FRTS_INSECURE_CONFIG, _MEDIA_TYPE, _SYSMEM,
+        REF_NUM(
+            NV_PBUS_ZB_SW_FRTS_INSECURE_CONFIG_SIZE_4K,
+            (memdescGetSize(pKernelFsp->pSysmemFrtsMemdesc) >>
+                NV_PBUS_ZB_SW_FRTS_INSECURE_CONFIG_SIZE_4K_SHIFT))));
+    return NV_OK;
 }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2015-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2015-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -33,8 +33,16 @@
 extern "C" {
 #endif
 
-// TODO See if this can be added to NvPort
-#define pmaPortAtomicGet(ptr) portAtomicOrSize((ptr), 0)
+#define PMA_ADDR2FRAME(addr, base)  (((addr) - (base)) >> PMA_PAGE_SHIFT)
+#define PMA_FRAME2ADDR(frame, base) ((base) + ((frame) << PMA_PAGE_SHIFT))
+
+// State bits
+#define PMA_SCRUB_INITIALIZE   (NvSPtr)0
+#define PMA_SCRUB_IN_PROGRESS  (NvSPtr)1
+#define PMA_SCRUB_DONE         (NvSPtr)2
+
+#define PMA_SCRUBBER_VALID     1
+#define PMA_SCRUBBER_INVALID   0
 
 NvU32 findRegionID(PMA *pPma, NvU64 address);
 void pmaPrintBlockStatus(PMA_PAGESTATUS blockStatus);
@@ -183,16 +191,12 @@ void pmaFreeList(PMA *pPma, PRANGELISTTYPE *ppList);
  * @param[in] physAddrBase          The base address of this address tree
  * @param[in] pBlacklistPageBase    Structure that contains the blacklisted pages
  * @param[in] blacklistCount        Number of blacklisted pages
- * @param[in] bBlacklistFromInforom Whether the blacklisted pages are coming from
- *                                  inforom (i.e., from heap/PMA init) or not
- *                                  (i.e., from ECC interrupt handling)
  *
  * @return NV_OK
  *         NV_ERR_NO_MEMORY if memory allocation fails
  */
 NV_STATUS pmaRegisterBlacklistInfo(PMA *pPma, NvU64 physAddrBase,
-                                      PPMA_BLACKLIST_ADDRESS pBlacklistPageBase, NvU32 blacklistCount,
-                                      NvBool bBlacklistFromInforom);
+                                      PPMA_BLACKLIST_ADDRESS pBlacklistPageBase, NvU32 blacklistCount);
 
 /*!
  * @brief Query blacklisting states tracked by PMA

@@ -103,9 +103,12 @@ struct NvKmsKapiDevice {
     NvU32 subDeviceMask;
 
     NvBool isSOC;
+    NvBool isSOCDisplay;
     NvKmsDispIOCoherencyModes isoIOCoherencyModes;
     NvKmsDispIOCoherencyModes nisoIOCoherencyModes;
     NvBool supportsSyncpts;
+
+    NvBool coherentGpuMemory;
 
     /* SMG state */
 
@@ -128,10 +131,6 @@ struct NvKmsKapiDevice {
         NvU32 maxCursorSizeInPixels;
 
         NvU8  genericPageKind;
-        NvBool requiresVrrSemaphores;
-
-        NvBool supportsInputColorSpace;
-        NvBool supportsInputColorRange;
     } caps;
 
     NvU64 supportedSurfaceMemoryFormats[NVKMS_KAPI_LAYER_MAX];
@@ -166,6 +165,8 @@ struct NvKmsKapiMemory {
     struct NvKmsKapiPrivSurfaceParams surfaceParams;
 
     NvBool isVidmem;
+    /* Whether memory can be updated directly on the screen */
+    NvBool noDisplayCaching;
 };
 
 struct NvKmsKapiSurface {

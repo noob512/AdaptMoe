@@ -28,25 +28,10 @@
 
 #include <linux/spinlock.h>
 #include <linux/rwsem.h>
-#include <linux/sched.h> /* signal_pending, cond_resched */
+#include <linux/sched.h> /* cond_resched */
 #include <linux/semaphore.h>
+#include <linux/sched/signal.h> /* signal_pending */
 
-#if defined(NV_LINUX_SCHED_SIGNAL_H_PRESENT)
-#include <linux/sched/signal.h>     /* signal_pending for kernels >= 4.11 */
-#endif
-
-#if defined(CONFIG_PREEMPT_RT) || defined(CONFIG_PREEMPT_RT_FULL)
-typedef raw_spinlock_t            nv_spinlock_t;
-#define NV_DEFINE_SPINLOCK(lock)  DEFINE_RAW_SPINLOCK(lock)
-#define NV_SPIN_LOCK_INIT(lock)   raw_spin_lock_init(lock)
-#define NV_SPIN_LOCK_IRQ(lock)    raw_spin_lock_irq(lock)
-#define NV_SPIN_UNLOCK_IRQ(lock)  raw_spin_unlock_irq(lock)
-#define NV_SPIN_LOCK_IRQSAVE(lock,flags) raw_spin_lock_irqsave(lock,flags)
-#define NV_SPIN_UNLOCK_IRQRESTORE(lock,flags) raw_spin_unlock_irqrestore(lock,flags)
-#define NV_SPIN_LOCK(lock)        raw_spin_lock(lock)
-#define NV_SPIN_UNLOCK(lock)      raw_spin_unlock(lock)
-#define NV_SPIN_UNLOCK_WAIT(lock) raw_spin_unlock_wait(lock)
-#else
 typedef spinlock_t                nv_spinlock_t;
 #define NV_DEFINE_SPINLOCK(lock)  DEFINE_SPINLOCK(lock)
 #define NV_SPIN_LOCK_INIT(lock)   spin_lock_init(lock)
@@ -57,7 +42,6 @@ typedef spinlock_t                nv_spinlock_t;
 #define NV_SPIN_LOCK(lock)        spin_lock(lock)
 #define NV_SPIN_UNLOCK(lock)      spin_unlock(lock)
 #define NV_SPIN_UNLOCK_WAIT(lock) spin_unlock_wait(lock)
-#endif
 
 #define NV_INIT_MUTEX(mutex) sema_init(mutex, 1)
 

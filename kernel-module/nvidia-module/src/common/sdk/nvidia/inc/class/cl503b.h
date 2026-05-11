@@ -51,6 +51,10 @@ typedef struct NV503B_BAR1_P2P_DMA_INFO {
     NV_DECLARE_ALIGNED(NvU64 dma_size, 8);
 } NV503B_BAR1_P2P_DMA_INFO;
 
+typedef struct NV503B_FABRIC_P2P_DMA_INFO {
+    NV_DECLARE_ALIGNED(NvU64 gpa, 8);
+} NV503B_FABRIC_P2P_DMA_INFO;
+
 /* NvRmAlloc parameters */
 #define NV503B_ALLOC_PARAMETERS_MESSAGE_ID (0x503bU)
 
@@ -70,6 +74,8 @@ typedef struct NV503B_ALLOC_PARAMETERS {
     NvU32    flags;                     /* Flag to indicate types/attib of p2p   */
     NvU32    subDeviceEgmPeerIdMask;       /* Bit mask of EGM peer ID of SubDevice       */
     NvU32    peerSubDeviceEgmPeerIdMask;    /* Bit mask of EGM peer ID for PeerSubDevice  */
-    NV_DECLARE_ALIGNED(NV503B_BAR1_P2P_DMA_INFO l2pBar1P2PDmaInfo, 8);  /* Bar1 DMA info from local GPU to peer GPU   */
-    NV_DECLARE_ALIGNED(NV503B_BAR1_P2P_DMA_INFO p2lBar1P2PDmaInfo, 8);  /* Bar1 DMA info from peer GPU to local GPU   */
+    NV_DECLARE_ALIGNED(NV503B_BAR1_P2P_DMA_INFO l2pBar1P2PDmaInfo, 8);   /* Bar1 DMA info from local GPU to peer GPU   */
+    NV_DECLARE_ALIGNED(NV503B_BAR1_P2P_DMA_INFO p2lBar1P2PDmaInfo, 8);   /* Bar1 DMA info from peer GPU to local GPU   */
+    NV_DECLARE_ALIGNED(NV503B_FABRIC_P2P_DMA_INFO l2pFabricP2PInfo, 8); /* NVLink fabric base address of the local GPU. Used in switch systems */
+    NV_DECLARE_ALIGNED(NV503B_FABRIC_P2P_DMA_INFO p2lFabricP2PInfo, 8); /* NVLink fabric base address of the remote GPU. Used in switch systems */
 } NV503B_ALLOC_PARAMETERS;

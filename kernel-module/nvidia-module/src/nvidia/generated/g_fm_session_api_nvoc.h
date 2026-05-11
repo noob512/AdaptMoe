@@ -52,7 +52,7 @@ extern "C" {
 #define FM_SESSION_API_H
 
 #include "rmapi/resource.h"
-#include "rmapi/event.h"
+#include "rmapi/event_api.h"
 #include "ctrl/ctrl000f.h"
 
 // ****************************************************************************
@@ -108,10 +108,6 @@ struct FmSessionApi {
     struct RmResource *__nvoc_pbase_RmResource;    // rmres super
     struct FmSessionApi *__nvoc_pbase_FmSessionApi;    // fmsessionapi
 
-    // Vtable with 2 per-object function pointers
-    NV_STATUS (*__fmsessionapiCtrlCmdSetFmState__)(struct FmSessionApi * /*this*/);  // exported (id=0xf0101)
-    NV_STATUS (*__fmsessionapiCtrlCmdClearFmState__)(struct FmSessionApi * /*this*/);  // exported (id=0xf0102)
-
     // Data members
     NvU64 dupedCapDescriptor;
 };
@@ -149,13 +145,9 @@ struct NVOC_METADATA__FmSessionApi {
     const struct NVOC_VTABLE__FmSessionApi vtable;
 };
 
-#ifndef __NVOC_CLASS_FmSessionApi_TYPEDEF__
-#define __NVOC_CLASS_FmSessionApi_TYPEDEF__
-typedef struct FmSessionApi FmSessionApi;
-#endif /* __NVOC_CLASS_FmSessionApi_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_FmSessionApi
-#define __nvoc_class_id_FmSessionApi 0xdfbd08
+#define __nvoc_class_id_FmSessionApi 0xdfbd08u
+typedef struct FmSessionApi FmSessionApi;
 #endif /* __nvoc_class_id_FmSessionApi */
 
 // Casting support
@@ -173,16 +165,40 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_FmSessionApi;
 
 NV_STATUS __nvoc_objCreateDynamic_FmSessionApi(FmSessionApi**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_FmSessionApi(FmSessionApi**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_FmSessionApi(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_FmSessionApi((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_FmSessionApi(FmSessionApi**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_FmSessionApi(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_FmSessionApi((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
-#define fmsessionapiCtrlCmdSetFmState_FNPTR(pFmSessionApi) pFmSessionApi->__fmsessionapiCtrlCmdSetFmState__
-#define fmsessionapiCtrlCmdSetFmState(pFmSessionApi) fmsessionapiCtrlCmdSetFmState_DISPATCH(pFmSessionApi)
-#define fmsessionapiCtrlCmdClearFmState_FNPTR(pFmSessionApi) pFmSessionApi->__fmsessionapiCtrlCmdClearFmState__
-#define fmsessionapiCtrlCmdClearFmState(pFmSessionApi) fmsessionapiCtrlCmdClearFmState_DISPATCH(pFmSessionApi)
+// Wrapper macros for implementation functions
+NV_STATUS fmsessionapiConstruct_IMPL(struct FmSessionApi *pFmSessionApi, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_fmsessionapiConstruct(pFmSessionApi, pCallContext, pParams) fmsessionapiConstruct_IMPL(pFmSessionApi, pCallContext, pParams)
+
+void fmsessionapiDestruct_IMPL(struct FmSessionApi *pFmSessionApi);
+#define __nvoc_fmsessionapiDestruct(pFmSessionApi) fmsessionapiDestruct_IMPL(pFmSessionApi)
+
+NV_STATUS fmsessionapiCtrlCmdSetFmState_IMPL(struct FmSessionApi *pFmSessionApi);
+#ifdef __nvoc_fm_session_api_h_disabled
+static inline NV_STATUS fmsessionapiCtrlCmdSetFmState(struct FmSessionApi *pFmSessionApi) {
+    NV_ASSERT_FAILED_PRECOMP("FmSessionApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_fm_session_api_h_disabled
+#define fmsessionapiCtrlCmdSetFmState(pFmSessionApi) fmsessionapiCtrlCmdSetFmState_IMPL(pFmSessionApi)
+#endif // __nvoc_fm_session_api_h_disabled
+
+NV_STATUS fmsessionapiCtrlCmdClearFmState_IMPL(struct FmSessionApi *pFmSessionApi);
+#ifdef __nvoc_fm_session_api_h_disabled
+static inline NV_STATUS fmsessionapiCtrlCmdClearFmState(struct FmSessionApi *pFmSessionApi) {
+    NV_ASSERT_FAILED_PRECOMP("FmSessionApi was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_fm_session_api_h_disabled
+#define fmsessionapiCtrlCmdClearFmState(pFmSessionApi) fmsessionapiCtrlCmdClearFmState_IMPL(pFmSessionApi)
+#endif // __nvoc_fm_session_api_h_disabled
+
+
+// Wrapper macros for halified functions
 #define fmsessionapiAccessCallback_FNPTR(pResource) pResource->__nvoc_base_RmResource.__nvoc_metadata_ptr->vtable.__rmresAccessCallback__
 #define fmsessionapiAccessCallback(pResource, pInvokingClient, pAllocParams, accessRight) fmsessionapiAccessCallback_DISPATCH(pResource, pInvokingClient, pAllocParams, accessRight)
 #define fmsessionapiShareCallback_FNPTR(pResource) pResource->__nvoc_base_RmResource.__nvoc_metadata_ptr->vtable.__rmresShareCallback__
@@ -227,14 +243,6 @@ NV_STATUS __nvoc_objCreate_FmSessionApi(FmSessionApi**, Dynamic*, NvU32, struct 
 #define fmsessionapiAddAdditionalDependants(pClient, pResource, pReference) fmsessionapiAddAdditionalDependants_DISPATCH(pClient, pResource, pReference)
 
 // Dispatch functions
-static inline NV_STATUS fmsessionapiCtrlCmdSetFmState_DISPATCH(struct FmSessionApi *pFmSessionApi) {
-    return pFmSessionApi->__fmsessionapiCtrlCmdSetFmState__(pFmSessionApi);
-}
-
-static inline NV_STATUS fmsessionapiCtrlCmdClearFmState_DISPATCH(struct FmSessionApi *pFmSessionApi) {
-    return pFmSessionApi->__fmsessionapiCtrlCmdClearFmState__(pFmSessionApi);
-}
-
 static inline NvBool fmsessionapiAccessCallback_DISPATCH(struct FmSessionApi *pResource, struct RsClient *pInvokingClient, void *pAllocParams, RsAccessRight accessRight) {
     return pResource->__nvoc_metadata_ptr->vtable.__fmsessionapiAccessCallback__(pResource, pInvokingClient, pAllocParams, accessRight);
 }
@@ -319,16 +327,16 @@ static inline void fmsessionapiAddAdditionalDependants_DISPATCH(struct RsClient 
     pResource->__nvoc_metadata_ptr->vtable.__fmsessionapiAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
 NV_STATUS fmsessionapiCtrlCmdSetFmState_IMPL(struct FmSessionApi *pFmSessionApi);
 
 NV_STATUS fmsessionapiCtrlCmdClearFmState_IMPL(struct FmSessionApi *pFmSessionApi);
 
-NV_STATUS fmsessionapiConstruct_IMPL(struct FmSessionApi *arg_pFmSessionApi, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_fmsessionapiConstruct(arg_pFmSessionApi, arg_pCallContext, arg_pParams) fmsessionapiConstruct_IMPL(arg_pFmSessionApi, arg_pCallContext, arg_pParams)
-void fmsessionapiDestruct_IMPL(struct FmSessionApi *pFmSessionApi);
-
-#define __nvoc_fmsessionapiDestruct(pFmSessionApi) fmsessionapiDestruct_IMPL(pFmSessionApi)
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

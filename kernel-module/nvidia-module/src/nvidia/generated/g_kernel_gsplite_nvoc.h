@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -89,10 +89,18 @@ struct KernelGsplite {
     struct OBJENGSTATE *__nvoc_pbase_OBJENGSTATE;    // engstate super
     struct KernelGsplite *__nvoc_pbase_KernelGsplite;    // kgsplite
 
-    // 1 PDB property
+    // 2 PDB properties
+//  NvBool PDB_PROP_KGSPLITE_IS_MISSING inherited from OBJENGSTATE
+    NvBool PDB_PROP_KGSPLITE_ENABLE_CMC_NVLOG;
 
     // Data members
     NvU32 PublicId;
+    LIBOS_LOG_DECODE logDecode;
+    NvU32 logBufSize;
+    MEMORY_DESCRIPTOR *pLogMemDesc;
+    NvU64 *pLogBuf;
+    NvU64 *pLogBufPriv;
+    void *pLogElf;
 };
 
 
@@ -100,10 +108,10 @@ struct KernelGsplite {
 struct NVOC_VTABLE__KernelGsplite {
     NV_STATUS (*__kgspliteConstructEngine__)(struct OBJGPU *, struct KernelGsplite * /*this*/, ENGDESCRIPTOR);  // virtual override (engstate) base (engstate)
     NV_STATUS (*__kgspliteStateInitUnlocked__)(struct OBJGPU *, struct KernelGsplite * /*this*/);  // virtual override (engstate) base (engstate)
+    NV_STATUS (*__kgspliteStateInitLocked__)(struct OBJGPU *, struct KernelGsplite * /*this*/);  // virtual override (engstate) base (engstate)
     void (*__kgspliteInitMissing__)(struct OBJGPU *, struct KernelGsplite * /*this*/);  // virtual inherited (engstate) base (engstate)
     NV_STATUS (*__kgspliteStatePreInitLocked__)(struct OBJGPU *, struct KernelGsplite * /*this*/);  // virtual inherited (engstate) base (engstate)
     NV_STATUS (*__kgspliteStatePreInitUnlocked__)(struct OBJGPU *, struct KernelGsplite * /*this*/);  // virtual inherited (engstate) base (engstate)
-    NV_STATUS (*__kgspliteStateInitLocked__)(struct OBJGPU *, struct KernelGsplite * /*this*/);  // virtual inherited (engstate) base (engstate)
     NV_STATUS (*__kgspliteStatePreLoad__)(struct OBJGPU *, struct KernelGsplite * /*this*/, NvU32);  // virtual inherited (engstate) base (engstate)
     NV_STATUS (*__kgspliteStateLoad__)(struct OBJGPU *, struct KernelGsplite * /*this*/, NvU32);  // virtual inherited (engstate) base (engstate)
     NV_STATUS (*__kgspliteStatePostLoad__)(struct OBJGPU *, struct KernelGsplite * /*this*/, NvU32);  // virtual inherited (engstate) base (engstate)
@@ -121,13 +129,9 @@ struct NVOC_METADATA__KernelGsplite {
     const struct NVOC_VTABLE__KernelGsplite vtable;
 };
 
-#ifndef __NVOC_CLASS_KernelGsplite_TYPEDEF__
-#define __NVOC_CLASS_KernelGsplite_TYPEDEF__
-typedef struct KernelGsplite KernelGsplite;
-#endif /* __NVOC_CLASS_KernelGsplite_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_KernelGsplite
-#define __nvoc_class_id_KernelGsplite 0x927969
+#define __nvoc_class_id_KernelGsplite 0x927969u
+typedef struct KernelGsplite KernelGsplite;
 #endif /* __nvoc_class_id_KernelGsplite */
 
 // Casting support
@@ -146,27 +150,73 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_KernelGsplite;
 // Property macros
 #define PDB_PROP_KGSPLITE_IS_MISSING_BASE_CAST __nvoc_base_OBJENGSTATE.
 #define PDB_PROP_KGSPLITE_IS_MISSING_BASE_NAME PDB_PROP_ENGSTATE_IS_MISSING
+#define PDB_PROP_KGSPLITE_ENABLE_CMC_NVLOG_BASE_CAST
+#define PDB_PROP_KGSPLITE_ENABLE_CMC_NVLOG_BASE_NAME PDB_PROP_KGSPLITE_ENABLE_CMC_NVLOG
+
 
 NV_STATUS __nvoc_objCreateDynamic_KernelGsplite(KernelGsplite**, Dynamic*, NvU32, va_list);
 
 NV_STATUS __nvoc_objCreate_KernelGsplite(KernelGsplite**, Dynamic*, NvU32);
-#define __objCreate_KernelGsplite(ppNewObj, pParent, createFlags) \
-    __nvoc_objCreate_KernelGsplite((ppNewObj), staticCast((pParent), Dynamic), (createFlags))
+#define __objCreate_KernelGsplite(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags) \
+    __nvoc_objCreate_KernelGsplite((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags))
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+void kgspliteDestruct_IMPL(struct KernelGsplite *pKernelGsplite);
+#define __nvoc_kgspliteDestruct(pKernelGsplite) kgspliteDestruct_IMPL(pKernelGsplite)
+
+NV_STATUS kgspliteInitLibosLoggingStructures_IMPL(struct OBJGPU *pGpu, struct KernelGsplite *pKernelGsplite);
+#ifdef __nvoc_kernel_gsplite_h_disabled
+static inline NV_STATUS kgspliteInitLibosLoggingStructures(struct OBJGPU *pGpu, struct KernelGsplite *pKernelGsplite) {
+    NV_ASSERT_FAILED_PRECOMP("KernelGsplite was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_gsplite_h_disabled
+#define kgspliteInitLibosLoggingStructures(pGpu, pKernelGsplite) kgspliteInitLibosLoggingStructures_IMPL(pGpu, pKernelGsplite)
+#endif // __nvoc_kernel_gsplite_h_disabled
+
+NV_STATUS kgspliteSendLibosLoggingStructuresInfo_IMPL(struct OBJGPU *pGpu, struct KernelGsplite *pKernelGsplite);
+#ifdef __nvoc_kernel_gsplite_h_disabled
+static inline NV_STATUS kgspliteSendLibosLoggingStructuresInfo(struct OBJGPU *pGpu, struct KernelGsplite *pKernelGsplite) {
+    NV_ASSERT_FAILED_PRECOMP("KernelGsplite was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_kernel_gsplite_h_disabled
+#define kgspliteSendLibosLoggingStructuresInfo(pGpu, pKernelGsplite) kgspliteSendLibosLoggingStructuresInfo_IMPL(pGpu, pKernelGsplite)
+#endif // __nvoc_kernel_gsplite_h_disabled
+
+void kgspliteFreeLibosLoggingStructures_IMPL(struct OBJGPU *pGpu, struct KernelGsplite *pKernelGsplite);
+#ifdef __nvoc_kernel_gsplite_h_disabled
+static inline void kgspliteFreeLibosLoggingStructures(struct OBJGPU *pGpu, struct KernelGsplite *pKernelGsplite) {
+    NV_ASSERT_FAILED_PRECOMP("KernelGsplite was disabled!");
+}
+#else // __nvoc_kernel_gsplite_h_disabled
+#define kgspliteFreeLibosLoggingStructures(pGpu, pKernelGsplite) kgspliteFreeLibosLoggingStructures_IMPL(pGpu, pKernelGsplite)
+#endif // __nvoc_kernel_gsplite_h_disabled
+
+void kgspliteDumpLibosLogs_IMPL(struct OBJGPU *pGpu, struct KernelGsplite *pKernelGsplite);
+#ifdef __nvoc_kernel_gsplite_h_disabled
+static inline void kgspliteDumpLibosLogs(struct OBJGPU *pGpu, struct KernelGsplite *pKernelGsplite) {
+    NV_ASSERT_FAILED_PRECOMP("KernelGsplite was disabled!");
+}
+#else // __nvoc_kernel_gsplite_h_disabled
+#define kgspliteDumpLibosLogs(pGpu, pKernelGsplite) kgspliteDumpLibosLogs_IMPL(pGpu, pKernelGsplite)
+#endif // __nvoc_kernel_gsplite_h_disabled
+
+
+// Wrapper macros for halified functions
 #define kgspliteConstructEngine_FNPTR(pKernelGsplite) pKernelGsplite->__nvoc_metadata_ptr->vtable.__kgspliteConstructEngine__
 #define kgspliteConstructEngine(pGpu, pKernelGsplite, engDesc) kgspliteConstructEngine_DISPATCH(pGpu, pKernelGsplite, engDesc)
 #define kgspliteStateInitUnlocked_FNPTR(pKernelGsplite) pKernelGsplite->__nvoc_metadata_ptr->vtable.__kgspliteStateInitUnlocked__
 #define kgspliteStateInitUnlocked(pGpu, pKernelGsplite) kgspliteStateInitUnlocked_DISPATCH(pGpu, pKernelGsplite)
+#define kgspliteStateInitLocked_FNPTR(pKernelGsplite) pKernelGsplite->__nvoc_metadata_ptr->vtable.__kgspliteStateInitLocked__
+#define kgspliteStateInitLocked(pGpu, pKernelGsplite) kgspliteStateInitLocked_DISPATCH(pGpu, pKernelGsplite)
 #define kgspliteInitMissing_FNPTR(pEngstate) pEngstate->__nvoc_base_OBJENGSTATE.__nvoc_metadata_ptr->vtable.__engstateInitMissing__
 #define kgspliteInitMissing(pGpu, pEngstate) kgspliteInitMissing_DISPATCH(pGpu, pEngstate)
 #define kgspliteStatePreInitLocked_FNPTR(pEngstate) pEngstate->__nvoc_base_OBJENGSTATE.__nvoc_metadata_ptr->vtable.__engstateStatePreInitLocked__
 #define kgspliteStatePreInitLocked(pGpu, pEngstate) kgspliteStatePreInitLocked_DISPATCH(pGpu, pEngstate)
 #define kgspliteStatePreInitUnlocked_FNPTR(pEngstate) pEngstate->__nvoc_base_OBJENGSTATE.__nvoc_metadata_ptr->vtable.__engstateStatePreInitUnlocked__
 #define kgspliteStatePreInitUnlocked(pGpu, pEngstate) kgspliteStatePreInitUnlocked_DISPATCH(pGpu, pEngstate)
-#define kgspliteStateInitLocked_FNPTR(pEngstate) pEngstate->__nvoc_base_OBJENGSTATE.__nvoc_metadata_ptr->vtable.__engstateStateInitLocked__
-#define kgspliteStateInitLocked(pGpu, pEngstate) kgspliteStateInitLocked_DISPATCH(pGpu, pEngstate)
 #define kgspliteStatePreLoad_FNPTR(pEngstate) pEngstate->__nvoc_base_OBJENGSTATE.__nvoc_metadata_ptr->vtable.__engstateStatePreLoad__
 #define kgspliteStatePreLoad(pGpu, pEngstate, arg3) kgspliteStatePreLoad_DISPATCH(pGpu, pEngstate, arg3)
 #define kgspliteStateLoad_FNPTR(pEngstate) pEngstate->__nvoc_base_OBJENGSTATE.__nvoc_metadata_ptr->vtable.__engstateStateLoad__
@@ -193,6 +243,10 @@ static inline NV_STATUS kgspliteStateInitUnlocked_DISPATCH(struct OBJGPU *pGpu, 
     return pKernelGsplite->__nvoc_metadata_ptr->vtable.__kgspliteStateInitUnlocked__(pGpu, pKernelGsplite);
 }
 
+static inline NV_STATUS kgspliteStateInitLocked_DISPATCH(struct OBJGPU *pGpu, struct KernelGsplite *pKernelGsplite) {
+    return pKernelGsplite->__nvoc_metadata_ptr->vtable.__kgspliteStateInitLocked__(pGpu, pKernelGsplite);
+}
+
 static inline void kgspliteInitMissing_DISPATCH(struct OBJGPU *pGpu, struct KernelGsplite *pEngstate) {
     pEngstate->__nvoc_metadata_ptr->vtable.__kgspliteInitMissing__(pGpu, pEngstate);
 }
@@ -203,10 +257,6 @@ static inline NV_STATUS kgspliteStatePreInitLocked_DISPATCH(struct OBJGPU *pGpu,
 
 static inline NV_STATUS kgspliteStatePreInitUnlocked_DISPATCH(struct OBJGPU *pGpu, struct KernelGsplite *pEngstate) {
     return pEngstate->__nvoc_metadata_ptr->vtable.__kgspliteStatePreInitUnlocked__(pGpu, pEngstate);
-}
-
-static inline NV_STATUS kgspliteStateInitLocked_DISPATCH(struct OBJGPU *pGpu, struct KernelGsplite *pEngstate) {
-    return pEngstate->__nvoc_metadata_ptr->vtable.__kgspliteStateInitLocked__(pGpu, pEngstate);
 }
 
 static inline NV_STATUS kgspliteStatePreLoad_DISPATCH(struct OBJGPU *pGpu, struct KernelGsplite *pEngstate, NvU32 arg3) {
@@ -241,13 +291,18 @@ static inline NvBool kgspliteIsPresent_DISPATCH(struct OBJGPU *pGpu, struct Kern
     return pEngstate->__nvoc_metadata_ptr->vtable.__kgspliteIsPresent__(pGpu, pEngstate);
 }
 
+// Virtual method declarations and/or inline definitions
 NV_STATUS kgspliteConstructEngine_IMPL(struct OBJGPU *pGpu, struct KernelGsplite *pKernelGsplite, ENGDESCRIPTOR engDesc);
 
 NV_STATUS kgspliteStateInitUnlocked_IMPL(struct OBJGPU *pGpu, struct KernelGsplite *pKernelGsplite);
 
-void kgspliteDestruct_IMPL(struct KernelGsplite *pKernelGsplite);
+NV_STATUS kgspliteStateInitLocked_IMPL(struct OBJGPU *pGpu, struct KernelGsplite *pKernelGsplite);
 
-#define __nvoc_kgspliteDestruct(pKernelGsplite) kgspliteDestruct_IMPL(pKernelGsplite)
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

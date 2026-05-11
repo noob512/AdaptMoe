@@ -33,7 +33,8 @@ nv_uvm_interface.o: nvidia/nv_uvm_interface.c \
  /usr/src/linux-headers-6.13.12-061312-generic/arch/x86/include/asm/posix_types.h \
  /usr/src/linux-headers-6.13.12-061312-generic/arch/x86/include/uapi/asm/posix_types_64.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/uapi/asm-generic/posix_types.h \
- common/inc/nv-ioctl-numa.h common/inc/nv-lock.h \
+ common/inc/nvi2c.h common/inc/nvimpshared.h common/inc/nv-ioctl-numa.h \
+ common/inc/nv-lock.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/spinlock.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/typecheck.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/preempt.h \
@@ -629,8 +630,7 @@ nv_uvm_interface.o: nvidia/nv_uvm_interface.c \
  /usr/src/linux-headers-6.13.12-061312-generic/arch/x86/include/generated/uapi/asm/poll.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/uapi/asm-generic/poll.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/uapi/linux/eventpoll.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/linux/dma-buf.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/linux/iosys-map.h \
+ /usr/src/linux-headers-6.13.12-061312-generic/include/linux/pci.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/io.h \
  /usr/src/linux-headers-6.13.12-061312-generic/arch/x86/include/asm/io.h \
  /usr/src/linux-headers-6.13.12-061312-generic/arch/x86/include/generated/asm/early_ioremap.h \
@@ -640,39 +640,20 @@ nv_uvm_interface.o: nvidia/nv_uvm_interface.c \
  /usr/src/linux-headers-6.13.12-061312-generic/include/asm-generic/iomap.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/asm-generic/pci_iomap.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/logic_pio.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/linux/file.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/linux/scatterlist.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/linux/dma-mapping.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/linux/dma-direction.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/linux/dma-fence.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/drm/drm_device.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/drm/drm_mode_config.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/drm/drm_modeset_lock.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/linux/stackdepot.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/linux/ww_mutex.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/linux/rtmutex.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/drm/drm_drv.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/video/nomodeset.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/drm/drm_gem.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/linux/dma-resv.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/drm/drm_vma_manager.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/drm/drm_mm.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/drm/drm_print.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/uapi/drm/drm.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/uapi/drm/drm_mode.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/uapi/drm/drm.h \
- /usr/src/linux-headers-6.13.12-061312-generic/include/linux/pci.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/resource_ext.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/msi_api.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/uapi/linux/pci.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/uapi/linux/pci_regs.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/pci_ids.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/dmapool.h \
+ /usr/src/linux-headers-6.13.12-061312-generic/include/linux/scatterlist.h \
  /usr/src/linux-headers-6.13.12-061312-generic/arch/x86/include/asm/pci.h \
  /usr/src/linux-headers-6.13.12-061312-generic/arch/x86/include/asm/memtype.h \
+ /usr/src/linux-headers-6.13.12-061312-generic/include/linux/dma-mapping.h \
+ /usr/src/linux-headers-6.13.12-061312-generic/include/linux/dma-direction.h \
+ /usr/src/linux-headers-6.13.12-061312-generic/include/linux/file.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/pm_runtime.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/fdtable.h \
- common/inc/nv-list-helpers.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/vgaarb.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/video/vga.h \
  /usr/src/linux-headers-6.13.12-061312-generic/arch/x86/include/asm/vga.h \
@@ -780,6 +761,7 @@ nv_uvm_interface.o: nvidia/nv_uvm_interface.c \
  /usr/src/linux-headers-6.13.12-061312-generic/include/uapi/linux/mempolicy.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/freezer.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/uapi/regulator/regulator.h \
+ /usr/src/linux-headers-6.13.12-061312-generic/include/linux/rtmutex.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/irqdomain.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/irqdomain_defs.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/irqhandler.h \
@@ -791,6 +773,9 @@ nv_uvm_interface.o: nvidia/nv_uvm_interface.c \
  common/inc/nv-memdbg.h common/inc/nv-proto.h common/inc/nv-pci.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/platform_device.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/reset.h \
+ /usr/src/linux-headers-6.13.12-061312-generic/include/linux/dma-buf.h \
+ /usr/src/linux-headers-6.13.12-061312-generic/include/linux/iosys-map.h \
+ /usr/src/linux-headers-6.13.12-061312-generic/include/linux/dma-fence.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/gpio.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/of_gpio.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/gpio/driver.h \
@@ -813,6 +798,8 @@ nv_uvm_interface.o: nvidia/nv_uvm_interface.c \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/clk-provider.h \
  /usr/src/linux-headers-6.13.12-061312-generic/include/linux/of_clk.h \
  common/inc/nv_uvm_interface.h common/inc/nvgputypes.h \
- common/inc/nv_uvm_types.h common/inc/nvCpuUuid.h nvidia/nv_gpu_ops.h \
+ common/inc/nv_uvm_types.h common/inc/nvCpuUuid.h \
+ common/inc/nv_uvm_user_types.h nvidia/nv_gpu_ops.h \
  common/inc/nvgputypes.h common/inc/nv_uvm_types.h \
- common/inc/rm-gpu-ops.h common/inc/nvCpuUuid.h
+ common/inc/nv_uvm_user_types.h common/inc/rm-gpu-ops.h \
+ common/inc/nvCpuUuid.h

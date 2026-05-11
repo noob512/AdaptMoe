@@ -104,6 +104,17 @@ portMemCopy
     return os_mem_copy(pDestination, pSource, srcSize);
 }
 
+void *
+portMemCopyAligned
+(
+    void       *pDestination,
+    NvLength    destSize,
+    const void *pSource,
+    NvLength    srcSize
+)
+{
+    return portMemCopy(pDestination, destSize, pSource, srcSize);
+}
 
 void *
 portMemSet

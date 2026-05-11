@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2013-2024 NVidia Corporation
+    Copyright (c) 2013-2025 NVidia Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -148,40 +148,6 @@ typedef struct
 } UVM_SET_STREAM_STOPPED_PARAMS;
 
 //
-// UvmCallTestFunction
-//
-#define UVM_RUN_TEST                                                  UVM_IOCTL_BASE(9)
-
-typedef struct
-{
-    NvProcessorUuid gpuUuid;     // IN
-    NvU32           test;        // IN
-    struct
-    {
-        NvProcessorUuid peerGpuUuid; // IN
-        NvU32           peerId;      // IN
-    } multiGpu;
-    NV_STATUS      rmStatus;    // OUT
-} UVM_RUN_TEST_PARAMS;
-
-//
-// This is a magic offset for mmap. Any mapping of an offset above this
-// threshold will be treated as a counters mapping, not as an allocation
-// mapping. Since allocation offsets must be identical to the virtual address
-// of the mapping, this threshold has to be an offset that cannot be
-// a valid virtual address.
-//
-#if defined(__linux__)
-    #if defined(NV_64_BITS)
-        #define UVM_EVENTS_OFFSET_BASE   (1UL << 63)
-        #define UVM_COUNTERS_OFFSET_BASE (1UL << 62)
-    #else
-        #define UVM_EVENTS_OFFSET_BASE   (1UL << 31)
-        #define UVM_COUNTERS_OFFSET_BASE (1UL << 30)
-    #endif
-#endif // defined(__linux___)
-
-//
 // UvmAddSession
 //
 #define UVM_ADD_SESSION                                               UVM_IOCTL_BASE(10)
@@ -189,26 +155,8 @@ typedef struct
 typedef struct
 {
     NvU32        pidTarget;                             // IN
-#ifdef __linux__
-    NvP64        countersBaseAddress NV_ALIGN_BYTES(8); // IN
-    NvS32        sessionIndex;                          // OUT (session index that got added)
-#endif
     NV_STATUS    rmStatus;                              // OUT
 } UVM_ADD_SESSION_PARAMS;
-
-//
-// UvmRemoveSession
-//
-#define UVM_REMOVE_SESSION                                             UVM_IOCTL_BASE(11)
-
-typedef struct
-{
-#ifdef __linux__
-    NvS32        sessionIndex; // IN (session index to be removed)
-#endif
-    NV_STATUS    rmStatus;     // OUT
-} UVM_REMOVE_SESSION_PARAMS;
-
 
 #define UVM_MAX_COUNTERS_PER_IOCTL_CALL 32
 
@@ -219,9 +167,6 @@ typedef struct
 
 typedef struct
 {
-#ifdef __linux__
-    NvS32            sessionIndex;                            // IN
-#endif
     UvmCounterConfig config[UVM_MAX_COUNTERS_PER_IOCTL_CALL]; // IN
     NvU32            count;                                   // IN
     NV_STATUS        rmStatus;                                // OUT
@@ -234,9 +179,6 @@ typedef struct
 
 typedef struct
 {
-#ifdef __linux__
-    NvS32           sessionIndex;                   // IN
-#endif
     NvU32           scope;                          // IN (UvmCounterScope)
     NvU32           counterName;                    // IN (UvmCounterName)
     NvProcessorUuid gpuUuid;                        // IN
@@ -251,15 +193,10 @@ typedef struct
 
 typedef struct
 {
-#ifdef __linux__
-    NvS32                 sessionIndex;                         // IN
-#endif
     NvU32                 eventQueueIndex;                      // OUT
     NvU64                 queueSize          NV_ALIGN_BYTES(8); // IN
     NvU64                 notificationCount  NV_ALIGN_BYTES(8); // IN
-#if defined(WIN32) || defined(WIN64)
     NvU64                 notificationHandle NV_ALIGN_BYTES(8); // IN
-#endif
     NvU32                 timeStampType;                        // IN (UvmEventTimeStampType)
     NV_STATUS             rmStatus;                             // OUT
 } UVM_CREATE_EVENT_QUEUE_PARAMS;
@@ -271,9 +208,6 @@ typedef struct
 
 typedef struct
 {
-#ifdef __linux__
-    NvS32         sessionIndex;       // IN
-#endif
     NvU32         eventQueueIndex;    // IN
     NV_STATUS     rmStatus;           // OUT
 } UVM_REMOVE_EVENT_QUEUE_PARAMS;
@@ -285,9 +219,6 @@ typedef struct
 
 typedef struct
 {
-#ifdef __linux__
-    NvS32         sessionIndex;                       // IN
-#endif
     NvU32         eventQueueIndex;                    // IN
     NvP64         userRODataAddr   NV_ALIGN_BYTES(8); // IN
     NvP64         userRWDataAddr   NV_ALIGN_BYTES(8); // IN
@@ -304,38 +235,11 @@ typedef struct
 
 typedef struct
 {
-#ifdef __linux__
-    NvS32        sessionIndex;      // IN
-#endif
     NvU32        eventQueueIndex;   // IN
     NvS32        eventType;         // IN
     NvU32        enable;            // IN
     NV_STATUS    rmStatus;          // OUT
 } UVM_EVENT_CTRL_PARAMS;
-
-//
-// UvmRegisterMpsServer
-//
-#define UVM_REGISTER_MPS_SERVER                                       UVM_IOCTL_BASE(18)
-
-typedef struct
-{
-    NvProcessorUuid gpuUuidArray[UVM_MAX_GPUS_V1];                 // IN
-    NvU32           numGpus;                                       // IN
-    NvU64           serverId                    NV_ALIGN_BYTES(8); // OUT
-    NV_STATUS       rmStatus;                                      // OUT
-} UVM_REGISTER_MPS_SERVER_PARAMS;
-
-//
-// UvmRegisterMpsClient
-//
-#define UVM_REGISTER_MPS_CLIENT                                       UVM_IOCTL_BASE(19)
-
-typedef struct
-{
-    NvU64     serverId  NV_ALIGN_BYTES(8); // IN
-    NV_STATUS rmStatus;                    // OUT
-} UVM_REGISTER_MPS_CLIENT_PARAMS;
 
 //
 // UvmEventGetGpuUuidTable
@@ -442,7 +346,6 @@ typedef struct
 
 typedef struct
 {
-    NvProcessorUuid gpuUuid;  // IN
     NvHandle        hClient;  // IN
     NvHandle        hChannel; // IN
     NV_STATUS       rmStatus; // OUT
@@ -510,7 +413,6 @@ typedef struct
 typedef struct
 {
     NvU64     base      NV_ALIGN_BYTES(8); // IN
-    NvU64     length    NV_ALIGN_BYTES(8); // IN
     NV_STATUS rmStatus;                    // OUT
 } UVM_FREE_PARAMS;
 
@@ -791,28 +693,6 @@ typedef struct
     NvProcessorUuid destinationUuid;                      // IN
     NV_STATUS       rmStatus;                             // OUT
 } UVM_MIGRATE_RANGE_GROUP_PARAMS;
-
-//
-// UvmEnableSystemWideAtomics
-//
-#define UVM_ENABLE_SYSTEM_WIDE_ATOMICS                                UVM_IOCTL_BASE(54)
-
-typedef struct
-{
-    NvProcessorUuid gpu_uuid; // IN
-    NV_STATUS       rmStatus; // OUT
-} UVM_ENABLE_SYSTEM_WIDE_ATOMICS_PARAMS;
-
-//
-// UvmDisableSystemWideAtomics
-//
-#define UVM_DISABLE_SYSTEM_WIDE_ATOMICS                               UVM_IOCTL_BASE(55)
-
-typedef struct
-{
-    NvProcessorUuid gpu_uuid; // IN
-    NV_STATUS       rmStatus; // OUT
-} UVM_DISABLE_SYSTEM_WIDE_ATOMICS_PARAMS;
 
 //
 // Initialize any tracker object such as a queue or counter
@@ -1120,6 +1000,18 @@ typedef struct
 {
     NV_STATUS       rmStatus; // OUT
 } UVM_CLEAR_ALL_ACCESS_COUNTERS_PARAMS;
+
+//
+// UvmDiscard
+//
+#define UVM_DISCARD                                                   UVM_IOCTL_BASE(80)
+typedef struct
+{
+    NvU64           base                                    NV_ALIGN_BYTES(8); // IN
+    NvU64           length                                  NV_ALIGN_BYTES(8); // IN
+    NvU64           flags                                   NV_ALIGN_BYTES(8); // IN
+    NV_STATUS       rmStatus;                                                  // OUT
+} UVM_DISCARD_PARAMS;
 
 //
 // Temporary ioctls which should be removed before UVM 8 release

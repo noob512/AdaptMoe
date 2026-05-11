@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -87,7 +87,7 @@ kpmuReservedMemoryBackingStoreSizeGet_IMPL
         // MMINTS-TODO: cross-reference with this when reserving memory
         // in pmu_20.c
         //
-        return 0x800000;
+        return 0x900000;
     }
 
     return 0U;
@@ -131,7 +131,6 @@ NvU64 kpmuReservedMemoryOffsetGet_IMPL
     {
         MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
         const NvU64 fbTotalMemSize = (pMemoryManager->Ram.fbTotalMemSizeMb << 20U);
-
         KernelFsp *pKernelFsp = GPU_GET_KERNEL_FSP(pGpu);
 
         if ((pKernelFsp != NULL) && !pKernelFsp->getProperty(pKernelFsp, PDB_PROP_KFSP_DISABLE_FRTS_VIDMEM))
@@ -199,7 +198,7 @@ kpmuInitLibosLoggingStructures_IMPL
     // Add PMU log buffer (use a fake "task name" - NVRISCV)
     libosLogAddLogEx(&pKernelPmu->logDecode, pKernelPmu->pPrintBuf, pKernelPmu->printBufSize,
                      pGpu->gpuInstance, (gpuGetChipArch(pGpu) >> GPU_ARCH_SHIFT), gpuGetChipImpl(pGpu),
-                     "NVRISCV", NULL, 0, NULL);
+                     "NVRISCV", NULL, 0, NULL, LIBOS_LOG_NVLOG_BUFFER_VERSION, 0);
 
     // Finish PMU log init (setting the lossless-print flag and resolve-pointers flag)
     libosLogInitEx(&pKernelPmu->logDecode, pKernelPmu->pLogElf, NV_TRUE, NV_TRUE, NV_TRUE, pKernelPmu->logElfSize);
@@ -257,6 +256,7 @@ NV_STATUS kpmuStateInitLocked_IMPL
     KernelPmu *pKernelPmu
 )
 {
+    NV_STATUS status = NV_OK;
 
-    return NV_OK;
+    return status;
 }

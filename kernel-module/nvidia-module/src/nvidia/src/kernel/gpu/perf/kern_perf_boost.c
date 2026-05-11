@@ -50,6 +50,43 @@ subdeviceCtrlCmdKPerfBoost_IMPL
     KernelPerf  *pKernelPerf     = GPU_GET_KERNEL_PERF(pGpu);
     NV_STATUS    status          = NV_OK;
 
+    if (IsGB10Y(pGpu))
+    {
+        if (pBoostParams->duration != NV2080_CTRL_PERF_BOOST_DURATION_INFINITE &&
+            pBoostParams->duration > NV2080_CTRL_PERF_BOOST_DURATION_MAX)
+        {
+            NV_PRINTF(LEVEL_ERROR, "The specified duration exceed maximum %d!\n",
+                      NV2080_CTRL_PERF_BOOST_DURATION_MAX);
+            return NV_ERR_INVALID_ARGUMENT;
+        }
+
+        if (FLD_TEST_DRF(2080, _CTRL_PERF_BOOST_FLAGS, _CMD, _CLEAR, pBoostParams->flags))
+        {
+            return osTegraiGpuPerfBoost(pGpu, NV_FALSE, 0);
+        }
+        else
+        {
+            // Bug 5397272
+            //
+            // When cudaSetDevice is being used, duration of perfboost will be
+            // NV2080_CTRL_PERF_BOOST_DURATION_INFINITE, and when the app exits,
+            // there is no followup NV2080_CTRL_PERF_BOOST_FLAGS_CMD_CLEAR call
+            // to reset/disable the perfboost. This leave GPU in perfboost mode
+            // forever (long enough).
+            //
+            // This is a WAR solution for Tegra iGPU only to override the
+            // duration to 1 when the app does not explicitly reset the perfboost
+            // but still give it 1 second time to boost up GPU clocks and speed
+            // up the context creation or app init time.
+            if (pBoostParams->duration == NV2080_CTRL_PERF_BOOST_DURATION_INFINITE)
+            {
+                pBoostParams->duration = 1;
+            }
+
+            return osTegraiGpuPerfBoost(pGpu, NV_TRUE, pBoostParams->duration);
+        }
+    }
+
     NV_CHECK_OR_RETURN(LEVEL_INFO, (pKernelPerf != NULL), NV_ERR_NOT_SUPPORTED);
 
     status = kperfBoostSet(pKernelPerf, pSubdevice, pBoostParams);

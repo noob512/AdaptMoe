@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2015-2024 NVIDIA Corporation
+    Copyright (c) 2015-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -124,11 +124,6 @@ typedef struct
     uvm_rw_semaphore_t lock;
 } uvm_vma_wrapper_t;
 
-// TODO: Bug 1733295.
-//
-//       There's a lot of state in the top-level uvm_va_range_t struct below
-//       which really belongs in the per-type structs (for example, blocks).
-
 typedef struct
 {
     // GPU mapping the allocation. The GPU's RM address space is required when
@@ -202,6 +197,15 @@ typedef struct
     // This field is unused for sparse mappings. Since they don't have physical
     // backing there is no RM object to be freed when the mapping is unmapped.
     uvm_deferred_free_object_t deferred_free;
+
+    // Flag indicating whether L2 cache invalidation is needed at unmap time.
+    // This is set by RM during mapping and used during unmap to determine if L2
+    // cache invalidation should be performed. For GPU cached system memory
+    // allocations on systems a write-back cache this is required for
+    // correctness. For GPU cached peer and system memory on systems with a
+    // write-through cache the invalidation could be done by RM at map time
+    // however this introduces overhead during performance sensitive sections.
+    bool need_l2_invalidate_at_unmap;
 } uvm_ext_gpu_map_t;
 
 typedef struct
@@ -223,25 +227,18 @@ struct uvm_va_range_struct
     // start and end + 1 have to be PAGE_SIZED aligned.
     uvm_range_tree_node_t node;
 
-    // Force the next split on this range to fail. Set by error injection ioctl
-    // (testing purposes only).
-    bool inject_split_error;
-
     // Force the next register_gpu_va_space to fail while adding this va_range.
     // Set by error injection ioctl (testing purposes only).
     bool inject_add_gpu_va_space_error;
 
-    // Mask of UVM-Lite GPUs for the VA range
-    //
-    // If the preferred location is set to a non-faultable GPU or the CPU,
-    // this mask contains all non-faultable GPUs that are in the accessed by
-    // mask and the preferred location itself if it's a GPU. Empty otherwise.
-    //
-    // All UVM-Lite GPUs have mappings only to the preferred location. The
-    // mappings are initially established only when the pages are resident on
-    // the preferred location, but persist after that until the preferred
-    // location is changed or a GPU stops being a UVM-Lite GPU.
-    uvm_processor_mask_t uvm_lite_gpus;
+    uvm_va_range_type_t type;
+};
+
+// Subclass of va_range state for va_range.type == UVM_VA_RANGE_TYPE_MANAGED
+struct uvm_va_range_managed_struct
+{
+    // Base class
+    uvm_va_range_t va_range;
 
     // This is a uvm_va_block_t ** array of all VA block pointers under this
     // range. The pointers can be accessed using the functions
@@ -263,15 +260,6 @@ struct uvm_va_range_struct
     //       them all at range allocation.
     atomic_long_t *blocks;
 
-    uvm_va_range_type_t type;
-};
-
-// Subclass of va_range state for va_range.type == UVM_VA_RANGE_TYPE_MANAGED
-struct uvm_va_range_managed_struct
-{
-    // Base class
-    uvm_va_range_t va_range;
-
     // This is null in the case of a zombie allocation. Zombie allocations are
     // created from unfreed allocations at termination of a process which used
     // UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE, when at least one other
@@ -281,6 +269,10 @@ struct uvm_va_range_managed_struct
     // Managed allocations only use this policy and never use the policy
     // stored in the va_block for HMM allocations.
     uvm_va_policy_t policy;
+
+    // Force the next split on this range to fail. Set by error injection ioctl
+    // (testing purposes only).
+    bool inject_split_error;
 
     uvm_perf_module_data_desc_t perf_modules_data[UVM_PERF_MODULE_TYPE_COUNT];
 };
@@ -1012,7 +1004,7 @@ static uvm_va_block_t *uvm_va_range_block(uvm_va_range_managed_t *managed_range,
     UVM_ASSERT(index < uvm_va_range_num_blocks(managed_range));
     uvm_assert_rwsem_locked(&managed_range->va_range.va_space->lock);
 
-    return (uvm_va_block_t *)atomic_long_read(&managed_range->va_range.blocks[index]);
+    return (uvm_va_block_t *)atomic_long_read(&managed_range->blocks[index]);
 }
 
 // Same as uvm_va_range_block except that the block is created if not already
@@ -1046,9 +1038,6 @@ uvm_va_block_t *uvm_va_range_block_next(uvm_va_range_managed_t *managed_range, u
 // association to UVM_RANGE_GROUP_ID_NONE if the managed range was previously
 // associated with a non-migratable range group.
 //
-// Changing the preferred location also updates the mask and mappings of GPUs
-// in UVM-Lite mode.
-//
 // If mm != NULL, that mm is used for any CPU mappings which may be created as
 // a result of this call. See uvm_va_block_context_t::mm for details.
 //
@@ -1065,8 +1054,6 @@ NV_STATUS uvm_va_range_set_preferred_location(uvm_va_range_managed_t *managed_ra
 // Add a processor to the accessed_by mask and establish any new required
 // mappings.
 //
-// Also update the mask of UVM-Lite GPUs if needed.
-//
 // If mm != NULL, that mm is used for any CPU mappings which may be created as
 // a result of this call. See uvm_va_block_context_t::mm for details.
 //
@@ -1082,8 +1069,6 @@ NV_STATUS uvm_va_range_set_accessed_by(uvm_va_range_managed_t *managed_range,
 // Remove a processor from the accessed_by mask
 //
 // If out_tracker != NULL any block work will be added to that tracker.
-//
-// This also updates the mask and mappings of the UVM-Lite GPUs if required.
 void uvm_va_range_unset_accessed_by(uvm_va_range_managed_t *managed_range,
                                     uvm_processor_id_t processor_id,
                                     uvm_tracker_t *out_tracker);
@@ -1105,6 +1090,16 @@ NV_STATUS uvm_va_range_set_read_duplication(uvm_va_range_managed_t *managed_rang
 // LOCKING: If mm != NULL, the caller must hold mm->mmap_lock in at least read
 //          mode.
 NV_STATUS uvm_va_range_unset_read_duplication(uvm_va_range_managed_t *managed_range, struct mm_struct *mm);
+
+// Set discard status for all pages within the overlap of the VA range and
+// [start, end].
+//
+// LOCKING: The VA space lock should be held read mode.
+NV_STATUS uvm_va_range_discard(uvm_va_range_managed_t *va_range,
+                               uvm_va_block_context_t *va_block_context,
+                               NvU64 start,
+                               NvU64 end,
+                               NvU64 flags);
 
 // Create and destroy vma wrappers
 uvm_vma_wrapper_t *uvm_vma_wrapper_alloc(struct vm_area_struct *vma);

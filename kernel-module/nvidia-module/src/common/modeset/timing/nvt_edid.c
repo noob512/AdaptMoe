@@ -1,31 +1,29 @@
-//*****************************************************************************
-//
-//  SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-//  SPDX-License-Identifier: MIT
-//
-//  Permission is hereby granted, free of charge, to any person obtaining a
-//  copy of this software and associated documentation files (the "Software"),
-//  to deal in the Software without restriction, including without limitation
-//  the rights to use, copy, modify, merge, publish, distribute, sublicense,
-//  and/or sell copies of the Software, and to permit persons to whom the
-//  Software is furnished to do so, subject to the following conditions:
-//
-//  The above copyright notice and this permission notice shall be included in
-//  all copies or substantial portions of the Software.
-//
-//  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-//  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-//  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-//  THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-//  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-//  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-//  DEALINGS IN THE SOFTWARE.
-//
-//  File:       nvt_edid.c
-//
-//  Purpose:    the provide edid related services
-//
-//*****************************************************************************
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2006-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: MIT
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+/** @file  nvt_edid.c
+ *  @brief the provide EDID related services
+ */
 
 #include "nvBinSegment.h"
 #include "nvmisc.h"
@@ -53,7 +51,7 @@ static const NVT_TIMING EDID_EST[] =
 {
     EST_TIMING( 720, 0,  0, 720,'-', 400, 0,0, 400,'-',70,    0,NVT_STATUS_EDID_EST), // 720x400x70Hz   (IBM, VGA)
     EST_TIMING( 720, 0,  0, 720,'-', 400, 0,0, 400,'-',88,    0,NVT_STATUS_EDID_EST), // 720x400x88Hz   (IBM, XGA2)
-    {640,0,16,96,800,NVT_H_SYNC_NEGATIVE,480,0,10,2,525,NVT_V_SYNC_NEGATIVE,NVT_PROGRESSIVE,2518,25180,{0,60,60000,0,1,{0},{0},{0},{0},NVT_STATUS_EDID_EST,"EDID_Established"}},
+    {640,0,16,96,800,NVT_H_SYNC_NEGATIVE,480,0,10,2,525,NVT_V_SYNC_NEGATIVE,NVT_PROGRESSIVE,2518,25175,{0,60,60000,0,1,{0},{0},{0},{0},NVT_STATUS_EDID_EST,"EDID_Established"}},
 
     EST_TIMING( 640, 0,  0, 640,'-', 480, 0,0, 480,'-',67,    0,NVT_STATUS_EDID_EST), // 640x480x67Hz   (Apple, Mac II)
 
@@ -154,8 +152,8 @@ NVT_STATUS NvTiming_EnumEST(NvU32 index, NVT_TIMING *pT)
         return NVT_STATUS_ERR;
     }
 
-    pT->etc.rrx1k = axb_div_c((NvU32)pT->pclk,
-                              (NvU32)10000*(NvU32)1000,
+    pT->etc.rrx1k = axb_div_c((NvU32)pT->pclk1khz,
+                              (NvU32)1000*(NvU32)1000,
                               (NvU32)pT->HTotal*(NvU32)pT->VTotal);
 
     return NVT_STATUS_SUCCESS;
@@ -176,8 +174,8 @@ NVT_STATUS NvTiming_EnumESTIII(NvU32 index, NVT_TIMING *pT)
         return NVT_STATUS_ERR;
     }
 
-    pT->etc.rrx1k = axb_div_c((NvU32)pT->pclk,
-                              (NvU32)10000*(NvU32)1000,
+    pT->etc.rrx1k = axb_div_c((NvU32)pT->pclk1khz,
+                              (NvU32)1000*(NvU32)1000,
                               (NvU32)pT->HTotal*(NvU32)pT->VTotal);
 
     return NVT_STATUS_SUCCESS;
@@ -347,7 +345,7 @@ void parseEdidEstablishedTiming(NVT_EDID_INFO *pInfo)
 
     for (i = 1 << (sizeof(pInfo->established_timings_1_2) * 8 - 1), j = 0; i != 0; i >>= 1, j ++)
     {
-        if ((pInfo->established_timings_1_2 & i) != 0 && EDID_EST[j].pclk != 0)
+        if ((pInfo->established_timings_1_2 & i) != 0 && EDID_EST[j].pclk1khz != 0)
         {
             // count the timing
             newTiming = EDID_EST[j];
@@ -382,7 +380,7 @@ void parseEdidEstablishedTiming(NVT_EDID_INFO *pInfo)
                 for (k=7; k<=7; k--)
                 {
                     // find if the bit is 1 and we have a valid associated timing
-                    if (pEST->data[j] & (1<<k) && EDID_ESTIII[(j*8)+(7-k)].pclk != 0)
+                    if (pEST->data[j] & (1<<k) && EDID_ESTIII[(j*8)+(7-k)].pclk1khz != 0)
                     {
                         newTiming = EDID_ESTIII[(j*8)+(7-k)];
                         newTiming.etc.status = NVT_STATUS_EDID_ESTn(++count);
@@ -565,7 +563,7 @@ NVT_STATUS parseEdidDetailedTimingDescriptor(NvU8 *p, NVT_TIMING *pT)
 
         // pixel clock
         pT->pclk     = (NvU32)pDTD->wDTPixelClock;
-        pT->pclk1khz = (NvU32)((pT->pclk << 3) + (pT->pclk << 1));
+        pT->pclk1khz = (NvU32)((pDTD->wDTPixelClock << 3) + (pDTD->wDTPixelClock << 1));
 
         // sync polarities
         if ((pDTD->bDTFlags & 0x18) == 0x18)
@@ -1200,6 +1198,8 @@ NVT_STATUS NV_STDCALL NvTiming_ParseEDIDInfo(NvU8 *pEdid, NvU32 length, NVT_EDID
 
     getEdidHDM1_4bVsdbTiming(pInfo);
 
+    prioritizeEdidHDMIExtTiming(pInfo);
+
     // Assert if no timings were found (due to a bad EDID) or if we mistakenly
     // assigned more timings than we allocated space for (due to bad logic above)
     nvt_assert(pInfo->total_timings &&
@@ -1261,6 +1261,8 @@ void updateColorFormatAndBpcTiming(NVT_EDID_INFO *pInfo)
             // DisplayId2.0 spec has its own way of determining color format support which includes bpc + color format
             updateColorFormatForDisplayId20ExtnTimings(pInfo, i);
         }
+
+        updateBpcForYuv420OnlyTiming(&pInfo->timing[i], &pInfo->ext861);
     }
 
     // Go through all the timings and set CTA format accordingly. If a timing is a CTA 861b timing, store the
@@ -2048,7 +2050,8 @@ NVT_STATUS NvTiming_GetEDIDBasedASPRTiming( NvU16 width, NvU16 height, NvU16 rr,
         if(rr != pT->etc.rr)
         {
             pT->etc.rrx1k = rr * 1000;
-            pT->pclk = RRx1kToPclk (pT);
+            pT->pclk      = RRx1kToPclk (pT);
+            pT->pclk1khz  = RRx1kToPclk1khz(pT);
         }
 
         pT->etc.status = NVT_STATUS_ASPR;
@@ -2991,7 +2994,7 @@ NvU32 NvTiming_CalculateCommonEDIDCRC32(NvU8* pEDIDBuffer, NvU32 edidVersion)
 CODE_SEGMENT(PAGE_DD_CODE)
 NVT_STATUS NvTiming_CalculateEDIDLimits(NVT_EDID_INFO *pEdidInfo, NVT_EDID_RANGE_LIMIT *pLimit)
 {
-    NvU32 i;
+    NvU32 i, pclk10khz;
 
     NVMISC_MEMSET(pLimit, 0, sizeof(NVT_EDID_RANGE_LIMIT));
 
@@ -3022,7 +3025,7 @@ NVT_STATUS NvTiming_CalculateEDIDLimits(NVT_EDID_INFO *pEdidInfo, NVT_EDID_RANGE
             pLimit->max_v_rate_hzx1k = pTiming->etc.rrx1k;
         }
 
-        h_rate_hz = axb_div_c(pTiming->pclk, 10000, (NvU32)pTiming->HTotal);
+        h_rate_hz = axb_div_c(pTiming->pclk1khz, 1000, (NvU32)pTiming->HTotal);
 
         if (pLimit->min_h_rate_hz > h_rate_hz)
         {
@@ -3033,9 +3036,11 @@ NVT_STATUS NvTiming_CalculateEDIDLimits(NVT_EDID_INFO *pEdidInfo, NVT_EDID_RANGE
             pLimit->max_h_rate_hz = h_rate_hz;
         }
 
-        if (pLimit->max_pclk_10khz < pTiming->pclk)
+        pclk10khz = (pTiming->pclk1khz + 5 ) / 10;
+
+        if (pLimit->max_pclk_10khz < pclk10khz)
         {
-            pLimit->max_pclk_10khz = pTiming->pclk;
+            pLimit->max_pclk_10khz = pclk10khz;
         }
     }
 

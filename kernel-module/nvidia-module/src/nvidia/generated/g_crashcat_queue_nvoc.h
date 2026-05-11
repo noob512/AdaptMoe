@@ -48,29 +48,19 @@ extern "C" {
 #include "nv-crashcat.h"
 #include "crashcat/crashcat_wayfinder.h" // for CrashCatWayfinderHal spec
 
-
 struct CrashCatEngine;
 
-#ifndef __NVOC_CLASS_CrashCatEngine_TYPEDEF__
-#define __NVOC_CLASS_CrashCatEngine_TYPEDEF__
-typedef struct CrashCatEngine CrashCatEngine;
-#endif /* __NVOC_CLASS_CrashCatEngine_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_CrashCatEngine
-#define __nvoc_class_id_CrashCatEngine 0x654166
+#define __nvoc_class_id_CrashCatEngine 0x654166u
+typedef struct CrashCatEngine CrashCatEngine;
 #endif /* __nvoc_class_id_CrashCatEngine */
-
 
 
 struct CrashCatReport;
 
-#ifndef __NVOC_CLASS_CrashCatReport_TYPEDEF__
-#define __NVOC_CLASS_CrashCatReport_TYPEDEF__
-typedef struct CrashCatReport CrashCatReport;
-#endif /* __NVOC_CLASS_CrashCatReport_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_CrashCatReport
-#define __nvoc_class_id_CrashCatReport 0xde4777
+#define __nvoc_class_id_CrashCatReport 0xde4777u
+typedef struct CrashCatReport CrashCatReport;
 #endif /* __nvoc_class_id_CrashCatReport */
 
 
@@ -129,13 +119,9 @@ struct NVOC_METADATA__CrashCatQueue {
     const struct NVOC_METADATA__Object metadata__Object;
 };
 
-#ifndef __NVOC_CLASS_CrashCatQueue_TYPEDEF__
-#define __NVOC_CLASS_CrashCatQueue_TYPEDEF__
-typedef struct CrashCatQueue CrashCatQueue;
-#endif /* __NVOC_CLASS_CrashCatQueue_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_CrashCatQueue
-#define __nvoc_class_id_CrashCatQueue 0xbaa900
+#define __nvoc_class_id_CrashCatQueue 0xbaa900u
+typedef struct CrashCatQueue CrashCatQueue;
 #endif /* __nvoc_class_id_CrashCatQueue */
 
 // Casting support
@@ -153,34 +139,40 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_CrashCatQueue;
 
 NV_STATUS __nvoc_objCreateDynamic_CrashCatQueue(CrashCatQueue**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_CrashCatQueue(CrashCatQueue**, Dynamic*, NvU32, CrashCatQueueConfig *arg_pQueueConfig);
-#define __objCreate_CrashCatQueue(ppNewObj, pParent, createFlags, arg_pQueueConfig) \
-    __nvoc_objCreate_CrashCatQueue((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pQueueConfig)
+NV_STATUS __nvoc_objCreate_CrashCatQueue(CrashCatQueue**, Dynamic*, NvU32, CrashCatQueueConfig *pQueueConfig);
+#define __objCreate_CrashCatQueue(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pQueueConfig) \
+    __nvoc_objCreate_CrashCatQueue((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pQueueConfig)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS crashcatQueueConstruct_IMPL(struct CrashCatQueue *arg_this, CrashCatQueueConfig *pQueueConfig);
+#define __nvoc_crashcatQueueConstruct(arg_this, pQueueConfig) crashcatQueueConstruct_IMPL(arg_this, pQueueConfig)
 
-// Dispatch functions
-struct CrashCatReport *crashcatQueueConsumeNextReport_V1(struct CrashCatQueue *arg1);
-
+void crashcatQueueDestruct_IMPL(struct CrashCatQueue *arg_this);
+#define __nvoc_crashcatQueueDestruct(arg_this) crashcatQueueDestruct_IMPL(arg_this)
 
 #ifdef __nvoc_crashcat_queue_h_disabled
-static inline struct CrashCatReport *crashcatQueueConsumeNextReport(struct CrashCatQueue *arg1) {
+static inline struct CrashCatReport * crashcatQueueConsumeNextReport(struct CrashCatQueue *arg_this) {
     NV_ASSERT_FAILED_PRECOMP("CrashCatQueue was disabled!");
     return NULL;
 }
-#else //__nvoc_crashcat_queue_h_disabled
-#define crashcatQueueConsumeNextReport(arg1) crashcatQueueConsumeNextReport_V1(arg1)
-#endif //__nvoc_crashcat_queue_h_disabled
+#else // __nvoc_crashcat_queue_h_disabled
+#define crashcatQueueConsumeNextReport(arg_this) crashcatQueueConsumeNextReport_V1(arg_this)
+#endif // __nvoc_crashcat_queue_h_disabled
 
-#define crashcatQueueConsumeNextReport_HAL(arg1) crashcatQueueConsumeNextReport(arg1)
 
-NV_STATUS crashcatQueueConstruct_IMPL(struct CrashCatQueue *arg_, CrashCatQueueConfig *arg_pQueueConfig);
+// Wrapper macros for halified functions
+#define crashcatQueueConsumeNextReport_HAL(arg_this) crashcatQueueConsumeNextReport(arg_this)
 
-#define __nvoc_crashcatQueueConstruct(arg_, arg_pQueueConfig) crashcatQueueConstruct_IMPL(arg_, arg_pQueueConfig)
-void crashcatQueueDestruct_IMPL(struct CrashCatQueue *arg1);
+// Dispatch functions
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+struct CrashCatReport * crashcatQueueConsumeNextReport_V1(struct CrashCatQueue *arg_this);
 
-#define __nvoc_crashcatQueueDestruct(arg1) crashcatQueueDestruct_IMPL(arg1)
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

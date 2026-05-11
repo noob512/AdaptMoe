@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -45,11 +45,11 @@
 #include "resource_desc.h"
 #include "platform/sli/sli.h"
 
-#include "mem_mgr/fla_mem.h"
-
 #include "vgpu/vgpu_version.h"
 #include "virtualization/kernel_vgpu_mgr.h"
 
+#include "ctrl/ctrl2080/ctrl2080perf.h"
+#include "kernel/gpu/perf/kern_perf.h"
 #include "platform/chipset/chipset_info.h"
 #include "platform/chipset/chipset.h"
 #include "platform/cpu.h"
@@ -389,6 +389,11 @@ CliGetSystemP2pCaps
             goto done;
         }
 
+        if (pGpuLocalLoop->getProperty(pGpu, PDB_PROP_GPU_TEGRA_SOC_NVDISPLAY))
+        {
+            continue;
+        }
+
         gpuMask |= NVBIT(gpuGetInstance(pGpuLocalLoop));
 
         for (peerGpuIndex = 0; peerGpuIndex < gpuCount; peerGpuIndex++)
@@ -400,6 +405,11 @@ CliGetSystemP2pCaps
                           gpuIds[peerGpuIndex]);
                 rmStatus = NV_ERR_INVALID_ARGUMENT;
                 goto done;
+            }
+
+            if (pGpuPeer->getProperty(pGpu, PDB_PROP_GPU_TEGRA_SOC_NVDISPLAY))
+            {
+                continue;
             }
 
             if (pBusPeerIds != NULL)
@@ -424,6 +434,11 @@ CliGetSystemP2pCaps
                   gpuIds[localGpuIndex]);
         rmStatus = NV_ERR_INVALID_ARGUMENT;
         goto done;
+    }
+
+    if (pGpuLocal->getProperty(pGpuLocal, PDB_PROP_GPU_TEGRA_SOC_NVDISPLAY))
+    {
+        return NV_ERR_NOT_SUPPORTED;
     }
 
     rmStatus = p2pGetCapsStatus(gpuMask, &p2pWriteCapStatus,
@@ -1123,6 +1138,22 @@ cliresCtrlCmdSystemGetChipsetInfo_IMPL
         pChipsetInfo->flags = FLD_SET_DRF(0000, _CTRL_SYSTEM_CHIPSET_FLAG, _HAS_RESIZABLE_BAR_ISSUE, _NO, pChipsetInfo->flags);
     }
 
+    pChipsetInfo->flags = FLD_SET_DRF(0000, _CTRL_SYSTEM_CHIPSET_FLAG,
+                                      _BAR1_UNALIGNED_ACCESS, _YES, pChipsetInfo->flags);
+
+#if defined(NVCPU_AARCH64)
+    //
+    // Unaligned accesses on Aarch64 platforms are supported only when the BAR
+    // is not mapped as Device type. When PDB_PROP_CL_DISABLE_IOMAP_WC is set,
+    // it is mapped as Device type.
+    //
+    if (pCl->getProperty(pCl, PDB_PROP_CL_DISABLE_IOMAP_WC))
+    {
+        pChipsetInfo->flags = FLD_SET_DRF(0000, _CTRL_SYSTEM_CHIPSET_FLAG,
+                                          _BAR1_UNALIGNED_ACCESS, _NO, pChipsetInfo->flags);
+    }
+#endif
+
     return NV_OK;
 }
 
@@ -1244,7 +1275,61 @@ cliresCtrlCmdSystemNotifyEvent_IMPL
         }
 
         case NV0000_CTRL_SYSTEM_EVENT_TYPE_POWER_SOURCE:
-            status = NV_ERR_NOT_SUPPORTED;
+        {
+            OBJGPU     *pGpu      = NULL;
+            NvU32       gpuMask   = 0;
+            NvU32       gpuIndex  = 0;
+            NvU32       gpuCount  = 0;
+
+            NV2080_CTRL_PERF_SET_POWERSTATE_PARAMS params = {0};
+
+            params.powerStateInfo.powerState = (pParams->eventData == NV0000_CTRL_SYSTEM_EVENT_DATA_POWER_BATTERY) ?
+                                               NV2080_CTRL_PERF_POWER_SOURCE_BATTERY :
+                                               NV2080_CTRL_PERF_POWER_SOURCE_AC;
+
+            // First check to make sure all GPUs are powered up
+            gpumgrGetGpuAttachInfo(&gpuCount, &gpuMask);
+            pGpu = gpumgrGetNextGpu(gpuMask, &gpuIndex);
+            while (pGpu)
+            {
+                if (!gpuIsGpuFullPower(pGpu))
+                {
+                    status = NV_ERR_GPU_NOT_FULL_POWER;
+                    break;
+                }
+                pGpu = gpumgrGetNextGpu(gpuMask, &gpuIndex);
+            }
+
+            // Skip any extra work if we're not in full power
+            if (status == NV_ERR_GPU_NOT_FULL_POWER)
+            {
+                NV_PRINTF(LEVEL_WARNING,
+                          "NV0000_CTRL_SYSTEM_EVENT_TYPE_POWER_SOURCE called in power down state.\n");
+                NV_PRINTF(LEVEL_WARNING,
+                          "      Returning NV_ERR_GPU_NOT_FULL_POWER.\n");
+                break;
+            }
+
+            gpuMask   = 0;
+            gpuIndex  = 0;
+            gpuCount  = 0;
+
+            // OK, we need to loop over all gpus in the system
+            gpumgrGetGpuAttachInfo(&gpuCount, &gpuMask);
+            pGpu = gpumgrGetNextGpu(gpuMask, &gpuIndex);
+            while (pGpu)
+            {
+                KernelPerf *pKernelPerf  = GPU_GET_KERNEL_PERF(pGpu);
+
+                if (pKernelPerf)
+                {
+                    NV_CHECK_OK(status, LEVEL_ERROR,
+                                kperfPerfSetPowerstate(pGpu, pKernelPerf, &params));
+                }
+
+                pGpu = gpumgrGetNextGpu(gpuMask, &gpuIndex);
+            }
+        }
             break;
 
         default:
@@ -1737,29 +1822,6 @@ cliresCtrlCmdGpuDetachIds_IMPL
 done:
     portMemFree(pGpuAttachedIds);
     return status;
-}
-
-NV_STATUS
-cliresCtrlCmdGpuGetSvmSize_IMPL
-(
-    RmClientResource *pRmCliRes,
-    NV0000_CTRL_GPU_GET_SVM_SIZE_PARAMS *pSvmSizeGetParams
-)
-{
-    OBJGPU *pGpu = NULL;
-
-    // error check incoming gpu id
-    pGpu = gpumgrGetGpuFromId(pSvmSizeGetParams->gpuId);
-    if (pGpu == NULL)
-    {
-        NV_PRINTF(LEVEL_WARNING, "GET_SVM_SIZE: bad gpuid: 0x%x\n",
-                  pSvmSizeGetParams->gpuId);
-        return NV_ERR_INVALID_ARGUMENT;
-    }
-
-    // Get the SVM size in MB.
-    pSvmSizeGetParams->svmSize = 0;
-    return NV_OK;
 }
 
 NV_STATUS
@@ -2894,6 +2956,12 @@ cliresCtrlCmdSystemNVPCFGetPowerModeInfo_IMPL
             NvU16 dataSize = sizeof(header) + sizeof(common) + sizeof(entries);
             pData = portMemAllocNonPaged(dataSize);
 
+            if (pData == NULL)
+            {
+                status = NV_ERR_NO_MEMORY;
+                goto nvpcf2xGetDynamicParams_exit;
+            }
+
             portMemSet(&header, 0, sizeof(header));
 
             header.version    = pParams->version;
@@ -2901,6 +2969,8 @@ cliresCtrlCmdSystemNVPCFGetPowerModeInfo_IMPL
             header.commonSize = NVPCF_DYNAMIC_PARAMS_2X_COMMON_SIZE_10;
             header.entrySize  = NVPCF_DYNAMIC_PARAMS_2X_ENTRY_SIZE_1C;
             header.entryCount = 0;
+
+            ct_assert(CONTROLLER_SBIOS_TABLE_MAX_VERSION == NVPCF_CONTROLLER_STATIC_TABLE_MAX_VERSION);
 
             bRequireDcSysPowerLimitsTable =
                 (pParams->version >= NVPCF_CONTROLLER_STATIC_TABLE_VERSION_22);
@@ -3039,9 +3109,9 @@ cliresCtrlCmdSystemNVPCFGetPowerModeInfo_IMPL
 
                 if (bSupportDcTsp)
                 {
-                    pParams->dcTspLongTimescaleLimitmA = (NvU32)DRF_VAL(PCF_DYNAMIC_PARAMS_ENTRY_2X,
+                    pParams->dcTspLongTimescaleLimitOverridemA = (NvU32)DRF_VAL(PCF_DYNAMIC_PARAMS_ENTRY_2X,
                             _OUTPUT_PARAM5, _CMD0_UNSIGNED, entriesOut.param5);
-                    pParams->dcTspShortTimescaleLimitmA = (NvU32)DRF_VAL(PCF_DYNAMIC_PARAMS_ENTRY_2X,
+                    pParams->dcTspShortTimescaleLimitOverridemA = (NvU32)DRF_VAL(PCF_DYNAMIC_PARAMS_ENTRY_2X,
                             _OUTPUT_PARAM6, _CMD0_UNSIGNED, entriesOut.param6);
                 }
             }
@@ -3057,6 +3127,12 @@ nvpcf2xGetDynamicParams_exit:
             NvU16 dataSize =  NVPCF0100_CTRL_CONFIG_2X_BUFF_SIZE_MAX;
 
             pData = portMemAllocNonPaged(dataSize);
+
+            if (pData == NULL)
+            {
+                status = NV_ERR_NO_MEMORY;
+                goto nvpcf2xGetStaticParams_exit;
+            }
 
             if ((rc = osCallACPI_DSM(pGpu,
                             ACPI_DSM_FUNCTION_NVPCF_2X,
@@ -3098,7 +3174,7 @@ nvpcf2xGetStaticParams_exit:
             NvU8 *pData = NULL;
             NvU32 i;
             NvU8 prevThreshold = 99;
-            NvU8 version;
+            NvU32 version;
             NvU16 size = NVPCF_DC_SYSTEM_POWER_LIMITS_TABLE_1X_HEADER_SIZE_04 +
                          (NVPCF_DC_SYSTEM_POWER_LIMITS_TABLE_VERSION_10_MAX_ENTRIES *
                          NVPCF_DC_SYSTEM_POWER_LIMITS_TABLE_1X_ENTRY_SIZE_11);
@@ -3388,61 +3464,6 @@ nvpcf2xGetSystemPowerTable_exit:
 
 }
 
-static void
-getHwbcInfo
-(
-    NV0000_CTRL_SYSTEM_HWBC_INFO *pHwbcInfo,
-    OBJHWBC *pHWBC,
-    NvU32 *pIndex
-)
-{
-    if (pHWBC->pFirstChild)
-        getHwbcInfo(pHwbcInfo, pHWBC->pFirstChild, pIndex);
-    if (pHWBC->pSibling)
-        getHwbcInfo(pHwbcInfo, pHWBC->pSibling, pIndex);
-
-    if (HWBC_NVIDIA_BR04 == pHWBC->bcRes)
-    {
-        if (*pIndex >= NV0000_CTRL_SYSTEM_MAX_HWBCS)
-        {
-            //
-            // Should never happen! Return whatever info we've
-            // gathered till now.
-            //
-            NV_ASSERT(*pIndex < NV0000_CTRL_SYSTEM_MAX_HWBCS);
-            return;
-        }
-        pHwbcInfo[*pIndex].hwbcId = pHWBC->hwbcId;
-        pHwbcInfo[*pIndex].firmwareVersion = pHWBC->fwVersion;
-        pHwbcInfo[*pIndex].subordinateBus = pHWBC->maxBus;
-        pHwbcInfo[*pIndex].secondaryBus = pHWBC->minBus;
-        (*pIndex)++;
-    }
-}
-
-NV_STATUS
-cliresCtrlCmdSystemGetHwbcInfo_IMPL
-(
-    RmClientResource *pRmCliRes,
-    NV0000_CTRL_SYSTEM_GET_HWBC_INFO_PARAMS *pParams
-)
-{
-    NV0000_CTRL_SYSTEM_HWBC_INFO *pHwbcInfo = pParams->hwbcInfo;
-    OBJSYS *pSys = SYS_GET_INSTANCE();
-    OBJCL  *pCl  = SYS_GET_CL(pSys);
-    NvU32   index = 0;
-
-    if (pCl->pHWBC)
-        getHwbcInfo(pHwbcInfo, pCl->pHWBC, &index);
-
-    for (; index < NV0000_CTRL_SYSTEM_MAX_HWBCS; index++)
-    {
-        pHwbcInfo[index].hwbcId = NV0000_CTRL_SYSTEM_HWBC_INVALID_ID;
-    }
-
-    return NV_OK;
-}
-
 /*!
  * @brief Get Dump Size. Returns an estimate of the number of bytes in the dump
  * that can be used to allocate a buffer. The size is based on the component
@@ -3509,7 +3530,7 @@ cliresCtrlCmdNvdGetDump_IMPL
 }
 
 /*!
- * @brief Get Timestamp. Returns a standard timestamp, osGetCurrentTime.
+ * @brief Get Timestamp. Returns a standard timestamp, osGetSystemTime.
  *
  * @returns NV_OK
  */
@@ -3530,7 +3551,7 @@ cliresCtrlCmdNvdGetTimestamp_IMPL
             NvU32 sec;
             NvU32 uSec;
 
-            osGetCurrentTime(&sec, &uSec);
+            osGetSystemTime(&sec, &uSec);
             pTimestampParams->timestamp = (((NvU64)sec) * 1000000) + uSec;
             break;
         }
@@ -4962,12 +4983,6 @@ cliresCtrlCmdClientGetAddrSpaceType_IMPL
     if (pMemory != NULL)
     {
         NV_ASSERT_OK_OR_RETURN(memGetMapAddrSpace(pMemory, &callContext, pParams->mapFlags, &memType));
-
-        // Soon FlaMemory is deprecated. This is just a hack to keep compatibility.
-        if ((memType == ADDR_FBMEM) && (dynamicCast(pMemory, FlaMemory) != NULL))
-        {
-            memType = ADDR_FABRIC_V2;
-        }
     }
     else
     {
@@ -4985,7 +5000,6 @@ cliresCtrlCmdClientGetAddrSpaceType_IMPL
     switch (memType)
     {
         case ADDR_SYSMEM:
-        case ADDR_EGM:
             pParams->addrSpaceType = NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE_SYSMEM;
             break;
         case ADDR_FBMEM:
@@ -5289,7 +5303,8 @@ cliresCtrlCmdGpuDisableNvlinkInit_IMPL
         return NV_ERR_INVALID_ARGUMENT;
     }
 
-    return gpumgrSetGpuInitDisabledNvlinks(pParams->gpuId, pParams->mask, pParams->bSkipHwNvlinkDisable);
+    return gpumgrSetGpuInitDisabledNvlinks(pParams->gpuId, pParams->mask,
+                                           &pParams->links, pParams->bSkipHwNvlinkDisable);
 }
 
 NV_STATUS
@@ -5419,63 +5434,6 @@ cliresCtrlCmdNvdGetRcerrRpt_IMPL
     }
 
     return status;
-}
-
-NV_STATUS
-cliresCtrlCmdLegacyConfig_IMPL
-(
-    RmClientResource *pRmCliRes,
-    NV0000_CTRL_GPU_LEGACY_CONFIG_PARAMS *pParams
-)
-{
-    NvHandle      hClient            = RES_GET_CLIENT_HANDLE(pRmCliRes);
-    RsClient     *pClient            = RES_GET_CLIENT(pRmCliRes);
-    RmClient     *pRmClient          = dynamicCast(pClient, RmClient);
-    NvHandle      hDeviceOrSubdevice = pParams->hContext;
-    NvHandle      hDevice;
-    OBJGPU       *pGpu;
-    GpuResource  *pGpuResource;
-    NV_STATUS     rmStatus           = NV_OK;
-    CALL_CONTEXT *pCallContext       = resservGetTlsCallContext();
-
-    NV_ASSERT_OR_RETURN(RMCFG_FEATURE_KERNEL_RM, NV_ERR_NOT_SUPPORTED);
-    NV_ASSERT_OR_RETURN(pCallContext != NULL, NV_ERR_INVALID_STATE);
-    NV_ASSERT_OR_RETURN(pRmClient != NULL, NV_ERR_INVALID_CLIENT);
-
-    //
-    // Clients pass in device or subdevice as context for NvRmConfigXyz.
-    //
-    rmStatus = gpuresGetByDeviceOrSubdeviceHandle(pClient,
-                                                  hDeviceOrSubdevice,
-                                                  &pGpuResource);
-    if (rmStatus != NV_OK)
-        return rmStatus;
-
-    hDevice = RES_GET_HANDLE(GPU_RES_GET_DEVICE(pGpuResource));
-    pGpu    = GPU_RES_GET_GPU(pGpuResource);
-
-    //
-    // GSP client builds should have these legacy APIs disabled,
-    // but a monolithic build running in offload mode can still reach here,
-    // so log those cases and bail early to keep the same behavior.
-    //
-    NV_ASSERT_OR_RETURN(!IS_GSP_CLIENT(pGpu), NV_ERR_NOT_SUPPORTED);
-
-    GPU_RES_SET_THREAD_BC_STATE(pGpuResource);
-
-    pParams->dataType = pParams->opType;
-
-    switch (pParams->opType)
-    {
-        default:
-            PORT_UNREFERENCED_VARIABLE(pGpu);
-            PORT_UNREFERENCED_VARIABLE(hDevice);
-            PORT_UNREFERENCED_VARIABLE(hClient);
-            rmStatus = NV_ERR_NOT_SUPPORTED;
-            break;
-    }
-
-    return rmStatus;
 }
 
 NV_STATUS

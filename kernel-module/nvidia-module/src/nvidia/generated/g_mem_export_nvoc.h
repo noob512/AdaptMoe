@@ -98,11 +98,6 @@ struct MemoryExport {
     struct RmResource *__nvoc_pbase_RmResource;    // rmres super
     struct MemoryExport *__nvoc_pbase_MemoryExport;    // memoryexport
 
-    // Vtable with 3 per-object function pointers
-    NV_STATUS (*__memoryexportCtrlExportMem__)(struct MemoryExport * /*this*/, NV00E0_CTRL_EXPORT_MEM_PARAMS *);  // exported (id=0xe00101)
-    NV_STATUS (*__memoryexportCtrlImportMem__)(struct MemoryExport * /*this*/, NV00E0_CTRL_IMPORT_MEM_PARAMS *);  // exported (id=0xe00102)
-    NV_STATUS (*__memoryexportCtrlGetInfo__)(struct MemoryExport * /*this*/, NV00E0_CTRL_GET_INFO_PARAMS *);  // exported (id=0xe00103)
-
     // Data members
     MEM_EXPORT_INFO *PRIVATE_FIELD(pExportInfo);
 };
@@ -140,13 +135,9 @@ struct NVOC_METADATA__MemoryExport {
     const struct NVOC_VTABLE__MemoryExport vtable;
 };
 
-#ifndef __NVOC_CLASS_MemoryExport_TYPEDEF__
-#define __NVOC_CLASS_MemoryExport_TYPEDEF__
-typedef struct MemoryExport MemoryExport;
-#endif /* __NVOC_CLASS_MemoryExport_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_MemoryExport
-#define __nvoc_class_id_MemoryExport 0xe7ac53
+#define __nvoc_class_id_MemoryExport 0xe7ac53u
+typedef struct MemoryExport MemoryExport;
 #endif /* __nvoc_class_id_MemoryExport */
 
 // Casting support
@@ -164,22 +155,54 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_MemoryExport;
 
 NV_STATUS __nvoc_objCreateDynamic_MemoryExport(MemoryExport**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_MemoryExport(MemoryExport**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_MemoryExport(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_MemoryExport((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_MemoryExport(MemoryExport**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_MemoryExport(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_MemoryExport((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS memoryexportConstruct_IMPL(struct MemoryExport *pMemoryExport, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_memoryexportConstruct(pMemoryExport, pCallContext, pParams) memoryexportConstruct_IMPL(pMemoryExport, pCallContext, pParams)
+
+void memoryexportDestruct_IMPL(struct MemoryExport *pMemoryExport);
+#define __nvoc_memoryexportDestruct(pMemoryExport) memoryexportDestruct_IMPL(pMemoryExport)
+
+NV_STATUS memoryexportCtrlExportMem_IMPL(struct MemoryExport *pMemoryExport, NV00E0_CTRL_EXPORT_MEM_PARAMS *pParams);
+#ifdef __nvoc_mem_export_h_disabled
+static inline NV_STATUS memoryexportCtrlExportMem(struct MemoryExport *pMemoryExport, NV00E0_CTRL_EXPORT_MEM_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("MemoryExport was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_mem_export_h_disabled
+#define memoryexportCtrlExportMem(pMemoryExport, pParams) memoryexportCtrlExportMem_IMPL(pMemoryExport, pParams)
+#endif // __nvoc_mem_export_h_disabled
+
+NV_STATUS memoryexportCtrlImportMem_IMPL(struct MemoryExport *pMemoryExport, NV00E0_CTRL_IMPORT_MEM_PARAMS *pParams);
+#ifdef __nvoc_mem_export_h_disabled
+static inline NV_STATUS memoryexportCtrlImportMem(struct MemoryExport *pMemoryExport, NV00E0_CTRL_IMPORT_MEM_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("MemoryExport was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_mem_export_h_disabled
+#define memoryexportCtrlImportMem(pMemoryExport, pParams) memoryexportCtrlImportMem_IMPL(pMemoryExport, pParams)
+#endif // __nvoc_mem_export_h_disabled
+
+NV_STATUS memoryexportCtrlGetInfo_IMPL(struct MemoryExport *pMemoryExport, NV00E0_CTRL_GET_INFO_PARAMS *pParams);
+#ifdef __nvoc_mem_export_h_disabled
+static inline NV_STATUS memoryexportCtrlGetInfo(struct MemoryExport *pMemoryExport, NV00E0_CTRL_GET_INFO_PARAMS *pParams) {
+    NV_ASSERT_FAILED_PRECOMP("MemoryExport was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_mem_export_h_disabled
+#define memoryexportCtrlGetInfo(pMemoryExport, pParams) memoryexportCtrlGetInfo_IMPL(pMemoryExport, pParams)
+#endif // __nvoc_mem_export_h_disabled
+
+
+// Wrapper macros for halified functions
 #define memoryexportCanCopy_FNPTR(pMemoryExport) pMemoryExport->__nvoc_metadata_ptr->vtable.__memoryexportCanCopy__
 #define memoryexportCanCopy(pMemoryExport) memoryexportCanCopy_DISPATCH(pMemoryExport)
 #define memoryexportControl_FNPTR(pMemoryExport) pMemoryExport->__nvoc_metadata_ptr->vtable.__memoryexportControl__
 #define memoryexportControl(pMemoryExport, pCallContext, pParams) memoryexportControl_DISPATCH(pMemoryExport, pCallContext, pParams)
-#define memoryexportCtrlExportMem_FNPTR(pMemoryExport) pMemoryExport->__memoryexportCtrlExportMem__
-#define memoryexportCtrlExportMem(pMemoryExport, pParams) memoryexportCtrlExportMem_DISPATCH(pMemoryExport, pParams)
-#define memoryexportCtrlImportMem_FNPTR(pMemoryExport) pMemoryExport->__memoryexportCtrlImportMem__
-#define memoryexportCtrlImportMem(pMemoryExport, pParams) memoryexportCtrlImportMem_DISPATCH(pMemoryExport, pParams)
-#define memoryexportCtrlGetInfo_FNPTR(pMemoryExport) pMemoryExport->__memoryexportCtrlGetInfo__
-#define memoryexportCtrlGetInfo(pMemoryExport, pParams) memoryexportCtrlGetInfo_DISPATCH(pMemoryExport, pParams)
 #define memoryexportAccessCallback_FNPTR(pResource) pResource->__nvoc_base_RmResource.__nvoc_metadata_ptr->vtable.__rmresAccessCallback__
 #define memoryexportAccessCallback(pResource, pInvokingClient, pAllocParams, accessRight) memoryexportAccessCallback_DISPATCH(pResource, pInvokingClient, pAllocParams, accessRight)
 #define memoryexportShareCallback_FNPTR(pResource) pResource->__nvoc_base_RmResource.__nvoc_metadata_ptr->vtable.__rmresShareCallback__
@@ -226,18 +249,6 @@ static inline NvBool memoryexportCanCopy_DISPATCH(struct MemoryExport *pMemoryEx
 
 static inline NV_STATUS memoryexportControl_DISPATCH(struct MemoryExport *pMemoryExport, struct CALL_CONTEXT *pCallContext, struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams) {
     return pMemoryExport->__nvoc_metadata_ptr->vtable.__memoryexportControl__(pMemoryExport, pCallContext, pParams);
-}
-
-static inline NV_STATUS memoryexportCtrlExportMem_DISPATCH(struct MemoryExport *pMemoryExport, NV00E0_CTRL_EXPORT_MEM_PARAMS *pParams) {
-    return pMemoryExport->__memoryexportCtrlExportMem__(pMemoryExport, pParams);
-}
-
-static inline NV_STATUS memoryexportCtrlImportMem_DISPATCH(struct MemoryExport *pMemoryExport, NV00E0_CTRL_IMPORT_MEM_PARAMS *pParams) {
-    return pMemoryExport->__memoryexportCtrlImportMem__(pMemoryExport, pParams);
-}
-
-static inline NV_STATUS memoryexportCtrlGetInfo_DISPATCH(struct MemoryExport *pMemoryExport, NV00E0_CTRL_GET_INFO_PARAMS *pParams) {
-    return pMemoryExport->__memoryexportCtrlGetInfo__(pMemoryExport, pParams);
 }
 
 static inline NvBool memoryexportAccessCallback_DISPATCH(struct MemoryExport *pResource, struct RsClient *pInvokingClient, void *pAllocParams, RsAccessRight accessRight) {
@@ -316,22 +327,22 @@ static inline void memoryexportAddAdditionalDependants_DISPATCH(struct RsClient 
     pResource->__nvoc_metadata_ptr->vtable.__memoryexportAddAdditionalDependants__(pClient, pResource, pReference);
 }
 
+// Virtual method declarations and/or inline definitions
 NvBool memoryexportCanCopy_IMPL(struct MemoryExport *pMemoryExport);
 
 NV_STATUS memoryexportControl_IMPL(struct MemoryExport *pMemoryExport, struct CALL_CONTEXT *pCallContext, struct RS_RES_CONTROL_PARAMS_INTERNAL *pParams);
 
+// Exported method declarations and/or inline definitions
 NV_STATUS memoryexportCtrlExportMem_IMPL(struct MemoryExport *pMemoryExport, NV00E0_CTRL_EXPORT_MEM_PARAMS *pParams);
 
 NV_STATUS memoryexportCtrlImportMem_IMPL(struct MemoryExport *pMemoryExport, NV00E0_CTRL_IMPORT_MEM_PARAMS *pParams);
 
 NV_STATUS memoryexportCtrlGetInfo_IMPL(struct MemoryExport *pMemoryExport, NV00E0_CTRL_GET_INFO_PARAMS *pParams);
 
-NV_STATUS memoryexportConstruct_IMPL(struct MemoryExport *arg_pMemoryExport, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_memoryexportConstruct(arg_pMemoryExport, arg_pCallContext, arg_pParams) memoryexportConstruct_IMPL(arg_pMemoryExport, arg_pCallContext, arg_pParams)
-void memoryexportDestruct_IMPL(struct MemoryExport *pMemoryExport);
-
-#define __nvoc_memoryexportDestruct(pMemoryExport) memoryexportDestruct_IMPL(pMemoryExport)
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

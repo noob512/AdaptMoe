@@ -31,7 +31,9 @@ typedef struct NV_RATS_GSP_TRACE_RECORD_V1
 {
     NvU16 seqNo;
     NvU16 gspSeqNo;
-    NvU32 threadId;
+    NvU8 threadId;
+    NvU8 partitionId;
+    NvU16 reserved0;
     NvU64 info;
     NvU64 timeStamp;
     NvU64 recordType;

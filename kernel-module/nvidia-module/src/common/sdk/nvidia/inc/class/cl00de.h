@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -30,6 +30,7 @@ extern "C" {
 
 #include "nvmisc.h"
 #include "nvfixedtypes.h"
+#include "ctrl/ctrl2080/ctrl2080ecc.h"
 
 #define RM_USER_SHARED_DATA                      (0x000000de)
 
@@ -88,16 +89,6 @@ do {                                                                            
       (((timestamp) & (0x1LLU)) == 1LLU)))
 
 enum {
-    RUSD_CLK_PUBLIC_DOMAIN_GRAPHICS = 0,
-    RUSD_CLK_PUBLIC_DOMAIN_MEMORY,
-    RUSD_CLK_PUBLIC_DOMAIN_VIDEO,
-
-    // Put at the end. See bug 1000230 NVML doesn't report SM frequency on Kepler
-    RUSD_CLK_PUBLIC_DOMAIN_SM,
-    RUSD_CLK_PUBLIC_DOMAIN_MAX_TYPE,
-};
-
-enum {
     RUSD_CLK_THROTTLE_REASON_GPU_IDLE                         = NVBIT(0),
     RUSD_CLK_THROTTLE_REASON_APPLICATION_CLOCK_SETTING        = NVBIT(1), 
     RUSD_CLK_THROTTLE_REASON_SW_POWER_CAP                     = NVBIT(2), 
@@ -129,8 +120,19 @@ typedef struct RUSD_PMA_MEMORY_INFO {
     NvU64 freePmaMemory;
 } RUSD_PMA_MEMORY_INFO;
 
+enum {
+    RUSD_CLK_PUBLIC_DOMAIN_GRAPHICS = 0,
+    RUSD_CLK_PUBLIC_DOMAIN_MEMORY,
+    RUSD_CLK_PUBLIC_DOMAIN_VIDEO,
+
+    // Put at the end. See bug 1000230 NVML doesn't report SM frequency on Kepler
+    RUSD_CLK_PUBLIC_DOMAIN_SM,
+    RUSD_CLK_PUBLIC_DOMAIN_MAX_TYPE,
+};
+
 typedef struct RUSD_CLK_PUBLIC_DOMAIN_INFO {
     NvU32 targetClkMHz;
+    NvU32 actualClkKHz;
 } RUSD_CLK_PUBLIC_DOMAIN_INFO;
 
 typedef struct RUSD_CLK_PUBLIC_DOMAIN_INFOS {
@@ -205,10 +207,18 @@ typedef struct RUSD_MEM_ERROR_COUNTS {
 #define RUSD_MEMORY_ERROR_TYPE_SRAM  2
 #define RUSD_MEMORY_ERROR_TYPE_COUNT 3
 
+typedef struct RUSD_ECC_COUNTS {
+    NV2080_CTRL_ECC_GET_VOLATILE_COUNTS_PARAMS volatileCounts;
+    NV2080_CTRL_ECC_GET_CLIENT_EXPOSED_COUNTERS_PARAMS clientExposedCounts;
+} RUSD_ECC_INFO;
+
 typedef struct RUSD_MEM_ECC {
     volatile NvU64 lastModifiedTimestamp;
-    // Provided from NV2080_CTRL_CMD_GPU_QUERY_ECC_STATUS
     RUSD_MEM_ERROR_COUNTS count[RUSD_MEMORY_ERROR_TYPE_COUNT];
+    // TODO: Due to incapability of getting voteup for X driver update with
+    // existing RM APIs, need to resolve bug 5138911 before fully updating
+    // RUSD_MEM_ECC and removing deprecated RUSD_MEM_ERROR_COUNTS.
+    RUSD_ECC_INFO info;
 } RUSD_MEM_ECC;
 
 typedef struct RUSD_POWER_LIMIT_INFO {
@@ -255,6 +265,8 @@ typedef struct RUSD_MEM_ROW_REMAP_INFO {
 
     NvU32 correctableRows;
     NvU32 uncorrectableRows;
+    NvU32 correctableRowsInactive;
+    NvU32 uncorrectableRowsInactive;
     NvBool isPending;
     NvBool hasFailureOccurred;
 } RUSD_MEM_ROW_REMAP_INFO;
@@ -343,6 +355,73 @@ typedef struct RUSD_GR_INFO
     NvBool bCtxswLoggingEnabled;
 } RUSD_GR_INFO;
 
+#define RUSD_PROC_UTIL_SAMPLE_COUNT 5
+
+// 
+// RUSD_CTRL_PERF_GPUMON_ENGINE_UTIL_SAMPLE is NV2080_CTRL_PERF_GPUMON_ENGINE_UTIL_SAMPLE
+// without subProcessName and pOsPidInfo
+//
+typedef struct {
+    /*!
+     * Percentage during the sample that the engine remains busy. This
+     * is in units of pct*100.
+     */
+    NvU32 util;
+    /*!
+     * Scaling factor to convert utilization from full GPU to per vGPU.
+     */
+    NvU32 vgpuScale;
+    /*!
+     * Process ID of the process that was active on the engine when the
+     * sample was taken. If no process is active then NV2080_GPUMON_PID_INVALID
+     * will be returned.
+     */
+    NvU32 procId;
+    /*!
+     * Process ID of the process in the vGPU VM that was active on the engine when
+     * the sample was taken. If no process is active then NV2080_GPUMON_PID_INVALID
+     * will be returned.
+     */
+    NvU32 subProcessID;
+} RUSD_CTRL_PERF_GPUMON_ENGINE_UTIL_SAMPLE;
+
+typedef struct  {
+    NvU64 timeStamp;  // Original is NV2080_CTRL_GPUMON_SAMPLE
+    /*!
+     * FB bandwidth utilization sample.
+     */
+    RUSD_CTRL_PERF_GPUMON_ENGINE_UTIL_SAMPLE fb;
+    /*!
+     * GR utilization sample.
+     */
+    RUSD_CTRL_PERF_GPUMON_ENGINE_UTIL_SAMPLE gr;
+    /*!
+     * NV ENCODER utilization sample.
+     */
+    RUSD_CTRL_PERF_GPUMON_ENGINE_UTIL_SAMPLE nvenc;
+    /*!
+     * NV DECODER utilization sample.
+     */
+    RUSD_CTRL_PERF_GPUMON_ENGINE_UTIL_SAMPLE nvdec;
+    /*!
+     * NV JPEG utilization sample.
+     */
+    RUSD_CTRL_PERF_GPUMON_ENGINE_UTIL_SAMPLE nvjpg;
+    /*!
+     * NV OFA utilization sample.
+     */
+    RUSD_CTRL_PERF_GPUMON_ENGINE_UTIL_SAMPLE nvofa;
+} RUSD_CTRL_PERF_GPUMON_PERFMON_UTIL_SAMPLE;
+
+typedef struct {
+    RUSD_CTRL_PERF_GPUMON_PERFMON_UTIL_SAMPLE samples[RUSD_PROC_UTIL_SAMPLE_COUNT];
+} RUSD_PROC_UTIL_INFO;
+
+typedef struct {
+    volatile NvU64 lastModifiedTimestamp;
+    RUSD_PROC_UTIL_INFO info;
+} RUSD_PROC_UTIL;
+
 typedef struct NV00DE_SHARED_DATA {
     NV_DECLARE_ALIGNED(RUSD_BAR1_MEMORY_INFO bar1MemoryInfo, 8);
 
@@ -402,6 +481,10 @@ typedef struct NV00DE_SHARED_DATA {
 
     // POLL_FAN
     NV_DECLARE_ALIGNED(RUSD_FAN_COOLER_STATUS fanCoolerStatus, 8);
+
+    // POLL_PROC_UTIL
+    NV_DECLARE_ALIGNED(RUSD_PROC_UTIL procUtil, 8);
+
 } NV00DE_SHARED_DATA;
 
 //
@@ -415,6 +498,7 @@ typedef struct NV00DE_SHARED_DATA {
 #define NV00DE_RUSD_POLL_THERMAL   0x10
 #define NV00DE_RUSD_POLL_PCI       0x20
 #define NV00DE_RUSD_POLL_FAN       0x40
+#define NV00DE_RUSD_POLL_PROC_UTIL 0x80
 
 typedef struct NV00DE_ALLOC_PARAMETERS {
     NvU64 polledDataMask; // Bitmask of data to request polling at alloc time, 0 if not needed

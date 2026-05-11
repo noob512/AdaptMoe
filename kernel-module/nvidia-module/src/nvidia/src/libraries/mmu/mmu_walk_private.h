@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2014-2016 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2014-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -31,10 +31,12 @@ extern "C" {
 /* ------------------------ Includes --------------------------------------- */
 #include "mmu/mmu_walk.h"
 #include "containers/btree.h"
+#include "ctrl/ctrl90f1.h"
 
 /* --------------------------- Macros ---------------------------------------- */
 #define HI_PRI_SUBLEVEL_INDEX     0
 #define LO_PRI_SUBLEVEL_INDEX     1
+#define MMU_TRACE_MAX_LEVEL       GMMU_FMT_MAX_LEVELS + 1
 
 /* --------------------------- Datatypes ------------------------------------ */
 
@@ -216,6 +218,7 @@ struct MMU_WALK
     MMU_WALK_MEMDESC         *pStagingBuffer;
     NvBool                    bUseStagingBuffer;
     NvBool                    bInvalidateOnReserve;
+    MMU_TRACE_ITER_INFO       traceInfo[MMU_TRACE_MAX_LEVEL];
 };
 
 /*!

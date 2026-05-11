@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2015-2024 NVIDIA Corporation
+    Copyright (c) 2015-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -30,8 +30,7 @@
 #include "nvtypes.h"
 #include "nvmisc.h"
 #include "cla06fsubch.h"
-#include "cla16f.h"
-#include "clb06f.h"
+#include "clc46f.h"
 
 #define HWMASK(d, r, f) DRF_MASK(NV ## d ## _ ## r ## _ ## f)
 #define HWSHIFT(d, r, f) DRF_SHIFT(NV ## d ## _ ## r ## _ ## f)
@@ -81,21 +80,25 @@
 // Host methods ignore the subchannel, just use 0
 #define UVM_SUBCHANNEL_HOST 0
 
-// Starting with Kepler HW settled on using a fixed subchannel for CE.
+// HW uses a fixed subchannel for CE.
 #define UVM_SUBCHANNEL_CE NVA06F_SUBCHANNEL_COPY_ENGINE
 
-#define UVM_SUBCHANNEL_A16F UVM_SUBCHANNEL_HOST
+// Subchannel for UVM SW methods. The largest fixed HW subchannel is 4, meaning
+// subchannels 5-7 are reserved for SW use. See cla06fsubch.h. RM does not care
+// which of those we use.
+#define UVM_SUBCHANNEL_SW 5
 
-#define UVM_SUBCHANNEL_B06F UVM_SUBCHANNEL_HOST
-#define UVM_SUBCHANNEL_B0B5 UVM_SUBCHANNEL_CE
+// NVA06F_SUBCHANNEL_COMPUTE is a semi-arbitrary value for UVM_SUBCHANNEL_SEC2.
+// We need a "unique" subchannel across all subchannels UVM submits work. This
+// is used when we are post-processing a pushbuffer and we need to extract SEC2
+// methods from a it, having a unique subchannel facilitates the SEC2 method
+// identification.
+#define UVM_SUBCHANNEL_SEC2 NVA06F_SUBCHANNEL_COMPUTE
 
-#define UVM_SUBCHANNEL_C06F UVM_SUBCHANNEL_HOST
-#define UVM_SUBCHANNEL_C0B5 UVM_SUBCHANNEL_CE
-
-#define UVM_SUBCHANNEL_C36F UVM_SUBCHANNEL_HOST
-#define UVM_SUBCHANNEL_C3B5 UVM_SUBCHANNEL_CE
+#define UVM_SUBCHANNEL_C076 UVM_SUBCHANNEL_SW
 
 #define UVM_SUBCHANNEL_C46F UVM_SUBCHANNEL_HOST
+#define UVM_SUBCHANNEL_C5B5 UVM_SUBCHANNEL_CE
 
 #define UVM_SUBCHANNEL_C56F UVM_SUBCHANNEL_HOST
 #define UVM_SUBCHANNEL_C6B5 UVM_SUBCHANNEL_CE
@@ -105,36 +108,25 @@
 
 #define UVM_SUBCHANNEL_C96F UVM_SUBCHANNEL_HOST
 
-// Channel for UVM SW methods. This is defined in nv_uvm_types.h. RM does not
-// care about the specific number as long as it's bigger than the largest HW
-// value. For example, Kepler reserves subchannels 5-7 for software objects.
-#define UVM_SUBCHANNEL_C076 UVM_SW_OBJ_SUBCHANNEL
-
-// NVA06F_SUBCHANNEL_COMPUTE is a semi-arbitrary value for UVM_SUBCHANNEL_SEC2.
-// We need a "unique" subchannel across all subchannels UVM submits work. This
-// is used when we are post-processing a pushbuffer and we need to extract SEC2
-// methods from a it, having a unique subchannel facilitates the SEC2 method
-// identification.
-#define UVM_SUBCHANNEL_SEC2 NVA06F_SUBCHANNEL_COMPUTE
 #define UVM_SUBCHANNEL_CBA2 UVM_SUBCHANNEL_SEC2
 
 #define UVM_METHOD_SIZE 4
-#define UVM_METHOD_COUNT_MAX HWMASK(B06F, DMA, INCR_COUNT)
-#if HWMASK(B06F, DMA, INCR_COUNT) != HWMASK(B06F, DMA, NONINCR_COUNT)
+#define UVM_METHOD_COUNT_MAX HWMASK(C46F, DMA, INCR_COUNT)
+#if HWMASK(C46F, DMA, INCR_COUNT) != HWMASK(C46F, DMA, NONINCR_COUNT)
 #error "Unable to define UVM_METHOD_COUNT_MAX"
 #endif
 
 #define UVM_METHOD_INC(subch, address, count)                                   \
-                        (HWCONST(B06F, DMA, SEC_OP, INC_METHOD) |               \
-                         HWVALUE(B06F, DMA, INCR_ADDRESS, (address) >> 2) |     \
-                         HWVALUE(B06F, DMA, INCR_SUBCHANNEL, (subch)) |         \
-                         HWVALUE(B06F, DMA, INCR_COUNT, (count)))
+                        (HWCONST(C46F, DMA, SEC_OP, INC_METHOD) |               \
+                         HWVALUE(C46F, DMA, INCR_ADDRESS, (address) >> 2) |     \
+                         HWVALUE(C46F, DMA, INCR_SUBCHANNEL, (subch)) |         \
+                         HWVALUE(C46F, DMA, INCR_COUNT, (count)))
 
 #define UVM_METHOD_NONINC(subch, address, count)                                    \
-                            (HWCONST(B06F, DMA, SEC_OP, NON_INC_METHOD) |           \
-                             HWVALUE(B06F, DMA, NONINCR_ADDRESS, (address) >> 2) |  \
-                             HWVALUE(B06F, DMA, NONINCR_SUBCHANNEL, (subch)) |      \
-                             HWVALUE(B06F, DMA, NONINCR_COUNT, (count)))
+                            (HWCONST(C46F, DMA, SEC_OP, NON_INC_METHOD) |           \
+                             HWVALUE(C46F, DMA, NONINCR_ADDRESS, (address) >> 2) |  \
+                             HWVALUE(C46F, DMA, NONINCR_SUBCHANNEL, (subch)) |      \
+                             HWVALUE(C46F, DMA, NONINCR_COUNT, (count)))
 
 #define __UVM_ASSERT_CONTIGUOUS_METHODS(a1, a2) BUILD_BUG_ON((a2) - (a1) != UVM_METHOD_SIZE)
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2015-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2015-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -43,8 +43,6 @@ NVOC_CLASS_ID __nvoc_objGetClassId(Dynamic *pObj);
 const NVOC_CLASS_INFO *__nvoc_objGetClassInfo(Dynamic *pObj);
 
 void __nvoc_objDelete(Dynamic *pDynamic);
-
-NV_STATUS __nvoc_handleObjCreateMemAlloc(NvU32 createFlags, NvU32 allocSize, void **ppLocalPtr, void **ppThis);
 
 NV_STATUS __nvoc_objCreateDynamic(
         Dynamic               **pNewObject,

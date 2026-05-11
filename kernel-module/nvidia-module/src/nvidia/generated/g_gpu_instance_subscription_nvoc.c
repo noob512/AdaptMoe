@@ -16,7 +16,7 @@
 
 
 #ifdef DEBUG
-char __nvoc_class_id_uniqueness_check__0x91fde7 = 1;
+char __nvoc_class_id_uniqueness_check__91fde7 = 1;
 #endif
 
 extern const struct NVOC_CLASS_DEF __nvoc_class_def_GPUInstanceSubscription;
@@ -30,7 +30,7 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_GpuResource;
 void __nvoc_init__GpuResource(GpuResource*);
 void __nvoc_init__GPUInstanceSubscription(GPUInstanceSubscription*);
 void __nvoc_init_funcTable_GPUInstanceSubscription(GPUInstanceSubscription*);
-NV_STATUS __nvoc_ctor_GPUInstanceSubscription(GPUInstanceSubscription*, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
+NV_STATUS __nvoc_ctor_GPUInstanceSubscription(GPUInstanceSubscription*, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
 void __nvoc_init_dataField_GPUInstanceSubscription(GPUInstanceSubscription*);
 void __nvoc_dtor_GPUInstanceSubscription(GPUInstanceSubscription*);
 
@@ -106,34 +106,35 @@ NV_STATUS __nvoc_up_thunk_RsResource_gisubscriptionUnmapFrom(struct GPUInstanceS
 NvU32 __nvoc_up_thunk_RsResource_gisubscriptionGetRefCount(struct GPUInstanceSubscription *pResource);    // this
 void __nvoc_up_thunk_RsResource_gisubscriptionAddAdditionalDependants(struct RsClient *pClient, struct GPUInstanceSubscription *pResource, RsResourceRef *pReference);    // this
 
+// Class-specific details for GPUInstanceSubscription
 const struct NVOC_CLASS_DEF __nvoc_class_def_GPUInstanceSubscription = 
 {
-    /*classInfo=*/ {
-        /*size=*/               sizeof(GPUInstanceSubscription),
-        /*classId=*/            classId(GPUInstanceSubscription),
-        /*providerId=*/         &__nvoc_rtti_provider,
+    .classInfo.size =               sizeof(GPUInstanceSubscription),
+    .classInfo.classId =            classId(GPUInstanceSubscription),
+    .classInfo.providerId =         &__nvoc_rtti_provider,
 #if NV_PRINTF_STRINGS_ALLOWED
-        /*name=*/               "GPUInstanceSubscription",
+    .classInfo.name =               "GPUInstanceSubscription",
 #endif
-    },
-    /*objCreatefn=*/        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_GPUInstanceSubscription,
-    /*pCastInfo=*/          &__nvoc_castinfo__GPUInstanceSubscription,
-    /*pExportInfo=*/        &__nvoc_export_info__GPUInstanceSubscription
+    .objCreatefn =        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_GPUInstanceSubscription,
+    .pCastInfo =          &__nvoc_castinfo__GPUInstanceSubscription,
+    .pExportInfo =        &__nvoc_export_info__GPUInstanceSubscription
 };
 
+// By default, all exported methods are enabled.
 #if !defined(NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG)
 #define NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(x)      (0)
 #endif
 
+// Exported method array
 static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_GPUInstanceSubscription[] = 
 {
     {               /*  [0] */
-#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
+#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x10008u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) gisubscriptionCtrlCmdExecPartitionsCreate_IMPL,
-#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-        /*flags=*/      0x8u,
+        /*pFunc=*/      (void (*)(void)) &gisubscriptionCtrlCmdExecPartitionsCreate_IMPL,
+#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x10008u)
+        /*flags=*/      0x10008u,
         /*accessRight=*/0x0u,
         /*methodId=*/   0xc6370101u,
         /*paramSize=*/  sizeof(NVC637_CTRL_EXEC_PARTITIONS_CREATE_PARAMS),
@@ -143,12 +144,12 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_GPUInsta
 #endif
     },
     {               /*  [1] */
-#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
+#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x10008u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) gisubscriptionCtrlCmdExecPartitionsDelete_IMPL,
-#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-        /*flags=*/      0x8u,
+        /*pFunc=*/      (void (*)(void)) &gisubscriptionCtrlCmdExecPartitionsDelete_IMPL,
+#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x10008u)
+        /*flags=*/      0x10008u,
         /*accessRight=*/0x0u,
         /*methodId=*/   0xc6370102u,
         /*paramSize=*/  sizeof(NVC637_CTRL_EXEC_PARTITIONS_DELETE_PARAMS),
@@ -158,12 +159,12 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_GPUInsta
 #endif
     },
     {               /*  [2] */
-#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
+#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x10008u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) gisubscriptionCtrlCmdExecPartitionsGet_IMPL,
-#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-        /*flags=*/      0x8u,
+        /*pFunc=*/      (void (*)(void)) &gisubscriptionCtrlCmdExecPartitionsGet_IMPL,
+#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x10008u)
+        /*flags=*/      0x10008u,
         /*accessRight=*/0x0u,
         /*methodId=*/   0xc6370103u,
         /*paramSize=*/  sizeof(NVC637_CTRL_EXEC_PARTITIONS_GET_PARAMS),
@@ -173,12 +174,12 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_GPUInsta
 #endif
     },
     {               /*  [3] */
-#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
+#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x10008u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) gisubscriptionCtrlCmdExecPartitionsGetActiveIds_IMPL,
-#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-        /*flags=*/      0x8u,
+        /*pFunc=*/      (void (*)(void)) &gisubscriptionCtrlCmdExecPartitionsGetActiveIds_IMPL,
+#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x10008u)
+        /*flags=*/      0x10008u,
         /*accessRight=*/0x0u,
         /*methodId=*/   0xc6370104u,
         /*paramSize=*/  sizeof(NVC637_CTRL_EXEC_PARTITIONS_GET_ACTIVE_IDS_PARAMS),
@@ -191,7 +192,7 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_GPUInsta
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) gisubscriptionCtrlCmdExecPartitionsExport_IMPL,
+        /*pFunc=*/      (void (*)(void)) &gisubscriptionCtrlCmdExecPartitionsExport_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*flags=*/      0x8u,
         /*accessRight=*/0x0u,
@@ -206,7 +207,7 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_GPUInsta
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x80u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) gisubscriptionCtrlCmdExecPartitionsImport_IMPL,
+        /*pFunc=*/      (void (*)(void)) &gisubscriptionCtrlCmdExecPartitionsImport_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x80u)
         /*flags=*/      0x80u,
         /*accessRight=*/0x0u,
@@ -221,7 +222,7 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_GPUInsta
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) gisubscriptionCtrlCmdExecPartitionsGetProfileCapacity_IMPL,
+        /*pFunc=*/      (void (*)(void)) &gisubscriptionCtrlCmdExecPartitionsGetProfileCapacity_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*flags=*/      0x8u,
         /*accessRight=*/0x0u,
@@ -236,7 +237,7 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_GPUInsta
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) gisubscriptionCtrlCmdGetUuid_IMPL,
+        /*pFunc=*/      (void (*)(void)) &gisubscriptionCtrlCmdGetUuid_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*flags=*/      0x8u,
         /*accessRight=*/0x0u,
@@ -247,7 +248,6 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_GPUInsta
         /*func=*/       "gisubscriptionCtrlCmdGetUuid"
 #endif
     },
-
 };
 
 
@@ -510,90 +510,62 @@ void __nvoc_up_thunk_RsResource_gisubscriptionAddAdditionalDependants(struct RsC
 
 const struct NVOC_EXPORT_INFO __nvoc_export_info__GPUInstanceSubscription = 
 {
-    /*numEntries=*/     8,
-    /*pExportEntries=*/ __nvoc_exported_method_def_GPUInstanceSubscription
+    .numEntries=     8,
+    .pExportEntries= __nvoc_exported_method_def_GPUInstanceSubscription
 };
 
+
+// Destruct GPUInstanceSubscription object.
+void __nvoc_gisubscriptionDestruct(GPUInstanceSubscription*);
 void __nvoc_dtor_GpuResource(GpuResource*);
-void __nvoc_dtor_GPUInstanceSubscription(GPUInstanceSubscription *pThis) {
+void __nvoc_dtor_GPUInstanceSubscription(GPUInstanceSubscription* pThis) {
+
+// Call destructor.
     __nvoc_gisubscriptionDestruct(pThis);
+
+// Recurse to superclass destructors.
     __nvoc_dtor_GpuResource(&pThis->__nvoc_base_GpuResource);
+
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
-
 void __nvoc_init_dataField_GPUInstanceSubscription(GPUInstanceSubscription *pThis) {
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
 
-NV_STATUS __nvoc_ctor_GpuResource(GpuResource* , CALL_CONTEXT *, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
-NV_STATUS __nvoc_ctor_GPUInstanceSubscription(GPUInstanceSubscription *pThis, CALL_CONTEXT * arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams) {
-    NV_STATUS status = NV_OK;
-    status = __nvoc_ctor_GpuResource(&pThis->__nvoc_base_GpuResource, arg_pCallContext, arg_pParams);
-    if (status != NV_OK) goto __nvoc_ctor_GPUInstanceSubscription_fail_GpuResource;
-    __nvoc_init_dataField_GPUInstanceSubscription(pThis);
 
-    status = __nvoc_gisubscriptionConstruct(pThis, arg_pCallContext, arg_pParams);
+// Construct GPUInstanceSubscription object.
+NV_STATUS __nvoc_ctor_GpuResource(GpuResource *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);    // inline
+NV_STATUS __nvoc_ctor_GPUInstanceSubscription(GPUInstanceSubscription *pGPUInstanceSubscription, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {    // inline
+    NV_STATUS status = NV_OK;
+
+    // Recurse to ancestor constructor(s).
+    status = __nvoc_ctor_GpuResource(&pGPUInstanceSubscription->__nvoc_base_GpuResource, pCallContext, pParams);
+    if (status != NV_OK) goto __nvoc_ctor_GPUInstanceSubscription_fail_GpuResource;
+
+    // Initialize data fields.
+    __nvoc_init_dataField_GPUInstanceSubscription(pGPUInstanceSubscription);
+
+    // Call the constructor for this class.
+    status = __nvoc_gisubscriptionConstruct(pGPUInstanceSubscription, pCallContext, pParams);
     if (status != NV_OK) goto __nvoc_ctor_GPUInstanceSubscription_fail__init;
     goto __nvoc_ctor_GPUInstanceSubscription_exit; // Success
 
+    // Unwind on error.
 __nvoc_ctor_GPUInstanceSubscription_fail__init:
-    __nvoc_dtor_GpuResource(&pThis->__nvoc_base_GpuResource);
+    __nvoc_dtor_GpuResource(&pGPUInstanceSubscription->__nvoc_base_GpuResource);
 __nvoc_ctor_GPUInstanceSubscription_fail_GpuResource:
 __nvoc_ctor_GPUInstanceSubscription_exit:
-
     return status;
 }
 
 // Vtable initialization
 static void __nvoc_init_funcTable_GPUInstanceSubscription_1(GPUInstanceSubscription *pThis) {
     PORT_UNREFERENCED_VARIABLE(pThis);
-
-    // gisubscriptionCtrlCmdExecPartitionsCreate -- exported (id=0xc6370101)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__gisubscriptionCtrlCmdExecPartitionsCreate__ = &gisubscriptionCtrlCmdExecPartitionsCreate_IMPL;
-#endif
-
-    // gisubscriptionCtrlCmdExecPartitionsDelete -- exported (id=0xc6370102)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__gisubscriptionCtrlCmdExecPartitionsDelete__ = &gisubscriptionCtrlCmdExecPartitionsDelete_IMPL;
-#endif
-
-    // gisubscriptionCtrlCmdExecPartitionsGet -- exported (id=0xc6370103)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__gisubscriptionCtrlCmdExecPartitionsGet__ = &gisubscriptionCtrlCmdExecPartitionsGet_IMPL;
-#endif
-
-    // gisubscriptionCtrlCmdExecPartitionsGetProfileCapacity -- exported (id=0xc63701a9)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__gisubscriptionCtrlCmdExecPartitionsGetProfileCapacity__ = &gisubscriptionCtrlCmdExecPartitionsGetProfileCapacity_IMPL;
-#endif
-
-    // gisubscriptionCtrlCmdExecPartitionsGetActiveIds -- exported (id=0xc6370104)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__gisubscriptionCtrlCmdExecPartitionsGetActiveIds__ = &gisubscriptionCtrlCmdExecPartitionsGetActiveIds_IMPL;
-#endif
-
-    // gisubscriptionCtrlCmdExecPartitionsExport -- exported (id=0xc6370105)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__gisubscriptionCtrlCmdExecPartitionsExport__ = &gisubscriptionCtrlCmdExecPartitionsExport_IMPL;
-#endif
-
-    // gisubscriptionCtrlCmdExecPartitionsImport -- exported (id=0xc6370106)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x80u)
-    pThis->__gisubscriptionCtrlCmdExecPartitionsImport__ = &gisubscriptionCtrlCmdExecPartitionsImport_IMPL;
-#endif
-
-    // gisubscriptionCtrlCmdGetUuid -- exported (id=0xc63701aa)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__gisubscriptionCtrlCmdGetUuid__ = &gisubscriptionCtrlCmdGetUuid_IMPL;
-#endif
-} // End __nvoc_init_funcTable_GPUInstanceSubscription_1 with approximately 8 basic block(s).
+} // End __nvoc_init_funcTable_GPUInstanceSubscription_1
 
 
-// Initialize vtable(s) for 33 virtual method(s).
+// Initialize vtable(s) for 25 virtual method(s).
 void __nvoc_init_funcTable_GPUInstanceSubscription(GPUInstanceSubscription *pThis) {
-
-    // Initialize vtable(s) with 8 per-object function pointer(s).
     __nvoc_init_funcTable_GPUInstanceSubscription_1(pThis);
 }
 
@@ -623,68 +595,82 @@ void __nvoc_init__GPUInstanceSubscription(GPUInstanceSubscription *pThis) {
     __nvoc_init_funcTable_GPUInstanceSubscription(pThis);
 }
 
-NV_STATUS __nvoc_objCreate_GPUInstanceSubscription(GPUInstanceSubscription **ppThis, Dynamic *pParent, NvU32 createFlags, CALL_CONTEXT * arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams)
+NV_STATUS __nvoc_objCreate_GPUInstanceSubscription(GPUInstanceSubscription **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams)
 {
-    NV_STATUS status;
-    Object *pParentObj = NULL;
-    GPUInstanceSubscription *pThis;
+    NV_STATUS __nvoc_status;
+    Object *__nvoc_pParentObj = NULL;
+    GPUInstanceSubscription *__nvoc_pThis;
 
-    // Assign `pThis`, allocating memory unless suppressed by flag.
-    status = __nvoc_handleObjCreateMemAlloc(createFlags, sizeof(GPUInstanceSubscription), (void**)&pThis, (void**)ppThis);
-    if (status != NV_OK)
-        return status;
+    // Don't allocate memory if the caller has already done so.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+    {
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_ppThis != NULL && *__nvoc_ppThis != NULL, NV_ERR_INVALID_PARAMETER);
+        __nvoc_pThis = *__nvoc_ppThis;
+    }
+
+    // Allocate memory
+    else
+    {
+        __nvoc_pThis = portMemAllocNonPaged(sizeof(GPUInstanceSubscription));
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_pThis != NULL, NV_ERR_NO_MEMORY);
+    }
 
     // Zero is the initial value for everything.
-    portMemSet(pThis, 0, sizeof(GPUInstanceSubscription));
+    portMemSet(__nvoc_pThis, 0, sizeof(GPUInstanceSubscription));
 
-    pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.createFlags = createFlags;
+    __nvoc_pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.createFlags = __nvoc_createFlags;
 
     // Link the child into the parent if there is one unless flagged not to do so.
-    if (pParent != NULL && !(createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
+    if (__nvoc_pParent != NULL && !(__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
     {
-        pParentObj = dynamicCast(pParent, Object);
-        objAddChild(pParentObj, &pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
+        __nvoc_pParentObj = dynamicCast(__nvoc_pParent, Object);
+        objAddChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
     }
     else
     {
-        pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.pParent = NULL;
+        __nvoc_pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.pParent = NULL;
     }
 
-    __nvoc_init__GPUInstanceSubscription(pThis);
-    status = __nvoc_ctor_GPUInstanceSubscription(pThis, arg_pCallContext, arg_pParams);
-    if (status != NV_OK) goto __nvoc_objCreate_GPUInstanceSubscription_cleanup;
+    // Initialize vtable, RTTI, etc., then call constructor.
+    __nvoc_init__GPUInstanceSubscription(__nvoc_pThis);
+    __nvoc_status = __nvoc_ctor_GPUInstanceSubscription(__nvoc_pThis, pCallContext, pParams);
+    if (__nvoc_status != NV_OK) goto __nvoc_objCreate_GPUInstanceSubscription_cleanup;
 
     // Assignment has no effect if NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT is set.
-    *ppThis = pThis;
+    *__nvoc_ppThis = __nvoc_pThis;
 
+    // Success
     return NV_OK;
 
+    // Do not call destructors here since the constructor already called them.
 __nvoc_objCreate_GPUInstanceSubscription_cleanup:
 
     // Unlink the child from the parent if it was linked above.
-    if (pParentObj != NULL)
-        objRemoveChild(pParentObj, &pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
+    if (__nvoc_pParentObj != NULL)
+        objRemoveChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
 
-    // Do not call destructors here since the constructor already called them.
-    if (createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
-        portMemSet(pThis, 0, sizeof(GPUInstanceSubscription));
+    // Zero out memory that was allocated by caller.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+        portMemSet(__nvoc_pThis, 0, sizeof(GPUInstanceSubscription));
+
+    // Free memory allocated by `__nvoc_handleObjCreateMemAlloc`.
     else
     {
-        portMemFree(pThis);
-        *ppThis = NULL;
+        portMemFree(__nvoc_pThis);
+        *__nvoc_ppThis = NULL;
     }
 
-    // coverity[leaked_storage:FALSE]
-    return status;
+    // Failure
+    return __nvoc_status;
 }
 
-NV_STATUS __nvoc_objCreateDynamic_GPUInstanceSubscription(GPUInstanceSubscription **ppThis, Dynamic *pParent, NvU32 createFlags, va_list args) {
-    NV_STATUS status;
-    CALL_CONTEXT * arg_pCallContext = va_arg(args, CALL_CONTEXT *);
-    struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams = va_arg(args, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
+NV_STATUS __nvoc_objCreateDynamic_GPUInstanceSubscription(GPUInstanceSubscription **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, va_list __nvoc_args) {
+    NV_STATUS __nvoc_status;
+    CALL_CONTEXT *pCallContext = va_arg(__nvoc_args, CALL_CONTEXT *);
+    struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams = va_arg(__nvoc_args, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
 
-    status = __nvoc_objCreate_GPUInstanceSubscription(ppThis, pParent, createFlags, arg_pCallContext, arg_pParams);
+    __nvoc_status = __nvoc_objCreate_GPUInstanceSubscription(__nvoc_ppThis, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams);
 
-    return status;
+    return __nvoc_status;
 }
 

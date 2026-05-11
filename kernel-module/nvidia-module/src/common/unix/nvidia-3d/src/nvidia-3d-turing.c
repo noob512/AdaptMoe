@@ -32,7 +32,15 @@ void _nv3dInitChannelTuring(Nv3dChannelRec *p3dChannel)
 {
     NvPushChannelPtr p = p3dChannel->pPushChannel;
 
-    _nv3dInitChannelPascal(p3dChannel);
+    // Disable shader exceptions.  This matches OpenGL driver behavior.
+    nvPushImmedVal(p, NVA06F_SUBCHANNEL_3D,
+        NVC597_SET_SHADER_EXCEPTIONS,
+        NV3D_C(C597, SET_SHADER_EXCEPTIONS, ENABLE, FALSE));
+
+    if (!p3dChannel->hasFrameBoundaries) {
+        nvPushMethod(p, NVA06F_SUBCHANNEL_3D, NVC597_SET_GO_IDLE_TIMEOUT, 1);
+        nvPushSetMethodData(p, 0x800);
+    }
 
     nvPushMethod(p, NVA06F_SUBCHANNEL_3D, NVC597_SET_SPH_VERSION, 2);
     nvPushSetMethodData(p,

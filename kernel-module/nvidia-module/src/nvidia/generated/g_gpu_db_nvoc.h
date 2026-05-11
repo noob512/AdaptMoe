@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -47,6 +47,7 @@ extern "C" {
 #include "nvoc/object.h"
 #include "containers/list.h"
 #include "gpu/gpu_uuid.h"
+#include "gpu/gpu_shared_data_map.h"
 
 typedef struct NBADDR NBADDR;
 
@@ -98,6 +99,7 @@ typedef struct
     GPU_COMPUTE_POLICY_INFO          policyInfo;
     NvBool                           bShutdownState;
     GPU_CLK_PROP_TOP_POLS_CONTROL    clkPropTopPolsControl;
+    GPU_DB_RUSD_SETTINGS             rusd;
 } GPU_INFO_LIST_NODE, *PGPU_INFO_LIST_NODE;
 
 MAKE_LIST(GpuInfoList, GPU_INFO_LIST_NODE);
@@ -145,13 +147,9 @@ struct NVOC_METADATA__GpuDb {
     const struct NVOC_METADATA__Object metadata__Object;
 };
 
-#ifndef __NVOC_CLASS_GpuDb_TYPEDEF__
-#define __NVOC_CLASS_GpuDb_TYPEDEF__
-typedef struct GpuDb GpuDb;
-#endif /* __NVOC_CLASS_GpuDb_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_GpuDb
-#define __nvoc_class_id_GpuDb 0xcdd250
+#define __nvoc_class_id_GpuDb 0xcdd250u
+typedef struct GpuDb GpuDb;
 #endif /* __nvoc_class_id_GpuDb */
 
 // Casting support
@@ -170,19 +168,27 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_GpuDb;
 NV_STATUS __nvoc_objCreateDynamic_GpuDb(GpuDb**, Dynamic*, NvU32, va_list);
 
 NV_STATUS __nvoc_objCreate_GpuDb(GpuDb**, Dynamic*, NvU32);
-#define __objCreate_GpuDb(ppNewObj, pParent, createFlags) \
-    __nvoc_objCreate_GpuDb((ppNewObj), staticCast((pParent), Dynamic), (createFlags))
+#define __objCreate_GpuDb(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags) \
+    __nvoc_objCreate_GpuDb((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags))
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS gpudbConstruct_IMPL(struct GpuDb *pGpuDb);
+#define __nvoc_gpudbConstruct(pGpuDb) gpudbConstruct_IMPL(pGpuDb)
+
+void gpudbDestruct_IMPL(struct GpuDb *pGpuDb);
+#define __nvoc_gpudbDestruct(pGpuDb) gpudbDestruct_IMPL(pGpuDb)
+
+
+// Wrapper macros for halified functions
 
 // Dispatch functions
-NV_STATUS gpudbConstruct_IMPL(struct GpuDb *arg_pGpuDb);
-
-#define __nvoc_gpudbConstruct(arg_pGpuDb) gpudbConstruct_IMPL(arg_pGpuDb)
-void gpudbDestruct_IMPL(struct GpuDb *pGpuDb);
-
-#define __nvoc_gpudbDestruct(pGpuDb) gpudbDestruct_IMPL(pGpuDb)
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 
@@ -192,6 +198,8 @@ NV_STATUS   gpudbGetGpuComputePolicyConfigs(const NvU8 *uuid, GPU_COMPUTE_POLICY
 NV_STATUS   gpudbSetClockPoliciesControl(const NvU8 *uuid, GPU_CLK_PROP_TOP_POLS_CONTROL *pControl);
 NV_STATUS   gpudbGetClockPoliciesControl(const NvU8 *uuid, GPU_CLK_PROP_TOP_POLS_CONTROL *pControl);
 NV_STATUS   gpudbSetShutdownState(const NvU8 *pUuid);
+NV_STATUS   gpudbSetRusdSettings(const NvU8 *uuid, GPU_DB_RUSD_SETTINGS *pRusd);
+NV_STATUS   gpudbGetRusdSettings(const NvU8 *uuid, GPU_DB_RUSD_SETTINGS *pRusd);
 #endif // GPU_DB_H
 
 #ifdef __cplusplus

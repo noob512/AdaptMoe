@@ -72,16 +72,11 @@ typedef struct
 
 MAKE_MAP(REFCNT_REQUESTER_ENTRY_MAP, REFCNT_REQUESTER_ENTRY);
 
-
 struct OBJREFCNT;
 
-#ifndef __NVOC_CLASS_OBJREFCNT_TYPEDEF__
-#define __NVOC_CLASS_OBJREFCNT_TYPEDEF__
-typedef struct OBJREFCNT OBJREFCNT;
-#endif /* __NVOC_CLASS_OBJREFCNT_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_OBJREFCNT
-#define __nvoc_class_id_OBJREFCNT 0xf89281
+#define __nvoc_class_id_OBJREFCNT 0xf89281u
+typedef struct OBJREFCNT OBJREFCNT;
 #endif /* __nvoc_class_id_OBJREFCNT */
 
 
@@ -150,13 +145,9 @@ struct NVOC_METADATA__OBJREFCNT {
     const struct NVOC_METADATA__Object metadata__Object;
 };
 
-#ifndef __NVOC_CLASS_OBJREFCNT_TYPEDEF__
-#define __NVOC_CLASS_OBJREFCNT_TYPEDEF__
-typedef struct OBJREFCNT OBJREFCNT;
-#endif /* __NVOC_CLASS_OBJREFCNT_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_OBJREFCNT
-#define __nvoc_class_id_OBJREFCNT 0xf89281
+#define __nvoc_class_id_OBJREFCNT 0xf89281u
+typedef struct OBJREFCNT OBJREFCNT;
 #endif /* __nvoc_class_id_OBJREFCNT */
 
 // Casting support
@@ -176,55 +167,61 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_OBJREFCNT;
 #define PDB_PROP_REFCNT_ALLOW_RECURSIVE_REQUESTS_BASE_CAST
 #define PDB_PROP_REFCNT_ALLOW_RECURSIVE_REQUESTS_BASE_NAME PDB_PROP_REFCNT_ALLOW_RECURSIVE_REQUESTS
 
+
 NV_STATUS __nvoc_objCreateDynamic_OBJREFCNT(OBJREFCNT**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_OBJREFCNT(OBJREFCNT**, Dynamic*, NvU32, Dynamic *arg_pParent, NvU32 arg_tag, RefcntStateChangeCallback *arg_pStateChangeCallback, RefcntResetCallback *arg_pResetCallback);
-#define __objCreate_OBJREFCNT(ppNewObj, pParent, createFlags, arg_pParent, arg_tag, arg_pStateChangeCallback, arg_pResetCallback) \
-    __nvoc_objCreate_OBJREFCNT((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pParent, arg_tag, arg_pStateChangeCallback, arg_pResetCallback)
+NV_STATUS __nvoc_objCreate_OBJREFCNT(OBJREFCNT**, Dynamic*, NvU32, Dynamic *pParent, NvU32 tag, RefcntStateChangeCallback *pStateChangeCallback, RefcntResetCallback *pResetCallback);
+#define __objCreate_OBJREFCNT(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pParent, tag, pStateChangeCallback, pResetCallback) \
+    __nvoc_objCreate_OBJREFCNT((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pParent, tag, pStateChangeCallback, pResetCallback)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS refcntConstruct_IMPL(struct OBJREFCNT *pRefcnt, Dynamic *pParent, NvU32 tag, RefcntStateChangeCallback *pStateChangeCallback, RefcntResetCallback *pResetCallback);
+#define __nvoc_refcntConstruct(pRefcnt, pParent, tag, pStateChangeCallback, pResetCallback) refcntConstruct_IMPL(pRefcnt, pParent, tag, pStateChangeCallback, pResetCallback)
 
-// Dispatch functions
-NV_STATUS refcntConstruct_IMPL(struct OBJREFCNT *arg_pRefcnt, Dynamic *arg_pParent, NvU32 arg_tag, RefcntStateChangeCallback *arg_pStateChangeCallback, RefcntResetCallback *arg_pResetCallback);
-
-#define __nvoc_refcntConstruct(arg_pRefcnt, arg_pParent, arg_tag, arg_pStateChangeCallback, arg_pResetCallback) refcntConstruct_IMPL(arg_pRefcnt, arg_pParent, arg_tag, arg_pStateChangeCallback, arg_pResetCallback)
 void refcntDestruct_IMPL(struct OBJREFCNT *pRefcnt);
-
 #define __nvoc_refcntDestruct(pRefcnt) refcntDestruct_IMPL(pRefcnt)
-NV_STATUS refcntRequestReference_IMPL(struct OBJREFCNT *pRefcnt, NvU64 arg2, NvU32 arg3, NvBool arg4);
 
+NV_STATUS refcntRequestReference_IMPL(struct OBJREFCNT *pRefcnt, NvU64 arg2, NvU32 arg3, NvBool arg4);
 #ifdef __nvoc_ref_count_h_disabled
 static inline NV_STATUS refcntRequestReference(struct OBJREFCNT *pRefcnt, NvU64 arg2, NvU32 arg3, NvBool arg4) {
     NV_ASSERT_FAILED_PRECOMP("OBJREFCNT was disabled!");
     return NV_ERR_NOT_SUPPORTED;
 }
-#else //__nvoc_ref_count_h_disabled
+#else // __nvoc_ref_count_h_disabled
 #define refcntRequestReference(pRefcnt, arg2, arg3, arg4) refcntRequestReference_IMPL(pRefcnt, arg2, arg3, arg4)
-#endif //__nvoc_ref_count_h_disabled
+#endif // __nvoc_ref_count_h_disabled
 
 NV_STATUS refcntReleaseReferences_IMPL(struct OBJREFCNT *pRefcnt, NvU64 arg2, NvBool arg3);
-
 #ifdef __nvoc_ref_count_h_disabled
 static inline NV_STATUS refcntReleaseReferences(struct OBJREFCNT *pRefcnt, NvU64 arg2, NvBool arg3) {
     NV_ASSERT_FAILED_PRECOMP("OBJREFCNT was disabled!");
     return NV_ERR_NOT_SUPPORTED;
 }
-#else //__nvoc_ref_count_h_disabled
+#else // __nvoc_ref_count_h_disabled
 #define refcntReleaseReferences(pRefcnt, arg2, arg3) refcntReleaseReferences_IMPL(pRefcnt, arg2, arg3)
-#endif //__nvoc_ref_count_h_disabled
+#endif // __nvoc_ref_count_h_disabled
 
 NV_STATUS refcntReset_IMPL(struct OBJREFCNT *pRefcnt, NvBool arg2);
-
 #ifdef __nvoc_ref_count_h_disabled
 static inline NV_STATUS refcntReset(struct OBJREFCNT *pRefcnt, NvBool arg2) {
     NV_ASSERT_FAILED_PRECOMP("OBJREFCNT was disabled!");
     return NV_ERR_NOT_SUPPORTED;
 }
-#else //__nvoc_ref_count_h_disabled
+#else // __nvoc_ref_count_h_disabled
 #define refcntReset(pRefcnt, arg2) refcntReset_IMPL(pRefcnt, arg2)
-#endif //__nvoc_ref_count_h_disabled
+#endif // __nvoc_ref_count_h_disabled
 
+
+// Wrapper macros for halified functions
+
+// Dispatch functions
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

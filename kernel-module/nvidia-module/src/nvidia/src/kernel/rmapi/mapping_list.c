@@ -112,7 +112,8 @@ intermapCreateDmaMapping
     RsClient              *pClient,
     VirtualMemory         *pVirtualMemory,
     PCLI_DMA_MAPPING_INFO *ppDmaMapping,
-    NvU32                  flags
+    NvU32                  flags,
+    NvU32                  flags2
 )
 {
     Memory                *pMemory  = NULL;
@@ -148,7 +149,8 @@ intermapCreateDmaMapping
     portMemSet(pDmaMapping, 0, sizeof(CLI_DMA_MAPPING_INFO));
     pDmaMapping->DmaOffset          = 0;
     pDmaMapping->bP2P               = NV_FALSE;
-    pDmaMapping->Flags              = flags; // NV0S46_*
+    pDmaMapping->Flags              = flags; // NV0S46_FLAGS_*
+    pDmaMapping->Flags2             = flags2; // NV0S46_FLAGS2_*
     pDmaMapping->addressTranslation = VAS_ADDRESS_TRANSLATION(pVAS);
 
     *ppDmaMapping = pDmaMapping;
@@ -442,61 +444,4 @@ CliGetDmaMappingInfo
     }
 
     return NV_FALSE;
-}
-
-void
-CliGetDmaMappingIterator
-(
-    PCLI_DMA_MAPPING_INFO         *ppFirstDmaMapping,       // [OUT] first found pDmaMapping
-    PCLI_DMA_MAPPING_INFO_ITERATOR pIt,                     // [OUT] iterator object to enum all other pDmaMappings
-    PNODE                          pDmaMappingList          // [IN]  the two level pDmaMapping list to iterate
-)
-{
-    // don't iterate if we didn't get a empty list
-    *ppFirstDmaMapping = NULL;
-    portMemSet(pIt, 0, sizeof(*pIt));
-
-    if (pDmaMappingList == NULL)
-        return;
-
-    // find the first pDmaMapping
-    pIt->pDmaMappingList = pDmaMappingList;
-    btreeEnumStart(0, &pIt->pNextDmaMapping, pIt->pDmaMappingList);
-
-    if (pIt->pNextDmaMapping == NULL)
-        return;
-
-    NV_ASSERT(pIt->pNextDmaMapping->Data);
-    CliGetDmaMappingNext(ppFirstDmaMapping, pIt);
-}
-
-void
-CliGetDmaMappingNext
-(
-    PCLI_DMA_MAPPING_INFO *ppDmaMapping,
-    PCLI_DMA_MAPPING_INFO_ITERATOR pIt
-)
-{
-    PCLI_DMA_MAPPING_INFO pDmaMapping = NULL;
-
-    if (pIt->pNextDmaMapping != NULL)
-    {
-        // return the current node.
-        NV_ASSERT(pIt->pNextDmaMapping->Data);
-        pDmaMapping = (PCLI_DMA_MAPPING_INFO)pIt->pNextDmaMapping->Data;
-
-        // not supporting legacy _DMA_UNICAST_REUSE_ALLOC case
-        NV_ASSERT(pDmaMapping->pNext == NULL);
-
-        // iterate to the next DmaOffset (so the caller is free to delete the node)
-        btreeEnumNext(&pIt->pNextDmaMapping, pIt->pDmaMappingList);
-    }
-
-    // stop iterating once we hit the end of list [or something bad happened]
-    if (pDmaMapping == NULL)
-    {
-        pIt->pDmaMappingList = NULL;
-        pIt->pNextDmaMapping = NULL;
-    }
-    *ppDmaMapping = pDmaMapping;
 }

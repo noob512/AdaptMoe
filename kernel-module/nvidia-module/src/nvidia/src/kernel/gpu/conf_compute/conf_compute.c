@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -98,8 +98,10 @@ confComputeConstructEngine_IMPL(OBJGPU                  *pGpu,
 
     if (gpuIsCCEnabledInHw_HAL(pGpu))
     {
-        NV_PRINTF(LEVEL_INFO, "CC mode is enabled by HW\n");
-        pConfCompute->setProperty(pConfCompute, PDB_PROP_CONFCOMPUTE_ENABLED, NV_TRUE);
+        {
+            NV_PRINTF(LEVEL_INFO, "CC mode is enabled by HW\n");
+            pConfCompute->setProperty(pConfCompute, PDB_PROP_CONFCOMPUTE_ENABLED, NV_TRUE);
+        }
     }
     else if (gpuIsProtectedPcieEnabledInHw_HAL(pGpu))
     {
@@ -116,7 +118,8 @@ confComputeConstructEngine_IMPL(OBJGPU                  *pGpu,
         pConfCompute->setProperty(pConfCompute, PDB_PROP_CONFCOMPUTE_DEVTOOLS_MODE_ENABLED, NV_TRUE);
     }
 
-    if (gpuIsMultiGpuNvleEnabledInHw_HAL(pGpu))
+    if (gpuIsMultiGpuNvleEnabledInHw_HAL(pGpu)
+       )
     {
         NV_PRINTF(LEVEL_INFO, "Enabling NVlink encryption with multi GPU mode. \n");
         pConfCompute->setProperty(pConfCompute, PDB_PROP_CONFCOMPUTE_ENABLED, NV_TRUE);
@@ -457,27 +460,11 @@ confComputeStatePostLoad_IMPL
 
     if (!IS_GSP_CLIENT(pGpu) && !RMCFG_FEATURE_PLATFORM_GSP)
     {
-        Spdm *pSpdm = GPU_GET_SPDM(pGpu);
-        if (pSpdm != NULL && pSpdm->getProperty(pSpdm, PDB_PROP_SPDM_ENABLED))
-        {
-            // TODO CONFCOMP-2102: Cleanup session establishment for MODS scenario
-            NV_PRINTF(LEVEL_INFO, "Performing late SPDM initialization!\n");
-            NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
-                                spdmEstablishSession(pGpu, pSpdm, NV_SPDM_REQUESTER_ID_CONF_COMPUTE), ErrorExit);
-        }
-
         status = confComputeDeriveSessionKeys(pGpu, pConfCompute);
         if (status != NV_OK)
         {
             return status;
         }
-    }
-
-    // TODO CONFCOMP-2102: Move this to kernel_spdm.c
-    Spdm *pSpdm = GPU_GET_SPDM(pGpu);
-    if (pSpdm != NULL && pSpdm->getProperty(pSpdm, PDB_PROP_SPDM_ENABLED))
-    {
-        NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR, spdmSendInitRmDataCommand_HAL(pGpu, pSpdm), ErrorExit);
     }
 
     if (pConfCompute->getProperty(pConfCompute, PDB_PROP_CONFCOMPUTE_KEY_ROTATION_SUPPORTED) &&
@@ -535,11 +522,6 @@ confComputeStatePreUnload_KERNEL
     if (!IS_GSP_CLIENT(pGpu) && !RMCFG_FEATURE_PLATFORM_GSP)
     {
         _confComputeDeinitSessionKeys(pGpu, pConfCompute);
-        Spdm * pSpdm = GPU_GET_SPDM(pGpu);
-        if (pSpdm != NULL && pSpdm->getProperty(pSpdm, PDB_PROP_SPDM_ENABLED))
-        {
-            status = spdmContextDeinit(pGpu, pSpdm, NV_TRUE);            
-        }
     }
 
     return status;
@@ -826,3 +808,4 @@ _confComputeGetKeyspaceSize
             NV_ASSERT_OR_RETURN(NV_FALSE, 0);
     }
 }
+

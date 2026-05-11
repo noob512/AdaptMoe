@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2014-2019 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2014-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -113,6 +113,8 @@ extern "C" {
 #define MMU_WALK_API_VERSION 2
 
 /* --------------------------- Datatypes ------------------------------------ */
+
+#define MMU_WALK_MEMDESC_MAX_SIZE 424
 
 /*!
  * Opaque library-defined state for a single page level hierarchy backing a VAS.
@@ -406,8 +408,6 @@ typedef struct
     MmuWalkCBWriteBuffer *WriteBuffer;
 } MMU_WALK_CALLBACKS;
 
-
-
 /*!
  * Flags that affect walk library behavior.
  */
@@ -441,6 +441,42 @@ typedef struct
      */
     NvBool bAtsEnabled : 1;
 } MMU_WALK_FLAGS;
+
+typedef struct MEMORY_DESCRIPTOR *PMEMORY_DESCRIPTOR;
+
+/*!
+ * Invalid MMU range information used by MMU tracer.
+ */
+typedef struct {
+  NvU64  va;
+  NvU64  vaLimit;
+  NvU32  index;
+  NvU32  indexLimit;
+  NvBool bInvalid;
+} MMU_INVALID_RANGE, *PMMU_INVALID_RANGE;
+
+/*!
+ * Information about the current level iteration state.
+ * Used for converting the MMU tracer to be iterative.
+ */
+typedef struct
+{
+    MMU_FMT_LEVEL *pFmtLevel;
+    PMEMORY_DESCRIPTOR pMemDesc;
+    NvU64 va;
+    NvU64 vaLimit;
+    NvU32 index;
+    NvU64 offset;
+    NV_STATUS status;
+    MMU_INVALID_RANGE invalidRange;
+    NvU64 entryVa;
+    NvBool isPt;
+    NvU32 subLevelIdx;
+    NvBool valid;
+    NvBool destroyMemDesc;
+    NvU8 *pBase;
+    NvU8 memDescBuf[MMU_WALK_MEMDESC_MAX_SIZE];
+} MMU_TRACE_ITER_INFO;
 
 /*!
  * User callback to map a batch of entries during an @ref mmuWalkMap operation.
@@ -756,6 +792,35 @@ mmuWalkLevelInstancesForceFree
     MMU_WALK *pWalk
 );
 
+/*!
+ * Get traceInfo[level]
+ */
+void
+mmuWalkGetTraceInfo(
+    MMU_WALK            *pWalk,
+    NvU32                level,
+    MMU_TRACE_ITER_INFO *pState
+);
+
+/*!
+ * Set traceInfo[level] to pState
+ */
+void
+mmuWalkSetTraceInfo(
+    MMU_WALK            *pWalk,
+    NvU32                level,
+    MMU_TRACE_ITER_INFO *pState
+);
+
+/*!
+ * Get traceInfo[level].memDescBuf
+ */
+void*
+mmuWalkGetTraceInfoMemDesc
+(
+    MMU_WALK *pWalk,
+    NvU32 level
+);
 /*!
  * Continue a walker operation that was previously started.
  *

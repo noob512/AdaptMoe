@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -27,6 +27,7 @@
 #include "library/debuglib.h"
 #include "library/memlib.h"
 #include "library/cryptlib.h"
+#include "library/spdm_crypt_lib.h"
 #include "libraries/utils/nvprintf.h"
 #include <rmconfig.h>
 #include "industry_standard/spdm.h"
@@ -34,6 +35,13 @@
 
 bool libspdm_requester_data_sign
 (
+//
+// Note : Even LIBSPDM_HAL_PASS_SPDM_CONTEXT is 0, we still need to add this
+//        define check; otherwise extra garbage parameters will pass in.
+//
+#if LIBSPDM_HAL_PASS_SPDM_CONTEXT
+    void                 *spdm_context,
+#endif
     spdm_version_number_t spdm_version,
     uint8_t               op_code,
     uint16_t              req_base_asym_alg,
@@ -110,9 +118,11 @@ bool libspdm_requester_data_sign
     }
 
     // RSA-PSS signature generation.
-    status = libspdm_rsa_pss_sign(rsa, LIBSPDM_CRYPTO_NID_SHA384,
-                                  message, message_size,
-                                  signature, sig_size);
+    status = libspdm_req_asym_sign_hash(spdm_version, op_code,
+                                        req_base_asym_alg,
+                                        base_hash_algo, rsa,
+                                        message, message_size,
+                                        signature, sig_size);
 
     if (!status)
     {

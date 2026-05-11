@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2014-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2014-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -29,7 +29,6 @@
 /*--------------------------------Includes------------------------------------*/
 #if defined(SRT_BUILD)
 
-#include "shrdebug.h"
 #else
 #include "os/os.h"
 #endif
@@ -1590,3 +1589,37 @@ _mmuWalkLevelInstancesForceFree
     }
 }
 
+void
+mmuWalkGetTraceInfo
+(
+    MMU_WALK            *pWalk,
+    NvU32                level,
+    MMU_TRACE_ITER_INFO *pState
+)
+{
+    NV_ASSERT_OR_RETURN_VOID(level < MMU_TRACE_MAX_LEVEL);
+    *pState = pWalk->traceInfo[level];
+}
+
+void
+mmuWalkSetTraceInfo
+(
+    MMU_WALK            *pWalk,
+    NvU32                level,
+    MMU_TRACE_ITER_INFO *pState
+)
+{
+    NV_ASSERT_OR_RETURN_VOID(level < MMU_TRACE_MAX_LEVEL);
+    pWalk->traceInfo[level] = *pState;
+}
+
+void*
+mmuWalkGetTraceInfoMemDesc
+(
+    MMU_WALK *pWalk,
+    NvU32 level
+)
+{
+    NV_ASSERT_OR_RETURN(level < MMU_TRACE_MAX_LEVEL, NULL);
+    return (void *)pWalk->traceInfo[level].memDescBuf;
+}

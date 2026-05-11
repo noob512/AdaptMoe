@@ -4,7 +4,7 @@ _out/Linux_x86_64/g_client_resource_nvoc.o: \
  ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
  ../common/sdk/nvidia/inc/nvstatus.h ../common/sdk/nvidia/inc/nvtypes.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
@@ -50,7 +50,7 @@ _out/Linux_x86_64/g_client_resource_nvoc.o: \
  generated/g_hal.h ../common/sdk/nvidia/inc/rmcd.h \
  ../common/sdk/nvidia/inc/nvcd.h inc/kernel/rmapi/control.h \
  inc/kernel/rmapi/param_copy.h inc/kernel/os/nv_memory_area.h \
- inc/kernel/rmapi/event.h generated/g_event_nvoc.h \
+ inc/kernel/rmapi/event_api.h generated/g_event_api_nvoc.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000event.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
@@ -61,7 +61,7 @@ _out/Linux_x86_64/g_client_resource_nvoc.o: \
  ../common/sdk/nvidia/inc/class/cl2080_notification.h \
  inc/libraries/utils/nvbitvector.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpuacct.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gsync.h \
  ../common/sdk/nvidia/inc/class/cl30f1.h \
@@ -77,6 +77,7 @@ _out/Linux_x86_64/g_client_resource_nvoc.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080gr.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h \
  ../common/sdk/nvidia/inc/nv_vgpu_types.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000client.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000unix.h
@@ -90,7 +91,7 @@ inc/libraries/nvport/nvport.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -167,8 +168,8 @@ generated/g_hal.h:
 inc/kernel/rmapi/control.h:
 inc/kernel/rmapi/param_copy.h:
 inc/kernel/os/nv_memory_area.h:
-inc/kernel/rmapi/event.h:
-generated/g_event_nvoc.h:
+inc/kernel/rmapi/event_api.h:
+generated/g_event_api_nvoc.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000event.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
@@ -181,7 +182,7 @@ inc/kernel/gpu/gpu_engine_type.h:
 ../common/sdk/nvidia/inc/class/cl2080_notification.h:
 inc/libraries/utils/nvbitvector.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h:
-../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpuacct.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gsync.h:
 ../common/sdk/nvidia/inc/class/cl30f1.h:
@@ -197,6 +198,7 @@ inc/libraries/utils/nvbitvector.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080gr.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h:
+../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h:
 ../common/sdk/nvidia/inc/nv_vgpu_types.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000client.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000unix.h:

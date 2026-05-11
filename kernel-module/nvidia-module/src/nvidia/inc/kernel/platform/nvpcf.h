@@ -25,6 +25,7 @@
 #define NVPCF_H
 
 #include "ctrl/ctrl0000/ctrl0000system.h"
+#include "controller/sbios_table_version.h"
 
 /*
  * Definitions for the static  params table.
@@ -74,17 +75,6 @@ typedef struct
 #define NVPCF_SYSDEV_STATIC_TABLE_COMMON_2X_PARAM0_CPU_TYPE_NVIDIA  (0x00000002)
 #define NVPCF_SYSDEV_STATIC_TABLE_COMMON_2X_PARAM0_GPU_TYPE                  7:4
 #define NVPCF_SYSDEV_STATIC_TABLE_COMMON_2X_PARAM0_GPU_TYPE_NVIDIA  (0x00000000)
-
-/*!
- * Layout of Controller 2x data used for static config
- */
-#define NVPCF_CONTROLLER_STATIC_TABLE_VERSION_20                          (0x20)
-#define NVPCF_CONTROLLER_STATIC_TABLE_VERSION_21                          (0x21)
-#define NVPCF_CONTROLLER_STATIC_TABLE_VERSION_22                          (0x22)
-#define NVPCF_CONTROLLER_STATIC_TABLE_VERSION_23                          (0x23)
-#define NVPCF_CONTROLLER_STATIC_TABLE_VERSION_24                          (0x24)
-#define NVPCF_CONTROLLER_STATIC_TABLE_VERSION_25                          (0x25)
-#define NVPCF_CONTROLLER_STATIC_TABLE_MAX_ENTRIES                         (8)
 
 // format for 2.0 and 2.1
 #define NVPCF_CONTROLLER_STATIC_TABLE_HEADER_V20_SIZE_05                 (0x05U)

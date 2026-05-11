@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2016-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2016-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -80,8 +80,6 @@
 #define RS_FLAGS_ACQUIRE_GPUS_LOCK                (RS_FLAGS_ACQUIRE_GPUS_LOCK_ON_ALLOC | RS_FLAGS_ACQUIRE_GPUS_LOCK_ON_FREE | RS_FLAGS_ACQUIRE_GPUS_LOCK_ON_DUP)
 #define RS_FLAGS_ACQUIRE_GPU_GROUP_LOCK           (RS_FLAGS_ACQUIRE_GPU_GROUP_LOCK_ON_ALLOC | RS_FLAGS_ACQUIRE_GPU_GROUP_LOCK_ON_FREE | RS_FLAGS_ACQUIRE_GPU_GROUP_LOCK_ON_DUP)
 
-#define RS_FLAGS_ACQUIRE_RELAXED_GPUS_LOCK_ON_DUP NVBIT(17) /// < If the object is a GPU resource and the src/dst GPUs are the same, take the GPU Group Lock. Take all GPUs lock otherwise.
-
 /**
  * Use RO API lock even if NV_REG_STR_RM_READONLY_API_LOCK_ALLOC_RESOURCE is not set.
  *
@@ -90,5 +88,15 @@
  *  default. Default enablement is tracked in bug 4283710.
  */
 #define RS_FLAGS_FORCE_ACQUIRE_RO_API_LOCK_ON_ALLOC_FREE     NVBIT(17)
+
+/**
+ * Take the GPU Group Lock if the below two conditions are met:
+ * 1. The src object and the parent of the dst object are either
+ *    GpuResource or descendant of a Device Object.
+ * 2. The src and dst GPUs (From the GpuResource or Device Object) are the same.
+ *
+ * Take all GPUs lock otherwise.
+ */
+#define RS_FLAGS_ACQUIRE_RELAXED_GPUS_LOCK_ON_DUP NVBIT(18)
 
 #endif // _RESOURCE_DESC_FLAGS_H_

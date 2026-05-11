@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -56,10 +56,16 @@ static inline nv_firmware_chip_family_t nv_firmware_get_chip_family(
             return NV_FIRMWARE_CHIP_FAMILY_GH100;
 
         case GPU_ARCHITECTURE_BLACKWELL_GB1XX:
-            return NV_FIRMWARE_CHIP_FAMILY_GB10X;
+            if (gpuImpl == GPU_IMPLEMENTATION_GB10B)
+                return NV_FIRMWARE_CHIP_FAMILY_GB10Y;
+            else
+                return NV_FIRMWARE_CHIP_FAMILY_GB10X;
 
         case GPU_ARCHITECTURE_BLACKWELL_GB2XX:
-            return NV_FIRMWARE_CHIP_FAMILY_GB20X;
+            if (gpuImpl >= GPU_IMPLEMENTATION_GB20B)
+                return NV_FIRMWARE_CHIP_FAMILY_GB20Y;
+            else
+                return NV_FIRMWARE_CHIP_FAMILY_GB20X;
 
     }
 
@@ -75,6 +81,7 @@ typedef enum
     NV_FIRMWARE_TASK_MNOC,
     NV_FIRMWARE_TASK_DEBUG,
     NV_FIRMWARE_TASK_ROOT,
+    NV_FIRMWARE_TASK_RM_STATE_MONITOR,
 
     NV_FIRMWARE_TASK_COUNT
 } nv_firmware_task_t;
@@ -90,7 +97,7 @@ typedef struct
     const char *memory_id;
     const char *prefix;
     const char *elf_section_name;
-    const libosMappingType supported_os;
+    const NvU8 supported_os; // bitmask
 } nv_firmware_task_log_info_t;
 
 static inline
@@ -98,13 +105,14 @@ const nv_firmware_task_log_info_t *nv_firmware_get_task_log_infos(unsigned *num_
 {
     const static nv_firmware_task_log_info_t infos[] =
     {
-        {"LOGINIT", "INIT", ".fwlogging_init",  NV_FIRMWARE_LIBOS2_SUPPORTED | NV_FIRMWARE_LIBOS3_SUPPORTED},
-        {"LOGRM",   "RM",   ".fwlogging_rm",    NV_FIRMWARE_LIBOS2_SUPPORTED | NV_FIRMWARE_LIBOS3_SUPPORTED},
-        {"LOGINTR", "INTR", ".fwlogging_rm",    NV_FIRMWARE_LIBOS3_SUPPORTED},
-        {"LOGVGPU", "VGPU", ".fwlogging_vgpu",  NV_FIRMWARE_LIBOS2_SUPPORTED | NV_FIRMWARE_LIBOS3_SUPPORTED},
-        {"LOGMNOC", "MNOC", ".fwlogging_mnoc",  NV_FIRMWARE_LIBOS3_SUPPORTED},
-        {"LOGDBG",  "DBG",  ".fwlogging_debug", NV_FIRMWARE_LIBOS3_SUPPORTED},
-        {"LOGROOT", "ROOT", ".fwlogging_start", NV_FIRMWARE_LIBOS3_SUPPORTED},
+        {"LOGINIT", "INIT",   ".fwlogging_init",  NV_FIRMWARE_LIBOS2_SUPPORTED | NV_FIRMWARE_LIBOS3_SUPPORTED},
+        {"LOGRM",   "RM",     ".fwlogging_rm",    NV_FIRMWARE_LIBOS2_SUPPORTED | NV_FIRMWARE_LIBOS3_SUPPORTED},
+        {"LOGINTR", "INTR",   ".fwlogging_rm",    NV_FIRMWARE_LIBOS3_SUPPORTED},
+        {"LOGVGPU", "VGPU",   ".fwlogging_vgpu",  NV_FIRMWARE_LIBOS2_SUPPORTED | NV_FIRMWARE_LIBOS3_SUPPORTED},
+        {"LOGMNOC", "MNOC",   ".fwlogging_mnoc",  NV_FIRMWARE_LIBOS3_SUPPORTED},
+        {"LOGDBG",  "DBG",    ".fwlogging_debug", NV_FIRMWARE_LIBOS3_SUPPORTED},
+        {"LOGROOT", "ROOT",   ".fwlogging_start", NV_FIRMWARE_LIBOS3_SUPPORTED},
+        {"LOGRMON", "RMON",   ".fwlogging_rm",    NV_FIRMWARE_LIBOS3_SUPPORTED},
     };
 
     *num_infos = NV_ARRAY_ELEMENTS(infos);
@@ -157,6 +165,10 @@ const nv_firmware_kernel_log_info_t *nv_firmware_get_kernel_log_infos(unsigned *
 {
     const static nv_firmware_kernel_log_info_t infos[] =
     {
+        {".fwlogging_kernel_gb20y",
+        {GPU_ARCHITECTURE_BLACKWELL_GB2XX, GPU_ARCHITECTURE_BLACKWELL_GB2XX}, // gb20y
+        {GPU_IMPLEMENTATION_GB20B, 0}
+        },
         {".fwlogging_kernel_gb20x",
          {GPU_ARCHITECTURE_BLACKWELL_GB2XX}, // gb20x...
         },

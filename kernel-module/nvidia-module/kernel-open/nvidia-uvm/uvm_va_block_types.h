@@ -49,8 +49,8 @@
 
 #define PAGES_PER_UVM_VA_BLOCK          (UVM_VA_BLOCK_SIZE / PAGE_SIZE)
 
-#define UVM_MIN_BIG_PAGE_SIZE           UVM_PAGE_SIZE_64K
-#define MAX_BIG_PAGES_PER_UVM_VA_BLOCK  (UVM_VA_BLOCK_SIZE / UVM_MIN_BIG_PAGE_SIZE)
+#define UVM_BIG_PAGE_SIZE               UVM_PAGE_SIZE_64K
+#define UVM_BIG_PAGES_PER_UVM_VA_BLOCK  (UVM_VA_BLOCK_SIZE / UVM_BIG_PAGE_SIZE)
 
 // Prefetch heuristics shift the VA Block page mask so that it is always
 // aligned to big page granularity. Big page is guaranteed not to exceed
@@ -101,14 +101,14 @@ typedef struct
     // it contains both those big PTEs which are being modified by the
     // operation, and any pre-existing big PTEs which remain unchanged. The
     // latter will not have the corresponding bit set in big_ptes_covered.
-    DECLARE_BITMAP(big_ptes, MAX_BIG_PAGES_PER_UVM_VA_BLOCK);
+    DECLARE_BITMAP(big_ptes, UVM_BIG_PAGES_PER_UVM_VA_BLOCK);
 
     // These are the big PTE regions which the operation is touching. These may
     // or may not be big PTEs: use the big_ptes bitmap to determine that. For
     // example, a bit set here but not in big_ptes means that the PTE size for
     // that region should be 4k, and that some of those 4k PTEs will be written
     // by the operation.
-    DECLARE_BITMAP(big_ptes_covered, MAX_BIG_PAGES_PER_UVM_VA_BLOCK);
+    DECLARE_BITMAP(big_ptes_covered, UVM_BIG_PAGES_PER_UVM_VA_BLOCK);
 } uvm_va_block_new_pte_state_t;
 
 // Event that triggered the call to uvm_va_block_make_resident/
@@ -260,11 +260,6 @@ typedef struct
         // mask can be used concurrently with other page masks.
         uvm_page_mask_t big_split_page_mask;
 
-        // Mask used by block_unmap_gpu to track non_uvm_lite_gpus which have
-        // this block mapped. This mask can be used concurrently with other page
-        // masks.
-        uvm_processor_mask_t non_uvm_lite_gpus;
-
         uvm_page_mask_t page_mask;
         uvm_page_mask_t filtered_page_mask;
         uvm_page_mask_t migratable_mask;
@@ -285,6 +280,27 @@ typedef struct
     {
         uvm_page_mask_t running_page_mask;
     } update_read_duplicated_pages;
+
+    struct
+    {
+        // Mask used by both UVM discard API and VA block migration code.
+        //
+        // UvmDiscard uses it as per-VA block mask holding the set of pages that
+        // are being discarded in that block.
+        //
+        // Migration API uses it as the subset of pages that are being migrated
+        // that are also discarded. This is needed in order to correctly update
+        // residency status.
+        uvm_page_mask_t discarded_pages;
+
+        // Scratch page mask. This page amsk is used as scratch space for
+        // computing page mask during discard operations.
+        uvm_page_mask_t scratch_page_mask;
+
+        // Mask used during migrations to track pages that can be
+        // read-duplicated vs pages that need to be collapsed.
+        uvm_page_mask_t make_resident_mask;
+    } discard;
 
     // mm to use for the operation. If this is non-NULL, the caller guarantees
     // that the mm will be valid (reference held) for the duration of the
@@ -326,19 +342,6 @@ typedef enum
     UVM_VA_BLOCK_TRANSFER_MODE_MOVE = 1,
     UVM_VA_BLOCK_TRANSFER_MODE_COPY = 2
 } uvm_va_block_transfer_mode_t;
-
-struct uvm_reverse_map_struct
-{
-    // VA block where the VA region of this Phys/DMA -> Virt translation
-    // belongs to
-    uvm_va_block_t             *va_block;
-
-    // VA block region covered by this translation
-    uvm_va_block_region_t         region;
-
-    // Processor the physical memory range belongs to
-    uvm_processor_id_t             owner;
-};
 
 typedef enum
 {

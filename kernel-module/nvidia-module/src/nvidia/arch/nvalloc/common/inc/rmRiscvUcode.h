@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2018-2019 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2018-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -77,13 +77,19 @@ typedef struct {
     NvU32  swbromDataOffset;
     NvU32  swbromDataSize;
     //
-    // Total size of FB carveout (image and reserved space).  
+    // Total size of FB carveout (image and reserved space).
     //
     NvU32  fbReservedSize;
     //
     // Indicates whether the entire RISC-V image is signed as "code" in code section.
     //
     NvU32  bSignedAsCode;
+    //
+    // SMP (multihart) and PLIC (split interrupts)
+    // enablement options
+    //
+    NvU32 bIsSmp;
+    NvU32 bIsPlicEnabled;
 } RM_RISCV_UCODE_DESC;
 
 #endif  // RM_RISCV_UCODE_H

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -46,7 +46,7 @@
 #include "vgpu/vgpu_events.h"
 #include "gpu/mem_sys/kern_mem_sys.h"
 #if RMCFG_FEATURE_GSPRM_BULLSEYE || defined(GSPRM_BULLSEYE_ENABLE)
-#include "diagnostics/code_coverage_mgr.h"
+#include "diagnostics/instrumentation_manager.h"
 #endif
 
 ct_assert(NVA084_MAX_VMMU_SEGMENTS == NV2080_CTRL_MAX_VMMU_SEGMENTS);
@@ -113,6 +113,7 @@ kernelhostvgpudeviceapiConstruct_IMPL
                                    pAllocParams->bDisableDefaultSmcExecPartRestore,
                                    pAllocParams->placementId,
                                    pAllocParams->vgpuDevName,
+                                   pAllocParams->accountingPid,
                                    &pKernelHostVgpuDevice);
     if (status != NV_OK)
     {
@@ -229,7 +230,7 @@ _kernelhostvgpudeviceInvalidateGpuTLBL2Cache(OBJGPU *pGpu, Device *pDevice)
     /* Invalidate TLBs for non SR-IOV vGPUs */
     if (!gpuIsSriovEnabled(pGpu))
         kgmmuInvalidateTlb_HAL(pGpu, pKernelGmmu, NULL, VASPACE_FLAGS_NONE,
-                               PTE_DOWNGRADE, GPU_GFID_PF, NV_GMMU_INVAL_SCOPE_ALL_TLBS);
+                               PTE_DOWNGRADE, GPU_GFID_PF, NV_GMMU_INVAL_SCOPE_ALL_TLBS, NV_FALSE);
 
     /* Invalidate L2 cache for sysmem */
     pl2_params->flags =
@@ -881,7 +882,6 @@ kernelhostvgpudeviceapiCtrlCmdBootloadVgpuTask_IMPL
     NvU32 i;
     NvU64 vmmuSegmentSize;
     RsClient *pClient = NULL;
-    NvBool bPreserveLogBufferFull = NV_FALSE;
 
     if (!IS_GSP_CLIENT(pGpu))
         return NV_ERR_NOT_SUPPORTED;
@@ -1030,8 +1030,7 @@ kernelhostvgpudeviceapiCtrlCmdBootloadVgpuTask_IMPL
                                                              pBootloadParams->vgpuTaskLogBuffOffset,
                                                              pBootloadParams->vgpuTaskLogBuffSize,
                                                              pBootloadParams->kernelLogBuffOffset,
-                                                             pBootloadParams->kernelLogBuffSize,
-                                                             &bPreserveLogBufferFull),
+                                                             pBootloadParams->kernelLogBuffSize),
                             done);
     }
 
@@ -1057,15 +1056,12 @@ kernelhostvgpudeviceapiCtrlCmdBootloadVgpuTask_IMPL
                              NV2080_CTRL_CMD_VGPU_MGR_INTERNAL_BOOTLOAD_GSP_VGPU_PLUGIN_TASK,
                              pBootloadParams, sizeof(*pBootloadParams));
 
-    if (!bPreserveLogBufferFull)
-    {
-        // Preserve any captured vGPU Partition logs
-        NV_ASSERT_OK(kgspPreserveVgpuPartitionLogging(pGpu, pKernelGsp, pKernelHostVgpuDevice->gfid));
-    }
+    // Preserve any captured vGPU Partition logs
+    NV_ASSERT_OK(kgspPreserveVgpuPartitionLogging(pGpu, pKernelGsp, pKernelHostVgpuDevice->gfid));
 
 #if RMCFG_FEATURE_GSPRM_BULLSEYE || defined(GSPRM_BULLSEYE_ENABLE)
     OBJSYS *pSys = SYS_GET_INSTANCE();
-    codecovmgrResetCoverage(pSys->pCodeCovMgr, pKernelHostVgpuDevice->gfid, pGpu->gpuInstance);
+    instrumentationmanagerReset(pSys->pInstrumentationManager, pKernelHostVgpuDevice->gfid, pGpu->gpuInstance);
 #endif
     if (status != NV_OK && pBootloadParams != NULL)
     {
@@ -1140,18 +1136,20 @@ kernelhostvgpudeviceapiCtrlCmdSetPlacementId_IMPL
 
         portMemSet(&tmpEngineInfo, 0, sizeof(ENGINE_INFO));
 
-        NV_ASSERT_OK_OR_RETURN(kfifoGetHostDeviceInfoTable_HAL(pGpu, pKernelFifo, &tmpEngineInfo, pMigDevice));
-
-        rmStatus = vgpuMgrReserveSystemChannelIDs(pGpu,
-                                                  vgpuTypeInfo,
-                                                  pKernelHostVgpuDevice->gfid,
-                                                  pKernelHostVgpuDevice->chidOffset,
-                                                  pKernelHostVgpuDevice->channelCount,
-                                                  pMigDevice,
-                                                  pParams->numChannels,
-                                                  pKernelHostVgpuDevice->placementId,
-                                                  tmpEngineInfo.engineInfoListSize,
-                                                  tmpEngineInfo.engineInfoList);
+        rmStatus = kfifoGetHostDeviceInfoTable_HAL(pGpu, pKernelFifo, &tmpEngineInfo, pMigDevice);
+        if (rmStatus == NV_OK)
+        {
+            rmStatus = vgpuMgrReserveSystemChannelIDs(pGpu,
+                                                      vgpuTypeInfo,
+                                                      pKernelHostVgpuDevice->gfid,
+                                                      pKernelHostVgpuDevice->chidOffset,
+                                                      pKernelHostVgpuDevice->channelCount,
+                                                      pMigDevice,
+                                                      pParams->numChannels,
+                                                      pKernelHostVgpuDevice->placementId,
+                                                      tmpEngineInfo.engineInfoListSize,
+                                                      tmpEngineInfo.engineInfoList);
+        }
 
         portMemFree(tmpEngineInfo.engineInfoList);
         tmpEngineInfo.engineInfoList = NULL;

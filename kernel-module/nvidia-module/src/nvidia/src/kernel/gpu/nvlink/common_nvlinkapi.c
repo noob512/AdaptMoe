@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -83,7 +83,7 @@ subdeviceCtrlCmdBusGetNvlinkCaps_VF
 static void _calculateNvlinkCaps
 (
     OBJGPU *pGpu,
-    NvU64   bridgeSensableLinks,
+    NVLINK_BIT_VECTOR *bridgeSensableLinks,
     NvU32   bridgedLinks,
     NvU32   ipVerNvlink,
     NvBool  bMIGNvLinkP2PSupported,
@@ -107,7 +107,7 @@ static void _calculateNvlinkCaps
         // This GPU supports SLI bridge sensing if any of the links
         // support bridge sensing.
         //
-        if (bridgeSensableLinks != 0)
+        if (!bitVectorTestAllCleared(bridgeSensableLinks))
         {
             RMCTRL_SET_CAP(tempCaps, NV2080_CTRL_NVLINK_CAPS, _SLI_BRIDGE_SENSABLE);
         }
@@ -237,13 +237,16 @@ nvlinkCtrlCmdBusGetNvlinkCaps
     NV2080_CTRL_CMD_NVLINK_GET_NVLINK_CAPS_PARAMS *pParams
 )
 {
+    NV_STATUS status;
     KernelMIGManager *pKernelMIGManager      = GPU_GET_KERNEL_MIG_MANAGER(pGpu);
     NvBool            bMIGNvLinkP2PSupported = ((pKernelMIGManager != NULL) &&
                                                 kmigmgrIsMIGNvlinkP2PSupported(pGpu, pKernelMIGManager));
 
     // Initialize link masks to 0
     pParams->enabledLinkMask    = 0;
+    portMemSet(&pParams->enabledLinks, 0, sizeof(pParams->enabledLinks));
     pParams->discoveredLinkMask = 0;
+    portMemSet(&pParams->discoveredLinks, 0, sizeof(pParams->discoveredLinks));
 
     if (IS_VGPU_GSP_PLUGIN_OFFLOAD_ENABLED(pGpu) && RMCFG_FEATURE_PLATFORM_GSP)
     {
@@ -252,11 +255,16 @@ nvlinkCtrlCmdBusGetNvlinkCaps
     else
     {
         KernelNvlink *pKernelNvlink = GPU_GET_KERNEL_NVLINK(pGpu);
+        NVLINK_BIT_VECTOR *pLocalLinkMask = NULL;
+        
         if (pKernelNvlink == NULL)
         {
             NV_PRINTF(LEVEL_INFO, "Kernel NVLink is unavailable. Returning.\n");
             return NV_OK;
         }
+
+        pLocalLinkMask = knvlinkGetEnabledLinkMask(pGpu, pKernelNvlink);
+
         // With MIG memory partitioning, NvLink P2P or sysmem accesses are not allowed
         if (bMIGNvLinkP2PSupported)
         {
@@ -267,16 +275,68 @@ nvlinkCtrlCmdBusGetNvlinkCaps
             //
             knvlinkFilterBridgeLinks_HAL(pGpu, pKernelNvlink);
         }
-        _calculateNvlinkCaps(pGpu, pKernelNvlink->bridgeSensableLinks, pKernelNvlink->bridgedLinks,
+        _calculateNvlinkCaps(pGpu, &pKernelNvlink->bridgeSensableLinks, pKernelNvlink->bridgedLinks,
                              pKernelNvlink->ipVerNvlink, bMIGNvLinkP2PSupported,
                              pKernelNvlink->getProperty(pNvlink, PDB_PROP_KNVLINK_ENABLED),
                              pKernelNvlink->getProperty(pKernelNvlink, PDB_PROP_KNVLINK_UNCONTAINED_ERROR_RECOVERY_SUPPORTED),
                              pParams);
 
-        pParams->discoveredLinkMask = KNVLINK_GET_MASK(pKernelNvlink, discoveredLinks, 32);
-        pParams->discoveredLinks    = knvlinkGetDiscoveredLinkMask(pGpu, pKernelNvlink);
-        pParams->enabledLinkMask    = KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 32);
-        pParams->enabledLinks       = knvlinkGetEnabledLinkMask(pGpu, pKernelNvlink);
+        NVLINK_BIT_VECTOR * pDiscoveredLinks = knvlinkGetDiscoveredLinkMask(pGpu, pKernelNvlink);
+        if (pDiscoveredLinks == NULL)
+        {
+            NV_PRINTF(LEVEL_ERROR, "Failed to get discovered link mask!\n");
+        }
+
+        //
+        // copy data to legacy NvU32 mask
+        // TODO: delete after clients move and the field is deprecated
+        //
+        {
+            status = convertBitVectorToLinkMasks(pDiscoveredLinks,
+                                                &pParams->discoveredLinkMask,
+                                                sizeof(pParams->discoveredLinkMask),
+                                                NULL);
+            if (status != NV_OK)
+            {
+                NV_PRINTF(LEVEL_ERROR, "Failed to convert bit vector to discovered link mask! 0x%x\n", status);
+                return status;
+            }
+        }
+
+        status = convertBitVectorToLinkMasks(pDiscoveredLinks, NULL, 0,
+                                             &pParams->discoveredLinks);
+        if (status != NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR, "Failed to convert bit vector to discovered links! 0x%x\n", status);
+            return status;
+        }
+
+        //
+        // copy data to legacy NvU32 mask
+        // TODO: delete after clients move and the field is deprecated
+        //
+        {
+            status = convertBitVectorToLinkMasks(pLocalLinkMask,
+                                                &pParams->enabledLinkMask,
+                                                sizeof(pParams->enabledLinkMask),
+                                                NULL);
+            if (status != NV_OK)
+            {
+                NV_PRINTF(LEVEL_ERROR, "Failed to convert bit vector to enabled link mask! 0x%x\n", status);
+                return status;
+            }
+
+            pLocalLinkMask = knvlinkGetEnabledLinkMask(pGpu, pKernelNvlink);
+        }
+
+        status = convertBitVectorToLinkMasks(pLocalLinkMask, NULL, 0,
+                                             &pParams->enabledLinks);
+        if (status != NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR, "Failed to convert bit vector to enabled links! 0x%x\n", status);
+            return status;
+        }
+
     }
 
     return NV_OK;
@@ -287,7 +347,7 @@ static _getNvlinkStatus
 (
     OBJGPU *pGpu,
     NV2080_CTRL_INTERNAL_NVLINK_GET_LINK_AND_CLOCK_INFO_PARAMS *nvlinkLinkAndClockInfoParams,
-    NvU64 bridgeSensableLinks,
+    NVLINK_BIT_VECTOR *bridgeSensableLinks,
     NvU32 bridgedLinks,
     NvU32 ipVerNvlink,
     NvlinkLinkStatus nvlinkLinks[NVLINK_MAX_LINKS_SW],
@@ -302,21 +362,36 @@ static _getNvlinkStatus
 {
     NvU8   i = 0;
     NvU8   tempCaps[NV2080_CTRL_NVLINK_CAPS_TBL_SIZE];
-    NvU32  r = 0;
     OBJGPU *remotePeer0 = NULL;
     NvBool bPeerLink, bSysmemLink, bSwitchLink;
+    NVLINK_BIT_VECTOR localLinkMask;
 
-    r = pParams->enabledLinkMask;
-    while (r >>= 1 ) i++;
+    if (convertLinkMasksToBitVector(&pParams->enabledLinkMask,
+                                    sizeof(pParams->enabledLinkMask),
+                                    &pParams->enabledLinks, &localLinkMask) != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Failed to convert enabled link masks to bitvector\n");
+    }
 
-    NV_ASSERT(i <= NV2080_CTRL_NVLINK_MAX_LINKS);
+    i = bitVectorCountSetBits(&localLinkMask);
 
-    FOR_EACH_INDEX_IN_MASK(32, i, pParams->enabledLinkMask)
+    NV_ASSERT_OR_RETURN_VOID(i <= NV2080_CTRL_NVLINK_MAX_LINKS);
+
+    // Copy out nvlpwMask
+    pParams->enabledNvlpwMask = nvlinkLinkAndClockInfoParams->enabledNvlpwMask;
+
+    FOR_EACH_IN_BITVECTOR(&localLinkMask, i)
     {
         bPeerLink   = NV_FALSE;
         bSysmemLink = NV_FALSE;
         bSwitchLink = NV_FALSE;
         NV2080_CTRL_INTERNAL_NVLINK_GET_LINK_AND_CLOCK_VALUES *pLinkAndClockValues;
+
+        if (i >= NV2080_CTRL_INTERNAL_NVLINK_MAX_ARR_SIZE)
+        {
+            NV_PRINTF(LEVEL_ERROR, "Trying to access out out bounds link from link mask! %d\n", i);
+            return;
+        }
 
         pLinkAndClockValues = &nvlinkLinkAndClockInfoParams->linkInfo[i];
 
@@ -351,13 +426,13 @@ static _getNvlinkStatus
         }
 
         // Indicate per-link bridge sense status
-        if (bridgeSensableLinks & NVBIT(i))
+        if (bitVectorTest(bridgeSensableLinks, i))
         {
             RMCTRL_SET_CAP(tempCaps, NV2080_CTRL_NVLINK_CAPS, _SLI_BRIDGE_SENSABLE);
         }
 
         // Indicate per-link bridge status
-        if (bridgedLinks & NVBIT(i))
+        if (bridgedLinks & NVBIT64(i))
         {
             RMCTRL_SET_CAP(tempCaps, NV2080_CTRL_NVLINK_CAPS, _SLI_BRIDGE);
         }
@@ -397,6 +472,7 @@ static _getNvlinkStatus
         pParams->linkInfo[i].linkState       = pLinkAndClockValues->linkState;
         pParams->linkInfo[i].txSublinkStatus = (NvU8) pLinkAndClockValues->txSublinkState;
         pParams->linkInfo[i].rxSublinkStatus = (NvU8) pLinkAndClockValues->rxSublinkState;
+        pParams->linkInfo[i].nvlpwIdx        = pLinkAndClockValues->nvlpwIdx;
 
         // Initialize the lane reversal state information for the link
         pParams->linkInfo[i].bLaneReversal = pLinkAndClockValues->bLaneReversal;
@@ -581,7 +657,7 @@ static _getNvlinkStatus
                         KernelNvlink *pRemoteKernelNvlink = GPU_GET_KERNEL_NVLINK(remotePeer0);
                         if (pRemoteKernelNvlink)
                         {
-                            if (pRemoteKernelNvlink->discoveredLinks == 0)
+                            if (bitVectorTestAllCleared(&pRemoteKernelNvlink->discoveredLinks))
                             {
                                 // There are no links on this remote, fall back to loopback.
                                 remotePeer0 = pGpu;
@@ -634,7 +710,7 @@ static _getNvlinkStatus
             }
         }
     }
-    FOR_EACH_INDEX_IN_MASK_END;
+    FOR_EACH_IN_BITVECTOR_END();
 }
 
 //
@@ -683,9 +759,33 @@ subdeviceCtrlCmdBusGetNvlinkStatus_IMPL
 
             if (IS_VGPU_GSP_PLUGIN_OFFLOAD_ENABLED(pGpu))
             {
-                FOR_EACH_INDEX_IN_MASK(32, i, pParams->enabledLinkMask)
+                NVLINK_BIT_VECTOR localLinkMask;
+
+                status = convertLinkMasksToBitVector(&pParams->enabledLinkMask,
+                                                     sizeof(pParams->enabledLinkMask),
+                                                     &pParams->enabledLinks,
+                                                     &localLinkMask);
+                if (status != NV_OK)
                 {
-                    NV2080_CTRL_NVLINK_DEVICE_INFO *pDeviceInfo = &pParams->linkInfo[i].remoteDeviceInfo;
+                    NV_PRINTF(LEVEL_ERROR, "Failed to convert enabled link masks to bit vector! 0x%x\n", status);
+                    return status;
+                }
+
+                i = bitVectorCountSetBits(&localLinkMask);
+
+                NV_ASSERT_OR_RETURN(i <= NV2080_CTRL_NVLINK_MAX_LINKS, NV_ERR_INVALID_STATE);
+
+                FOR_EACH_IN_BITVECTOR(&localLinkMask, i)
+                {
+                    NV2080_CTRL_NVLINK_DEVICE_INFO *pDeviceInfo;
+
+                    if (i >= NV2080_CTRL_NVLINK_MAX_ARR_SIZE)
+                    {
+                        NV_PRINTF(LEVEL_ERROR, "Trying to access out of bounds link from link mask! %d\n", i);
+                        return NV_ERR_INVALID_ARGUMENT;
+                    }
+
+                    pDeviceInfo = &pParams->linkInfo[i].remoteDeviceInfo;
                     if (pDeviceInfo->deviceType == NV2080_CTRL_NVLINK_DEVICE_INFO_DEVICE_TYPE_SWITCH)
                     	continue;
                     OBJGPU *pLoopGpu = gpumgrGetGpuFromUuid(pDeviceInfo->deviceUUID,
@@ -707,7 +807,7 @@ subdeviceCtrlCmdBusGetNvlinkStatus_IMPL
                         portMemSet(pDeviceInfo->deviceUUID, 0, sizeof(pDeviceInfo->deviceUUID));
                     }
                 }
-                FOR_EACH_INDEX_IN_MASK_END;
+                FOR_EACH_IN_BITVECTOR_END();
             }
 
             return status;
@@ -720,6 +820,7 @@ subdeviceCtrlCmdBusGetNvlinkStatus_IMPL
 
     // Initialize link mask to 0
     pParams->enabledLinkMask = 0;
+    portMemSet(&pParams->enabledLinks, 0, sizeof(pParams->enabledLinks));
 
     if (!bMIGNvLinkP2PSupported)
     {
@@ -744,6 +845,7 @@ subdeviceCtrlCmdBusGetNvlinkStatus_IMPL
     else
     {
         KernelNvlink *pKernelNvlink = GPU_GET_KERNEL_NVLINK(pGpu);
+        NVLINK_BIT_VECTOR localLinkMask;
 
         if (pKernelNvlink == NULL)
         {
@@ -783,9 +885,32 @@ subdeviceCtrlCmdBusGetNvlinkStatus_IMPL
         knvlinkFilterBridgeLinks_HAL(pGpu, pKernelNvlink);
 
         // If nvlink is not ready don't report back any links as being enabled
-        pParams->enabledLinkMask = (bIsNvlinkReady) ? KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 32) : 0x0;
+        bitVectorClrAll(&localLinkMask);
+        if (bIsNvlinkReady)
+        {
+            bitVectorCopy(&localLinkMask, knvlinkGetEnabledLinkMask(pGpu, pKernelNvlink));
+        }
 
-        pTmpData->nvlinkLinkAndClockInfoParams.linkMask = pParams->enabledLinkMask;
+        status = convertBitVectorToLinkMasks(&localLinkMask,
+                                             &pParams->enabledLinkMask,
+                                             sizeof(pParams->enabledLinkMask),
+                                             &pParams->enabledLinks);
+        if (status != NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR, "Failed to convert bit vector to enabled link masks! 0x%x\n", status);
+            goto done;
+        }
+
+        status = convertBitVectorToLinkMasks(&localLinkMask,
+                                             &pTmpData->nvlinkLinkAndClockInfoParams.linkMask,
+                                             sizeof(pTmpData->nvlinkLinkAndClockInfoParams.linkMask),
+                                             &pTmpData->nvlinkLinkAndClockInfoParams.links);
+        if (status != NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR, "Failed to convert bit vector to link masks! 0x%x\n", status);
+            goto done;
+        }
+
         pTmpData->nvlinkLinkAndClockInfoParams.bSublinkStateInst = NV_TRUE;
 
         status = knvlinkExecGspRmRpc(pGpu, pKernelNvlink,
@@ -798,8 +923,14 @@ subdeviceCtrlCmdBusGetNvlinkStatus_IMPL
             goto done;
         }
 
-        FOR_EACH_INDEX_IN_MASK(32, i, pParams->enabledLinkMask)
+        FOR_EACH_IN_BITVECTOR(&localLinkMask, i)
         {
+            if (i >= NVLINK_MAX_LINKS_SW)
+            {
+                NV_PRINTF(LEVEL_ERROR, "Trying to access incorrect link from mask! %d\n", i);
+                goto done;
+            }
+
             pTmpData->nvlinkLinks[i].laneRxdetStatusMask = pKernelNvlink->nvlinkLinks[i].laneRxdetStatusMask;
 
 #if defined(INCLUDE_NVLINK_LIB)
@@ -820,11 +951,13 @@ subdeviceCtrlCmdBusGetNvlinkStatus_IMPL
             }
 #endif
         }
-        FOR_EACH_INDEX_IN_MASK_END;
+        FOR_EACH_IN_BITVECTOR_END();
+
+        pParams->bNvleModeEnabled = pKernelNvlink->getProperty(pKernelNvlink, PDB_PROP_KNVLINK_ENCRYPTION_ENABLED);
 
         _getNvlinkStatus(pGpu,
                          &pTmpData->nvlinkLinkAndClockInfoParams,
-                         pKernelNvlink->bridgeSensableLinks,
+                         &pKernelNvlink->bridgeSensableLinks,
                          pKernelNvlink->bridgedLinks,
                          pKernelNvlink->ipVerNvlink,
                          pTmpData->nvlinkLinks,

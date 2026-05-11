@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -57,29 +57,6 @@ gpuGenGidData_VF
         return NV_OK;
     }
     return NV_ERR_NOT_SUPPORTED;
-}
-
-/*!
- * @brief       Returns FBIO Floorsweeping Mask
- *
- * @param[in]   pGpu            OBJGPU pointer
- * @returns     FBIO Floorsweeping Mask - On is enabled
- *
- */
-NvU64 gpuGetActiveFBIOs_VF
-(
-    OBJGPU *pGpu
-)
-{
-    // Cache is not valid.
-    if (pGpu->activeFBIOs == 0)
-    {
-        VGPU_STATIC_INFO *pVSI = GPU_GET_STATIC_INFO(pGpu);
-        if (pVSI)
-            pGpu->activeFBIOs = pVSI->fbioMask;
-    }
-    // Return the cached map of available FBIOs
-    return pGpu->activeFBIOs;
 }
 
 NV_STATUS
@@ -207,7 +184,6 @@ NV_STATUS
 gpuGetNameString_VF
 (
     OBJGPU *pGpu,
-    NvU32 type,
     void *nameStringBuffer
 )
 {
@@ -215,16 +191,8 @@ gpuGetNameString_VF
 
     NV_ASSERT_OR_RETURN(pVSI != NULL, NV_ERR_INVALID_STATE);
 
-    if (type == NV2080_CTRL_GPU_GET_NAME_STRING_FLAGS_TYPE_ASCII)
-    {
-        portMemCopy(nameStringBuffer, sizeof(pVSI->adapterName),
-                    pVSI->adapterName, sizeof(pVSI->adapterName));
-    }
-    else
-    {
-        portMemCopy(nameStringBuffer, sizeof(pVSI->adapterName_Unicode),
-                    pVSI->adapterName_Unicode, sizeof(pVSI->adapterName_Unicode));
-    }
+    portMemCopy(nameStringBuffer, sizeof(pVSI->adapterName),
+                pVSI->adapterName, sizeof(pVSI->adapterName));
 
     return NV_OK;
 }
@@ -288,7 +256,7 @@ gpuConstructDeviceInfoTable_VF
         NV2080_CTRL_INTERNAL_DEVICE_INFO *pSrc =
             &pVSI->deviceInfoTable.deviceInfoTable[i];
 
-        pGpu->pDeviceInfoTable[i] = (DEVICE_INFO2_ENTRY){
+        pGpu->pDeviceInfoTable[i] = (DEVICE_INFO_ENTRY){
             .faultId                = pSrc->faultId,
             .instanceId             = pSrc->instanceId,
             .typeEnum               = pSrc->typeEnum,
@@ -298,11 +266,21 @@ gpuConstructDeviceInfoTable_VF
             .rlEngId                = pSrc->rlEngId,
             .groupId                = pSrc->groupId,
             .runlistPriBase         = pSrc->runlistPriBase,
-            .groupId                = pSrc->groupId,
             .ginTargetId            = pSrc->ginTargetId,
             .deviceBroadcastPriBase = pSrc->deviceBroadcastPriBase,
             .groupLocalInstanceId   = pSrc->groupLocalInstanceId
         };
+
+        NV_PRINTF(LEVEL_INFO, "VF: Engine Entry [%d]\n", i);
+        NV_PRINTF(LEVEL_INFO, "VF:     Type Enum        : %d\n",     pSrc->typeEnum);
+        NV_PRINTF(LEVEL_INFO, "VF:     DieletGlobal Id  : %d\n",     pSrc->instanceId);
+        NV_PRINTF(LEVEL_INFO, "VF:     Dielet, LocalId  : %d, %d\n", pSrc->groupId, pSrc->groupLocalInstanceId);
+        NV_PRINTF(LEVEL_INFO, "VF:     Fault Id         : %d\n",     pSrc->faultId);
+        NV_PRINTF(LEVEL_INFO, "VF:     Reset Id         : %d\n",     pSrc->resetId);
+        NV_PRINTF(LEVEL_INFO, "VF:     Device PRI Base  : 0x%x\n",   pSrc->devicePriBase);
+        NV_PRINTF(LEVEL_INFO, "VF:     Is Engine        : %d\n",     pSrc->isEngine);
+        NV_PRINTF(LEVEL_INFO, "VF:     Runlist Engine ID: %d\n",     pSrc->rlEngId);
+        NV_PRINTF(LEVEL_INFO, "VF:     Runlist PRI Base : 0x%x\n",   pSrc->runlistPriBase);
     }
 
     return NV_OK;

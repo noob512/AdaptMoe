@@ -16,7 +16,7 @@
 
 
 #ifdef DEBUG
-char __nvoc_class_id_uniqueness_check__0x3434af = 1;
+char __nvoc_class_id_uniqueness_check__3434af = 1;
 #endif
 
 extern const struct NVOC_CLASS_DEF __nvoc_class_def_NvencSession;
@@ -30,7 +30,7 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_GpuResource;
 void __nvoc_init__GpuResource(GpuResource*);
 void __nvoc_init__NvencSession(NvencSession*);
 void __nvoc_init_funcTable_NvencSession(NvencSession*);
-NV_STATUS __nvoc_ctor_NvencSession(NvencSession*, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
+NV_STATUS __nvoc_ctor_NvencSession(NvencSession*, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
 void __nvoc_init_dataField_NvencSession(NvencSession*);
 void __nvoc_dtor_NvencSession(NvencSession*);
 
@@ -106,32 +106,33 @@ NV_STATUS __nvoc_up_thunk_RsResource_nvencsessionUnmapFrom(struct NvencSession *
 NvU32 __nvoc_up_thunk_RsResource_nvencsessionGetRefCount(struct NvencSession *pResource);    // this
 void __nvoc_up_thunk_RsResource_nvencsessionAddAdditionalDependants(struct RsClient *pClient, struct NvencSession *pResource, RsResourceRef *pReference);    // this
 
+// Class-specific details for NvencSession
 const struct NVOC_CLASS_DEF __nvoc_class_def_NvencSession = 
 {
-    /*classInfo=*/ {
-        /*size=*/               sizeof(NvencSession),
-        /*classId=*/            classId(NvencSession),
-        /*providerId=*/         &__nvoc_rtti_provider,
+    .classInfo.size =               sizeof(NvencSession),
+    .classInfo.classId =            classId(NvencSession),
+    .classInfo.providerId =         &__nvoc_rtti_provider,
 #if NV_PRINTF_STRINGS_ALLOWED
-        /*name=*/               "NvencSession",
+    .classInfo.name =               "NvencSession",
 #endif
-    },
-    /*objCreatefn=*/        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_NvencSession,
-    /*pCastInfo=*/          &__nvoc_castinfo__NvencSession,
-    /*pExportInfo=*/        &__nvoc_export_info__NvencSession
+    .objCreatefn =        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_NvencSession,
+    .pCastInfo =          &__nvoc_castinfo__NvencSession,
+    .pExportInfo =        &__nvoc_export_info__NvencSession
 };
 
+// By default, all exported methods are enabled.
 #if !defined(NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG)
 #define NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(x)      (0)
 #endif
 
+// Exported method array
 static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_NvencSession[] = 
 {
     {               /*  [0] */
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) nvencsessionCtrlCmdNvencSwSessionUpdateInfo_IMPL,
+        /*pFunc=*/      (void (*)(void)) &nvencsessionCtrlCmdNvencSwSessionUpdateInfo_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*flags=*/      0x8u,
         /*accessRight=*/0x0u,
@@ -143,12 +144,12 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_NvencSes
 #endif
     },
     {               /*  [1] */
-#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
+#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x10008u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) nvencsessionCtrlCmdNvencSwSessionUpdateInfoV2_IMPL,
-#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-        /*flags=*/      0x8u,
+        /*pFunc=*/      (void (*)(void)) &nvencsessionCtrlCmdNvencSwSessionUpdateInfoV2_IMPL,
+#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x10008u)
+        /*flags=*/      0x10008u,
         /*accessRight=*/0x0u,
         /*methodId=*/   0xa0bc0102u,
         /*paramSize=*/  sizeof(NVA0BC_CTRL_NVENC_SW_SESSION_UPDATE_INFO_V2_PARAMS),
@@ -157,7 +158,6 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_NvencSes
         /*func=*/       "nvencsessionCtrlCmdNvencSwSessionUpdateInfoV2"
 #endif
     },
-
 };
 
 
@@ -417,60 +417,62 @@ void __nvoc_up_thunk_RsResource_nvencsessionAddAdditionalDependants(struct RsCli
 
 const struct NVOC_EXPORT_INFO __nvoc_export_info__NvencSession = 
 {
-    /*numEntries=*/     2,
-    /*pExportEntries=*/ __nvoc_exported_method_def_NvencSession
+    .numEntries=     2,
+    .pExportEntries= __nvoc_exported_method_def_NvencSession
 };
 
+
+// Destruct NvencSession object.
+void __nvoc_nvencsessionDestruct(NvencSession*);
 void __nvoc_dtor_GpuResource(GpuResource*);
-void __nvoc_dtor_NvencSession(NvencSession *pThis) {
+void __nvoc_dtor_NvencSession(NvencSession* pThis) {
+
+// Call destructor.
     __nvoc_nvencsessionDestruct(pThis);
+
+// Recurse to superclass destructors.
     __nvoc_dtor_GpuResource(&pThis->__nvoc_base_GpuResource);
+
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
-
 void __nvoc_init_dataField_NvencSession(NvencSession *pThis) {
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
 
-NV_STATUS __nvoc_ctor_GpuResource(GpuResource* , struct CALL_CONTEXT *, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
-NV_STATUS __nvoc_ctor_NvencSession(NvencSession *pThis, struct CALL_CONTEXT * arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams) {
-    NV_STATUS status = NV_OK;
-    status = __nvoc_ctor_GpuResource(&pThis->__nvoc_base_GpuResource, arg_pCallContext, arg_pParams);
-    if (status != NV_OK) goto __nvoc_ctor_NvencSession_fail_GpuResource;
-    __nvoc_init_dataField_NvencSession(pThis);
 
-    status = __nvoc_nvencsessionConstruct(pThis, arg_pCallContext, arg_pParams);
+// Construct NvencSession object.
+NV_STATUS __nvoc_ctor_GpuResource(GpuResource *pGpuResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);    // inline
+NV_STATUS __nvoc_ctor_NvencSession(NvencSession *pNvencSession, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {    // inline
+    NV_STATUS status = NV_OK;
+
+    // Recurse to ancestor constructor(s).
+    status = __nvoc_ctor_GpuResource(&pNvencSession->__nvoc_base_GpuResource, pCallContext, pParams);
+    if (status != NV_OK) goto __nvoc_ctor_NvencSession_fail_GpuResource;
+
+    // Initialize data fields.
+    __nvoc_init_dataField_NvencSession(pNvencSession);
+
+    // Call the constructor for this class.
+    status = __nvoc_nvencsessionConstruct(pNvencSession, pCallContext, pParams);
     if (status != NV_OK) goto __nvoc_ctor_NvencSession_fail__init;
     goto __nvoc_ctor_NvencSession_exit; // Success
 
+    // Unwind on error.
 __nvoc_ctor_NvencSession_fail__init:
-    __nvoc_dtor_GpuResource(&pThis->__nvoc_base_GpuResource);
+    __nvoc_dtor_GpuResource(&pNvencSession->__nvoc_base_GpuResource);
 __nvoc_ctor_NvencSession_fail_GpuResource:
 __nvoc_ctor_NvencSession_exit:
-
     return status;
 }
 
 // Vtable initialization
 static void __nvoc_init_funcTable_NvencSession_1(NvencSession *pThis) {
     PORT_UNREFERENCED_VARIABLE(pThis);
-
-    // nvencsessionCtrlCmdNvencSwSessionUpdateInfo -- exported (id=0xa0bc0101)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__nvencsessionCtrlCmdNvencSwSessionUpdateInfo__ = &nvencsessionCtrlCmdNvencSwSessionUpdateInfo_IMPL;
-#endif
-
-    // nvencsessionCtrlCmdNvencSwSessionUpdateInfoV2 -- exported (id=0xa0bc0102)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__nvencsessionCtrlCmdNvencSwSessionUpdateInfoV2__ = &nvencsessionCtrlCmdNvencSwSessionUpdateInfoV2_IMPL;
-#endif
-} // End __nvoc_init_funcTable_NvencSession_1 with approximately 2 basic block(s).
+} // End __nvoc_init_funcTable_NvencSession_1
 
 
-// Initialize vtable(s) for 27 virtual method(s).
+// Initialize vtable(s) for 25 virtual method(s).
 void __nvoc_init_funcTable_NvencSession(NvencSession *pThis) {
-
-    // Initialize vtable(s) with 2 per-object function pointer(s).
     __nvoc_init_funcTable_NvencSession_1(pThis);
 }
 
@@ -500,68 +502,82 @@ void __nvoc_init__NvencSession(NvencSession *pThis) {
     __nvoc_init_funcTable_NvencSession(pThis);
 }
 
-NV_STATUS __nvoc_objCreate_NvencSession(NvencSession **ppThis, Dynamic *pParent, NvU32 createFlags, struct CALL_CONTEXT * arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams)
+NV_STATUS __nvoc_objCreate_NvencSession(NvencSession **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams)
 {
-    NV_STATUS status;
-    Object *pParentObj = NULL;
-    NvencSession *pThis;
+    NV_STATUS __nvoc_status;
+    Object *__nvoc_pParentObj = NULL;
+    NvencSession *__nvoc_pThis;
 
-    // Assign `pThis`, allocating memory unless suppressed by flag.
-    status = __nvoc_handleObjCreateMemAlloc(createFlags, sizeof(NvencSession), (void**)&pThis, (void**)ppThis);
-    if (status != NV_OK)
-        return status;
+    // Don't allocate memory if the caller has already done so.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+    {
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_ppThis != NULL && *__nvoc_ppThis != NULL, NV_ERR_INVALID_PARAMETER);
+        __nvoc_pThis = *__nvoc_ppThis;
+    }
+
+    // Allocate memory
+    else
+    {
+        __nvoc_pThis = portMemAllocNonPaged(sizeof(NvencSession));
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_pThis != NULL, NV_ERR_NO_MEMORY);
+    }
 
     // Zero is the initial value for everything.
-    portMemSet(pThis, 0, sizeof(NvencSession));
+    portMemSet(__nvoc_pThis, 0, sizeof(NvencSession));
 
-    pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.createFlags = createFlags;
+    __nvoc_pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.createFlags = __nvoc_createFlags;
 
     // Link the child into the parent if there is one unless flagged not to do so.
-    if (pParent != NULL && !(createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
+    if (__nvoc_pParent != NULL && !(__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
     {
-        pParentObj = dynamicCast(pParent, Object);
-        objAddChild(pParentObj, &pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
+        __nvoc_pParentObj = dynamicCast(__nvoc_pParent, Object);
+        objAddChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
     }
     else
     {
-        pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.pParent = NULL;
+        __nvoc_pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.pParent = NULL;
     }
 
-    __nvoc_init__NvencSession(pThis);
-    status = __nvoc_ctor_NvencSession(pThis, arg_pCallContext, arg_pParams);
-    if (status != NV_OK) goto __nvoc_objCreate_NvencSession_cleanup;
+    // Initialize vtable, RTTI, etc., then call constructor.
+    __nvoc_init__NvencSession(__nvoc_pThis);
+    __nvoc_status = __nvoc_ctor_NvencSession(__nvoc_pThis, pCallContext, pParams);
+    if (__nvoc_status != NV_OK) goto __nvoc_objCreate_NvencSession_cleanup;
 
     // Assignment has no effect if NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT is set.
-    *ppThis = pThis;
+    *__nvoc_ppThis = __nvoc_pThis;
 
+    // Success
     return NV_OK;
 
+    // Do not call destructors here since the constructor already called them.
 __nvoc_objCreate_NvencSession_cleanup:
 
     // Unlink the child from the parent if it was linked above.
-    if (pParentObj != NULL)
-        objRemoveChild(pParentObj, &pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
+    if (__nvoc_pParentObj != NULL)
+        objRemoveChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_GpuResource.__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
 
-    // Do not call destructors here since the constructor already called them.
-    if (createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
-        portMemSet(pThis, 0, sizeof(NvencSession));
+    // Zero out memory that was allocated by caller.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+        portMemSet(__nvoc_pThis, 0, sizeof(NvencSession));
+
+    // Free memory allocated by `__nvoc_handleObjCreateMemAlloc`.
     else
     {
-        portMemFree(pThis);
-        *ppThis = NULL;
+        portMemFree(__nvoc_pThis);
+        *__nvoc_ppThis = NULL;
     }
 
-    // coverity[leaked_storage:FALSE]
-    return status;
+    // Failure
+    return __nvoc_status;
 }
 
-NV_STATUS __nvoc_objCreateDynamic_NvencSession(NvencSession **ppThis, Dynamic *pParent, NvU32 createFlags, va_list args) {
-    NV_STATUS status;
-    struct CALL_CONTEXT * arg_pCallContext = va_arg(args, struct CALL_CONTEXT *);
-    struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams = va_arg(args, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
+NV_STATUS __nvoc_objCreateDynamic_NvencSession(NvencSession **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, va_list __nvoc_args) {
+    NV_STATUS __nvoc_status;
+    struct CALL_CONTEXT *pCallContext = va_arg(__nvoc_args, struct CALL_CONTEXT *);
+    struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams = va_arg(__nvoc_args, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
 
-    status = __nvoc_objCreate_NvencSession(ppThis, pParent, createFlags, arg_pCallContext, arg_pParams);
+    __nvoc_status = __nvoc_objCreate_NvencSession(__nvoc_ppThis, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams);
 
-    return status;
+    return __nvoc_status;
 }
 

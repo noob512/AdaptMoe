@@ -25,15 +25,13 @@
 
 #include "nvidia-drm-conftest.h"
 
-#if defined(NV_DRM_ATOMIC_MODESET_AVAILABLE)
+#if defined(NV_DRM_AVAILABLE)
 
 #if defined(NV_DRM_DRMP_H_PRESENT)
 #include <drm/drmP.h>
 #endif
 
-#if defined(NV_DRM_DRM_CONNECTOR_H_PRESENT)
 #include <drm/drm_connector.h>
-#endif
 
 #include "nvtypes.h"
 #include "nvkms-api-types.h"
@@ -77,6 +75,22 @@ static inline struct nv_drm_connector *to_nv_connector(
     return container_of(connector, struct nv_drm_connector, base);
 }
 
+struct nv_drm_connector_state {
+       struct drm_connector_state base;
+};
+
+static inline struct nv_drm_connector_state *to_nv_drm_connector_state(
+                     struct drm_connector_state *state)
+{
+    return container_of(state, struct nv_drm_connector_state, base);
+}
+
+static inline const struct nv_drm_connector_state *to_nv_drm_connector_state_const(
+                           const struct drm_connector_state *state)
+{
+    return container_of(state, const struct nv_drm_connector_state, base);
+}
+
 static inline void nv_drm_connector_mark_connection_status_dirty(
     struct nv_drm_connector *nv_connector)
 {
@@ -101,6 +115,6 @@ nv_drm_get_connector(struct drm_device *dev,
 bool nv_drm_connector_revoke_permissions(struct drm_device *dev,
                                          struct nv_drm_connector *nv_connector);
 
-#endif /* NV_DRM_ATOMIC_MODESET_AVAILABLE */
+#endif /* NV_DRM_AVAILABLE */
 
 #endif /* __NVIDIA_DRM_CONNECTOR_H__ */

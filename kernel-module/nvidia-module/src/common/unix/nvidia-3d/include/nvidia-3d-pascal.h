@@ -26,8 +26,6 @@
 
 #include "nvidia-3d-types.h"
 
-void _nv3dInitChannelPascal(Nv3dChannelRec *p3dChannel);
-
 void _nv3dAssignNv3dTexturePascal(
     Nv3dRenderTexInfo info,
     Nv3dTexture *tex);

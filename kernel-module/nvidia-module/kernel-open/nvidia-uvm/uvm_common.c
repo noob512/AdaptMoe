@@ -44,7 +44,7 @@ bool uvm_debug_prints_enabled(void)
 // must not be set to true otherwise since it breaks security when it is
 // enabled. By default and for safety reasons this parameter is set to false.
 int uvm_enable_builtin_tests __read_mostly = 0;
-module_param(uvm_enable_builtin_tests, int, S_IRUGO);
+module_param(uvm_enable_builtin_tests, int, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_enable_builtin_tests,
                  "Enable the UVM built-in tests. (This is a security risk)");
 

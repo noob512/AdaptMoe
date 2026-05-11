@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -79,25 +79,44 @@ _knvlinkFilterDiscoveredLinks
     KernelNvlink *pKernelNvlink
 )
 {
-    // Ensure any vbios disabled links are removed from discovered
-    if (pKernelNvlink->vbiosDisabledLinkMask)
-    {
-        // Update the link mask if overridden through vbios
-        pKernelNvlink->discoveredLinks &= ~(pKernelNvlink->vbiosDisabledLinkMask);
+    NVLINK_BIT_VECTOR localBitVector;
 
-        NV_PRINTF(LEVEL_INFO,
-                  "Links discovered after VBIOS overrides = 0x%llx\n",
-                  KNVLINK_GET_MASK(pKernelNvlink, discoveredLinks, 64));
+    // Ensure any vbios disabled links are removed from discovered
+    if (!bitVectorTestAllCleared(&pKernelNvlink->vbiosDisabledLinkMask))
+    {
+        bitVectorClrAll(&localBitVector);
+
+        //
+        // Invert the vbiosDisabledLinkMask then AN with the discovered links
+        // to get the final mask of links that are discovered
+        //
+        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, bitVectorComplement(&localBitVector, &pKernelNvlink->vbiosDisabledLinkMask));
+
+        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, bitVectorAnd(&pKernelNvlink->discoveredLinks,
+                &pKernelNvlink->discoveredLinks, &localBitVector));
+
+        NV_BITVECTOR_PRINT(
+            NV_PRINTF(LEVEL_INFO, "Discovered Links:\n"),
+            &pKernelNvlink->discoveredLinks);
     }
 
     // Filter links that are disabled through regkey overrides
-    if (pKernelNvlink->regkeyDisabledLinksMask)
+    if (!bitVectorTestAllCleared(&pKernelNvlink->regkeyDisabledLinksMask))
     {
-        pKernelNvlink->discoveredLinks &= ~(pKernelNvlink->regkeyDisabledLinksMask);
+        bitVectorClrAll(&localBitVector);
 
-        NV_PRINTF(LEVEL_INFO,
-                  "Links after applying disable links regkey = 0x%llx\n",
-                  KNVLINK_GET_MASK(pKernelNvlink, discoveredLinks, 64));
+        //
+        // Invert the regkeyDisabledLinksMask then AND with the discovered links
+        // to get the final mask of links that are discovered
+        //
+        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+                bitVectorComplement(&localBitVector, &pKernelNvlink->regkeyDisabledLinksMask));
+        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+                bitVectorAnd(&pKernelNvlink->discoveredLinks, &pKernelNvlink->discoveredLinks, &localBitVector));
+
+        NV_BITVECTOR_PRINT(
+                NV_PRINTF(LEVEL_INFO, "Links after applying disable links regkey\n"),
+                &pKernelNvlink->discoveredLinks);
     }
 
     return NV_OK;
@@ -135,7 +154,7 @@ _knvlinkFilterIoctrls
         NvU32 localDiscoveredLinks = kioctrlGetLocalDiscoveredLinks(pGpu, pKernelIoctrl);
 
         localDiscoveredLinks &=
-            kioctrlGetGlobalToLocalMask(pGpu, pKernelIoctrl, KNVLINK_GET_MASK(pKernelNvlink, discoveredLinks, 32));
+            kioctrlGetGlobalToLocalMask(pGpu, pKernelIoctrl, KNVLINK_BITVECTOR_TO_MASK(pKernelNvlink, discoveredLinks, 32));
 
         // No need to handle the IOCTRL if no links are being enabled
         if (localDiscoveredLinks == 0x0)
@@ -167,6 +186,9 @@ knvlinkConstructEngine_IMPL
 {
     NV_STATUS status    = NV_OK;
     NvU32     ioctrlIdx = 0;
+
+    // Must clear out all BIT_VECTOR masks to initialize them to 0
+    bitVectorClrAll(&pKernelNvlink->discoveredLinks);
 
     // Initialize the nvlink core library
     knvlinkCoreDriverLoadWar(pGpu, pKernelNvlink);
@@ -359,6 +381,7 @@ knvlinkStateLoad_IMPL
     NvU64             preInitializedLinks;
     NvU32             i;
     OBJTMR            *pTmr = GPU_GET_TIMER(pGpu);
+    NVLINK_BIT_VECTOR localBitVector;
 
     //
     // If we are on the resume path, nvlinkIsPresent will not be called,
@@ -441,10 +464,15 @@ knvlinkStateLoad_IMPL
     }
 
     // Remove the init disabled links from the discovered links mask
-    pKernelNvlink->discoveredLinks &= ~((NvU64)pKernelNvlink->initDisabledLinksMask);
+    bitVectorClrAll(&localBitVector);
+
+    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+        convertMaskToBitVector(~((NvU64)pKernelNvlink->initDisabledLinksMask), &localBitVector));
+
+    bitVectorAnd(&pKernelNvlink->discoveredLinks, &pKernelNvlink->discoveredLinks, &localBitVector);
 
     // Track un-connected links, we assume all discovered links are connected.
-    pKernelNvlink->connectedLinksMask = KNVLINK_GET_MASK(pKernelNvlink, discoveredLinks, 32);
+    bitVectorCopy(&pKernelNvlink->connectedLinksMask, &pKernelNvlink->discoveredLinks);
 
     // Initialize initializedLinks to 0 (assume no links initialized)
     pKernelNvlink->initializedLinks = 0;
@@ -475,7 +503,7 @@ knvlinkStateLoad_IMPL
     // At this point, the discovered links mask is filtered. If there are no
     // discovered links, then we skip the rest of the steps.
     //
-    if (pKernelNvlink->discoveredLinks == 0)
+    if (bitVectorTestAllCleared(&pKernelNvlink->discoveredLinks))
     {
         goto knvlinkStateLoad_end;
     }
@@ -498,31 +526,33 @@ knvlinkStateLoad_IMPL
     //
     if (pKernelNvlink->bRegistryLinkOverride)
     {
-        pKernelNvlink->enabledLinks = KNVLINK_GET_MASK(pKernelNvlink, discoveredLinks, 64) &
-                                      KNVLINK_GET_MASK(pKernelNvlink, registryLinkMask, 64);
+        NVLINK_BIT_VECTOR registryLinkMaskVec;
+        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+            convertMaskToBitVector(KNVLINK_GET_MASK(pKernelNvlink, registryLinkMask, 64), &registryLinkMaskVec));
+        bitVectorAnd(&pKernelNvlink->enabledLinks, &pKernelNvlink->discoveredLinks, &registryLinkMaskVec);
     }
     else if (bMIGNvLinkP2PDisabled)
     {
         // NvLink is not supported with MIG
-        pKernelNvlink->enabledLinks = 0;
+        bitVectorClrAll(&pKernelNvlink->enabledLinks);
     }
     else
     {
-        pKernelNvlink->enabledLinks = KNVLINK_GET_MASK(pKernelNvlink, discoveredLinks, 64);
+        bitVectorCopy(&pKernelNvlink->enabledLinks, &pKernelNvlink->discoveredLinks);
     }
 
     // Sense NVLink bridge presence and remove links on missing bridges.
     knvlinkFilterBridgeLinks_HAL(pGpu, pKernelNvlink);
 
     // Disconnected links mask tracks links whose remote ends are not discovered
-    pKernelNvlink->disconnectedLinkMask = KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 64);
+    pKernelNvlink->disconnectedLinkMask = KNVLINK_BITVECTOR_TO_MASK(pKernelNvlink, enabledLinks, 64);
 
     if (!IS_RTLSIM(pGpu) || pKernelNvlink->bForceEnableCoreLibRtlsims)
     {
         if (!knvlinkPoweredUpForD3_HAL(pGpu, pKernelNvlink))
         {
             // Register links in the nvlink core library
-            FOR_EACH_INDEX_IN_MASK(64, i, KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 64))
+            FOR_EACH_IN_BITVECTOR(&pKernelNvlink->enabledLinks, i)
             {
                 status = knvlinkCoreAddLink(pGpu, pKernelNvlink, i);
                 if (status != NV_OK)
@@ -532,7 +562,7 @@ knvlinkStateLoad_IMPL
                     goto knvlinkStateLoad_end;
                 }
             }
-            FOR_EACH_INDEX_IN_MASK_END;
+            FOR_EACH_IN_BITVECTOR_END();
         }
         else
         {
@@ -636,7 +666,7 @@ knvlinkStateLoad_IMPL
                                      PDB_PROP_KNVLINK_MINION_FORCE_ALI_TRAINING)))
     {
         status = knvlinkPreTrainLinksToActiveAli(pGpu, pKernelNvlink,
-                                                 KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 32), NV_TRUE);
+                                                 KNVLINK_BITVECTOR_TO_MASK(pKernelNvlink, enabledLinks, 32), NV_TRUE);
         if (status != NV_OK)
         {
             goto knvlinkStateLoad_end;
@@ -648,7 +678,7 @@ knvlinkStateLoad_IMPL
         // will be queries via DLSTAT to know their status and training
         // progression.
         //
-        FOR_EACH_INDEX_IN_MASK(32, i, KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 32))
+        FOR_EACH_IN_BITVECTOR(&pKernelNvlink->enabledLinks, i)
         {
             status = knvlinkTrainLinksToActiveAli(pGpu, pKernelNvlink, NVBIT(i), NV_FALSE);
             if (status != NV_OK)
@@ -669,10 +699,10 @@ knvlinkStateLoad_IMPL
                 osDelayUs(8000000);
             }
         }
-        FOR_EACH_INDEX_IN_MASK_END;
+        FOR_EACH_IN_BITVECTOR_END();
     }
 
-    FOR_EACH_INDEX_IN_MASK(32, i, KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 32))
+    FOR_EACH_IN_BITVECTOR(&pKernelNvlink->enabledLinks, i)
     {
         status = tmrEventCreate(pTmr, &pKernelNvlink->nvlinkLinks[i].pTmrEvent,
                             ioctrlFaultUpTmrHandler, NULL,
@@ -683,7 +713,7 @@ knvlinkStateLoad_IMPL
                           "Failed to create TmrEvent for Link %d\n", i);
         }
     }
-    FOR_EACH_INDEX_IN_MASK_END;
+    FOR_EACH_IN_BITVECTOR_END();
 
     listInit(&pKernelNvlink->faultUpLinks, portMemAllocatorGetGlobalNonPaged());
 
@@ -799,10 +829,27 @@ knvlinkStatePostLoad_IMPL
     // We check for NVLE enablement here for the production/non-MODS case
     if (pKernelNvlink->bNvleModeRegkey)
     {
-        if (!knvlinkIsNvleEnabled_HAL(pGpu, pKernelNvlink))
+        //
+        // On new firmware, CC enabled implies NVLE enabled, which is not true on older
+        // firmware. Hence confirm if we need to check for NVLE enablement
+        //
+        NV_ASSERT_OK_OR_RETURN(knvlinkGetEncryptionBits_HAL(pGpu, pKernelNvlink));
+
+        if (RMCFG_FEATURE_MODS_FEATURES || pKernelNvlink->bMmuNvlinkEncryptEn)
         {
-            NV_PRINTF(LEVEL_ERROR," NVLE not enabled on GPU%d\n", pGpu->gpuInstance);
-            return NV_ERR_FEATURE_NOT_ENABLED;
+            if (!knvlinkIsNvleEnabled_HAL(pGpu, pKernelNvlink))
+            {
+                NV_PRINTF(LEVEL_ERROR," NVLE not enabled on GPU%d\n", pGpu->gpuInstance);
+                return NV_ERR_FEATURE_NOT_ENABLED;
+            }
+        }
+
+        // Pre-assign the CLID for the GPU
+        status = knvlinkAssignNvleClid(pGpu, pKernelNvlink);
+        if (status != NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR,"Failed to assign CLID for GPU 0x%x\n", pGpu->gpuInstance);
+            return status;
         }
     }
 
@@ -811,6 +858,11 @@ knvlinkStatePostLoad_IMPL
     {
         NV_PRINTF(LEVEL_ERROR," failed for GPU 0x%x\n", pGpu->gpuInstance);
         return status;
+    }
+
+    if (!GPU_IS_NVSWITCH_DETECTED(pGpu))
+    {
+        NV_ASSERT_OK_OR_RETURN(knvlinkSetDirectConnectBaseAddress_HAL(pGpu, pKernelNvlink));
     }
 
     return NV_OK;
@@ -865,6 +917,7 @@ knvlinkStatePostUnload_IMPL
 {
     OBJSYS    *pSys   = SYS_GET_INSTANCE();
     NV_STATUS  status = NV_OK;
+
 #if defined(INCLUDE_NVLINK_LIB)
     NvU32 linkId = 0;
 #endif
@@ -939,7 +992,7 @@ knvlinkStatePostUnload_IMPL
         NV2080_CTRL_INTERNAL_NVLINK_DISABLE_DL_INTERRUPTS_PARAMS params;
 
         portMemSet(&params, 0, sizeof(params));
-        params.linkMask = KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 32);
+        params.linkMask = KNVLINK_BITVECTOR_TO_MASK(pKernelNvlink, enabledLinks, 32);
 
         // Disable all the DL interrupts
         status = knvlinkExecGspRmRpc(pGpu, pKernelNvlink,
@@ -963,7 +1016,7 @@ knvlinkStatePostUnload_IMPL
     }
 
 #if defined(INCLUDE_NVLINK_LIB)
-    FOR_EACH_INDEX_IN_MASK(32, linkId, KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 32))
+    FOR_EACH_IN_BITVECTOR(&pKernelNvlink->enabledLinks, linkId)
     {
         // Update remote GPU disconnectedLinkMasks
         OBJGPU *pRemoteGpu = gpumgrGetGpuFromBusInfo(pKernelNvlink->nvlinkLinks[linkId].remoteEndInfo.domain,
@@ -976,10 +1029,17 @@ knvlinkStatePostUnload_IMPL
             pRemoteKernelNvlink->disconnectedLinkMask |= NVBIT64(pKernelNvlink->nvlinkLinks[linkId].remoteEndInfo.linkNumber);
         }
     }
-    FOR_EACH_INDEX_IN_MASK_END;
+    FOR_EACH_IN_BITVECTOR_END();
 #endif
 
     listDestroy(&pKernelNvlink->faultUpLinks);
+
+    // If Nvlink encryption is enabled, clear the NVLE boolean state
+    status = knvlinkClearEncryptionKeys(pGpu, pKernelNvlink);
+    if ((status != NV_OK) && (status != NV_ERR_NOT_SUPPORTED))
+    {
+        NV_PRINTF(LEVEL_ERROR, "Failed to clear NVLE keys for the GPU\n");
+    }
 
 knvlinkStatePostUnload_end:
 
@@ -1013,7 +1073,7 @@ _knvlinkPurgeState
     NvBool bMIGNvLinkP2PDisabled = ((pKernelMIGManager != NULL) &&
                           !kmigmgrIsMIGNvlinkP2PSupported(pGpu, pKernelMIGManager));
 
-    FOR_EACH_INDEX_IN_MASK(32, linkId, KNVLINK_GET_MASK(pKernelNvlink, discoveredLinks, 32))
+    FOR_EACH_IN_BITVECTOR(&pKernelNvlink->discoveredLinks, linkId)
     {
         if ((pKernelNvlink->nvlinkLinks[linkId].pTmrEvent != NULL) && (pTmr != NULL))
         {
@@ -1021,7 +1081,7 @@ _knvlinkPurgeState
             pKernelNvlink->nvlinkLinks[linkId].pTmrEvent = NULL;
         }
     }
-    FOR_EACH_INDEX_IN_MASK_END;
+    FOR_EACH_IN_BITVECTOR_END();
 
     // RM disables NVLink at runtime in Hopper so device un-registration can't be skipped
     if (!IsGH100orBetter(pGpu))
@@ -1047,11 +1107,11 @@ _knvlinkPurgeState
         if (pKernelNvlink->pNvlinkDev)
         {
             // Un-register the links from nvlink core library
-            FOR_EACH_INDEX_IN_MASK(32, linkId, KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 32))
+            FOR_EACH_IN_BITVECTOR(&pKernelNvlink->enabledLinks, linkId)
             {
                 knvlinkCoreRemoveLink(pGpu, pKernelNvlink, linkId);
             }
-            FOR_EACH_INDEX_IN_MASK_END;
+            FOR_EACH_IN_BITVECTOR_END();
 
             // Un-register the nvgpu device from nvlink core library
             knvlinkCoreRemoveDevice(pGpu, pKernelNvlink);
@@ -1116,34 +1176,14 @@ knvlinkShutdownLinks_WORKITEM
 {
     OBJGPU *pGpu                = gpumgrGetGpu(gpuInstance);
     KernelNvlink *pKernelNvlink = GPU_GET_KERNEL_NVLINK(pGpu);
-    NV_STATUS status;
 
     // Sanity Checks
     NV_CHECK_OR_RETURN_VOID(LEVEL_INFO,
             (pGpu != NULL &&
              pKernelNvlink != NULL));
 
-    if (pKernelNvlink->ipVerNvlink >= NVLINK_VERSION_50)
-    {
-        // Unilaterally shut down all enabled links
-        NV2080_CTRL_NVLINK_PROCESS_INIT_DISABLED_LINKS_PARAMS disableLinksParams = { 0 };
-        disableLinksParams.initDisabledLinksMask = pKernelNvlink->enabledLinks;
-        status = knvlinkExecGspRmRpc(pGpu, pKernelNvlink,
-                        NV2080_CTRL_CMD_NVLINK_PROCESS_INIT_DISABLED_LINKS,
-                        (void *)&disableLinksParams,
-                        sizeof(NV2080_CTRL_NVLINK_PROCESS_INIT_DISABLED_LINKS_PARAMS));
-
-        if (status != NV_OK)
-        {
-            NV_PRINTF(LEVEL_ERROR, "Failed to send disable link RPC on degraded GPU%d\n",
-                pGpu->gpuInstance);
-        }
-    }
-    else
-    {
-        NV_ASSERT_OR_RETURN_VOID(
-            knvlinkCoreShutdownDeviceLinks(pGpu, pKernelNvlink, NV_TRUE) == NV_OK);
-    }
+    NV_ASSERT_OR_RETURN_VOID(
+        knvlinkCoreShutdownDeviceLinks(pGpu, pKernelNvlink, NV_TRUE) == NV_OK);
 }
 
 /*!
@@ -1166,9 +1206,6 @@ knvlinkSetDegradedMode_IMPL
 {
     NV_STATUS status = NV_OK;
 
-    // Prevent invalid shift later
-    NV_ASSERT_OR_RETURN_VOID((linkId == -1) || ((linkId >= 0) && (linkId < 32)));
-
     if (pKernelNvlink == NULL)
     {
         NV_PRINTF(LEVEL_ERROR,
@@ -1190,13 +1227,15 @@ knvlinkSetDegradedMode_IMPL
 
     // Queue a workitem to handle rest of the degraded mode handling
 
-    NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
-        osQueueWorkItemWithFlags(pGpu, knvlinkShutdownLinks_WORKITEM,
-                                    NULL,
-                                    (OS_QUEUE_WORKITEM_FLAGS_LOCK_API_RO |
-                                    OS_QUEUE_WORKITEM_FLAGS_LOCK_GPU_GROUP_SUBDEVICE)),
-        return;);
-
+    NV_CHECK_OK_OR_ELSE(status,
+        LEVEL_ERROR,
+        osQueueWorkItem(pGpu,
+                        knvlinkShutdownLinks_WORKITEM,
+                        NULL,
+                        (OsQueueWorkItemFlags){
+                            .apiLock = WORKITEM_FLAGS_API_LOCK_READ_ONLY,
+                            .bLockGpuGroupSubdevice = NV_TRUE}),
+                        return;);
 }
 
 /*!
@@ -1279,7 +1318,7 @@ _knvlinkProcessSysmemLinks
 {
     NV_STATUS status = NV_OK;
 
-#if defined(NVCPU_AARCH64)
+#if defined(INCLUDE_NVLINK_LIB) && defined(NVCPU_AARCH64)
     if (pKernelNvlink->getProperty(pKernelNvlink, PDB_PROP_KNVLINK_SYSMEM_SUPPORT_ENABLED))
     {
         //

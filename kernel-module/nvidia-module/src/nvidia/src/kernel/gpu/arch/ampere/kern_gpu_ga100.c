@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -29,7 +29,6 @@
 #include "published/ampere/ga100/dev_fb.h"
 #include "published/ampere/ga100/dev_vm.h"
 #include "published/ampere/ga100/dev_fuse.h"
-#include "published/ampere/ga100/dev_top.h"
 #include "virtualization/hypervisor/hypervisor.h"
 
 /*!
@@ -69,6 +68,8 @@ gpuClearFbhubPoisonIntrForBug2924523_GA100
     // Check if FBHUB Poison interrupt got triggered before RM Init due
     // to VBIOS IFR on GA100. If yes, clear the FBHUB Interrupt. This WAR is
     // required for Bug 2924523 as VBIOS IFR causes FBHUB Poison intr.
+    // We can't use intrServiceStall or intrIsPending_HAL here because interrupt table
+    // is not initialized.
     //
     if (intrIsVectorPending_HAL(pGpu, GPU_GET_INTR(pGpu), intrVector, NULL))
     {
@@ -166,6 +167,7 @@ static const GPUCHILDPRESENT gpuChildrenPresent_GA100[] =
     GPU_CHILD_PRESENT(KernelNvlink, 1),
     GPU_CHILD_PRESENT(KernelPerf, 1),
     GPU_CHILD_PRESENT(KernelPmu, 1),
+    GPU_CHILD_PRESENT(OBJGRIDDISPLAYLESS, 1),
     GPU_CHILD_PRESENT(KernelSec2, 1),
     GPU_CHILD_PRESENT(KernelGsp, 1),
     GPU_CHILD_PRESENT(ConfidentialCompute, 1),
@@ -216,6 +218,7 @@ static const GPUCHILDPRESENT gpuChildrenPresent_GA102[] =
     GPU_CHILD_PRESENT(KernelNvlink, 1),
     GPU_CHILD_PRESENT(KernelPerf, 1),
     GPU_CHILD_PRESENT(KernelPmu, 1),
+    GPU_CHILD_PRESENT(OBJGRIDDISPLAYLESS, 1),
     GPU_CHILD_PRESENT(KernelSec2, 1),
     GPU_CHILD_PRESENT(KernelGsp, 1),
     GPU_CHILD_PRESENT(ConfidentialCompute, 1),
@@ -261,6 +264,7 @@ static const GPUCHILDPRESENT gpuChildrenPresent_GA10B[] =
     GPU_CHILD_PRESENT(SwIntr, 1),
     GPU_CHILD_PRESENT(KernelNvlink, 1),
     GPU_CHILD_PRESENT(KernelPmu, 1),
+    GPU_CHILD_PRESENT(OBJGRIDDISPLAYLESS, 1),
     GPU_CHILD_PRESENT(KernelSec2, 1),
     GPU_CHILD_PRESENT(KernelGsp, 1),
     GPU_CHILD_PRESENT(ConfidentialCompute, 1),

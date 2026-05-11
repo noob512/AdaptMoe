@@ -25,6 +25,7 @@
 
 #include "os-interface.h"
 #include "nv-linux.h"
+#include <linux/iommu.h>
 #include "nv-caps-imex.h"
 
 #include "nv-platform.h"
@@ -34,6 +35,7 @@
 #include <linux/mmzone.h>
 #include <linux/numa.h>
 #include <linux/cpuset.h>
+#include <linux/sys_soc.h>
 
 #include <linux/pid.h>
 #include <linux/pid_namespace.h>
@@ -51,9 +53,11 @@ extern nv_linux_state_t nv_ctl_device;
 
 extern nv_kthread_q_t nv_kthread_q;
 
-NvU32 os_page_size  = PAGE_SIZE;
-NvU64 os_page_mask  = NV_PAGE_MASK;
-NvU8  os_page_shift = PAGE_SHIFT;
+NvU64 os_page_size     = PAGE_SIZE;
+NvU64 os_max_page_size = PAGE_SIZE << NV_MAX_PAGE_ORDER;
+NvU64 os_page_mask     = NV_PAGE_MASK;
+NvU8  os_page_shift    = PAGE_SHIFT;
+
 NvBool os_cc_enabled = 0;
 NvBool os_cc_sev_snp_enabled = 0;
 NvBool os_cc_snp_vtom_enabled = 0;
@@ -280,9 +284,11 @@ void* NV_API_CALL os_alloc_rwlock(void)
     init_rwsem(&os_rwlock->sem);
 
 #if defined(CONFIG_LOCKDEP)
+#if NV_IS_EXPORT_SYMBOL_PRESENT_lockdep_register_key
     // Register the dynamically allocated key to Lockdep.
     lockdep_register_key(&os_rwlock->key);
     lockdep_set_class(&os_rwlock->sem, &os_rwlock->key);
+#endif //NV_IS_EXPORT_SYMBOL_PRESENT_lockdep_register_key
 #endif // CONFIG_LOCKDEP
 
     return os_rwlock;
@@ -367,7 +373,7 @@ NvBool NV_API_CALL os_semaphore_may_sleep(void)
 
 NvBool NV_API_CALL os_is_isr(void)
 {
-    return (in_irq());
+    return (nv_in_hardirq());
 }
 
 // return TRUE if the caller is the super-user
@@ -474,11 +480,6 @@ void *NV_API_CALL os_mem_copy(
      * When performing memcpy for memory mapped as device, memcpy_[to/from]io
      * must be used. WAR to check the source and destination to determine the
      * correct memcpy_io to use.
-     *
-     * This WAR is limited to just aarch64 for now because the address range used
-     * to map ioremap and vmalloc is different on ppc64le, and is_vmalloc_addr()
-     * does not correctly handle this. is_ioremap_addr() is needed instead. This
-     * will have to be addressed when reorganizing RM to use the new memset model.
      */
     if (is_vmalloc_addr(dst) && !is_vmalloc_addr(src))
     {
@@ -524,7 +525,7 @@ NV_STATUS NV_API_CALL os_memcpy_from_user(
     NvU32       n
 )
 {
-    return (NV_COPY_FROM_USER(to, from, n) ? NV_ERR_INVALID_ADDRESS : NV_OK);
+    return (copy_from_user(to, from, n) ? NV_ERR_INVALID_ADDRESS : NV_OK);
 }
 
 NV_STATUS NV_API_CALL os_memcpy_to_user(
@@ -533,7 +534,7 @@ NV_STATUS NV_API_CALL os_memcpy_to_user(
     NvU32       n
 )
 {
-    return (NV_COPY_TO_USER(to, from, n) ? NV_ERR_INVALID_ADDRESS : NV_OK);
+    return (copy_to_user(to, from, n) ? NV_ERR_INVALID_ADDRESS : NV_OK);
 }
 
 void* NV_API_CALL os_mem_set(
@@ -548,11 +549,6 @@ void* NV_API_CALL os_mem_set(
      *
      * WAR to check the destination to determine if the memory is of type Device
      * or Normal, and use the correct memset.
-     *
-     * This WAR is limited to just aarch64 for now because the address range used
-     * to map ioremap and vmalloc is different on ppc64le, and is_vmalloc_addr()
-     * does not correctly handle this. is_ioremap_addr() is needed instead. This
-     * will have to be addressed when reorganizing RM to use the new memset model.
      */
     if (is_vmalloc_addr(dst))
     {
@@ -676,11 +672,11 @@ void NV_API_CALL os_free_mem(void *address)
 
 /*****************************************************************************
 *
-*   Name: osGetCurrentTime
+*   Name: osGetSystemTime
 *
 *****************************************************************************/
 
-NV_STATUS NV_API_CALL os_get_current_time(
+NV_STATUS NV_API_CALL os_get_system_time(
     NvU32 *seconds,
     NvU32 *useconds
 )
@@ -698,16 +694,14 @@ NV_STATUS NV_API_CALL os_get_current_time(
 //
 // Get the High resolution tick count of the system uptime
 //
-NvU64 NV_API_CALL os_get_current_tick_hr(void)
+NvU64 NV_API_CALL os_get_monotonic_time_ns_hr(void)
 {
     struct timespec64 tm;
     ktime_get_raw_ts64(&tm);
     return (NvU64) timespec64_to_ns(&tm);
 }
 
-#if BITS_PER_LONG >= 64
-
-NvU64 NV_API_CALL os_get_current_tick(void)
+NvU64 NV_API_CALL os_get_monotonic_time_ns(void)
 {
 #if defined(NV_JIFFIES_TO_TIMESPEC_PRESENT)
     struct timespec ts;
@@ -720,47 +714,13 @@ NvU64 NV_API_CALL os_get_current_tick(void)
 #endif
 }
 
-NvU64 NV_API_CALL os_get_tick_resolution(void)
+NvU64 NV_API_CALL os_get_monotonic_tick_resolution_ns(void)
 {
     return (NvU64)jiffies_to_usecs(1) * NSEC_PER_USEC;
 }
 
-#else
-
-NvU64 NV_API_CALL os_get_current_tick(void)
-{
-    /*
-     * 'jiffies' overflows regularly on 32-bit builds (unsigned long is 4 bytes
-     * instead of 8 bytes), so it's unwise to build a tick counter on it, since
-     * the rest of the Resman assumes the 'tick' returned from this function is
-     * monotonically increasing and never overflows.
-     *
-     * Instead, use the previous implementation that we've lived with since the
-     * beginning, which uses system clock time to calculate the tick. This is
-     * subject to problems if the system clock time changes dramatically
-     * (more than a second or so) while the Resman is actively tracking a
-     * timeout.
-     */
-    NvU32 seconds, useconds;
-
-    (void) os_get_current_time(&seconds, &useconds);
-
-    return ((NvU64)seconds * NSEC_PER_SEC +
-                 (NvU64)useconds * NSEC_PER_USEC);
-}
-
-NvU64 NV_API_CALL os_get_tick_resolution(void)
-{
-    /*
-     * os_get_current_tick() uses os_get_current_time(), which has
-     * microsecond resolution.
-     */
-    return 1000ULL;
-}
-
-#endif
-
 //---------------------------------------------------------------------------
+
 //
 //  Misc services.
 //
@@ -795,7 +755,7 @@ NvU64 NV_API_CALL os_get_cpu_frequency(void)
 
 NvU32 NV_API_CALL os_get_current_process(void)
 {
-    return NV_GET_CURRENT_PROCESS();
+    return current->tgid;
 }
 
 void NV_API_CALL os_get_current_process_name(char *buf, NvU32 len)
@@ -804,6 +764,50 @@ void NV_API_CALL os_get_current_process_name(char *buf, NvU32 len)
     strncpy(buf, current->comm, len - 1);
     buf[len - 1] = '\0';
     task_unlock(current);
+}
+
+NV_STATUS NV_API_CALL os_iommu_sva_bind(void *arg, void **handle, NvU32 *pasid)
+{
+    nv_state_t *nv = arg;
+#if defined(CONFIG_IOMMU_SVA) && \
+    (defined(NV_IOASID_GET_PRESENT) || defined(NV_MM_PASID_DROP_PRESENT))
+    nv_linux_state_t *nvl = NV_GET_NVL_FROM_NV_STATE(nv);
+    struct iommu_sva *sva_handle;
+
+    if (pasid == NULL || handle == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    *pasid = 0;
+    *handle = NULL;
+
+    if (nv->ats_support && current && current->mm)
+    {
+#if defined(NV_IOMMU_SVA_BIND_DEVICE_HAS_DRVDATA_ARG)
+        sva_handle = iommu_sva_bind_device(nvl->dev, current->mm, NULL);
+#else
+        sva_handle = iommu_sva_bind_device(nvl->dev, current->mm);
+#endif
+        if (!IS_ERR(sva_handle))
+        {
+            *pasid = iommu_sva_get_pasid(sva_handle);
+            *handle = sva_handle;
+            NV_DEV_PRINTF(NV_DBG_INFO, nv, "PASID: %u\n", *pasid);
+
+            return NV_OK;
+        }
+    }
+#endif
+    NV_DEV_PRINTF(NV_DBG_ERRORS, nv, "IOMMU SVA bind failed\n");
+
+    return NV_ERR_INVALID_STATE;
+}
+
+void NV_API_CALL os_iommu_sva_unbind(void *handle)
+{
+#if defined(CONFIG_IOMMU_SVA) && \
+    (defined(NV_IOASID_GET_PRESENT) || defined(NV_MM_PASID_DROP_PRESENT))
+    iommu_sva_unbind_device(handle);
+#endif
 }
 
 NV_STATUS NV_API_CALL os_get_current_thread(NvU64 *threadId)
@@ -1087,8 +1091,6 @@ void NV_API_CALL os_flush_cpu_write_combine_buffer(void)
 {
 #if defined(NVCPU_X86_64)
     asm volatile("sfence" ::: "memory");
-#elif defined(NVCPU_PPC64LE)
-    __asm__ __volatile__ ("sync" : : : "memory");
 #elif defined(NVCPU_AARCH64)
     asm volatile("dsb st" : : : "memory");
 #else
@@ -1247,8 +1249,6 @@ void NV_API_CALL os_dbg_breakpoint(void)
     __asm__ __volatile__ (".word %c0" :: "i" (KGDB_COMPILED_BREAK));
   #elif defined(NVCPU_AARCH64)
     # warning "Need to implement os_dbg_breakpoint() for aarch64"
-  #elif defined(NVCPU_PPC64LE)
-    __asm__ __volatile__ ("trap");
   #endif // NVCPU_*
 #elif defined(CONFIG_KDB)
     KDB_ENTER();
@@ -1264,7 +1264,7 @@ NvU32 NV_API_CALL os_get_cpu_number(void)
 
 NvU32 NV_API_CALL os_get_cpu_count(void)
 {
-    return NV_NUM_CPUS();
+    return num_possible_cpus();
 }
 
 NvBool NV_API_CALL os_pat_supported(void)
@@ -1286,6 +1286,15 @@ typedef struct os_spinlock_s
 {
     nv_spinlock_t      lock;
     unsigned long      eflags;
+#if defined(CONFIG_LOCKDEP)
+    /**
+     * A key of lock class. It would be registered to Lockdep validator so all
+     * instances' usages and dependencies will contribute to constructing correct
+     * locking rules and this lock will be tracked by the Lockdep validator.
+     *
+     */
+    struct lock_class_key key;
+#endif // CONFIG_LOCKDEP
 } os_spinlock_t;
 
 NV_STATUS NV_API_CALL os_alloc_spinlock(void **ppSpinlock)
@@ -1302,12 +1311,25 @@ NV_STATUS NV_API_CALL os_alloc_spinlock(void **ppSpinlock)
 
     os_spinlock = (os_spinlock_t *)*ppSpinlock;
     NV_SPIN_LOCK_INIT(&os_spinlock->lock);
+#if defined(CONFIG_LOCKDEP)
+#if NV_IS_EXPORT_SYMBOL_PRESENT_lockdep_register_key
+    // Register the dynamically allocated key to Lockdep.
+    lockdep_register_key(&os_spinlock->key);
+    lockdep_set_class(&os_spinlock->lock, &os_spinlock->key);
+#endif // NV_IS_EXPORT_SYMBOL_PRESENT_lockdep_register_key
+#endif // CONFIG_LOCKDEP
     os_spinlock->eflags = 0;
     return NV_OK;
 }
 
 void NV_API_CALL os_free_spinlock(void *pSpinlock)
 {
+
+#if defined(CONFIG_LOCKDEP)
+    os_spinlock_t *os_spinlock = (os_spinlock_t *)pSpinlock;
+    // Unregister the dynamically allocated key.
+    lockdep_unregister_key(&os_spinlock->key);
+#endif // CONFIG_LOCKDEP
     os_free_mem(pSpinlock);
 }
 
@@ -1368,6 +1390,15 @@ NV_STATUS NV_API_CALL os_get_is_openrm(NvBool *bIsOpenRm)
 #else // defined(NVCPU_X86_64) || defined(NVCPU_AARCH64)
     return NV_ERR_NOT_SUPPORTED;
 #endif // defined(NVCPU_X86_64) || defined(NVCPU_AARCH64)
+}
+
+NvBool NV_API_CALL os_is_bif_reset_supported(void *pOsGpuInfo)
+{
+    nv_state_t *nv = (nv_state_t *) pOsGpuInfo;
+    nv_linux_state_t *nvl = NV_GET_NVL_FROM_NV_STATE(nv);
+
+    // BIF reset is not supported if init on probe is enabled
+    return !(nvl->init_on_probe);
 }
 
 NvBool NV_API_CALL os_is_xen_dom0(void)
@@ -1515,7 +1546,7 @@ static NV_STATUS os_get_smbios_header_legacy(NvU64 *pSmbsAddr)
 }
 
 // This function is needed only if "efi" is enabled.
-#if (defined(NV_LINUX_EFI_H_PRESENT) && defined(CONFIG_EFI))
+#if defined(CONFIG_EFI)
 static NV_STATUS os_verify_smbios_header_uefi(NvU64 smbsAddr)
 {
     NV_STATUS status = NV_ERR_OBJECT_NOT_FOUND;
@@ -1558,8 +1589,7 @@ static NV_STATUS os_get_smbios_header_uefi(NvU64 *pSmbsAddr)
 {
     NV_STATUS status = NV_ERR_OPERATING_SYSTEM;
 
-// Make sure that efi.h is present before using "struct efi".
-#if (defined(NV_LINUX_EFI_H_PRESENT) && defined(CONFIG_EFI))
+#if defined(CONFIG_EFI)
 
 // Make sure that efi.h has SMBIOS3_TABLE_GUID present.
 #if defined(SMBIOS3_TABLE_GUID)
@@ -1626,9 +1656,7 @@ NV_STATUS NV_API_CALL os_get_acpi_rsdp_from_uefi
 
     *pRsdpAddr = 0;
 
-// Make sure that efi.h is present before using "struct efi".
-#if (defined(NV_LINUX_EFI_H_PRESENT) && defined(CONFIG_EFI))
-
+#if defined(CONFIG_EFI)
     if (efi.acpi20 != EFI_INVALID_TABLE_ADDR)
     {
         *pRsdpAddr = efi.acpi20;
@@ -1696,7 +1724,15 @@ NV_STATUS NV_API_CALL os_alloc_pages_node
      *                              the requested order is too large (just fail
      *                              instead).
      *
-     * 5. (Optional) __GFP_RECLAIM: Used to allow/forbid reclaim.
+     * 5. __GFP_RETRY_MAYFAIL:      Used to avoid the Linux kernel OOM killer.
+     *                              To help PMA on paths where UVM might be in
+     *                              memory over subscription. This gives UVM a
+     *                              chance to free memory before invoking any
+     *                              action from the OOM killer.  Freeing
+     *                              non-essential memory will also benefit the
+     *                              system as a whole.
+     *
+     * 6. (Optional) __GFP_RECLAIM: Used to allow/forbid reclaim.
      *                              This is part of GFP_USER and consequently
      *                              GFP_HIGHUSER_MOVABLE.
      *
@@ -1710,37 +1746,12 @@ NV_STATUS NV_API_CALL os_alloc_pages_node
      */
 
     gfp_mask = __GFP_THISNODE | GFP_HIGHUSER_MOVABLE | __GFP_COMP |
-               __GFP_NOWARN;
-    
-#if defined(__GFP_RETRY_MAYFAIL)
+               __GFP_NOWARN | __GFP_RETRY_MAYFAIL;
 
-    /*
-     * __GFP_RETRY_MAYFAIL :  Used to avoid the Linux kernel OOM killer.
-     *                        To help PMA on paths where UVM might be
-     *                        in memory over subscription. This gives UVM 
-     *                        a chance to free memory before invoking any 
-     *                        action from the OOM killer.
-     *                        Freeing non-essential memory will also benefit 
-     *                        the system as a whole.
-     */
-
-    gfp_mask |= __GFP_RETRY_MAYFAIL;
-#elif defined(__GFP_NORETRY)
-
-    /*
-     *  __GFP_NORETRY :       Use __GFP_NORETRY on older kernels where
-     *                        __GFP_RETRY_MAYFAIL is not present.
-     */
-
-    gfp_mask |= __GFP_NORETRY;
-#endif
-
-#if defined(__GFP_RECLAIM)
     if (flag & NV_ALLOC_PAGES_NODE_SKIP_RECLAIM)
     {
         gfp_mask &= ~(__GFP_RECLAIM);
     }
-#endif // defined(__GFP_RECLAIM)
 
     alloc_addr = alloc_pages_node(nid, gfp_mask, order);
     if (alloc_addr == NULL)
@@ -1914,11 +1925,7 @@ NV_STATUS NV_API_CALL os_write_file
     int num_retries = NV_MAX_NUM_FILE_IO_RETRIES;
 
 retry:
-#if defined(NV_KERNEL_WRITE_HAS_POINTER_POS_ARG)
     num_written = kernel_write(pFile, pBuffer, size, &f_pos);
-#else
-    num_written = kernel_write(pFile, pBuffer, size, f_pos);
-#endif
     if (num_written < 0)
     {
         return NV_ERR_OPERATING_SYSTEM;
@@ -1958,11 +1965,7 @@ NV_STATUS NV_API_CALL os_read_file
     int num_retries = NV_MAX_NUM_FILE_IO_RETRIES;
 
 retry:
-#if defined(NV_KERNEL_READ_HAS_POINTER_POS_ARG)
     num_read = kernel_read(pFile, pBuffer, size, &f_pos);
-#else
-    num_read = kernel_read(pFile, f_pos, pBuffer, size);
-#endif
     if (num_read < 0)
     {
         return NV_ERR_OPERATING_SYSTEM;
@@ -2067,13 +2070,27 @@ NV_STATUS NV_API_CALL os_get_random_bytes
     NvU16 numBytes
 )
 {
-#if defined NV_WAIT_FOR_RANDOM_BYTES_PRESENT
     if (wait_for_random_bytes() < 0)
         return NV_ERR_NOT_READY;
-#endif
 
     get_random_bytes(bytes, numBytes);
     return NV_OK;
+}
+
+NvU32 NV_API_CALL os_get_current_process_flags
+(
+    void
+)
+{
+    NvU32 flags = OS_CURRENT_PROCESS_FLAG_NONE;
+
+    if (current->flags & PF_EXITING)
+        flags |= OS_CURRENT_PROCESS_FLAG_EXITING;
+
+    if (current->flags & PF_KTHREAD)
+        flags |= OS_CURRENT_PROCESS_FLAG_KERNEL_THREAD;
+
+    return flags;
 }
 
 NV_STATUS NV_API_CALL os_alloc_wait_queue
@@ -2122,17 +2139,45 @@ void NV_API_CALL os_wake_up
     complete_all(&wq->q);
 }
 
-NV_STATUS NV_API_CALL os_get_tegra_platform
+static bool os_platform_is_fpga(void)
+{
+    const struct soc_device_attribute soc_attrs[] = {
+        { .revision = "*FPGA" },
+        {/* sentinel */}
+    };
+
+    if (soc_device_match(soc_attrs)) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool os_platform_is_vdk(void)
+{
+    const struct soc_device_attribute soc_attrs[] = {
+        { .revision = "VDK" },
+        {/* sentinel */}
+    };
+
+    if (soc_device_match(soc_attrs)) {
+        return true;
+    }
+
+    return false;
+}
+
+    NV_STATUS NV_API_CALL os_get_tegra_platform
 (
     NvU32 *mode
 )
 {
-#if defined(NV_SOC_TEGRA_FUSE_HELPER_H_PRESENT) && NV_SUPPORTS_PLATFORM_DISPLAY_DEVICE
-    if (tegra_platform_is_fpga())
+#if NV_SUPPORTS_PLATFORM_DISPLAY_DEVICE
+    if (os_platform_is_fpga())
     {
         *mode = NV_OS_TEGRA_PLATFORM_FPGA;
     }
-    else if (tegra_platform_is_vdk())
+    else if (os_platform_is_vdk())
     {
         *mode = NV_OS_TEGRA_PLATFORM_SIM;
     }
@@ -2214,6 +2259,51 @@ NvS32 NV_API_CALL os_imex_channel_get
 )
 {
     return nv_caps_imex_channel_get((int)descriptor);
+}
+
+NV_STATUS NV_API_CALL os_tegra_igpu_perf_boost
+(
+    void *handle,
+    NvBool enable,
+    NvU32 duration
+)
+{
+#if defined(CONFIG_PM_DEVFREQ) && defined(NV_UPDATE_DEVFREQ_PRESENT)
+    nv_state_t *nv = handle;
+    nv_linux_state_t *nvl = NV_GET_NVL_FROM_NV_STATE(nv);
+    int err;
+
+    if (enable)
+    {
+        if (nvl->devfreq_enable_boost == NULL)
+        {
+            return NV_ERR_NOT_SUPPORTED;
+        }
+
+        err = nvl->devfreq_enable_boost(nvl->dev, duration);
+        if (err != 0)
+        {
+            return NV_ERR_OPERATING_SYSTEM;
+        }
+    }
+    else
+    {
+        if (nvl->devfreq_disable_boost == NULL)
+        {
+            return NV_ERR_NOT_SUPPORTED;
+        }
+
+        err = nvl->devfreq_disable_boost(nvl->dev);
+        if (err != 0)
+        {
+            return NV_ERR_OPERATING_SYSTEM;
+        }
+    }
+
+    return NV_OK;
+#else // !defined(CONFIG_PM_DEVFREQ) || !defined(NV_UPDATE_DEVFREQ_PRESENT)
+    return NV_ERR_NOT_SUPPORTED;
+#endif
 }
 
 /*
@@ -2300,7 +2390,7 @@ static int os_numa_verify_gpu_memory_zone(struct notifier_block *nb,
     return NOTIFY_OK;
 }
 
-#define ADD_REMOVE_GPU_MEMORY_NUM_SEGMENTS 4
+#define ADD_REMOVE_GPU_MEMORY_NUM_SEGMENTS 128
 
 NV_STATUS NV_API_CALL os_numa_add_gpu_memory
 (
@@ -2624,7 +2714,6 @@ NV_STATUS NV_API_CALL os_offline_page_at_address
 {
 #if defined(CONFIG_MEMORY_FAILURE)
     int flags = 0;
-    int ret;
     NvU64 pfn;
     struct page *page = NV_GET_PAGE_STRUCT(address);
 
@@ -2649,22 +2738,18 @@ NV_STATUS NV_API_CALL os_offline_page_at_address
     flags |= MF_SW_SIMULATED;
 #endif
 
-#ifdef NV_MEMORY_FAILURE_HAS_TRAPNO_ARG
-    ret = memory_failure(pfn, 0, flags);
-#else
-    ret = memory_failure(pfn, flags);
-#endif
+    nv_printf(NV_DBG_INFO, "NVRM: offlining page at address: 0x%llx pfn: 0x%llx\n",
+              address, pfn);
 
-    if (ret != 0)
-    {
-        nv_printf(NV_DBG_ERRORS, "NVRM: page offlining failed. address: 0x%llx pfn: 0x%llx ret: %d\n",
-                  address, pfn, ret);
-        return NV_ERR_OPERATING_SYSTEM;
-    }
+#ifdef NV_MEMORY_FAILURE_QUEUE_HAS_TRAPNO_ARG
+    memory_failure_queue(pfn, 0, flags);
+#else
+    memory_failure_queue(pfn, flags);
+#endif
 
     return NV_OK;
 #else // !defined(CONFIG_MEMORY_FAILURE)
-    nv_printf(NV_DBG_ERRORS, "NVRM: memory_failure() not supported by kernel. page offlining failed. address: 0x%llx\n",
+    nv_printf(NV_DBG_ERRORS, "NVRM: memory_failure_queue() not supported by kernel. page offlining failed. address: 0x%llx\n",
               address);
     return NV_ERR_NOT_SUPPORTED;
 #endif
@@ -2711,4 +2796,9 @@ NV_STATUS NV_API_CALL os_device_vm_present(void)
 #else
     return NV_ERR_NOT_SUPPORTED;
 #endif
+}
+
+NvBool NV_API_CALL os_supports_kernel_suspend_notifiers(void)
+{
+    return (NVreg_UseKernelSuspendNotifiers == 1);
 }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2015-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2015-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -142,25 +142,6 @@ Object *objGetDirectParent_IMPL(Object *pObj)
 {
     NV_ASSERT(pObj != NULL);
     return pObj->pParent;
-}
-
-NV_STATUS __nvoc_handleObjCreateMemAlloc(NvU32 createFlags, NvU32 allocSize, void **ppLocalPtr, void **ppThis)
-{
-    if (allocSize == 0 || ppThis == NULL || ppLocalPtr == NULL)
-        return NV_ERR_INVALID_PARAMETER;
-
-    if (createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
-    {
-        *ppLocalPtr = *ppThis;
-    }
-    else
-    {
-        *ppLocalPtr = portMemAllocNonPaged(allocSize);
-        if (*ppLocalPtr == NULL)
-            return NV_ERR_NO_MEMORY;
-    }
-
-    return NV_OK;
 }
 
 //! Internal backing method for objDelete.

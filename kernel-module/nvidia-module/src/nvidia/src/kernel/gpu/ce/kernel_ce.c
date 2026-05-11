@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -24,6 +24,7 @@
 #include "core/locks.h"
 #include "gpu/ce/kernel_ce.h"
 #include "gpu/ce/kernel_ce_private.h"
+#include "gpu/bif/kernel_bif.h"
 #include "gpu/eng_desc.h"
 #include "gpu/mem_mgr/ce_utils.h"
 #include "gpu_mgr/gpu_mgr.h"
@@ -56,6 +57,7 @@ NV_STATUS kceConstructEngine_IMPL(OBJGPU *pGpu, KernelCE *pKCe, ENGDESCRIPTOR en
 
     pKCe->bIsAutoConfigEnabled = NV_TRUE;
     pKCe->bUseGen4Mapping = NV_FALSE;
+    pKCe->bMultipleP2PLce = NV_FALSE;
     pKCe->ceCapsMask = 0;
     NvU32 data32 = 0;
     if ((osReadRegistryDword(pGpu, NV_REG_STR_RM_CE_ENABLE_AUTO_CONFIG, &data32) == NV_OK) &&
@@ -502,7 +504,9 @@ static void printCaps(OBJGPU *pGpu, KernelCE *pKCe, RM_ENGINE_TYPE rmEngineType,
     PRINT_CAP(_CE_SUPPORTS_NONPIPELINED_BL);
     PRINT_CAP(_CE_SUPPORTS_PIPELINED_BL);
     PRINT_CAP(_CE_CC_SECURE);
+    PRINT_CAP(_CE_CC_WORK_SUBMIT);
     PRINT_CAP(_CE_DECOMP_SUPPORTED);
+    PRINT_CAP(_CE_SCRUB);
 }
 
 void kceGetNvlinkCaps_IMPL(OBJGPU *pGpu, KernelCE *pKCe, NvU8 *pKCeCaps)
@@ -515,6 +519,17 @@ void kceGetNvlinkCaps_IMPL(OBJGPU *pGpu, KernelCE *pKCe, NvU8 *pKCeCaps)
 
     if (kceIsCeNvlinkP2P_HAL(pGpu, pKCe))
         RMCTRL_SET_CAP(pKCeCaps, NV2080_CTRL_CE_CAPS, _CE_NVLINK_P2P);
+
+    if (kceIsScrubLce_HAL(pGpu, pKCe))
+        RMCTRL_SET_CAP(pKCeCaps, NV2080_CTRL_CE_CAPS, _CE_SCRUB);
+
+    if (gpuIsCCFeatureEnabled(pGpu))
+    {
+        if (kceIsCCWorkSubmitLce_HAL(pGpu, pKCe))
+        {
+            RMCTRL_SET_CAP(pKCeCaps, NV2080_CTRL_CE_CAPS, _CE_CC_WORK_SUBMIT);
+        }
+    }
 }
 
 NV_STATUS kceGetDeviceCaps_IMPL(OBJGPU *pGpu, KernelCE *pKCe, RM_ENGINE_TYPE rmEngineType, NvU8 *pKCeCaps)
@@ -607,7 +622,8 @@ kceGetCeFromNvlinkConfig_IMPL
 
         // Check if GPU supports NVLink for P2P
         if (NV2080_CTRL_NVLINK_GET_CAP(nvlinkCaps, NV2080_CTRL_NVLINK_CAPS_P2P_SUPPORTED))
-            rmStatus = kceGetP2PCes(pKCe, pGpu, gpuMask, nvlinkP2PCeMask);
+            if (nvlinkP2PCeMask)
+                rmStatus = kceGetP2PCes(pKCe, pGpu, gpuMask, nvlinkP2PCeMask);
     }
 
     return rmStatus;
@@ -958,6 +974,58 @@ kceGetLceMask_IMPL
 }
 
 /**
+ * Takes in CE Mappings for a MIG GPU Instance and makes the control
+ * call to perform the actual mapping.
+ *
+ * @param[in]   pGpu                OBJGPU pointer
+ * @param[in]   pKCe                KCe pointer
+ * @param[in]   pLocalPceLceMap     CE Mapping to apply
+ * @param[in]   lceAvailableMask    LCE Mask available to this GPU Instance
+ *
+ * @return NV_TRUE if mapping is successful. If error in mapping occurs an
+ *                 assert will be thrown.
+ */
+NvBool kceApplyMIGMappings_IMPL
+(
+    OBJGPU      *pGpu,
+    KernelCE    *pKCe,
+    NvU32       *pLocalPceLceMap,
+    NvU32        lceAvailableMask
+)
+{
+    NV_STATUS status;
+    RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);
+    NV2080_CTRL_CE_UPDATE_PCE_LCE_MIG_MAPPINGS_PARAMS params = {0};
+
+    params.lceAvailableMask = lceAvailableMask;
+
+    portMemCopy(params.pceLceMap,
+                sizeof(params.pceLceMap),
+                pLocalPceLceMap,
+                sizeof(params.pceLceMap));
+
+    params.shimInstance = pKCe->shimInstance;
+
+    status = pRmApi->Control(pRmApi,
+                             pGpu->hInternalClient,
+                             pGpu->hInternalSubdevice,
+                             NV2080_CTRL_CE_UPDATE_PCE_LCE_MIG_MAPPINGS,
+                             &params,
+                             sizeof(params));
+
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+            "Failed to update PCE-LCE mappings for LCE 0x%x. Return\n", lceAvailableMask);
+        return NV_FALSE;
+    }
+
+    kceUpdateClassDB_HAL(pGpu, pKCe);
+
+    return NV_TRUE;
+}
+
+/**
  * Returns the PCE config for the specified LCE type.
  *
  * @param[in] pGpu                  OBJGPU pointer
@@ -996,6 +1064,25 @@ kceGetPceConfigForLceType_IMPL
     portMemSet(&pceConfigParams, 0, sizeof(pceConfigParams));
     pceConfigParams.lceType = lceType;
 
+    if (lceType == NV2080_CTRL_CE_LCE_TYPE_PCIE_RD ||
+        lceType == NV2080_CTRL_CE_LCE_TYPE_PCIE_WR)
+    {
+        KernelBif *pKernelBif = GPU_GET_KERNEL_BIF(pGpu);
+
+        NV2080_CTRL_BUS_INFO busInfo = {0};
+        busInfo.index = NV2080_CTRL_BUS_INFO_INDEX_PCIE_ROOT_LINK_CAPS;
+        busInfo.data  = 0;
+
+        if (kbifControlGetPCIEInfo(pGpu, pKernelBif, &busInfo) == NV_OK)
+        {
+            pceConfigParams.metadataForLceType = ceEncodeLceTypeMetadataForPcie(pGpu, busInfo.data);
+        }
+        else
+        {
+            pceConfigParams.metadataForLceType = UNKNOWN_PCIE_GEN_SPEED;
+        }
+    }
+
     NV_ASSERT_OK_OR_RETURN(pRmApi->Control(pRmApi,
                                            pGpu->hInternalClient,
                                            pGpu->hInternalSubdevice,
@@ -1008,6 +1095,61 @@ kceGetPceConfigForLceType_IMPL
     *pSupportedPceMask    = pceConfigParams.supportedPceMask;
     *pSupportedLceMask    = pceConfigParams.supportedLceMask;
     *pPcesPerHshub        = pceConfigParams.pcePerHshub;
+
+    return NV_OK;
+}
+
+/**
+ * Returns the PCE config for the specified MIG GPU Instance.
+ *
+ * @param[in] pGpu                  OBJGPU pointer
+ * @param[in] pKCe                  kCE object pointer
+ * @param[in] lceMask               mask of LCEs available on this GPU Instance
+ * @param[in] numLce                Number of LCEs on this GPU Instance
+ * @param[out] pPceAvailableMask    PCEs available to this GPU Instance
+ * @param[out] pNumLcesToMap        Number of LCEs to map
+ * @param[out] pLceAvailableMask    LCE Mask to use for this GPU Instance
+ * @param[out] pNumMinPcesPerLce    Number of PCEs per LCE to map
+ *
+ * @return NV_OK on success or NV_ERR_INVALID_ARGUMENT with additional
+ *         log error message from control call if an invalid setting is requested
+ */
+NV_STATUS
+kceGetPceConfigForLceMIGGpuInstance
+(
+    OBJGPU     *pGpu,
+    KernelCE   *pKCe,
+    NvU32       lceMask,
+    NvU32       numLces,
+    NvU32      *pPceAvailableMask,
+    NvU32      *pNumLcesToMap,
+    NvU32      *pLceAvailableMask,
+    NvU32      *pNumMinPcesPerLce
+)
+{
+    RM_API   *pRmApi    = GPU_GET_PHYSICAL_RMAPI(pGpu);
+
+    NV_ASSERT_OR_RETURN(pPceAvailableMask != NULL, NV_ERR_INVALID_ARGUMENT);
+    NV_ASSERT_OR_RETURN(pLceAvailableMask != NULL, NV_ERR_INVALID_ARGUMENT);
+    NV_ASSERT_OR_RETURN(pNumMinPcesPerLce != NULL, NV_ERR_INVALID_ARGUMENT);
+    NV_ASSERT_OR_RETURN(pNumLcesToMap != NULL, NV_ERR_INVALID_ARGUMENT);
+
+    NV2080_CTRL_CMD_INTERNAL_CE_GET_PCE_CONFIG_FOR_LCE_MIG_GPU_INSTANCE_PARAMS pceConfigParams;
+    portMemSet(&pceConfigParams, 0, sizeof(pceConfigParams));
+    pceConfigParams.lceMask = lceMask;
+    pceConfigParams.numLces = numLces;
+
+    NV_ASSERT_OK_OR_RETURN(pRmApi->Control(pRmApi,
+                           pGpu->hInternalClient,
+                           pGpu->hInternalSubdevice,
+                           NV2080_CTRL_CMD_INTERNAL_CE_GET_PCE_CONFIG_FOR_LCE_MIG_GPU_INSTANCE,
+                           &pceConfigParams,
+                           sizeof(pceConfigParams)));
+
+    *pPceAvailableMask = pceConfigParams.pceAvailableMask;
+    *pNumLcesToMap     = pceConfigParams.numLcesToMap;
+    *pLceAvailableMask = pceConfigParams.lceAvailableMask;
+    *pNumMinPcesPerLce = pceConfigParams.numMinPcesPerLce;
 
     return NV_OK;
 }

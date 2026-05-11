@@ -175,6 +175,9 @@ nvswitch_minion_send_command_ls10
     NvU32            ingressEccRegVal = 0, egressEccRegVal = 0;
     NVSWITCH_TIMEOUT timeout;
     NvBool           keepPolling;
+    NVSWITCH_RAW_ERROR_LOG_TYPE minion_error = {0, { 0 }};
+
+    minion_error.data[0] = command;
 
     localLinkNumber = linkNumber % NVSWITCH_LINKS_PER_MINION_LS10;
 
@@ -195,6 +198,12 @@ nvswitch_minion_send_command_ls10
             "%s: MINION %d is in fault state. NV_MINION_NVLINK_DL_CMD(%d) = %08x\n",
             __FUNCTION__, NVSWITCH_GET_LINK_ENG_INST(device, linkNumber, MINION),
             linkNumber, data);
+
+        minion_error.data[1] = data;
+        NVSWITCH_REPORT_NONFATAL_LINK(device, linkNumber, _HW_MINION_DLCMD_FAULT,
+            "DLCMD FAULT: cmd=0x%x DL_CMD=0x%x",
+            minion_error.data[0],
+            minion_error.data[1]);
         return -NVL_ERR_GENERIC;
     }
 
@@ -263,6 +272,8 @@ nvswitch_minion_send_command_ls10
             // The command has completed, success?
             if (FLD_TEST_DRF_NUM(_MINION, _NVLINK_DL_CMD, _FAULT, 1, data))
             {
+                minion_error.data[1] = data;
+
                 NVSWITCH_PRINT(device, ERROR,
                     "%s: NVLink MINION command faulted!"
                     " NV_MINION_NVLINK_DL_CMD(%d) = 0x%08x\n",
@@ -292,6 +303,7 @@ nvswitch_minion_send_command_ls10
 
                 data = FLD_SET_DRF_NUM(_MINION, _NVLINK_DL_CMD, _FAULT, 1, 0x0);
                 NVSWITCH_MINION_LINK_WR32_LS10(device, linkNumber, _MINION, _NVLINK_DL_CMD(localLinkNumber), data);
+
                 return -NVL_ERR_INVALID_STATE;
             }
             else
@@ -313,6 +325,12 @@ nvswitch_minion_send_command_ls10
             "%s: Timeout waiting for NVLink MINION command to complete!"
             " NV_MINION_NVLINK_DL_CMD(%d) = 0x%08x\n",
             __FUNCTION__, linkNumber, data);
+
+        minion_error.data[1] = data;
+
+        NVSWITCH_REPORT_NONFATAL_LINK(device, linkNumber, _HW_MINION_DLCMD_TIMEOUT,
+            "DLCMD TIMEOUT: cmd=0x%x DL_CMD=0x%0x",
+            minion_error.data[0], minion_error.data[1]);
         return -NVL_ERR_INVALID_STATE;
     }
 

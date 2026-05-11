@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -504,10 +504,21 @@ kheadReadPendingVblank_v03_00
     }
 
     intr = GPU_REG_RD32_EX(pGpu, NV_PDISP_FE_RM_INTR_STAT_HEAD_TIMING(pKernelHead->PublicId), pThreadState);
-
-    if (FLD_TEST_DRF(_PDISP, _FE_EVT_STAT_HEAD_TIMING, _LAST_DATA, _PENDING, intr))
+    
+    if (pKernelHead->bIsPanelReplayEnabled == NV_TRUE)
     {
-        return NV_TRUE;
+        if (FLD_TEST_DRF(_PDISP, _FE_EVT_STAT_HEAD_TIMING, _VBLANK, _PENDING, intr))
+        {
+            return NV_TRUE;
+        }
+
+    }
+    else
+    {
+        if (FLD_TEST_DRF(_PDISP, _FE_EVT_STAT_HEAD_TIMING, _LAST_DATA, _PENDING, intr))
+        {
+            return NV_TRUE;
+        }
     }
 
     return NV_FALSE;
@@ -712,11 +723,6 @@ kdispServiceAwakenIntr_v03_00
     NvU32  intrCtrlDisp;
     NvBool bAwakenIntrPending = NV_FALSE;
 
-    if (pKernelDisplay->getProperty(pKernelDisplay, PDB_PROP_KDISP_IN_AWAKEN_INTR))
-        return awakenWinChannelNumMask;
-
-    pKernelDisplay->setProperty(pKernelDisplay, PDB_PROP_KDISP_IN_AWAKEN_INTR, NV_TRUE);
-
     intrCtrlDisp = GPU_REG_RD32_EX(pGpu, DISP_INTR_REG(STAT_CTRL_DISP), pThreadState);
 
     // Handle awaken interrupts
@@ -741,8 +747,6 @@ kdispServiceAwakenIntr_v03_00
         // HW reported AWAKEN interrupt, we should not end up with no channel having AWAKEN pending
         NV_ASSERT(bAwakenIntrPending);
     }
-
-    pKernelDisplay->setProperty(pKernelDisplay, PDB_PROP_KDISP_IN_AWAKEN_INTR, NV_FALSE);
 
     return awakenWinChannelNumMask;
 }

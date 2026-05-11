@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2005-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2005-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -683,6 +683,10 @@ typedef struct NV2080_CTRL_PERF_GET_LEVEL_INFO_V2_PARAMS {
     NvU32                         perfGetClkInfoListSize;
 } NV2080_CTRL_PERF_GET_LEVEL_INFO_V2_PARAMS;
 
+#define NV2080_CTRL_PERF_GET_LEVEL_INFO_LEVEL_STANDARD       0
+#define NV2080_CTRL_PERF_GET_LEVEL_INFO_LEVEL_CONSERVATIVE   1
+#define NV2080_CTRL_PERF_GET_LEVEL_INFO_LEVEL_AGGRESSIVE     2
+
 #define NV2080_CTRL_PERF_GET_LEVEL_INFO_FLAGS_TYPE                 0:0
 #define NV2080_CTRL_PERF_GET_LEVEL_INFO_FLAGS_TYPE_DEFAULT   (0x00000000)
 #define NV2080_CTRL_PERF_GET_LEVEL_INFO_FLAGS_TYPE_OVERCLOCK (0x00000001)
@@ -889,6 +893,34 @@ typedef NvU32 NV2080_CTRL_PERF_PSTATES_ID;
 typedef struct NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS {
     NvU32 currPstate;
 } NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS;
+
+/*
+ * NV2080_CTRL_CMD_PERF_GET_TEGRA_PERFMON_SAMPLE
+ *
+ * Fetch the busyness of the specified clock domain in percentage
+ * for Tegra chips.
+ *
+ *   clkDomain
+ *     Clock domain identifier for Tegra platforms.
+ *
+ *   clkPercentBusy
+ *     Busyness of the specified clock domain in percentage
+ *     unit ranging from 0 to 100.
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_NOT_SUPPORTED
+ */
+#define NV2080_CTRL_CMD_PERF_GET_TEGRA_PERFMON_SAMPLE (0x20802069) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_0_PERF_INTERFACE_ID << 8) | NV2080_CTRL_PERF_GET_TEGRA_PERFMON_SAMPLE_PARAMS_MESSAGE_ID" */
+
+typedef NvU32 NV2080_CTRL_CLK_DOMAIN_TEGRA;
+
+#define NV2080_CTRL_PERF_GET_TEGRA_PERFMON_SAMPLE_PARAMS_MESSAGE_ID (0x69U)
+
+typedef struct NV2080_CTRL_PERF_GET_TEGRA_PERFMON_SAMPLE_PARAMS {
+    NV2080_CTRL_CLK_DOMAIN_TEGRA clkDomain;
+    NvU32                        clkPercentBusy;
+} NV2080_CTRL_PERF_GET_TEGRA_PERFMON_SAMPLE_PARAMS;
 
 
 /* _ctrl2080perf_h_ */

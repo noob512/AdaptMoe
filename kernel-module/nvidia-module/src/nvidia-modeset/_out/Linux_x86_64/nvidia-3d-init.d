@@ -22,7 +22,7 @@ _out/Linux_x86_64/nvidia-3d-init.o: \
  ../common/unix/nvidia-3d/interface/nvidia-3d-types.h \
  ../common/unix/nvidia-push/interface/nvidia-push-methods.h \
  ../common/unix/nvidia-push/interface/nvidia-push-types.h \
- ../common/sdk/nvidia/inc/class/cla16f.h \
+ ../common/sdk/nvidia/inc/class/clc46f.h \
  ../common/unix/nvidia-3d/interface/nvidia-3d-shaders.h \
  ../common/sdk/nvidia/inc/class/cl9097.h \
  ../common/unix/nvidia-3d/include/nvidia-3d-surface.h \
@@ -30,7 +30,6 @@ _out/Linux_x86_64/nvidia-3d-init.o: \
  ../common/unix/nvidia-3d/include/nvidia-3d-types-priv.h \
  ../common/unix/nvidia-3d/include/nvidia-3d-fermi.h \
  ../common/unix/nvidia-3d/include/nvidia-3d-kepler.h \
- ../common/unix/nvidia-3d/include/nvidia-3d-maxwell.h \
  ../common/unix/nvidia-3d/include/nvidia-3d-pascal.h \
  ../common/unix/nvidia-3d/include/nvidia-3d-volta.h \
  ../common/unix/nvidia-3d/include/nvidia-3d-turing.h \
@@ -44,22 +43,16 @@ _out/Linux_x86_64/nvidia-3d-init.o: \
  ../common/sdk/nvidia/inc/class/clc797.h \
  ../common/sdk/nvidia/inc/class/clc697.h \
  ../common/sdk/nvidia/inc/class/clc597.h \
- ../common/sdk/nvidia/inc/class/clc397.h \
- ../common/sdk/nvidia/inc/class/clc197.h \
- ../common/sdk/nvidia/inc/class/clc097.h \
- ../common/sdk/nvidia/inc/class/clb197.h \
- ../common/sdk/nvidia/inc/class/clb097.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080gr.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h \
- src/shaders/g_maxwell_shader_info.h \
+ src/shaders/g_turing_shader_info.h \
  ../common/unix/nvidia-3d/interface/nvidia-3d-shaders.h \
- src/shaders/g_shader_names.h src/shaders/g_pascal_shader_info.h \
- src/shaders/g_volta_shader_info.h src/shaders/g_turing_shader_info.h \
- src/shaders/g_ampere_shader_info.h src/shaders/g_hopper_shader_info.h \
- src/shaders/g_blackwell_shader_info.h src/shaders/g_gb20x_shader_info.h
+ src/shaders/g_shader_names.h src/shaders/g_ampere_shader_info.h \
+ src/shaders/g_hopper_shader_info.h src/shaders/g_blackwell_shader_info.h \
+ src/shaders/g_gb20x_shader_info.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 ../common/unix/nvidia-3d/interface/nvidia-3d.h:
 ../common/sdk/nvidia/inc/nvtypes.h:
@@ -87,7 +80,7 @@ _out/Linux_x86_64/nvidia-3d-init.o: \
 ../common/unix/nvidia-3d/interface/nvidia-3d-types.h:
 ../common/unix/nvidia-push/interface/nvidia-push-methods.h:
 ../common/unix/nvidia-push/interface/nvidia-push-types.h:
-../common/sdk/nvidia/inc/class/cla16f.h:
+../common/sdk/nvidia/inc/class/clc46f.h:
 ../common/unix/nvidia-3d/interface/nvidia-3d-shaders.h:
 ../common/sdk/nvidia/inc/class/cl9097.h:
 ../common/unix/nvidia-3d/include/nvidia-3d-surface.h:
@@ -95,7 +88,6 @@ _out/Linux_x86_64/nvidia-3d-init.o: \
 ../common/unix/nvidia-3d/include/nvidia-3d-types-priv.h:
 ../common/unix/nvidia-3d/include/nvidia-3d-fermi.h:
 ../common/unix/nvidia-3d/include/nvidia-3d-kepler.h:
-../common/unix/nvidia-3d/include/nvidia-3d-maxwell.h:
 ../common/unix/nvidia-3d/include/nvidia-3d-pascal.h:
 ../common/unix/nvidia-3d/include/nvidia-3d-volta.h:
 ../common/unix/nvidia-3d/include/nvidia-3d-turing.h:
@@ -109,22 +101,14 @@ _out/Linux_x86_64/nvidia-3d-init.o: \
 ../common/sdk/nvidia/inc/class/clc797.h:
 ../common/sdk/nvidia/inc/class/clc697.h:
 ../common/sdk/nvidia/inc/class/clc597.h:
-../common/sdk/nvidia/inc/class/clc397.h:
-../common/sdk/nvidia/inc/class/clc197.h:
-../common/sdk/nvidia/inc/class/clc097.h:
-../common/sdk/nvidia/inc/class/clb197.h:
-../common/sdk/nvidia/inc/class/clb097.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080gr.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h:
-src/shaders/g_maxwell_shader_info.h:
+src/shaders/g_turing_shader_info.h:
 ../common/unix/nvidia-3d/interface/nvidia-3d-shaders.h:
 src/shaders/g_shader_names.h:
-src/shaders/g_pascal_shader_info.h:
-src/shaders/g_volta_shader_info.h:
-src/shaders/g_turing_shader_info.h:
 src/shaders/g_ampere_shader_info.h:
 src/shaders/g_hopper_shader_info.h:
 src/shaders/g_blackwell_shader_info.h:

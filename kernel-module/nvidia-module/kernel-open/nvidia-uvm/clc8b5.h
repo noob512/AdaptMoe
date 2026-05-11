@@ -30,9 +30,11 @@
 #define NVC8B5_SET_SEMAPHORE_B                                                  (0x00000244)
 #define NVC8B5_SET_SEMAPHORE_B_LOWER                                            31:0
 #define NVC8B5_SET_SEMAPHORE_PAYLOAD                                            (0x00000248)
+#define NVC8B5_SET_SRC_PHYS_MODE                                                (0x00000260)
 #define NVC8B5_SET_SRC_PHYS_MODE_TARGET                                         1:0
 #define NVC8B5_SET_SRC_PHYS_MODE_TARGET_LOCAL_FB                                (0x00000000)
 #define NVC8B5_SET_SRC_PHYS_MODE_TARGET_COHERENT_SYSMEM                         (0x00000001)
+#define NVC8B5_SET_SRC_PHYS_MODE_TARGET_NONCOHERENT_SYSMEM                      (0x00000002)
 #define NVC8B5_SET_SRC_PHYS_MODE_TARGET_PEERMEM                                 (0x00000003)
 #define NVC8B5_SET_SRC_PHYS_MODE_PEER_ID                                        8:6
 #define NVC8B5_SET_SRC_PHYS_MODE_FLA                                            9:9
@@ -40,6 +42,7 @@
 #define NVC8B5_SET_DST_PHYS_MODE_TARGET                                         1:0
 #define NVC8B5_SET_DST_PHYS_MODE_TARGET_LOCAL_FB                                (0x00000000)
 #define NVC8B5_SET_DST_PHYS_MODE_TARGET_COHERENT_SYSMEM                         (0x00000001)
+#define NVC8B5_SET_DST_PHYS_MODE_TARGET_NONCOHERENT_SYSMEM                      (0x00000002)
 #define NVC8B5_SET_DST_PHYS_MODE_TARGET_PEERMEM                                 (0x00000003)
 #define NVC8B5_LAUNCH_DMA                                                       (0x00000300)
 #define NVC8B5_LAUNCH_DMA_DATA_TRANSFER_TYPE                                    1:0
@@ -66,6 +69,7 @@
 #define NVC8B5_LAUNCH_DMA_REMAP_ENABLE_FALSE                                    (0x00000000)
 #define NVC8B5_LAUNCH_DMA_REMAP_ENABLE_TRUE                                     (0x00000001)
 #define NVC8B5_LAUNCH_DMA_SRC_TYPE                                              12:12
+#define NVC8B5_LAUNCH_DMA_SRC_TYPE_VIRTUAL                                      (0x00000000)
 #define NVC8B5_LAUNCH_DMA_SRC_TYPE_PHYSICAL                                     (0x00000001)
 #define NVC8B5_LAUNCH_DMA_DST_TYPE                                              13:13
 #define NVC8B5_LAUNCH_DMA_DST_TYPE_VIRTUAL                                      (0x00000000)

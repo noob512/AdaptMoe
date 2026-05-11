@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1999-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1999-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -26,6 +26,17 @@
 #include "os-interface.h"
 #include "nv-linux.h"
 #include "nv-reg.h"
+
+#if IS_ENABLED(CONFIG_DRM)
+#include <drm/drm_device.h>
+#include <drm/drm_drv.h>
+
+#if defined(NV_DRM_DRMP_H_PRESENT)
+#include <drm/drmP.h>
+#endif
+
+#include <drm/drm_gem.h>
+#endif /* IS_ENABLED(CONFIG_DRM) */
 
 #define NV_DMA_DEV_PRINTF(debuglevel, dma_dev, format, ... )                \
     nv_printf(debuglevel, "NVRM: %s: " format,                              \
@@ -61,16 +72,11 @@ static NV_STATUS nv_dma_map_contig(
     NvU64 *va
 )
 {
-#if defined(NV_DMA_MAP_PAGE_ATTRS_PRESENT) && defined(NV_DMA_ATTR_SKIP_CPU_SYNC_PRESENT)
     *va = dma_map_page_attrs(dma_map->dev, dma_map->pages[0], 0,
                              dma_map->page_count * PAGE_SIZE,
                              DMA_BIDIRECTIONAL,
                              (dma_map->cache_type == NV_MEMORY_UNCACHED) ?
                               DMA_ATTR_SKIP_CPU_SYNC : 0);
-#else
-    *va = dma_map_page(dma_map->dev, dma_map->pages[0], 0,
-            dma_map->page_count * PAGE_SIZE, DMA_BIDIRECTIONAL);
-#endif
     if (dma_mapping_error(dma_map->dev, *va))
     {
         return NV_ERR_OPERATING_SYSTEM;
@@ -95,16 +101,11 @@ static NV_STATUS nv_dma_map_contig(
 
 static void nv_dma_unmap_contig(nv_dma_map_t *dma_map)
 {
-#if defined(NV_DMA_MAP_PAGE_ATTRS_PRESENT) && defined(NV_DMA_ATTR_SKIP_CPU_SYNC_PRESENT)
     dma_unmap_page_attrs(dma_map->dev, dma_map->mapping.contig.dma_addr,
                          dma_map->page_count * PAGE_SIZE,
                          DMA_BIDIRECTIONAL,
                          (dma_map->cache_type == NV_MEMORY_UNCACHED) ?
                           DMA_ATTR_SKIP_CPU_SYNC : 0);
-#else
-    dma_unmap_page(dma_map->dev, dma_map->mapping.contig.dma_addr,
-            dma_map->page_count * PAGE_SIZE, DMA_BIDIRECTIONAL);
-#endif
 }
 
 static void nv_fill_scatterlist
@@ -386,7 +387,7 @@ NV_STATUS NV_API_CALL nv_dma_map_sgt(
         return NV_ERR_NOT_SUPPORTED;
     }
 
-    if (page_count > NV_NUM_PHYSPAGES)
+    if (page_count > get_num_physpages())
     {
         NV_DMA_DEV_PRINTF(NV_DBG_ERRORS, dma_dev,
                 "DMA mapping request too large!\n");
@@ -467,7 +468,7 @@ static NV_STATUS NV_API_CALL nv_dma_map_pages(
         return NV_ERR_NOT_SUPPORTED;
     }
 
-    if (page_count > NV_NUM_PHYSPAGES)
+    if (page_count > get_num_physpages())
     {
         NV_DMA_DEV_PRINTF(NV_DBG_ERRORS, dma_dev,
                 "DMA mapping request too large!\n");
@@ -537,7 +538,7 @@ static NV_STATUS NV_API_CALL nv_dma_unmap_pages(
 
     dma_map = *priv;
 
-    if (page_count > NV_NUM_PHYSPAGES)
+    if (page_count > get_num_physpages())
     {
         NV_DMA_DEV_PRINTF(NV_DBG_ERRORS, dma_dev,
                 "DMA unmapping request too large!\n");
@@ -708,16 +709,13 @@ static NvBool nv_dma_use_map_resource
     nv_dma_device_t *dma_dev
 )
 {
-#if defined(NV_DMA_MAP_RESOURCE_PRESENT)
     const struct dma_map_ops *ops = get_dma_ops(dma_dev->dev);
-#endif
 
     if (nv_dma_remap_peer_mmio == NV_DMA_REMAP_PEER_MMIO_DISABLE)
     {
         return NV_FALSE;
     }
 
-#if defined(NV_DMA_MAP_RESOURCE_PRESENT)
     if (ops == NULL)
     {
         /* On pre-5.0 kernels, if dma_map_resource() is present, then we
@@ -731,9 +729,10 @@ static NvBool nv_dma_use_map_resource
 #endif
     }
 
-    return (ops->map_resource != NULL);
+#if defined(NV_DMA_MAP_OPS_HAS_MAP_PHYS)
+    return (ops->map_phys != NULL);
 #else
-    return NV_FALSE;
+    return (ops->map_resource != NULL);
 #endif
 }
 
@@ -817,7 +816,6 @@ NV_STATUS NV_API_CALL nv_dma_map_mmio
     NvU64           *va
 )
 {
-#if defined(NV_DMA_MAP_RESOURCE_PRESENT)
     BUG_ON(!va);
 
     if (nv_dma_use_map_resource(dma_dev))
@@ -844,9 +842,6 @@ NV_STATUS NV_API_CALL nv_dma_map_mmio
     }
 
     return NV_OK;
-#else
-    return NV_ERR_NOT_SUPPORTED;
-#endif
 }
 
 void NV_API_CALL nv_dma_unmap_mmio
@@ -856,13 +851,11 @@ void NV_API_CALL nv_dma_unmap_mmio
     NvU64            va
 )
 {
-#if defined(NV_DMA_MAP_RESOURCE_PRESENT)
     if (nv_dma_use_map_resource(dma_dev))
     {
         dma_unmap_resource(dma_dev->dev, va, page_count * PAGE_SIZE,
                            DMA_BIDIRECTIONAL, 0);
     }
-#endif
 }
 
 /*
@@ -905,39 +898,54 @@ void NV_API_CALL nv_dma_cache_invalidate
 #endif
 }
 
-#if defined(NV_LINUX_DMA_BUF_H_PRESENT) && \
-    defined(NV_DRM_AVAILABLE) && defined(NV_DRM_DRM_GEM_H_PRESENT)
+//
+// Note: For mapping GPU memory on third-party devices using dma-buf/nv-p2p in CDMM,
+// there isn't a kernel API that can be used for page-less coherent memory
+// on pre-6.18 kernels. Kernel 6.18 introduces dma_map_phys which doesn't require
+// struct page and uses physical addresses directly.
+// So this is only a WAR on CDMM for kernels older than 6.18. UVM creates
+// ZONE_DEVICE coherent pages for GPU memory in CDMM. RM uses these for DMA mapping.
+//
+// nv_dma_get_dev_pagemap adds a reference on the ZONE_DEVICE pagemap so the pages
+// don't go away when the DMA mapping is in progress.
+//
+void* NV_API_CALL nv_dma_get_dev_pagemap
+(
+    NvU64 phys_addr
+)
+{
+#if defined(NV_MEMORY_DEVICE_COHERENT_PRESENT)
+    return NV_GET_DEV_PAGEMAP(PHYS_PFN(phys_addr));
+#else
+    return NULL;
+#endif
+}
 
-/*
- * drm_gem_object_{get/put}() added by commit
- * e6b62714e87c8811d5564b6a0738dcde63a51774 (2017-02-28) and
- * drm_gem_object_{reference/unreference}() removed by commit
- * 3e70fd160cf0b1945225eaa08dd2cb8544f21cb8 (2018-11-15).
- */
+//
+// nv_dma_put_dev_pagemap removes the reference on the ZONE_DEVICE pagemap.
+//
+void NV_API_CALL nv_dma_put_dev_pagemap
+(
+    void *pgmap
+)
+{
+#if defined(NV_MEMORY_DEVICE_COHERENT_PRESENT)
+    if (pgmap != NULL)
+    {
+        put_dev_pagemap((struct dev_pagemap*) pgmap);
+    }
+#endif
+}
+
+#if IS_ENABLED(CONFIG_DRM)
 
 static inline void
-nv_dma_gem_object_unreference_unlocked(struct drm_gem_object *gem)
+nv_dma_gem_object_put_unlocked(struct drm_gem_object *gem)
 {
-#if defined(NV_DRM_GEM_OBJECT_GET_PRESENT)
-
 #if defined(NV_DRM_GEM_OBJECT_PUT_UNLOCK_PRESENT)
     drm_gem_object_put_unlocked(gem);
 #else
     drm_gem_object_put(gem);
-#endif
-
-#else
-    drm_gem_object_unreference_unlocked(gem);
-#endif
-}
-
-static inline void
-nv_dma_gem_object_reference(struct drm_gem_object *gem)
-{
-#if defined(NV_DRM_GEM_OBJECT_GET_PRESENT)
-    drm_gem_object_get(gem);
-#else
-    drm_gem_object_reference(gem);
 #endif
 }
 
@@ -967,7 +975,7 @@ NV_STATUS NV_API_CALL nv_dma_import_sgt
 
     // Do nothing with SGT, it is already mapped and pinned by the exporter
 
-    nv_dma_gem_object_reference(gem);
+    drm_gem_object_get(gem);
 
     return NV_OK;
 }
@@ -986,7 +994,7 @@ void NV_API_CALL nv_dma_release_sgt
     // Do nothing with SGT, it will be unmapped and unpinned by the exporter
     WARN_ON(sgt == NULL);
 
-    nv_dma_gem_object_unreference_unlocked(gem);
+    nv_dma_gem_object_put_unlocked(gem);
 
     module_put(gem->dev->driver->fops->owner);
 }
@@ -1010,4 +1018,4 @@ void NV_API_CALL nv_dma_release_sgt
 )
 {
 }
-#endif /* NV_LINUX_DMA_BUF_H_PRESENT && NV_DRM_AVAILABLE && NV_DRM_DRM_GEM_H_PRESENT */
+#endif /* IS_ENABLED(CONFIG_DRM) */

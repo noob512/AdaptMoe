@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2014-2019 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2014-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -117,7 +117,8 @@ const GMMU_FIELD_ADDRESS *
 gmmuFmtPtePhysAddrFld
 (
     const GMMU_FMT_PTE *pPte,
-    const GMMU_APERTURE aperture
+    const GMMU_APERTURE aperture,
+    const GMMU_PEER_TYPE peerType
 )
 {
     switch (aperture)
@@ -126,7 +127,9 @@ gmmuFmtPtePhysAddrFld
         case GMMU_APERTURE_SYS_NONCOH:
             return &pPte->fldAddrSysmem;
         case GMMU_APERTURE_PEER:
-            return &pPte->fldAddrPeer;
+            {
+                return &pPte->fldAddrPeer;
+            }
         case GMMU_APERTURE_VIDEO:
             return &pPte->fldAddrVidmem;
         default:

@@ -71,7 +71,7 @@ static inline NvU32 NVKMS_KAPI_NOTIFIER_OFFSET(NvU32 head,
         NVKMS_KAPI_NOTIFIER_SIZE;
 }
 
-NvBool nvKmsKapiAllocateNotifiers(struct NvKmsKapiDevice *device, NvBool inVideoMemory);
+NvBool nvKmsKapiAllocateNotifiers(struct NvKmsKapiDevice *device);
 NvBool nvKmsKapiAllocateSemaphores(struct NvKmsKapiDevice *device, NvBool inVideoMemory);
 
 void nvKmsKapiFreeNisoSurface(struct NvKmsKapiDevice *device,

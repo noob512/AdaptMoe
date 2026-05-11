@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1999-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1999-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -83,6 +83,9 @@ NV_STATUS  NV_API_CALL rm_gpu_ops_destroy_access_cntr_info(nvidia_stack_t *, nvg
 NV_STATUS  NV_API_CALL rm_gpu_ops_own_access_cntr_intr(nvidia_stack_t *, nvgpuSessionHandle_t, nvgpuAccessCntrInfo_t, NvBool);
 NV_STATUS  NV_API_CALL rm_gpu_ops_enable_access_cntr(nvidia_stack_t *, nvgpuDeviceHandle_t, nvgpuAccessCntrInfo_t, const nvgpuAccessCntrConfig_t *);
 NV_STATUS  NV_API_CALL rm_gpu_ops_disable_access_cntr(nvidia_stack_t *, nvgpuDeviceHandle_t, nvgpuAccessCntrInfo_t);
+NV_STATUS  NV_API_CALL rm_gpu_ops_access_bits_buffer_alloc(nvidia_stack_t *, nvgpuDeviceHandle_t, nvgpuAccessBitBufferAlloc_t);
+NV_STATUS  NV_API_CALL rm_gpu_ops_access_bits_buffer_free(nvidia_stack_t *, nvgpuDeviceHandle_t, nvgpuAccessBitBufferAlloc_t);
+NV_STATUS  NV_API_CALL rm_gpu_ops_access_bits_dump(nvidia_stack_t *, nvgpuDeviceHandle_t, nvgpuAccessBitBufferAlloc_t, UVM_ACCESS_BITS_DUMP_MODE);
 NV_STATUS  NV_API_CALL  rm_gpu_ops_set_page_directory (nvidia_stack_t *, nvgpuAddressSpaceHandle_t, NvU64, unsigned, NvBool, NvU32, NvU64 *);
 NV_STATUS  NV_API_CALL  rm_gpu_ops_unset_page_directory (nvidia_stack_t *, nvgpuAddressSpaceHandle_t);
 NV_STATUS  NV_API_CALL rm_gpu_ops_get_nvlink_info(nvidia_stack_t *, nvgpuDeviceHandle_t, nvgpuNvlinkInfo_t);

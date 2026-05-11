@@ -157,7 +157,7 @@ void on_uvm_assert(void);
 #define UVM_ASSERT_MSG_IGNORE(expr, fmt, ...)   \
     do {                                        \
         UVM_IGNORE_EXPR(expr);                  \
-        UVM_NO_PRINT(fmt, ##__VA_ARGS__);       \
+        no_printk(fmt, ##__VA_ARGS__);          \
     } while (0)
 
 // UVM_ASSERT and UVM_ASSERT_MSG are only enabled on non-release and Coverity
@@ -328,7 +328,7 @@ typedef struct
 } uvm_rm_user_object_t;
 
 // Macro used to compare two values for types that support less than operator.
-// It returns -1 if a < b, 1 if a > b and 0 if a == 0
+// It returns -1 if a < b, 1 if a > b and 0 if a == b
 #define UVM_CMP_DEFAULT(a,b)              \
 ({                                        \
     typeof(a) _a = a;                     \

@@ -76,6 +76,7 @@ struct THREAD_STATE_NODE
      */
     NvU32                threadSeqId;
     NvBool               bValid;
+    NvBool               bUsingHeap;
     THREAD_TIMEOUT_STATE timeout;
     NvU32                cpuNum;
     NvU32                flags;
@@ -131,7 +132,7 @@ typedef struct THREAD_STATE_DB
      * Thread state sequencer id counter.  The last allocated thread state
      * sequencer id via @ref threadStateInitXYZ().
      */
-    NvU32   threadSeqCntr;
+    PORT_ATOMIC NvU32   threadSeqCntr;
     /*!
      * Thread state sequencer id counter for only GSP task_interrupt.
      */
@@ -186,6 +187,8 @@ typedef struct THREAD_STATE_DB
 #define THREAD_STATE_FLAGS_TIMEOUT_INITED               NVBIT(5)
 #define THREAD_STATE_FLAGS_DEVICE_INIT                  NVBIT(7)
 #define THREAD_STATE_FLAGS_STATE_FREE_CB_ENABLED        NVBIT(8)
+#define THREAD_STATE_FLAGS_IS_KERNEL_THREAD             NVBIT(9)
+#define THREAD_STATE_FLAGS_IS_EXITING                   NVBIT(10)
 
 // These Threads run exclusively between a conditional acquire
 #define THREAD_STATE_FLAGS_EXCLUSIVE_RUNNING   (THREAD_STATE_FLAGS_IS_ISR                       | \
@@ -208,6 +211,7 @@ void        threadStateOnlyProcessWorkISRAndDeferredIntHandler(THREAD_STATE_NODE
 void        threadStateOnlyFreeISRAndDeferredIntHandler(THREAD_STATE_NODE *, OBJGPU*, NvU32);
 void        threadStateFreeISRAndDeferredIntHandler(THREAD_STATE_NODE *, OBJGPU*, NvU32);
 void        threadStateInit(THREAD_STATE_NODE *pThreadNode, NvU32 flags);
+THREAD_STATE_NODE* threadStateAlloc(NvU32 flags);
 void        threadStateFree(THREAD_STATE_NODE *pThreadNode, NvU32 flags);
 
 NV_STATUS   threadStateGetCurrent(THREAD_STATE_NODE **ppThreadNode, OBJGPU *pGpu);

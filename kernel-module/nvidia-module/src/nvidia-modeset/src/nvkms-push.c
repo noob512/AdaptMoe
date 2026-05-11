@@ -274,7 +274,7 @@ NvBool nvAllocNvPushDevice(NVDevEvoPtr pDevEvo)
 
     params.amodel.config = NV_AMODEL_NONE;
     params.isTegra = FALSE;
-    params.subDevice[0].gpuVASpace = pDevEvo->nvkmsGpuVASpace;
+    params.subDevice[0].gpuVASpaceCtxDma = pDevEvo->nvkmsGpuVASpace;
 
     ct_assert(sizeof(params.handlePool) ==
               sizeof(pDevEvo->nvPush.handlePool));

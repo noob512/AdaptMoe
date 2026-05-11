@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -25,6 +25,7 @@
 *   The GM107 specific HAL TMR routines reside in this file.                *
 *                                                                           *
 \***************************************************************************/
+#define NVOC_OBJTMR_H_PRIVATE_ACCESS_ALLOWED
 /* ------------------------- Includes --------------------------------------- */
 #include "gpu/gpu.h"
 #include "gpu/timer/objtmr.h"
@@ -60,10 +61,10 @@ tmrSetCurrentTime_GM107
     // We get the time in seconds and microseconds since 1970
     // Note that we don't really need the real time of day
     //
-    osGetCurrentTime(&seconds, &useconds);
+    osGetSystemTime(&seconds, &useconds);
 
     NV_PRINTF(LEVEL_INFO,
-              "osGetCurrentTime returns 0x%x seconds, 0x%x useconds\n",
+              "osGetSystemTime returns 0x%x seconds, 0x%x useconds\n",
               seconds, useconds);
 
     //
@@ -77,9 +78,6 @@ tmrSetCurrentTime_GM107
     //
     GPU_REG_WR32(pGpu, NV_PTIMER_TIME_1, NvU64_HI32(ns));
     GPU_REG_WR32(pGpu, NV_PTIMER_TIME_0, NvU64_LO32(ns));
-
-    // Mark that time has been initialized
-    pTmr->bInitialized = NV_TRUE;
 
     return NV_OK;
 }
@@ -277,6 +275,26 @@ tmrGetTimeEx_GM107
     return Time;
 }
 
+NvU32
+tmrGetTmrBaseAddr_GM107
+(
+    OBJGPU *pGpu,
+    OBJTMR *pTmr
+)
+{
+    return NV_PTIMER_TIME_0;
+}
+
+NvU32
+tmrGetNsecShiftMask_GM107
+(
+    OBJGPU *pGpu,
+    OBJTMR *pTmr
+)
+{
+    return DRF_SHIFTMASK(NV_PTIMER_TIME_0_NSEC);
+}
+
 //
 // For functions that only need a short delta of time elapsed (~ 4.29 seconds)
 // NOTE: Since it wraps around every 4.29 seconds, for general GetTime purposes,
@@ -297,7 +315,7 @@ tmrGetTimeLo_GM107
     // check if it's a stable TIME_0, otherwise, we just call a regular
     // tmrGetTime to handle all error book-keeping, resetting timer, etc.
     //
-    if ((lo & ~DRF_SHIFTMASK(NV_PTIMER_TIME_0_NSEC)) != 0)
+    if ((lo & ~tmrGetNsecShiftMask_HAL(pGpu, pTmr)) != 0)
     {
         // let tmrGetTime() handle all the mess..
         NV_PRINTF(LEVEL_WARNING,

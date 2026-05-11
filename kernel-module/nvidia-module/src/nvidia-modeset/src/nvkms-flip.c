@@ -25,7 +25,6 @@
 #include "nvkms-evo.h"
 #include "nvkms-flip.h"
 #include "nvkms-hw-flip.h"
-#include "nvkms-utils-flip.h"
 #include "nvkms-lut.h"
 #include "nvkms-prealloc.h"
 #include "nvkms-private.h"
@@ -41,11 +40,9 @@
 NvBool nvCheckLayerPermissions(
     const struct NvKmsPerOpenDev *pOpenDev,
     const NVDevEvoRec *pDevEvo,
-    const NvU32 sd,
     const NvU32 apiHead,
     const NvU8 changedLayersMask)
 {
-    const int dispIndex = pDevEvo->gpus[sd].pDispEvo->displayOwner;
     const struct NvKmsFlipPermissions *pFlipPermissions =
         nvGetFlipPermissionsFromOpenDev(pOpenDev);
     const struct NvKmsModesetPermissions *pModesetPermissions =
@@ -53,14 +50,13 @@ NvBool nvCheckLayerPermissions(
     const NvU8 allLayersMask = NVBIT(pDevEvo->apiHead[apiHead].numLayers) - 1;
     NvU8 layerMask = 0;
 
-    layerMask = pFlipPermissions->disp[dispIndex].head[apiHead].layerMask;
+    layerMask = pFlipPermissions->head[apiHead].layerMask;
 
     /*
-     * If the client has modeset permissions for this disp+head, allow
+     * If the client has modeset permissions for this head, allow
      * the client to also perform flips on any layer.
      */
-    if (!nvDpyIdListIsEmpty(pModesetPermissions->disp[dispIndex].
-                            head[apiHead].dpyIdList)) {
+    if (!nvDpyIdListIsEmpty(pModesetPermissions->head[apiHead].dpyIdList)) {
         layerMask = allLayersMask;
     }
 
@@ -88,7 +84,6 @@ NvBool nvCheckLayerPermissions(
 NvBool nvCheckFlipPermissions(
     const struct NvKmsPerOpenDev *pOpenDev,
     const NVDevEvoRec *pDevEvo,
-    const NvU32 sd,
     const NvU32 apiHead,
     const struct NvKmsFlipCommonParams *pParams)
 {
@@ -102,7 +97,7 @@ NvBool nvCheckFlipPermissions(
         (pParams->lut.input.specified)  ||
         (pParams->lut.output.specified)) {
         return nvCheckLayerPermissions(pOpenDev, pDevEvo,
-                                       sd, apiHead,
+                                       apiHead,
                                        allLayersMask);
     }
 
@@ -113,7 +108,7 @@ NvBool nvCheckFlipPermissions(
     }
 
     return nvCheckLayerPermissions(pOpenDev, pDevEvo,
-                                   sd, apiHead,
+                                   apiHead,
                                    changedLayersMask);
 }
 
@@ -249,61 +244,9 @@ static NvBool UpdateProposedFlipStateOneApiHead(
     return TRUE;
 }
 
-static NvBool GetAllowVrr(const NVDevEvoRec *pDevEvo,
-                          const struct NvKmsFlipRequestOneHead *pFlipHead,
-                          NvU32 numFlipHeads)
-{
-    NvU32 sd, i;
-    const NVDispEvoRec *pDispEvo;
-    const NvU32 requestedApiHeadCount = numFlipHeads;
-    NvU32 activeApiHeadCount, dirtyMainLayerCount;
-    NvBool allowVrr = TRUE;
-
-    if (!pDevEvo->hal->caps.supportsDisplayRate)
-    {
-        /*!
-         * Count active heads so we can make a decision about VRR
-         * and register syncpts if specified.
-         */
-        activeApiHeadCount = dirtyMainLayerCount = 0;
-
-        FOR_ALL_EVO_DISPLAYS(pDispEvo, sd, pDevEvo) {
-            NvU32 apiHead;
-            for (apiHead = 0; apiHead < pDevEvo->numApiHeads; apiHead++) {
-                if (nvApiHeadIsActive(pDispEvo, apiHead)) {
-                    activeApiHeadCount++;
-                }
-            }
-        }
-
-        for (i = 0; i < numFlipHeads; i++) {
-            if (nvIsLayerDirty(&pFlipHead[i].flip, NVKMS_MAIN_LAYER)) {
-                dirtyMainLayerCount++;
-            }
-        }
-
-        /*
-         * Deactivate VRR if only a subset of the heads are requested,
-         * only a subset of the heads are being flipped, or only a subset
-         * of the heads are allowed a VRR flip.
-         */
-        if ((activeApiHeadCount != requestedApiHeadCount) ||
-                (activeApiHeadCount != dirtyMainLayerCount)) {
-            allowVrr = FALSE;
-        }
-    }
-
-    if (!pDevEvo->vrr.enabled) {
-        allowVrr = FALSE;
-    }
-
-    return allowVrr;
-}
-
 static void FillNvKmsFlipReply(NVDevEvoRec *pDevEvo,
                                struct NvKmsFlipWorkArea *pWorkArea,
                                const NvBool applyAllowVrr,
-                               const NvS32 vrrSemaphoreIndex,
                                const struct NvKmsFlipRequestOneHead *pFlipHead,
                                NvU32 numFlipHeads,
                                struct NvKmsFlipReply *reply)
@@ -328,10 +271,8 @@ static void FillNvKmsFlipReply(NVDevEvoRec *pDevEvo,
 
     if (applyAllowVrr) {
         reply->vrrFlipType = nvGetActiveVrrType(pDevEvo);
-        reply->vrrSemaphoreIndex = vrrSemaphoreIndex;
     } else {
         reply->vrrFlipType = NV_KMS_VRR_FLIP_NON_VRR;
-        reply->vrrSemaphoreIndex = -1;
     }
 }
 
@@ -533,19 +474,15 @@ NvBool nvFlipEvo(NVDevEvoPtr pDevEvo,
                  NvBool skipUpdate,
                  NvBool allowFlipLock)
 {
-    NvS32 vrrSemaphoreIndex = -1;
-    NvU32 apiHead, sd;
     NvBool ret = FALSE;
     enum NvKmsFlipResult result = NV_KMS_FLIP_RESULT_INVALID_PARAMS;
+
     NvBool changed = FALSE;
-    NvBool vrrOnSubsetOfHeads; 
-    NVDispEvoPtr pDispEvo;
-    const NvBool allowVrrDev =
-        GetAllowVrr(pDevEvo, pFlipHead, numFlipHeads);
+    NvBool replyApplyVrr = FALSE;
     struct NvKmsFlipWorkArea *pWorkArea;
-    NvU32 i;
-    
-    vrrOnSubsetOfHeads = pDevEvo->hal->caps.supportsDisplayRate;
+
+    NvU32 allowVrrApiHeadMasks[NVKMS_MAX_SUBDEVICES];
+    NvU32 applyAllowVrrApiHeadMasks[NVKMS_MAX_SUBDEVICES];
 
     /*
      * Do not execute NVKMS_IOCTL_FLIP if the display channel yet has not
@@ -566,51 +503,29 @@ NvBool nvFlipEvo(NVDevEvoPtr pDevEvo,
                               sizeof(*pWorkArea));
     InitNvKmsFlipWorkArea(pDevEvo, pWorkArea);
 
-    NvU32 allowVrrApiHeadMasks[NVKMS_MAX_SUBDEVICES];
-    NvU32 applyAllowVrrApiHeadMasks[NVKMS_MAX_SUBDEVICES];
-
     nvkms_memset(allowVrrApiHeadMasks, 0, sizeof(allowVrrApiHeadMasks));
     nvkms_memset(applyAllowVrrApiHeadMasks, 0, sizeof(applyAllowVrrApiHeadMasks));
 
     /* Validate the flip parameters and update the work area. */
-    
-    /*
-     * In the pre-displayrate case, any head requesting a VRR flip means
-     * all heads within pDevEvo request a VRR flip. Similarly, any head
-     * with a dirty main layer means allowVrr must be applied to all heads.
-     */
-    NvBool anyAllowVrrHead = FALSE;
-    NvBool anyDirtyMainLayer = FALSE;
-    for (i = 0; i < numFlipHeads; i++) {
-        if (pFlipHead[i].flip.allowVrr) {
-            anyAllowVrrHead = TRUE;
-        }
-        if (nvIsLayerDirty(&pFlipHead[i].flip, NVKMS_MAIN_LAYER)) {
-            anyDirtyMainLayer = TRUE;
-        }
-    }
 
-    for (i = 0; i < numFlipHeads; i++) {
+    for (NvU32 i = 0; i < numFlipHeads; i++) {
         const NvU32 apiHead = pFlipHead[i].head;
         const NvU32 sd = pFlipHead[i].sd;
+        NvU32 head;
+
         const NvBool allowVrrHead = pFlipHead[i].flip.allowVrr;
         const NvBool dirtyMainLayer = nvIsLayerDirty(&pFlipHead[i].flip, NVKMS_MAIN_LAYER);
-        const NvBool allowVrr = allowVrrDev && 
-                                (vrrOnSubsetOfHeads ? allowVrrHead : anyAllowVrrHead);
+        const NvBool allowVrr = pDevEvo->vrr.enabled && allowVrrHead;
 
-        const NvBool applyAllowVrr = (vrrOnSubsetOfHeads ? 
-                                      dirtyMainLayer : anyDirtyMainLayer);
+        const NVDispEvoPtr pDispEvo = pDevEvo->pDispEvo[sd];
+        const NVDispApiHeadStateEvoRec *pApiHeadState = &pDispEvo->apiHeadState[apiHead];
 
-        NVDispEvoPtr pDispEvo = pDevEvo->pDispEvo[sd];
-        NvU32 head;
-        const NVDispApiHeadStateEvoRec *pApiHeadState =
-            &pDispEvo->apiHeadState[apiHead];
 
         if (!nvApiHeadIsActive(pDispEvo, apiHead)) {
             goto done;
         }
 
-        if (!nvCheckFlipPermissions(pOpenDev, pDevEvo, sd, apiHead,
+        if (!nvCheckFlipPermissions(pOpenDev, pDevEvo, apiHead,
                                     &pFlipHead[i].flip)) {
             goto done;
         }
@@ -634,7 +549,7 @@ NvBool nvFlipEvo(NVDevEvoPtr pDevEvo,
                 goto done;
             }
         }
-        if (applyAllowVrr) {
+        if (dirtyMainLayer) {
             applyAllowVrrApiHeadMasks[sd] |= (1 << apiHead);
             if (allowVrr) {
                 allowVrrApiHeadMasks[sd] |= (1 << apiHead);
@@ -668,9 +583,9 @@ NvBool nvFlipEvo(NVDevEvoPtr pDevEvo,
      *
      * See bug 4054546 for efforts to update this system.
      */
-    for (sd = 0; sd < pDevEvo->numSubDevices; sd++) {
-        pDispEvo = pDevEvo->gpus[sd].pDispEvo;
-        for (apiHead = 0; apiHead < pDevEvo->numApiHeads; apiHead++) {
+    for (NvU32 sd = 0; sd < pDevEvo->numSubDevices; sd++) {
+        const NVDispEvoPtr pDispEvo = pDevEvo->gpus[sd].pDispEvo;
+        for (NvU32 apiHead = 0; apiHead < pDevEvo->numApiHeads; apiHead++) {
             const NVProposedFlipStateOneApiHead *pProposedApiHead =
                 &pWorkArea->disp[sd].apiHead[apiHead].proposedFlipState;
 
@@ -715,14 +630,13 @@ NvBool nvFlipEvo(NVDevEvoPtr pDevEvo,
     nvPreFlip(pDevEvo, pWorkArea, applyAllowVrrApiHeadMasks, 
               allowVrrApiHeadMasks, skipUpdate);
 
-    for (sd = 0; sd < pDevEvo->numSubDevices; sd++) {
+    for (NvU32 sd = 0; sd < pDevEvo->numSubDevices; sd++) {
         NvU32 flip2Heads1OrApiHeadsMask = 0x0;
+        const NVDispEvoPtr pDispEvo = pDevEvo->gpus[sd].pDispEvo;
 
         if (!pWorkArea->sd[sd].changed) {
             continue;
         }
-
-        pDispEvo = pDevEvo->gpus[sd].pDispEvo;
 
         flip2Heads1OrApiHeadsMask =
             FlipEvo2Head1OrOneDisp(pDispEvo, pWorkArea, skipUpdate);
@@ -736,7 +650,7 @@ NvBool nvFlipEvo(NVDevEvoPtr pDevEvo,
          */
         nvEvoClearStagedLUTNotifiers(pDispEvo);
 
-        for (apiHead = 0; apiHead < NVKMS_MAX_HEADS_PER_DISP; apiHead++) {
+        for (NvU32 apiHead = 0; apiHead < NVKMS_MAX_HEADS_PER_DISP; apiHead++) {
             if (!nvApiHeadIsActive(pDispEvo, apiHead) ||
                     ((NVBIT(apiHead) & flip2Heads1OrApiHeadsMask) != 0x0)) {
                 continue;
@@ -751,20 +665,17 @@ NvBool nvFlipEvo(NVDevEvoPtr pDevEvo,
         }
     }
 
-    nvPostFlip(pDevEvo, pWorkArea, skipUpdate, applyAllowVrrApiHeadMasks,
-               &vrrSemaphoreIndex);
+    nvPostFlip(pDevEvo, pWorkArea, skipUpdate, applyAllowVrrApiHeadMasks);
 
-    NvBool replyApplyVrr = NV_FALSE;
-
-    for (sd = 0; sd < pDevEvo->numSubDevices; sd++) {
+    for (NvU32 sd = 0; sd < pDevEvo->numSubDevices; sd++) {
         if (applyAllowVrrApiHeadMasks[sd] > 0) {
             replyApplyVrr = NV_TRUE;
             break;
         }
     }
 
-    FillNvKmsFlipReply(pDevEvo, pWorkArea, replyApplyVrr, vrrSemaphoreIndex,
-                       pFlipHead, numFlipHeads, reply);
+    FillNvKmsFlipReply(pDevEvo, pWorkArea, replyApplyVrr, pFlipHead,
+                       numFlipHeads, reply);
 
     /* fall through */
 
@@ -1227,13 +1138,14 @@ void nvIdleLayerChannels(NVDevEvoRec *pDevEvo,
  * in-flight methods flip away from this surface.
  */
 void nvEvoClearSurfaceUsage(NVDevEvoRec *pDevEvo,
-                            NVSurfaceEvoPtr pSurfaceEvo)
+                            NVSurfaceEvoPtr pSurfaceEvo,
+                            const NvBool skipSync)
 {
     NvU32 head;
 
     /*
      * If the core channel is no longer allocated, we don't need to
-     * sync. This assumes the channels are allocated/deallocated
+     * clear usage/sync. This assumes the channels are allocated/deallocated
      * together.
      */
     if (pDevEvo->core) {
@@ -1242,16 +1154,20 @@ void nvEvoClearSurfaceUsage(NVDevEvoRec *pDevEvo,
             pDevEvo->hal->ClearSurfaceUsage(pDevEvo, pSurfaceEvo);
         }
 
-        nvRMSyncEvoChannel(pDevEvo, pDevEvo->core, __LINE__);
+        /* HALs with ClearSurfaceUsage() require sync to ensure completion. */
+        if (!skipSync ||
+            (pDevEvo->hal->ClearSurfaceUsage != NULL)) {
+            nvRMSyncEvoChannel(pDevEvo, pDevEvo->core, __LINE__);
 
-        for (head = 0; head < pDevEvo->numHeads; head++) {
-            NvU32 layer;
+            for (head = 0; head < pDevEvo->numHeads; head++) {
+                NvU32 layer;
 
-            for (layer = 0; layer < pDevEvo->head[head].numLayers; layer++) {
-                NVEvoChannelPtr pChannel =
-                    pDevEvo->head[head].layer[layer];
+                for (layer = 0; layer < pDevEvo->head[head].numLayers; layer++) {
+                    NVEvoChannelPtr pChannel =
+                        pDevEvo->head[head].layer[layer];
 
-                nvRMSyncEvoChannel(pDevEvo, pChannel, __LINE__);
+                    nvRMSyncEvoChannel(pDevEvo, pChannel, __LINE__);
+                }
             }
         }
     }

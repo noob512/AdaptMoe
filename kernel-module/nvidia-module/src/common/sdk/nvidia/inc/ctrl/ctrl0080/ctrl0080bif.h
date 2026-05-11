@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2009-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2009-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -31,6 +31,7 @@
 //
 
 #include "ctrl/ctrl0080/ctrl0080base.h"
+#include "nvcfg_sdk.h"
 
 /*
  * NV0080_CTRL_CMD_BIF_RESET
@@ -47,7 +48,8 @@
  *         to _SBR, a secondary-bus reset is performed. When set to
  *         _FUNDAMENTAL, a fundamental reset is performed.
  *
- *         NOTE: _FUNDAMENTAL is not yet supported.
+ *         NOTE: _FUNDAMENTAL is not supported for Blackwell and later chips.
+ *         Use BOOT_DEVICE_FUSE or BOOT_DEVICE reset type instead.
  *
  * Possible status return values are:
  *   NV_OK
@@ -73,30 +75,7 @@ typedef struct NV0080_CTRL_BIF_RESET_PARAMS {
 #define NV0080_CTRL_BIF_RESET_FLAGS_TYPE_OOBHUB_TRIGGER   0x7
 #define NV0080_CTRL_BIF_RESET_FLAGS_TYPE_BASE             0x8
 
-/*
- * NV0080_CTRL_BIF_SET_ASPM_FEATURE
- *
- * aspmFeatureSupported
- *    ASPM feature override by client
- *
- * Possible status values returned are:
- *   NV_OK
- */
 
-#define NV0080_CTRL_CMD_BIF_SET_ASPM_FEATURE              (0x800104) /* finn: Evaluated from "(FINN_NV01_DEVICE_0_BIF_INTERFACE_ID << 8) | NV0080_CTRL_BIF_SET_ASPM_FEATURE_PARAMS_MESSAGE_ID" */
-
-#define NV0080_CTRL_BIF_SET_ASPM_FEATURE_PARAMS_MESSAGE_ID (0x4U)
-
-typedef struct NV0080_CTRL_BIF_SET_ASPM_FEATURE_PARAMS {
-    NvU32 aspmFeatureSupported;
-} NV0080_CTRL_BIF_SET_ASPM_FEATURE_PARAMS;
-
-#define NV0080_CTRL_BIF_ASPM_FEATURE_DT_L0S                0:0
-#define NV0080_CTRL_BIF_ASPM_FEATURE_DT_L0S_ENABLED  0x000000001
-#define NV0080_CTRL_BIF_ASPM_FEATURE_DT_L0S_DISABLED 0x000000000
-#define NV0080_CTRL_BIF_ASPM_FEATURE_DT_L1                 1:1
-#define NV0080_CTRL_BIF_ASPM_FEATURE_DT_L1_ENABLED   0x000000001
-#define NV0080_CTRL_BIF_ASPM_FEATURE_DT_L1_DISABLED  0x000000000
 
 /*
  * NV0080_CTRL_BIF_ASPM_CYA_UPDATE
@@ -109,7 +88,7 @@ typedef struct NV0080_CTRL_BIF_SET_ASPM_FEATURE_PARAMS {
  *   NV_OK
  */
 
-#define NV0080_CTRL_CMD_BIF_ASPM_CYA_UPDATE          (0x800105) /* finn: Evaluated from "(FINN_NV01_DEVICE_0_BIF_INTERFACE_ID << 8) | NV0080_CTRL_BIF_ASPM_CYA_UPDATE_PARAMS_MESSAGE_ID" */
+#define NV0080_CTRL_CMD_BIF_ASPM_CYA_UPDATE               (0x800105) /* finn: Evaluated from "(FINN_NV01_DEVICE_0_BIF_INTERFACE_ID << 8) | NV0080_CTRL_BIF_ASPM_CYA_UPDATE_PARAMS_MESSAGE_ID" */
 
 #define NV0080_CTRL_BIF_ASPM_CYA_UPDATE_PARAMS_MESSAGE_ID (0x5U)
 
@@ -119,7 +98,7 @@ typedef struct NV0080_CTRL_BIF_ASPM_CYA_UPDATE_PARAMS {
 } NV0080_CTRL_BIF_ASPM_CYA_UPDATE_PARAMS;
 
 /*
- * NV0080_CTRL_BIF_ASPM_FEATURE
+ * NV0080_CTRL_CMD_BIF_GET_PCIE_POWER_CONTROL_MASK
  *
  * pciePowerControlMask
  * pciePowerControlIdentifiedKeyOrder

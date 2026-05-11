@@ -23,6 +23,7 @@
 
 #ifndef LIBELF_H_
 #define LIBELF_H_
+#include <nvctassert.h>
 #include <nvtypes.h>
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +32,24 @@ extern "C" {
 #include "libos_status.h"
 
 // Structures for Loader
+typedef struct
+{
+    NvU8 ident[16];
+    NvU16 type;
+    NvU16 machine;
+    NvU32 version;
+    NvU32 entry;
+    NvU32 phoff;
+    NvU32 shoff;
+    NvU32 flags;
+    NvU16 ehsize;
+    NvU16 phentsize;
+    NvU16 phnum;
+    NvU16 shentsize;
+    NvU16 shnum;
+    NvU16 shstrndx;
+} LibosElf32Header;
+
 typedef struct
 {
     NvU8 ident[16];
@@ -49,6 +68,21 @@ typedef struct
     NvU16 shstrndx;
 } LibosElf64Header;
 
+#define ELFCLASS32 1
+#define ELFCLASS64 2
+
+typedef struct
+{
+    NvU32 type;
+    NvU32 offset;
+    NvU32 vaddr;
+    NvU32 paddr;
+    NvU32 filesz;
+    NvU32 memsz;
+    NvU32 flags;
+    NvU32 align;
+} LibosElf32ProgramHeader;
+
 typedef struct
 {
     NvU32 type;
@@ -61,6 +95,13 @@ typedef struct
     NvU64 align;
 } LibosElf64ProgramHeader;
 
+typedef union
+{
+    LibosElf32ProgramHeader * phdr32;
+    LibosElf64ProgramHeader * phdr64;
+    NvU8                    * raw;
+} LibosElfProgramHeaderPtr;
+
 #define PF_X 1
 #define PF_W 2
 #define PF_R 4
@@ -68,9 +109,25 @@ typedef struct
 #define PT_LOAD    1
 #define PT_NOTE    4
 #define PT_PHDR    6
+#define PT_TLS     7
 #define PT_SHLIB   5
 #define PT_DYNAMIC 2
+
 // Structures for finding Symbols
+typedef struct
+{
+    NvU32 name;
+    NvU32 type;
+    NvU32 flags;
+    NvU32 addr;
+    NvU32 offset;
+    NvU32 size;
+    NvU32 link;
+    NvU32 info;
+    NvU32 addralign;
+    NvU32 entsize;
+} LibosElf32SectionHeader;
+
 typedef struct
 {
     NvU32 name;
@@ -85,8 +142,26 @@ typedef struct
     NvU64 entsize;
 } LibosElf64SectionHeader;
 
+typedef union
+{
+    LibosElf32SectionHeader * shdr32;
+    LibosElf64SectionHeader * shdr64;
+    NvU8                    * raw;
+} LibosElfSectionHeaderPtr;
+
 #define SHT_NOBITS   8
 #define SHT_PROGBITS 1
+
+// TODO
+typedef struct
+{
+    NvU32 name;
+    NvU32 value;
+    NvU32 size;
+    NvU8 info;
+    NvU8 other;
+    NvU16 shndx;
+} LibosElf32Symbol;
 
 typedef struct
 {
@@ -98,13 +173,14 @@ typedef struct
     NvU64 size;
 } LibosElf64Symbol;
 
-typedef struct {
-  NvS64 tag; 
-  NvU64 ptr;
-} LibosElf64Dynamic;
-
-typedef struct LibosElfImage{
-    LibosElf64Header * elf;
+typedef struct LibosElfImage
+{
+    union
+    {
+        LibosElf32Header * elf32;
+        LibosElf64Header * elf64;
+        NvU8             * raw;
+    };
     NvU64              size;
     void *            (*map)(struct LibosElfImage *image, NvU64 offset, NvU64 size);
 } LibosElfImage;
@@ -118,20 +194,18 @@ typedef struct
 } LibosElfNoteHeader;
 
 LibosStatus               LibosElfImageConstruct(LibosElfImage * image, void * elf, NvU64 size);
+NvU8                      LibosElfGetClass(const LibosElfImage * image);
 
 // Program headers
-LibosElf64ProgramHeader * LibosElfProgramHeaderForRange(LibosElfImage * image, NvU64 va, NvU64 vaLastByte);
-LibosElf64ProgramHeader * LibosElfProgramHeaderNext(LibosElfImage * image, LibosElf64ProgramHeader * previous);
+LibosElfProgramHeaderPtr LibosElfProgramHeaderForRange(LibosElfImage * image, NvU64 va, NvU64 vaLastByte);
+LibosElfProgramHeaderPtr  LibosElfProgramHeaderNext(LibosElfImage * image, LibosElfProgramHeaderPtr previous);
 
 // Section headers
-LibosElf64SectionHeader * LibosElfFindSectionByName(LibosElfImage * image, const char *targetName);
-LibosStatus               LibosElfMapSection(LibosElfImage * image, LibosElf64SectionHeader * shdr, NvU8 ** start, NvU8 ** end);
-LibosElf64SectionHeader * LibosElfFindSectionByAddress(LibosElfImage * image, NvU64 address);
-LibosElf64SectionHeader * LibosElfSectionHeaderNext(LibosElfImage * image, LibosElf64SectionHeader * previous);
+LibosElfSectionHeaderPtr LibosElfFindSectionByName(LibosElfImage * image, const char *targetName);
+LibosStatus               LibosElfMapSection(LibosElfImage * image, LibosElfSectionHeaderPtr shdr, NvU8 ** start, NvU8 ** end);
+LibosElfSectionHeaderPtr LibosElfFindSectionByAddress(LibosElfImage * image, NvU64 address);
 
-// Dynamic linker
-LibosElf64ProgramHeader * LibosElfHeaderDynamic(LibosElfImage * image);
-LibosElf64Dynamic * LibosElfDynamicEntryNext(LibosElfImage * image, LibosElf64ProgramHeader * dynamicTableHeader, LibosElf64Dynamic * previous);
+LibosElfSectionHeaderPtr  LibosElfSectionHeaderNext(LibosElfImage * image, LibosElfSectionHeaderPtr previous);
 
 // VA based access
 void *                    LibosElfMapVirtual(LibosElfImage * image, NvU64 address, NvU64 size);

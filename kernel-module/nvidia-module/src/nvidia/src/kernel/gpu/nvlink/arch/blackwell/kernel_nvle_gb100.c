@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -21,6 +21,8 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#define NVOC_KERNEL_NVLINK_H_PRIVATE_ACCESS_ALLOWED
+
 #include "core/core.h"
 
 #include "nvctassert.h"
@@ -32,24 +34,32 @@
 #include "nvlink_inband_msg.h"
 #include "nvrm_registry.h"
 
-/*
- * Gets the GPUs Alid, Clid, and DCF
+ct_assert(NV2080_CTRL_NVLINK_MAX_REMAP_TABLE_ENTRIES == NVLINK_NVLE_MAX_REMAP_TABLE_ENTRIES);
+
+/*!
+ * Gets the alid of the GPU, and gets the alids and updates the clids in the remap table
+ *
+ * @param[in] pGpu           OBJGPU pointer
+ * @param[in] pKernelNvlink  KernelNvlink pointer
+ * @param[in] bGet           Whether to get or set the LID information
  */
 NV_STATUS
-knvlinkEncryptionGetGpuIdentifiers_GB100
+knvlinkEncryptionGetUpdateGpuIdentifiers_GB100
 (
-    OBJGPU *pGpu,
-    KernelNvlink *pKernelNvlink
+    OBJGPU       *pGpu,
+    KernelNvlink *pKernelNvlink,
+    NvBool        bGet
 )
 {
-    if (pKernelNvlink == NULL)
-        return NV_ERR_INVALID_ARGUMENT;
+    NV_ASSERT_OR_RETURN((pKernelNvlink != NULL),  NV_ERR_INVALID_ARGUMENT);
 
     // Switch system
     if (GPU_IS_NVSWITCH_DETECTED(pGpu))
     {
-        NV2080_CTRL_NVLINK_GET_NVLE_LIDS_PARAMS lidParams;
-        NvU32 probeClid;
+        OBJSYS    *pSys    = SYS_GET_INSTANCE();
+        OBJGPUMGR *pGpuMgr = SYS_GET_GPUMGR(pSys);
+
+        NV2080_CTRL_NVLINK_GET_UPDATE_NVLE_LIDS_PARAMS lidParams;
         GPU_FABRIC_PROBE_INFO_KERNEL *pGpuFabricProbeInfoKernel = pGpu->pGpuFabricProbeInfoKernel;
 
         if (pGpuFabricProbeInfoKernel == NULL)
@@ -60,61 +70,60 @@ knvlinkEncryptionGetGpuIdentifiers_GB100
 
         if (!gpuFabricProbeIsReceived(pGpuFabricProbeInfoKernel))
         {
-            NV_PRINTF(LEVEL_ERROR, "%s: GPU%u Fabric probe has not been received\n", __FUNCTION__, gpuGetInstance(pGpu));
+            NV_PRINTF(LEVEL_ERROR, "%s: Fabric probe has not been received\n", __FUNCTION__);
             return NV_ERR_NVLINK_FABRIC_FAILURE;
         }
-        
-        // Get CLID from probe response
-        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
-            gpuFabricProbeGetRemapTableIndex(pGpuFabricProbeInfoKernel, &probeClid));
 
-        // Get CLID from remap table entry
         portMemSet(&lidParams, 0, sizeof(lidParams));
-        lidParams.probeClid = probeClid;
-        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
-                                knvlinkExecGspRmRpc(pGpu, pKernelNvlink,
-                                NV2080_CTRL_NVLINK_GET_NVLE_LIDS,
-                                (void *)&lidParams, sizeof(lidParams)));
-        pKernelNvlink->alid = lidParams.alid;
+        lidParams.bGet = (bGet ? NV_TRUE : NV_FALSE);
 
-        // Validate and store clid
-        if (probeClid != lidParams.clid)
+        if (bGet)
         {
-            NV_PRINTF(LEVEL_ERROR, "Remap clid %d doesn't match probe response clid %d\n", lidParams.clid, probeClid);
-            return NV_ERR_INVALID_DATA;
+            NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+                                  knvlinkExecGspRmRpc(pGpu, pKernelNvlink,
+                                                      NV2080_CTRL_NVLINK_GET_UPDATE_NVLE_LIDS,
+                                                      (void *)&lidParams, sizeof(lidParams)));
+
+            // Cache the ALID, CLID for the GPU
+            pKernelNvlink->alid         = lidParams.alid;
+            pKernelNvlink->clid         = lidParams.clid;
+            pKernelNvlink->bClidUpdated = lidParams.bClidUpdated;
+
+            // Check if the ALID is present in the ALID-CLID map
+            if (!gpuMgrIsNvleAlidPresent(pGpuMgr, pKernelNvlink->alid))
+            {
+                NV_CHECK_OR_RETURN(LEVEL_ERROR,
+                    (gpuMgrCacheNvleAlidClid(pGpuMgr, pKernelNvlink->alid, pKernelNvlink->clid) == NV_TRUE),
+                    NV_ERR_INVALID_STATE);
+            }
         }
-        pKernelNvlink->clid = probeClid;
+        else
+        {
+            NvU32 idx;
+
+            // Construct the lidList with CLIDs for updating the LID fields. Initialize all entries to invalid
+            for (idx = 0; idx < pGpuMgr->alidClidTable.numEntries; idx++)
+            {
+                lidParams.alidClidTable.alidClidMap[idx].alid = pGpuMgr->alidClidTable.alidClidMap[idx].alid;
+                lidParams.alidClidTable.alidClidMap[idx].clid = pGpuMgr->alidClidTable.alidClidMap[idx].clid;
+                lidParams.alidClidTable.numEntries++;
+            }
+
+            NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+                                  knvlinkExecGspRmRpc(pGpu, pKernelNvlink,
+                                                      NV2080_CTRL_NVLINK_GET_UPDATE_NVLE_LIDS,
+                                                      (void *)&lidParams, sizeof(lidParams)));
+            // Cache the ALID, CLID for the GPU
+            pKernelNvlink->alid         = lidParams.alid;
+            pKernelNvlink->clid         = lidParams.clid;
+            pKernelNvlink->bClidUpdated = lidParams.bClidUpdated;
+        }
     }
     else // Direct connect system
     {
         pKernelNvlink->alid = (NvU16)pGpu->gpuId;
         pKernelNvlink->clid = pGpu->gpuId;
     }
+
     return NV_OK;
-}
-
-NV_STATUS
-knvlinkEncryptionUpdateTopology_GB100
-(
-    OBJGPU *pGpu,
-    KernelNvlink *pKernelNvlink,
-    NvU32   remoteGpuAlid,
-    NvU32   remoteGpuClid
-)
-{
-    NV2080_CTRL_NVLINK_UPDATE_NVLE_TOPOLOGY_PARAMS params;
-    NvU32 status;
-    params.localGpuAlid = pKernelNvlink->alid;
-    params.localGpuClid = pKernelNvlink->clid;
-    params.remoteGpuAlid = remoteGpuAlid;
-    params.remoteGpuClid = remoteGpuClid;
-    status = knvlinkExecGspRmRpc(pGpu, pKernelNvlink,
-                                NV2080_CTRL_NVLINK_UPDATE_NVLE_TOPOLOGY,
-                                (void *)&params, sizeof(params));
-    if (status != NV_OK)
-    {
-        NV_PRINTF(LEVEL_ERROR, "Failed to execute GSP-RM GPC to update Nvlink topology in GSP\n");
-    }
-
-    return status;
 }

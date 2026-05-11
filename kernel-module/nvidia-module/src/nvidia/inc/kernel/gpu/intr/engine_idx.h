@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -78,7 +78,6 @@
 #define MC_ENGINE_IDX_NVENC                         38
 #define MC_ENGINE_IDX_NVENC1                        39
 #define MC_ENGINE_IDX_NVENC2                        40
-// Bug 4175886 - Use this new value for all chips once GB20X is released
 #define MC_ENGINE_IDX_NVENC3                        41
 #define MC_ENGINE_IDX_C2C                           42
 #define MC_ENGINE_IDX_LTC                           43
@@ -135,6 +134,7 @@
 #define MC_ENGINE_IDX_GR5                           89
 #define MC_ENGINE_IDX_GR6                           90
 #define MC_ENGINE_IDX_GR7                           91
+#define MC_ENGINE_IDX_GR_MAX                        MC_ENGINE_IDX_GR7
 #define MC_ENGINE_IDX_ESCHED                        92
 #define MC_ENGINE_IDX_ESCHED__SIZE                  64
 #define MC_ENGINE_IDX_GR_FECS_LOG                   156
@@ -153,7 +153,6 @@
 #define MC_ENGINE_IDX_PXUC                          168
 #define MC_ENGINE_IDX_SYSLTC                        169
 #define MC_ENGINE_IDX_LRCC                          170
-// Bug 4175886 - Use this new value for all chips once GB20X is released
 #define MC_ENGINE_IDX_GSPLITE                       171
 #define MC_ENGINE_IDX_GSPLITE0                      MC_ENGINE_IDX_GSPLITE
 #define MC_ENGINE_IDX_GSPLITE1                      172
@@ -164,8 +163,9 @@
 #define MC_ENGINE_IDX_GPIO                          176
 #define MC_ENGINE_IDX_DISP_LOW                      177
 #define MC_ENGINE_IDX_HFRP                          178
+#define MC_ENGINE_IDX_I2C                           179
 // This must be kept as the max bit if we need to add more engines
-#define MC_ENGINE_IDX_MAX                           179
+#define MC_ENGINE_IDX_MAX                           180
 
 // Index GR reference
 #define MC_ENGINE_IDX_GRn(x)            (MC_ENGINE_IDX_GR0 + (x))
@@ -189,13 +189,13 @@
 #define MC_ENGINE_IDX_IS_CE(x) \
     ((MC_ENGINE_IDX_CE(0) <= (x)) && ((x) <= MC_ENGINE_IDX_CE_MAX))
 
+#define MC_ENGINE_IDX_IS_GR(x) \
+    ((MC_ENGINE_IDX_GR0 <= (x)) && ((x) <= MC_ENGINE_IDX_GR_MAX))
+
 // Index OFA reference
 #define MC_ENGINE_IDX_OFA(x)            (MC_ENGINE_IDX_OFA0 + (x))
 
-//
-// Bug 4175886 - Remove check once GB20X is released
 // Index GSPLITE reference
-//
 #define MC_ENGINE_IDX_GSPLITEn(x)       (MC_ENGINE_IDX_GSPLITE + (x))
 
 MAKE_BITVECTOR(MC_ENGINE_BITVECTOR, MC_ENGINE_IDX_MAX);

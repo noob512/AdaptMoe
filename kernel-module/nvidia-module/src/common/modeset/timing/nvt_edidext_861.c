@@ -1,31 +1,29 @@
-//*****************************************************************************
-//
-//  SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-//  SPDX-License-Identifier: MIT
-//
-//  Permission is hereby granted, free of charge, to any person obtaining a
-//  copy of this software and associated documentation files (the "Software"),
-//  to deal in the Software without restriction, including without limitation
-//  the rights to use, copy, modify, merge, publish, distribute, sublicense,
-//  and/or sell copies of the Software, and to permit persons to whom the
-//  Software is furnished to do so, subject to the following conditions:
-//
-//  The above copyright notice and this permission notice shall be included in
-//  all copies or substantial portions of the Software.
-//
-//  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-//  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-//  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-//  THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-//  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-//  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-//  DEALINGS IN THE SOFTWARE.
-//
-//  File:       nvt_edidext_861.c
-//
-//  Purpose:    the provide edid 861 extension related services
-//
-//*****************************************************************************
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2006-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: MIT
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+/** @file  nvt_edidext_861.c
+ *  @brief provide edid 861 extension related services
+ */
 
 #include "nvBinSegment.h"
 #include "nvmisc.h"
@@ -284,7 +282,8 @@ static const NVT_TIMING EIA861B[]=
     // the end
     EIA_TIMING(0,0,0,0,'-',0,0,0,0,'-',0,'p',4:3,0,0)
 };
-static NvU32 MAX_CEA861B_FORMAT = sizeof(EIA861B)/sizeof(EIA861B[0]) - 1;
+
+static const NvU32 MAX_CEA861B_FORMAT = sizeof(EIA861B)/sizeof(EIA861B[0]) - 1;
 
 static const NvU32 EIA861B_DUAL_ASPECT_VICS[][2] =
 {
@@ -783,7 +782,7 @@ void parseCta861VideoFormatDataBlock(NVT_EDID_CEA861_INFO *pExt861, void *pRawIn
 
                 if (NvTiming_CalcOVT(width, height, VF_FRAME_RATE[rateIdx], &newTiming) == NVT_STATUS_SUCCESS)
                 {
-                    if (pExt861->vfdb[vfdb_idx].info.y420 && newTiming.pclk > NVT_HDMI_YUV_420_PCLK_SUPPORTED_MIN)
+                    if (pExt861->vfdb[vfdb_idx].info.y420 && newTiming.pclk1khz > NVT_HDMI_YUV_420_PCLK_SUPPORTED_MIN)
                     {
                         UPDATE_BPC_FOR_COLORFORMAT(newTiming.etc.yuv420, 0, 1,
                                                    pInfo->hdmiForumInfo.dc_30bit_420,
@@ -927,7 +926,7 @@ void parse861bShortYuv420Timing(NVT_EDID_CEA861_INFO *pExt861,
 
         // calculate the pixel clock
         newTiming.pclk     = RRx1kToPclk(&newTiming);
-        newTiming.pclk1khz = (newTiming.pclk << 3) + (newTiming.pclk << 1); // *10
+        newTiming.pclk1khz = RRx1kToPclk1khz(&newTiming);
 
         // From CTA-861-F: By default, Y420VDB SVDs, when present in the EDID, shall be less preferred than all regular Video Data Block SVDs.
         // So it should use normal VIC code without native flag.
@@ -969,6 +968,40 @@ void parse861bShortYuv420Timing(NVT_EDID_CEA861_INFO *pExt861,
                 break;
             }
         }
+    }
+}
+
+// If a timing is present in the YUV420 VDB, consider it
+// incompatible with other sampling modes
+CODE_SEGMENT(PAGE_DD_CODE)
+void updateBpcForYuv420OnlyTiming(NVT_TIMING *pT,
+                                  const NVT_EDID_CEA861_INFO *p861Info)
+{
+    NvU32 i;
+    const NvU8 *pYuv420Vic = p861Info->svd_y420vdb;
+    NvBool yuv420Only = NV_FALSE;
+
+    for (i = 0; i < p861Info->total_y420vdb; i++)
+    { 
+        NVT_TIMING y420vdbTiming;
+        NvU8 vic = NVT_GET_CTA_8BIT_VIC(pYuv420Vic[i]);
+        if (vic == 0 || vic > MAX_CEA861B_FORMAT)
+            continue;
+
+        y420vdbTiming = EIA861B[vic-1]; 
+
+        if (NvTiming_IsTimingExactEqual(pT, &y420vdbTiming))
+        {
+            yuv420Only = NV_TRUE;
+            break; 
+        }
+    }
+    
+    if (yuv420Only)
+    {
+        pT->etc.rgb444.bpcs = 0;
+        pT->etc.yuv444.bpcs = 0;
+        pT->etc.yuv422.bpcs = 0;
     }
 }
 
@@ -2275,7 +2308,7 @@ NVT_STATUS NvTiming_CalcCEA861bTiming(NvU32 width, NvU32 height, NvU32 rr, NvU32
 
             // calculate the pixel clock
             pT->pclk      = RRx1kToPclk (pT);
-            pT->pclk1khz  = (pT->pclk << 3) + (pT->pclk << 1); // *10
+            pT->pclk1khz  = RRx1kToPclk1khz (pT);
 
             NVT_SET_CEA_FORMAT(pT->etc.status, NVT_GET_TIMING_STATUS_SEQ(pT->etc.status));
 
@@ -2838,122 +2871,148 @@ NVT_STATUS NvTiming_ConstructVendorSpecificInfoframe(NVT_EDID_INFO *pEdidInfo, N
         return NVT_STATUS_ERR;
     }
 
+    if ((pCtrl->VSIFVersion != NVT_VSIF_VERSION_HF_VSIF) && (pCtrl->VSIFVersion != NVT_VSIF_VERSION_H14B_VSIF))
+    {
+        return NVT_STATUS_INVALID_PARAMETER;
+    }
 
     // initialize the infoframe buffer
     nvt_nvu8_set_bits(pInfoFrame->Header.type, NVT_HDMI_VS_HB0_VALUE, NVT_HDMI_VS_HB0_MASK, NVT_HDMI_VS_HB0_SHIFT);
     nvt_nvu8_set_bits(pInfoFrame->Header.version, NVT_HDMI_VS_HB1_VALUE, NVT_HDMI_VS_HB1_MASK, NVT_HDMI_VS_HB1_SHIFT);
     nvt_nvu8_set_bits(pInfoFrame->Header.length, NVT_HDMI_VS_HB2_VALUE, NVT_HDMI_VS_HB2_MASK, NVT_HDMI_VS_HB2_SHIFT);
 
-    if (pCtrl->VSIFVersion == NVT_VSIF_VERSION_H14B_VSIF)
-    {
-        nvt_nvu8_set_bits(pInfoFrame->Data.byte1, NVT_HDMI_VS_BYTE1_OUI_VER_1_4, NVT_HDMI_VS_BYTE1_OUI_MASK, NVT_HDMI_VS_BYTE1_OUI_SHIFT);
-        nvt_nvu8_set_bits(pInfoFrame->Data.byte2, NVT_HDMI_VS_BYTE2_OUI_VER_1_4, NVT_HDMI_VS_BYTE2_OUI_MASK, NVT_HDMI_VS_BYTE2_OUI_SHIFT);
-        nvt_nvu8_set_bits(pInfoFrame->Data.byte3, NVT_HDMI_VS_BYTE3_OUI_VER_1_4, NVT_HDMI_VS_BYTE3_OUI_MASK, NVT_HDMI_VS_BYTE3_OUI_SHIFT);
-    }
-    else if (pCtrl->VSIFVersion == NVT_VSIF_VERSION_HF_VSIF)
-    {
-        nvt_nvu8_set_bits(pInfoFrame->Data.byte1, NVT_HDMI_VS_BYTE1_OUI_VER_2_0, NVT_HDMI_VS_BYTE1_OUI_MASK, NVT_HDMI_VS_BYTE1_OUI_SHIFT);
-        nvt_nvu8_set_bits(pInfoFrame->Data.byte2, NVT_HDMI_VS_BYTE2_OUI_VER_2_0, NVT_HDMI_VS_BYTE2_OUI_MASK, NVT_HDMI_VS_BYTE2_OUI_SHIFT);
-        nvt_nvu8_set_bits(pInfoFrame->Data.byte3, NVT_HDMI_VS_BYTE3_OUI_VER_2_0, NVT_HDMI_VS_BYTE3_OUI_MASK, NVT_HDMI_VS_BYTE3_OUI_SHIFT);
-    }
-
     // init the header (mostly done in default Infoframe)
     pInfoFrame->Header.length   = offsetof(NVT_VENDOR_SPECIFIC_INFOFRAME_PAYLOAD, optionalBytes);
 
-    // construct the desired infoframe contents based on the control
-
-    // clear all static reserved fields
-    nvt_nvu8_set_bits(pInfoFrame->Data.byte4, 0, NVT_HDMI_VS_BYTE4_RSVD_MASK, NVT_HDMI_VS_BYTE4_RSVD_SHIFT);
-
-    // setup the parameters
-    nvt_nvu8_set_bits(pInfoFrame->Data.byte4, pCtrl->HDMIFormat, NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_MASK, NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_SHIFT);
-
-    // determine what the format is -- if disabled, force the format to NONE.
-    if (pCtrl->Enable)
+    if (pCtrl->VSIFVersion == NVT_VSIF_VERSION_HF_VSIF)
     {
-        HDMIFormat = pCtrl->HDMIFormat;
-    }
-    else
-    {
-        HDMIFormat = NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_NONE;
-    }
-
-    switch(HDMIFormat)
-    {
-    case NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_NONE:
+        // infoframe is only supported on 861F and later
+        if (pEdidInfo->ext861.revision < NVT_CEA861_REV_F)
         {
-            nvt_nvu8_set_bits(pInfoFrame->Data.byte5, 0, NVT_HDMI_VS_BYTENv_RSVD_MASK, NVT_HDMI_VS_BYTENv_RSVD_SHIFT);
-            break;
+            return NVT_STATUS_ERR;
         }
-    case NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_EXT:
-        {
-            // Note: extended resolution frames are not yet fully supported
-            nvt_nvu8_set_bits(pInfoFrame->Data.byte5, pCtrl->HDMI_VIC, NVT_HDMI_VS_BYTE5_HDMI_VIC_MASK, NVT_HDMI_VS_BYTE5_HDMI_VIC_SHIFT);
-            break;
-        }
-    case NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_3D:
-        {
-            nvt_nvu8_set_bits(pInfoFrame->Data.byte5, 0, NVT_HDMI_VS_BYTE5_HDMI_RSVD_MASK, NVT_HDMI_VS_BYTE5_HDMI_RSVD_SHIFT);
-            nvt_nvu8_set_bits(pInfoFrame->Data.byte5, pCtrl->ThreeDStruc, NVT_HDMI_VS_BYTE5_HDMI_3DS_MASK, NVT_HDMI_VS_BYTE5_HDMI_3DS_SHIFT);
 
-            // side by side half requires additional format data in the infoframe.
-            if (NVT_HDMI_VS_BYTE5_HDMI_3DS_SIDEBYSIDEHALF == pCtrl->ThreeDStruc)
+        if (pCtrl->Enable && (pCtrl->HDMIFormat != NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_NONE))
+        {
+            return NVT_STATUS_INVALID_PARAMETER;
+        }
+
+        nvt_nvu8_set_bits(pInfoFrame->Data.byte1, NVT_HDMI_VS_BYTE1_OUI_VER_2_0, NVT_HDMI_VS_BYTE1_OUI_MASK, NVT_HDMI_VS_BYTE1_OUI_SHIFT);
+        nvt_nvu8_set_bits(pInfoFrame->Data.byte2, NVT_HDMI_VS_BYTE2_OUI_VER_2_0, NVT_HDMI_VS_BYTE2_OUI_MASK, NVT_HDMI_VS_BYTE2_OUI_SHIFT);
+        nvt_nvu8_set_bits(pInfoFrame->Data.byte3, NVT_HDMI_VS_BYTE3_OUI_VER_2_0, NVT_HDMI_VS_BYTE3_OUI_MASK, NVT_HDMI_VS_BYTE3_OUI_SHIFT);
+
+        // construct the desired HF-VSIF infoframe contents based on the control
+
+        nvt_nvu8_set_bits(pInfoFrame->Data.byte4, NVT_HDMI_HF_VS_BYTE4_VER_1_0, NVT_HDMI_HF_VS_BYTE4_VER_MASK, NVT_HDMI_HF_VS_BYTE4_VER_SHIFT);
+
+        if (pCtrl->Enable)
+        {
+            if (pCtrl->ALLMEnable == 1)
             {
-                nvt_nvu8_set_bits(pInfoFrame->Data.optionalBytes[optIdx], pCtrl->ThreeDDetail, NVT_HDMI_VS_BYTE_OPT1_HDMI_3DEX_MASK, NVT_HDMI_VS_BYTE_OPT1_HDMI_3DEX_SHIFT);
-                optIdx++;
+                nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTE5_ALLM_MODE_EN, NVT_HDMI_VS_BYTE5_ALLM_MODE_MASK, NVT_HDMI_VS_BYTE5_ALLM_MODE_SHIFT);
             }
-            if (pCtrl->MetadataPresent)
+            else if (pCtrl->ALLMEnable == 0)
             {
-                nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTE5_HDMI_META_PRESENT_PRES, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_MASK, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_SHIFT);
+                nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTE5_ALLM_MODE_DIS, NVT_HDMI_VS_BYTE5_ALLM_MODE_MASK, NVT_HDMI_VS_BYTE5_ALLM_MODE_SHIFT);
+            }
+        }
+        else
+        {
+            nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTENv_RSVD, NVT_HDMI_VS_BYTENv_RSVD_MASK, NVT_HDMI_VS_BYTENv_RSVD_SHIFT);
+        }
+    }
+    else if (pCtrl->VSIFVersion == NVT_VSIF_VERSION_H14B_VSIF)
+    {
+        // construct the desired H14b-VSIF infoframe contents based on the control
 
-                switch(pCtrl->MetadataType)
+        nvt_nvu8_set_bits(pInfoFrame->Data.byte1, NVT_HDMI_VS_BYTE1_OUI_VER_1_4, NVT_HDMI_VS_BYTE1_OUI_MASK, NVT_HDMI_VS_BYTE1_OUI_SHIFT);
+        nvt_nvu8_set_bits(pInfoFrame->Data.byte2, NVT_HDMI_VS_BYTE2_OUI_VER_1_4, NVT_HDMI_VS_BYTE2_OUI_MASK, NVT_HDMI_VS_BYTE2_OUI_SHIFT);
+        nvt_nvu8_set_bits(pInfoFrame->Data.byte3, NVT_HDMI_VS_BYTE3_OUI_VER_1_4, NVT_HDMI_VS_BYTE3_OUI_MASK, NVT_HDMI_VS_BYTE3_OUI_SHIFT);
+
+        // clear all static reserved fields
+        nvt_nvu8_set_bits(pInfoFrame->Data.byte4, 0, NVT_HDMI_VS_BYTE4_RSVD_MASK, NVT_HDMI_VS_BYTE4_RSVD_SHIFT);
+
+        // setup the parameters
+        nvt_nvu8_set_bits(pInfoFrame->Data.byte4, pCtrl->HDMIFormat, NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_MASK, NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_SHIFT);
+
+        // determine what the format is -- if disabled, force the format to NONE.
+        if (pCtrl->Enable)
+        {
+            HDMIFormat = pCtrl->HDMIFormat;
+        }
+        else
+        {
+            HDMIFormat = NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_NONE;
+        }
+
+        switch(HDMIFormat)
+        {
+        case NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_NONE:
+            {
+                nvt_nvu8_set_bits(pInfoFrame->Data.byte5, 0, NVT_HDMI_VS_BYTENv_RSVD_MASK, NVT_HDMI_VS_BYTENv_RSVD_SHIFT);
+                break;
+            }
+        case NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_EXT:
+            {
+                // Note: extended resolution frames are not yet fully supported
+                nvt_nvu8_set_bits(pInfoFrame->Data.byte5, pCtrl->HDMI_VIC, NVT_HDMI_VS_BYTE5_HDMI_VIC_MASK, NVT_HDMI_VS_BYTE5_HDMI_VIC_SHIFT);
+                break;
+            }
+        case NVT_HDMI_VS_BYTE4_HDMI_VID_FMT_3D:
+            {
+                nvt_nvu8_set_bits(pInfoFrame->Data.byte5, 0, NVT_HDMI_VS_BYTE5_HDMI_RSVD_MASK, NVT_HDMI_VS_BYTE5_HDMI_RSVD_SHIFT);
+                nvt_nvu8_set_bits(pInfoFrame->Data.byte5, pCtrl->ThreeDStruc, NVT_HDMI_VS_BYTE5_HDMI_3DS_MASK, NVT_HDMI_VS_BYTE5_HDMI_3DS_SHIFT);
+
+                // side by side half requires additional format data in the infoframe.
+                if (NVT_HDMI_VS_BYTE5_HDMI_3DS_SIDEBYSIDEHALF == pCtrl->ThreeDStruc)
                 {
-                case NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_TYPE_PARALLAX:
-                    {
-                        if (sizeof(pCtrl->Metadata) >= NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_PARALLAX &&
-                            sizeof(pInfoFrame->Data.optionalBytes) - (optIdx + 1) >= NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_PARALLAX)
-                        {
-                            nvt_nvu8_set_bits(pInfoFrame->Data.optionalBytes[optIdx], NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_PARALLAX, NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_MASK, NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_SHIFT);
-                            nvt_nvu8_set_bits(pInfoFrame->Data.optionalBytes[optIdx], NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_TYPE_PARALLAX, NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_TYPE_MASK, NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_TYPE_SHIFT);
-                            ++optIdx;
-
-                            NVMISC_MEMCPY(pCtrl->Metadata, &pInfoFrame->Data.optionalBytes[optIdx], NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_PARALLAX);
-                            optIdx += NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_PARALLAX;
-                        }
-                        else
-                        {
-                            // not enough data in the control struct or not enough room in the infoframe -- BOTH compile time issues!!
-                            // ignore metadata.
-                            nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTE5_HDMI_META_PRESENT_NOTPRES, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_MASK, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_SHIFT);
-                        }
-                        break;
-                    }
-                default:
-                    {
-                        // unrecognised metadata, recover the best we can.
-                        // note -- can not copy whatever is there because type implies length.
-                        nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTE5_HDMI_META_PRESENT_NOTPRES, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_MASK, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_SHIFT);
-                        RetCode = NVT_STATUS_ERR;
-                    }
+                    nvt_nvu8_set_bits(pInfoFrame->Data.optionalBytes[optIdx], pCtrl->ThreeDDetail, NVT_HDMI_VS_BYTE_OPT1_HDMI_3DEX_MASK, NVT_HDMI_VS_BYTE_OPT1_HDMI_3DEX_SHIFT);
+                    optIdx++;
                 }
+                if (pCtrl->MetadataPresent)
+                {
+                    nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTE5_HDMI_META_PRESENT_PRES, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_MASK, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_SHIFT);
 
+                    switch(pCtrl->MetadataType)
+                    {
+                    case NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_TYPE_PARALLAX:
+                        {
+                            if (sizeof(pCtrl->Metadata) >= NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_PARALLAX &&
+                                sizeof(pInfoFrame->Data.optionalBytes) - (optIdx + 1) >= NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_PARALLAX)
+                            {
+                                nvt_nvu8_set_bits(pInfoFrame->Data.optionalBytes[optIdx], NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_PARALLAX, NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_MASK, NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_SHIFT);
+                                nvt_nvu8_set_bits(pInfoFrame->Data.optionalBytes[optIdx], NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_TYPE_PARALLAX, NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_TYPE_MASK, NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_TYPE_SHIFT);
+                                ++optIdx;
+
+                                NVMISC_MEMCPY(pCtrl->Metadata, &pInfoFrame->Data.optionalBytes[optIdx], NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_PARALLAX);
+                                optIdx += NVT_HDMI_VS_BYTE_OPT2_HDMI_METADATA_LEN_PARALLAX;
+                            }
+                            else
+                            {
+                                // not enough data in the control struct or not enough room in the infoframe -- BOTH compile time issues!!
+                                // ignore metadata.
+                                nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTE5_HDMI_META_PRESENT_NOTPRES, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_MASK, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_SHIFT);
+                            }
+                            break;
+                        }
+                    default:
+                        {
+                            // unrecognised metadata, recover the best we can.
+                            // note -- can not copy whatever is there because type implies length.
+                            nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTE5_HDMI_META_PRESENT_NOTPRES, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_MASK, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_SHIFT);
+                            RetCode = NVT_STATUS_ERR;
+                        }
+                    }
+
+                }
+                else
+                {
+                    nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTE5_HDMI_META_PRESENT_NOTPRES, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_MASK, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_SHIFT);
+                }
+                break;
             }
-            else
-            {
-                nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTE5_HDMI_META_PRESENT_NOTPRES, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_MASK, NVT_HDMI_VS_BYTE5_3D_META_PRESENT_SHIFT);
-            }
-            break;
+
         }
-
-    }
-
-    if (pCtrl->ALLMEnable == 1)
-    {
-        nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTE5_ALLM_MODE_EN, NVT_HDMI_VS_BYTE5_ALLM_MODE_MASK, NVT_HDMI_VS_BYTE5_ALLM_MODE_SHIFT);
-    }
-    else if (pCtrl->ALLMEnable == 0)
-    {
-        nvt_nvu8_set_bits(pInfoFrame->Data.byte5, NVT_HDMI_VS_BYTE5_ALLM_MODE_DIS, NVT_HDMI_VS_BYTE5_ALLM_MODE_MASK, NVT_HDMI_VS_BYTE5_ALLM_MODE_SHIFT);
     }
 
     // clear last byte of infoframe (reserved per spec).
@@ -3121,6 +3180,13 @@ void NvTiming_ConstructAdaptiveSyncSDP(
         nvt_nvu8_set_bits(pSdp->payload.db0, NVT_DP_ADAPTIVE_SYNC_SDP_DB0_VARIABLE_FRAME_RATE_AVT_VARIABLE,
                                     NVT_DP_ADAPTIVE_SYNC_SDP_DB0_VARIABLE_FRAME_RATE_MASK,
                                     NVT_DP_ADAPTIVE_SYNC_SDP_DB0_VARIABLE_FRAME_RATE_SHIFT);
+    }
+
+    if (pCtrl->bDisableSourceSinkSync)
+    {
+        nvt_nvu8_set_bits(pSdp->payload.db0, NVT_DP_ADAPTIVE_SYNC_SDP_DB0_DISABLE_PR_ACTIVE_SOURCE_SINK_SYNC_DISABLED,
+                                    NVT_DP_ADAPTIVE_SYNC_SDP_DB0_DISABLE_PR_ACTIVE_MASK,
+                                    NVT_DP_ADAPTIVE_SYNC_SDP_DB0_DISABLE_PR_ACTIVE_SHIFT);
     }
 
     if (pCtrl->minVTotal)
@@ -3599,6 +3665,27 @@ void parseEdidHDMILLCTiming(NVT_EDID_INFO *pInfo, VSDB_DATA *pVsdb, NvU32 *pMapS
     }
 }
 
+CODE_SEGMENT(PAGE_DD_CODE)
+void prioritizeEdidHDMIExtTiming(NVT_EDID_INFO *pInfo)
+{
+    NvU16                       i, j;
+
+    nvt_assert(pInfo->total_timings <= COUNT(pInfo->timing));
+
+    for (i = 0; i < pInfo->total_timings; ++i)
+    {
+        if (NVT_GET_TIMING_STATUS_TYPE(pInfo->timing[i].etc.status) == NVT_TYPE_HDMI_EXT)
+        {
+            const NVT_TIMING extTimings = pInfo->timing[i];
+            for (j = i; j > 0; j--)
+            {
+                pInfo->timing[j] = pInfo->timing[j - 1];
+            }
+            pInfo->timing[0] = extTimings;
+        }
+    }
+}
+
 // get HDMI 1.4 3D mandatory stereo format datail base on the input vic.
 // If the vic is not in the mandatory format list, return error.
 CODE_SEGMENT(PAGE_DD_CODE)
@@ -3915,7 +4002,7 @@ void parseCta861DIDType7VideoTimingDataBlock(NVT_EDID_CEA861_INFO *pExt861, void
                 pT7Descriptor = (const DISPLAYID_2_0_TIMING_7_DESCRIPTOR *)
                                     &pExt861->did_type7_data_block[t7db_idx].payload[i*eachOfDescSize];
 
-                if (pT7Descriptor->options.is_preferred_or_ycc420 == 1 && newTiming.pclk > NVT_HDMI_YUV_420_PCLK_SUPPORTED_MIN)
+                if (pT7Descriptor->options.is_preferred_or_ycc420 == 1 && newTiming.pclk1khz > NVT_HDMI_YUV_420_PCLK_SUPPORTED_MIN)
                 {
                     newTiming.etc.yuv420.bpcs = 0;
                     UPDATE_BPC_FOR_COLORFORMAT(newTiming.etc.yuv420, 0, 1,
@@ -3976,7 +4063,7 @@ void parseCta861DIDType8VideoTimingDataBlock(NVT_EDID_CEA861_INFO *pExt861, void
             if (parseDisplayId20Timing8Descriptor(pExt861->did_type8_data_block[t8db_idx].payload,
                                                   &newTiming, codeType, codeSize, i, startSeqNum + i) == NVT_STATUS_SUCCESS)
             {
-                if (pExt861->did_type8_data_block[t8db_idx].version.t8y420 == 1 && newTiming.pclk > NVT_HDMI_YUV_420_PCLK_SUPPORTED_MIN)
+                if (pExt861->did_type8_data_block[t8db_idx].version.t8y420 == 1 && newTiming.pclk1khz > NVT_HDMI_YUV_420_PCLK_SUPPORTED_MIN)
                 {
                     UPDATE_BPC_FOR_COLORFORMAT(newTiming.etc.yuv420, 0, 1,
                                                 pInfo->hdmiForumInfo.dc_30bit_420,
@@ -4037,7 +4124,7 @@ void parseCta861DIDType10VideoTimingDataBlock(NVT_EDID_CEA861_INFO *pExt861, voi
                 p6bytesDescriptor = (const DISPLAYID_2_0_TIMING_10_6BYTES_DESCRIPTOR *)
                                     &pExt861->did_type10_data_block[t10db_idx].payload[i*eachOfDescriptorsSize];
 
-                if (p6bytesDescriptor->options.ycc420_support && newTiming.pclk > NVT_HDMI_YUV_420_PCLK_SUPPORTED_MIN)
+                if (p6bytesDescriptor->options.ycc420_support && newTiming.pclk1khz > NVT_HDMI_YUV_420_PCLK_SUPPORTED_MIN)
                 {
                     UPDATE_BPC_FOR_COLORFORMAT(newTiming.etc.yuv420, 0, 1,
                                                pInfo->hdmiForumInfo.dc_30bit_420,

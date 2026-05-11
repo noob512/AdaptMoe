@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -28,8 +28,6 @@
 
 #include "ctrl/ctrla06c.h"  // NVA06C_CTRL_INTERLEAVE_LEVEL_*
 
-#include "nv-gpu-sched-hooks.h"  // GPU scheduler eBPF hook functions
-
 // Static functions
 static void _kchangrpFreeAllEngCtxDescs(OBJGPU *pGpu, KernelChannelGroup *pKernelChannelGroup);
 
@@ -42,12 +40,6 @@ kchangrpConstruct_IMPL(KernelChannelGroup *pKernelChannelGroup)
 void
 kchangrpDestruct_IMPL(KernelChannelGroup *pKernelChannelGroup)
 {
-    // eBPF hook: task_destroy - TSG destruction
-    {
-        struct nv_gpu_task_destroy_ctx ctx = {0};
-        ctx.tsg_id = pKernelChannelGroup->grpID;
-        nv_gpu_sched_task_destroy(&ctx);
-    }
     return;
 }
 
@@ -182,29 +174,6 @@ kchangrpInit_IMPL
 
     pKernelChannelGroup->grpID = grpID;
     pKernelChannelGroup->timesliceUs = kfifoChannelGroupGetDefaultTimeslice_HAL(pKernelFifo);
-
-    // eBPF hook: task_init - TSG creation
-    {
-        NvU32 subdevInst = gpumgrGetSubDeviceInstanceFromGpu(pGpu);
-        struct nv_gpu_task_init_ctx ctx = {0};
-        ctx.tsg_id = pKernelChannelGroup->grpID;
-        ctx.engine_type = pKernelChannelGroup->engineType;
-        ctx.default_timeslice = pKernelChannelGroup->timesliceUs;
-        ctx.default_interleave = pKernelChannelGroup->pInterleaveLevel[subdevInst];
-        ctx.runlist_id = runlistId;
-        ctx.timeslice = 0;
-        ctx.interleave_level = 0;
-        nv_gpu_sched_task_init(&ctx);
-        // Apply eBPF decisions if any
-        if (ctx.timeslice != 0)
-        {
-            pKernelChannelGroup->timesliceUs = ctx.timeslice;
-        }
-        if (ctx.interleave_level != 0)
-        {
-            pKernelChannelGroup->pInterleaveLevel[subdevInst] = ctx.interleave_level;
-        }
-    }
 
     NV_ASSERT_OK_OR_GOTO(status,
         kfifoChannelGroupSetTimeslice(pGpu, pKernelFifo, pKernelChannelGroup,
@@ -588,8 +557,10 @@ kchangrpAddChannel_IMPL
     pKernelChannel->vaSpaceId = pKernelCtxShare->vaSpaceId;
 
     NV_PRINTF(LEVEL_INFO,
-              "Channel 0x%x within TSG 0x%x is using subcontext 0x%x\n",
-              kchannelGetDebugTag(pKernelChannel), pKernelChannelGroup->grpID, pKernelChannel->subctxId);
+        FMT_CHANNEL_DEBUG_TAG " within TSG 0x%x is using subcontext 0x%x\n",
+        kchannelGetDebugTag(pKernelChannel),
+        pKernelChannelGroup->grpID,
+        pKernelChannel->subctxId);
 
     status = kfifoChannelListAppend(pGpu, GPU_GET_KERNEL_FIFO(pGpu),
                                    pKernelChannel,
@@ -802,3 +773,7 @@ kchangrpGetEngineContextMemDesc_IMPL
     return NV_OK;
 }
 
+FIFO_TSG_INFO kchangrpGetInfo_IMPL(KernelChannelGroup *pKernelChannelGroup)
+{
+    return (FIFO_TSG_INFO){pKernelChannelGroup->grpID, pKernelChannelGroup->runlistId};
+}

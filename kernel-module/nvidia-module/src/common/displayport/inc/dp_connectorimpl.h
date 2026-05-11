@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -23,7 +23,7 @@
 
 /******************************* DisplayPort********************************\
 *                                                                           *
-* Module: dp_connectorimpl.cpp                                              *
+* Module: dp_connectorimpl.h                                                *
 *    DP connector implementation                                            *
 *                                                                           *
 \***************************************************************************/
@@ -42,7 +42,10 @@
 #include "dp_discovery.h"
 #include "dp_groupimpl.h"
 #include "dp_deviceimpl.h"
+#include "dp_qse.h"
 #include "./dptestutil/dp_testmessage.h"
+
+#include "dp_displayid2.h"
 
 // HDCP abort codes
 #define    HDCP_FLAGS_ABORT_DEVICE_REVOKED     0x00000800 // Abort due to a revoked device in DP1.2 topology
@@ -71,6 +74,8 @@ static inline unsigned getDataClockMultiplier(NvU64 linkRate, NvU64 laneCount)
 
 namespace DisplayPort
 {
+
+    class QSENonceGenerator;
 
     typedef enum
     {
@@ -137,6 +142,8 @@ namespace DisplayPort
         bool    bPConConnected;                 // HDMI2.1-Protocol Converter (Support SRC control mode) connected.
         bool    bSkipAssessLinkForPCon;         // Skip assessLink() for PCON. DD will call assessFRLLink later.
         bool    bHdcpAuthOnlyOnDemand;          // True if only initiate Hdcp authentication on demand and MST won't auto-trigger authenticate at device attach.
+        bool    bMstRestoreHdcpStateAtAttach;   // True if restore previous HDCP state at attach
+        bool    bHdcpStrmEncrEnblOnlyOnDemand;  // True if only initiate Hdcp Stream Encryption Enable on demand and MST won't auto-trigger.
         bool    bReassessMaxLink;               // Retry assessLink() if the first assessed link config is lower than the panel max config.
 
         bool    constructorFailed;
@@ -186,6 +193,7 @@ namespace DisplayPort
         List activeGroups;
         LinkedList<GroupImpl> intransitionGroups;
         LinkedList<GroupImpl> addStreamMSTIntransitionGroups;
+        LinkedList<GroupImpl> hdcpEnableTransitionGroups;
         List inactiveGroups;
 
         LinkedList<Device> dscEnabledDevices;
@@ -197,7 +205,6 @@ namespace DisplayPort
         unsigned compoundQueryLocalLinkPBN;
         NvU64 compoundQueryUsedTunnelingBw;
         bool compoundQueryForceEnableFEC;
-        // WAR
         bool bDP2XPreferNonDSCForLowPClk;
 
         unsigned freeSlots;
@@ -251,7 +258,19 @@ namespace DisplayPort
         List pendingEdidReads;                   // List of DevicePendingEDIDRead structures.
                                                  // This list tracks the currently in progress MST Edid Reads
 
+        List pendingDid2Reads;                   // List of DevicePendingDID2Read structures.
+                                                     // This list tracks the currently in progress MST Did2 Reads
+
         Device          * lastDeviceSetForVbios;
+
+        QSENonceGenerator * qseNonceGenerator;
+
+        // Tells whether requests made by library to Downstream Device (i.e QSE messages sent to Branch Device) and RM
+        // (i.e KSV validation and Stream Validation requests sent by library to RM after getting QSE message reply from Downstream)
+        // during querying stream status is valid or not.
+        bool        bValidQSERequest;
+        ListElement       * message;             // Outstanding QSE message pointer for which Stream Validation submission failed.
+        NvU8              * clientId;            // ClientId of the group for which Stream Validation submission failed.
 
         // Flag which gets set when ACPI init is done. DD calls notifyAcpiInitDone to tell client that ACPI init is completed
         // & client can now initiate DDC EDID read for a device which supports EDID through SBIOS
@@ -259,6 +278,14 @@ namespace DisplayPort
 
         // Flag to check if the system is UEFI.
         bool        bIsUefiSystem;
+
+        //
+        // Flag to minimize link config for SST if it is 128b/132b.
+        // Enables gR-3336 if set.
+        //
+        bool        bEnable128b132bDSCLnkCfgReduction;
+
+        bool        bSkipResetLinkStateDuringPlug;
 
         // Flag to check if LT should be skipped.
         bool        bSkipLt;
@@ -327,6 +354,12 @@ namespace DisplayPort
         //
         bool        bForceHeadShutdownOnModeTransition;
 
+         // Use max DSC compression for MST topologies
+        bool        bUseMaxDSCCompressionMST;
+
+        // Flag to tell whether to send QSE after stream encryption on
+        bool        bIsEncryptionQseValid;
+
         bool        bReportDeviceLostBeforeNew;
         bool        bDisableSSC;
         bool        bEnableFastLT;
@@ -338,6 +371,8 @@ namespace DisplayPort
         //
         NvU32       LT2FecLatencyMs;
 
+        bool        bIgnoreCapsAndForceHighestLc;
+
         // On eDP, do not cache the source OUI if it reads 0. See bug 4793112
         bool        bSkipZeroOuiCache;
 
@@ -345,7 +380,12 @@ namespace DisplayPort
 
         bool        bForceHeadShutdownPerMonitor;
 
-        bool        bEnableLowerBppCheckForDsc;
+        // Enable stats collection for compoundQueryAttach()
+        bool        bEnableCqaStatsCollection;
+        NvU64       cqaStatsMinUs = static_cast<NvU64>(-1);
+        NvU64       cqaStatsMaxUs = 0;
+        NvU64       cqaStatsSumUs = 0;
+        NvU64       cqaStatsCount = 0;
 
         //
         // Dual SST Partner connector object pointer
@@ -389,6 +429,12 @@ namespace DisplayPort
         bool        bForceDisableTunnelBwAllocation;
         bool        bDisableEffBppSST8b10b;
 
+        // Use regkey DP_DSC_DEVID_WAR to toggle this flag.
+        bool        bEnableDevId;
+
+        // To skip NLP similar to fakeMuxDevice on non-DSC DDS
+        bool        bIgnoreUnplugUnlessRequested;
+
         Group *perHeadAttachedGroup[NV_MAX_HEADS];
         NvU32 inTransitionHeadMask;
 
@@ -398,15 +444,24 @@ namespace DisplayPort
         void setPolicyForceLTAtNAB(bool enabled);
         void setPolicyAssessLinkSafely(bool enabled);
 
+        void setDisplayId2MSTPolicy(DISPLAYID2_MST_POLICY policy) { return; };
+        virtual void discoveryNewDevice(const DiscoveryManager::Device &device);
+        bool bDisableNativeDisplayId2xSupport;
+
         void discoveryDetectComplete();
-        void discoveryNewDevice(const DiscoveryManager::Device &device);
         void discoveryLostDevice(const Address &address);
-        void processNewDevice(const DiscoveryManager::Device &device,
-            const Edid &edid,
-            bool isMultistream,
-            DwnStreamPortType portType,
-            DwnStreamPortAttribute portAttribute,
-            bool isCompliance = false);
+
+        struct ProcessNewDeviceParams {
+            const DiscoveryManager::Device &device;
+            const Edid &edid;
+            const DisplayID2x &displayId2x;
+            bool isMultistream;
+            DwnStreamPortType portType;
+            DwnStreamPortAttribute portAttribute;
+            bool isCompliance;
+        };
+
+        void processNewDevice(const ProcessNewDeviceParams &params);
 
         void applyEdidWARs(Edid &edid, DiscoveryManager::Device &device);
         virtual void handleEdidWARs(Edid &edid, DiscoveryManager::Device &device){};
@@ -424,7 +479,7 @@ namespace DisplayPort
         virtual void hardwareWasReset();
         virtual LinkConfiguration getMaxLinkConfig();
         virtual LinkConfiguration getActiveLinkConfig();
-        virtual void powerdownLink(bool bPowerdownPanel = false);
+        void powerdownLink(bool bPowerdownPanel = false);
         LinkConfiguration initMaxLinkConfig();
 
         GroupImpl * getActiveGroupForSST();
@@ -524,8 +579,8 @@ namespace DisplayPort
 
         virtual bool compoundQueryAttachSSTDsc(const DpModesetParams &modesetParams,
                                                LinkConfiguration lc,
-                                               DscParams *pDscParams = NULL,       
-                                               DP_IMP_ERROR *pErrorCode = NULL);  
+                                               DscParams *pDscParams = NULL,
+                                               DP_IMP_ERROR *pErrorCode = NULL);
 
 
         //
@@ -536,7 +591,9 @@ namespace DisplayPort
         char tagHDCPReauthentication;
         char tagDelayedHdcpCapRead;
         char tagDelayedHDCPCPIrqHandling;
+        char tagSendQseMessage;
         char tagDpBwAllocationChanged;
+        char tagHDCPStreamEncrEnable;
 
         //
         //  Enable disable TMDS mode
@@ -594,6 +651,7 @@ namespace DisplayPort
             unsigned rasterBlankEndX,
             unsigned depth) ;
 
+        void ensureMstNodesPoweredUp(Group * target);
         virtual void readRemoteHdcpCaps();
         virtual void notifyAttachEnd(bool modesetCancelled);
         virtual void notifyDetachBegin(Group * target);
@@ -613,6 +671,7 @@ namespace DisplayPort
         bool     allocateMaxDpTunnelBw();
         NvU64    getMaxTunnelBw();
         void     enableDpTunnelingBwAllocationSupport();
+        void     cancelDpTunnelBwAllocation();
 
         void assessLink(LinkTrainingType trainType = NORMAL_LINK_TRAINING);
 
@@ -675,6 +734,8 @@ namespace DisplayPort
         virtual bool allocateTimeslice(GroupImpl * targetGroup);
         void freeTimeslice(GroupImpl * targetGroup);
         void flushTimeslotsToHardware();
+        void hdcpRenegotiate(NvU64 cN, NvU64 cKsv);
+        void hdcpActiveGroupsSetECF();
         bool getHDCPAbortCodesDP12(NvU32 &hdcpAbortCodesDP12);
         bool getOuiSink(unsigned &ouiId, unsigned char * modelName, size_t modelNameBufferSize, NvU8 &chipRevision);
         bool hdcpValidateKsv(const NvU8 *ksv, NvU32 Size);
@@ -779,6 +840,11 @@ namespace DisplayPort
         {
             activeLinkConfig.setLTCounter(0);
         }
+
+        virtual bool isDpInTunnelingSupported();
+        virtual bool isDpInTunnelingPanelReplayOptimizationSupported();
+        virtual bool isDpInTunnelingBwAllocationSupported();
+        virtual bool getUSBDpInAdapterInfo(NvU32 displayId, NV0073_CTRL_DP_USB4_INFO *pInfo);
     };
 
     //

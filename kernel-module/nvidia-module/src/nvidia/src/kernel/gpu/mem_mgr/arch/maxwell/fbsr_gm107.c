@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2009-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2009-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -109,18 +109,11 @@ static NV_STATUS _fbsrInitGsp
 {
     MemoryManager     *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
     KernelGsp         *pKernelGsp     = GPU_GET_KERNEL_GSP(pGpu);
-    NvHandle           hSysMem        = NV01_NULL_OBJECT;
     RM_API            *pRmApi         = GPU_GET_PHYSICAL_RMAPI(pGpu);
-    MEMORY_DESCRIPTOR *pGspSysMemDesc = pMemoryManager->fbsrReservedRanges[FBSR_RESERVED_INST_MEMORY_GSP_HEAP];
     NV2080_CTRL_INTERNAL_FBSR_INIT_PARAMS params;
 
-    NV_ASSERT_OR_RETURN(pGspSysMemDesc != NULL, NV_ERR_INVALID_STATE);
-
-    // Register sysmem memdesc with GSP. This creates memlist object
-    NV_ASSERT_OK_OR_RETURN(memdescSendMemDescToGSP(pGpu, pGspSysMemDesc, &hSysMem));
-
     params.hClient    = pMemoryManager->hClient;
-    params.hSysMem    = hSysMem;
+    params.hSysMem    = pMemoryManager->hGspHeapSysMemHandle;
     params.bEnteringGcoffState  = pGpu->getProperty(pGpu, PDB_PROP_GPU_GCOFF_STATE_ENTERING);
     params.sysmemAddrOfSuspendResumeData = memdescGetPhysAddr(pKernelGsp->pSRMetaDescriptor, AT_GPU, 0);
 
@@ -131,9 +124,6 @@ static NV_STATUS _fbsrInitGsp
                                            NV2080_CTRL_CMD_INTERNAL_FBSR_INIT,
                                            &params,
                                            sizeof(params)));
-
-    // Free memlist object
-    pRmApi->Free(pRmApi, pMemoryManager->hClient, hSysMem);
 
     return NV_OK;
 }
@@ -268,7 +258,7 @@ fbsrDestroy_GM107(OBJGPU *pGpu, OBJFBSR *pFbsr)
     {
         if (pFbsr->pSysMemDesc)
         {
-            memdescUnmapOld(pFbsr->pSysMemDesc, 1 /*kernel*/, 0,
+            memdescUnmapOld(pFbsr->pSysMemDesc, 1 /*kernel*/,
                             (pFbsr->type == FBSR_TYPE_FILE) ? (void*)pFbsr->pDmaBuffer :
                                                               (void*)pFbsr->pPinnedBuffer,
                             pFbsr->pMapCookie);
@@ -309,7 +299,7 @@ fbsrBegin_GM107(OBJGPU *pGpu, OBJFBSR *pFbsr, FBSR_OP_TYPE op)
         if (IS_GSP_CLIENT(pGpu) || IS_VIRTUAL(pGpu))
         {
             pFbsr->pCe = NULL;
-            bVirtualMode = !IS_VIRTUAL(pGpu) ? NV_TRUE : NV_FALSE;
+            bVirtualMode = pMemoryManager->bUseVirtualCopyOnSuspend;
             NV_ASSERT_OK_OR_RETURN(memmgrInitCeUtils(pMemoryManager, NV_FALSE, bVirtualMode));
         }
 

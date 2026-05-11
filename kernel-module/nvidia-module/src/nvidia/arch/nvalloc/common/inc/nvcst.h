@@ -65,8 +65,7 @@ CHIPSET_SETUP_FUNC(Intel_0685_setupFunc)
 CHIPSET_SETUP_FUNC(Intel_4381_setupFunc)
 CHIPSET_SETUP_FUNC(Intel_7A82_setupFunc)
 CHIPSET_SETUP_FUNC(Intel_7A04_setupFunc)
-CHIPSET_SETUP_FUNC(Intel_5795_setupFunc)
-CHIPSET_SETUP_FUNC(Intel_1B81_setupFunc)
+CHIPSET_SETUP_FUNC(Intel_7D06_setupFunc)
 CHIPSET_SETUP_FUNC(SiS_656_setupFunc)
 CHIPSET_SETUP_FUNC(ATI_RS400_setupFunc)
 CHIPSET_SETUP_FUNC(ATI_RS480_setupFunc)
@@ -92,11 +91,14 @@ CHIPSET_SETUP_FUNC(Fujitsu_A64FX_setupFunc)
 CHIPSET_SETUP_FUNC(Ampere_Altra_setupFunc)
 CHIPSET_SETUP_FUNC(Arm_NeoverseN1_setupFunc)
 CHIPSET_SETUP_FUNC(Ampere_AmpereOne_setupFunc)
+CHIPSET_SETUP_FUNC(Qualcomm_Snapdragon_setupFunc)
 CHIPSET_SETUP_FUNC(Nvidia_T210_setupFunc)
 CHIPSET_SETUP_FUNC(Nvidia_T194_setupFunc)
 CHIPSET_SETUP_FUNC(Nvidia_TH500_setupFunc)
 CHIPSET_SETUP_FUNC(PLDA_XpressRichAXI_setupFunc)
 CHIPSET_SETUP_FUNC(Riscv_generic_setupFunc)
+CHIPSET_SETUP_FUNC(Intel_A70D_setupFunc)
+CHIPSET_SETUP_FUNC(AMD_14D8_setupFunc)
 
 
 // Keep string length <=32 (including termination) to avoid string copy overflow
@@ -190,11 +192,22 @@ CSINFO chipsetInfo[] =
     {PCI_VENDOR_ID_INTEL,       0x4385, CS_INTEL_4381,      "Intel-RocketLake",     Intel_4381_setupFunc},
     {PCI_VENDOR_ID_INTEL,       0x7A82, CS_INTEL_7A82,      "Intel-AlderLake",      Intel_7A82_setupFunc},
     {PCI_VENDOR_ID_INTEL,       0x7A84, CS_INTEL_7A82,      "Intel-AlderLake",      Intel_7A82_setupFunc},
-    {PCI_VENDOR_ID_INTEL,       0x1B81, CS_INTEL_1B81,      "Intel-SapphireRapids", Intel_1B81_setupFunc},
-    {PCI_VENDOR_ID_INTEL,       0x7A8A, CS_INTEL_1B81,      "Intel-SapphireRapids", Intel_1B81_setupFunc},
+    {PCI_VENDOR_ID_INTEL,       0x1B81, CS_INTEL_1B81,      "Intel-SapphireRapids", NULL},
+    {PCI_VENDOR_ID_INTEL,       0x7A8A, CS_INTEL_1B81,      "Intel-SapphireRapids", NULL},
     {PCI_VENDOR_ID_INTEL,       0x18DC, CS_INTEL_18DC,      "Intel-IceLake",        NULL},
     {PCI_VENDOR_ID_INTEL,       0x7A04, CS_INTEL_7A04,      "Intel-RaptorLake",     Intel_7A04_setupFunc},
-    {PCI_VENDOR_ID_INTEL,       0x5795, CS_INTEL_5795,      "Intel-GraniteRapids",  Intel_5795_setupFunc},
+    {PCI_VENDOR_ID_INTEL,       0x5795, CS_INTEL_5795,      "Intel-GraniteRapids",  NULL},
+    {PCI_VENDOR_ID_INTEL,       0xA70D, CS_INTEL_B660,      "Intel-B660",           Intel_A70D_setupFunc},
+    {PCI_VENDOR_ID_INTEL,       0x7D06, CS_INTEL_7D06,      "Intel-Arrowlake",      Intel_7D06_setupFunc},
+    {PCI_VENDOR_ID_INTEL,       0x7D1A, CS_INTEL_7D06,      "Intel-Arrowlake",      Intel_7D06_setupFunc},
+    {PCI_VENDOR_ID_INTEL,       0x7D1B, CS_INTEL_7D06,      "Intel-Arrowlake",      Intel_7D06_setupFunc},
+    {PCI_VENDOR_ID_INTEL,       0x7D1C, CS_INTEL_7D06,      "Intel-Arrowlake",      Intel_7D06_setupFunc},
+    {PCI_VENDOR_ID_INTEL,       0x7D2A, CS_INTEL_7D06,      "Intel-Arrowlake",      Intel_7D06_setupFunc},
+    {PCI_VENDOR_ID_INTEL,       0x7D2D, CS_INTEL_7D06,      "Intel-Arrowlake",      Intel_7D06_setupFunc},
+    {PCI_VENDOR_ID_INTEL,       0x7D2F, CS_INTEL_7D06,      "Intel-Arrowlake",      Intel_7D06_setupFunc},
+    {PCI_VENDOR_ID_INTEL,       0x7D35, CS_INTEL_7D06,      "Intel-Arrowlake",      Intel_7D06_setupFunc},
+    {PCI_VENDOR_ID_INTEL,       0x7D67, CS_INTEL_7D06,      "Intel-Arrowlake",      Intel_7D06_setupFunc},
+    {PCI_VENDOR_ID_INTEL,       0x7D30, CS_INTEL_7D06,      "Intel-Arrowlake",      Intel_7D06_setupFunc},
 
     {PCI_VENDOR_ID_NVIDIA,      0x0FAE, CS_NVIDIA_T210,      "T210",      Nvidia_T210_setupFunc},
     {PCI_VENDOR_ID_NVIDIA,      0x0FAF, CS_NVIDIA_T210,      "T210",      Nvidia_T210_setupFunc},
@@ -237,6 +250,7 @@ CSINFO chipsetInfo[] =
     {PCI_VENDOR_ID_AMD,         0x9601, CS_AMD_GX890,        "GX890"        ,AMD_FX890_setupFunc},
     {PCI_VENDOR_ID_AMD,         0x9600, CS_AMD_RS780,        "RS780"        ,AMD_RS780_setupFunc},
     {PCI_VENDOR_ID_AMD,         0x790e, CS_AMD_X370,         "X370/X399/X470/ TRX40/X570/WRX80", AMD_X370_setupFunc },
+    {PCI_VENDOR_ID_AMD,         0x14d8, CS_AMD_RPH,          "AMD-Raphael",  AMD_14D8_setupFunc},
 
     {PCI_VENDOR_ID_VIA,         0x0308, CS_VIA_VT8369B,      "VT8369B",      NULL},
     {PCI_VENDOR_ID_VIA,         0x0410, CS_VIA_VX900,        "VX900",        VIA_VX900_setupFunc},
@@ -276,6 +290,8 @@ CSINFO chipsetInfo[] =
     {PCI_VENDOR_ID_HYGON,       0x790E, CS_HYGON_C86,      "Hygon-C86-7151",   NULL},
     {PCI_VENDOR_ID_MARVELL,     0xA02D, CS_MARVELL_OCTEON_CN96XX, "Marvell Octeon CN96xx", ARMV8_generic_setupFunc},
     {PCI_VENDOR_ID_MARVELL,     0xA02D, CS_MARVELL_OCTEON_CN98XX, "Marvell Octeon CN98xx", ARMV8_generic_setupFunc},
+    {PCI_VENDOR_ID_QUALCOMM,    0x010E, CS_SNAPDRAGON_8CX, "Qualcomm Snapdragon 8cx Gen3", Qualcomm_Snapdragon_setupFunc},
+    {PCI_VENDOR_ID_QUALCOMM,    0x0111, CS_SNAPDRAGON_8CX, "Qualcomm Snapdragon 8cx Gen4", Qualcomm_Snapdragon_setupFunc},
     {PCI_VENDOR_ID_SIFIVE,      0x0000, CS_SIFIVE_FU740_C000, "SiFive FU740-000", Riscv_generic_setupFunc},
     {PCI_VENDOR_ID_PLDA,        0x1111, CS_PLDA_XPRESSRICH_AXI_REF, "XpressRich-AXI Ref Design", PLDA_XpressRichAXI_setupFunc},
     {PCI_VENDOR_ID_AMPERE,      0xE200, CS_AMPERE_AMPEREONE160, "Ampere AmpereOne-160", Ampere_AmpereOne_setupFunc},
@@ -295,6 +311,7 @@ CSINFO chipsetInfo[] =
     {PCI_VENDOR_ID_AMPERE,      0xE20D, CS_AMPERE_AMPEREONE192, "Ampere AmpereOne-192", Ampere_AmpereOne_setupFunc},
     {PCI_VENDOR_ID_AMPERE,      0xE20E, CS_AMPERE_AMPEREONE192, "Ampere AmpereOne-192", Ampere_AmpereOne_setupFunc},
     {PCI_VENDOR_ID_AMPERE,      0xE20F, CS_AMPERE_AMPEREONE192, "Ampere AmpereOne-192", Ampere_AmpereOne_setupFunc},
+    {PCI_VENDOR_ID_NVIDIA,      0x22D1, CS_NVIDIA_T254,         "T254",                 Nvidia_T194_setupFunc},
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -330,6 +347,7 @@ VENDORNAME vendorName[] =
     {PCI_VENDOR_ID_CADENCE,     "Cadence"},
     {PCI_VENDOR_ID_ARM,         "ARM"},
     {PCI_VENDOR_ID_ALIBABA,     "Alibaba"},
+    {PCI_VENDOR_ID_QUALCOMM,    "Qualcomm"},
     {PCI_VENDOR_ID_SIFIVE,      "SiFive"},
     {PCI_VENDOR_ID_PLDA,        "PLDA"},
     {PCI_VENDOR_ID_PHYTIUM,     "Phytium"},
@@ -339,7 +357,7 @@ VENDORNAME vendorName[] =
 
 //
 // Allowlist all chipsets with which dGPU over PCIe is supported on ARM
-// (both v7 and v8) platforms
+// (both v7 and v8) platforms. Also include IGPU specific chipsets.
 //
 ARMCSALLOWLISTINFO armChipsetAllowListInfo[] =
 {
@@ -364,7 +382,8 @@ ARMCSALLOWLISTINFO armChipsetAllowListInfo[] =
     {PCI_VENDOR_ID_NVIDIA,      0x22D6, CS_NVIDIA_T264},        // NVIDIA Tegra RP x8
     {PCI_VENDOR_ID_NVIDIA,      0x22D8, CS_NVIDIA_T264},        // NVIDIA Tegra RP x4
     {PCI_VENDOR_ID_NVIDIA,      0x22DA, CS_NVIDIA_T264},        // NVIDIA Tegra RP x2
-    {PCI_VENDOR_ID_NVIDIA,      0x2B00, CS_NVIDIA_T264},        // NVIDIA Tegra RP iGPU
+    {PCI_VENDOR_ID_NVIDIA,      0x22E6, CS_NVIDIA_T264},        // NVIDIA Tegra iGPU RP
+    {PCI_VENDOR_ID_NVIDIA,      0x2B00, CS_NVIDIA_T264},        // NVIDIA Tegra iGPU
 
     {PCI_VENDOR_ID_APM,         0xe004, CS_APM_STORM},          // Applied Micro X-Gene "Storm"
     {PCI_VENDOR_ID_MARVELL,     0xAF00, CS_MARVELL_THUNDERX2},  // Marvell ThunderX2
@@ -401,6 +420,8 @@ ARMCSALLOWLISTINFO armChipsetAllowListInfo[] =
     {PCI_VENDOR_ID_MARVELL,     0xA02D, CS_MARVELL_OCTEON_CN96XX}, // Marvell OCTEON CN96xx
     {PCI_VENDOR_ID_MARVELL,     0xA02D, CS_MARVELL_OCTEON_CN98XX}, // Marvell OCTEON CN98xx
     {PCI_VENDOR_ID_ALIBABA,     0x8000, CS_ALIBABA_YITIAN},      // Alibaba Yitian
+    {PCI_VENDOR_ID_QUALCOMM,    0x010E, CS_SNAPDRAGON_8CX},        // Qualcomm Snapdragon 8cx Gen3 - 8280 dev platform
+    {PCI_VENDOR_ID_QUALCOMM,    0x0111, CS_SNAPDRAGON_8CX},        // Qualcomm Snapdragon 8cx Gen4 - 8380 dev(?) platform
     {PCI_VENDOR_ID_AMPERE,      0xE200, CS_AMPERE_AMPEREONE160},   // Ampere AmpereOne-160
     {PCI_VENDOR_ID_AMPERE,      0xE201, CS_AMPERE_AMPEREONE160},   // Ampere AmpereOne-160
     {PCI_VENDOR_ID_AMPERE,      0xE202, CS_AMPERE_AMPEREONE160},   // Ampere AmpereOne-160
@@ -418,6 +439,7 @@ ARMCSALLOWLISTINFO armChipsetAllowListInfo[] =
     {PCI_VENDOR_ID_AMPERE,      0xE20D, CS_AMPERE_AMPEREONE192},   // Ampere AmpereOne-192
     {PCI_VENDOR_ID_AMPERE,      0xE20E, CS_AMPERE_AMPEREONE192},   // Ampere AmpereOne-192
     {PCI_VENDOR_ID_AMPERE,      0xE20F, CS_AMPERE_AMPEREONE192},   // Ampere AmpereOne-192
+    {PCI_VENDOR_ID_NVIDIA,      0x22D1, CS_NVIDIA_T254},
 
     // last element must have chipset CS_UNKNOWN (zero)
     {0,                         0,      CS_UNKNOWN}

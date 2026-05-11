@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2012-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2012-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -26,6 +26,7 @@
 #include "virtualization/hypervisor/hypervisor.h"
 
 #include "ctrl/ctrl2080/ctrl2080gpu.h"
+#include "nvdevid.h"
 
 #if PORT_MEM_TRACK_USE_LIMIT
 ct_assert(PORT_MEM_LIMIT_MAX_GFID == VGPU_MAX_GFID);
@@ -194,6 +195,7 @@ vgpuMgrReserveSystemChannelIDs
         NvU32       runlistId;
         CHID_MGR   *pChidMgr;
         NvU32       currentNumChannels = numChannels;
+        NvU32       hostChannelCount;
 
         if (engineFifoList[i].engineData[ENGINE_INFO_TYPE_RM_ENGINE_TYPE] ==
             RM_ENGINE_TYPE_SW)
@@ -213,19 +215,39 @@ vgpuMgrReserveSystemChannelIDs
                                                     &runlistId));
         pChidMgr = kfifoGetChidMgr(pGpu, pKernelFifo, runlistId);
 
+        hostChannelCount = kfifoChidMgrGetNumChannels(pGpu, pKernelFifo, pChidMgr);
         //
-        // numChannels received as input argument is prevPow2(maxPhysicalChannels/vgpuTypeInfo->maxInstance)
-        // So, if vgpuTypeInfo->maxInstance is not pow2, then numChannels is already reduced.
+        // On hyperv host, KMD/OS uses a CE channel for some paging oprations.
+        // For Blackwell+, since we don't have powerOf2 restriction we will calculate channel count
+        // using reserved ce channel and available host channel count
+
+        // For prev, GPUs,  we need to reduce the number of channels for guest to prev
+        // power of 2 and then reserve the channels. This applies to MIG vGPU
+        // profiles as well.
+        // Now numChannels received as input argument is prevPow2(maxPhysicalChannels/vgpuTypeInfo->maxInstance)
+        // If vgpuTypeInfo->maxInstance is not pow2, then numChannels is already reduced.
+		// Hence only reduce the number of channels by half when vgpuTypeInfo->maxInstance
+		// is pow2 or MIG is enabled
+		//
         if (hypervisorIsType(OS_HYPERVISOR_HYPERV) &&
-            (RM_ENGINE_TYPE_IS_COPY(engineFifoList[i].engineData[ENGINE_INFO_TYPE_RM_ENGINE_TYPE])) &&
-            ONEBITSET(vgpuTypeInfo->maxInstance))
+            (RM_ENGINE_TYPE_IS_COPY(engineFifoList[i].engineData[ENGINE_INFO_TYPE_RM_ENGINE_TYPE])))
         {
-            //
-            // On hyperv host, KMD/OS uses a CE channel for some paging oprations.
-            // so, we need to reduce the number of channels for guest to prev
-            // power of 2 and then reserve the channels.
-            //
-            currentNumChannels /= 2;
+            if (gpuIsNonPowerOf2ChannelCountSupported(pGpu))
+            {
+                if (IS_MIG_ENABLED(pGpu))
+                {
+                    currentNumChannels = (hostChannelCount - HYPERV_RESERVED_CE_CHANNELS_KMD) / vgpuTypeInfo->maxInstancePerGI;
+                }
+                else
+                {
+                    currentNumChannels = (hostChannelCount - HYPERV_RESERVED_CE_CHANNELS_KMD) / vgpuTypeInfo->maxInstance;
+                }
+            }
+
+            else if (ONEBITSET(vgpuTypeInfo->maxInstance) || IS_MIG_ENABLED(pGpu))
+            {
+                currentNumChannels /= 2;
+            }
         }
 
         //
@@ -325,25 +347,138 @@ vgpuMgrFreeSystemChannelIDs
 }
 
 
-NvU32 vgpuMgrGetSwrlCountToAllocate(OBJGPU *pGpu)
+NvU32 vgpuMgrGetVmsetCountToAllocate(OBJGPU *pGpu, RM_ENGINE_TYPE rmEngineType)
 {
-    NvU32 num_swrl;
+    NvU32 num_vmsets = 1;
+    NvU32 schedPolicy;
 
-    if (IS_MIG_IN_USE(pGpu))
+    //num_vmsets are 1 for NON-GR and NON-NVENC engines & if sched policy is Default
+    if (!(
+        RM_ENGINE_TYPE_IS_NVENC(rmEngineType) ||
+        RM_ENGINE_TYPE_IS_GR(rmEngineType)))
+    {
+        return num_vmsets;
+    }
+
+    schedPolicy = gpuGetSchedulerPolicy(pGpu, rmEngineType);
+    if (schedPolicy == SCHED_POLICY_DEFAULT)
+    {
+        return num_vmsets;
+    }
+
+    if (IS_MIG_ENABLED(pGpu))
     {
         if (IsGB20XorBetter(pGpu))
         {
-            num_swrl = OBJSCHED_SW_MIG_TIMESLICE_RUNLIST_COUNT;
+            num_vmsets = OBJSCHED_SW_MIG_TIMESLICE_RUNLIST_COUNT;
         }
         else
         {
-            num_swrl = OBJSCHED_SW_MIG_NO_TIMESLICE_RUNLIST_COUNT;
+            num_vmsets = OBJSCHED_SW_MIG_NO_TIMESLICE_RUNLIST_COUNT;
         }
     }
     else
     {
-        num_swrl = OBJSCHED_SW_RUNLIST_COUNT;
+        num_vmsets = OBJSCHED_SW_RUNLIST_COUNT;
     }
 
-    return num_swrl;
+    return num_vmsets;
+}
+
+NvU16 vgpuMgrGetVgpuSsvid(OBJGPU *pGpu)
+{
+    NvU16 vgpuSsvid = NV_PCI_SUBID_VENDOR_NVIDIA;
+
+    return vgpuSsvid;
+}
+
+/*
+ * Function to allocate the slot in nominalFbSizePerGI Array
+ *
+ * For each MIG memory partition size assign the array index.
+ *
+ * If any new MIG memory size partition supported later,
+ * increase the size of the array (currently 3)
+ * which is stored in def VGPU_SUPPORTED_GI_MAX
+ */
+NvU32
+_vgpuMgrGetNominalFbSizeGIIndex
+(
+    NvU32 vgpuTypeId
+)
+{
+    NvU32 partitionFlag;
+    NV_STATUS status = kvgpumgrGetPartitionFlag(vgpuTypeId, &partitionFlag);
+
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "partition flag not found for vgpuTypeId=%u; defaulting to FULL\n",
+                  vgpuTypeId);
+
+        return NV2080_CTRL_GPU_PARTITION_FLAG_MEMORY_SIZE_FULL;
+    }
+    
+    return DRF_VAL(2080, _CTRL_GPU_PARTITION_FLAG, _MEMORY_SIZE, partitionFlag);
+}
+
+void
+vgpuMgrSetNominalFbSize
+(
+    VGPU_NOMINAL_FB_SIZE *pVgpuNominalFbSize,
+    VGPU_TYPE            *pVgpuTypeInfo
+)
+{
+    if (pVgpuTypeInfo->maxInstance == 1)
+    {
+        if (pVgpuNominalFbSize->nominalGpuFbSize < pVgpuTypeInfo->profileSize)
+        {
+            pVgpuNominalFbSize->nominalGpuFbSize = pVgpuTypeInfo->profileSize;
+        }
+    }
+
+    if (pVgpuTypeInfo->maxInstancePerGI == 1)
+    {
+        NvU32 index = _vgpuMgrGetNominalFbSizeGIIndex(pVgpuTypeInfo->vgpuTypeId);
+
+        if (pVgpuNominalFbSize->nominalFbSizePerGI[index] < pVgpuTypeInfo->profileSize)
+        {
+            pVgpuNominalFbSize->nominalFbSizePerGI[index] = pVgpuTypeInfo->profileSize;
+        }
+    }
+}
+
+NvU64
+vgpuMgrGetNominalFbSize
+(
+    OBJGPU               *pGpu,
+    VGPU_NOMINAL_FB_SIZE *pVgpuNominalFbSize,
+    VGPU_TYPE            *pVgpuTypeInfo
+)
+{
+    NvU64 nominalGpuFbSize;
+
+    if (pVgpuTypeInfo->gpuInstanceSize != 0)
+    {
+        NvU32 index = _vgpuMgrGetNominalFbSizeGIIndex(pVgpuTypeInfo->vgpuTypeId);
+
+        nominalGpuFbSize = pVgpuNominalFbSize->nominalFbSizePerGI[index];
+    }
+    else
+    {
+        nominalGpuFbSize = pVgpuNominalFbSize->nominalGpuFbSize;
+    }
+
+    return nominalGpuFbSize;
+}
+
+NvU32
+vgpuMgrGetPlacementRegionSize
+(
+    OBJGPU               *pGpu,
+    VGPU_NOMINAL_FB_SIZE *pVgpuNominalFbSize,
+    VGPU_TYPE            *pVgpuTypeInfo
+)
+{
+    return (NvU32) (vgpuMgrGetNominalFbSize(pGpu, pVgpuNominalFbSize, pVgpuTypeInfo) >> VGPU_FB_BYTES_TO_GB_SHIFT);
 }

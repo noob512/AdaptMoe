@@ -58,6 +58,7 @@ WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE="${WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE:-0}"
 INIT_KV_MIN_BLOCKS="${INIT_KV_MIN_BLOCKS:-128}"
 INIT_WEIGHT_MAX_BYTES="${INIT_WEIGHT_MAX_BYTES:-8589934592}"
 INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="${INIT_WEIGHT_MAX_EXPERTS_PER_LAYER:-16}"
+RESET_COUNTERS="${RESET_COUNTERS:-1}"
 
 COORDINATOR_GLOBAL_BYTES_PER_STEP="${COORDINATOR_GLOBAL_BYTES_PER_STEP:-536870912}"
 COORDINATOR_KV_BYTES_PER_STEP="${COORDINATOR_KV_BYTES_PER_STEP:-268435456}"
@@ -126,6 +127,9 @@ Runtime enforcement controls:
   --weight-plan-experts <n>              default: 128
   --weight-plan-file <path>              optional external prefetch/offload plan
   --weight-executor <mode>               cpp_batch|driver_batch|auto (default: cpp_batch)
+  --uvm-enable-builtin-tests <0|1>       keep UVM test ioctl enabled across
+                                         counter-reset reloads (default: 0)
+  --no-reset-counters                    do not reload nvidia_uvm between runs
   --init-kv-min-blocks <n>               default: 128
   --init-weight-max-bytes <n>            default: 8GiB
   --init-weight-max-experts-per-layer <n> default: 16
@@ -173,6 +177,8 @@ while [ $# -gt 0 ]; do
     --weight-plan-experts) WEIGHT_PLAN_EXPERTS="$2"; shift 2 ;;
     --weight-plan-file) WEIGHT_PLAN_FILE="$2"; shift 2 ;;
     --weight-executor) WEIGHT_EXECUTOR="$2"; shift 2 ;;
+    --uvm-enable-builtin-tests) UVM_ENABLE_BUILTIN_TESTS="$2"; shift 2 ;;
+    --no-reset-counters) RESET_COUNTERS=0; shift ;;
     --init-kv-min-blocks) INIT_KV_MIN_BLOCKS="$2"; shift 2 ;;
     --init-weight-max-bytes) INIT_WEIGHT_MAX_BYTES="$2"; shift 2 ;;
     --init-weight-max-experts-per-layer) INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;;
@@ -213,6 +219,15 @@ fi
 WEIGHT_EXECUTOR="${WEIGHT_EXECUTOR:-cpp_batch}"
 if ! [[ "$WEIGHT_EXECUTOR" =~ ^(cpp_batch|driver_batch|auto)$ ]]; then
   echo "--weight-executor must be cpp_batch, driver_batch, or auto" >&2
+  exit 2
+fi
+UVM_ENABLE_BUILTIN_TESTS="${UVM_ENABLE_BUILTIN_TESTS:-0}"
+if ! [[ "$UVM_ENABLE_BUILTIN_TESTS" =~ ^[01]$ ]]; then
+  echo "--uvm-enable-builtin-tests must be 0 or 1" >&2
+  exit 2
+fi
+if ! [[ "$RESET_COUNTERS" =~ ^[01]$ ]]; then
+  echo "RESET_COUNTERS must be 0 or 1" >&2
   exit 2
 fi
 
@@ -261,6 +276,8 @@ echo " weight_victim_action: $WEIGHT_VICTIM_ACTION"
 echo " weight_budget_cpu_offload_enable: $WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE"
 echo " weight_batch_executor_enable: ${WEIGHT_BATCH_EXECUTOR_ENABLE:-1}"
 echo " weight_executor: $WEIGHT_EXECUTOR"
+echo " uvm_enable_builtin_tests: $UVM_ENABLE_BUILTIN_TESTS"
+echo " reset_counters: $RESET_COUNTERS"
 echo " init_kv_min_blocks: $INIT_KV_MIN_BLOCKS"
 echo " init_weight_max_bytes: $INIT_WEIGHT_MAX_BYTES"
 echo " init_weight_max_experts_per_layer: $INIT_WEIGHT_MAX_EXPERTS_PER_LAYER"
@@ -326,6 +343,12 @@ base_args() {
     --prompts "$PROMPTS" \
     --request-rate "$REQUEST_RATE" \
     --output-len "$OUTPUT_LEN"
+  if [ "$RESET_COUNTERS" = "0" ]; then
+    printf '%s\0' --no-reset-counters
+  fi
+  if [ "$UVM_ENABLE_BUILTIN_TESTS" = "1" ]; then
+    printf '%s\0' --uvm-enable-builtin-tests "$UVM_ENABLE_BUILTIN_TESTS"
+  fi
 }
 
 run_one() {

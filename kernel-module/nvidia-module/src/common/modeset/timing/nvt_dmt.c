@@ -1,31 +1,29 @@
-//*****************************************************************************
-//
-//  SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-//  SPDX-License-Identifier: MIT
-//
-//  Permission is hereby granted, free of charge, to any person obtaining a
-//  copy of this software and associated documentation files (the "Software"),
-//  to deal in the Software without restriction, including without limitation
-//  the rights to use, copy, modify, merge, publish, distribute, sublicense,
-//  and/or sell copies of the Software, and to permit persons to whom the
-//  Software is furnished to do so, subject to the following conditions:
-//
-//  The above copyright notice and this permission notice shall be included in
-//  all copies or substantial portions of the Software.
-//
-//  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-//  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-//  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-//  THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-//  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-//  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-//  DEALINGS IN THE SOFTWARE.
-//
-//  File:       nvt_dmt.c
-//
-//  Purpose:    calculate DMT/DMT-RB timing
-//
-//*****************************************************************************
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2006-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: MIT
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+/** @file  nvt_dmt.c
+ *  @brief calculate DMT/DMT-RB timing
+ */
 
 #include "nvBinSegment.h"
 #include "nvmisc.h"
@@ -179,9 +177,7 @@ NVT_STATUS NvTiming_EnumDMT(NvU32 dmtId, NVT_TIMING *pT)
     {
         *pT = DMT[dmtId - 1];
 
-        pT->etc.rrx1k = axb_div_c((NvU32)pT->pclk,
-                                  (NvU32)10000*(NvU32)1000,
-                                  (NvU32)pT->HTotal*(NvU32)pT->VTotal);
+        pT->etc.rrx1k = axb_div_c((NvU32)pT->pclk1khz, (NvU32)1000*(NvU32)1000, (NvU32)pT->HTotal*(NvU32)pT->VTotal);
         NVT_SNPRINTF((char *)pT->etc.name, 40, "DMT:#%d:%dx%dx%dHz",
                      dmtId, pT->HVisible, pT->VVisible, pT->etc.rr);
         ((char *)pT->etc.name)[39] = '\0';
@@ -254,7 +250,7 @@ NVT_STATUS NvTiming_CalcDMT(NvU32 width, NvU32 height, NvU32 rr, NvU32 flag, NVT
             {
                 NVMISC_MEMSET(pT, 0, sizeof(NVT_TIMING));
                 *pT = *p;
-                pT->etc.rrx1k = axb_div_c((NvU32)pT->pclk, (NvU32)10000*(NvU32)1000, (NvU32)pT->HTotal*(NvU32)pT->VTotal);
+                pT->etc.rrx1k = axb_div_c((NvU32)pT->pclk1khz, (NvU32)1000*(NvU32)1000, (NvU32)pT->HTotal*(NvU32)pT->VTotal);
                 NVT_SNPRINTF((char *)pT->etc.name, 40, "DMT:%dx%dx%dHz",width, height, rr);
                 pT->etc.name[39] = '\0';
                 pT->etc.rgb444.bpc.bpc8 = 1;
@@ -294,7 +290,7 @@ NVT_STATUS NvTiming_CalcDMT_RB(NvU32 width, NvU32 height, NvU32 rr, NvU32 flag, 
             {
                 NVMISC_MEMSET(pT, 0, sizeof(NVT_TIMING));
                 *pT = *p;
-                pT->etc.rrx1k = axb_div_c((NvU32)pT->pclk, (NvU32)10000*(NvU32)1000, (NvU32)pT->HTotal*(NvU32)pT->VTotal);
+                pT->etc.rrx1k = axb_div_c((NvU32)pT->pclk1khz, (NvU32)1000*(NvU32)1000, (NvU32)pT->HTotal*(NvU32)pT->VTotal);
                 NVT_SNPRINTF((char *)pT->etc.name, 40, "DMT-RB:%dx%dx%dHz",width, height, rr);
                 pT->etc.name[39] = '\0';
                 pT->etc.rgb444.bpc.bpc8 = 1;
@@ -332,7 +328,7 @@ NVT_STATUS NvTiming_CalcDMT_RB2(NvU32 width, NvU32 height, NvU32 rr, NvU32 flag,
             {
                 NVMISC_MEMSET(pT, 0, sizeof(NVT_TIMING));
                 *pT = *p;
-                pT->etc.rrx1k = axb_div_c((NvU32)pT->pclk, (NvU32)10000*(NvU32)1000, (NvU32)pT->HTotal*(NvU32)pT->VTotal);
+                pT->etc.rrx1k = axb_div_c((NvU32)pT->pclk1khz, (NvU32)1000*(NvU32)1000, (NvU32)pT->HTotal*(NvU32)pT->VTotal);
                 NVT_SNPRINTF((char *)pT->etc.name, 40, "DMT-RB2:%dx%dx%dHz",width, height, rr);
                 pT->etc.name[39] = '\0';
                 pT->etc.rgb444.bpc.bpc8 = 1;

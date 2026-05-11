@@ -32,6 +32,9 @@ typedef struct {
         NvU8  bus, slot, function;
     } pci_info;
 
+    NvBool needs_numa_setup;
+    NvBool is_soc_disp;
+
     /*
      * opaque OS-specific pointer; on Linux, this is a pointer to the
      * 'struct device' for the GPU.

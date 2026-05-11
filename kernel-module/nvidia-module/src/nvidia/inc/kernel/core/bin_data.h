@@ -106,27 +106,13 @@ typedef enum {
     BINDATA_LABEL_LC128_PATCH_LOC_PROD,
     BINDATA_LABEL_LC128_PATCH_LOC_DBG,
     BINDATA_LABEL_CERTIFICATE_PEM,
-    BINDATA_LABEL_CERTIFICATE_DER,
 } BINDATA_LABEL;
-
-//
-// Binary data access handler
-//
-typedef struct BINDATA_RUNTIME_INFO BINDATA_RUNTIME_INFO, *PBINDATA_RUNTIME_INFO;
 
 //
 // Public binary storage information
 //
 struct BINDATA_STORAGE;         // currently no public data fields
 typedef struct BINDATA_STORAGE BINDATA_STORAGE, *PBINDATA_STORAGE;
-
-
-//
-// Primitives
-//
-NV_STATUS bindataAcquire(const BINDATA_STORAGE *pBinStorage, PBINDATA_RUNTIME_INFO *ppBinInfo);
-NV_STATUS bindataGetNextChunk(PBINDATA_RUNTIME_INFO pBinInfo, NvU8 *pBuffer, NvU32 nBytes);
-void      bindataRelease(PBINDATA_RUNTIME_INFO pBinInfo);
 
 
 //

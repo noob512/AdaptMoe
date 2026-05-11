@@ -212,6 +212,7 @@ namespace DisplayPort
         virtual NvU32 getUHBRSupported() {return 0;}
         virtual bool  isRgFlushSequenceUsed() {return false;}
         virtual bool isStreamCloningEnabled() = 0;
+        virtual bool isDpTunnelingHwBugWarEnabled() = 0;
         virtual NvU32 maxLinkRateSupported() = 0;
         virtual bool isLttprSupported() = 0;
         virtual bool isFECSupported() = 0;
@@ -225,6 +226,18 @@ namespace DisplayPort
         //  HDCP Renegotiate and trigger ACT.
         //
         virtual void configureHDCPRenegotiate(NvU64 cN = HDCP_DUMMY_CN, NvU64 cKsv = HDCP_DUMMY_CKSV, bool bForceReAuth = false, bool bRxIDMsgPending = false) = 0;
+        //  HDCP set ECF
+        virtual void configureAndTriggerECF(NvU64 ecf, NvBool bForceClearEcf = NV_FALSE, NvBool bAddStreamBack = NV_FALSE) = 0;
+        //
+        //  Enable of disable alternate scrambler SR (ASSR)
+        //
+        //      (used for embedded displayport)
+        virtual void disableAlternateScramblerReset() = 0;
+        virtual void configureHDCPDisableAuthentication() = 0;
+        virtual void configureHDCPAbortAuthentication(AbortAuthReason abortAuthReason) = 0;
+        virtual bool setStreamType(unsigned streamIndex, NvU8 streamType, bool * bNeedReNegotiate) = 0;
+        virtual void configureHDCPValidateLink(HDCPValidateData &hdcpValidateData, NvU64 cN = HDCP_DUMMY_CN, NvU64 cKsv = HDCP_DUMMY_CKSV) = 0;
+        virtual void forwardPendingKsvListReady(NvBool bKsvListReady) = 0;
         virtual void triggerACT() = 0;
         virtual void configureHDCPGetHDCPState(HDCPState &hdcpState) = 0;
 
@@ -291,7 +304,7 @@ namespace DisplayPort
         virtual bool clearFlushMode(FlushModePhase phase, NvU32 attachFailedHeadMask = 0, NvU32 headIndex = 0) { return false; }
         virtual bool getDp2xLaneData(NvU32 *numLanes, NvU32 *data) { return false; }
         virtual bool setDp2xLaneData(NvU32 numLanes, NvU32 *data) { return false; }
-        virtual bool isSupportedDPLinkConfig(LinkConfiguration &link) {return false; };
+        virtual bool isSupportedDPLinkConfig(LinkConfiguration &link) {return false; }
         virtual bool getEdpPowerData(bool *panelPowerOn, bool *bDPCDPowerStateD0) = 0;
         virtual bool vrrRunEnablementStage(unsigned stage, NvU32 *status) = 0;
 
@@ -302,6 +315,7 @@ namespace DisplayPort
         virtual bool dscCrcTransaction(NvBool bEnable, gpuDscCrc *data, NvU16 *headIndex){ return false; }
         virtual bool configureLinkRateTable(const NvU16 *pLinkRateTable, LinkRates *pLinkRates) = 0;
         virtual bool configureFec(const bool bEnableFec) = 0;
+        virtual void applyStuffDummySymbolWAR(NvU32 head, bool enable) = 0;
     };
 }
 

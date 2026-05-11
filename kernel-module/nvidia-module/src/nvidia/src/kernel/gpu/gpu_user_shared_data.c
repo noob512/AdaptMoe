@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -34,15 +34,39 @@
 #include "class/cl003e.h" // NV01_MEMORY_SYSTEM
 #include "class/cl00de.h"
 #include "ctrl/ctrl2080/ctrl2080gpu.h"
+#include "gpu_mgr/gpu_db.h"
+#include "gpu_mgr/gpu_mgr.h"
+#include "core/locks.h"
+#include "nvctassert.h"
 
 #include "gpu/mig_mgr/kernel_mig_manager.h"
 
-static NV_STATUS _gpushareddataInitGsp(OBJGPU *pGpu);
 static void _gpushareddataDestroyGsp(OBJGPU *pGpu);
-static NV_STATUS _gpushareddataSendDataPollRpc(OBJGPU *pGpu, NvU64 polledDataMask);
-static NV_STATUS _gpushareddataRequestDataPoll(GpuUserSharedData *pData, NvU64 polledDataMask);
-static inline void _gpushareddataUpdateSeqOpen(volatile NvU64 *pSeq);
-static inline void _gpushareddataUpdateSeqClose(volatile NvU64 *pSeq);
+static NV_STATUS _gpushareddataSendDataPollRpc(OBJGPU *pGpu, NvU64 polledDataMask, NvU32 pollingIntervalMs);
+static inline void _gpushareddataUpdateSeqOpen(PORT_ATOMIC NvU64 *pSeq);
+static inline void _gpushareddataUpdateSeqClose(PORT_ATOMIC NvU64 *pSeq);
+static NV_STATUS _handlePollMaskHelper(OBJGPU *, NvBool, NvBool);
+
+//
+// A subtle difference between vGPU and MODS/CC is that we create RUSD memory for vGPU
+// but not for MODS/CC.
+//
+static inline NvBool
+_rusdSupported
+(
+    OBJGPU *pGpu
+)
+{
+
+    if (IS_VIRTUAL(pGpu))
+        return NV_FALSE;
+
+    // RUSD is not yet supported when CPU CC is enabled. See bug 4148522.
+    if ((sysGetStaticConfig(SYS_GET_INSTANCE()))->bOsCCEnabled)
+        return NV_FALSE;
+
+    return NV_TRUE;
+}
 
 static inline
 NvBool
@@ -56,11 +80,11 @@ _rusdPollingSupported
     // with VSYNC interrupt on high refresh rate monitors. See Bug 4432698.
     // For GA102+, the RPC to PMU are replaced by PMUMON RMCTRLs.
     //
-    return ((!IS_VIRTUAL(pGpu)) && 
+    return _rusdSupported(pGpu) &&
             (pGpu->userSharedData.pollingRegistryOverride != NV_REG_STR_RM_DEBUG_RUSD_POLLING_FORCE_DISABLE) &&
             (IS_GSP_CLIENT(pGpu) ||
                 (pGpu->userSharedData.pollingRegistryOverride == NV_REG_STR_RM_DEBUG_RUSD_POLLING_FORCE_ENABLE) ||
-                pGpu->getProperty(pGpu, PDB_PROP_GPU_RUSD_POLLING_SUPPORT_MONOLITHIC)));
+                pGpu->getProperty(pGpu, PDB_PROP_GPU_RUSD_POLLING_SUPPORT_MONOLITHIC));
 }
 
 NV_STATUS
@@ -78,11 +102,13 @@ gpushareddataConstruct_IMPL
 
     NV_ASSERT_OR_RETURN(!RMCFG_FEATURE_PLATFORM_GSP, NV_ERR_NOT_SUPPORTED);
 
-    if (IS_VIRTUAL(pGpu))
+    if (!_rusdSupported(pGpu))
         return NV_ERR_NOT_SUPPORTED;
 
     if (!_rusdPollingSupported(pGpu) && (pAllocParams->polledDataMask != 0U))
         return NV_ERR_NOT_SUPPORTED;
+
+    pData->pollingIntervalMs = pGpu->userSharedData.defaultPollingIntervalMs;
 
     if (RS_IS_COPY_CTOR(pParams))
         return NV_OK;
@@ -90,9 +116,12 @@ gpushareddataConstruct_IMPL
     if (*ppMemDesc == NULL)
         return NV_ERR_NOT_SUPPORTED;
 
+    // TODO: no need to iterate through all clients for adding a new mask
     if (pAllocParams->polledDataMask != 0U)
     {
-        NV_ASSERT_OK_OR_RETURN(_gpushareddataRequestDataPoll(pData, pAllocParams->polledDataMask));
+        pData->polledDataMask = pAllocParams->polledDataMask;
+        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+            _handlePollMaskHelper(pGpu, NV_FALSE, NV_FALSE));
     }
 
     NV_ASSERT_OK_OR_RETURN(memConstructCommon(pMemory,
@@ -116,7 +145,10 @@ gpushareddataDestruct_IMPL(GpuUserSharedData *pData)
         return;
     }
 
-    _gpushareddataRequestDataPoll(pData, 0U);
+    // On object destruction, reset to default and re-trigger polling param calculation.
+    pData->polledDataMask = 0U;
+    pData->pollingIntervalMs = pGpu->userSharedData.defaultPollingIntervalMs;
+    NV_CHECK(LEVEL_ERROR, _handlePollMaskHelper(pGpu, NV_FALSE, NV_TRUE) == NV_OK);
 
     memdescRemoveRef(pGpu->userSharedData.pMemDesc);
     memDestructCommon(pMemory);
@@ -126,15 +158,18 @@ gpushareddataDestruct_IMPL(GpuUserSharedData *pData)
 static inline void
 _gpushareddataUpdateSeqOpen
 (
-    volatile NvU64 *pSeq
+    PORT_ATOMIC NvU64 *pSeq
 )
 {
     NvU64 seqVal;
 
+    ct_assert(sizeof(PORT_ATOMIC NvU64) == sizeof(NvU64));
+    ct_assert(NV_ALIGNOF(PORT_ATOMIC NvU64) == NV_ALIGNOF(NvU64));
+
     // Initialize seq to RUSD_SEQ_START at first write. If never written before, seq is treated as an invalid timestamp
     if (MEM_RD64(pSeq) == 0LLU)
     {
-        portAtomicExSetU64(pSeq, RUSD_SEQ_START + 1);
+        portAtomicExSetU64(pSeq, RUSD_SEQ_START + 1ULL);
     }
     else
     {
@@ -152,7 +187,7 @@ _gpushareddataUpdateSeqOpen
 static inline void
 _gpushareddataUpdateSeqClose
 (
-    volatile NvU64 *pSeq
+    PORT_ATOMIC NvU64 *pSeq
 )
 {
     NvU64 seqVal;
@@ -181,7 +216,7 @@ NV00DE_SHARED_DATA * gpushareddataWriteStart_INTERNAL(OBJGPU *pGpu, NvU64 offset
         pSharedData = &pGpu->userSharedData.data;
     }
     
-    _gpushareddataUpdateSeqOpen((volatile NvU64*)(((NvU8*)pSharedData) + offset));
+    _gpushareddataUpdateSeqOpen((PORT_ATOMIC NvU64*)(((NvU8*)pSharedData) + offset));
 
     return pSharedData;
 }
@@ -195,7 +230,7 @@ void gpushareddataWriteFinish_INTERNAL(OBJGPU *pGpu, NvU64 offset)
         pSharedData = &pGpu->userSharedData.data;
     }
 
-    _gpushareddataUpdateSeqClose((volatile NvU64*)(((NvU8*)pSharedData) + offset));
+    _gpushareddataUpdateSeqClose((PORT_ATOMIC NvU64*)(((NvU8*)pSharedData) + offset));
 }
 static void
 _gpushareddataDestroyGsp
@@ -214,11 +249,40 @@ _gpushareddataDestroyGsp
                 pRmApi->Control(pRmApi, pGpu->hInternalClient,
                                 pGpu->hInternalSubdevice,
                                 NV2080_CTRL_CMD_INTERNAL_INIT_USER_SHARED_DATA,
-                               &params, sizeof(params)));
+                                &params, sizeof(params)));
 }
 
-static NV_STATUS
-_gpushareddataInitGsp
+NV_STATUS
+gpuHandleRusdPollingRegistry_KERNEL
+(
+    OBJGPU *pGpu
+)
+{
+    if (!_rusdSupported(pGpu))
+    {
+        return NV_OK;
+    }
+
+    //
+    // The function is called in state load, which is called on both driver init
+    // and resume. Only handle registry override in the init path by checking
+    // the lastPolledDataMask. If the registry is force enabled, the
+    // lastPolledDataMask will be set in the init path.
+    //
+    if ((pGpu->userSharedData.pollingRegistryOverride ==
+            NV_REG_STR_RM_DEBUG_RUSD_POLLING_FORCE_ENABLE) &&
+        (pGpu->userSharedData.lastPolledDataMask == 0))
+    {
+        // If polling is forced always on, start polling during init and never stop
+        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+            _gpushareddataSendDataPollRpc(pGpu, ~0ULL, pGpu->userSharedData.pollingIntervalMs));
+    }
+
+    return NV_OK;
+}
+
+NV_STATUS
+gpuRusdInitPhysical_KERNEL
 (
     OBJGPU *pGpu
 )
@@ -235,13 +299,33 @@ _gpushareddataInitGsp
                                            NV2080_CTRL_CMD_INTERNAL_INIT_USER_SHARED_DATA,
                                            &params, sizeof(params)));
 
-    if (pGpu->userSharedData.pollingRegistryOverride == NV_REG_STR_RM_DEBUG_RUSD_POLLING_FORCE_ENABLE)
-    {
-        // If polling is forced always on, start polling during init and never stop
-        return _gpushareddataSendDataPollRpc(pGpu, ~0ULL);
-    }
-
     return NV_OK;
+}
+
+static void
+_gpusharedataPollingIntervalSanityCheck
+(
+    OBJGPU *pGpu
+)
+{
+    // Value should have already been initialized in registry handling
+    if (pGpu->userSharedData.pollingIntervalMs == 0)
+    {
+        NV_ASSERT(0);
+        // as a safety measure, initialize to default value.
+        if (gpuIsTeslaBranded(pGpu))
+        {
+            pGpu->userSharedData.pollingIntervalMs = NV_REG_STR_RM_RUSD_POLLING_INTERVAL_TESLA;
+        }
+        else if (RMCFG_FEATURE_PLATFORM_WINDOWS && IS_GSP_CLIENT(pGpu))
+        {
+            pGpu->userSharedData.pollingIntervalMs = NV_REG_STR_RM_RUSD_POLLING_INTERVAL_WINDOWS_GSP;
+        }
+        else
+        {
+            pGpu->userSharedData.pollingIntervalMs = NV_REG_STR_RM_RUSD_POLLING_INTERVAL_DEFAULT;
+        }
+    }
 }
 
 static NV_STATUS
@@ -259,11 +343,21 @@ _gpushareddataInitPollingFrequency
     //
     if (!RMCFG_FEATURE_PLATFORM_GSP && !IS_VIRTUAL(pGpu))
     {
-        if (!pGpu->userSharedData.bPollFrequencyOverridden && gpuIsTeslaBranded(pGpu))
-            pGpu->userSharedData.pollingFrequencyMs = NV_REG_STR_RM_RUSD_POLLING_INTERVAL_TESLA;
+        _gpusharedataPollingIntervalSanityCheck(pGpu);
+        if (!pGpu->userSharedData.bPollIntervalOverridden && gpuIsTeslaBranded(pGpu))
+        {
+            pGpu->userSharedData.pollingIntervalMs = NV_REG_STR_RM_RUSD_POLLING_INTERVAL_TESLA;
+        }
+
+        pGpu->userSharedData.defaultPollingIntervalMs = pGpu->userSharedData.pollingIntervalMs;
+
+        NV_PRINTF(LEVEL_INFO, "Default RUSD polling frequency: %d ms\n",
+                  pGpu->userSharedData.defaultPollingIntervalMs);
 
         params.polledDataMask = pGpu->userSharedData.lastPolledDataMask;
-        params.pollFrequencyMs = pGpu->userSharedData.pollingFrequencyMs;
+        params.pollIntervalMs = pGpu->userSharedData.pollingIntervalMs;
+
+        NV_ASSERT(pGpu->userSharedData.lastPolledDataMask == 0);
 
         NV_ASSERT_OK_OR_RETURN(
             pRmApi->Control(pRmApi, pGpu->hInternalClient,
@@ -288,6 +382,8 @@ gpuCreateRusdMemory_IMPL
     if ((sysGetStaticConfig(SYS_GET_INSTANCE()))->bOsCCEnabled)
         return NV_OK;
 
+    ct_assert(NV00DE_RUSD_POLLING_INTERVAL_MIN == NV_REG_STR_RM_RUSD_POLLING_INTERVAL_MIN);
+
     // Create a kernel-side mapping for writing RUSD data
     NV_ASSERT_OK_OR_RETURN(memdescCreate(ppMemDesc, pGpu, sizeof(NV00DE_SHARED_DATA), 0, NV_TRUE,
                            ADDR_SYSMEM, NV_MEMORY_CACHED, MEMDESC_FLAGS_USER_READ_ONLY));
@@ -304,11 +400,7 @@ gpuCreateRusdMemory_IMPL
 
     portMemSet(pGpu->userSharedData.pMapBuffer, 0, sizeof(NV00DE_SHARED_DATA));
 
-    if (IS_GSP_CLIENT(pGpu))
-    {
-       // Init system memdesc on GSP
-       _gpushareddataInitGsp(pGpu);
-    }
+    gpuRusdInitPhysical_HAL(pGpu);
 
     _gpushareddataInitPollingFrequency(pGpu);
 
@@ -338,6 +430,18 @@ gpuDestroyRusdMemory_IMPL
        _gpushareddataDestroyGsp(pGpu);
     }
 
+    if (pData->pRusdQueryCache != NULL)
+    {
+        portMemFree(pData->pRusdQueryCache);
+        pData->pRusdQueryCache = NULL;
+    }
+
+    if (pData->pRusdStaticQueryCache != NULL)
+    {
+        portMemFree(pData->pRusdStaticQueryCache);
+        pData->pRusdStaticQueryCache = NULL;
+    }
+
     NV_ASSERT(pGpu->userSharedData.pMemDesc->RefCount == 1);
 
     memdescUnmapInternal(pGpu, pData->pMemDesc, TRANSFER_FLAGS_NONE);
@@ -351,48 +455,70 @@ static NV_STATUS
 _gpushareddataSendDataPollRpc
 (
     OBJGPU *pGpu,
-    NvU64 polledDataMask
+    NvU64 polledDataMask,
+    NvU32 pollingIntervalMs
 )
 {
     NV2080_CTRL_INTERNAL_USER_SHARED_DATA_SET_DATA_POLL_PARAMS params;
     RM_API *pRmApi = GPU_GET_PHYSICAL_RMAPI(pGpu);
     NV_STATUS status;
 
-    if (polledDataMask == pGpu->userSharedData.lastPolledDataMask)
+    if (pollingIntervalMs == 0)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    NV_ASSERT(pollingIntervalMs >= NV_REG_STR_RM_RUSD_POLLING_INTERVAL_MIN);
+    NV_ASSERT(pollingIntervalMs <= pGpu->userSharedData.defaultPollingIntervalMs);
+
+    //
+    // If the registry is set, override the polling mask to all data.
+    // With the registry set, non-poll interval request should return in the below check.
+    //
+    if (pGpu->userSharedData.pollingRegistryOverride ==
+            NV_REG_STR_RM_DEBUG_RUSD_POLLING_FORCE_ENABLE)
+    {
+        polledDataMask = ~0ULL;
+    }
+
+    if (polledDataMask == pGpu->userSharedData.lastPolledDataMask &&
+        pollingIntervalMs == pGpu->userSharedData.pollingIntervalMs)
+    {
         return NV_OK; // Nothing to do
+    }
+
+    NV_PRINTF(LEVEL_INFO, "RUSD polledDataMask: 0x%llx, pollingIntervalMs: %u\n",
+              polledDataMask, pollingIntervalMs);
 
     portMemSet(&params, 0, sizeof(params));
 
     params.polledDataMask = polledDataMask;
+    params.pollIntervalMs = pollingIntervalMs;
 
     // Send updated data request to GSP
     status = pRmApi->Control(pRmApi, pGpu->hInternalClient,
                              pGpu->hInternalSubdevice,
                              NV2080_CTRL_CMD_INTERNAL_USER_SHARED_DATA_SET_DATA_POLL,
                              &params, sizeof(params));
-    NV_ASSERT_OR_RETURN((status == NV_OK) || (status == NV_ERR_GPU_IN_FULLCHIP_RESET), status);
+    NV_CHECK_OR_RETURN(LEVEL_ERROR,
+                      (status == NV_OK) || (status == NV_ERR_GPU_IN_FULLCHIP_RESET),
+                       status);
     if (status == NV_ERR_GPU_IN_FULLCHIP_RESET)
         return status;
     pGpu->userSharedData.lastPolledDataMask = polledDataMask;
+    pGpu->userSharedData.pollingIntervalMs = pollingIntervalMs;
 
     return NV_OK;
 }
 
-static NV_STATUS
-_gpushareddataRequestDataPoll
+static void _gpushareddataGetPollDataUnion
 (
-    GpuUserSharedData *pData,
-    NvU64 polledDataMask
+    OBJGPU *pGpu,
+    NvU64 *pPolledDataMask,
+    NvU32 *pPollingIntervalMs
 )
 {
-    OBJGPU *pGpu = staticCast(pData, Memory)->pGpu;
-    NvU64 polledDataUnion = 0U;
     RmClient **ppClient;
-
-    if (polledDataMask == pData->polledDataMask)
-        return NV_OK; // Nothing to do
-
-    pData->polledDataMask = polledDataMask;
 
     // Iterate over all clients to get all RUSD objects
     for (ppClient = serverutilGetFirstClientUnderLock();
@@ -408,12 +534,131 @@ _gpushareddataRequestDataPoll
             GpuUserSharedData *pIterData = dynamicCast(iter.pResourceRef->pResource, GpuUserSharedData);
             if ((pIterData != NULL) && (staticCast(pIterData, Memory)->pGpu == pGpu))
             {
-                polledDataUnion |= pIterData->polledDataMask;
+                // poll data mask is the union of mask requested by all RUSD clients
+                (*pPolledDataMask) |= pIterData->polledDataMask;
+
+                NV_ASSERT(pIterData->pollingIntervalMs >= NV_REG_STR_RM_RUSD_POLLING_INTERVAL_MIN);
+                NV_ASSERT(pIterData->pollingIntervalMs <= pGpu->userSharedData.defaultPollingIntervalMs);
+
+                // polling interval is the minimum of all RUSD clients
+                if (pIterData->pollingIntervalMs < *pPollingIntervalMs)
+                {
+                    *pPollingIntervalMs = pIterData->pollingIntervalMs;
+                }
             }
         }
     }
+}
 
-    return _gpushareddataSendDataPollRpc(pGpu, polledDataUnion);
+/*
+ * bPermanentRequest:
+ *   NV_TRUE  : if this is a permanent polling request that comes from
+ *              NV2080_CTRL_CMD_GPU_RUSD_SET_FEATURES or the kernel channel ctor/dtor
+ *   NV_FALSE : if this is NOT a permanent polling request, i.e., it's a polling
+ *              request for the RUSD clients.
+ *
+ * bPollingIntervalRequested:
+ *   NV_TRUE: if the caller requests polling intertval change.
+ *   NV_FALSE: if the caller does not request polling interval change.
+ */
+static NV_STATUS
+_handlePollMaskHelper
+(
+    OBJGPU *pGpu,
+    NvBool bPermanentRequest,
+    NvBool bPollingIntervalRequested
+)
+{
+    GPU_DB_RUSD_SETTINGS gpudbRusd = { 0 };
+    NvU64 permanentPolledDataMask = 0;
+    NvU64 polledDataMask = 0;
+    NvU32 pollingIntervalMs = pGpu->userSharedData.defaultPollingIntervalMs;
+    NV_STATUS status;
+    NvU32 originalPollingIntervalMs = pGpu->userSharedData.pollingIntervalMs;
+
+    NV_ASSERT(pollingIntervalMs != 0);
+
+    // A permanent request should never request polling interval change.
+    NV_ASSERT_OR_RETURN(!(bPermanentRequest && bPollingIntervalRequested),
+                        NV_ERR_INVALID_ARGUMENT);
+
+    // Get the permanent mask if the setting is active.
+    if (pGpu->numUserKernelChannel > 0)
+    {
+        if (gpudbGetRusdSettings(pGpu->gpuUuid.uuid, &gpudbRusd) == NV_OK)
+        {
+            NV_PRINTF(LEVEL_INFO, "RUSD permanent polled data mask: 0x%llx\n",
+                      gpudbRusd.permanentPolledDataMask);
+            permanentPolledDataMask = gpudbRusd.permanentPolledDataMask;
+        }
+    }
+
+    // Skip if the permanent request is the same as lastPolledDataMask
+    if (bPermanentRequest &&
+        (permanentPolledDataMask == pGpu->userSharedData.lastPolledDataMask))
+    {
+        return NV_OK;
+    }
+
+    // Combine with 00DE objects polling mask
+    _gpushareddataGetPollDataUnion(pGpu, &polledDataMask, &pollingIntervalMs);
+
+    polledDataMask |= permanentPolledDataMask;
+
+    //
+    // If this is not a polling interval request, the calculated polling
+    // interval should be the same as the global polling interval.
+    //
+    if (!bPollingIntervalRequested)
+    {
+        NV_ASSERT(pollingIntervalMs == pGpu->userSharedData.pollingIntervalMs);
+    }
+
+    // on failed request, global polling interval should not change
+    NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+        _gpushareddataSendDataPollRpc(pGpu, polledDataMask, pollingIntervalMs),
+        NV_ASSERT(pGpu->userSharedData.pollingIntervalMs == originalPollingIntervalMs));
+
+    return status;
+}
+
+static void
+_gpuRusdRequestPermanentDataPollCallback
+(
+    NvU32 gpuInstance,
+    void *pArgs
+)
+{
+    OBJGPU *pGpu = gpumgrGetGpu(gpuInstance);
+    
+    if (pGpu == NULL)
+        return;
+
+    NV_CHECK(LEVEL_ERROR, _handlePollMaskHelper(pGpu, NV_TRUE, NV_FALSE) == NV_OK);
+}
+
+NV_STATUS
+gpuRusdRequestPermanentDataPoll_IMPL
+(
+    OBJGPU *pGpu
+)
+{
+    NV_STATUS status;
+
+    if (!_rusdPollingSupported(pGpu))
+        return NV_ERR_NOT_SUPPORTED;
+
+    status = osQueueWorkItem(pGpu,
+                             _gpuRusdRequestPermanentDataPollCallback,
+                             NULL,
+                             (OsQueueWorkItemFlags){
+                                 .apiLock = WORKITEM_FLAGS_API_LOCK_READ_WRITE,
+                                 .bLockGpuGroupDevice = NV_TRUE});
+
+    if (status != NV_OK)
+        NV_PRINTF(LEVEL_ERROR, "Fail to queue work _gpuRusdRequestPermanentDataPollCallback\n");
+
+    return status;
 }
 
 NV_STATUS
@@ -424,15 +669,27 @@ gpushareddataCtrlCmdRequestDataPoll_IMPL
 )
 {
     OBJGPU *pGpu = staticCast(pData, Memory)->pGpu;
+    NvU64 originalPolledDataMask;
+    NV_STATUS status;
+
+    if (!_rusdPollingSupported(pGpu))
+        return NV_ERR_NOT_SUPPORTED;
 
     // Polling is always forced on, no point routing to GSP because we will never change state
     if (pGpu->userSharedData.pollingRegistryOverride == NV_REG_STR_RM_DEBUG_RUSD_POLLING_FORCE_ENABLE)
         return NV_OK;
 
-    if (!_rusdPollingSupported(pGpu) && (pParams->polledDataMask != 0U))
-        return NV_ERR_NOT_SUPPORTED;
+    if (pData->polledDataMask == pParams->polledDataMask)
+        return NV_OK;
 
-    return _gpushareddataRequestDataPoll(pData, pParams->polledDataMask);
+    originalPolledDataMask = pData->polledDataMask;
+    pData->polledDataMask = pParams->polledDataMask;
+
+    NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+        _handlePollMaskHelper(pGpu, NV_FALSE, NV_FALSE),
+        pData->polledDataMask = originalPolledDataMask; return status);
+
+    return NV_OK;
 }
 
 NV_STATUS
@@ -442,14 +699,14 @@ subdeviceCtrlCmdRusdGetSupportedFeatures_IMPL
     NV2080_CTRL_RUSD_GET_SUPPORTED_FEATURES_PARAMS *pParams
 )
 {
-    POBJGPU pGpu = GPU_RES_GET_GPU(pSubdevice);
+    OBJGPU *pGpu = GPU_RES_GET_GPU(pSubdevice);
 
     pParams->supportedFeatures = 0;
 
-    if (!IS_VIRTUAL(pGpu))
-    {
-        pParams->supportedFeatures |= RUSD_FEATURE_NON_POLLING;
-    }
+    if (!_rusdSupported(pGpu))
+        return NV_OK;
+
+    pParams->supportedFeatures |= RUSD_FEATURE_NON_POLLING;
 
     if (_rusdPollingSupported(pGpu))
     {
@@ -457,4 +714,130 @@ subdeviceCtrlCmdRusdGetSupportedFeatures_IMPL
     }
 
     return NV_OK;
+}
+
+NV_STATUS
+subdeviceCtrlCmdRusdSetFeatures_IMPL
+(
+    Subdevice *pSubdevice,
+    NV2080_CTRL_GPU_RUSD_SET_FEATURES_PARAMS *pParams
+)
+{
+    OBJGPU *pGpu = GPU_RES_GET_GPU(pSubdevice);
+    GPU_DB_RUSD_SETTINGS gpudbRusd = { 0 };
+    NV_STATUS status = NV_OK;
+
+    if (!_rusdPollingSupported(pGpu))
+        return NV_ERR_NOT_SUPPORTED;
+
+    /* 
+     * permanentPolledDataMask is saved in gpudb
+     * The permanentPolledDataMask is preserved when GPU is unbind.
+     * when GPU is rebind (same gpuId), the permanentPolledDataMask will be applied.
+     */
+    gpudbRusd.permanentPolledDataMask = pParams->permanentPolledDataMask;
+
+    status = gpudbSetRusdSettings(pGpu->gpuUuid.uuid, &gpudbRusd);
+
+    if (status == NV_OK)
+    {
+        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+            _handlePollMaskHelper(pGpu, NV_TRUE, NV_FALSE)); 
+    }
+
+    return status;
+}
+
+NV_STATUS
+gpushareddataCtrlCmdRequestPollInterval_IMPL
+(
+    GpuUserSharedData *pData,
+    NV00DE_CTRL_REQUEST_POLL_INTERVAL_PARAM *pParams
+)
+{
+    OBJGPU *pGpu = staticCast(pData, Memory)->pGpu;
+    NvU32 originalGlobalPollingIntervalMs;
+    NvU32 originalClientPollingIntervalMs;
+    NvU32 inputIntervalMs;
+    NV_STATUS status;
+
+    NV_ASSERT_OR_RETURN(pParams != NULL, NV_ERR_INVALID_ARGUMENT);
+
+    if (!_rusdPollingSupported(pGpu))
+        return NV_ERR_NOT_SUPPORTED;
+
+    inputIntervalMs = pParams->pollingIntervalMs;
+
+    // 0ms is a special value used to reset the polling interval to the default.
+    if (inputIntervalMs < NV_REG_STR_RM_RUSD_POLLING_INTERVAL_MIN && inputIntervalMs != 0)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Invalid input polling interval: %u ms\n", inputIntervalMs);
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    //
+    // If a client requests a polling interval longer than the default, we
+    // do not treat it as an error. The system's default polling is already
+    // faster, thus satisfying the client's requirement. This simplifies
+    // client logic as they don't need to know the default interval.
+    //
+    // A special case: a requested interval of 0 resets the client's
+    // override, causing it to fall back to the default polling behavior.
+    //
+    if (inputIntervalMs > pGpu->userSharedData.defaultPollingIntervalMs || inputIntervalMs == 0)
+    {
+        inputIntervalMs = pGpu->userSharedData.defaultPollingIntervalMs;
+    }
+
+    originalGlobalPollingIntervalMs = pGpu->userSharedData.pollingIntervalMs;
+    originalClientPollingIntervalMs = pData->pollingIntervalMs;
+    pData->pollingIntervalMs = inputIntervalMs;
+
+    //
+    // Requested polling interval must be valid at this point. If the requested
+    // interval is smaller than the current one, poll at the new interval.
+    //
+    if (originalGlobalPollingIntervalMs > inputIntervalMs)
+    {
+        NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+            _gpushareddataSendDataPollRpc(pGpu,
+                                          pGpu->userSharedData.lastPolledDataMask,
+                                          inputIntervalMs),
+            pData->pollingIntervalMs = originalClientPollingIntervalMs);
+
+        return status;
+    }
+
+    //
+    // If RUSD already uses a shorter interval than the requested, and the
+    // current polling interval does not come from this client, the request
+    // won't affect the global polling interval.
+    // Update the interval for this client and return.
+    //
+    if (originalGlobalPollingIntervalMs < originalClientPollingIntervalMs &&
+        originalGlobalPollingIntervalMs < inputIntervalMs)
+    {
+        return NV_OK;
+    }
+
+    // If we're already polling at the requested polling freq, nothing to do.
+    if (originalGlobalPollingIntervalMs == inputIntervalMs)
+    {
+        return NV_OK;
+    }
+
+    //
+    // The only case reaches here is when the global polling interval equals
+    // the current client specific interval. And the requested interval is longer.
+    // In this case, we'll need to iterate through the client list to find
+    // the new polling interval.
+    //
+    NV_ASSERT(originalGlobalPollingIntervalMs == originalClientPollingIntervalMs);
+    NV_ASSERT(originalGlobalPollingIntervalMs < inputIntervalMs);
+
+    NV_CHECK_OK_OR_ELSE(status, LEVEL_ERROR,
+        _handlePollMaskHelper(pGpu, NV_FALSE, NV_TRUE),
+        pData->pollingIntervalMs = originalClientPollingIntervalMs);
+
+    return status;
 }

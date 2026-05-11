@@ -204,6 +204,7 @@ void nvDbgInitRmMsg(struct OBJGPU *);
 #define NVRM_MSG_PREFIX_FUNCTION        NVBIT(2)
 #define NVRM_MSG_PREFIX_LINE            NVBIT(3)
 #define NVRM_MSG_PREFIX_OSTIMESTAMP     NVBIT(4)
+#define NVRM_MSG_PREFIX_GPU_INSTANCE    NVBIT(5)
 NvU32 RmMsgPrefix(NvU32 prefix, const char *filename, NvU32 linenumber, const char *function, char *str, NvU32 len);
 // nvDbgRmMsgCheck return code
 #define NVRM_MSG_NORMAL 0    // Use normal message handling (warnings/errors)
@@ -251,6 +252,15 @@ void nvDbgDumpBufferBytes(void *pBuffer, NvU32 length);
     portDbgPrintf(NV_PRINTF_ADD_PREFIX(fmt), ##__VA_ARGS__);            \
     NVLOG_PRINTF(NV_PRINTF_MODULE, NVLOG_ROUTE_RM, LEVEL_ERROR,         \
                  NV_PRINTF_ADD_PREFIX(fmt), ##__VA_ARGS__)
+
+#define NV_ERROR_LOG_COND(pGpu, num, fmt, ...)                          \
+    do {                                                                \
+        if ((num) != 0) {                                               \
+            NV_ERROR_LOG(pGpu, num, fmt, ##__VA_ARGS__);                \
+        } else {                                                        \
+            NV_ERROR_LOG_DATA(pGpu, num, fmt, ##__VA_ARGS__);           \
+        }                                                               \
+    } while (0)
 
 void nvErrorLog(void *pVoid, XidContext context, const char *pFormat, va_list arglist);
 void nvErrorLog_va(void * pGpu, NvU32 num, const char * pFormat, ...);

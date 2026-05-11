@@ -133,7 +133,9 @@ dispchnConstruct_IMPL
     NvHandle        hChannel;
     NvU32           dispChannelNum;
 
-    NV_ASSERT_OR_RETURN(pDispObject, NV_ERR_INVALID_OBJECT_HANDLE);
+    NvU32 prevGpuInst = gpumgrSetCurrentGpuInstance(pGpu->gpuInstance);
+
+    NV_ASSERT_TRUE_OR_GOTO(rmStatus, pDispObject != NULL, NV_ERR_INVALID_OBJECT_HANDLE, done);
 
     if (pParams->pSecInfo->privLevel < RS_PRIV_LEVEL_USER_ROOT)
     {
@@ -148,7 +150,8 @@ dispchnConstruct_IMPL
         //
         osAssertFailed();
 
-        return NV_ERR_INSUFFICIENT_PERMISSIONS;
+        rmStatus =  NV_ERR_INSUFFICIENT_PERMISSIONS;
+        goto done;
     }
 
     //
@@ -159,7 +162,8 @@ dispchnConstruct_IMPL
     if (!gpuIsClassSupported(pGpu, RES_GET_EXT_CLASS_ID(pDispChannel)))
     {
         NV_PRINTF(LEVEL_ERROR, "Unsupported class in\n");
-        return NV_ERR_INVALID_CLASS;
+        rmStatus = NV_ERR_INVALID_CLASS;
+        goto done;
     }
 
     // Move params into RM's address space
@@ -178,7 +182,7 @@ dispchnConstruct_IMPL
                                          RES_GET_EXT_CLASS_ID(pDispChannel),
                                         &internalDispChnClass);
     if (rmStatus != NV_OK)
-        return rmStatus;
+        goto done;
 
     if (internalDispChnClass == dispChnClass_Any)
     {
@@ -188,7 +192,8 @@ dispchnConstruct_IMPL
         //
         pDispChannel->DispClass        = internalDispChnClass;
         pDispChannel->InstanceNumber   = channelInstance;
-        return NV_OK;
+        rmStatus = NV_OK;
+        goto done;
     }
 
     API_GPU_FULL_POWER_SANITY_CHECK(pGpu, NV_TRUE, NV_FALSE);
@@ -205,7 +210,7 @@ dispchnConstruct_IMPL
                                             channelPBSize,
                                             subDeviceId);
         if (rmStatus != NV_OK)
-           return rmStatus;
+           goto done;
     }
     SLI_LOOP_END
 
@@ -223,7 +228,7 @@ dispchnConstruct_IMPL
                   "disp channel[0x%x] alloc failed. Return status = 0x%x\n",
                   channelInstance, rmStatus);
 
-        return rmStatus;
+        goto done;
     }
 
     // Channel allocation is successful, initialize new channel's data structures
@@ -255,7 +260,7 @@ dispchnConstruct_IMPL
         if (rmStatus != NV_OK)
         {
             NV_PRINTF(LEVEL_ERROR, "kdispGetChannelNum_HAL failed!\n");
-            return rmStatus;
+            goto done;
         }
 
         pKernelDisplay->pClientChannelTable[dispChannelNum].pClient = pClient;
@@ -265,6 +270,9 @@ dispchnConstruct_IMPL
         NV_PRINTF(LEVEL_INFO, "Mapped hclient: %p hchannel: 0x%x channleNum: 0x%x\n",
                                 pClient, hChannel, dispChannelNum);
     }
+
+done:
+    gpumgrSetCurrentGpuInstance(prevGpuInst);
 
     return rmStatus;
 }

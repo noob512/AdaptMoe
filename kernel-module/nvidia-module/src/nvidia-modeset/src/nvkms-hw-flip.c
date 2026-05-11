@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2014 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2014-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -250,7 +250,11 @@ NvBool nvIsLayerDirty(const struct NvKmsFlipCommonParams *pParams,
            pParams->layer[layer].csc.specified ||
            pParams->layer[layer].hdr.specified ||
            pParams->layer[layer].colorSpace.specified ||
-           pParams->layer[layer].tf.specified;
+           pParams->layer[layer].tf.specified ||
+           pParams->layer[layer].csc00Override.specified ||
+           pParams->layer[layer].csc01Override.specified ||
+           pParams->layer[layer].csc10Override.specified ||
+           pParams->layer[layer].csc11Override.specified;
 }
 
 /*!
@@ -261,7 +265,6 @@ NvBool nvIsLayerDirty(const struct NvKmsFlipCommonParams *pParams,
  */
 static NvBool FlipRequiresNonTearingMode(
     const NVDevEvoRec *pDevEvo,
-    const NvU32 head,
     const NVFlipChannelEvoHwState *pOld,
     const NVFlipChannelEvoHwState *pNew)
 {
@@ -350,7 +353,7 @@ static NvBool ApplyBaseFlipOverrides(
         pNew->tearing = FALSE;
     } else {
         // Force non-tearing mode if EVO requires it.
-        if (FlipRequiresNonTearingMode(pDevEvo, head, pOld, pNew)) {
+        if (FlipRequiresNonTearingMode(pDevEvo, pOld, pNew)) {
             pNew->tearing = FALSE;
         }
     }
@@ -1106,10 +1109,7 @@ static NvBool UpdateMainLayerFlipEvoHwState(
      * not computed until later, when nvEvoSetLut() and nvEvoSetLUTContextDma()
      * are called. See bug 4054546.
      */
-    if ((pParams->lut.input.specified ||
-        pParams->lut.output.specified) &&
-        !pDevEvo->hal->caps.supportsCoreLut) {
-
+    if (pParams->lut.input.specified || pParams->lut.output.specified) {
         pHwState->tearing = FALSE;
     }
 
@@ -1489,19 +1489,18 @@ ValidateLayerLutHwState(const NVDevEvoRec *pDevEvo,
     }
 
     /* Surface format validation is handled in UpdateFlipLutHwState */
-    if (pDevEvo->hal->caps.needDefaultLutSurface &&
-        pHwState->pSurfaceEvo[NVKMS_LEFT] != NULL) {
+    if (pHwState->pSurfaceEvo[NVKMS_LEFT] != NULL) {
+        const enum NvKmsSurfaceMemoryFormat surfaceFormat =
+            pHwState->pSurfaceEvo[NVKMS_LEFT]->format;
+
         /*
-         * needDefaultLutSurface corresponds to the Turing+ case where the ILUT
-         * must convert to FP16. When it is set, the ILUT must be set if the
-         * surface is not in FP16 and the ILUT must not be set if the surface
-         * is in FP16. However, we only validate the second case because the
-         * first is handled internally be using the default ILUT.
+         * The ILUT must be set if the surface is not in FP16 and the ILUT must
+         * not be set if the surface is in FP16. However, we only validate the
+         * second case because the first is handled internally be using the
+         * default ILUT.
          */
-        if ((pHwState->pSurfaceEvo[NVKMS_LEFT]->format ==
-                NvKmsSurfaceMemoryFormatRF16GF16BF16XF16) ||
-            (pHwState->pSurfaceEvo[NVKMS_LEFT]->format ==
-                NvKmsSurfaceMemoryFormatRF16GF16BF16AF16)) {
+        if (surfaceFormat == NvKmsSurfaceMemoryFormatRF16GF16BF16XF16 ||
+            surfaceFormat == NvKmsSurfaceMemoryFormatRF16GF16BF16AF16) {
             /*
              * If the layer's surface format is FP16, the ILUT must not be
              * enabled.
@@ -1510,15 +1509,11 @@ ValidateLayerLutHwState(const NVDevEvoRec *pDevEvo,
                 (pHwState->tf != NVKMS_INPUT_TF_LINEAR)) {
                 return FALSE;
             }
-        }
-    }
-
-    if (pHwState->pSurfaceEvo[NVKMS_LEFT] &&
-        pHwState->pSurfaceEvo[NVKMS_LEFT]->format == NvKmsSurfaceMemoryFormatI8) {
-
-        /* If the layer's surface format is I8, the ILUT must be enabled. */
-        if (pHwState->inputLut.pLutSurfaceEvo == NULL) {
-            return FALSE;
+        } else if (surfaceFormat == NvKmsSurfaceMemoryFormatI8) {
+            /* If the layer's surface format is I8, the ILUT must be enabled. */
+            if (pHwState->inputLut.pLutSurfaceEvo == NULL) {
+                return FALSE;
+            }
         }
     }
 
@@ -1717,14 +1712,16 @@ ValidateColorspace(const NVDevEvoRec *pDevEvo,
                    const NVFlipEvoHwState *pFlipState,
                    NvU32 layer)
 {
+    NVSurfaceEvoPtr pSurfaceEvo =
+        pFlipState->layer[layer].pSurfaceEvo[NVKMS_LEFT];
+    if (pSurfaceEvo == NULL) {
+        return TRUE;
+    }
+
     if ((pFlipState->layer[layer].colorSpace !=
          NVKMS_INPUT_COLOR_SPACE_NONE)) {
-
-        NVSurfaceEvoPtr pSurfaceEvo =
-            pFlipState->layer[layer].pSurfaceEvo[NVKMS_LEFT];
         const NvKmsSurfaceMemoryFormatInfo *pFormatInfo =
-            (pSurfaceEvo != NULL) ?
-                nvKmsGetSurfaceMemoryFormatInfo(pSurfaceEvo->format) : NULL;
+                nvKmsGetSurfaceMemoryFormatInfo(pSurfaceEvo->format);
 
         if (pFormatInfo == NULL) {
             return FALSE;
@@ -2177,10 +2174,8 @@ void nvFlipEvoOneHead(
                                          pFlipState->layer[layer].outputPosition.x,
                                          pFlipState->layer[layer].outputPosition.y);
 
-            if (pDevEvo->hal->caps.supportsSynchronizedOverlayPositionUpdate) {
-                UpdateWinImmInterlockState(pDevEvo, updateState,
-                                           pDevEvo->head[head].layer[layer]);
-            }
+            UpdateWinImmInterlockState(pDevEvo, updateState,
+                                       pDevEvo->head[head].layer[layer]);
         }
 
         /* Inform DIFR about the upcoming flip. */
@@ -2475,99 +2470,34 @@ NvBool nvAllocatePreFlipBandwidth(NVDevEvoPtr pDevEvo,
 }
 
 /*!
- * If the satellite channel is active then pre-NVDisplay hardware does not allow
- * to change its usage bounds in non-interlock update. The nvSetUsageBoundsEvo()
- * code path for pre-NVDisplay hardware, interlocks the satellite channels with
- * the usage bounds update. This makes it essential to poll for
- * NO_METHOD_PENDING state of the satellite channels, otherwise blocking
- * pre-flip IMP update will also get stuck.
- *
- * It is not possible to interlock flip-locked satellite channels with the core
- * channel usage bounds update; in that case, reject the flip.  Do not allow
- * client to make any change in surface usage bounds parameters without
- * deactivating channel first, if channel is flip-locked.
+ * Compute the usage bounds union of the current display configuration and the
+ * requested new configuration.
  */
-static NvBool PrepareToDoPreFlipIMP(NVDevEvoPtr pDevEvo,
+static void PrepareToDoPreFlipIMP(NVDevEvoPtr pDevEvo,
                                     struct NvKmsFlipWorkArea *pWorkArea)
 {
-    NvU64 startTime = 0;
-    NvU32 timeout = 2000000; /* 2 seconds */
     NvU32 sd;
 
     for (sd = 0; sd < pDevEvo->numSubDevices; sd++) {
-        NVEvoSubDevPtr pEvoSubDev = &pDevEvo->gpus[sd];
         NvU32 head;
 
         for (head = 0; head < pDevEvo->numHeads; head++) {
-            NVEvoHeadControlPtr pHC =
-                &pEvoSubDev->headControl[head];
             const NVEvoSubDevHeadStateRec *pCurrentFlipState =
                 &pDevEvo->gpus[sd].headState[head];
-            const NVSurfaceEvoRec *pCurrentBaseSurf =
-                pCurrentFlipState->layer[NVKMS_MAIN_LAYER].pSurfaceEvo[NVKMS_LEFT];
             const struct NvKmsUsageBounds *pCurrentUsage =
                 &pCurrentFlipState->usage;
 
             NVFlipEvoHwState *pNewFlipState =
                 &pWorkArea->sd[sd].head[head].newState;
-            const NVSurfaceEvoRec *pNewBaseSurf =
-                pNewFlipState->layer[NVKMS_MAIN_LAYER].pSurfaceEvo[NVKMS_LEFT];
             struct NvKmsUsageBounds *pNewUsage =
                 &pNewFlipState->usage;
 
             struct NvKmsUsageBounds *pPreFlipUsage =
                 &pWorkArea->sd[sd].head[head].preFlipUsage;
 
-            NvU32 layer;
-
             nvUnionUsageBounds(pNewUsage, pCurrentUsage, pPreFlipUsage);
-
-            if (pDevEvo->hal->caps.supportsNonInterlockedUsageBoundsUpdate) {
-                /*
-                 * NVDisplay does not interlock the satellite channel
-                 * with its usage bounds update.
-                 */
-                continue;
-            }
-
-            /*
-             * If head is flip-locked then do not change usage
-             * bounds while base channel is active.
-             */
-            if (pHC->flipLock &&
-                 /* If the base channel is active before and after flip then
-                  * current and new base usage bounds should be same. */
-                ((pNewBaseSurf != NULL &&
-                  pCurrentBaseSurf != NULL &&
-                  !nvEvoLayerUsageBoundsEqual(pCurrentUsage,
-                                              pNewUsage, NVKMS_MAIN_LAYER)) ||
-                  /* If the base channel is active before flip then current and
-                   * preflip base usage bounds should be same. */
-                 (pCurrentBaseSurf != NULL &&
-                  !nvEvoLayerUsageBoundsEqual(pCurrentUsage,
-                                              pPreFlipUsage, NVKMS_MAIN_LAYER)))) {
-                return FALSE;
-            }
-
-            /*
-             * Poll for NO_METHOD_PENDING state if usage
-             * bounds of the channel are changed.
-             */
-            for (layer = 0; layer < pDevEvo->head[head].numLayers; layer++) {
-                if (!nvEvoLayerUsageBoundsEqual(pCurrentUsage,
-                                                pPreFlipUsage, layer) &&
-                    !nvEvoPollForNoMethodPending(pDevEvo,
-                                                 sd,
-                                                 pDevEvo->head[head].layer[layer],
-                                                 &startTime,
-                                                 timeout)) {
-                    return FALSE;
-                }
-            }
         }
     }
-
-    return TRUE;
 }
 
 /*!
@@ -3019,8 +2949,7 @@ void nvPreFlip(NVDevEvoRec *pDevEvo,
 void nvPostFlip(NVDevEvoRec *pDevEvo,
                 struct NvKmsFlipWorkArea *pWorkArea,
                 const NvBool skipUpdate,
-                const NvU32 applyAllowVrrApiHeadMasks[NVKMS_MAX_SUBDEVICES],
-                NvS32 *pVrrSemaphoreIndex)
+                const NvU32 applyAllowVrrApiHeadMasks[NVKMS_MAX_SUBDEVICES])
 {
     NvU32 sd, head;
 
@@ -3031,12 +2960,13 @@ void nvPostFlip(NVDevEvoRec *pDevEvo,
                               pWorkArea);
     }
 
-    for (sd = 0; sd < pDevEvo->numSubDevices; sd++) {
-        if (applyAllowVrrApiHeadMasks[sd] > 0) {
-            *pVrrSemaphoreIndex = nvIncVrrSemaphoreIndex(pDevEvo, applyAllowVrrApiHeadMasks);
-            break;
-        }
-    }
+    // If there are pending unstall timers (e.g. triggered by cursor motion),
+    // cancel them now. The flip that was just requested will trigger an
+    // unstall.
+    // NOTE: This call will not cancel the frame release timer in
+    // the case where there is a vrr active head that is pending cursor motion
+    // and not currently flipping, since we need to wait for the timer for that head
+    nvCancelVrrFrameReleaseTimers(pDevEvo, applyAllowVrrApiHeadMasks);
 
     for (sd = 0; sd < pDevEvo->numSubDevices; sd++) {
         if (!pWorkArea->sd[sd].changed) {
@@ -3162,10 +3092,7 @@ NvBool nvPrepareToDoPreFlip(NVDevEvoRec *pDevEvo,
         return FALSE;
     }
 
-    if (!PrepareToDoPreFlipIMP(pDevEvo, pWorkArea)) {
-        return FALSE;
-    }
-
+    PrepareToDoPreFlipIMP(pDevEvo, pWorkArea);
     return TRUE;
 }
 

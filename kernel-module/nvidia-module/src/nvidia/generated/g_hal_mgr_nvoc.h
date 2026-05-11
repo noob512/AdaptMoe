@@ -82,7 +82,7 @@ struct OBJHALMGR {
     struct OBJHALMGR *__nvoc_pbase_OBJHALMGR;    // halmgr
 
     // Data members
-    struct OBJHAL *pHalList[79];
+    struct OBJHAL *pHalList[81];
 };
 
 
@@ -92,13 +92,9 @@ struct NVOC_METADATA__OBJHALMGR {
     const struct NVOC_METADATA__Object metadata__Object;
 };
 
-#ifndef __NVOC_CLASS_OBJHALMGR_TYPEDEF__
-#define __NVOC_CLASS_OBJHALMGR_TYPEDEF__
-typedef struct OBJHALMGR OBJHALMGR;
-#endif /* __NVOC_CLASS_OBJHALMGR_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_OBJHALMGR
-#define __nvoc_class_id_OBJHALMGR 0xbf26de
+#define __nvoc_class_id_OBJHALMGR 0xbf26deu
+typedef struct OBJHALMGR OBJHALMGR;
 #endif /* __nvoc_class_id_OBJHALMGR */
 
 // Casting support
@@ -117,52 +113,57 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_OBJHALMGR;
 NV_STATUS __nvoc_objCreateDynamic_OBJHALMGR(OBJHALMGR**, Dynamic*, NvU32, va_list);
 
 NV_STATUS __nvoc_objCreate_OBJHALMGR(OBJHALMGR**, Dynamic*, NvU32);
-#define __objCreate_OBJHALMGR(ppNewObj, pParent, createFlags) \
-    __nvoc_objCreate_OBJHALMGR((ppNewObj), staticCast((pParent), Dynamic), (createFlags))
+#define __objCreate_OBJHALMGR(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags) \
+    __nvoc_objCreate_OBJHALMGR((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags))
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS halmgrConstruct_IMPL(struct OBJHALMGR *arg_this);
+#define __nvoc_halmgrConstruct(arg_this) halmgrConstruct_IMPL(arg_this)
 
-// Dispatch functions
-NV_STATUS halmgrConstruct_IMPL(struct OBJHALMGR *arg_);
+void halmgrDestruct_IMPL(struct OBJHALMGR *arg_this);
+#define __nvoc_halmgrDestruct(arg_this) halmgrDestruct_IMPL(arg_this)
 
-#define __nvoc_halmgrConstruct(arg_) halmgrConstruct_IMPL(arg_)
-void halmgrDestruct_IMPL(struct OBJHALMGR *arg1);
-
-#define __nvoc_halmgrDestruct(arg1) halmgrDestruct_IMPL(arg1)
-NV_STATUS halmgrCreateHal_IMPL(struct OBJHALMGR *arg1, NvU32 arg2);
-
+NV_STATUS halmgrCreateHal_IMPL(struct OBJHALMGR *arg_this, NvU32 arg2);
 #ifdef __nvoc_hal_mgr_h_disabled
-static inline NV_STATUS halmgrCreateHal(struct OBJHALMGR *arg1, NvU32 arg2) {
+static inline NV_STATUS halmgrCreateHal(struct OBJHALMGR *arg_this, NvU32 arg2) {
     NV_ASSERT_FAILED_PRECOMP("OBJHALMGR was disabled!");
     return NV_ERR_NOT_SUPPORTED;
 }
-#else //__nvoc_hal_mgr_h_disabled
-#define halmgrCreateHal(arg1, arg2) halmgrCreateHal_IMPL(arg1, arg2)
-#endif //__nvoc_hal_mgr_h_disabled
+#else // __nvoc_hal_mgr_h_disabled
+#define halmgrCreateHal(arg_this, arg2) halmgrCreateHal_IMPL(arg_this, arg2)
+#endif // __nvoc_hal_mgr_h_disabled
 
-NV_STATUS halmgrGetHalForGpu_IMPL(struct OBJHALMGR *arg1, NvU32 arg2, NvU32 arg3, NvU32 *arg4);
-
+NV_STATUS halmgrGetHalForGpu_IMPL(struct OBJHALMGR *arg_this, NvU32 arg2, NvU32 arg3, NvU32 *arg4);
 #ifdef __nvoc_hal_mgr_h_disabled
-static inline NV_STATUS halmgrGetHalForGpu(struct OBJHALMGR *arg1, NvU32 arg2, NvU32 arg3, NvU32 *arg4) {
+static inline NV_STATUS halmgrGetHalForGpu(struct OBJHALMGR *arg_this, NvU32 arg2, NvU32 arg3, NvU32 *arg4) {
     NV_ASSERT_FAILED_PRECOMP("OBJHALMGR was disabled!");
     return NV_ERR_NOT_SUPPORTED;
 }
-#else //__nvoc_hal_mgr_h_disabled
-#define halmgrGetHalForGpu(arg1, arg2, arg3, arg4) halmgrGetHalForGpu_IMPL(arg1, arg2, arg3, arg4)
-#endif //__nvoc_hal_mgr_h_disabled
+#else // __nvoc_hal_mgr_h_disabled
+#define halmgrGetHalForGpu(arg_this, arg2, arg3, arg4) halmgrGetHalForGpu_IMPL(arg_this, arg2, arg3, arg4)
+#endif // __nvoc_hal_mgr_h_disabled
 
-struct OBJHAL *halmgrGetHal_IMPL(struct OBJHALMGR *arg1, NvU32 arg2);
-
+struct OBJHAL * halmgrGetHal_IMPL(struct OBJHALMGR *arg_this, NvU32 arg2);
 #ifdef __nvoc_hal_mgr_h_disabled
-static inline struct OBJHAL *halmgrGetHal(struct OBJHALMGR *arg1, NvU32 arg2) {
+static inline struct OBJHAL * halmgrGetHal(struct OBJHALMGR *arg_this, NvU32 arg2) {
     NV_ASSERT_FAILED_PRECOMP("OBJHALMGR was disabled!");
     return NULL;
 }
-#else //__nvoc_hal_mgr_h_disabled
-#define halmgrGetHal(arg1, arg2) halmgrGetHal_IMPL(arg1, arg2)
-#endif //__nvoc_hal_mgr_h_disabled
+#else // __nvoc_hal_mgr_h_disabled
+#define halmgrGetHal(arg_this, arg2) halmgrGetHal_IMPL(arg_this, arg2)
+#endif // __nvoc_hal_mgr_h_disabled
 
+
+// Wrapper macros for halified functions
+
+// Dispatch functions
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

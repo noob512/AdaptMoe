@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -70,7 +70,8 @@ memmgrGetMemTransferType
     KernelBus    *pKernelBus          = GPU_GET_KERNEL_BUS(pGpu);
 
     if ((pDst == NULL || memdescGetAddressSpace(pDst->pMemDesc) == ADDR_SYSMEM) &&
-        (pSrc == NULL || memdescGetAddressSpace(pSrc->pMemDesc) == ADDR_SYSMEM))
+        (pSrc == NULL || memdescGetAddressSpace(pSrc->pMemDesc) == ADDR_SYSMEM) &&
+        !RMCFG_FEATURE_PLATFORM_GSP)
     {
         //
         // If the operation only touches sysmem, use processor copy
@@ -79,7 +80,7 @@ memmgrGetMemTransferType
     }
     else if (flags & TRANSFER_FLAGS_PREFER_CE)
     {
-        if (IS_SIMULATION(pGpu) && pSrc != NULL)
+        if (IS_SIMULATION(pGpu) && pSrc != NULL && !KBUS_BAR0_PRAMIN_DISABLED(pGpu))
         {
             //
             // This is significantly faster on fmodel for S/R (5min vs. 5sec) because of the
@@ -195,7 +196,7 @@ _memmgrUnmapAndFreeSurface
     void              *pPriv
 )
 {
-    memdescUnmapOld(pMemDesc, NV_TRUE, 0, pMap, pPriv);
+    memdescUnmapOld(pMemDesc, NV_TRUE, pMap, pPriv);
 
     memdescFree(pMemDesc);
     memdescDestroy(pMemDesc);
@@ -417,7 +418,7 @@ _memmgrMemcpyWithGsp
         }
 
         // Be sure to unmap memory before potentially taking cleanup path
-        memdescUnmapOld(pSrc->pMemDesc, NV_TRUE, 0, (void*)pMap, pPriv);
+        memdescUnmapOld(pSrc->pMemDesc, NV_TRUE, (void*)pMap, pPriv);
         NV_ASSERT_OK_OR_GOTO(status, status, failed);
 
         // Source surface in unprotected sysmem
@@ -503,7 +504,7 @@ _memmgrMemcpyWithGsp
         }
 
         // Be sure to unmap memory before potentially taking cleanup path
-        memdescUnmapOld(pDst->pMemDesc, NV_TRUE, 0, (void*)pMap, pPriv);
+        memdescUnmapOld(pDst->pMemDesc, NV_TRUE, (void*)pMap, pPriv);
         NV_ASSERT_OK_OR_GOTO(status, status, failed);
     }
 
@@ -960,7 +961,6 @@ void memUtilsInitFBAllocInfo
     pFbAllocInfo->comprCovg         = pAllocParams->comprCovg;
     pFbAllocInfo->zcullCovg         = 0;
     pFbAllocInfo->ctagOffset        = pAllocParams->ctagOffset;
-    pFbAllocInfo->bIsKernelAlloc    = NV_FALSE;
     pFbAllocInfo->internalflags     = 0;
     pFbAllocInfo->hClient           = hClient;
     pFbAllocInfo->hDevice           = hDevice;
@@ -1169,6 +1169,16 @@ memmgrMemReadOrWriteInBlocks
         {
             NV_ASSERT_OK_OR_RETURN(
                 memdescCreateSubMem(&pSubMemDesc, pMemDesc, pMemDesc->pGpu, offset + baseOffset, copySize));
+
+            if (memdescGetPageSize(pSubMemDesc, AT_GPU) > RM_PAGE_SIZE_HUGE)
+            {
+                //
+                // Downgrade page size if more than 2MB because BAR2
+                // cannot handle massive page sizes in the copy
+                //
+                memdescSetPageSize(pSubMemDesc, AT_GPU, RM_PAGE_SIZE_HUGE);
+            }
+
             tmpSurf.pMemDesc = pSubMemDesc;
             tmpSurf.offset = 0;
         }
@@ -1384,7 +1394,7 @@ memmgrMemEndTransfer_IMPL
         case TRANSFER_TYPE_PROCESSOR:
             if (flags & TRANSFER_FLAGS_USE_BAR1)
             {
-                memdescUnmap(pMemDesc, NV_TRUE, 0, pTransferInfo->pMapping, pTransferInfo->pMappingPriv);
+                memdescUnmap(pMemDesc, NV_TRUE, pTransferInfo->pMapping, pTransferInfo->pMappingPriv);
             }
             else
             {
@@ -1531,64 +1541,67 @@ memmgrAllocResources_IMPL
         pFbAllocInfo->retAttr = FLD_SET_DRF(OS32, _ATTR, _LOCATION, _ANY, pFbAllocInfo->retAttr);
     }
 
-    // Fetch RM page size
-    pageSize = memmgrDeterminePageSize(pMemoryManager, pFbAllocInfo->hClient, pFbAllocInfo->size,
-                                       pFbAllocInfo->format, pFbAllocInfo->pageFormat->flags,
-                                       &pFbAllocInfo->retAttr, &pFbAllocInfo->retAttr2);
-    if (!IsAMODEL(pGpu) && pageSize == 0)
+    if (!pGpu->getProperty(pGpu, PDB_PROP_GPU_TEGRA_SOC_NVDISPLAY))
     {
-        status = NV_ERR_INVALID_STATE;
-        NV_PRINTF(LEVEL_ERROR, "memmgrDeterminePageSize failed, status: 0x%x\n", status);
-        goto failed;
-    }
+        // Fetch RM page size
+        pageSize = memmgrDeterminePageSize(pMemoryManager, pFbAllocInfo->hClient, pFbAllocInfo->size,
+                                           pFbAllocInfo->format, pFbAllocInfo->pageFormat->flags,
+                                           &pFbAllocInfo->retAttr, &pFbAllocInfo->retAttr2);
+        if (!IsAMODEL(pGpu) && pageSize == 0)
+        {
+            status = NV_ERR_INVALID_STATE;
+            NV_PRINTF(LEVEL_ERROR, "memmgrDeterminePageSize failed, status: 0x%x\n", status);
+            goto failed;
+        }
 
-    // Fetch memory alignment
-    status = memmgrAllocDetermineAlignment_HAL(pGpu, pMemoryManager, &pFbAllocInfo->size, &pFbAllocInfo->align,
-                                               pFbAllocInfo->alignPad, pFbAllocInfo->pageFormat->flags,
-                                               pFbAllocInfo->retAttr, pFbAllocInfo->retAttr2, 0);
-    if (status != NV_OK)
-    {
-        NV_PRINTF(LEVEL_ERROR, "memmgrAllocDetermineAlignment failed, status: 0x%x\n", status);
-        goto failed;
-    }
+        // Fetch memory alignment
+        status = memmgrAllocDetermineAlignment_HAL(pGpu, pMemoryManager, &pFbAllocInfo->size, &pFbAllocInfo->align,
+                                                   pFbAllocInfo->alignPad, pFbAllocInfo->pageFormat->flags,
+                                                   pFbAllocInfo->retAttr, pFbAllocInfo->retAttr2, 0);
+        if (status != NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR, "memmgrAllocDetermineAlignment failed, status: 0x%x\n", status);
+            goto failed;
+        }
 
-    //
-    // Call into HAL to reserve any hardware resources for
-    // the specified memory pVidHeapAlloc->type.
-    // If the alignment was changed due to a HW limitation, and the
-    // flag NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE is set, bad_argument
-    // will be passed back from the HAL
-    //
-    status = memmgrAllocHwResources(pGpu, pMemoryManager, pFbAllocInfo);
-    bAllocedHwRes = NV_TRUE;
-
-    pVidHeapAlloc->attr  = pFbAllocInfo->retAttr;
-    pVidHeapAlloc->attr2 = pFbAllocInfo->retAttr2;
-    pVidHeapAlloc->format = pFbAllocInfo->format;
-    pVidHeapAlloc->comprCovg = pFbAllocInfo->comprCovg;
-    pVidHeapAlloc->zcullCovg = pFbAllocInfo->zcullCovg;
-
-    if (status != NV_OK)
-    {
         //
-        // probably means we passed in a bogus pVidHeapAlloc->type or no tiling resources available
-        // when tiled memory attribute was set to REQUIRED
+        // Call into HAL to reserve any hardware resources for
+        // the specified memory pVidHeapAlloc->type.
+        // If the alignment was changed due to a HW limitation, and the
+        // flag NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE is set, bad_argument
+        // will be passed back from the HAL
         //
-        NV_PRINTF(LEVEL_ERROR, "fbAlloc failure!\n");
-        goto failed;
-    }
+        status = memmgrAllocHwResources(pGpu, pMemoryManager, pFbAllocInfo);
+        bAllocedHwRes = NV_TRUE;
 
-    // call HAL to set resources
-    status = memmgrSetAllocParameters_HAL(pGpu, pMemoryManager, pFbAllocInfo);
+        pVidHeapAlloc->attr  = pFbAllocInfo->retAttr;
+        pVidHeapAlloc->attr2 = pFbAllocInfo->retAttr2;
+        pVidHeapAlloc->format = pFbAllocInfo->format;
+        pVidHeapAlloc->comprCovg = pFbAllocInfo->comprCovg;
+        pVidHeapAlloc->zcullCovg = pFbAllocInfo->zcullCovg;
 
-    if (status != NV_OK)
-    {
-        //
-        // Two possibilties: either some attribute was set to REQUIRED, ran out of resources,
-        // or unaligned address / size was passed down. Free up memory and fail this call.
-        // heapFree will fix up heap pointers.
-        //
-        goto failed;
+        if (status != NV_OK)
+        {
+            //
+            // probably means we passed in a bogus pVidHeapAlloc->type or no tiling resources available
+            // when tiled memory attribute was set to REQUIRED
+            //
+            NV_PRINTF(LEVEL_ERROR, "fbAlloc failure!\n");
+            goto failed;
+        }
+
+        // call HAL to set resources
+        status = memmgrSetAllocParameters_HAL(pGpu, pMemoryManager, pFbAllocInfo);
+
+        if (status != NV_OK)
+        {
+            //
+            // Two possibilties: either some attribute was set to REQUIRED, ran out of resources,
+            // or unaligned address / size was passed down. Free up memory and fail this call.
+            // heapFree will fix up heap pointers.
+            //
+            goto failed;
+        }
     }
 
     //
@@ -1690,9 +1703,17 @@ memUtilsAllocMemDesc
     {
         NvU64 memDescFlags = MEMDESC_FLAGS_SKIP_RESOURCE_COMPUTE;
 
-        if (FLD_TEST_DRF(OS32, _ATTR2, _USE_EGM, _TRUE, pFbAllocInfo->retAttr2))
+        if (pGpu->getProperty(pGpu, PDB_PROP_GPU_IS_SOC_SDM))
         {
-            memDescFlags |= MEMDESC_FLAGS_ALLOC_FROM_EGM;
+            if (FLD_TEST_DRF(OS32, _ATTR2, _USE_SCANOUT_CARVEOUT, _TRUE, pFbAllocInfo->retAttr2))
+            {
+                memDescFlags |= MEMDESC_FLAGS_ALLOC_FROM_SCANOUT_CARVEOUT;
+            }
+            if (pGpu->getProperty(pGpu, PDB_PROP_GPU_ALLOC_ISO_SYS_MEM_FROM_CARVEOUT) &&
+                    FLD_TEST_DRF(OS32, _ATTR2, _ISO, _YES, pFbAllocInfo->retAttr2))
+            {
+                memDescFlags |= MEMDESC_FLAGS_ALLOC_FROM_SCANOUT_CARVEOUT;
+            }
         }
 
         //
@@ -1770,7 +1791,7 @@ memUtilsMemSetNoBAR2(OBJGPU *pGpu, PMEMORY_DESCRIPTOR pMemDesc, NvU8 value)
             // saving off the location to where the BAR0 window was
             // previously pointing.
             //
-            physAddr = memdescGetPhysAddr(pMemDesc, AT_GPU, 0);
+            physAddr = memdescGetPtePhysAddr(pMemDesc, AT_GPU, 0);
             NV_ASSERT((physAddr & (sizeOfDWord-1)) == 0);
 
             physAddrOrig = kbusGetBAR0WindowVidOffset_HAL(pGpu, pKernelBus);
@@ -1812,7 +1833,7 @@ memUtilsMemSetNoBAR2(OBJGPU *pGpu, PMEMORY_DESCRIPTOR pMemDesc, NvU8 value)
                               (void **)&pMap,
                               &pPriv));
             portMemSet(pMap, value, NvU64_LO32(pMemDesc->Size));
-            memdescUnmapOld(pMemDesc, 1, 0, pMap, pPriv);
+            memdescUnmapOld(pMemDesc, 1, pMap, pPriv);
             break;
 
         default:

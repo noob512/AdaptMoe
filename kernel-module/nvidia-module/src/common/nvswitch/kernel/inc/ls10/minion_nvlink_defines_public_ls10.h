@@ -44,6 +44,7 @@ typedef enum _MINION_STATUS
   {
     MINION_OK                                           =  0,
     MINION_ALARM_BUSY                                   = 80,
+    MINION_INBAND_BUFFER_BUSY                           = 89,
 } MINION_STATUS;
 
   #define LINKSTATUS_RESET                      0x0

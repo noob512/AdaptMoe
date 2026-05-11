@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2006-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2006-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -451,6 +451,26 @@
 #define NV_REG_ENABLE_USER_NUMA_MANAGEMENT NV_REG_STRING(__NV_ENABLE_USER_NUMA_MANAGEMENT)
 
 /*
+ * Option: CoherentGPUMemoryMode
+ *
+ * Description:
+ *
+ * This option can be set to control how GPU Memory is accessed through
+ * the coherent link. 
+ *
+ * This option has no effect on platforms that do not support onlining
+ * device memory to a NUMA node.
+ *
+ * Possible string values:
+ *
+ *  "driver" : disable onlining coherent memory to the OS as a NUMA node. The driver
+ *             will manage it in this case
+ *  "numa" (or unset) : enable onlining coherent memory to the OS as a NUMA node (default)
+ */
+#define __NV_COHERENT_GPU_MEMORY_MODE CoherentGPUMemoryMode
+#define NV_REG_COHERENT_GPU_MEMORY_MODE NV_REG_STRING(__NV_COHERENT_GPU_MEMORY_MODE)
+
+/*
  * Option: GpuBlacklist
  *
  * Description:
@@ -476,6 +496,22 @@
  */
 #define __NV_EXCLUDED_GPUS ExcludedGpus
 #define NV_REG_EXCLUDED_GPUS NV_REG_STRING(__NV_EXCLUDED_GPUS)
+
+/*
+ * Option: NVreg_ExcludeAllGpus
+ *
+ * Description:
+ *
+ * This option allows the user to exclude all GPUs. If used in conjunction with
+ * UUID based GPU exclusion, all GPUs will be excluded
+ *
+ * Possible values:
+ * 1 - Excludes all GPUs from being attached or used
+ * 0 - No effect (default)
+ */
+ #define __NV_EXCLUDE_ALL_GPUS ExcludeAllGpus
+ #define NV_EXCLUDE_ALL_GPUS NV_REG_STRING(__NV_EXCLUDE_ALL_GPUS)
+ #define NV_EXCLUDE_ALL_GPUS_DEFAULT 0
 
 /*
  * Option: NvLinkDisable
@@ -538,12 +574,35 @@
  *
  * Possible Values:
  *
- *  0: Preserve only select video memory allocations (default)
+ *  0: Preserve only select video memory allocations
  *  1: Preserve all video memory allocations
+ *  2: Automatically enable video memory allocations when
+ *     NVreg_UseKernelSuspendNotifiers is enabled (default)
  */
 #define __NV_PRESERVE_VIDEO_MEMORY_ALLOCATIONS PreserveVideoMemoryAllocations
 #define NV_REG_PRESERVE_VIDEO_MEMORY_ALLOCATIONS \
     NV_REG_STRING(__NV_PRESERVE_VIDEO_MEMORY_ALLOCATIONS)
+
+#define NV_REG_PRESERVE_VIDEO_MEMORY_ALLOCATIONS_DISABLED    0
+#define NV_REG_PRESERVE_VIDEO_MEMORY_ALLOCATIONS_ENABLED     1
+#define NV_REG_PRESERVE_VIDEO_MEMORY_ALLOCATIONS_AUTO        2
+
+/*
+ * Option: UseKernelSuspendNotifiers
+ *
+ * If enabled, this option prompts the NVIDIA kernel module to register a
+ * notifier that saves and restores all video memory allocations across system
+ * power management cycles if PreserveVideoMemoryAllocations is enabled.
+ *
+ * Possible Values:
+ *
+ *  0: Suspend notifiers are not used (default)
+ *  1: Suspend notifiers are used when available
+ */
+
+#define __NV_USE_KERNEL_SUSPEND_NOTIFIERS UseKernelSuspendNotifiers
+#define NV_REG_USE_KERNEL_SUSPEND_NOTIFIERS \
+    NV_REG_STRING(__NV_USE_KERNEL_SUSPEND_NOTIFIERS)
 
 /*
  * Option: EnableS0ixPowerManagement
@@ -643,6 +702,16 @@
     NV_REG_STRING(__NV_DYNAMIC_POWER_MANAGEMENT_VIDEO_MEMORY_THRESHOLD)
 
 /*
+ * Option: TegraGpuPgMask
+ *
+ * This option controls the TPC/GPC/FBP power-gating mask for Tegra iGPU.
+ *
+ */
+#define __NV_TEGRA_GPU_PG_MASK TegraGpuPgMask
+#define NV_REG_TEGRA_GPU_PG_MASK \
+    NV_REG_STRING(__NV_TEGRA_GPU_PG_MASK)
+
+/*
  * Option: RegisterPCIDriver
  *
  * Description:
@@ -658,6 +727,23 @@
 
 #define __NV_REGISTER_PCI_DRIVER  RegisterPCIDriver
 #define NV_REG_REGISTER_PCI_DRIVER NV_REG_STRING(__NV_REGISTER_PCI_DRIVER)
+
+/*
+ * Option: RegisterPlatformDeviceDriver
+ *
+ * Description:
+ *
+ * When this option is enabled, the NVIDIA driver will register with
+ * platform subsystem.
+ *
+ * Possible values:
+ *
+ *  1 - register as platform driver (default)
+ *  0 - do not register as platform driver
+ */
+
+#define __NV_REGISTER_PLATFORM_DEVICE_DRIVER  RegisterPlatformDeviceDriver
+#define NV_REG_REGISTER_PLATFORM_DEVICE_DRIVER NV_REG_STRING(__NV_REGISTER_PLATFORM_DEVICE_DRIVER)
 
 /*
  * Option: EnablePCIERelaxedOrderingMode
@@ -894,20 +980,53 @@
  *
  * Description:
  *
- * This option is applicable only on coherent systems with BAR1 enabled to allow
- * maximum bandwidth between GPU and a third party device over a dedicated
- * PCIe link instead of over C2C for GPUDirect RDMA use-cases.
- * Such a config is only supported for a specific topology which is checked by
+ * This option allows users to override the PCI topology validation enforced by
  * the GPU driver's dma-buf and nv-p2p subsystems.
  *
- * This option allows the user to override the driver's topology check.
- *
  * Possible values:
- * 0 - Do not override topology check (default).
- * 1 - Override topology check.
+ * 0 - Driver's topology check to allow or deny access (default).
+ * 1 - Override driver's topology check to allow access.
+ * 2 - Override driver's topology check to deny access.
  */
 #define __NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE GrdmaPciTopoCheckOverride
 #define NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE NV_REG_STRING(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE)
+#define NV_REG_GRDMA_PCI_TOPO_CHECK_OVERRIDE_DEFAULT       0
+#define NV_REG_GRDMA_PCI_TOPO_CHECK_OVERRIDE_ALLOW_ACCESS  1
+#define NV_REG_GRDMA_PCI_TOPO_CHECK_OVERRIDE_DENY_ACCESS   2
+
+/*
+ * Option: NVreg_EnableSystemMemoryPools
+ *
+ * Description:
+ *
+ * This option controls system memory page pools creation for different page sizes
+ * Pool for pageSize is enabled by setting bit (pageSize >> NV_ENABLE_SYSTEM_MEMORY_POOLS_SHIFT)
+ * The pools keep memory cached once freed to speed-up reallocation
+ * Pools are shared by all adapters
+ *
+ * This feature is only supported by OpenRM driver
+ *
+ * By default 4K, 64K, 2M page size pools are enabled
+ */
+#define __NV_ENABLE_SYSTEM_MEMORY_POOLS EnableSystemMemoryPools
+#define NV_ENABLE_SYSTEM_MEMORY_POOLS NV_REG_STRING(__NV_ENABLE_SYSTEM_MEMORY_POOLS)
+#define NV_ENABLE_SYSTEM_MEMORY_POOLS_DEFAULT 0x00000211
+#define NV_ENABLE_SYSTEM_MEMORY_POOLS_SHIFT 12
+
+/*
+ * Option: NVreg_GpuInitOnProbe
+ *
+ * Description:
+ *
+ * This option allows the user to control initialization of the GPU at PCI probe time
+ *
+ * Possible values:
+ * 0 - Disable initializing the GPUs on PCI probe
+ * 1 - Initialize GPUs on PCI probe
+ */
+ #define __NV_GPU_INIT_ON_PROBE GpuInitOnProbe
+ #define NV_GPU_INIT_ON_PROBE NV_REG_STRING(__NV_GPU_INIT_ON_PROBE)
+ #define NV_GPU_INIT_ON_PROBE_DEFAULT 0
 
 #if defined(NV_DEFINE_REGISTRY_KEY_TABLE)
 
@@ -927,7 +1046,8 @@ NV_DEFINE_REG_ENTRY(__NV_ENABLE_PCIE_GEN3, 0);
 NV_DEFINE_REG_ENTRY(__NV_ENABLE_MSI, 1);
 NV_DEFINE_REG_ENTRY(__NV_ENABLE_STREAM_MEMOPS, 0);
 NV_DEFINE_REG_ENTRY(__NV_RM_PROFILING_ADMIN_ONLY_PARAMETER, 1);
-NV_DEFINE_REG_ENTRY(__NV_PRESERVE_VIDEO_MEMORY_ALLOCATIONS, 0);
+NV_DEFINE_REG_ENTRY(__NV_PRESERVE_VIDEO_MEMORY_ALLOCATIONS,
+                    NV_REG_PRESERVE_VIDEO_MEMORY_ALLOCATIONS_AUTO);
 NV_DEFINE_REG_ENTRY(__NV_ENABLE_S0IX_POWER_MANAGEMENT, 0);
 NV_DEFINE_REG_ENTRY(__NV_S0IX_POWER_MANAGEMENT_VIDEO_MEMORY_THRESHOLD, 256);
 NV_DEFINE_REG_ENTRY(__NV_DYNAMIC_POWER_MANAGEMENT, 3);
@@ -944,10 +1064,15 @@ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_IGNORE_MMIO_CHECK, 0);
 NV_DEFINE_REG_ENTRY_GLOBAL(__NV_NVLINK_DISABLE, 0);
 NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_PCIE_RELAXED_ORDERING_MODE, 0);
 NV_DEFINE_REG_ENTRY_GLOBAL(__NV_REGISTER_PCI_DRIVER, 1);
+NV_DEFINE_REG_ENTRY_GLOBAL(__NV_REGISTER_PLATFORM_DEVICE_DRIVER, 1);
 NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_RESIZABLE_BAR, 0);
 NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_DBG_BREAKPOINT, 0);
+NV_DEFINE_REG_ENTRY_GLOBAL(__NV_TEGRA_GPU_PG_MASK, ~0);
 NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_NONBLOCKING_OPEN, 1);
+NV_DEFINE_REG_ENTRY_GLOBAL(__NV_EXCLUDE_ALL_GPUS, NV_EXCLUDE_ALL_GPUS_DEFAULT);
+NV_DEFINE_REG_ENTRY_GLOBAL(__NV_GPU_INIT_ON_PROBE, NV_GPU_INIT_ON_PROBE_DEFAULT);
 
+NV_DEFINE_REG_STRING_ENTRY(__NV_COHERENT_GPU_MEMORY_MODE, NULL);
 NV_DEFINE_REG_STRING_ENTRY(__NV_REGISTRY_DWORDS, NULL);
 NV_DEFINE_REG_STRING_ENTRY(__NV_REGISTRY_DWORDS_PER_DEVICE, NULL);
 NV_DEFINE_REG_STRING_ENTRY(__NV_RM_MSG, NULL);
@@ -959,7 +1084,10 @@ NV_DEFINE_REG_STRING_ENTRY(__NV_RM_NVLINK_BW, NULL);
 NV_DEFINE_REG_ENTRY(__NV_RM_NVLINK_BW_LINK_COUNT, 0);
 NV_DEFINE_REG_ENTRY_GLOBAL(__NV_IMEX_CHANNEL_COUNT, 2048);
 NV_DEFINE_REG_ENTRY_GLOBAL(__NV_CREATE_IMEX_CHANNEL_0, 0);
-NV_DEFINE_REG_ENTRY_GLOBAL(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE, 0);
+NV_DEFINE_REG_ENTRY_GLOBAL(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE,
+                           NV_REG_GRDMA_PCI_TOPO_CHECK_OVERRIDE_DEFAULT);
+NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_SYSTEM_MEMORY_POOLS, NV_ENABLE_SYSTEM_MEMORY_POOLS_DEFAULT);
+NV_DEFINE_REG_ENTRY_GLOBAL(__NV_USE_KERNEL_SUSPEND_NOTIFIERS, 0);
 
 /*
  *----------------registry database definition----------------------
@@ -993,10 +1121,12 @@ nv_parm_t nv_parms[] = {
     NV_DEFINE_PARAMS_TABLE_ENTRY_CUSTOM_NAME(__NV_RM_PROFILING_ADMIN_ONLY,
         __NV_RM_PROFILING_ADMIN_ONLY_PARAMETER),
     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_PRESERVE_VIDEO_MEMORY_ALLOCATIONS),
+    NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_USE_KERNEL_SUSPEND_NOTIFIERS),
     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_ENABLE_S0IX_POWER_MANAGEMENT),
     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_S0IX_POWER_MANAGEMENT_VIDEO_MEMORY_THRESHOLD),
     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_DYNAMIC_POWER_MANAGEMENT),
     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_DYNAMIC_POWER_MANAGEMENT_VIDEO_MEMORY_THRESHOLD),
+    NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_TEGRA_GPU_PG_MASK),
     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_REGISTER_PCI_DRIVER),
     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_ENABLE_PCIE_RELAXED_ORDERING_MODE),
     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_ENABLE_RESIZABLE_BAR),
@@ -1009,6 +1139,7 @@ nv_parm_t nv_parms[] = {
     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_IMEX_CHANNEL_COUNT),
     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_CREATE_IMEX_CHANNEL_0),
     NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_GRDMA_PCI_TOPO_CHECK_OVERRIDE),
+    NV_DEFINE_PARAMS_TABLE_ENTRY(__NV_ENABLE_SYSTEM_MEMORY_POOLS),
     {NULL, NULL}
 };
 

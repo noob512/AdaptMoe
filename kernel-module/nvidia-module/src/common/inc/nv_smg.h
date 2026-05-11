@@ -29,6 +29,8 @@ extern "C" {
 
 #include "nvtypes.h"
 #include "nvlimits.h"
+#include "nvgputypes.h"
+#include "nvctassert.h"
 #include "nvrmcontext.h"
 #include "nv_mig_types.h"
 
@@ -66,9 +68,10 @@ typedef struct nvMIGDeviceDescriptionRec {
     NvU32 computeInstanceId;
 
     /* Whether this device is accessible to the calling process */
-    NvBool migAccessOk;
+    NvBool smgAccessOk;
     /* MIG exec partition UUID string */
     char migUuid[NV_MIG_DEVICE_UUID_STR_LENGTH];
+    NvU8 migUuidBin[NV_GPU_UUID_LEN];
 } nvMIGDeviceDescription;
 
 NvBool nvSMGSubscribeSubDevToPartition(nvRMContextPtr rmctx,

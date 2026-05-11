@@ -56,16 +56,11 @@ extern "C" {
 
 
 
-
 struct Object;
 
-#ifndef __NVOC_CLASS_Object_TYPEDEF__
-#define __NVOC_CLASS_Object_TYPEDEF__
-typedef struct Object Object;
-#endif /* __NVOC_CLASS_Object_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_Object
-#define __nvoc_class_id_Object 0x497031
+#define __nvoc_class_id_Object 0x497031u
+typedef struct Object Object;
 #endif /* __nvoc_class_id_Object */
 
 
@@ -121,13 +116,9 @@ struct NVOC_METADATA__Object {
     const struct NVOC_RTTI rtti;
 };
 
-#ifndef __NVOC_CLASS_Object_TYPEDEF__
-#define __NVOC_CLASS_Object_TYPEDEF__
-typedef struct Object Object;
-#endif /* __NVOC_CLASS_Object_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_Object
-#define __nvoc_class_id_Object 0x497031
+#define __nvoc_class_id_Object 0x497031u
+typedef struct Object Object;
 #endif /* __nvoc_class_id_Object */
 
 // Casting support
@@ -146,66 +137,69 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_Object;
 NV_STATUS __nvoc_objCreateDynamic_Object(Object**, Dynamic*, NvU32, va_list);
 
 NV_STATUS __nvoc_objCreate_Object(Object**, Dynamic*, NvU32);
-#define __objCreate_Object(ppNewObj, pParent, createFlags) \
-    __nvoc_objCreate_Object((ppNewObj), staticCast((pParent), Dynamic), (createFlags))
+#define __objCreate_Object(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags) \
+    __nvoc_objCreate_Object((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags))
 
 
-// Wrapper macros
-
-// Dispatch functions
+// Wrapper macros for implementation functions
 void objAddChild_IMPL(struct Object *pObj, struct Object *pChild);
-
 #ifdef __nvoc_object_h_disabled
 static inline void objAddChild(struct Object *pObj, struct Object *pChild) {
     NV_ASSERT_FAILED_PRECOMP("Object was disabled!");
 }
-#else //__nvoc_object_h_disabled
+#else // __nvoc_object_h_disabled
 #define objAddChild(pObj, pChild) objAddChild_IMPL(pObj, pChild)
-#endif //__nvoc_object_h_disabled
+#endif // __nvoc_object_h_disabled
 
 void objRemoveChild_IMPL(struct Object *pObj, struct Object *pChild);
-
 #ifdef __nvoc_object_h_disabled
 static inline void objRemoveChild(struct Object *pObj, struct Object *pChild) {
     NV_ASSERT_FAILED_PRECOMP("Object was disabled!");
 }
-#else //__nvoc_object_h_disabled
+#else // __nvoc_object_h_disabled
 #define objRemoveChild(pObj, pChild) objRemoveChild_IMPL(pObj, pChild)
-#endif //__nvoc_object_h_disabled
+#endif // __nvoc_object_h_disabled
 
-struct Object *objGetChild_IMPL(struct Object *pObj);
-
+struct Object * objGetChild_IMPL(struct Object *pObj);
 #ifdef __nvoc_object_h_disabled
-static inline struct Object *objGetChild(struct Object *pObj) {
+static inline struct Object * objGetChild(struct Object *pObj) {
     NV_ASSERT_FAILED_PRECOMP("Object was disabled!");
     return NULL;
 }
-#else //__nvoc_object_h_disabled
+#else // __nvoc_object_h_disabled
 #define objGetChild(pObj) objGetChild_IMPL(pObj)
-#endif //__nvoc_object_h_disabled
+#endif // __nvoc_object_h_disabled
 
-struct Object *objGetSibling_IMPL(struct Object *pObj);
-
+struct Object * objGetSibling_IMPL(struct Object *pObj);
 #ifdef __nvoc_object_h_disabled
-static inline struct Object *objGetSibling(struct Object *pObj) {
+static inline struct Object * objGetSibling(struct Object *pObj) {
     NV_ASSERT_FAILED_PRECOMP("Object was disabled!");
     return NULL;
 }
-#else //__nvoc_object_h_disabled
+#else // __nvoc_object_h_disabled
 #define objGetSibling(pObj) objGetSibling_IMPL(pObj)
-#endif //__nvoc_object_h_disabled
+#endif // __nvoc_object_h_disabled
 
-struct Object *objGetDirectParent_IMPL(struct Object *pObj);
-
+struct Object * objGetDirectParent_IMPL(struct Object *pObj);
 #ifdef __nvoc_object_h_disabled
-static inline struct Object *objGetDirectParent(struct Object *pObj) {
+static inline struct Object * objGetDirectParent(struct Object *pObj) {
     NV_ASSERT_FAILED_PRECOMP("Object was disabled!");
     return NULL;
 }
-#else //__nvoc_object_h_disabled
+#else // __nvoc_object_h_disabled
 #define objGetDirectParent(pObj) objGetDirectParent_IMPL(pObj)
-#endif //__nvoc_object_h_disabled
+#endif // __nvoc_object_h_disabled
 
+
+// Wrapper macros for halified functions
+
+// Dispatch functions
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

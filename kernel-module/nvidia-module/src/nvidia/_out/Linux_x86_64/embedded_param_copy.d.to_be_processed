@@ -17,7 +17,7 @@ _out/Linux_x86_64/embedded_param_copy.o: \
  ../common/sdk/nvidia/inc/class/cl9010_callback.h \
  ../common/inc/nvctassert.h inc/libraries/nvport/nvport.h \
  inc/libraries/nvport/core.h inc/libraries/nvport/atomic.h \
- inc/libraries/nvport/inline/atomic_gcc.h inc/libraries/nvport/debug.h \
+ inc/libraries/nvport/inline/atomic_c11.h inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
  inc/libraries/nvport/util.h inc/libraries/nvport/inline/util_generic.h \
@@ -28,9 +28,9 @@ _out/Linux_x86_64/embedded_param_copy.o: \
  inc/libraries/nvport/safe.h inc/libraries/nvport/inline/safe_generic.h \
  inc/libraries/nvport/thread.h inc/libraries/nvport/crypto.h \
  inc/libraries/nvport/string.h inc/libraries/nvport/cpu.h \
- inc/libraries/nvoc/object.h inc/libraries/nvoc/prelude.h \
- inc/libraries/utils/nvmacro.h generated/g_object_nvoc.h \
- inc/libraries/nvoc/runtime.h inc/libraries/nvoc/rtti.h \
+ inc/libraries/nvoc/object.h generated/g_object_nvoc.h \
+ inc/libraries/nvoc/runtime.h inc/libraries/nvoc/prelude.h \
+ inc/libraries/utils/nvmacro.h inc/libraries/nvoc/rtti.h \
  inc/kernel/core/printf.h inc/libraries/utils/nvprintf.h \
  inc/libraries/utils/nvprintf_level.h inc/libraries/nvlog/nvlog_printf.h \
  inc/libraries/nvlog/internal/nvlog_printf_internal.h \
@@ -50,8 +50,9 @@ _out/Linux_x86_64/embedded_param_copy.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000nvd.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0041.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080dma.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h \
@@ -105,7 +106,8 @@ _out/Linux_x86_64/embedded_param_copy.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrlb06f.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl83de.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl83de/ctrl83dedebug.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl83de/ctrl83debase.h
+ ../common/sdk/nvidia/inc/ctrl/ctrl83de/ctrl83debase.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrla083.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 inc/kernel/rmapi/control.h:
 inc/kernel/core/core.h:
@@ -132,7 +134,7 @@ arch/nvalloc/common/inc/nvrangetypes.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -151,10 +153,10 @@ inc/libraries/nvport/crypto.h:
 inc/libraries/nvport/string.h:
 inc/libraries/nvport/cpu.h:
 inc/libraries/nvoc/object.h:
-inc/libraries/nvoc/prelude.h:
-inc/libraries/utils/nvmacro.h:
 generated/g_object_nvoc.h:
 inc/libraries/nvoc/runtime.h:
+inc/libraries/nvoc/prelude.h:
+inc/libraries/utils/nvmacro.h:
 inc/libraries/nvoc/rtti.h:
 inc/kernel/core/printf.h:
 inc/libraries/utils/nvprintf.h:
@@ -189,8 +191,9 @@ inc/kernel/rmapi/param_copy.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
-../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000nvd.h:
+../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0041.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080dma.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h:
@@ -245,3 +248,4 @@ inc/kernel/rmapi/param_copy.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl83de.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl83de/ctrl83dedebug.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl83de/ctrl83debase.h:
+../common/sdk/nvidia/inc/ctrl/ctrla083.h:

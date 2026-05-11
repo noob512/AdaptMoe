@@ -118,17 +118,22 @@ memmgrGetMaxContextSize_GB202
 {
     NvU64  size = memmgrGetMaxContextSize_GA100(pGpu, pMemoryManager);
 
-    // Increase reserved memory pool for non-client RM enabled platforms (MODS, non-GSP-RM)
-    if (!gpuIsClientRmAllocatedCtxBufferEnabled(pGpu))
+    if (RMCFG_FEATURE_PLATFORM_WINDOWS)
     {
-        // Need this extra 100MBs to meet max GR buffer allocation requirement
-        size += 100 * 1024 * 1024;
+        size += 10 * 1024 * 1024;
     }
-    else if (!RMCFG_FEATURE_PLATFORM_GSP)
+
+    if (IS_GSP_CLIENT(pGpu) && gpuIsClientRmAllocatedCtxBufferEnabled(pGpu))
     {
         // We need extra 50MBs to meet max GR buffer allocation requirement
         // as global ctx buffers are allocated from RM heap for non-MIG.
         size += 50 * 1024 * 1024;
+    }
+
+    if ((pMemoryManager->overrideMaxContextSizeRsvdMemory > 0) && (pMemoryManager->overrideMaxContextSizeRsvdMemory <= size))   
+    {
+        NV_PRINTF(LEVEL_ERROR, "Max context size set from %llu MB to %llu MB\n", size/1024/1024, pMemoryManager->overrideMaxContextSizeRsvdMemory/1024/1024);
+        size = pMemoryManager->overrideMaxContextSizeRsvdMemory;
     }
 
     return size;

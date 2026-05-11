@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2018 NVIDIA Corporation
+    Copyright (c) 2018-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -21,9 +21,7 @@
 
 *******************************************************************************/
 
+#include "uvm_va_block.h"
+
 NV_STATUS uvm_migrate_init(void);
 void uvm_migrate_exit(void);
-
-// BPF cross-block prefetch: migrate a VA range to GPU from deferred workqueue.
-// Acquires va_space read lock internally. Caller must ensure va_space is valid.
-NV_STATUS uvm_migrate_bpf(uvm_va_space_t *va_space, NvU64 base, NvU64 length);

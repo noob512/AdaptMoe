@@ -59,29 +59,19 @@ extern "C" {
 #include "gpu_mgr/gpu_mgr.h"
 #include "kernel/gpu/mig_mgr/kernel_mig_manager.h"
 
-
 struct PhysMemSubAlloc;
 
-#ifndef __NVOC_CLASS_PhysMemSubAlloc_TYPEDEF__
-#define __NVOC_CLASS_PhysMemSubAlloc_TYPEDEF__
-typedef struct PhysMemSubAlloc PhysMemSubAlloc;
-#endif /* __NVOC_CLASS_PhysMemSubAlloc_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_PhysMemSubAlloc
-#define __nvoc_class_id_PhysMemSubAlloc 0x2351fc
+#define __nvoc_class_id_PhysMemSubAlloc 0x2351fcu
+typedef struct PhysMemSubAlloc PhysMemSubAlloc;
 #endif /* __nvoc_class_id_PhysMemSubAlloc */
-
 
 
 struct VgpuConfigApi;
 
-#ifndef __NVOC_CLASS_VgpuConfigApi_TYPEDEF__
-#define __NVOC_CLASS_VgpuConfigApi_TYPEDEF__
-typedef struct VgpuConfigApi VgpuConfigApi;
-#endif /* __NVOC_CLASS_VgpuConfigApi_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_VgpuConfigApi
-#define __nvoc_class_id_VgpuConfigApi 0x4d560a
+#define __nvoc_class_id_VgpuConfigApi 0x4d560au
+typedef struct VgpuConfigApi VgpuConfigApi;
 #endif /* __nvoc_class_id_VgpuConfigApi */
 
 
@@ -120,7 +110,8 @@ typedef struct VGPU_DEVICE_GUEST_FB_INFO
 typedef enum VGPU_SYSFS_OP
 {
     SET_GPU_INSTANCE_ID   = 0,
-    SET_PLACEMENT_ID      = 1
+    SET_PLACEMENT_ID      = 1,
+    GET_PLACEMENT_ID      = 2
 } VGPU_SYSFS_OP;
 
 typedef struct
@@ -139,6 +130,7 @@ typedef struct KERNEL_HOST_VGPU_DEVICE
     struct KERNEL_VGPU_GUEST        *vgpuGuest;
     NvU32                            gfid;
     NvU32                            swizzId;
+    NvU32                            accountingPid;
     NvU16                            placementId;
     NvU32                            numPluginChannels;
     NvU32                            chidOffset[RM_ENGINE_TYPE_LAST];
@@ -253,8 +245,10 @@ typedef struct
     NvU64                                   assignedSwizzIdMask;
     NvU32                                   assignedSwizzIdVgpuCount[KMIGMGR_MAX_GPU_SWIZZID];
     NvU32                                   fractionalMultiVgpu;
+    NvBool                                  isPlacementIdInfoSet;
     // Indicates MIG timeslicing mode enabled/disabled
     NvBool                                  migTimeslicingModeEnabled;
+    VGPU_NOMINAL_FB_SIZE                    vgpuNominalFbSize;
 } KERNEL_PHYS_GPU_INFO;
 
 /* vGPU info received from mdev kernel module for KVM */
@@ -321,13 +315,9 @@ struct NVOC_METADATA__KernelVgpuMgr {
     const struct NVOC_METADATA__Object metadata__Object;
 };
 
-#ifndef __NVOC_CLASS_KernelVgpuMgr_TYPEDEF__
-#define __NVOC_CLASS_KernelVgpuMgr_TYPEDEF__
-typedef struct KernelVgpuMgr KernelVgpuMgr;
-#endif /* __NVOC_CLASS_KernelVgpuMgr_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_KernelVgpuMgr
-#define __nvoc_class_id_KernelVgpuMgr 0xa793dd
+#define __nvoc_class_id_KernelVgpuMgr 0xa793ddu
+typedef struct KernelVgpuMgr KernelVgpuMgr;
 #endif /* __nvoc_class_id_KernelVgpuMgr */
 
 // Casting support
@@ -346,19 +336,27 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_KernelVgpuMgr;
 NV_STATUS __nvoc_objCreateDynamic_KernelVgpuMgr(KernelVgpuMgr**, Dynamic*, NvU32, va_list);
 
 NV_STATUS __nvoc_objCreate_KernelVgpuMgr(KernelVgpuMgr**, Dynamic*, NvU32);
-#define __objCreate_KernelVgpuMgr(ppNewObj, pParent, createFlags) \
-    __nvoc_objCreate_KernelVgpuMgr((ppNewObj), staticCast((pParent), Dynamic), (createFlags))
+#define __objCreate_KernelVgpuMgr(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags) \
+    __nvoc_objCreate_KernelVgpuMgr((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags))
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS kvgpumgrConstruct_IMPL(struct KernelVgpuMgr *pKernelVgpuMgr);
+#define __nvoc_kvgpumgrConstruct(pKernelVgpuMgr) kvgpumgrConstruct_IMPL(pKernelVgpuMgr)
+
+void kvgpumgrDestruct_IMPL(struct KernelVgpuMgr *pKernelVgpuMgr);
+#define __nvoc_kvgpumgrDestruct(pKernelVgpuMgr) kvgpumgrDestruct_IMPL(pKernelVgpuMgr)
+
+
+// Wrapper macros for halified functions
 
 // Dispatch functions
-NV_STATUS kvgpumgrConstruct_IMPL(struct KernelVgpuMgr *arg_pKernelVgpuMgr);
-
-#define __nvoc_kvgpumgrConstruct(arg_pKernelVgpuMgr) kvgpumgrConstruct_IMPL(arg_pKernelVgpuMgr)
-void kvgpumgrDestruct_IMPL(struct KernelVgpuMgr *pKernelVgpuMgr);
-
-#define __nvoc_kvgpumgrDestruct(pKernelVgpuMgr) kvgpumgrDestruct_IMPL(pKernelVgpuMgr)
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 
@@ -416,6 +414,7 @@ kvgpumgrGuestRegister(OBJGPU *pGpu,
                       NvBool bDisableDefaultSmcExecPartRestore,
                       NvU16 placementId,
                       NvU8 *pVgpuDevName,
+                      NvU32 accountingPid,
                       KERNEL_HOST_VGPU_DEVICE **ppKernelHostVgpuDevice);
 
 NV_STATUS
@@ -439,6 +438,10 @@ kvgpumgrGetSwizzId(OBJGPU *pGpu,
                    NvU32 partitionFlag,
                    VGPU_TYPE *vgpuTypeInfo, 
                    NvU32 *swizzId);
+
+NV_STATUS
+_kvgpumgrClearAssignedSwizzIdMask(OBJGPU *pGpu,
+                                  NvU32 swizzId);
 
 NV_STATUS
 kvgpumgrHeterogeneousGetChidOffset(NvU32 vgpuTypeId, NvU16 placementId,

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -174,6 +174,13 @@ kfifoDestruct_IMPL
     listDestroy(&pKernelFifo->postSchedulingEnableHandlerList);
     listDestroy(&pKernelFifo->preSchedulingDisableHandlerList);
 
+    // Destroy the Runlist write lock.
+    if (pKernelFifo->pLockRunlistWriteVfs != NULL)
+    {
+        portSyncSpinlockDestroy(pKernelFifo->pLockRunlistWriteVfs);
+        pKernelFifo->pLockRunlistWriteVfs = NULL;
+    }
+
     portMemFree(pEngineInfo->engineInfoList);
     pEngineInfo->engineInfoList = NULL;
 
@@ -214,13 +221,6 @@ kfifoStateInitLocked_IMPL
             }
         }
     }
-
-    //
-    // If bUsePerRunlistChram is set, RM cannot feasibly pre-allocate USERD for
-    // such a large number of channels. We expect clients to have already
-    // migrated to using client allocated USERD.
-    //
-    pKernelFifo->bDisablePreAllocatedUserD = pKernelFifo->bUsePerRunlistChram;
 
     NV_ASSERT_OK_OR_RETURN(kfifoConstructUsermodeMemdescs_HAL(pGpu, pKernelFifo));
 

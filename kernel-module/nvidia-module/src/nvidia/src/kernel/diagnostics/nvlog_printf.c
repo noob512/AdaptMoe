@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2002-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2002-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -29,8 +29,9 @@
 
 #include "core/core.h"
 #include "core/system.h"
-#include "os/os.h" // to pick up declarations for osDelay() and osDelayUs()
+#include "gpu_mgr/gpu_mgr.h"
 #include "nvrm_registry.h"
+#include "os/os.h" // to pick up declarations for osDelay() and osDelayUs()
 
 #include <ctrl/ctrl0000/ctrl0000system.h> // NV0000_CTRL_SYSTEM_DEBUG_RMMSG_SIZE
 
@@ -935,7 +936,7 @@ nvDbgRmMsgCheck
     NvU32 startline;
     NvU32 endline;
     NvU32 level;
-    NvU32 prefix = NVRM_MSG_PREFIX_NVRM | NVRM_MSG_PREFIX_FUNCTION;
+    NvU32 prefix = NVRM_MSG_PREFIX_NVRM | NVRM_MSG_PREFIX_FUNCTION | NVRM_MSG_PREFIX_GPU_INSTANCE;
     NvU32 tempPrefix;
     char *p;
 
@@ -955,7 +956,7 @@ nvDbgRmMsgCheck
         nounlen = 0;
         startline = 0;
         endline = 0x7fffffff;
-        tempPrefix = NVRM_MSG_PREFIX_NVRM | NVRM_MSG_PREFIX_FUNCTION;
+        tempPrefix = NVRM_MSG_PREFIX_NVRM | NVRM_MSG_PREFIX_FUNCTION | NVRM_MSG_PREFIX_GPU_INSTANCE;
         level = LEVEL_INFO;         // default to everything
         state = NOUN;
 
@@ -1027,7 +1028,7 @@ nvDbgRmMsgCheck
                         case '*':
                             tempPrefix = NVRM_MSG_PREFIX_NVRM | NVRM_MSG_PREFIX_FILE |
                                          NVRM_MSG_PREFIX_LINE | NVRM_MSG_PREFIX_FUNCTION |
-                                         NVRM_MSG_PREFIX_OSTIMESTAMP;
+                                         NVRM_MSG_PREFIX_OSTIMESTAMP | NVRM_MSG_PREFIX_GPU_INSTANCE;
                             break;
                         case 'n':
                             tempPrefix |= NVRM_MSG_PREFIX_NVRM;
@@ -1058,6 +1059,12 @@ nvDbgRmMsgCheck
                             break;
                         case 'T':
                             tempPrefix &= ~NVRM_MSG_PREFIX_OSTIMESTAMP;
+                            break;
+                        case 'g':
+                            tempPrefix |= NVRM_MSG_PREFIX_GPU_INSTANCE;
+                            break;
+                        case 'G':
+                            tempPrefix &= ~NVRM_MSG_PREFIX_GPU_INSTANCE;
                             break;
                     }
                     break;
@@ -1101,7 +1108,7 @@ done:
 // RmMsgPrefix - Add the RmMsg prefix to the passed in string, returning
 // the length of the formatted string.
 //
-// Format: "NVRM: file linenum function timestamp: "
+// Format: "NVRM: gpu file linenum function timestamp: "
 //
 NvU32
 RmMsgPrefix
@@ -1128,6 +1135,17 @@ RmMsgPrefix
         len += sizeof(NV_PRINTF_PREFIX_SEPARATOR) - 1;
     }
 
+    if (prefix & NVRM_MSG_PREFIX_GPU_INSTANCE)
+    {
+        NvU32 gpuInst = gpumgrGetCurrentGpuInstance();
+
+        if (gpuInst != NV_U32_MAX)
+        {
+            len += nvDbgSnprintf(str + len, totalLen - len, "%sGPU%u", space, gpuInst);
+            space = " ";
+        }
+    }
+
     if (prefix & NVRM_MSG_PREFIX_FILE)
     {
         len += nvDbgSnprintf(str + len, totalLen - len, "%s%s", space, filename);
@@ -1148,7 +1166,7 @@ RmMsgPrefix
 
     if (prefix & NVRM_MSG_PREFIX_OSTIMESTAMP)
     {
-        osGetCurrentTime(&sec, &usec);
+        osGetSystemTime(&sec, &usec);
 
         len += nvDbgSnprintf(str + len, totalLen - len, "%s%d.%06d", space, sec, usec);
     }

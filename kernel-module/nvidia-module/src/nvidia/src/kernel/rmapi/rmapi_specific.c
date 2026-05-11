@@ -23,7 +23,7 @@
 #include "rmconfig.h"
 #include "g_rmconfig_private.h"
 #include "rmapi/rmapi_specific.h"
-#include "rmapi/event.h"
+#include "rmapi/event_api.h"
 #include "resource_desc.h"
 #include "resserv/rs_server.h"
 
@@ -55,7 +55,7 @@ rmapiFixupAllocParams
 {
     RS_RESOURCE_DESC *pResDesc = *ppResDesc;
 
-    if ((pResDesc->pClassInfo != NULL) && (pResDesc->pClassInfo->classId == classId(Event)))
+    if ((pResDesc->pClassInfo != NULL) && (pResDesc->pClassInfo->classId == classId(EventApi)))
     {
         NV0005_ALLOC_PARAMETERS *pNv0005Params = pRmAllocParams->pAllocParams;
 
@@ -74,9 +74,9 @@ rmapiFixupAllocParams
         if (pNv0005Params->hParentClient != pRmAllocParams->hClient)
             pRmAllocParams->hParent = pRmAllocParams->hClient;
 
-        // class id may have changed so refresh the resource descriptor, but make sure it is still an Event
+        // class id may have changed so refresh the resource descriptor, but make sure it is still an EventApi
         pResDesc = RsResInfoByExternalClassId(pRmAllocParams->externalClassId);
-        if (pResDesc == NULL || pResDesc->pClassInfo == NULL || pResDesc->pClassInfo->classId != classId(Event))
+        if (pResDesc == NULL || pResDesc->pClassInfo == NULL || pResDesc->pClassInfo->classId != classId(EventApi))
             return NV_ERR_INVALID_CLASS;
 
         *ppResDesc = pResDesc;
@@ -171,6 +171,7 @@ rmapiRmControlCanBeRaisedIrql(NvU32 cmd)
         // We use TRASH/ABORT mode to discard queued hw commands in the push buffer (bug 200644346)
         case NVC370_CTRL_CMD_SET_ACCL:
         case NVC370_CTRL_CMD_GET_CHANNEL_INFO:
+        case NVC370_CTRL_CMD_CHANNEL_CANCEL_FLIP:            
         case NV9010_CTRL_CMD_SET_VBLANK_NOTIFICATION:
             return NV_TRUE;
         default:
@@ -190,6 +191,7 @@ rmapiRmControlCanBeBypassLock(NvU32 cmd)
         // We use TRASH/ABORT mode to discard queued hw commands in the push buffer (bug 200644346)
         case NVC370_CTRL_CMD_SET_ACCL:
         case NVC370_CTRL_CMD_GET_CHANNEL_INFO:
+        case NVC370_CTRL_CMD_CHANNEL_CANCEL_FLIP:            
         case NV2080_CTRL_CMD_BUS_SYSMEM_ACCESS:
         case NV9010_CTRL_CMD_SET_VBLANK_NOTIFICATION:
         case NV2080_CTRL_CMD_NVD_SET_NOCAT_JOURNAL_DATA:

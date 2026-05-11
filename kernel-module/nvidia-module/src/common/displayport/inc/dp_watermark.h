@@ -93,6 +93,23 @@ namespace DisplayPort
            bEnablePassThroughForPCON(newBEnablePassThroughForPCON),
            mode(newMode),
            colorFormat(dpColorFormat) {}
+
+        bool operator==(const ModesetInfo &other) const
+        {
+            return twoChannelAudioHz == other.twoChannelAudioHz &&
+                   eightChannelAudioHz == other.eightChannelAudioHz &&
+                   pixelClockHz == other.pixelClockHz &&
+                   rasterWidth == other.rasterWidth &&
+                   rasterHeight == other.rasterHeight &&
+                   surfaceWidth == other.surfaceWidth &&
+                   surfaceHeight == other.surfaceHeight &&
+                   depth == other.depth &&
+                   rasterBlankStartX == other.rasterBlankStartX &&
+                   rasterBlankEndX == other.rasterBlankEndX &&
+                   bitsPerComponent == other.bitsPerComponent &&
+                   colorFormat == other.colorFormat &&
+                   bEnableDsc == other.bEnableDsc;
+        }
     };
 
     struct Watermark

@@ -27,16 +27,19 @@
 #include "nverror.h"
 #include "gpu/bif/kernel_bif.h"
 #include "gpu/fsp/kern_fsp.h"
+#include "gpu/sec2/kernel_sec2.h"
+#include "gpu_mgr/gpu_mgr.h"
 #include "platform/chipset/chipset.h"
 #include "ctrl/ctrl2080/ctrl2080bus.h"
 #include "kernel/gpu/nvlink/kernel_nvlink.h"
 #include "gpu_mgr/gpu_mgr.h"
+#include "kernel/gpu/mc/kernel_mc.h"
+
+#include "published/hopper/gh100/dev_xtl_ep_pri.h"
 
 #include "published/hopper/gh100/dev_xtl_ep_pcfg_gpu.h"
 
-#include "published/hopper/gh100/dev_fb.h"
 #include "published/hopper/gh100/hwproject.h"
-#include "published/hopper/gh100/dev_xtl_ep_pri.h"
 #include "published/hopper/gh100/dev_nv_xpl.h"
 #include "published/hopper/gh100/dev_vm.h"
 #include "published/hopper/gh100/dev_pmc.h"
@@ -120,35 +123,6 @@ kbifIsMSIXEnabledInHW_GH100
         return FLD_TEST_DRF(_EP_PCFG_GPU, _MSIX_CAP_HEADER, _ENABLE,
                             _ENABLED, data32);
     }
-}
-
-/*!
- * @brief Check if access to PCI config space is enabled or not
- *
- * @param[in] pGpu        GPU object pointer
- * @param[in] pKernelBif  Kernel BIF object pointer
- *
- * @return NV_TRUE Pci IO access is enabled
- */
-NvBool
-kbifIsPciIoAccessEnabled_GH100
-(
-    OBJGPU    *pGpu,
-    KernelBif *pKernelBif
-)
-{
-    NvU32   data = 0;
-
-    if (GPU_BUS_CFG_CYCLE_RD32(pGpu,
-                             NV_EP_PCFG_GPU_CTRL_CMD_AND_STATUS, &data) == NV_OK)
-    {
-        if (FLD_TEST_DRF(_EP_PCFG_GPU, _CTRL_CMD_AND_STATUS, _CMD_IO_SPACE, _ENABLE, data))
-        {
-            return NV_TRUE;
-        }
-    }
-
-    return NV_FALSE;
 }
 
 /*!
@@ -973,8 +947,10 @@ kbifDoFunctionLevelReset_GH100
     NV_STATUS  status = NV_OK;
     NvU32      flrDevInitTimeout;
     NvU32      flrDevInitTimeoutScale = pKernelBif->flrDevInitTimeoutScale;
-
-    KernelFsp *pKernelFsp = GPU_GET_KERNEL_FSP(pGpu);
+    KernelFsp *pKernelFsp = NULL;
+    KernelSec2 *pKernelSec2 = NULL;
+    pKernelFsp = GPU_GET_KERNEL_FSP(pGpu);
+    pKernelSec2 = GPU_GET_KERNEL_SEC2(pGpu);
 
     // If this is non-windows platform or non-ESXi, we already use OS based interface
     {
@@ -1031,12 +1007,14 @@ kbifDoFunctionLevelReset_GH100
     flrDevInitTimeout = BIF_FLR_DEVINIT_COMPLETION_TIMEOUT_DEFAULT *
                         flrDevInitTimeoutScale;
 
-    if (!gpumgrWaitForBarFirewall(
+    if (!gpuWaitForBarFirewallHal_HAL(
+            pGpu,
             gpuGetDomain(pGpu),
             gpuGetBus(pGpu),
             gpuGetDevice(pGpu),
             0,
-            pGpu->idInfo.PCIDeviceID))
+            pGpu->idInfo.PCIDeviceID,
+            pGpu->idInfo.PCISubDeviceID))
     {
         status = NV_ERR_INVALID_STATE;
         NV_ASSERT_FAILED("Timed out waiting for devinit to complete\n");
@@ -1076,15 +1054,19 @@ kbifDoFunctionLevelReset_GH100
             NV_PRINTF(LEVEL_ERROR, "Entering secure boot completion wait.\n");
         }
 
-        if (pKernelFsp == NULL ||
-            pKernelFsp->getProperty(pKernelFsp, PDB_PROP_KFSP_IS_MISSING))
-        {
-            status = NV_ERR_NOT_SUPPORTED;
-        }
-        else
+        if (pKernelFsp != NULL && pKernelFsp->getProperty(pKernelFsp, PDB_PROP_KFSP_IS_MISSING) == NV_FALSE )
         {
             status = kfspWaitForSecureBoot_HAL(pGpu, pKernelFsp);
         }
+        else if(pKernelSec2 != NULL && pKernelSec2->getProperty(pKernelSec2, PDB_PROP_KSEC2_IS_MISSING) == NV_FALSE )
+        {
+            status = ksec2WaitForSecureBoot_HAL(pGpu, pKernelSec2);
+        }
+        else
+        {
+           status = NV_ERR_NOT_SUPPORTED;
+        }
+
         if (status != NV_OK)
         {
             DBG_BREAKPOINT();
@@ -1383,7 +1365,6 @@ kbifSavePcieConfigRegisters_GH100
     KernelBif *pKernelBif
 )
 {
-
     NV_STATUS status = NV_OK;
 
     // Skip config save on FMODEL (200684952), move to regmap (200700271)
@@ -1427,6 +1408,12 @@ kbifSavePcieConfigRegisters_GH100
     // Return early if device is not multifunction (azalia is disabled or not present)
     if (!pKernelBif->getProperty(pKernelBif, PDB_PROP_KBIF_DEVICE_IS_MULTIFUNCTION))
     {
+        return NV_OK;
+    }
+
+    if (!IS_SILICON(pGpu))
+    {
+        NV_PRINTF(LEVEL_INFO, "Skipping PCIe Fn1 config space save.\n");
         return NV_OK;
     }
 
@@ -1499,14 +1486,14 @@ kbifRestorePcieConfigRegisters_GH100
             // Check if GPU is actually accessible before continue
             osGetPerformanceCounter(&timeStampStart);
             gpuSetTimeout(pGpu, GPU_TIMEOUT_DEFAULT, &timeout, 0);
-            NvU32 pmcBoot0 = GPU_REG_RD32(pGpu, NV_PMC_BOOT_0);
+            NvU32 pmcBoot0 = kmcReadPmcBoot0_HAL(pGpu, GPU_GET_KERNEL_MC(pGpu));
 
             while (pmcBoot0 != pGpu->chipId0)
             {
                 NV_PRINTF(LEVEL_INFO,
                           "GPU not back on the bus after %s, 0x%x != 0x%x!\n",
                           pKernelBif->bInFunctionLevelReset?"FLR":"GC6 exit", pmcBoot0, pGpu->chipId0);
-                pmcBoot0 = GPU_REG_RD32(pGpu, NV_PMC_BOOT_0);
+                pmcBoot0 = kmcReadPmcBoot0_HAL(pGpu, GPU_GET_KERNEL_MC(pGpu));
                 NV_ASSERT(0);
                 status = gpuCheckTimeout(pGpu, &timeout);
                 if (status == NV_ERR_TIMEOUT)
@@ -1530,6 +1517,12 @@ kbifRestorePcieConfigRegisters_GH100
     // Return early if device is not multifunction (azalia is disabled or not present)
     if (!pKernelBif->getProperty(pKernelBif, PDB_PROP_KBIF_DEVICE_IS_MULTIFUNCTION))
     {
+        return NV_OK;
+    }
+
+    if (!IS_SILICON(pGpu))
+    {
+        NV_PRINTF(LEVEL_INFO, "Skipping PCIe Fn1 config space restore.\n");
         return NV_OK;
     }
 
@@ -1655,7 +1648,7 @@ kbifRestoreBarsAndCommand_GH100
     GPU_BUS_CFG_CYCLE_WR32(pGpu, NV_EP_PCFG_GPU_CTRL_CMD_AND_STATUS,
                            pKernelBif->cacheData.gpuBootConfigSpace[NV_EP_PCFG_GPU_CTRL_CMD_AND_STATUS/sizeof(NvU32)]);
 
-    if (GPU_REG_RD32(pGpu, NV_PMC_BOOT_0) != pGpu->chipId0)
+    if (kmcReadPmcBoot0_HAL(pGpu, GPU_GET_KERNEL_MC(pGpu)) != pGpu->chipId0)
     {
         return NV_ERR_INVALID_READ;
     }
@@ -1736,14 +1729,14 @@ kbifGetEccCounts_GH100
     count += DRF_VAL(_XPL_DL, _ERR_COUNT_SEQ_LUT, _UNCORR_ERR, regVal);
 
     // PCIE XTL
-    regVal = GPU_REG_RD32(pGpu, NV_XTL_BASE_ADDRESS + NV_XTL_EP_PRI_DED_ERROR_STATUS);
+    regVal = REG_RD32(&pKernelBif->pBifXtlAperture, NV_XTL_EP_PRI_DED_ERROR_STATUS);
     if (regVal != 0)
     {
         count += 1;
     }
 
     // PCIE XTL
-    regVal = GPU_REG_RD32(pGpu, NV_XTL_BASE_ADDRESS + NV_XTL_EP_PRI_RAM_ERROR_INTR_STATUS);
+    regVal = REG_RD32(&pKernelBif->pBifXtlAperture, NV_XTL_EP_PRI_RAM_ERROR_INTR_STATUS);
     if (regVal != 0)
     {
         count += 1;
@@ -1818,3 +1811,96 @@ kbifDoSecondaryBusHotReset_GH100
     return kbifDoSecondaryBusHotReset_GM107(pGpu, pKernelBif);
 }
 
+/*!
+ * @brief Find the presence of C2C connection
+ *
+ * @param[in] pGpu0            First GPU object pointer
+ * @param[in] pKernelBif0      KernelBIF object pointer of first GPU
+ * @param[in] pGpu1            second GPU object pointer
+ *
+ * @return  NV_TRUE if C2C connection is present.
+ *          NV_FALSE otherwise.
+ */
+NvBool
+kbifIsC2CP2PSupported_GH100
+(
+    OBJGPU    *pGpu0,
+    KernelBif *pKernelBif0,
+    OBJGPU    *pGpu1
+)
+{
+    KernelBif *pKernelBif1  = GPU_GET_KERNEL_BIF(pGpu1);
+    NV2080_CTRL_CMD_BUS_GET_C2C_INFO_PARAMS c2cInfoParamsGpu0 = {0};
+    NV2080_CTRL_CMD_BUS_GET_C2C_INFO_PARAMS c2cInfoParamsGpu1 = {0};
+    RM_API *pRmApiGpu0 = GPU_GET_PHYSICAL_RMAPI(pGpu0);
+    RM_API *pRmApiGpu1 = GPU_GET_PHYSICAL_RMAPI(pGpu1);
+    NvU32 gpuAttachCnt = 0U;
+    NV_STATUS status;
+    
+    if (gpumgrGetGpuAttachInfo(&gpuAttachCnt, NULL) != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR, "Unable to get number of GPU attached\n");
+        return NV_FALSE;
+    }
+    if (pGpu0 != pGpu1)
+    {
+        if (gpuAttachCnt > 2)
+        {
+            return NV_FALSE;
+        }
+    }
+
+
+    if (!pKernelBif0->getProperty(pKernelBif0, PDB_PROP_KBIF_IS_C2C_LINK_UP) ||
+        !pKernelBif1->getProperty(pKernelBif1, PDB_PROP_KBIF_IS_C2C_LINK_UP))
+    {
+        return NV_FALSE;
+    }
+
+    status = pRmApiGpu0->Control(pRmApiGpu0,
+                                 pGpu0->hInternalClient,
+                                 pGpu0->hInternalSubdevice,
+                                 NV2080_CTRL_CMD_BUS_GET_C2C_INFO,
+                                 &c2cInfoParamsGpu0,
+                                 sizeof(c2cInfoParamsGpu0));
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR, "GPU0 NV2080_CTRL_CMD_BUS_GET_C2C_INFO failed %s (0x%x)\n",
+                nvstatusToString(status), status);
+        return NV_FALSE;
+    }
+
+    status = pRmApiGpu1->Control(pRmApiGpu1,
+                                 pGpu1->hInternalClient,
+                                 pGpu1->hInternalSubdevice,
+                                 NV2080_CTRL_CMD_BUS_GET_C2C_INFO,
+                                 &c2cInfoParamsGpu1,
+                                 sizeof(c2cInfoParamsGpu1));
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR, "GPU1 NV2080_CTRL_CMD_BUS_GET_C2C_INFO failed %s (0x%x)\n",
+                nvstatusToString(status), status);
+        return NV_FALSE;
+    }
+
+    if ((c2cInfoParamsGpu0.remoteType == NV2080_CTRL_BUS_GET_C2C_INFO_REMOTE_TYPE_GPU) &&
+        (c2cInfoParamsGpu1.remoteType == NV2080_CTRL_BUS_GET_C2C_INFO_REMOTE_TYPE_GPU))
+    {
+        return NV_TRUE;
+    }
+
+    return NV_FALSE;
+}
+
+void
+kbifConstructXtlAperture_GH100
+(
+    OBJGPU *pGpu,
+    KernelBif *pKernelBif
+)
+{
+    NvU32 xtlBaseAddress = gpuGetXtlBaseAddr_HAL(pGpu);
+    NV_ASSERT_OR_RETURN_VOID(ioaprtInit(&pKernelBif->pBifXtlAperture,
+                                        pGpu->pIOApertures[DEVICE_INDEX_GPU],
+                                        xtlBaseAddress, DRF_SIZE(NV_XTL_EP_PRI)) == NV_OK);
+}

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -59,7 +59,7 @@
 #include "core/bin_data.h"
 
 #if RMCFG_FEATURE_GSPRM_BULLSEYE || defined(GSPRM_BULLSEYE_ENABLE)
-#include "diagnostics/code_coverage_mgr.h"
+#include "diagnostics/instrumentation_manager.h"
 #endif
 
 // local static functions
@@ -97,7 +97,7 @@ static sysChildObject sysChildObjects[] =
     { NV_OFFSETOF(OBJSYS, pFabric),         classInfo(Fabric),          NV_TRUE },
     { NV_OFFSETOF(OBJSYS, pGpuDb),          classInfo(GpuDb),           NV_TRUE },
 #if RMCFG_FEATURE_GSPRM_BULLSEYE || defined(GSPRM_BULLSEYE_ENABLE)
-    { NV_OFFSETOF(OBJSYS, pCodeCovMgr),     classInfo(CodeCoverageManager),  NV_TRUE },
+    { NV_OFFSETOF(OBJSYS, pInstrumentationManager),     classInfo(InstrumentationManager),  NV_TRUE },
 #endif
 };
 
@@ -197,7 +197,7 @@ sysConstruct_IMPL(OBJSYS *pSys)
     }
 
     // Use the monotonic system clock for a unique value
-    osGetCurrentTime(&sec, &uSec);
+    osGetSystemTime(&sec, &uSec);
     pSys->rmInstanceId = (NvU64)sec * 1000000 + (NvU64)uSec;
 
     {
@@ -799,6 +799,18 @@ sysInitRegistryOverrides_IMPL
             == NV_OK)
     {
         pSys->setProperty(pSys, PDB_PROP_SYS_ENABLE_FORCE_SHARED_LOCK, !!data32);
+    }
+
+    if (osReadRegistryDword(pGpu, NV_REG_STR_RM_ALLOW_UNKNOWN_4PART_IDS, &data32)
+            == NV_OK)
+    {
+        pSys->setProperty(pSys, PDB_PROP_SYS_ALLOW_UNKNOWN_4PART_IDS, !!data32);
+    }
+
+    if (osReadRegistryDword(pGpu, NV_REG_STR_RM_USE_RW_API_LOCK_GET_MEM_ALIGNMENT_BUG_5785851_WAR,
+                            &data32) == NV_OK)
+    {
+        pSys->setProperty(pSys, PDB_PROP_SYS_USE_RW_API_LOCK_GET_MEM_ALIGNMENT_BUG_5785851_WAR, !!data32);
     }
 
     gpumgrSetGpuNvlinkBwModeFromRegistry(pGpu);

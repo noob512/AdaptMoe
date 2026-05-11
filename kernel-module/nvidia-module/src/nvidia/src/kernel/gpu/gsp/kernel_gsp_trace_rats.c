@@ -29,7 +29,7 @@
 #include "gpu/gsp/kernel_gsp_trace_rats.h"
 
 #include "rmapi/client.h"
-#include "rmapi/event.h"
+#include "rmapi/event_api.h"
 #include "rmapi/event_buffer.h"
 #include "core/locks.h"
 #include "class/cl90cdtypes.h"
@@ -81,7 +81,10 @@ _gspTraceEventBufferAdd
     return status;
 }
 
-static void _gspTraceReadVgpuTracingBuffer(OBJGPU *pGpu, NV_RATS_VGPU_GSP_TRACING_BUFFER *pVgpuGspTracingBuffer)
+static void _gspTraceReadVgpuTracingBuffer(
+    OBJGPU *pGpu,
+    NV_RATS_VGPU_GSP_TRACING_BUFFER *pVgpuGspTracingBuffer
+)
 {
     // Allocated memory for buffer entries located immediately after header
     NV_RATS_GSP_TRACE_RECORD *pRecords = (NV_RATS_GSP_TRACE_RECORD*) (pVgpuGspTracingBuffer + 1);
@@ -123,11 +126,14 @@ void gspTraceNotifyAllConsumers
                 }
             }
 
-            osEventNotification(pGpu,
-                pBind->pEventBuffer->pListeners,
-                NV_EVENT_BUFFER_RECORD_TYPE_RATS_GSP_TRACE,
-                NULL,
-                0);             // Do not copy structure -- embedded pointers.
+            if (!eventBufferIsEmpty(pBind->pEventBuffer))
+            {
+                osEventNotification(pGpu,
+                    pBind->pEventBuffer->pListeners,
+                    NV_EVENT_BUFFER_RECORD_TYPE_RATS_GSP_TRACE,
+                    NULL,
+                    0);             // Do not copy structure -- embedded pointers.
+            }
         }
     }
 }

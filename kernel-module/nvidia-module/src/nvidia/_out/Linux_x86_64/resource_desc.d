@@ -16,7 +16,7 @@ _out/Linux_x86_64/resource_desc.o: \
  ../common/sdk/nvidia/inc/class/cl9010_callback.h \
  ../common/inc/nvctassert.h inc/libraries/nvport/nvport.h \
  inc/libraries/nvport/core.h inc/libraries/nvport/atomic.h \
- inc/libraries/nvport/inline/atomic_gcc.h inc/libraries/nvport/debug.h \
+ inc/libraries/nvport/inline/atomic_c11.h inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
  inc/libraries/nvport/util.h inc/libraries/nvport/inline/util_generic.h \
@@ -27,9 +27,9 @@ _out/Linux_x86_64/resource_desc.o: \
  inc/libraries/nvport/safe.h inc/libraries/nvport/inline/safe_generic.h \
  inc/libraries/nvport/thread.h inc/libraries/nvport/crypto.h \
  inc/libraries/nvport/string.h inc/libraries/nvport/cpu.h \
- inc/libraries/nvoc/object.h inc/libraries/nvoc/prelude.h \
- inc/libraries/utils/nvmacro.h generated/g_object_nvoc.h \
- inc/libraries/nvoc/runtime.h inc/libraries/nvoc/rtti.h \
+ inc/libraries/nvoc/object.h generated/g_object_nvoc.h \
+ inc/libraries/nvoc/runtime.h inc/libraries/nvoc/prelude.h \
+ inc/libraries/utils/nvmacro.h inc/libraries/nvoc/rtti.h \
  inc/kernel/core/printf.h inc/libraries/utils/nvprintf.h \
  inc/libraries/utils/nvprintf_level.h inc/libraries/nvlog/nvlog_printf.h \
  inc/libraries/nvlog/internal/nvlog_printf_internal.h \
@@ -59,7 +59,6 @@ _out/Linux_x86_64/resource_desc.o: \
  ../common/sdk/nvidia/inc/class/cl003e.h \
  ../common/sdk/nvidia/inc/class/cl003f.h \
  ../common/sdk/nvidia/inc/class/cl0040.h \
- ../common/sdk/nvidia/inc/class/cl0042.h \
  ../common/sdk/nvidia/inc/class/cl0070.h \
  ../common/sdk/nvidia/inc/class/cl00fe.h \
  ../common/sdk/nvidia/inc/class/cl00c2.h \
@@ -71,7 +70,6 @@ _out/Linux_x86_64/resource_desc.o: \
  ../common/sdk/nvidia/inc/class/cl84a0.h \
  ../common/sdk/nvidia/inc/class/cl84a0_deprecated.h \
  ../common/sdk/nvidia/inc/class/cl00f1.h \
- ../common/sdk/nvidia/inc/class/cl00f3.h \
  ../common/sdk/nvidia/inc/class/cl00e0.h \
  ../common/sdk/nvidia/inc/class/cl0050.h \
  ../common/sdk/nvidia/inc/class/cl00f8.h \
@@ -85,6 +83,7 @@ _out/Linux_x86_64/resource_desc.o: \
  ../common/sdk/nvidia/inc/class/cl0005_notification.h \
  ../common/sdk/nvidia/inc/class/cl0004.h \
  ../common/sdk/nvidia/inc/class/cl0090.h \
+ ../common/sdk/nvidia/inc/class/cl008f.h \
  ../common/sdk/nvidia/inc/class/cl0100.h \
  ../common/sdk/nvidia/inc/class/cl0101.h \
  ../common/sdk/nvidia/inc/class/cl506f.h \
@@ -116,6 +115,7 @@ _out/Linux_x86_64/resource_desc.o: \
  ../common/sdk/nvidia/inc/class/clc973.h \
  ../common/sdk/nvidia/inc/class/clca73.h \
  ../common/sdk/nvidia/inc/class/clcb73.h \
+ ../common/sdk/nvidia/inc/class/clcc73.h \
  ../common/sdk/nvidia/inc/class/cl0073.h \
  ../common/sdk/nvidia/inc/class/cl5080.h \
  ../common/sdk/nvidia/inc/class/cl5080_notification.h \
@@ -153,6 +153,12 @@ _out/Linux_x86_64/resource_desc.o: \
  ../common/sdk/nvidia/inc/class/clcb7b.h \
  ../common/sdk/nvidia/inc/class/clcb7d.h \
  ../common/sdk/nvidia/inc/class/clcb7e.h \
+ ../common/sdk/nvidia/inc/class/clcc70.h \
+ ../common/sdk/nvidia/inc/class/clcc71.h \
+ ../common/sdk/nvidia/inc/class/clcc7a.h \
+ ../common/sdk/nvidia/inc/class/clcc7b.h \
+ ../common/sdk/nvidia/inc/class/clcc7d.h \
+ ../common/sdk/nvidia/inc/class/clcc7e.h \
  ../common/sdk/nvidia/inc/class/cl90cc.h \
  ../common/sdk/nvidia/inc/class/clb0cc.h \
  ../common/sdk/nvidia/inc/class/clb1cc.h \
@@ -178,15 +184,20 @@ _out/Linux_x86_64/resource_desc.o: \
  ../common/sdk/nvidia/inc/class/clc7b0.h \
  ../common/sdk/nvidia/inc/class/clc9b0.h \
  ../common/sdk/nvidia/inc/class/clcdb0.h \
+ ../common/sdk/nvidia/inc/class/clceb0.h \
  ../common/sdk/nvidia/inc/class/clcfb0.h \
+ ../common/sdk/nvidia/inc/class/cld1b0.h \
  ../common/sdk/nvidia/inc/class/clc4b7.h \
  ../common/sdk/nvidia/inc/class/clb4b7.h \
  ../common/sdk/nvidia/inc/class/clc7b7.h \
  ../common/sdk/nvidia/inc/class/clc9b7.h \
+ ../common/sdk/nvidia/inc/class/clceb7.h \
  ../common/sdk/nvidia/inc/class/clcfb7.h \
+ ../common/sdk/nvidia/inc/class/cld1b7.h \
  ../common/sdk/nvidia/inc/class/clb8d1.h \
  ../common/sdk/nvidia/inc/class/clc4d1.h \
  ../common/sdk/nvidia/inc/class/clc9d1.h \
+ ../common/sdk/nvidia/inc/class/clced0.h \
  ../common/sdk/nvidia/inc/class/clcdd1.h \
  ../common/sdk/nvidia/inc/class/clcfd1.h \
  ../common/sdk/nvidia/inc/class/clb8fa.h \
@@ -194,7 +205,9 @@ _out/Linux_x86_64/resource_desc.o: \
  ../common/sdk/nvidia/inc/class/clc7fa.h \
  ../common/sdk/nvidia/inc/class/clc9fa.h \
  ../common/sdk/nvidia/inc/class/clcdfa.h \
+ ../common/sdk/nvidia/inc/class/clcefa.h \
  ../common/sdk/nvidia/inc/class/clcffa.h \
+ ../common/sdk/nvidia/inc/class/cld1fa.h \
  ../common/sdk/nvidia/inc/class/cla140.h \
  ../common/sdk/nvidia/inc/class/cl9067.h \
  ../common/sdk/nvidia/inc/class/cla06c.h \
@@ -209,6 +222,7 @@ _out/Linux_x86_64/resource_desc.o: \
  ../common/sdk/nvidia/inc/class/clc365.h \
  ../common/sdk/nvidia/inc/class/clc369.h \
  ../common/sdk/nvidia/inc/class/clc763.h \
+ ../common/sdk/nvidia/inc/class/clc863.h \
  ../common/sdk/nvidia/inc/class/clc597.h \
  ../common/sdk/nvidia/inc/class/clc5c0.h \
  ../common/sdk/nvidia/inc/class/clc697.h \
@@ -233,6 +247,9 @@ _out/Linux_x86_64/resource_desc.o: \
  ../common/sdk/nvidia/inc/class/cl00db.h \
  ../common/sdk/nvidia/inc/class/cl00de.h \
  ../common/sdk/nvidia/inc/nvfixedtypes.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080ecc.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
  ../common/sdk/nvidia/inc/class/cl83de.h \
  ../common/sdk/nvidia/inc/class/cl402c.h \
  ../common/sdk/nvidia/inc/class/cla080.h \
@@ -240,6 +257,7 @@ _out/Linux_x86_64/resource_desc.o: \
  ../common/sdk/nvidia/inc/class/cla084.h \
  ../common/sdk/nvidia/inc/nv_vgpu_types.h \
  ../common/sdk/nvidia/inc/class/cla084_notification.h \
+ ../common/sdk/nvidia/inc/class/cla083.h \
  ../common/sdk/nvidia/inc/class/cl0060.h \
  ../common/sdk/nvidia/inc/class/clc076.h \
  ../common/sdk/nvidia/inc/class/cla0bc.h \
@@ -279,7 +297,7 @@ arch/nvalloc/common/inc/nvrangetypes.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -298,10 +316,10 @@ inc/libraries/nvport/crypto.h:
 inc/libraries/nvport/string.h:
 inc/libraries/nvport/cpu.h:
 inc/libraries/nvoc/object.h:
-inc/libraries/nvoc/prelude.h:
-inc/libraries/utils/nvmacro.h:
 generated/g_object_nvoc.h:
 inc/libraries/nvoc/runtime.h:
+inc/libraries/nvoc/prelude.h:
+inc/libraries/utils/nvmacro.h:
 inc/libraries/nvoc/rtti.h:
 inc/kernel/core/printf.h:
 inc/libraries/utils/nvprintf.h:
@@ -342,7 +360,6 @@ generated/g_allclasses.h:
 ../common/sdk/nvidia/inc/class/cl003e.h:
 ../common/sdk/nvidia/inc/class/cl003f.h:
 ../common/sdk/nvidia/inc/class/cl0040.h:
-../common/sdk/nvidia/inc/class/cl0042.h:
 ../common/sdk/nvidia/inc/class/cl0070.h:
 ../common/sdk/nvidia/inc/class/cl00fe.h:
 ../common/sdk/nvidia/inc/class/cl00c2.h:
@@ -354,7 +371,6 @@ generated/g_allclasses.h:
 ../common/sdk/nvidia/inc/class/cl84a0.h:
 ../common/sdk/nvidia/inc/class/cl84a0_deprecated.h:
 ../common/sdk/nvidia/inc/class/cl00f1.h:
-../common/sdk/nvidia/inc/class/cl00f3.h:
 ../common/sdk/nvidia/inc/class/cl00e0.h:
 ../common/sdk/nvidia/inc/class/cl0050.h:
 ../common/sdk/nvidia/inc/class/cl00f8.h:
@@ -368,6 +384,7 @@ generated/g_allclasses.h:
 ../common/sdk/nvidia/inc/class/cl0005_notification.h:
 ../common/sdk/nvidia/inc/class/cl0004.h:
 ../common/sdk/nvidia/inc/class/cl0090.h:
+../common/sdk/nvidia/inc/class/cl008f.h:
 ../common/sdk/nvidia/inc/class/cl0100.h:
 ../common/sdk/nvidia/inc/class/cl0101.h:
 ../common/sdk/nvidia/inc/class/cl506f.h:
@@ -399,6 +416,7 @@ generated/g_allclasses.h:
 ../common/sdk/nvidia/inc/class/clc973.h:
 ../common/sdk/nvidia/inc/class/clca73.h:
 ../common/sdk/nvidia/inc/class/clcb73.h:
+../common/sdk/nvidia/inc/class/clcc73.h:
 ../common/sdk/nvidia/inc/class/cl0073.h:
 ../common/sdk/nvidia/inc/class/cl5080.h:
 ../common/sdk/nvidia/inc/class/cl5080_notification.h:
@@ -436,6 +454,12 @@ generated/g_allclasses.h:
 ../common/sdk/nvidia/inc/class/clcb7b.h:
 ../common/sdk/nvidia/inc/class/clcb7d.h:
 ../common/sdk/nvidia/inc/class/clcb7e.h:
+../common/sdk/nvidia/inc/class/clcc70.h:
+../common/sdk/nvidia/inc/class/clcc71.h:
+../common/sdk/nvidia/inc/class/clcc7a.h:
+../common/sdk/nvidia/inc/class/clcc7b.h:
+../common/sdk/nvidia/inc/class/clcc7d.h:
+../common/sdk/nvidia/inc/class/clcc7e.h:
 ../common/sdk/nvidia/inc/class/cl90cc.h:
 ../common/sdk/nvidia/inc/class/clb0cc.h:
 ../common/sdk/nvidia/inc/class/clb1cc.h:
@@ -461,15 +485,20 @@ generated/g_allclasses.h:
 ../common/sdk/nvidia/inc/class/clc7b0.h:
 ../common/sdk/nvidia/inc/class/clc9b0.h:
 ../common/sdk/nvidia/inc/class/clcdb0.h:
+../common/sdk/nvidia/inc/class/clceb0.h:
 ../common/sdk/nvidia/inc/class/clcfb0.h:
+../common/sdk/nvidia/inc/class/cld1b0.h:
 ../common/sdk/nvidia/inc/class/clc4b7.h:
 ../common/sdk/nvidia/inc/class/clb4b7.h:
 ../common/sdk/nvidia/inc/class/clc7b7.h:
 ../common/sdk/nvidia/inc/class/clc9b7.h:
+../common/sdk/nvidia/inc/class/clceb7.h:
 ../common/sdk/nvidia/inc/class/clcfb7.h:
+../common/sdk/nvidia/inc/class/cld1b7.h:
 ../common/sdk/nvidia/inc/class/clb8d1.h:
 ../common/sdk/nvidia/inc/class/clc4d1.h:
 ../common/sdk/nvidia/inc/class/clc9d1.h:
+../common/sdk/nvidia/inc/class/clced0.h:
 ../common/sdk/nvidia/inc/class/clcdd1.h:
 ../common/sdk/nvidia/inc/class/clcfd1.h:
 ../common/sdk/nvidia/inc/class/clb8fa.h:
@@ -477,7 +506,9 @@ generated/g_allclasses.h:
 ../common/sdk/nvidia/inc/class/clc7fa.h:
 ../common/sdk/nvidia/inc/class/clc9fa.h:
 ../common/sdk/nvidia/inc/class/clcdfa.h:
+../common/sdk/nvidia/inc/class/clcefa.h:
 ../common/sdk/nvidia/inc/class/clcffa.h:
+../common/sdk/nvidia/inc/class/cld1fa.h:
 ../common/sdk/nvidia/inc/class/cla140.h:
 ../common/sdk/nvidia/inc/class/cl9067.h:
 ../common/sdk/nvidia/inc/class/cla06c.h:
@@ -492,6 +523,7 @@ generated/g_allclasses.h:
 ../common/sdk/nvidia/inc/class/clc365.h:
 ../common/sdk/nvidia/inc/class/clc369.h:
 ../common/sdk/nvidia/inc/class/clc763.h:
+../common/sdk/nvidia/inc/class/clc863.h:
 ../common/sdk/nvidia/inc/class/clc597.h:
 ../common/sdk/nvidia/inc/class/clc5c0.h:
 ../common/sdk/nvidia/inc/class/clc697.h:
@@ -516,6 +548,9 @@ generated/g_allclasses.h:
 ../common/sdk/nvidia/inc/class/cl00db.h:
 ../common/sdk/nvidia/inc/class/cl00de.h:
 ../common/sdk/nvidia/inc/nvfixedtypes.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080ecc.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h:
+../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
 ../common/sdk/nvidia/inc/class/cl83de.h:
 ../common/sdk/nvidia/inc/class/cl402c.h:
 ../common/sdk/nvidia/inc/class/cla080.h:
@@ -523,6 +558,7 @@ generated/g_allclasses.h:
 ../common/sdk/nvidia/inc/class/cla084.h:
 ../common/sdk/nvidia/inc/nv_vgpu_types.h:
 ../common/sdk/nvidia/inc/class/cla084_notification.h:
+../common/sdk/nvidia/inc/class/cla083.h:
 ../common/sdk/nvidia/inc/class/cl0060.h:
 ../common/sdk/nvidia/inc/class/clc076.h:
 ../common/sdk/nvidia/inc/class/cla0bc.h:

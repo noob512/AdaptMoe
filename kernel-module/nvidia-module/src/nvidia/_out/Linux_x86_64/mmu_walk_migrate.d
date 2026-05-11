@@ -7,7 +7,7 @@ _out/Linux_x86_64/mmu_walk_migrate.o: \
  ../common/sdk/nvidia/inc/nvmisc.h ../common/shared/inc/compat.h \
  inc/libraries/utils/nvassert.h inc/libraries/utils/nvmacro.h \
  inc/libraries/nvport/nvport.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
@@ -23,7 +23,10 @@ _out/Linux_x86_64/mmu_walk_migrate.o: \
  inc/libraries/nvlog/nvlog_printf.h \
  inc/libraries/nvlog/internal/nvlog_printf_internal.h \
  ../common/sdk/nvidia/inc/mmu_fmt_types.h \
- inc/libraries/containers/btree.h inc/kernel/gpu/mem_mgr/mem_desc.h \
+ inc/libraries/containers/btree.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl90f1.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
+ ../common/sdk/nvidia/inc/nvcfg_sdk.h inc/kernel/gpu/mem_mgr/mem_desc.h \
  generated/g_mem_desc_nvoc.h inc/libraries/nvoc/runtime.h \
  inc/libraries/nvoc/prelude.h inc/libraries/utils/nvmacro.h \
  inc/libraries/nvoc/rtti.h inc/kernel/core/prelude.h \
@@ -34,7 +37,6 @@ _out/Linux_x86_64/mmu_walk_migrate.o: \
  ../common/sdk/nvidia/inc/rs_access.h ../common/sdk/nvidia/inc/nvmisc.h \
  ../common/sdk/nvidia/inc/nvcfg_sdk.h \
  ../common/sdk/nvidia/inc/alloc/alloc_channel.h \
- ../common/sdk/nvidia/inc/nvcfg_sdk.h \
  ../common/sdk/nvidia/inc/class/cl9010.h \
  ../common/sdk/nvidia/inc/class/cl9010_callback.h \
  ../common/inc/nvctassert.h inc/libraries/nvoc/object.h \
@@ -45,7 +47,9 @@ _out/Linux_x86_64/mmu_walk_migrate.o: \
  generated/g_nvh_state.h generated/g_odb.h generated/g_hal.h \
  ../common/sdk/nvidia/inc/rmcd.h ../common/sdk/nvidia/inc/nvcd.h \
  inc/libraries/poolalloc.h inc/libraries/nvport/nvport.h \
- inc/libraries/containers/list.h inc/libraries/containers/type_safety.h
+ inc/libraries/containers/list.h inc/libraries/containers/type_safety.h \
+ inc/kernel/gpu/mem_mgr/rm_page_size.h inc/kernel/os/nv_memory_iterator.h \
+ inc/kernel/os/nv_memory_area.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 src/libraries/mmu/mmu_walk_private.h:
 inc/libraries/mmu/mmu_walk.h:
@@ -62,7 +66,7 @@ inc/libraries/utils/nvmacro.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -86,6 +90,9 @@ inc/libraries/nvlog/nvlog_printf.h:
 inc/libraries/nvlog/internal/nvlog_printf_internal.h:
 ../common/sdk/nvidia/inc/mmu_fmt_types.h:
 inc/libraries/containers/btree.h:
+../common/sdk/nvidia/inc/ctrl/ctrl90f1.h:
+../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
+../common/sdk/nvidia/inc/nvcfg_sdk.h:
 inc/kernel/gpu/mem_mgr/mem_desc.h:
 generated/g_mem_desc_nvoc.h:
 inc/libraries/nvoc/runtime.h:
@@ -102,7 +109,6 @@ arch/nvalloc/common/inc/nvrangetypes.h:
 ../common/sdk/nvidia/inc/nvmisc.h:
 ../common/sdk/nvidia/inc/nvcfg_sdk.h:
 ../common/sdk/nvidia/inc/alloc/alloc_channel.h:
-../common/sdk/nvidia/inc/nvcfg_sdk.h:
 ../common/sdk/nvidia/inc/class/cl9010.h:
 ../common/sdk/nvidia/inc/class/cl9010_callback.h:
 ../common/inc/nvctassert.h:
@@ -124,3 +130,6 @@ inc/libraries/poolalloc.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/containers/list.h:
 inc/libraries/containers/type_safety.h:
+inc/kernel/gpu/mem_mgr/rm_page_size.h:
+inc/kernel/os/nv_memory_iterator.h:
+inc/kernel/os/nv_memory_area.h:

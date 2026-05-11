@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -38,7 +38,7 @@
 #include "rmapi/client_resource.h"
 #include <class/cl0000.h>
 #include <class/cl90cd.h>
-#include <class/cl0005.h>  // NV01_EVENT 
+#include <class/cl0005.h>  // NV01_EVENT
 #include <class/cl003e.h>  // NV01_MEMORY_SYSTEM
 #include <class/cl844c.h>  // G84_PERFBUFFER
 #include <ctrl/ctrl0000/ctrl0000gpu.h>
@@ -68,7 +68,8 @@ subdeviceCtrlCmdOsUnixVidmemPersistenceStatus_IMPL
     nv_state_t *nv   = NV_GET_NV_STATE(pGpu);
     nv_priv_t  *nvp  = NV_GET_NV_PRIV(nv);
 
-    pParams->bVidmemPersistent = (nv->preserve_vidmem_allocations || nvp->s0ix_pm_enabled);
+    pParams->bVidmemPersistent = (nv->preserve_vidmem_allocations || nvp->s0ix_pm_enabled ||
+                                  nv->supports_tegra_igpu_rg);
 
     return NV_OK;
 }
@@ -83,7 +84,7 @@ subdeviceCtrlCmdOsUnixVidmemPersistenceStatus_IMPL
  *
  * @return
  *      NV_OK   Success
- */ 
+ */
 NV_STATUS
 subdeviceCtrlCmdOsUnixUpdateTgpStatus_IMPL
 (

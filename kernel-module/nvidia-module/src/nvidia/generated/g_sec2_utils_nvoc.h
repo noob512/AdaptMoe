@@ -125,13 +125,9 @@ struct NVOC_METADATA__Sec2Utils {
     const struct NVOC_METADATA__Object metadata__Object;
 };
 
-#ifndef __NVOC_CLASS_Sec2Utils_TYPEDEF__
-#define __NVOC_CLASS_Sec2Utils_TYPEDEF__
-typedef struct Sec2Utils Sec2Utils;
-#endif /* __NVOC_CLASS_Sec2Utils_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_Sec2Utils
-#define __nvoc_class_id_Sec2Utils 0x7716b1
+#define __nvoc_class_id_Sec2Utils 0x7716b1u
+typedef struct Sec2Utils Sec2Utils;
 #endif /* __nvoc_class_id_Sec2Utils */
 
 // Casting support
@@ -149,52 +145,57 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_Sec2Utils;
 
 NV_STATUS __nvoc_objCreateDynamic_Sec2Utils(Sec2Utils**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_Sec2Utils(Sec2Utils**, Dynamic*, NvU32, struct OBJGPU *arg_pGpu, KERNEL_MIG_GPU_INSTANCE *arg_pKernelMIGGPUInstance);
-#define __objCreate_Sec2Utils(ppNewObj, pParent, createFlags, arg_pGpu, arg_pKernelMIGGPUInstance) \
-    __nvoc_objCreate_Sec2Utils((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pGpu, arg_pKernelMIGGPUInstance)
+NV_STATUS __nvoc_objCreate_Sec2Utils(Sec2Utils**, Dynamic*, NvU32, struct OBJGPU *pGpu, KERNEL_MIG_GPU_INSTANCE *pKernelMIGGPUInstance);
+#define __objCreate_Sec2Utils(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pGpu, pKernelMIGGPUInstance) \
+    __nvoc_objCreate_Sec2Utils((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pGpu, pKernelMIGGPUInstance)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS sec2utilsConstruct_IMPL(struct Sec2Utils *psec2utils, struct OBJGPU *pGpu, KERNEL_MIG_GPU_INSTANCE *pKernelMIGGPUInstance);
+#define __nvoc_sec2utilsConstruct(psec2utils, pGpu, pKernelMIGGPUInstance) sec2utilsConstruct_IMPL(psec2utils, pGpu, pKernelMIGGPUInstance)
 
-// Dispatch functions
-NV_STATUS sec2utilsConstruct_IMPL(struct Sec2Utils *arg_psec2utils, struct OBJGPU *arg_pGpu, KERNEL_MIG_GPU_INSTANCE *arg_pKernelMIGGPUInstance);
-
-#define __nvoc_sec2utilsConstruct(arg_psec2utils, arg_pGpu, arg_pKernelMIGGPUInstance) sec2utilsConstruct_IMPL(arg_psec2utils, arg_pGpu, arg_pKernelMIGGPUInstance)
 void sec2utilsDestruct_IMPL(struct Sec2Utils *psec2utils);
-
 #define __nvoc_sec2utilsDestruct(psec2utils) sec2utilsDestruct_IMPL(psec2utils)
-NV_STATUS sec2utilsMemset_IMPL(struct Sec2Utils *psec2utils, SEC2UTILS_MEMSET_PARAMS *pParams);
 
+NV_STATUS sec2utilsMemset_IMPL(struct Sec2Utils *psec2utils, SEC2UTILS_MEMSET_PARAMS *pParams);
 #ifdef __nvoc_sec2_utils_h_disabled
 static inline NV_STATUS sec2utilsMemset(struct Sec2Utils *psec2utils, SEC2UTILS_MEMSET_PARAMS *pParams) {
     NV_ASSERT_FAILED_PRECOMP("Sec2Utils was disabled!");
     return NV_ERR_NOT_SUPPORTED;
 }
-#else //__nvoc_sec2_utils_h_disabled
+#else // __nvoc_sec2_utils_h_disabled
 #define sec2utilsMemset(psec2utils, pParams) sec2utilsMemset_IMPL(psec2utils, pParams)
-#endif //__nvoc_sec2_utils_h_disabled
+#endif // __nvoc_sec2_utils_h_disabled
 
 NvU64 sec2utilsUpdateProgress_IMPL(struct Sec2Utils *psec2utils);
-
 #ifdef __nvoc_sec2_utils_h_disabled
 static inline NvU64 sec2utilsUpdateProgress(struct Sec2Utils *psec2utils) {
     NV_ASSERT_FAILED_PRECOMP("Sec2Utils was disabled!");
     return 0;
 }
-#else //__nvoc_sec2_utils_h_disabled
+#else // __nvoc_sec2_utils_h_disabled
 #define sec2utilsUpdateProgress(psec2utils) sec2utilsUpdateProgress_IMPL(psec2utils)
-#endif //__nvoc_sec2_utils_h_disabled
+#endif // __nvoc_sec2_utils_h_disabled
 
 void sec2utilsServiceInterrupts_IMPL(struct Sec2Utils *psec2utils);
-
 #ifdef __nvoc_sec2_utils_h_disabled
 static inline void sec2utilsServiceInterrupts(struct Sec2Utils *psec2utils) {
     NV_ASSERT_FAILED_PRECOMP("Sec2Utils was disabled!");
 }
-#else //__nvoc_sec2_utils_h_disabled
+#else // __nvoc_sec2_utils_h_disabled
 #define sec2utilsServiceInterrupts(psec2utils) sec2utilsServiceInterrupts_IMPL(psec2utils)
-#endif //__nvoc_sec2_utils_h_disabled
+#endif // __nvoc_sec2_utils_h_disabled
 
+
+// Wrapper macros for halified functions
+
+// Dispatch functions
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

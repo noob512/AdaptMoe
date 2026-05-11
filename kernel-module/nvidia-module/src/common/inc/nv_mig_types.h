@@ -33,6 +33,12 @@ typedef NvU32 MIGDeviceId;
 
 #define NO_MIG_DEVICE 0L
 
+/* Convert a MIGDeviceId into a 0-based per-GPU subdevice index. */
+#define MIG_DEVICE_ID_SUBDEV_MASK  0xf0000000
+#define MIG_DEVICE_ID_SUBDEV_SHIFT 28
+
+#define MIG_DEVICE_ID_TO_SUBDEV(migDeviceId) (((migDeviceId) & MIG_DEVICE_ID_SUBDEV_MASK) >> MIG_DEVICE_ID_SUBDEV_SHIFT)
+
 #ifdef __cplusplus
 }
 #endif

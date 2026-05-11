@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -27,9 +27,9 @@
 #include "core/core.h"
 #include "kernel/gpu/nvlink/kernel_nvlink.h"
 #include "kernel/gpu/nvlink/kernel_ioctrl.h"
+#include "utils/nvbitvector.h"
 
 #include "ctrl/ctrl2080/ctrl2080nvlink.h" // rmcontrol params
-
 NV_STATUS nvlinkCtrlCmdBusGetNvlinkCaps(OBJGPU *pGpu, NV2080_CTRL_CMD_NVLINK_GET_NVLINK_CAPS_PARAMS *pParams);
 
 #endif // COMMON_NVLINK_H

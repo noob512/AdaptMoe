@@ -17,14 +17,16 @@ _out/Linux_x86_64/nvkms-hal.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080unix.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gpu.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080gr.h \
- ../common/sdk/nvidia/inc/nvcfg_sdk.h ../common/sdk/nvidia/inc/nvstatus.h \
+ ../common/sdk/nvidia/inc/nvcfg_sdk.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h \
+ ../common/sdk/nvidia/inc/nvstatus.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl30f1.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl5070/ctrl5070system.h \
@@ -54,38 +56,32 @@ _out/Linux_x86_64/nvkms-hal.o: \
  ../common/modeset/hdmipacket/nvhdmi_frlInterface.h \
  ../common/modeset/hdmipacket/nvhdmipkt.h ../common/inc/nvHdmiFrlCommon.h \
  ../common/modeset/hdmipacket/../timing/nvtiming.h ../common/inc/nv_smg.h \
- ../common/inc/nvrmcontext.h ../common/inc/nv_mig_types.h \
- include/nvkms-cursor.h include/nvkms-types.h include/nvkms-hal.h \
- include/nvkms-rm.h ../common/sdk/nvidia/inc/class/cl0092.h \
+ ../common/inc/nvctassert.h ../common/inc/nvrmcontext.h \
+ ../common/inc/nv_mig_types.h include/nvkms-cursor.h \
+ include/nvkms-types.h include/nvkms-hal.h include/nvkms-rm.h \
+ ../common/sdk/nvidia/inc/class/cl0092.h \
  ../common/sdk/nvidia/inc/class/cl0092_callback.h \
- ../common/sdk/nvidia/inc/class/cl9470.h \
- ../common/sdk/nvidia/inc/class/cl9570.h \
- ../common/sdk/nvidia/inc/class/cl9770.h \
- ../common/sdk/nvidia/inc/class/cl9870.h \
- ../common/sdk/nvidia/inc/class/clc370.h \
- ../common/sdk/nvidia/inc/class/clc370_notification.h \
- ../common/sdk/nvidia/inc/class/cl5070.h \
- ../common/sdk/nvidia/inc/class/cl5070_notification.h \
  ../common/sdk/nvidia/inc/class/clc570.h \
  ../common/sdk/nvidia/inc/class/clc670.h \
  ../common/sdk/nvidia/inc/class/clc770.h \
+ ../common/sdk/nvidia/inc/class/clc970.h \
  ../common/sdk/nvidia/inc/class/clca70.h \
  ../common/sdk/nvidia/inc/class/clcb70.h \
- ../common/sdk/nvidia/inc/class/cl947d.h \
- ../common/sdk/nvidia/inc/class/cl957d.h \
- ../common/sdk/nvidia/inc/class/cl977d.h \
- ../common/sdk/nvidia/inc/class/cl987d.h \
- ../common/sdk/nvidia/inc/class/clc37d.h \
- ../common/sdk/nvidia/inc/class/clc37e.h \
+ ../common/sdk/nvidia/inc/class/clcc70.h \
+ ../common/sdk/nvidia/inc/class/cla083.h \
  ../common/sdk/nvidia/inc/class/clc57d.h \
  ../common/sdk/nvidia/inc/class/clc57e.h \
  ../common/sdk/nvidia/inc/class/clc67d.h \
  ../common/sdk/nvidia/inc/class/clc67e.h \
  ../common/sdk/nvidia/inc/class/clc77d.h \
+ ../common/sdk/nvidia/inc/class/clc97d.h \
+ ../common/sdk/nvidia/inc/class/clc97e.h \
  ../common/sdk/nvidia/inc/class/clca7d.h \
  ../common/sdk/nvidia/inc/class/clca7e.h \
  ../common/sdk/nvidia/inc/class/clcb7d.h \
- ../common/sdk/nvidia/inc/class/clcb7e.h
+ ../common/sdk/nvidia/inc/class/clcb7e.h \
+ ../common/sdk/nvidia/inc/class/clcc7d.h \
+ ../common/sdk/nvidia/inc/class/clcc7e.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 include/nvkms-types.h:
 os-interface/include/nvidia-modeset-os-interface.h:
@@ -111,7 +107,7 @@ interface/nvkms-format.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h:
-../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080unix.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gpu.h:
@@ -119,6 +115,7 @@ interface/nvkms-format.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080gr.h:
 ../common/sdk/nvidia/inc/nvcfg_sdk.h:
+../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h:
 ../common/sdk/nvidia/inc/nvstatus.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl30f1.h:
@@ -157,6 +154,7 @@ include/nvkms-prealloc-types.h:
 ../common/inc/nvHdmiFrlCommon.h:
 ../common/modeset/hdmipacket/../timing/nvtiming.h:
 ../common/inc/nv_smg.h:
+../common/inc/nvctassert.h:
 ../common/inc/nvrmcontext.h:
 ../common/inc/nv_mig_types.h:
 include/nvkms-cursor.h:
@@ -165,31 +163,24 @@ include/nvkms-hal.h:
 include/nvkms-rm.h:
 ../common/sdk/nvidia/inc/class/cl0092.h:
 ../common/sdk/nvidia/inc/class/cl0092_callback.h:
-../common/sdk/nvidia/inc/class/cl9470.h:
-../common/sdk/nvidia/inc/class/cl9570.h:
-../common/sdk/nvidia/inc/class/cl9770.h:
-../common/sdk/nvidia/inc/class/cl9870.h:
-../common/sdk/nvidia/inc/class/clc370.h:
-../common/sdk/nvidia/inc/class/clc370_notification.h:
-../common/sdk/nvidia/inc/class/cl5070.h:
-../common/sdk/nvidia/inc/class/cl5070_notification.h:
 ../common/sdk/nvidia/inc/class/clc570.h:
 ../common/sdk/nvidia/inc/class/clc670.h:
 ../common/sdk/nvidia/inc/class/clc770.h:
+../common/sdk/nvidia/inc/class/clc970.h:
 ../common/sdk/nvidia/inc/class/clca70.h:
 ../common/sdk/nvidia/inc/class/clcb70.h:
-../common/sdk/nvidia/inc/class/cl947d.h:
-../common/sdk/nvidia/inc/class/cl957d.h:
-../common/sdk/nvidia/inc/class/cl977d.h:
-../common/sdk/nvidia/inc/class/cl987d.h:
-../common/sdk/nvidia/inc/class/clc37d.h:
-../common/sdk/nvidia/inc/class/clc37e.h:
+../common/sdk/nvidia/inc/class/clcc70.h:
+../common/sdk/nvidia/inc/class/cla083.h:
 ../common/sdk/nvidia/inc/class/clc57d.h:
 ../common/sdk/nvidia/inc/class/clc57e.h:
 ../common/sdk/nvidia/inc/class/clc67d.h:
 ../common/sdk/nvidia/inc/class/clc67e.h:
 ../common/sdk/nvidia/inc/class/clc77d.h:
+../common/sdk/nvidia/inc/class/clc97d.h:
+../common/sdk/nvidia/inc/class/clc97e.h:
 ../common/sdk/nvidia/inc/class/clca7d.h:
 ../common/sdk/nvidia/inc/class/clca7e.h:
 ../common/sdk/nvidia/inc/class/clcb7d.h:
 ../common/sdk/nvidia/inc/class/clcb7e.h:
+../common/sdk/nvidia/inc/class/clcc7d.h:
+../common/sdk/nvidia/inc/class/clcc7e.h:

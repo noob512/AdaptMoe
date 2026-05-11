@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -28,6 +28,9 @@
 #include "core/core.h"
 #include "gpu/gpu.h"
 #include "ctrl/ctrl2080.h"
+
+#include "gpu/mem_mgr/mem_mgr.h"
+#include "kernel/gpu/mig_mgr/kernel_mig_manager.h"
 
 #include "gpu/gsp/gsp_static_config.h"  // CORERM-3199
 
@@ -139,6 +142,30 @@ NV_STATUS gpuInitBranding_FWCLIENT(OBJGPU *pGpu)
 }
 
 NV_STATUS
+gpuGetPdi_FWCLIENT
+(
+    OBJGPU *pGpu,
+    NvU64  *pdi
+)
+{
+    GspStaticConfigInfo *pGSCI = GPU_GET_GSP_STATIC_INFO(pGpu);
+
+    if (pGSCI->bPdiValid)
+    {
+        *pdi = pGSCI->pdi;
+        return NV_OK;
+    }
+    else if (!IS_SILICON(pGpu))
+    {
+        // SHA1 generated from string "Nvidia" => "0xA7C66AD26DBB0AB8C1A237BA6DBA36B8"
+        *pdi = 0x6DBB0AB8A7C66AD2;
+        return NV_OK;
+    }
+
+    return NV_ERR_INVALID_STATE;
+}
+
+NV_STATUS
 gpuGenGidData_FWCLIENT
 (
     OBJGPU *pGpu,
@@ -162,14 +189,6 @@ gpuGenGidData_FWCLIENT
         return NV_OK;
     }
     return NV_ERR_NOT_SUPPORTED;
-}
-
-NvU64 gpuGetActiveFBIOs_FWCLIENT(OBJGPU *pGpu)
-{
-    GspStaticConfigInfo *pGSCI = GPU_GET_GSP_STATIC_INFO(pGpu);
-    NV_ASSERT_OR_RETURN(pGSCI != NULL, 0);
-
-    return pGSCI->fbio_mask;
 }
 
 NvBool gpuIsGlobalPoisonFuseEnabled_FWCLIENT(OBJGPU *pGpu)
@@ -245,7 +264,7 @@ gpuConstructDeviceInfoTable_FWCLIENT
     for (NvU32 i = 0; i < pParams->numEntries; i++)
     {
         NV2080_CTRL_INTERNAL_DEVICE_INFO *pSrc = &pParams->deviceInfoTable[i];
-        pGpu->pDeviceInfoTable[i] = (DEVICE_INFO2_ENTRY){
+        pGpu->pDeviceInfoTable[i] = (DEVICE_INFO_ENTRY){
             .faultId                = pSrc->faultId,
             .instanceId             = pSrc->instanceId,
             .typeEnum               = pSrc->typeEnum,
@@ -269,22 +288,13 @@ NV_STATUS
 gpuGetNameString_FWCLIENT
 (
     OBJGPU *pGpu,
-    NvU32 type,
     void *nameStringBuffer
 )
 {
     GspStaticConfigInfo *pGSCI = GPU_GET_GSP_STATIC_INFO(pGpu);
 
-    if (type == NV2080_CTRL_GPU_GET_NAME_STRING_FLAGS_TYPE_ASCII)
-    {
-        portMemCopy(nameStringBuffer, sizeof(pGSCI->gpuNameString),
-                    pGSCI->gpuNameString, sizeof(pGSCI->gpuNameString));
-    }
-    else
-    {
-        portMemCopy(nameStringBuffer, sizeof(pGSCI->gpuNameString_Unicode),
-                    pGSCI->gpuNameString_Unicode, sizeof(pGSCI->gpuNameString_Unicode));
-    }
+    portMemCopy(nameStringBuffer, sizeof(pGSCI->gpuNameString),
+                pGSCI->gpuNameString, sizeof(pGSCI->gpuNameString));
 
     return NV_OK;
 }
@@ -360,3 +370,17 @@ gpuResetRequiredStateChanged_FWCLIENT
     return NV_OK;
 }
 
+NvBool
+gpuIsSystemRebootRequired_FWCLIENT
+(
+    OBJGPU *pGpu
+)
+{
+    GspStaticConfigInfo *pGSCI = GPU_GET_GSP_STATIC_INFO(pGpu);
+    if (pGSCI == NULL)
+    {
+        return NV_FALSE;
+    }
+
+    return pGSCI->bSystemRebootRequired;
+}

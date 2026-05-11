@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2014-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2014-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -100,6 +100,8 @@ typedef struct NV2080_CTRL_CE_GET_CAPS_V2_PARAMS {
 #define NV2080_CTRL_CE_CAPS_CE_SUPPORTS_PIPELINED_BL         1:0x02
 #define NV2080_CTRL_CE_CAPS_CE_CC_SECURE                     1:0x04
 #define NV2080_CTRL_CE_CAPS_CE_DECOMP_SUPPORTED              1:0x08
+#define NV2080_CTRL_CE_CAPS_CE_CC_WORK_SUBMIT                1:0x10
+#define NV2080_CTRL_CE_CAPS_CE_SCRUB                         1:0x40
 
 /*
  *   NV2080_CTRL_CE_CAPS_CE_GRCE
@@ -140,6 +142,12 @@ typedef struct NV2080_CTRL_CE_GET_CAPS_V2_PARAMS {
  *   NV2080_CTRL_CE_CAPS_CE_DECOMP_SUPPORTED
  *     Set if the CE is capable of handling decompression workloads;
  *     async copies will not be supported on the same CE
+ *
+ *   NV2080_CTRL_CE_CAPS_CE_CC_WORK_SUBMIT
+ *     Set if the CE can be used for work launch/completion in CC mode
+ *
+ *   NV2080_CTRL_CE_CAPS_CE_SCRUB
+ *     Set if the CE can be used for fast scrubbing
  */
 
 /*
@@ -421,6 +429,7 @@ typedef enum NV2080_CTRL_CE_LCE_TYPE {
     NV2080_CTRL_CE_LCE_TYPE_PCIE_WR = 7,
     NV2080_CTRL_CE_LCE_TYPE_C2C_H2D = 8,
     NV2080_CTRL_CE_LCE_TYPE_C2C_D2H = 9,
+    NV2080_CTRL_CE_LCE_TYPE_CC_WORK_SUBMIT = 10,
 } NV2080_CTRL_CE_LCE_TYPE;
 
 /*
@@ -430,6 +439,8 @@ typedef enum NV2080_CTRL_CE_LCE_TYPE {
  *
  *  [in] lceType
  *      LCE type. Should be one of NV2080_CTRL_CE_LCE_TYPE_* values.
+ *  [in] metadataForLceType
+ *      Metadata for LCE type.
  *  [out] numPces
  *      Number of PCEs supported per LCE
  *  [out] numLces
@@ -450,6 +461,7 @@ typedef enum NV2080_CTRL_CE_LCE_TYPE {
 
 typedef struct NV2080_CTRL_INTERNAL_CE_GET_PCE_CONFIG_FOR_LCE_TYPE_PARAMS {
     NV2080_CTRL_CE_LCE_TYPE lceType;
+    NvU32                   metadataForLceType;
     NvU32                   numPces;
     NvU32                   numLces;
     NvU32                   supportedPceMask;
@@ -498,5 +510,60 @@ typedef struct NV2080_CTRL_CE_IS_DECOMP_LCE_ENABLED_PARAMS {
     NvU32  lceIndex;
     NvBool bDecompEnabled;
 } NV2080_CTRL_CE_IS_DECOMP_LCE_ENABLED_PARAMS;
+
+/*
+ * NV2080_CTRL_CMD_INTERNAL_CE_GET_PCE_CONFIG_FOR_LCE_MIG_GPU_INSTANCE
+ *
+ * This command queries the PCE config required for the specified MIG GPU Instance.
+ * Mappings will prioritize utilizing 1 LCE each for sysmem read and write if available
+ * and ensure maximum number of PCEs are allocated for those LCEs to allow maximum bandwidth.
+ *
+ * [in] lceMask
+ *    Mask of LCEs which are being requested
+ * [in] numLCEs
+ *    Number of LCEs available for this GPU Instance
+ * [out] pceAvailableMask
+ *    Mask of PCEs which are available for this specific LCE mask given
+ * [out] numLcesToMap
+ *    Number of LCEs to map based on total num LCEs given
+ * [out] lceAvailableMask
+ *    Mask of LCEs which should be mapped for this GPU Instance based on num LCEs given
+ * [out] numMinPcesPerLce
+ *    Number of PCEs to be mapped for each LCE
+ */
+
+#define NV2080_CTRL_CMD_INTERNAL_CE_GET_PCE_CONFIG_FOR_LCE_MIG_GPU_INSTANCE (0x20802a13) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_0_CE_INTERFACE_ID << 8) | NV2080_CTRL_CMD_INTERNAL_CE_GET_PCE_CONFIG_FOR_LCE_MIG_GPU_INSTANCE_PARAMS_MESSAGE_ID" */
+
+#define NV2080_CTRL_CMD_INTERNAL_CE_GET_PCE_CONFIG_FOR_LCE_MIG_GPU_INSTANCE_PARAMS_MESSAGE_ID (0x13U)
+
+typedef struct NV2080_CTRL_CMD_INTERNAL_CE_GET_PCE_CONFIG_FOR_LCE_MIG_GPU_INSTANCE_PARAMS {
+    NvU32 lceMask;
+    NvU32 numLces;
+    NvU32 pceAvailableMask;
+    NvU32 numLcesToMap;
+    NvU32 lceAvailableMask;
+    NvU32 numMinPcesPerLce;
+} NV2080_CTRL_CMD_INTERNAL_CE_GET_PCE_CONFIG_FOR_LCE_MIG_GPU_INSTANCE_PARAMS;
+
+/*
+ * NV2080_CTRL_CE_UPDATE_PCE_LCE_MIG_MAPPINGS
+ *
+ * Apply CE Mappings for MIG GPU Instance
+ *
+ * [in] pceLceMap
+ *    Array of mappings indexed by PCE
+ * [in] lceAvailableMask
+ *    Mask of LCEs available to this MIG GPU Instance
+ */
+
+#define NV2080_CTRL_CE_UPDATE_PCE_LCE_MIG_MAPPINGS (0x20802a14) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_0_CE_INTERFACE_ID << 8) | NV2080_CTRL_CE_UPDATE_PCE_LCE_MIG_MAPPINGS_PARAMS_MESSAGE_ID" */
+
+#define NV2080_CTRL_CE_UPDATE_PCE_LCE_MIG_MAPPINGS_PARAMS_MESSAGE_ID (0x14U)
+
+typedef struct NV2080_CTRL_CE_UPDATE_PCE_LCE_MIG_MAPPINGS_PARAMS {
+    NvU32 pceLceMap[NV2080_CTRL_MAX_PCES];
+    NvU32 lceAvailableMask;
+    NvU32 shimInstance;
+} NV2080_CTRL_CE_UPDATE_PCE_LCE_MIG_MAPPINGS_PARAMS;
 
 /* _ctrl2080ce_h_ */

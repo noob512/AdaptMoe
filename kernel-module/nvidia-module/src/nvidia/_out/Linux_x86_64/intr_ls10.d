@@ -96,7 +96,8 @@ _out/Linux_x86_64/intr_ls10.o: \
  ../common/inc/swref/published/nvswitch/ls10/dev_nxbar_tcp_global_ip.h \
  ../common/inc/swref/published/nvswitch/ls10/dev_nxbar_tile_ip.h \
  ../common/inc/swref/published/nvswitch/ls10/dev_nxbar_tileout_ip.h \
- ../common/inc/swref/published/nvswitch/ls10/dev_ctrl_ip_addendum.h
+ ../common/inc/swref/published/nvswitch/ls10/dev_ctrl_ip_addendum.h \
+ ../common/nvswitch/kernel/inc/ls10/minion_nvlink_defines_public_ls10.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 ../common/nvswitch/kernel/inc/common_nvswitch.h:
 ../common/nvlink/interface/nvlink.h:
@@ -201,3 +202,4 @@ arch/nvalloc/common/inc/fsp/fsp_tnvl_rpc.h:
 ../common/inc/swref/published/nvswitch/ls10/dev_nxbar_tile_ip.h:
 ../common/inc/swref/published/nvswitch/ls10/dev_nxbar_tileout_ip.h:
 ../common/inc/swref/published/nvswitch/ls10/dev_ctrl_ip_addendum.h:
+../common/nvswitch/kernel/inc/ls10/minion_nvlink_defines_public_ls10.h:

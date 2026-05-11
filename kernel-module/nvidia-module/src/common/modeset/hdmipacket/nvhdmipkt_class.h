@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2012-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -19,10 +19,10 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
- *
- * File:      nvhdmipkt_class.h
- *
- * Purpose:   This file contains hdmipkt class definition. Which defines class interfaces.
+ */
+
+/** @file  nvhdmipkt_class.h
+ ** @brief This file contains hdmipkt class definition. Which defines class interfaces.
  */
 
 #ifndef _NVHDMIPKT_CLASS_H_
@@ -52,6 +52,7 @@ typedef enum
     NVHDMIPKT_C971_CLASS = 10, // NVD5.0
     NVHDMIPKT_CA71_CLASS = 11,
     NVHDMIPKT_CB71_CLASS = 12,
+    NVHDMIPKT_CC71_CLASS = 13,
     NVHDMIPKT_INVALID_CLASS   // Not to be used by client, and always the last entry here.
 } NVHDMIPKT_CLASS_ID;
 
@@ -169,12 +170,15 @@ struct tagNVHDMIPKT_CLASS
     // capacity required for target timing.
     //
     NVHDMIPKT_RESULT
-    (*hdmiAssessLinkCapabilities)  (NVHDMIPKT_CLASS             *pThis,
-                                    NvU32                        subDevice,
-                                    NvU32                        displayId,
+    (*hdmiAssessLinkCapabilities)  (NVHDMIPKT_CLASS      *pThis,
+                                    NvU32                 subDevice,
+                                    NvU32                 displayId,
                                     NVT_EDID_INFO         const * const pSinkEdid,
-                                    HDMI_SRC_CAPS               *pSrcCaps,
-                                    HDMI_SINK_CAPS              *pSinkCaps);
+                                    const NvBool          bPerformLinkTrainingToAssess,
+                                    const NvBool          bIsDisplayActive,
+                                    HDMI_FRL_DATA_RATE    currFRLRate,
+                                    HDMI_SRC_CAPS        *pSrcCaps,
+                                    HDMI_SINK_CAPS       *pSinkCaps);
     NVHDMIPKT_RESULT
     (*hdmiQueryFRLConfig)       (NVHDMIPKT_CLASS                     *pThis,
                                  HDMI_VIDEO_TRANSPORT_INFO     const * const pVidTransInfo,

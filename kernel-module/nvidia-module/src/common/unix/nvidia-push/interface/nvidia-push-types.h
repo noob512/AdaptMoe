@@ -85,8 +85,6 @@ typedef struct _NvPushChannelRec *NvPushChannelPtr;
 
 typedef struct _nv_push_hal {
     void (*kickoff)(struct _NvPushChannelRec*, NvU32 oldGpPut, NvU32 newGpPut);
-    void (*releaseTimelineSemaphore)(NvPushChannelPtr, void *cpuAddress, NvU64 gpuAddress, NvU64 val);
-    void (*acquireTimelineSemaphore)(NvPushChannelPtr, NvU64 gpuAddress, NvU64 val);
     struct {
         /* Requires USERD memory to be specified at channel allocation */
         NvU32 clientAllocatesUserD                      :1;
@@ -94,9 +92,6 @@ typedef struct _nv_push_hal {
         /* On Tegra, we currently need to allocate double the requested GPFIFO
          * entries */
         NvU32 allocateDoubleSizeGpFifo                  :1;
-
-        /* Use Volta+ semaphore methods */
-        NvU32 voltaSemMethods                           :1;
 
         NvU32 extendedBase                              :1;
     } caps;
@@ -106,7 +101,6 @@ typedef struct _NvPushDeviceRec {
 
     void           *hostDevice;     /* Provided by the host driver */
 
-    NvBool          hostLBoverflowBug1667921 : 1;
     NvBool          clientSli : 1;   /* Provided by the host driver */
     NvBool          hasFb : 1;       /* Computed from supportedClasses[] */
 

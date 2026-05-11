@@ -22,7 +22,7 @@ _out/Linux_x86_64/nvidia-3d-surface.o: \
  ../common/unix/nvidia-3d/interface/nvidia-3d-types.h \
  ../common/unix/nvidia-push/interface/nvidia-push-methods.h \
  ../common/unix/nvidia-push/interface/nvidia-push-types.h \
- ../common/sdk/nvidia/inc/class/cla16f.h \
+ ../common/sdk/nvidia/inc/class/clc46f.h \
  ../common/unix/nvidia-3d/interface/nvidia-3d-shaders.h \
  ../common/sdk/nvidia/inc/class/cl9097.h \
  ../common/unix/nvidia-3d/include/nvidia-3d-surface.h \
@@ -55,7 +55,7 @@ _out/Linux_x86_64/nvidia-3d-surface.o: \
 ../common/unix/nvidia-3d/interface/nvidia-3d-types.h:
 ../common/unix/nvidia-push/interface/nvidia-push-methods.h:
 ../common/unix/nvidia-push/interface/nvidia-push-types.h:
-../common/sdk/nvidia/inc/class/cla16f.h:
+../common/sdk/nvidia/inc/class/clc46f.h:
 ../common/unix/nvidia-3d/interface/nvidia-3d-shaders.h:
 ../common/sdk/nvidia/inc/class/cl9097.h:
 ../common/unix/nvidia-3d/include/nvidia-3d-surface.h:

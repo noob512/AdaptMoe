@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -29,6 +29,8 @@
 #include "platform/sli/sli.h"
 #include "nv_ref.h"
 
+#include "gpu/hfrp/kernel_hfrp.h"
+
 // Following enums are duplicated in 'apps/nvbucket/oca/ocarm.h'.
 typedef enum {
     BAD_READ_GPU_OFF_BUS = 1,
@@ -39,15 +41,13 @@ typedef enum {
     BAD_READ_UNKNOWN,
 } RMCD_BAD_READ_REASON;
 
-static void   _gpuCleanRegisterFilterList(DEVICE_REGFILTER_INFO *);
-static NvU32  _gpuHandleReadRegisterFilter(OBJGPU *, DEVICE_INDEX devIndex, NvU32 devInstance, NvU32 addr, NvU32 accessSize, NvU32 *pFlags, THREAD_STATE_NODE *pThreadState);
-static void   _gpuHandleWriteRegisterFilter(OBJGPU *, DEVICE_INDEX devIndex, NvU32 devInstance, NvU32 addr, NvU32 val, NvU32 accessSize, NvU32 *pFlags, THREAD_STATE_NODE *pThreadState);
-
 static void   ioaprtWriteRegUnicast(OBJGPU *, IoAperture *pAperture, NvU32 addr, NvV32 val, NvU32 size);
 static NvU32  ioaprtReadReg(IoAperture *pAperture, NvU32 addr, NvU32 size);
 
-static REGISTER_FILTER * _findGpuRegisterFilter(DEVICE_INDEX devIndex, NvU32 devInstance, NvU32 addr, REGISTER_FILTER *);
 static NV_STATUS _gpuInitIOAperture(OBJGPU *pGpu, NvU32 deviceIndex, DEVICE_MAPPING *pMapping);
+
+NvU32  gpuHandleReadRegisterFilter(OBJGPU *, DEVICE_INDEX devIndex, NvU32 devInstance, NvU32 addr, NvU32 accessSize, NvU32 *pFlags, THREAD_STATE_NODE *pThreadState, NvBool bAcquireThreadState);
+void   gpuHandleWriteRegisterFilter(OBJGPU *, DEVICE_INDEX devIndex, NvU32 devInstance, NvU32 addr, NvU32 val, NvU32 accessSize, NvU32 *pFlags, THREAD_STATE_NODE *pThreadState, NvBool bAcquireThreadState);
 
 NV_STATUS
 regAccessConstruct
@@ -193,7 +193,7 @@ _regWriteUnicast
         return;
     }
 
-    _gpuHandleWriteRegisterFilter(pGpu, deviceIndex, instance, addr, val, size, &flags, pThreadState);
+    gpuHandleWriteRegisterFilter(pGpu, deviceIndex, instance, addr, val, size, &flags, pThreadState, NV_FALSE);
 
     if (!(flags & REGISTER_FILTER_FLAGS_WRITE))
     {
@@ -260,9 +260,11 @@ ioaprtConstruct_IMPL
     DEVICE_MAPPING  *pMapping,
     NvU32            mappingStartAddr,
     NvU32            offset,
-    NvU32            length
+    NvU64            length
 )
 {
+    NV_ASSERT_OR_RETURN(length > 0, NV_ERR_INVALID_ARGUMENT);
+
     if (pParentAperture != NULL)
     {
         NV_ASSERT_OR_RETURN(pMapping == NULL, NV_ERR_INVALID_ARGUMENT);
@@ -279,7 +281,7 @@ ioaprtConstruct_IMPL
         if ((length + offset) > pParentAperture->length)
         {
             NV_PRINTF(LEVEL_WARNING,
-                "Child aperture crosses parent's boundary, length %u offset %u, Parent's length %u\n",
+                "Child aperture crosses parent's boundary, length 0x%llx offset 0x%x, Parent's length 0x%llx\n",
                 length, offset, pParentAperture->length);
         }
 
@@ -303,6 +305,18 @@ ioaprtConstruct_IMPL
     return NV_OK;
 }
 
+void
+ioaprtDestruct_IMPL
+(
+    IoAperture *pAperture
+)
+{
+    if (pAperture != NULL)
+    {
+        pAperture->length = 0;
+    }
+}
+
 static void
 ioaprtWriteRegUnicast
 (
@@ -320,7 +334,8 @@ ioaprtWriteRegUnicast
     DEVICE_MAPPING    *pMapping    = pAperture->pMapping;
     NvU32              flags       = 0;
     NV_STATUS          status;
-    THREAD_STATE_NODE *pThreadState;
+
+    NV_ASSERT_OR_RETURN_VOID(ioaprtIsInitialized(pAperture));
 
     if (!pGpu->getProperty(pGpu, PDB_PROP_GPU_TEGRA_SOC_NVDISPLAY))
     {
@@ -330,10 +345,8 @@ ioaprtWriteRegUnicast
             return;
         }
 
-        threadStateGetCurrentUnchecked(&pThreadState, pGpu);
-
-        _gpuHandleWriteRegisterFilter(pGpu, deviceIndex, instance, regAddr,
-                                      val, size, &flags, pThreadState);
+        gpuHandleWriteRegisterFilter(pGpu, deviceIndex, instance, regAddr,
+                                      val, size, &flags, NULL, NV_TRUE);
     }
 
     if (!(flags & REGISTER_FILTER_FLAGS_WRITE))
@@ -486,7 +499,8 @@ ioaprtReadReg
     NvU32              deviceIndex = pAperture->deviceIndex;
     NvU32              instance    = pAperture->deviceInstance;
     DEVICE_MAPPING    *pMapping    = pAperture->pMapping;
-    THREAD_STATE_NODE *pThreadState;
+
+    NV_ASSERT_OR_RETURN(ioaprtIsInitialized(pAperture), 0);
 
     pGpu->registerAccess.regReadCount++;
 
@@ -498,10 +512,8 @@ ioaprtReadReg
             return (~0);
         }
 
-        threadStateGetCurrentUnchecked(&pThreadState, pGpu);
-
-        returnValue = _gpuHandleReadRegisterFilter(pGpu, deviceIndex, instance,
-                                                   regAddr, size, &flags, pThreadState);
+        returnValue = gpuHandleReadRegisterFilter(pGpu, deviceIndex, instance,
+                                                   regAddr, size, &flags, NULL, NV_TRUE);
     }
 
     if (!(flags & REGISTER_FILTER_FLAGS_READ))
@@ -619,8 +631,8 @@ _regRead
     if (status != NV_OK)
         return returnValue;
 
-    returnValue = _gpuHandleReadRegisterFilter(pGpu, deviceIndex, instance,
-                                               addr, size, &flags, pThreadState);
+    returnValue = gpuHandleReadRegisterFilter(pGpu, deviceIndex, instance,
+                                               addr, size, &flags, pThreadState, NV_FALSE);
 
     if (!(flags & REGISTER_FILTER_FLAGS_READ))
     {
@@ -776,451 +788,6 @@ _gpuInitIOAperture
     }
 
     return NV_OK;
-}
-
-
-NV_STATUS
-regAddRegisterFilter
-(
-    RegisterAccess *pRegisterAccess,
-    NvU32 flags,
-    DEVICE_INDEX devIndex, NvU32 devInstance,
-    NvU32 rangeStart, NvU32 rangeEnd,
-    GpuWriteRegCallback pWriteCallback,
-    GpuReadRegCallback pReadCallback,
-    void *pParam,
-    REGISTER_FILTER **ppFilter
-)
-{
-    DEVICE_REGFILTER_INFO *pRegFilter;
-    REGISTER_FILTER     *pNode;
-    REGISTER_FILTER     *pTmpNode;
-    DEVICE_MAPPING      *pMapping;
-
-    NV_ASSERT_OR_RETURN(devIndex < DEVICE_INDEX_MAX, NV_ERR_INVALID_ARGUMENT);
-    NV_ASSERT_OR_RETURN(pRegisterAccess != NULL, NV_ERR_INVALID_ARGUMENT);
-    NV_ASSERT_OR_RETURN(ppFilter != NULL, NV_ERR_INVALID_ARGUMENT);
-
-    // Get the device filter
-    pMapping = gpuGetDeviceMapping(pRegisterAccess->pGpu, devIndex, devInstance);
-    NV_ASSERT_OR_RETURN(pMapping != NULL, NV_ERR_INVALID_ARGUMENT);
-
-    pRegFilter = &pMapping->devRegFilterInfo;
-
-    if (!pWriteCallback && !pReadCallback)
-    {
-        // At least one register callback needs to be passed.
-        NV_PRINTF(LEVEL_ERROR,
-                  "Need to specify at least one callback function.\n");
-
-        return NV_ERR_NOT_SUPPORTED;
-    }
-
-    NV_ASSERT(!(flags & REGISTER_FILTER_FLAGS_INVALID));
-
-    if ((flags & REGISTER_FILTER_FLAGS_READ) && !pReadCallback)
-    {
-        // If REGISTER_FILTER_FLAGS_READ is specified, then a read
-        // callback must also be specified.
-        NV_PRINTF(LEVEL_ERROR,
-                  "REGISTER_FILTER_FLAGS_READ requires a read callback function.\n");
-
-        return NV_ERR_INVALID_ARGUMENT;
-    }
-
-    if ((flags & REGISTER_FILTER_FLAGS_WRITE) && !pWriteCallback)
-    {
-        // If REGISTER_FILTER_FLAGS_WRITE is specified, then a write
-        // callback must also be specified.
-        NV_PRINTF(LEVEL_ERROR,
-                  "REGISTER_FILTER_FLAGS_WRITE requires a write callback function.\n");
-
-        return NV_ERR_INVALID_ARGUMENT;
-    }
-
-    // If the regfilter hasn't been used yet, then allocate a lock
-    if (NULL == pRegFilter->pRegFilterLock)
-    {
-        // Allocate spinlock for reg filter access
-        pRegFilter->pRegFilterLock = portSyncSpinlockCreate(portMemAllocatorGetGlobalNonPaged());
-        NV_ASSERT_OR_RETURN(pRegFilter->pRegFilterLock != NULL, NV_ERR_INSUFFICIENT_RESOURCES);
-    }
-
-    portSyncSpinlockAcquire(pRegFilter->pRegFilterLock);
-
-    if (NULL != pRegFilter->pRegFilterRecycleList)
-    {
-        pNode = pRegFilter->pRegFilterRecycleList;
-        pRegFilter->pRegFilterRecycleList = pNode->pNext;
-    }
-    else
-    {
-        portSyncSpinlockRelease(pRegFilter->pRegFilterLock);
-        pNode = portMemAllocNonPaged(sizeof(REGISTER_FILTER));
-        if (NULL == pNode)
-        {
-            return NV_ERR_NO_MEMORY;
-        }
-        portSyncSpinlockAcquire(pRegFilter->pRegFilterLock);
-    }
-
-    // Print a warning if there's another register filter already registered.
-    if (((pTmpNode = _findGpuRegisterFilter(devIndex, devInstance, rangeStart, pRegFilter->pRegFilterList)) != NULL) ||
-        ((pTmpNode = _findGpuRegisterFilter(devIndex, devInstance, rangeEnd,   pRegFilter->pRegFilterList)) != NULL))
-    {
-            NV_PRINTF(LEVEL_WARNING,
-                      "WARNING!! Previously registered reg filter found. Handle: %p, dev: "
-                      "%d(%d) Range : 0x%x - 0x%x, WR/RD Callback: %p/%p, flags : %x\n",
-                      pTmpNode, pTmpNode->devIndex, pTmpNode->devInstance,
-                      pTmpNode->rangeStart, pTmpNode->rangeEnd,
-                      pTmpNode->pWriteCallback, pTmpNode->pReadCallback,
-                      pTmpNode->flags);
-    }
-
-    // Populate structure
-    pNode->flags          = flags;
-    pNode->devIndex       = devIndex;
-    pNode->devInstance    = devInstance;
-    pNode->rangeStart     = rangeStart;
-    pNode->rangeEnd       = rangeEnd;
-    pNode->pWriteCallback = pWriteCallback;
-    pNode->pReadCallback  = pReadCallback;
-    pNode->pParam         = pParam;
-
-    // Link in
-    pNode->pNext = pRegFilter->pRegFilterList;
-    pRegFilter->pRegFilterList = pNode;
-
-    // return pNode
-    *ppFilter = pNode;
-
-    portSyncSpinlockRelease(pRegFilter->pRegFilterLock);
-    return NV_OK;
-}
-
-void
-regRemoveRegisterFilter
-(
-    RegisterAccess *pRegisterAccess,
-    REGISTER_FILTER *pFilter
-)
-{
-    REGISTER_FILTER       *pNode;
-    REGISTER_FILTER       *pPrev = NULL;
-    REGISTER_FILTER       *pNext = NULL;
-    DEVICE_REGFILTER_INFO *pRegFilter;
-    DEVICE_MAPPING        *pMapping;
-
-    // Get the device filter
-    pMapping = gpuGetDeviceMapping(pRegisterAccess->pGpu, pFilter->devIndex, pFilter->devInstance);
-    NV_ASSERT_OR_RETURN_VOID(pMapping != NULL);
-
-    pRegFilter = &pMapping->devRegFilterInfo;
-
-    portSyncSpinlockAcquire(pRegFilter->pRegFilterLock);
-    pNode = pRegFilter->pRegFilterList;
-    while (pNode)
-    {
-        //
-        // we could have used a doubly linked list to do a quick removal, but
-        // iterating the list to find the match serves as sanity test, so let's
-        // stick with a singly linked list.
-        //
-        if (pNode == pFilter)
-        {
-            if (pRegFilter->regFilterRefCnt > 0)
-            {
-                // defer removal if another thread is working on the list
-                pNode->flags |= REGISTER_FILTER_FLAGS_INVALID;
-                pRegFilter->bRegFilterNeedRemove = NV_TRUE;
-                portSyncSpinlockRelease(pRegFilter->pRegFilterLock);
-                return;
-            }
-
-            // Unlink
-            pNext = pNode->pNext;
-
-            // place on recycle list
-            pNode->pNext = pRegFilter->pRegFilterRecycleList;
-            pRegFilter->pRegFilterRecycleList = pNode;
-
-            if (pPrev)
-            {
-                pPrev->pNext = pNext;
-            }
-            else
-            {
-                pRegFilter->pRegFilterList = pNext;
-            }
-
-            portSyncSpinlockRelease(pRegFilter->pRegFilterLock);
-            return;
-        }
-
-        pPrev = pNode;
-        pNode = pNode->pNext;
-    }
-    NV_ASSERT_FAILED("Attempted to remove a nonexistent filter");
-    portSyncSpinlockRelease(pRegFilter->pRegFilterLock);
-}
-
-// called with lock held
-static void
-_gpuCleanRegisterFilterList
-(
-    DEVICE_REGFILTER_INFO *pRegFilter
-)
-{
-    REGISTER_FILTER *pNode = pRegFilter->pRegFilterList;
-    REGISTER_FILTER *pPrev = NULL;
-    REGISTER_FILTER *pNext = NULL;
-
-    while (pNode)
-    {
-        if (pNode->flags & REGISTER_FILTER_FLAGS_INVALID)
-        {
-            // Unlink
-            pNext = pNode->pNext;
-
-            // place on recycle list
-            pNode->pNext = pRegFilter->pRegFilterRecycleList;
-            pRegFilter->pRegFilterRecycleList = pNode;
-
-            if (pPrev)
-            {
-                pPrev->pNext = pNext;
-            }
-            else
-            {
-                pRegFilter->pRegFilterList = pNext;
-            }
-
-            pNode = pNext;
-            continue;
-        }
-
-        pPrev = pNode;
-        pNode = pNode->pNext;
-    }
-}
-
-static NvU32
-_gpuHandleReadRegisterFilter
-(
-    OBJGPU            *pGpu,
-    DEVICE_INDEX       devIndex,
-    NvU32              devInstance,
-    NvU32              addr,
-    NvU32              accessSize,
-    NvU32             *pFlags,
-    THREAD_STATE_NODE *pThreadState
-)
-{
-    REGISTER_FILTER       *pFilter;
-    NvU32                  returnValue = 0;
-    NvU32                  tempVal     = 0;
-    DEVICE_REGFILTER_INFO *pRegFilter;
-    DEVICE_MAPPING        *pMapping;
-
-    // Get the device filter
-    pMapping = gpuGetDeviceMapping(pGpu, devIndex, devInstance);
-    NV_ASSERT_OR_RETURN(pMapping != NULL, returnValue);
-
-    pRegFilter = &pMapping->devRegFilterInfo;
-
-    // if there is no filter, do nothing. just bail out.
-    if (pRegFilter->pRegFilterList == NULL)
-    {
-        return returnValue;
-    }
-
-    if (pThreadState != NULL)
-    {
-        // Filters should be only used with GPU lock is held.
-        if (pThreadState->flags & THREAD_STATE_FLAGS_IS_ISR_LOCKLESS)
-        {
-            return returnValue;
-        }
-    }
-#ifdef DEBUG
-    else
-    {
-        THREAD_STATE_NODE *pCurThread;
-
-        if (NV_OK == threadStateGetCurrentUnchecked(&pCurThread, pGpu))
-        {
-            // Filters should be only used with GPU lock is held.
-            // Assert because ISRs are expected to pass threadstate down the stack.
-            // Don't bale out to keep release and debug path behavior identical.
-            if (pCurThread->flags & THREAD_STATE_FLAGS_IS_ISR_LOCKLESS)
-            {
-                NV_ASSERT(0);
-            }
-        }
-    }
-#endif
-
-    //
-    // NOTE: we can't simply grab the lock and release it after
-    //       the search since it is not safe to assume that
-    //       callbacks can be called with spinlock held
-    //
-    portSyncSpinlockAcquire(pRegFilter->pRegFilterLock);
-    pRegFilter->regFilterRefCnt++;
-    portSyncSpinlockRelease(pRegFilter->pRegFilterLock);
-
-    //
-    // Note there is potential thread race condition where a filter may be
-    // being added or removed in one thread (dispatch) while another thread
-    // is searching the list.  This search should have a lock in place.
-    //
-    pFilter = pRegFilter->pRegFilterList;
-    while ((pFilter) && (pFilter = _findGpuRegisterFilter(devIndex, devInstance, addr, pFilter)))
-    {
-        if (pFilter->pReadCallback)
-        {
-            tempVal = pFilter->pReadCallback(pGpu, pFilter->pParam, addr,
-                                             accessSize, *pFlags);
-            //
-            // if there are multiple filters, we use the last filter found to
-            // save returnValue
-            //
-            if (pFilter->flags & REGISTER_FILTER_FLAGS_READ)
-            {
-                returnValue = tempVal;
-            }
-        }
-        *pFlags |= pFilter->flags;
-        pFilter = pFilter->pNext;
-    }
-
-    portSyncSpinlockAcquire(pRegFilter->pRegFilterLock);
-    pRegFilter->regFilterRefCnt--;
-    if (pRegFilter->regFilterRefCnt == 0 && pRegFilter->bRegFilterNeedRemove)
-    {
-        // no other thread can be touching the list. remove invalid entries
-        _gpuCleanRegisterFilterList(pRegFilter);
-        pRegFilter->bRegFilterNeedRemove = NV_FALSE;
-    }
-    portSyncSpinlockRelease(pRegFilter->pRegFilterLock);
-    return returnValue;
-}
-
-static void
-_gpuHandleWriteRegisterFilter
-(
-    OBJGPU            *pGpu,
-    DEVICE_INDEX       devIndex,
-    NvU32              devInstance,
-    NvU32              addr,
-    NvU32              val,
-    NvU32              accessSize,
-    NvU32             *pFlags,
-    THREAD_STATE_NODE *pThreadState
-)
-{
-    REGISTER_FILTER       *pFilter;
-    DEVICE_REGFILTER_INFO *pRegFilter;
-    DEVICE_MAPPING        *pMapping;
-
-    // Get the device filter
-    pMapping = gpuGetDeviceMapping(pGpu, devIndex, devInstance);
-    NV_ASSERT_OR_RETURN_VOID(pMapping != NULL);
-
-    pRegFilter = &pMapping->devRegFilterInfo;
-
-    // if there is no filter, do nothing. just bail out.
-    if (pRegFilter->pRegFilterList == NULL)
-    {
-        return;
-    }
-
-    if (pThreadState != NULL)
-    {
-        // Filters should be only used with GPU lock is held.
-        if (pThreadState->flags & THREAD_STATE_FLAGS_IS_ISR_LOCKLESS)
-        {
-            return;
-        }
-    }
-#ifdef DEBUG
-    else
-    {
-        THREAD_STATE_NODE *pCurThread;
-
-        if (NV_OK == threadStateGetCurrentUnchecked(&pCurThread, pGpu))
-        {
-            // Filters should be only used with GPU lock is held.
-            // Assert because ISRs are expected to pass threadstate down the stack.
-            // Don't bale out to keep release and debug path behavior identical.
-            if (pCurThread->flags & THREAD_STATE_FLAGS_IS_ISR_LOCKLESS)
-            {
-                NV_ASSERT(0);
-            }
-        }
-    }
-#endif
-
-    //
-    // NOTE: we can't simply grab the lock and release it after
-    //       the search since it is not safe to assume that
-    //       callbacks can be called with spinlock held
-    //
-    portSyncSpinlockAcquire(pRegFilter->pRegFilterLock);
-    pRegFilter->regFilterRefCnt++;
-    portSyncSpinlockRelease(pRegFilter->pRegFilterLock);
-
-    //
-    // Note there is potential thread race condition where a filter may be
-    // being added or removed in one thread (dispatch) while another thread
-    // is searching the list.  This search should have a lock in place.
-    //
-    pFilter = pRegFilter->pRegFilterList;
-    while ((pFilter) && (pFilter = _findGpuRegisterFilter(devIndex, devInstance, addr, pFilter)))
-    {
-        if (pFilter->pWriteCallback)
-        {
-            pFilter->pWriteCallback(pGpu, pFilter->pParam, addr, val,
-                                    accessSize, *pFlags);
-        }
-        *pFlags |= pFilter->flags;
-        pFilter = pFilter->pNext;
-    }
-
-    portSyncSpinlockAcquire(pRegFilter->pRegFilterLock);
-    pRegFilter->regFilterRefCnt--;
-    if (pRegFilter->regFilterRefCnt == 0 && pRegFilter->bRegFilterNeedRemove)
-    {
-        // no other thread can be touching the list. remove invalid entries
-        _gpuCleanRegisterFilterList(pRegFilter);
-        pRegFilter->bRegFilterNeedRemove = NV_FALSE;
-    }
-    portSyncSpinlockRelease(pRegFilter->pRegFilterLock);
-}
-
-static REGISTER_FILTER *
-_findGpuRegisterFilter
-(
-    DEVICE_INDEX     devIndex,
-    NvU32            devInstance,
-    NvU32            addr,
-    REGISTER_FILTER *pFilter
-)
-{
-    while (pFilter != NULL)
-    {
-        if (!(pFilter->flags & REGISTER_FILTER_FLAGS_INVALID) &&
-            (devIndex == pFilter->devIndex) &&
-            (devInstance == pFilter->devInstance) &&
-            (addr >= pFilter->rangeStart) && (addr <= pFilter->rangeEnd))
-        {
-            break;
-        }
-
-        pFilter = pFilter->pNext;
-    }
-
-    return pFilter;
 }
 
 static NvBool
@@ -1518,8 +1085,15 @@ gpuSanityCheckRegisterAccess_IMPL
     NvU32       *pRetVal
 )
 {
-    NV_STATUS status = NV_OK;
-    NvU32     retVal = ~0;
+    NV_STATUS   status = NV_OK;
+    NvU32       retVal = ~0;
+    NvBool      bIsPowerHfrpEnabled = NV_FALSE;
+    KernelHFRP *pKernelHfrp  = GPU_GET_KERNEL_HFRP(pGpu);
+    if (pKernelHfrp != NULL)
+    {
+        bIsPowerHfrpEnabled = pKernelHfrp->getProperty(pKernelHfrp, PDB_PROP_KHFRP_IS_ENABLED);
+    }
+
 
     if (API_GPU_IN_RESET_SANITY_CHECK(pGpu))
     {
@@ -1569,6 +1143,7 @@ gpuSanityCheckRegisterAccess_IMPL
          )                                                           &&
         !pGpu->getProperty(pGpu, PDB_PROP_GPU_MSHYBRID_GC6_ACTIVE)   &&
         !pGpu->getProperty(pGpu, PDB_PROP_GPU_ENABLE_REG_ACCESS_IN_LOW_POWER_FOR_SIM_SRTEST) &&
+        !bIsPowerHfrpEnabled                                         &&
         !pGpu->getProperty(pGpu, PDB_PROP_GPU_IN_PM_RESUME_CODEPATH))
     {
         DBG_BREAKPOINT();
@@ -1592,7 +1167,7 @@ done:
  *
  * @param[in] pGpu
  * @param[in] offset
- * @param[in] bSkipPermissionValidation 
+ * @param[in] bSkipPermissionValidation
  *
  * @returns NV_OK if valid
  * @returns NV_ERR_INVALID_ARGUMENT if offset is too large for bar
@@ -1647,7 +1222,7 @@ gpuVerifyExistence_IMPL
 
     if (regVal != pGpu->chipId0)
     {
-        osHandleGpuLost(pGpu);
+        osHandleGpuLost(pGpu, NV_TRUE);
         regVal = GPU_REG_RD32(pGpu, NV_PMC_BOOT_0);
         if (regVal != pGpu->chipId0)
         {
@@ -1694,7 +1269,7 @@ gpuSanityCheckRegRead_IMPL
                     NvU32 testValue = osGpuReadReg032(pGpu, NV_PMC_BOOT_0);
                     if (testValue == GPU_REG_VALUE_INVALID)
                     {
-                        osHandleGpuLost(pGpu);
+                        osHandleGpuLost(pGpu, NV_TRUE);
                         *pValue8 = osGpuReadReg008(pGpu, addr);
                     }
                 }
@@ -1711,7 +1286,7 @@ gpuSanityCheckRegRead_IMPL
                     NvU32 testValue = osGpuReadReg032(pGpu, NV_PMC_BOOT_0);
                     if (testValue == GPU_REG_VALUE_INVALID)
                     {
-                        osHandleGpuLost(pGpu);
+                        osHandleGpuLost(pGpu, NV_TRUE);
                         *pValue16 = osGpuReadReg016(pGpu, addr);
                     }
                 }
@@ -1728,7 +1303,7 @@ gpuSanityCheckRegRead_IMPL
                     NvU32 testValue = osGpuReadReg032(pGpu, NV_PMC_BOOT_0);
                     if (testValue == GPU_REG_VALUE_INVALID)
                     {
-                        osHandleGpuLost(pGpu);
+                        osHandleGpuLost(pGpu, NV_TRUE);
                         *pValue32 = osGpuReadReg032(pGpu, addr);
                     }
                 }
@@ -1898,4 +1473,64 @@ swbcaprtIsRegValid_IMPL
     }
 
     return NV_TRUE;
+}
+
+NV_STATUS
+regAddRegisterFilter
+(
+    RegisterAccess *pRegisterAccess,
+    NvU32 flags,
+    DEVICE_INDEX devIndex, NvU32 devInstance,
+    NvU32 rangeStart, NvU32 rangeEnd,
+    GpuWriteRegCallback pWriteCallback,
+    GpuReadRegCallback pReadCallback,
+    void *pParam,
+    REGISTER_FILTER **ppFilter
+)
+{
+    NV_ASSERT(0);
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+void
+regRemoveRegisterFilter
+(
+    RegisterAccess *pRegisterAccess,
+    REGISTER_FILTER *pFilter
+)
+{
+    NV_ASSERT(0);
+}
+
+
+void
+gpuHandleWriteRegisterFilter
+(
+    OBJGPU            *pGpu,
+    DEVICE_INDEX       devIndex,
+    NvU32              devInstance,
+    NvU32              addr,
+    NvU32              val,
+    NvU32              accessSize,
+    NvU32             *pFlags,
+    THREAD_STATE_NODE *pThreadState,
+    NvBool             bAcquireThreadState
+)
+{
+}
+
+NvU32
+gpuHandleReadRegisterFilter
+(
+    OBJGPU            *pGpu,
+    DEVICE_INDEX       devIndex,
+    NvU32              devInstance,
+    NvU32              addr,
+    NvU32              accessSize,
+    NvU32             *pFlags,
+    THREAD_STATE_NODE *pThreadState,
+    NvBool             bAcquireThreadState
+)
+{
+    return 0;
 }

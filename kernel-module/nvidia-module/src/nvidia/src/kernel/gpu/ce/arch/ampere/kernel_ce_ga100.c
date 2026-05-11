@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2018-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -30,7 +30,7 @@
 #include "gpu/bif/kernel_bif.h"
 #include "platform/chipset/chipset.h"
 
-#include "published/ampere/ga100/dev_ce.h"
+#include "published/ampere/ga100/dev_ce_base.h"
 #include "published/ampere/ga100/dev_nv_xve.h"
 #include "published/ampere/ga100/dev_nv_xve_addendum.h"
 
@@ -95,7 +95,7 @@ kceGetPce2lceConfigSize1_GA100
     KernelCE *    pKCe
 )
 {
-    return NV_CE_PCE2LCE_CONFIG__SIZE_1;
+    return NV_CE_BASE_PCE2LCE_CONFIG__SIZE_1;
 }
 
 /**
@@ -302,13 +302,13 @@ kceGetNvlinkAutoConfigCeValues_GA100
         if (grceSharedLce != 0xF)
         {
             // GRCE is shared
-            pGrceConfig[grceIdx] = DRF_NUM(_CE, _GRCE_CONFIG, _SHARED, 1) |
-                                   DRF_NUM(_CE, _GRCE_CONFIG, _SHARED_LCE, grceSharedLce);
+            pGrceConfig[grceIdx] = DRF_NUM(_CE_BASE, _GRCE_CONFIG, _SHARED, 1) |
+                                   DRF_NUM(_CE_BASE, _GRCE_CONFIG, _SHARED_LCE, grceSharedLce);
         }
         else
         {
             // GRCE got its own PCE
-            pGrceConfig[grceIdx] = DRF_NUM(_CE, _GRCE_CONFIG, _SHARED, 0);
+            pGrceConfig[grceIdx] = DRF_NUM(_CE_BASE, _GRCE_CONFIG, _SHARED, 0);
         }
         NV_PRINTF(LEVEL_INFO, "GRCE Config: GRCE %d LCE 0x%x\n", grceIdx, pGrceConfig[grceIdx]);
     }
@@ -524,14 +524,15 @@ kceGetMappings_GA100
         // So, we need to check if the FBHUB PCEs have already been assigned.
         //
         pceIndex = CE_GET_LOWEST_AVAILABLE_IDX(fbPceMask);
+        NV_ASSERT_OR_ELSE(pceIndex < NV2080_CTRL_MAX_PCES, break);
         fbPceMask &= (~(NVBIT32(pceIndex)));
 
         if ((NVBIT32(pLocalPceLceMap[pceIndex])) & *pExposeCeMask)
         {
             // GRCE is shared - set the status and shared LCE # in register field
             lceIndex = pLocalPceLceMap[pceIndex];
-            pLocalGrceMap[grceIdx] = DRF_NUM(_CE, _GRCE_CONFIG, _SHARED, 1) |
-                                     DRF_NUM(_CE, _GRCE_CONFIG, _SHARED_LCE, lceIndex);
+            pLocalGrceMap[grceIdx] = DRF_NUM(_CE_BASE, _GRCE_CONFIG, _SHARED, 1) |
+                                     DRF_NUM(_CE_BASE, _GRCE_CONFIG, _SHARED_LCE, lceIndex);
 
             if ((kceIsGenXorHigherSupported_HAL(pGpu, pKCe, 4)) || (pKCe->bUseGen4Mapping == NV_TRUE))
             {
@@ -550,8 +551,8 @@ kceGetMappings_GA100
             pLocalPceLceMap[pceIndex] = lceIndex;
             lceMask &= (~(NVBIT32(lceIndex)));
             // Reflect non-sharing status in register field
-            pLocalGrceMap[grceIdx] = DRF_NUM(_CE, _GRCE_CONFIG, _SHARED, 0) |
-                                     DRF_DEF(_CE, _GRCE_CONFIG, _SHARED_LCE, _NONE);
+            pLocalGrceMap[grceIdx] = DRF_NUM(_CE_BASE, _GRCE_CONFIG, _SHARED, 0) |
+                                     DRF_DEF(_CE_BASE, _GRCE_CONFIG, _SHARED_LCE, _NONE);
         }
     }
 
@@ -832,10 +833,11 @@ kceMapPceLceForNvlinkPeers_GA100
         portMemSet(pParams, 0, sizeof(*pParams));
         pParams->linkMask = peerLinkMask;
 
-        status = knvlinkExecGspRmRpc(pGpu, pKernelNvlink,
-                                     NV2080_CTRL_CMD_INTERNAL_HSHUB_GET_HSHUB_ID_FOR_LINKS,
-                                     pParams, sizeof(*pParams));
-        NV_ASSERT_OK_OR_RETURN(status);
+        NV_ASSERT_OK_OR_GOTO(status,
+            knvlinkExecGspRmRpc(pGpu, pKernelNvlink,
+                                NV2080_CTRL_CMD_INTERNAL_HSHUB_GET_HSHUB_ID_FOR_LINKS,
+                                pParams, sizeof(*pParams)),
+            done);
 
         FOR_EACH_INDEX_IN_MASK(32, linkId, peerLinkMask)
         {
@@ -892,6 +894,7 @@ kceMapPceLceForNvlinkPeers_GA100
         status = NV_WARN_NOTHING_TO_DO;
     }
 
+done:
     portMemFree(pParams);
     return status;
 }
@@ -1141,6 +1144,6 @@ kceApplyGen4orHigherMapping_GA100
     }
     if (hsPceAssigned == NV_TRUE)
     {
-        pLocalPceLceMap[fbPceIndex] = NV_CE_PCE2LCE_CONFIG_PCE_ASSIGNED_LCE_NONE;
+        pLocalPceLceMap[fbPceIndex] = NV_CE_BASE_PCE2LCE_CONFIG_PCE_ASSIGNED_LCE_NONE;
     }
 }

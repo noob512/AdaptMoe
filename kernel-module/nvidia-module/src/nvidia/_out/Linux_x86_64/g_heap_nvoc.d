@@ -4,7 +4,7 @@ _out/Linux_x86_64/g_heap_nvoc.o: \
  ../common/sdk/nvidia/inc/cpuopsys.h ../common/sdk/nvidia/inc/nvstatus.h \
  ../common/sdk/nvidia/inc/nvtypes.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
@@ -43,10 +43,8 @@ _out/Linux_x86_64/g_heap_nvoc.o: \
  inc/kernel/gpu/mem_mgr/mem_desc.h generated/g_mem_desc_nvoc.h \
  inc/libraries/poolalloc.h inc/libraries/nvport/nvport.h \
  inc/libraries/containers/list.h inc/libraries/containers/type_safety.h \
- inc/kernel/core/core.h \
- inc/kernel/gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.h \
- inc/kernel/gpu/mem_mgr/phys_mem_allocator/regmap.h \
- inc/kernel/gpu/mem_mgr/phys_mem_allocator/map_defines.h \
+ inc/kernel/gpu/mem_mgr/rm_page_size.h inc/kernel/os/nv_memory_iterator.h \
+ inc/kernel/os/nv_memory_area.h inc/kernel/core/core.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h inc/libraries/resserv/resserv.h \
@@ -67,7 +65,7 @@ inc/libraries/nvport/nvport.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -131,10 +129,10 @@ inc/libraries/poolalloc.h:
 inc/libraries/nvport/nvport.h:
 inc/libraries/containers/list.h:
 inc/libraries/containers/type_safety.h:
+inc/kernel/gpu/mem_mgr/rm_page_size.h:
+inc/kernel/os/nv_memory_iterator.h:
+inc/kernel/os/nv_memory_area.h:
 inc/kernel/core/core.h:
-inc/kernel/gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.h:
-inc/kernel/gpu/mem_mgr/phys_mem_allocator/regmap.h:
-inc/kernel/gpu/mem_mgr/phys_mem_allocator/map_defines.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:

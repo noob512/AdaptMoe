@@ -175,13 +175,9 @@ struct NVOC_METADATA__GpuAccounting {
     const struct NVOC_METADATA__Object metadata__Object;
 };
 
-#ifndef __NVOC_CLASS_GpuAccounting_TYPEDEF__
-#define __NVOC_CLASS_GpuAccounting_TYPEDEF__
-typedef struct GpuAccounting GpuAccounting;
-#endif /* __NVOC_CLASS_GpuAccounting_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_GpuAccounting
-#define __nvoc_class_id_GpuAccounting 0x0f1350
+#define __nvoc_class_id_GpuAccounting 0x0f1350u
+typedef struct GpuAccounting GpuAccounting;
 #endif /* __nvoc_class_id_GpuAccounting */
 
 // Casting support
@@ -200,129 +196,127 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_GpuAccounting;
 NV_STATUS __nvoc_objCreateDynamic_GpuAccounting(GpuAccounting**, Dynamic*, NvU32, va_list);
 
 NV_STATUS __nvoc_objCreate_GpuAccounting(GpuAccounting**, Dynamic*, NvU32);
-#define __objCreate_GpuAccounting(ppNewObj, pParent, createFlags) \
-    __nvoc_objCreate_GpuAccounting((ppNewObj), staticCast((pParent), Dynamic), (createFlags))
+#define __objCreate_GpuAccounting(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags) \
+    __nvoc_objCreate_GpuAccounting((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags))
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS gpuacctConstruct_IMPL(struct GpuAccounting *arg_this);
+#define __nvoc_gpuacctConstruct(arg_this) gpuacctConstruct_IMPL(arg_this)
+
+void gpuacctDestruct_IMPL(struct GpuAccounting *arg_this);
+#define __nvoc_gpuacctDestruct(arg_this) gpuacctDestruct_IMPL(arg_this)
+
+NV_STATUS gpuacctGetAccountingMode_IMPL(struct GpuAccounting *arg_this, NvU32 arg2, NV0000_CTRL_GPUACCT_GET_ACCOUNTING_STATE_PARAMS *arg3);
+#ifdef __nvoc_gpu_acct_h_disabled
+static inline NV_STATUS gpuacctGetAccountingMode(struct GpuAccounting *arg_this, NvU32 arg2, NV0000_CTRL_GPUACCT_GET_ACCOUNTING_STATE_PARAMS *arg3) {
+    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_gpu_acct_h_disabled
+#define gpuacctGetAccountingMode(arg_this, arg2, arg3) gpuacctGetAccountingMode_IMPL(arg_this, arg2, arg3)
+#endif // __nvoc_gpu_acct_h_disabled
+
+NV_STATUS gpuacctEnableAccounting_IMPL(struct GpuAccounting *arg_this, NvU32 arg2, NV0000_CTRL_GPUACCT_SET_ACCOUNTING_STATE_PARAMS *arg3);
+#ifdef __nvoc_gpu_acct_h_disabled
+static inline NV_STATUS gpuacctEnableAccounting(struct GpuAccounting *arg_this, NvU32 arg2, NV0000_CTRL_GPUACCT_SET_ACCOUNTING_STATE_PARAMS *arg3) {
+    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_gpu_acct_h_disabled
+#define gpuacctEnableAccounting(arg_this, arg2, arg3) gpuacctEnableAccounting_IMPL(arg_this, arg2, arg3)
+#endif // __nvoc_gpu_acct_h_disabled
+
+NV_STATUS gpuacctDisableAccounting_IMPL(struct GpuAccounting *arg_this, NvU32 arg2, NV0000_CTRL_GPUACCT_SET_ACCOUNTING_STATE_PARAMS *arg3);
+#ifdef __nvoc_gpu_acct_h_disabled
+static inline NV_STATUS gpuacctDisableAccounting(struct GpuAccounting *arg_this, NvU32 arg2, NV0000_CTRL_GPUACCT_SET_ACCOUNTING_STATE_PARAMS *arg3) {
+    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_gpu_acct_h_disabled
+#define gpuacctDisableAccounting(arg_this, arg2, arg3) gpuacctDisableAccounting_IMPL(arg_this, arg2, arg3)
+#endif // __nvoc_gpu_acct_h_disabled
+
+NV_STATUS gpuacctClearAccountingData_IMPL(struct GpuAccounting *arg_this, NvU32 arg2, NV0000_CTRL_GPUACCT_CLEAR_ACCOUNTING_DATA_PARAMS *arg3);
+#ifdef __nvoc_gpu_acct_h_disabled
+static inline NV_STATUS gpuacctClearAccountingData(struct GpuAccounting *arg_this, NvU32 arg2, NV0000_CTRL_GPUACCT_CLEAR_ACCOUNTING_DATA_PARAMS *arg3) {
+    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_gpu_acct_h_disabled
+#define gpuacctClearAccountingData(arg_this, arg2, arg3) gpuacctClearAccountingData_IMPL(arg_this, arg2, arg3)
+#endif // __nvoc_gpu_acct_h_disabled
+
+NV_STATUS gpuacctStartGpuAccounting_IMPL(struct GpuAccounting *arg_this, NvU32 arg2, NvU32 arg3, NvU32 arg4);
+#ifdef __nvoc_gpu_acct_h_disabled
+static inline NV_STATUS gpuacctStartGpuAccounting(struct GpuAccounting *arg_this, NvU32 arg2, NvU32 arg3, NvU32 arg4) {
+    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_gpu_acct_h_disabled
+#define gpuacctStartGpuAccounting(arg_this, arg2, arg3, arg4) gpuacctStartGpuAccounting_IMPL(arg_this, arg2, arg3, arg4)
+#endif // __nvoc_gpu_acct_h_disabled
+
+NV_STATUS gpuacctStopGpuAccounting_IMPL(struct GpuAccounting *arg_this, NvU32 arg2, NvU32 arg3, NvU32 arg4);
+#ifdef __nvoc_gpu_acct_h_disabled
+static inline NV_STATUS gpuacctStopGpuAccounting(struct GpuAccounting *arg_this, NvU32 arg2, NvU32 arg3, NvU32 arg4) {
+    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_gpu_acct_h_disabled
+#define gpuacctStopGpuAccounting(arg_this, arg2, arg3, arg4) gpuacctStopGpuAccounting_IMPL(arg_this, arg2, arg3, arg4)
+#endif // __nvoc_gpu_acct_h_disabled
+
+NV_STATUS gpuacctUpdateProcPeakFbUsage_IMPL(struct GpuAccounting *arg_this, NvU32 arg2, NvU32 arg3, NvU32 arg4, NvU64 arg5);
+#ifdef __nvoc_gpu_acct_h_disabled
+static inline NV_STATUS gpuacctUpdateProcPeakFbUsage(struct GpuAccounting *arg_this, NvU32 arg2, NvU32 arg3, NvU32 arg4, NvU64 arg5) {
+    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_gpu_acct_h_disabled
+#define gpuacctUpdateProcPeakFbUsage(arg_this, arg2, arg3, arg4, arg5) gpuacctUpdateProcPeakFbUsage_IMPL(arg_this, arg2, arg3, arg4, arg5)
+#endif // __nvoc_gpu_acct_h_disabled
+
+NV_STATUS gpuacctGetProcAcctInfo_IMPL(struct GpuAccounting *arg_this, NV0000_CTRL_GPUACCT_GET_PROC_ACCOUNTING_INFO_PARAMS *arg2);
+#ifdef __nvoc_gpu_acct_h_disabled
+static inline NV_STATUS gpuacctGetProcAcctInfo(struct GpuAccounting *arg_this, NV0000_CTRL_GPUACCT_GET_PROC_ACCOUNTING_INFO_PARAMS *arg2) {
+    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_gpu_acct_h_disabled
+#define gpuacctGetProcAcctInfo(arg_this, arg2) gpuacctGetProcAcctInfo_IMPL(arg_this, arg2)
+#endif // __nvoc_gpu_acct_h_disabled
+
+NV_STATUS gpuacctGetAcctPids_IMPL(struct GpuAccounting *arg_this, NV0000_CTRL_GPUACCT_GET_ACCOUNTING_PIDS_PARAMS *arg2);
+#ifdef __nvoc_gpu_acct_h_disabled
+static inline NV_STATUS gpuacctGetAcctPids(struct GpuAccounting *arg_this, NV0000_CTRL_GPUACCT_GET_ACCOUNTING_PIDS_PARAMS *arg2) {
+    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_gpu_acct_h_disabled
+#define gpuacctGetAcctPids(arg_this, arg2) gpuacctGetAcctPids_IMPL(arg_this, arg2)
+#endif // __nvoc_gpu_acct_h_disabled
+
+NV_STATUS gpuacctSetProcType_IMPL(struct GpuAccounting *arg_this, NvU32 arg2, NvU32 arg3, NvU32 arg4, NvU32 arg5);
+#ifdef __nvoc_gpu_acct_h_disabled
+static inline NV_STATUS gpuacctSetProcType(struct GpuAccounting *arg_this, NvU32 arg2, NvU32 arg3, NvU32 arg4, NvU32 arg5) {
+    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_gpu_acct_h_disabled
+#define gpuacctSetProcType(arg_this, arg2, arg3, arg4, arg5) gpuacctSetProcType_IMPL(arg_this, arg2, arg3, arg4, arg5)
+#endif // __nvoc_gpu_acct_h_disabled
+
+
+// Wrapper macros for halified functions
 
 // Dispatch functions
-NV_STATUS gpuacctConstruct_IMPL(struct GpuAccounting *arg_);
-
-#define __nvoc_gpuacctConstruct(arg_) gpuacctConstruct_IMPL(arg_)
-void gpuacctDestruct_IMPL(struct GpuAccounting *arg1);
-
-#define __nvoc_gpuacctDestruct(arg1) gpuacctDestruct_IMPL(arg1)
-NV_STATUS gpuacctGetAccountingMode_IMPL(struct GpuAccounting *arg1, NvU32 arg2, NV0000_CTRL_GPUACCT_GET_ACCOUNTING_STATE_PARAMS *arg3);
-
-#ifdef __nvoc_gpu_acct_h_disabled
-static inline NV_STATUS gpuacctGetAccountingMode(struct GpuAccounting *arg1, NvU32 arg2, NV0000_CTRL_GPUACCT_GET_ACCOUNTING_STATE_PARAMS *arg3) {
-    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_gpu_acct_h_disabled
-#define gpuacctGetAccountingMode(arg1, arg2, arg3) gpuacctGetAccountingMode_IMPL(arg1, arg2, arg3)
-#endif //__nvoc_gpu_acct_h_disabled
-
-NV_STATUS gpuacctEnableAccounting_IMPL(struct GpuAccounting *arg1, NvU32 arg2, NV0000_CTRL_GPUACCT_SET_ACCOUNTING_STATE_PARAMS *arg3);
-
-#ifdef __nvoc_gpu_acct_h_disabled
-static inline NV_STATUS gpuacctEnableAccounting(struct GpuAccounting *arg1, NvU32 arg2, NV0000_CTRL_GPUACCT_SET_ACCOUNTING_STATE_PARAMS *arg3) {
-    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_gpu_acct_h_disabled
-#define gpuacctEnableAccounting(arg1, arg2, arg3) gpuacctEnableAccounting_IMPL(arg1, arg2, arg3)
-#endif //__nvoc_gpu_acct_h_disabled
-
-NV_STATUS gpuacctDisableAccounting_IMPL(struct GpuAccounting *arg1, NvU32 arg2, NV0000_CTRL_GPUACCT_SET_ACCOUNTING_STATE_PARAMS *arg3);
-
-#ifdef __nvoc_gpu_acct_h_disabled
-static inline NV_STATUS gpuacctDisableAccounting(struct GpuAccounting *arg1, NvU32 arg2, NV0000_CTRL_GPUACCT_SET_ACCOUNTING_STATE_PARAMS *arg3) {
-    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_gpu_acct_h_disabled
-#define gpuacctDisableAccounting(arg1, arg2, arg3) gpuacctDisableAccounting_IMPL(arg1, arg2, arg3)
-#endif //__nvoc_gpu_acct_h_disabled
-
-NV_STATUS gpuacctClearAccountingData_IMPL(struct GpuAccounting *arg1, NvU32 arg2, NV0000_CTRL_GPUACCT_CLEAR_ACCOUNTING_DATA_PARAMS *arg3);
-
-#ifdef __nvoc_gpu_acct_h_disabled
-static inline NV_STATUS gpuacctClearAccountingData(struct GpuAccounting *arg1, NvU32 arg2, NV0000_CTRL_GPUACCT_CLEAR_ACCOUNTING_DATA_PARAMS *arg3) {
-    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_gpu_acct_h_disabled
-#define gpuacctClearAccountingData(arg1, arg2, arg3) gpuacctClearAccountingData_IMPL(arg1, arg2, arg3)
-#endif //__nvoc_gpu_acct_h_disabled
-
-NV_STATUS gpuacctStartGpuAccounting_IMPL(struct GpuAccounting *arg1, NvU32 arg2, NvU32 arg3, NvU32 arg4);
-
-#ifdef __nvoc_gpu_acct_h_disabled
-static inline NV_STATUS gpuacctStartGpuAccounting(struct GpuAccounting *arg1, NvU32 arg2, NvU32 arg3, NvU32 arg4) {
-    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_gpu_acct_h_disabled
-#define gpuacctStartGpuAccounting(arg1, arg2, arg3, arg4) gpuacctStartGpuAccounting_IMPL(arg1, arg2, arg3, arg4)
-#endif //__nvoc_gpu_acct_h_disabled
-
-NV_STATUS gpuacctStopGpuAccounting_IMPL(struct GpuAccounting *arg1, NvU32 arg2, NvU32 arg3, NvU32 arg4);
-
-#ifdef __nvoc_gpu_acct_h_disabled
-static inline NV_STATUS gpuacctStopGpuAccounting(struct GpuAccounting *arg1, NvU32 arg2, NvU32 arg3, NvU32 arg4) {
-    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_gpu_acct_h_disabled
-#define gpuacctStopGpuAccounting(arg1, arg2, arg3, arg4) gpuacctStopGpuAccounting_IMPL(arg1, arg2, arg3, arg4)
-#endif //__nvoc_gpu_acct_h_disabled
-
-NV_STATUS gpuacctUpdateProcPeakFbUsage_IMPL(struct GpuAccounting *arg1, NvU32 arg2, NvU32 arg3, NvU32 arg4, NvU64 arg5);
-
-#ifdef __nvoc_gpu_acct_h_disabled
-static inline NV_STATUS gpuacctUpdateProcPeakFbUsage(struct GpuAccounting *arg1, NvU32 arg2, NvU32 arg3, NvU32 arg4, NvU64 arg5) {
-    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_gpu_acct_h_disabled
-#define gpuacctUpdateProcPeakFbUsage(arg1, arg2, arg3, arg4, arg5) gpuacctUpdateProcPeakFbUsage_IMPL(arg1, arg2, arg3, arg4, arg5)
-#endif //__nvoc_gpu_acct_h_disabled
-
-NV_STATUS gpuacctGetProcAcctInfo_IMPL(struct GpuAccounting *arg1, NV0000_CTRL_GPUACCT_GET_PROC_ACCOUNTING_INFO_PARAMS *arg2);
-
-#ifdef __nvoc_gpu_acct_h_disabled
-static inline NV_STATUS gpuacctGetProcAcctInfo(struct GpuAccounting *arg1, NV0000_CTRL_GPUACCT_GET_PROC_ACCOUNTING_INFO_PARAMS *arg2) {
-    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_gpu_acct_h_disabled
-#define gpuacctGetProcAcctInfo(arg1, arg2) gpuacctGetProcAcctInfo_IMPL(arg1, arg2)
-#endif //__nvoc_gpu_acct_h_disabled
-
-NV_STATUS gpuacctGetAcctPids_IMPL(struct GpuAccounting *arg1, NV0000_CTRL_GPUACCT_GET_ACCOUNTING_PIDS_PARAMS *arg2);
-
-#ifdef __nvoc_gpu_acct_h_disabled
-static inline NV_STATUS gpuacctGetAcctPids(struct GpuAccounting *arg1, NV0000_CTRL_GPUACCT_GET_ACCOUNTING_PIDS_PARAMS *arg2) {
-    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_gpu_acct_h_disabled
-#define gpuacctGetAcctPids(arg1, arg2) gpuacctGetAcctPids_IMPL(arg1, arg2)
-#endif //__nvoc_gpu_acct_h_disabled
-
-NV_STATUS gpuacctSetProcType_IMPL(struct GpuAccounting *arg1, NvU32 arg2, NvU32 arg3, NvU32 arg4, NvU32 arg5);
-
-#ifdef __nvoc_gpu_acct_h_disabled
-static inline NV_STATUS gpuacctSetProcType(struct GpuAccounting *arg1, NvU32 arg2, NvU32 arg3, NvU32 arg4, NvU32 arg5) {
-    NV_ASSERT_FAILED_PRECOMP("GpuAccounting was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_gpu_acct_h_disabled
-#define gpuacctSetProcType(arg1, arg2, arg3, arg4, arg5) gpuacctSetProcType_IMPL(arg1, arg2, arg3, arg4, arg5)
-#endif //__nvoc_gpu_acct_h_disabled
-
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

@@ -59,4 +59,11 @@
 #define NV_PSEC_MSGQ_TAIL_VAL                                                        31:0 /* RWIUF */
 #define NV_PSEC_MSGQ_TAIL_VAL_INIT                                             0x00000000 /* RWI-V */
 
+#define NV_PSEC_FALCON_COMMON_SCRATCH_GROUP_2(i)                       (0x00840320+(i)*4) /* RW-4A */
+#define NV_PSEC_FALCON_COMMON_SCRATCH_GROUP_2__SIZE_1                                   4 /*       */
+#define NV_PSEC_FALCON_COMMON_SCRATCH_GROUP_2__DEVICE_MAP                      0x00000016 /*       */
+#define NV_PSEC_FALCON_COMMON_SCRATCH_GROUP_2__PRIV_LEVEL_MASK                 0x008403f8 /*       */
+#define NV_PSEC_FALCON_COMMON_SCRATCH_GROUP_2_VAL                                    31:0 /* RWIVF */
+#define NV_PSEC_FALCON_COMMON_SCRATCH_GROUP_2_VAL_INIT                         0x00000000 /* RWI-V */
+
 #endif // __gb20b_dev_sec_pri_h__

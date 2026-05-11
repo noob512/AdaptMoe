@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -68,7 +68,6 @@ static void _nv04MapMemoryDmaWithSecInfo(NVOS46_PARAMETERS*, API_SECURITY_INFO);
 static void _nv04UnmapMemoryDmaWithSecInfo(NVOS47_PARAMETERS*, API_SECURITY_INFO);
 static void _nv04DupObjectWithSecInfo(NVOS55_PARAMETERS*, API_SECURITY_INFO);
 static void _nv04ShareWithSecInfo(NVOS57_PARAMETERS*, API_SECURITY_INFO);
-
 
 //
 // RM API entry points
@@ -170,7 +169,6 @@ void Nv04MapMemoryDmaWithSecInfo(NVOS46_PARAMETERS *pArgs, API_SECURITY_INFO sec
 void Nv04UnmapMemoryDmaWithSecInfo(NVOS47_PARAMETERS *pArgs, API_SECURITY_INFO secInfo)      { _nv04UnmapMemoryDmaWithSecInfo(pArgs, secInfo); }
 void Nv04DupObjectWithSecInfo(NVOS55_PARAMETERS *pArgs, API_SECURITY_INFO secInfo)           { _nv04DupObjectWithSecInfo(pArgs, secInfo); }
 void Nv04ShareWithSecInfo(NVOS57_PARAMETERS *pArgs, API_SECURITY_INFO secInfo)               { _nv04ShareWithSecInfo(pArgs, secInfo); }
-
 
 static void
 XlateUserModeArgsToSecInfo
@@ -427,9 +425,7 @@ static void _nv04MapMemoryDma
 
     XlateUserModeArgsToSecInfo(bUserModeArgs, NV_FALSE, &secInfo);
 
-    pArgs->status = pRmApi->MapWithSecInfo(pRmApi, pArgs->hClient, pArgs->hDevice, pArgs->hDma,
-                                           pArgs->hMemory, pArgs->offset, pArgs->length, pArgs->flags,
-                                           &pArgs->dmaOffset, &secInfo);
+    pArgs->status = pRmApi->MapWithSecInfo(pRmApi, pArgs, &secInfo);
 } // end of Nv04MapMemoryDma()
 
 static void _nv04MapMemoryDmaWithSecInfo
@@ -441,9 +437,7 @@ static void _nv04MapMemoryDmaWithSecInfo
 
     RM_API *pRmApi = rmapiGetInterface(RMAPI_EXTERNAL);
 
-    pArgs->status = pRmApi->MapWithSecInfo(pRmApi, pArgs->hClient, pArgs->hDevice, pArgs->hDma,
-                                           pArgs->hMemory, pArgs->offset, pArgs->length, pArgs->flags,
-                                           &pArgs->dmaOffset, &secInfo);
+    pArgs->status = pRmApi->MapWithSecInfo(pRmApi, pArgs, &secInfo);
 }
 
 /*
@@ -469,8 +463,7 @@ static void _nv04UnmapMemoryDma
 
     XlateUserModeArgsToSecInfo(bUserModeArgs, NV_FALSE, &secInfo);
 
-    pArgs->status = pRmApi->UnmapWithSecInfo(pRmApi, pArgs->hClient, pArgs->hDevice, pArgs->hDma,
-                                             pArgs->flags, pArgs->dmaOffset, pArgs->size, &secInfo);
+    pArgs->status = pRmApi->UnmapWithSecInfo(pRmApi, pArgs, &secInfo);
 } // end of Nv04UnmapMemoryDma()
 
 static void _nv04UnmapMemoryDmaWithSecInfo
@@ -482,8 +475,7 @@ static void _nv04UnmapMemoryDmaWithSecInfo
 
     RM_API *pRmApi = rmapiGetInterface(RMAPI_EXTERNAL);
 
-    pArgs->status = pRmApi->UnmapWithSecInfo(pRmApi, pArgs->hClient, pArgs->hDevice, pArgs->hDma,
-                                             pArgs->flags, pArgs->dmaOffset, pArgs->size, &secInfo);
+    pArgs->status = pRmApi->UnmapWithSecInfo(pRmApi, pArgs, &secInfo);
 }
 
 /*

@@ -162,6 +162,7 @@ namespace DisplayPort
         bool _isDownspreadSupported;
         bool _bAvoidHBR3;
         bool _bAvoidHBR3DisabledByRegkey;
+        bool _bIsDpTunnelingHwBugWarEnabled;
         //
         // LTTPR count reported by RM, it might not be the same with DPLib probe
         // For example, some Intel LTTPR might not be ready to response 0xF0000 probe
@@ -180,6 +181,7 @@ namespace DisplayPort
             unsigned maxNumHztSlices;
             unsigned lineBufferBitDepth;
         }_DSC;
+        NV0073_CTRL_SPECIFIC_HDCP_CTRL_PARAMS paramsHdcpCtrl;
         void initializeRegkeyDatabase();
         void applyRegkeyOverrides();
 
@@ -275,7 +277,10 @@ namespace DisplayPort
         {
             return _bAvoidHBR3 && !_bAvoidHBR3DisabledByRegkey;
         }
-
+        virtual bool isDpTunnelingHwBugWarEnabled()
+        {
+            return _bIsDpTunnelingHwBugWarEnabled;
+        }
         // Get GPU DSC capabilities
         virtual void getDscCaps(bool *pbDscSupported,
                                 unsigned *pEncoderColorFormatMask,
@@ -367,6 +372,13 @@ namespace DisplayPort
         virtual bool dscCrcTransaction(NvBool bEnable, gpuDscCrc *data, NvU16 *headIndex);
 
         void triggerACT();
+        void configureAndTriggerECF(NvU64 ecf, NvBool bForceClearEcf = NV_FALSE, NvBool bAddStreamBack = NV_FALSE); // This function program as well as trigger ECF on branch devices.
+        virtual void disableAlternateScramblerReset();
+        void configureHDCPDisableAuthentication();
+        void configureHDCPAbortAuthentication(AbortAuthReason abortAuthReason);
+        bool setStreamType(unsigned streamIndex, NvU8 streamType, bool * bNeedReNegotiate);
+        void configureHDCPValidateLink(HDCPValidateData &hdcpValidateData, NvU64 cN = HDCP_DUMMY_CN, NvU64 cKsv = HDCP_DUMMY_CKSV);
+        void forwardPendingKsvListReady(NvBool bKsvListReady);
         void configureHDCPRenegotiate(NvU64 cN = HDCP_DUMMY_CN, NvU64 cKsv = HDCP_DUMMY_CKSV, bool bForceReAuth = false,
                                       bool bRxIDMsgPending = false);
         void configureHDCPGetHDCPState(HDCPState &hdcpState);
@@ -437,6 +449,7 @@ namespace DisplayPort
         void configureTriggerAll(NvU32 head, bool enable);
         virtual bool configureLinkRateTable(const NvU16 *pLinkRateTable, LinkRates *pLinkRates);
         bool configureFec(const bool bEnableFec);
+        virtual void applyStuffDummySymbolWAR(NvU32 head, bool enable);
     };
 
 }

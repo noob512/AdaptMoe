@@ -5,7 +5,7 @@ _out/Linux_x86_64/ioaccess.o: src/libraries/ioaccess/ioaccess.c \
  ../common/sdk/nvidia/inc/cpuopsys.h ../common/sdk/nvidia/inc/nvstatus.h \
  ../common/sdk/nvidia/inc/nvtypes.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
@@ -21,7 +21,8 @@ _out/Linux_x86_64/ioaccess.o: src/libraries/ioaccess/ioaccess.c \
  inc/libraries/utils/nvmacro.h inc/libraries/nvoc/rtti.h \
  inc/libraries/utils/nvprintf.h inc/libraries/utils/nvprintf_level.h \
  inc/libraries/nvlog/nvlog_printf.h \
- inc/libraries/nvlog/internal/nvlog_printf_internal.h
+ inc/libraries/nvlog/internal/nvlog_printf_internal.h \
+ inc/libraries/utils/nvassert.h inc/libraries/utils/nvmacro.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 inc/libraries/ioaccess/ioaccess.h:
 generated/g_ioaccess_nvoc.h:
@@ -34,7 +35,7 @@ inc/libraries/nvport/nvport.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -60,3 +61,5 @@ inc/libraries/utils/nvprintf.h:
 inc/libraries/utils/nvprintf_level.h:
 inc/libraries/nvlog/nvlog_printf.h:
 inc/libraries/nvlog/internal/nvlog_printf_internal.h:
+inc/libraries/utils/nvassert.h:
+inc/libraries/utils/nvmacro.h:

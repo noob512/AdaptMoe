@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -330,7 +330,8 @@ serverResLock_Prologue
     RsServer *pServer,
     LOCK_ACCESS_TYPE access,
     RS_LOCK_INFO *pLockInfo,
-    NvU32 *pReleaseFlags
+    NvU32 *pReleaseFlags,
+    NvU32 gpuMask
 )
 {
     NV_STATUS status = NV_OK;
@@ -361,6 +362,16 @@ serverResLock_Prologue
                 goto done;
             }
         }
+        else if (rmGpuLocksGetOwnedMask() != 0)
+        {
+            //
+            // Caller owns some of the GPU lock but requests all GPU locks.
+            // Violating locking order.
+            //
+            NV_ASSERT(0);
+            status = NV_ERR_INVALID_LOCK_STATE;
+            goto done;
+        }
         else
         {
             if ((status = rmGpuLocksAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_CLIENT)) != NV_OK)
@@ -373,12 +384,10 @@ serverResLock_Prologue
 
     if (pLockInfo->flags & RM_LOCK_FLAGS_GPU_GROUP_LOCK)
     {
-        RsResourceRef     *pParentRef;
-        GpuResource       *pGpuResource;
-        NvU32 gpuMask;
-        (void)gpuMask;
+        RsResourceRef *pParentRef   = pLockInfo->pContextRef;
+        GpuResource   *pGpuResource = NULL;
+        NvU32          gpuGroupMask = 0;
 
-        pParentRef = pLockInfo->pContextRef;
         if (pParentRef == NULL)
         {
             NV_ASSERT(0);
@@ -418,7 +427,7 @@ serverResLock_Prologue
 
         if (pLockInfo->state & RM_LOCK_STATES_GPU_GROUP_LOCK_ACQUIRED)
         {
-            if (rmGpuGroupLockIsOwner(pParentGpu->gpuInstance, GPU_LOCK_GRP_DEVICE, &gpuMask))
+            if (rmGpuGroupLockIsOwner(pParentGpu->gpuInstance, GPU_LOCK_GRP_DEVICE, &gpuGroupMask))
             {
                 goto done;
             }
@@ -430,7 +439,7 @@ serverResLock_Prologue
             }
         }
 
-        if (rmGpuGroupLockIsOwner(pParentGpu->gpuInstance, GPU_LOCK_GRP_DEVICE, &gpuMask))
+        if (rmGpuGroupLockIsOwner(pParentGpu->gpuInstance, GPU_LOCK_GRP_DEVICE, &gpuGroupMask))
         {
             if (!(pLockInfo->state & RM_LOCK_STATES_ALLOW_RECURSIVE_LOCKS))
             {
@@ -445,7 +454,7 @@ serverResLock_Prologue
             // Lock the parent GPU and if specified any GPUs that resource
             // may backreference via mappings.
             //
-            pLockInfo->gpuMask = gpumgrGetGpuMask(pParentGpu) |
+            pLockInfo->gpuMask = gpuMask | gpumgrGetGpuMask(pParentGpu) |
                                  _resGetBackRefGpusMask(pLockInfo->pResRefToBackRef);
 
             status = rmGpuGroupLockAcquire(0,
@@ -762,7 +771,7 @@ serverAllocResourceUnderLock
     tmpStatus = gpuGetByRef(pParentRef, NULL, &pGpu);
 
     // Override locking flags if we'll need to RPC to GSP
-    if (pGpu != NULL && IS_GSP_CLIENT(pGpu) &&
+    if (pGpu != NULL && IS_FW_CLIENT(pGpu) &&
         (pResDesc->flags & RS_FLAGS_ALLOC_RPC_TO_PHYS_RM))
     {
         resLockAccess = LOCK_ACCESS_WRITE; // always write as we're RPCing to GSP
@@ -784,7 +793,7 @@ serverAllocResourceUnderLock
         }
     }
 
-    status = serverResLock_Prologue(&g_resServ, resLockAccess, pLockInfo, &releaseFlags);
+    status = serverResLock_Prologue(&g_resServ, resLockAccess, pLockInfo, &releaseFlags, 0);
     if (status != NV_OK)
         goto done;
 
@@ -882,7 +891,7 @@ serverAllocResourceUnderLock
                 goto done;
             }
 
-            if (!IS_VIRTUAL(pGpu) && !IS_GSP_CLIENT(pGpu))
+            if (!IS_VIRTUAL(pGpu) && !IS_FW_CLIENT(pGpu))
             {
                 status = NV_OK;
                 goto done;
@@ -890,7 +899,7 @@ serverAllocResourceUnderLock
 
             // if physical RM RPC make sure we're a GSP client otherwise skip
             if (((pResDesc->flags & (RS_FLAGS_ALLOC_RPC_TO_VGPU_HOST | RS_FLAGS_ALLOC_RPC_TO_PHYS_RM)) == RS_FLAGS_ALLOC_RPC_TO_PHYS_RM) &&
-                (!IS_GSP_CLIENT(pGpu)))
+                (!IS_FW_CLIENT(pGpu)))
             {
                 status = NV_OK;
                 goto done;
@@ -973,7 +982,7 @@ serverFreeResourceRpcUnderLock
     pRmResource = dynamicCast(pResourceRef->pResource, RmResource);
     status = gpuGetByRef(pResourceRef, &bBcResource, &pGpu);
     if ((status != NV_OK) ||
-        (!IS_VIRTUAL(pGpu) && !IS_GSP_CLIENT(pGpu)) ||
+        (!IS_VIRTUAL(pGpu) && !IS_FW_CLIENT(pGpu)) ||
         (pRmResource == NULL) ||
         (pRmResource->bRpcFree == NV_FALSE))
     {
@@ -1085,7 +1094,7 @@ serverUpdateLockFlagsForFree
     if (gpuGetByRef(pLockInfo->pContextRef, NULL, &pGpu) == NV_OK)
     {
         RmResource *pRmResource = dynamicCast(pRmFreeParams->pResourceRef->pResource, RmResource);
-        if (pGpu != NULL && IS_GSP_CLIENT(pGpu) && pRmResource != NULL && pRmResource->bRpcFree)
+        if (pGpu != NULL && IS_FW_CLIENT(pGpu) && pRmResource != NULL && pRmResource->bRpcFree)
         {
             //
             // If the resource desc says no need for GPU locks, we still need to lock
@@ -1300,9 +1309,9 @@ rmapiAllocWithSecInfo
                   hParent, *phObject, hClass);
     }
 
+done:
     portMemFree(pLockInfo);
 
-done:
     rmapiEpilogue(pRmApi, &rmApiContext);
 
     return status;
@@ -1345,6 +1354,7 @@ resservResourceFactory
     Dynamic    *pDynamic = NULL;
     RsResource *pResource = NULL;
     OBJGPU     *pGpu = NULL;
+    NvU32       prevGpuInst = NV_U32_MAX;
 
     pResDesc = RsResInfoByExternalClassId(pParams->externalClassId);
     if (pResDesc == NULL)
@@ -1380,6 +1390,19 @@ resservResourceFactory
         }
     }
 
+    if (pGpu != NULL &&
+        !RMCFG_FEATURE_PLATFORM_MODS &&
+        !gpuIsClassSupported(pGpu, pParams->externalClassId))
+    {
+        NV_PRINTF(LEVEL_INFO, "Skipping unsupported class 0x%x\n", pParams->externalClassId);
+        return NV_ERR_NOT_SUPPORTED;
+    }
+
+    if (pGpu != NULL)
+    {
+        prevGpuInst = gpumgrSetCurrentGpuInstance(pGpu->gpuInstance);
+    }
+
     status = objCreateDynamicWithFlags(&pDynamic,
                                        (Object*)pGpu,
                                        pResDesc->pClassInfo,
@@ -1387,12 +1410,17 @@ resservResourceFactory
                                        pCallContext,
                                        pParams);
     if (status != NV_OK)
-        return status;
+    {
+        goto done;
+    }
 
     pResource = dynamicCast(pDynamic, RsResource);
 
     if (pResource == NULL)
-        return NV_ERR_INSUFFICIENT_RESOURCES;
+    {
+        status = NV_ERR_INSUFFICIENT_RESOURCES;
+        goto done;
+    }
 
     if (pResDesc->internalClassId == classId(Subdevice)  || pResDesc->internalClassId == classId(Device) ||
         pResDesc->internalClassId == classId(DispCommon))
@@ -1413,6 +1441,12 @@ resservResourceFactory
     }
 
     *ppResource = pResource;
+
+done:
+    if (pGpu != NULL)
+    {
+        gpumgrSetCurrentGpuInstance(prevGpuInst);
+    }
 
     return status;
 }

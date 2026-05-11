@@ -191,11 +191,6 @@ NvBool nvAssignNIsoEvoHwState(
         return FALSE;
     }
 
-    /*
-     * XXX NVKMS TODO: Check that the surface is in vidmem if
-     * NV5070_CTRL_SYSTEM_CAPS_BUG_644815_DNISO_VIDMEM_ONLY
-     */
-
     pNIsoState->pSurfaceEvo = pSurfaceEvo;
     pNIsoState->format = pParamsNIso->format;
     pNIsoState->offsetInWords = pParamsNIso->offsetInWords;

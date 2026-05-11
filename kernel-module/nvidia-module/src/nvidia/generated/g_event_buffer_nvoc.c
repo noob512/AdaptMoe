@@ -16,7 +16,7 @@
 
 
 #ifdef DEBUG
-char __nvoc_class_id_uniqueness_check__0x63502b = 1;
+char __nvoc_class_id_uniqueness_check__63502b = 1;
 #endif
 
 extern const struct NVOC_CLASS_DEF __nvoc_class_def_EventBuffer;
@@ -29,7 +29,7 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_RmResource;
 void __nvoc_init__RmResource(RmResource*);
 void __nvoc_init__EventBuffer(EventBuffer*);
 void __nvoc_init_funcTable_EventBuffer(EventBuffer*);
-NV_STATUS __nvoc_ctor_EventBuffer(EventBuffer*, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
+NV_STATUS __nvoc_ctor_EventBuffer(EventBuffer*, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
 void __nvoc_init_dataField_EventBuffer(EventBuffer*);
 void __nvoc_dtor_EventBuffer(EventBuffer*);
 
@@ -80,32 +80,33 @@ NV_STATUS __nvoc_up_thunk_RsResource_eventbufferUnmapFrom(struct EventBuffer *pR
 NvU32 __nvoc_up_thunk_RsResource_eventbufferGetRefCount(struct EventBuffer *pResource);    // this
 void __nvoc_up_thunk_RsResource_eventbufferAddAdditionalDependants(struct RsClient *pClient, struct EventBuffer *pResource, RsResourceRef *pReference);    // this
 
+// Class-specific details for EventBuffer
 const struct NVOC_CLASS_DEF __nvoc_class_def_EventBuffer = 
 {
-    /*classInfo=*/ {
-        /*size=*/               sizeof(EventBuffer),
-        /*classId=*/            classId(EventBuffer),
-        /*providerId=*/         &__nvoc_rtti_provider,
+    .classInfo.size =               sizeof(EventBuffer),
+    .classInfo.classId =            classId(EventBuffer),
+    .classInfo.providerId =         &__nvoc_rtti_provider,
 #if NV_PRINTF_STRINGS_ALLOWED
-        /*name=*/               "EventBuffer",
+    .classInfo.name =               "EventBuffer",
 #endif
-    },
-    /*objCreatefn=*/        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_EventBuffer,
-    /*pCastInfo=*/          &__nvoc_castinfo__EventBuffer,
-    /*pExportInfo=*/        &__nvoc_export_info__EventBuffer
+    .objCreatefn =        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_EventBuffer,
+    .pCastInfo =          &__nvoc_castinfo__EventBuffer,
+    .pExportInfo =        &__nvoc_export_info__EventBuffer
 };
 
+// By default, all exported methods are enabled.
 #if !defined(NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG)
 #define NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(x)      (0)
 #endif
 
+// Exported method array
 static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_EventBuffer[] = 
 {
     {               /*  [0] */
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x9u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) eventbuffertBufferCtrlCmdEnableEvent_IMPL,
+        /*pFunc=*/      (void (*)(void)) &eventbuffertBufferCtrlCmdEnableEvent_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x9u)
         /*flags=*/      0x9u,
         /*accessRight=*/0x0u,
@@ -120,7 +121,7 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_EventBuf
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x9u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) eventbuffertBufferCtrlCmdUpdateGet_IMPL,
+        /*pFunc=*/      (void (*)(void)) &eventbuffertBufferCtrlCmdUpdateGet_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x9u)
         /*flags=*/      0x9u,
         /*accessRight=*/0x0u,
@@ -135,12 +136,12 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_EventBuf
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) eventbuffertBufferCtrlCmdFlush_IMPL,
+        /*pFunc=*/      (void (*)(void)) &eventbuffertBufferCtrlCmdFlush_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*flags=*/      0x8u,
         /*accessRight=*/0x0u,
         /*methodId=*/   0x90cd0104u,
-        /*paramSize=*/  0,
+        /*paramSize=*/  0 /* Singleton parameter list */,
         /*pClassInfo=*/ &(__nvoc_class_def_EventBuffer.classInfo),
 #if NV_PRINTF_STRINGS_ALLOWED
         /*func=*/       "eventbuffertBufferCtrlCmdFlush"
@@ -150,7 +151,7 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_EventBuf
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) eventbuffertBufferCtrlCmdPostTelemetryEvent_IMPL,
+        /*pFunc=*/      (void (*)(void)) &eventbuffertBufferCtrlCmdPostTelemetryEvent_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*flags=*/      0x8u,
         /*accessRight=*/0x0u,
@@ -161,7 +162,6 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_EventBuf
         /*func=*/       "eventbuffertBufferCtrlCmdPostTelemetryEvent"
 #endif
     },
-
 };
 
 
@@ -368,70 +368,62 @@ void __nvoc_up_thunk_RsResource_eventbufferAddAdditionalDependants(struct RsClie
 
 const struct NVOC_EXPORT_INFO __nvoc_export_info__EventBuffer = 
 {
-    /*numEntries=*/     4,
-    /*pExportEntries=*/ __nvoc_exported_method_def_EventBuffer
+    .numEntries=     4,
+    .pExportEntries= __nvoc_exported_method_def_EventBuffer
 };
 
+
+// Destruct EventBuffer object.
+void __nvoc_eventbufferDestruct(EventBuffer*);
 void __nvoc_dtor_RmResource(RmResource*);
-void __nvoc_dtor_EventBuffer(EventBuffer *pThis) {
+void __nvoc_dtor_EventBuffer(EventBuffer* pThis) {
+
+// Call destructor.
     __nvoc_eventbufferDestruct(pThis);
+
+// Recurse to superclass destructors.
     __nvoc_dtor_RmResource(&pThis->__nvoc_base_RmResource);
+
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
-
 void __nvoc_init_dataField_EventBuffer(EventBuffer *pThis) {
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
 
-NV_STATUS __nvoc_ctor_RmResource(RmResource* , struct CALL_CONTEXT *, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
-NV_STATUS __nvoc_ctor_EventBuffer(EventBuffer *pThis, struct CALL_CONTEXT * arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams) {
-    NV_STATUS status = NV_OK;
-    status = __nvoc_ctor_RmResource(&pThis->__nvoc_base_RmResource, arg_pCallContext, arg_pParams);
-    if (status != NV_OK) goto __nvoc_ctor_EventBuffer_fail_RmResource;
-    __nvoc_init_dataField_EventBuffer(pThis);
 
-    status = __nvoc_eventbufferConstruct(pThis, arg_pCallContext, arg_pParams);
+// Construct EventBuffer object.
+NV_STATUS __nvoc_ctor_RmResource(RmResource *pResource, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);    // inline
+NV_STATUS __nvoc_ctor_EventBuffer(EventBuffer *pEventBuffer, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {    // inline
+    NV_STATUS status = NV_OK;
+
+    // Recurse to ancestor constructor(s).
+    status = __nvoc_ctor_RmResource(&pEventBuffer->__nvoc_base_RmResource, pCallContext, pParams);
+    if (status != NV_OK) goto __nvoc_ctor_EventBuffer_fail_RmResource;
+
+    // Initialize data fields.
+    __nvoc_init_dataField_EventBuffer(pEventBuffer);
+
+    // Call the constructor for this class.
+    status = __nvoc_eventbufferConstruct(pEventBuffer, pCallContext, pParams);
     if (status != NV_OK) goto __nvoc_ctor_EventBuffer_fail__init;
     goto __nvoc_ctor_EventBuffer_exit; // Success
 
+    // Unwind on error.
 __nvoc_ctor_EventBuffer_fail__init:
-    __nvoc_dtor_RmResource(&pThis->__nvoc_base_RmResource);
+    __nvoc_dtor_RmResource(&pEventBuffer->__nvoc_base_RmResource);
 __nvoc_ctor_EventBuffer_fail_RmResource:
 __nvoc_ctor_EventBuffer_exit:
-
     return status;
 }
 
 // Vtable initialization
 static void __nvoc_init_funcTable_EventBuffer_1(EventBuffer *pThis) {
     PORT_UNREFERENCED_VARIABLE(pThis);
-
-    // eventbuffertBufferCtrlCmdEnableEvent -- exported (id=0x90cd0101)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x9u)
-    pThis->__eventbuffertBufferCtrlCmdEnableEvent__ = &eventbuffertBufferCtrlCmdEnableEvent_IMPL;
-#endif
-
-    // eventbuffertBufferCtrlCmdUpdateGet -- exported (id=0x90cd0102)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x9u)
-    pThis->__eventbuffertBufferCtrlCmdUpdateGet__ = &eventbuffertBufferCtrlCmdUpdateGet_IMPL;
-#endif
-
-    // eventbuffertBufferCtrlCmdFlush -- exported (id=0x90cd0104)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__eventbuffertBufferCtrlCmdFlush__ = &eventbuffertBufferCtrlCmdFlush_IMPL;
-#endif
-
-    // eventbuffertBufferCtrlCmdPostTelemetryEvent -- exported (id=0x90cd0105)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__eventbuffertBufferCtrlCmdPostTelemetryEvent__ = &eventbuffertBufferCtrlCmdPostTelemetryEvent_IMPL;
-#endif
-} // End __nvoc_init_funcTable_EventBuffer_1 with approximately 4 basic block(s).
+} // End __nvoc_init_funcTable_EventBuffer_1
 
 
-// Initialize vtable(s) for 25 virtual method(s).
+// Initialize vtable(s) for 21 virtual method(s).
 void __nvoc_init_funcTable_EventBuffer(EventBuffer *pThis) {
-
-    // Initialize vtable(s) with 4 per-object function pointer(s).
     __nvoc_init_funcTable_EventBuffer_1(pThis);
 }
 
@@ -459,68 +451,82 @@ void __nvoc_init__EventBuffer(EventBuffer *pThis) {
     __nvoc_init_funcTable_EventBuffer(pThis);
 }
 
-NV_STATUS __nvoc_objCreate_EventBuffer(EventBuffer **ppThis, Dynamic *pParent, NvU32 createFlags, struct CALL_CONTEXT * arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams)
+NV_STATUS __nvoc_objCreate_EventBuffer(EventBuffer **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams)
 {
-    NV_STATUS status;
-    Object *pParentObj = NULL;
-    EventBuffer *pThis;
+    NV_STATUS __nvoc_status;
+    Object *__nvoc_pParentObj = NULL;
+    EventBuffer *__nvoc_pThis;
 
-    // Assign `pThis`, allocating memory unless suppressed by flag.
-    status = __nvoc_handleObjCreateMemAlloc(createFlags, sizeof(EventBuffer), (void**)&pThis, (void**)ppThis);
-    if (status != NV_OK)
-        return status;
+    // Don't allocate memory if the caller has already done so.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+    {
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_ppThis != NULL && *__nvoc_ppThis != NULL, NV_ERR_INVALID_PARAMETER);
+        __nvoc_pThis = *__nvoc_ppThis;
+    }
+
+    // Allocate memory
+    else
+    {
+        __nvoc_pThis = portMemAllocNonPaged(sizeof(EventBuffer));
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_pThis != NULL, NV_ERR_NO_MEMORY);
+    }
 
     // Zero is the initial value for everything.
-    portMemSet(pThis, 0, sizeof(EventBuffer));
+    portMemSet(__nvoc_pThis, 0, sizeof(EventBuffer));
 
-    pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.createFlags = createFlags;
+    __nvoc_pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.createFlags = __nvoc_createFlags;
 
     // Link the child into the parent if there is one unless flagged not to do so.
-    if (pParent != NULL && !(createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
+    if (__nvoc_pParent != NULL && !(__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
     {
-        pParentObj = dynamicCast(pParent, Object);
-        objAddChild(pParentObj, &pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
+        __nvoc_pParentObj = dynamicCast(__nvoc_pParent, Object);
+        objAddChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
     }
     else
     {
-        pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.pParent = NULL;
+        __nvoc_pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.pParent = NULL;
     }
 
-    __nvoc_init__EventBuffer(pThis);
-    status = __nvoc_ctor_EventBuffer(pThis, arg_pCallContext, arg_pParams);
-    if (status != NV_OK) goto __nvoc_objCreate_EventBuffer_cleanup;
+    // Initialize vtable, RTTI, etc., then call constructor.
+    __nvoc_init__EventBuffer(__nvoc_pThis);
+    __nvoc_status = __nvoc_ctor_EventBuffer(__nvoc_pThis, pCallContext, pParams);
+    if (__nvoc_status != NV_OK) goto __nvoc_objCreate_EventBuffer_cleanup;
 
     // Assignment has no effect if NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT is set.
-    *ppThis = pThis;
+    *__nvoc_ppThis = __nvoc_pThis;
 
+    // Success
     return NV_OK;
 
+    // Do not call destructors here since the constructor already called them.
 __nvoc_objCreate_EventBuffer_cleanup:
 
     // Unlink the child from the parent if it was linked above.
-    if (pParentObj != NULL)
-        objRemoveChild(pParentObj, &pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
+    if (__nvoc_pParentObj != NULL)
+        objRemoveChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
 
-    // Do not call destructors here since the constructor already called them.
-    if (createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
-        portMemSet(pThis, 0, sizeof(EventBuffer));
+    // Zero out memory that was allocated by caller.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+        portMemSet(__nvoc_pThis, 0, sizeof(EventBuffer));
+
+    // Free memory allocated by `__nvoc_handleObjCreateMemAlloc`.
     else
     {
-        portMemFree(pThis);
-        *ppThis = NULL;
+        portMemFree(__nvoc_pThis);
+        *__nvoc_ppThis = NULL;
     }
 
-    // coverity[leaked_storage:FALSE]
-    return status;
+    // Failure
+    return __nvoc_status;
 }
 
-NV_STATUS __nvoc_objCreateDynamic_EventBuffer(EventBuffer **ppThis, Dynamic *pParent, NvU32 createFlags, va_list args) {
-    NV_STATUS status;
-    struct CALL_CONTEXT * arg_pCallContext = va_arg(args, struct CALL_CONTEXT *);
-    struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams = va_arg(args, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
+NV_STATUS __nvoc_objCreateDynamic_EventBuffer(EventBuffer **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, va_list __nvoc_args) {
+    NV_STATUS __nvoc_status;
+    struct CALL_CONTEXT *pCallContext = va_arg(__nvoc_args, struct CALL_CONTEXT *);
+    struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams = va_arg(__nvoc_args, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
 
-    status = __nvoc_objCreate_EventBuffer(ppThis, pParent, createFlags, arg_pCallContext, arg_pParams);
+    __nvoc_status = __nvoc_objCreate_EventBuffer(__nvoc_ppThis, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams);
 
-    return status;
+    return __nvoc_status;
 }
 

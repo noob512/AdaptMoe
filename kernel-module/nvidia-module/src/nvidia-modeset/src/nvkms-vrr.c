@@ -91,79 +91,6 @@ static void ConfigVrrPstateSwitch(NVDispEvoPtr pDispEvo,
 
 
 /*!
- * Allocate the VRR semaphore surface.
- *
- * Only one array of VRR semaphores is needed per "head group", which for our
- * purposes means a pDevEvo.  This array is allocated when the device is
- * initialized and kept around for the lifetime of the pDevEvo.
- */
-void nvAllocVrrEvo(NVDevEvoPtr pDevEvo)
-{
-    NvU32 handle;
-    NvU64 size = NVKMS_VRR_SEMAPHORE_SURFACE_SIZE;
-
-    /* On GPUs that support the HEAD_SET_DISPLAY_RATE method (nvdisplay), we
-     * don't need a VRR semaphore surface. */
-    if (pDevEvo->hal->caps.supportsDisplayRate) {
-        return;
-    }
-
-    handle = nvGenerateUnixRmHandle(&pDevEvo->handleAllocator);
-
-    if (nvRmAllocSysmem(pDevEvo, handle, NULL, &pDevEvo->vrr.pSemaphores,
-                        size, NVKMS_MEMORY_NISO)) {
-        pDevEvo->vrr.semaphoreHandle = handle;
-    } else {
-        nvEvoLogDev(pDevEvo, EVO_LOG_ERROR,
-                    "Failed to allocate G-SYNC semaphore memory");
-        nvFreeUnixRmHandle(&pDevEvo->handleAllocator, handle);
-    }
-}
-
-void nvFreeVrrEvo(NVDevEvoPtr pDevEvo)
-{
-    if (pDevEvo->vrr.semaphoreHandle != 0) {
-        if (pDevEvo->vrr.pSemaphores != NULL) {
-            nvRmApiUnmapMemory(nvEvoGlobal.clientHandle,
-                               pDevEvo->deviceHandle,
-                               pDevEvo->vrr.semaphoreHandle,
-                               pDevEvo->vrr.pSemaphores,
-                               0);
-            pDevEvo->vrr.pSemaphores = NULL;
-        }
-        nvRmApiFree(nvEvoGlobal.clientHandle, pDevEvo->deviceHandle,
-                    pDevEvo->vrr.semaphoreHandle);
-        nvFreeUnixRmHandle(&pDevEvo->handleAllocator,
-                           pDevEvo->vrr.semaphoreHandle);
-        pDevEvo->vrr.semaphoreHandle = 0;
-    }
-}
-
-NvBool nvExportVrrSemaphoreSurface(const NVDevEvoRec *pDevEvo, int fd)
-{
-    // Export the memory as an FD.
-    NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS exportParams = { };
-    const NvU32 hMemory = pDevEvo->vrr.semaphoreHandle;
-    NvU32 status;
-
-    if (hMemory == 0) {
-        return FALSE;
-    }
-
-    exportParams.fd = fd;
-    exportParams.object.type = NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM;
-    exportParams.object.data.rmObject.hDevice = pDevEvo->deviceHandle;
-    exportParams.object.data.rmObject.hObject = hMemory;
-
-    status = nvRmApiControl(nvEvoGlobal.clientHandle,
-                           nvEvoGlobal.clientHandle,
-                           NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD,
-                           &exportParams, sizeof(exportParams));
-
-    return status == NVOS_STATUS_SUCCESS;
-}
-
-/*!
  * Return TRUE dpy support G-SYNC.
  */
 static NvBool DpyIsGsync(const NVDpyEvoRec *pDpyEvo)
@@ -254,6 +181,36 @@ nvGetAllowedDpyVrrType(const NVDpyEvoRec *pDpyEvo,
                        const NvBool allowGsync,
                        const enum NvKmsAllowAdaptiveSync allowAdaptiveSync)
 {
+
+    if (nvConnectorUsesDPLib(pDpyEvo->pConnectorEvo) &&
+        nvDPLibDpyUsesHDMIActivePcon(pDpyEvo)) {
+
+        return NVKMS_DPY_VRR_TYPE_NONE;
+    }
+
+    if (nvDpyIsHdmiEvo(pDpyEvo)) {
+        /*
+         * Do not allow HDMI VRR if refresh rate less than
+         * 50Hz or Vactive < 720.
+         */
+        if ((pTimings->vVisible < 720) || (pTimings->RRx1k < 50000)) {
+            return NVKMS_DPY_VRR_TYPE_NONE;
+        }
+
+        if (pDpyEvo->parsedEdid.valid &&
+            ((pDpyEvo->parsedEdid.info.product_id == 0x7232) &&
+             (pDpyEvo->parsedEdid.info.manuf_id == 0x2D4C))) {
+
+            const NvU32 vVisible = pTimings->vVisible;
+            const NvU32 hVisible = pTimings->hVisible;
+
+            // Filter out non-16:9 modes
+            if ((vVisible * 16) != (hVisible * 9)) {
+                return NVKMS_DPY_VRR_TYPE_NONE;
+            }
+        }
+    }
+
     /*
      * Mark these mode timings as indicating a VRR mode, even if the timings
      * don't need to be adjusted; this is used to distinguish between VRR and
@@ -437,17 +394,17 @@ static void RmDisableVrr(NVDevEvoPtr pDevEvo)
                                   head);
         }
     }
-    nvAssert(pDevEvo->hal->caps.supportsDisplayRate);
 }
 
 void nvDisableVrr(NVDevEvoPtr pDevEvo)
 {
     NVDispEvoPtr pDispEvo;
-    NvU32 head, dispIndex;
+    NvU32 apiHead, head, dispIndex;
+    NVDispHeadStateEvoRec *pHeadState;
 
     FOR_ALL_EVO_DISPLAYS(pDispEvo, dispIndex, pDevEvo) {
         for (head = 0; head < pDevEvo->numHeads; head++) {
-            NVDispHeadStateEvoRec *pHeadState = &pDispEvo->headState[head];
+            pHeadState = &pDispEvo->headState[head];
 
             TellRMAboutVrrHead(pDispEvo, pHeadState, FALSE);
         }
@@ -467,15 +424,26 @@ void nvDisableVrr(NVDevEvoPtr pDevEvo)
     RmDisableVrr(pDevEvo);
 
     FOR_ALL_EVO_DISPLAYS(pDispEvo, dispIndex, pDevEvo) {
-        for (head = 0; head < pDevEvo->numHeads; head++) {
-            NVDispHeadStateEvoRec *pHeadState = &pDispEvo->headState[head];
+        for (apiHead = 0; apiHead < pDevEvo->numApiHeads; apiHead++) {
+            NVDispApiHeadStateEvoRec *pApiHeadState =
+                &pDispEvo->apiHeadState[apiHead];
 
-            if ((pHeadState->pConnectorEvo != NULL) &&
-                    nvIsAdaptiveSyncDpyVrrType(pHeadState->timings.vrr.type)) {
+            if (!nvApiHeadIsActive(pDispEvo, apiHead)) {
+                continue;
+            }
+
+            head = nvGetPrimaryHwHeadFromMask(pApiHeadState->hwHeadsMask);
+            nvAssert(head != NV_INVALID_HEAD);
+
+            pHeadState = &pDispEvo->headState[head];
+            nvAssert(pHeadState->pConnectorEvo != NULL);
+
+            if (nvIsAdaptiveSyncDpyVrrType(pHeadState->timings.vrr.type)) {
                 if (nvConnectorUsesDPLib(pHeadState->pConnectorEvo)) {
                     nvDPLibSetAdaptiveSync(pDispEvo, head, FALSE);
                 } else {
-                    nvHdmiSetVRR(pDispEvo, head, FALSE);
+                    nvHdmiSetVRR(pDispEvo, head,
+                                 FALSE, &pApiHeadState->infoFrame.empCtrl);
                 }
             }
         }
@@ -505,7 +473,7 @@ static NvBool AnyEnabledGsyncDpys(const NVDevEvoRec *pDevEvo)
     return FALSE;
 }
 
-static NvBool RmEnableVrr(NVDevEvoPtr pDevEvo)
+static void RmEnableVrr(NVDevEvoPtr pDevEvo)
 {
     NVDispEvoPtr pDispEvo;
     NvU32 dispIndex, head;
@@ -518,8 +486,6 @@ static NvBool RmEnableVrr(NVDevEvoPtr pDevEvo)
                                   head);
         }
     }
-    nvAssert(pDevEvo->hal->caps.supportsDisplayRate);
-    return TRUE;
 }
 
 void nvGetDpyMinRefreshRateValidValues(
@@ -583,20 +549,32 @@ void nvGetDpyMinRefreshRateValidValues(
 void nvEnableVrr(NVDevEvoPtr pDevEvo)
 {
     NVDispEvoPtr pDispEvo;
-    NvU32 head, dispIndex;
+    NvU32 apiHead, head, dispIndex;
+    NVDispHeadStateEvoRec *pHeadState;
 
     nvAssert(!pDevEvo->vrr.enabled);
 
     FOR_ALL_EVO_DISPLAYS(pDispEvo, dispIndex, pDevEvo) {
-        for (head = 0; head < pDevEvo->numHeads; head++) {
-            NVDispHeadStateEvoRec *pHeadState = &pDispEvo->headState[head];
+        for (apiHead = 0; apiHead < pDevEvo->numApiHeads; apiHead++) {
+            NVDispApiHeadStateEvoRec *pApiHeadState =
+                &pDispEvo->apiHeadState[apiHead];
 
-            if ((pHeadState->pConnectorEvo != NULL) &&
-                    nvIsAdaptiveSyncDpyVrrType(pHeadState->timings.vrr.type)) {
+            if (!nvApiHeadIsActive(pDispEvo, apiHead)) {
+                continue;
+            }
+
+            head = nvGetPrimaryHwHeadFromMask(pApiHeadState->hwHeadsMask);
+            nvAssert(head != NV_INVALID_HEAD);
+
+            pHeadState = &pDispEvo->headState[head];
+            nvAssert(pHeadState->pConnectorEvo != NULL);
+
+            if (nvIsAdaptiveSyncDpyVrrType(pHeadState->timings.vrr.type)) {
                 if (nvConnectorUsesDPLib(pHeadState->pConnectorEvo)) {
                     nvDPLibSetAdaptiveSync(pDispEvo, head, TRUE);
                 } else {
-                    nvHdmiSetVRR(pDispEvo, head, TRUE);
+                    nvHdmiSetVRR(pDispEvo, head,
+                                 TRUE, &pApiHeadState->infoFrame.empCtrl);
                 }
             }
         }
@@ -604,7 +582,7 @@ void nvEnableVrr(NVDevEvoPtr pDevEvo)
 
     FOR_ALL_EVO_DISPLAYS(pDispEvo, dispIndex, pDevEvo) {
         for (head = 0; head < pDevEvo->numHeads; head++) {
-            NVDispHeadStateEvoRec *pHeadState = &pDispEvo->headState[head];
+            pHeadState = &pDispEvo->headState[head];
 
             // To allow VRR-based mclk switching, RM needs to know which heads
             // are driving VRR displays capable of extending vblank.  This
@@ -624,10 +602,7 @@ void nvEnableVrr(NVDevEvoPtr pDevEvo)
         return;
     }
 
-    if (!RmEnableVrr(pDevEvo)) {
-        return;
-    }
-
+    RmEnableVrr(pDevEvo);
     pDevEvo->vrr.enabled = TRUE;
 }
 
@@ -747,13 +722,10 @@ static void SetStallLockOneDisp(NVDispEvoPtr pDispEvo, NvU32 applyAllowVrrApiHea
             pDevEvo->hal->SetStallLock(pDispEvo, head,
                                     enableVrrOnHead[head],
                                     &updateState);
-
-            if (pDevEvo->hal->caps.supportsDisplayRate) {
-                pDevEvo->hal->SetDisplayRate(pDispEvo, head,
-                                            enableVrrOnHead[head],
-                                            &updateState,
-                                            timeout);
-            }
+            pDevEvo->hal->SetDisplayRate(pDispEvo, head,
+                                        enableVrrOnHead[head],
+                                        &updateState,
+                                        timeout);
         }
     }
 
@@ -862,7 +834,6 @@ static NvBool SetVrrActivePriv(NVDevEvoPtr pDevEvo,
                 (vrrActiveApiHeadMasks[sd] & (1 << apiHead)) > 0;
         }
     }
-    pDevEvo->vrr.flipCounter = 0;
     return NV_TRUE;
 }
 
@@ -976,40 +947,11 @@ enum NvKmsVrrFlipType nvGetActiveVrrType(const NVDevEvoRec *pDevEvo)
     return NV_KMS_VRR_FLIP_NON_VRR;
 }
 
-/*!
- * Get the next VRR semaphore index to be released
- * by the client, increments the counter and handles wrapping.
- */
-NvS32 nvIncVrrSemaphoreIndex(NVDevEvoPtr pDevEvo, 
-                             const NvU32 applyAllowVrrApiHeadMasks[NVKMS_MAX_SUBDEVICES])
-{
-    NvS32 vrrSemaphoreIndex = -1;
-
-    // If there are pending unstall timers (e.g. triggered by cursor motion),
-    // cancel them now. The flip that was just requested will trigger an
-    // unstall.
-    // NOTE: This call will not cancel the frame release timer in
-    // the case where there is a vrr active head that is pending cursor motion
-    // and not currently flipping, since we need to wait for the timer for that head
-    nvCancelVrrFrameReleaseTimers(pDevEvo, applyAllowVrrApiHeadMasks);
-
-    if (AnyActiveVrrHeads(pDevEvo) && !pDevEvo->hal->caps.supportsDisplayRate) {
-        vrrSemaphoreIndex = pDevEvo->vrr.flipCounter++;
-        if (pDevEvo->vrr.flipCounter >= NVKMS_VRR_SEMAPHORE_SURFACE_COUNT) {
-            pDevEvo->vrr.flipCounter = 0;
-        }
-    }
-
-    return vrrSemaphoreIndex;
-}
-
 static void
 VrrUnstallNow(NVDispEvoPtr pDispEvo)
 {
     NVDevEvoPtr pDevEvo = pDispEvo->pDevEvo;
     NvU32 apiHead, head;
-
-    nvAssert(pDevEvo->hal->caps.supportsDisplayRate);
 
     for (apiHead = 0; apiHead < NVKMS_MAX_HEADS_PER_DISP; apiHead++) {
         if (!pDispEvo->apiHeadState[apiHead].vrr.pendingCursorMotion) {
@@ -1059,16 +1001,14 @@ void nvTriggerVrrUnstallMoveCursor(NVDispEvoPtr pDispEvo)
         return;
     }
 
-    {
-        if (!pDispEvo->vrr.unstallTimer) {
-            for (apiHead = 0; apiHead < NVKMS_MAX_HEADS_PER_DISP; apiHead++) {
-                if (pDispEvo->apiHeadState[apiHead].vrr.active) {
-                    pDispEvo->apiHeadState[apiHead].vrr.pendingCursorMotion = NV_TRUE;
-                }
+    if (!pDispEvo->vrr.unstallTimer) {
+        for (apiHead = 0; apiHead < NVKMS_MAX_HEADS_PER_DISP; apiHead++) {
+            if (pDispEvo->apiHeadState[apiHead].vrr.active) {
+                pDispEvo->apiHeadState[apiHead].vrr.pendingCursorMotion = NV_TRUE;
             }
-            pDispEvo->vrr.unstallTimer =
-                nvkms_alloc_timer(VrrUnstallTimer, pDispEvo, 0, timeoutMs * 1000);
         }
+        pDispEvo->vrr.unstallTimer =
+            nvkms_alloc_timer(VrrUnstallTimer, pDispEvo, 0, timeoutMs * 1000);
     }
 }
 
@@ -1090,23 +1030,4 @@ void nvTriggerVrrUnstallSetCursorImage(NVDispEvoPtr pDispEvo,
             VrrUnstallNow(pDispEvo);
         }
     }
-}
-
-void nvVrrSignalSemaphore(NVDevEvoPtr pDevEvo, NvS32 vrrSemaphoreIndex)
-{
-    NvU32* pVrrSemaphores = (NvU32*)pDevEvo->vrr.pSemaphores;
-
-    if (!pDevEvo->vrr.pSemaphores) {
-        return;
-    }
-
-    if (vrrSemaphoreIndex < 0) {
-        return;
-    }
-
-    if (vrrSemaphoreIndex >= NVKMS_VRR_SEMAPHORE_SURFACE_COUNT) {
-        return;
-    }
-
-    pVrrSemaphores[vrrSemaphoreIndex] = 1;
 }

@@ -1,18 +1,18 @@
 _out/Linux_x86_64/nvspdm_memlib.o: \
  src/libraries/libspdm/nvidia/nvspdm_memlib.c \
  ../common/sdk/nvidia/inc/cpuopsys.h \
- src/libraries/libspdm/3.1.1/include/hal/base.h \
- src/libraries/libspdm/3.1.1/include/hal/library/debuglib.h \
- src/libraries/libspdm/3.1.1/include/hal/base.h \
- src/libraries/libspdm/3.1.1/include/internal/libspdm_lib_config.h \
+ src/libraries/libspdm/3.5.0/include/hal/base.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/debuglib.h \
+ src/libraries/libspdm/3.5.0/include/hal/base.h \
+ src/libraries/libspdm/3.5.0/include/internal/libspdm_lib_config.h \
  src/libraries/libspdm/nvidia/nvspdm_rmconfig.h \
- src/libraries/libspdm/3.1.1/include/internal/libspdm_macro_check.h \
- src/libraries/libspdm/3.1.1/include/hal/library/memlib.h \
+ src/libraries/libspdm/3.5.0/include/internal/libspdm_macro_check.h \
+ src/libraries/libspdm/3.5.0/include/hal/library/memlib.h \
  inc/libraries/nvport/nvport.h ../common/sdk/nvidia/inc/nvtypes.h \
  ../common/sdk/nvidia/inc/cpuopsys.h ../common/sdk/nvidia/inc/nvstatus.h \
  ../common/sdk/nvidia/inc/nvtypes.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
@@ -26,13 +26,13 @@ _out/Linux_x86_64/nvspdm_memlib.o: \
  inc/libraries/nvport/crypto.h inc/libraries/nvport/string.h \
  inc/libraries/nvport/cpu.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
-src/libraries/libspdm/3.1.1/include/hal/base.h:
-src/libraries/libspdm/3.1.1/include/hal/library/debuglib.h:
-src/libraries/libspdm/3.1.1/include/hal/base.h:
-src/libraries/libspdm/3.1.1/include/internal/libspdm_lib_config.h:
+src/libraries/libspdm/3.5.0/include/hal/base.h:
+src/libraries/libspdm/3.5.0/include/hal/library/debuglib.h:
+src/libraries/libspdm/3.5.0/include/hal/base.h:
+src/libraries/libspdm/3.5.0/include/internal/libspdm_lib_config.h:
 src/libraries/libspdm/nvidia/nvspdm_rmconfig.h:
-src/libraries/libspdm/3.1.1/include/internal/libspdm_macro_check.h:
-src/libraries/libspdm/3.1.1/include/hal/library/memlib.h:
+src/libraries/libspdm/3.5.0/include/internal/libspdm_macro_check.h:
+src/libraries/libspdm/3.5.0/include/hal/library/memlib.h:
 inc/libraries/nvport/nvport.h:
 ../common/sdk/nvidia/inc/nvtypes.h:
 ../common/sdk/nvidia/inc/cpuopsys.h:
@@ -41,7 +41,7 @@ inc/libraries/nvport/nvport.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:

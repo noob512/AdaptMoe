@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2013-2024 NVIDIA Corporation
+    Copyright (c) 2013-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -45,20 +45,20 @@
 //     #endif
 // 3) Do the same thing for the function definition, and for any structs that
 //    are taken as arguments to these functions.
-// 4) Let this change propagate over to cuda_a and bugfix_main, so that the CUDA
+// 4) Let this change propagate over to bugfix_main, so that the CUDA
 //    and nvidia-cfg libraries can start using the new API by bumping up the API
 //    version number it's using.
 //    Places where UVM_API_REVISION is defined are:
-//      drivers/gpgpu/cuda/cuda.nvmk (cuda_a)
+//      drivers/gpgpu/cuda/cuda.nvmk (bugfix_main)
 //      drivers/setup/linux/nvidia-cfg/makefile.nvmk (bugfix_main)
-// 5) Once the bugfix_main and cuda_a changes have made it back into chips_a,
+// 5) Once the bugfix_main changes have made it back into chips_a,
 //    remove the old API declaration, definition, and any old structs that were
 //    in use.
 
 #ifndef _UVM_H_
 #define _UVM_H_
 
-#define UVM_API_LATEST_REVISION 13
+#define UVM_API_LATEST_REVISION 14
 
 #if !defined(UVM_API_REVISION)
 #error "please define UVM_API_REVISION macro to a desired version number or UVM_API_LATEST_REVISION macro"
@@ -335,6 +335,12 @@ NV_STATUS UvmIsPageableMemoryAccessSupportedOnGpu(const NvProcessorUuid *gpuUuid
 // NvRmControl(NVC637_CTRL_CMD_GET_UUID). Otherwise, if the GPU is not SMC
 // capable or SMC enabled, the physical GPU UUID must be used.
 //
+// GPU registration may fail if certain features, such as those required to
+// support pageable memory on systems without hardware support, could not be
+// initialised. Registration may succeed if callers retry after explicitly
+// requesting these features be disabled when calling UvmInitialize(), for
+// example by passing UVM_INIT_FLAGS_DISABLE_HMM.
+//
 // Arguments:
 //     gpuUuid: (INPUT)
 //         UUID of the physical GPU to register.
@@ -344,6 +350,12 @@ NV_STATUS UvmIsPageableMemoryAccessSupportedOnGpu(const NvProcessorUuid *gpuUuid
 //         This should be NULL if the GPU is not SMC capable or SMC enabled.
 //
 // Error codes:
+//
+//     NV_ERR_BUSY_RETRY:
+//         Registration of the GPU failed because not all features required
+//         to support the VA space could be enabled. Caller should retry after
+//         disabling certain features when creating the VA space.
+//
 //     NV_ERR_NO_MEMORY:
 //         Internal memory allocation failed.
 //
@@ -1123,7 +1135,6 @@ NV_STATUS UvmAllowMigrationRangeGroups(const NvU64 *rangeGroupIds,
 //     for (i = 0; i < accessedByCount; i++) {
 //         UvmSetAccessedBy(base, length, &accessedByUuids[i]);
 //     }
-//     UvmSetRangeGroup(base, length, rangeGroupId);
 //     UvmMigrate(base, length, preferredLocationUuid, 0);
 //
 // Please see those APIs for further details on their behavior. If an error is
@@ -1183,8 +1194,7 @@ NV_STATUS UvmAlloc(void                  *base,
                    NvLength               length,
                    const NvProcessorUuid *preferredLocationUuid,
                    const NvProcessorUuid *accessedByUuids,
-                   NvLength               accessedByCount,
-                   NvU64                  rangeGroupId);
+                   NvLength               accessedByCount);
 
 //------------------------------------------------------------------------------
 // UvmFree
@@ -1456,17 +1466,19 @@ NV_STATUS UvmAllocDeviceP2P(NvProcessorUuid gpuUuid,
 // they will not be migrated.
 //
 // If the input virtual range corresponds to system-allocated pageable memory,
-// and UvmIsPageableMemoryAccessSupported reports that pageable memory access
-// is supported, then the driver will populate any unpopulated pages at the
+// and UvmIsPageableMemoryAccessSupported reports that pageable memory access is
+// supported, then the driver will populate any unpopulated pages at the
 // destination processor and migrate the data from any source location to the
-// destination. Pages in the VA range are migrated even if their preferred
-// location is set to a processor other than the destination processor.
-// If the accessed-by list of any of the pages in the VA range is not empty,
-// then mappings to those pages from all the appropriate processors are updated
-// to refer to the new location if establishing such a mapping is possible.
-// Otherwise, those mappings are cleared.
-// Note that in this case, software managed pageable memory does not support
-// migration of MAP_SHARED, file-backed, or PROT_NONE mappings.
+// destination. On coherent platforms, if the destination processor is a GPU and
+// the GPU is not a NUMA node, pages will be populated on the closest CPU NUMA
+// node if they are not already populated anywhere. Pages in the VA range are
+// migrated even if their preferred location is set to a processor other than
+// the destination processor. If the accessed-by list of any of the pages in the
+// VA range is not empty, then mappings to those pages from all the appropriate
+// processors are updated to refer to the new location if establishing such a
+// mapping is possible. Otherwise, those mappings are cleared. Note that in this
+// case, software managed pageable memory does not support migration of
+// MAP_SHARED, file-backed, or PROT_NONE mappings.
 //
 // If any pages in the given VA range are associated with a range group which
 // has been made non-migratable via UvmPreventMigrationRangeGroups, then those
@@ -2124,11 +2136,6 @@ NV_STATUS UvmUnmapExternal(void                  *base,
                            NvLength               length,
                            const NvProcessorUuid *gpuUuid);
 
-// TODO: Bug 2732305: Remove this declaration when the new external APIs have
-//       been implemented.
-NV_STATUS UvmUnmapExternalAllocation(void                  *base,
-                                     const NvProcessorUuid *gpuUuid);
-
 //------------------------------------------------------------------------------
 // UvmMapDynamicParallelismRegion
 //
@@ -2342,22 +2349,16 @@ NV_STATUS UvmDisableReadDuplication(void     *base,
 // a file backed shared mapping and least one GPU in the system supports
 // transparent access to pageable memory, the behavior below is not guaranteed.
 //
-// If any pages in the VA range are associated with a range group that was made
-// non-migratable via UvmPreventMigrationRangeGroups, then those pages are
-// migrated immediately to the specified preferred location and mapped according
-// to policies specified in UvmPreventMigrationRangeGroups. Otherwise, this API
-// neither migrates pages nor does it populate unpopulated pages. Note that if
-// the specified preferred location is a fault-capable GPU and at least one page
-// in the VA range is associated with a non-migratable range group, then an
-// error is returned. Additionally, if the specified preferred location is a
-// non-fault capable GPU and at least one page in the VA range is associated
-// with a non-migratable range group, an error is returned if another
-// non-fault-capable GPU is present in the accessed-by list of that page but P2P
-// support has not been enabled between both GPUs.
-//
 // When a page is in its preferred location, a fault from another processor will
 // not cause a migration if a mapping for that page from that processor can be
-// established without migrating the page.
+// established without migrating the page. Individual faulting pages will still
+// migrate to service immediate access needs, but prefetch operations will not
+// pull additional pages away from their preferred location.
+//
+// If the specified processor is a GPU and the GPU is not a NUMA node and the
+// input range is system-allocated pageable memory and the system supports
+// transparent access to pageable memory, preferred location will be set to the
+// closest CPU NUMA node.
 //
 // When a page that was allocated via either UvmAlloc or UvmMemMap migrates away
 // from its preferred location, the mapping on the preferred location's
@@ -2676,97 +2677,109 @@ NV_STATUS UvmUnsetAccessedBy(void                  *base,
                              const NvProcessorUuid *accessedByUuid);
 
 //------------------------------------------------------------------------------
-// UvmEnableSystemWideAtomics
+// UvmDiscard
 //
-// Enables software-assisted system-wide atomics support on the specified GPU.
-// Any system-wide atomic operation issued from this GPU is now guaranteed to be
-// atomic with respect to all accesses from other processors that also support
-// system-wide atomics regardless of whether that support is enabled on those
-// other processors or not.
+// Inform the UVM driver that the data in the specified virtual address range
+// is no longer needed.
 //
-// The class of atomic operations from the GPU that are considered system-wide
-// is GPU architecture dependent. All atomic operations from the CPU are always
-// considered to be system-wide and support for system-wide atomics on the CPU
-// is always considered to be enabled.
+// Both base and length must be aligned to the smallest page size supported by
+// the CPU. The VA range must lie within the largest possible virtual address
+// supported by the specified processor.
 //
-// System-wide atomics which cannot be natively supported in hardware are
-// emulated using virtual mappings and page faults. For example, assume a
-// virtual address which is resident in CPU memory and has CPU memory as its
-// preferred location. A GPU with system-wide atomics enabled but without native
-// atomics support to CPU memory will not have atomics enabled in its virtual
-// mapping of the page that contains that address. If that GPU performs an
-// atomic operation, the access will fault, all other processors' mappings to
-// that page will have their write permissions revoked, the faulting GPU will be
-// granted atomic permissions in its virtual mapping, and the faulting GPU will
-// retry its access. Further atomic accesses from that GPU will not cause page
-// faults until another processor attempts a write access to the same page.
+// The virtual address range specified by (base, length) must have been
+// allocated via a call to either UvmAlloc or UvmMemMap, or be supported
+// system-allocated pageable memory.
 //
-// Multiple calls to this API for the same GPU are not refcounted, i.e. calling
-// this API for a GPU for which software-assisted system-wide atomics support
-// has already been enabled results in a no-op.
+// If the input virtual range corresponds to system-allocated pageable memory,
+// and there is at least one GPU in the system that supports transparent access
+// to pageable memory, the behavior described in the next paragraphs does not
+// take effect.
 //
-// The GPU must have been registered using UvmRegisterGpu prior to making this
-// call. By default, software-assisted system-wide atomics support is enabled
-// when a GPU is registered.
+// When a virtual address range is discarded using this API, any
+// read-duplicated copies are collapsed. UvmDiscard will not cause the
+// immediate migration of any pages covered by the specified virtual address
+// range.
+//
+// A discard operation done without the flag UVM_DISCARD_FLAGS_UNMAP will be
+// faster than an operation with that flag, but clearing the discard status can
+// only be done with a migration API call as described below.
+//
+// After a page has been discarded, reads and writes to/from discarded memory
+// have the following behavior:
+//
+//   * Reads and writes to/from memory discarded without
+//     UVM_DISCARD_FLAGS_UNMAP have undefined behavior.
+//   * Reads and writes to/from memory discarded without
+//     UVM_DISCARD_FLAGS_UNMAP will not clear the discard status.
+//   * Reads from memory discarded with UVM_DISCARD_FLAGS_UNMAP, including
+//     back-to-back reads, return indeterminate data.
+//   * Writes to memory discarded with UVM_DISCARD_FLAGS_UNMAP
+//     - are guaranteed to land and remove the discard status of the virtual
+//       address,
+//     - any reads after a write will observe the written data,
+//     - will collapse any read-duplicated copies of the virtual address.
+//
+// UvmDiscard can happen concurrently with memory migrations.Therefore, the
+// caller is responsible for serializing page accesses and/or migrations and
+// discard operations.
+//
+// Calls to UvmMigrate, UvmMigrateAsync, UvmPreventMigrationRangeGroups, or
+// UvmMigrateRangeGroup, on a discarded virtual address range will cause the
+// collapsing of any discarded read-duplicated pages and will clear the discard
+// status of all discarded pages in the migrated VA range.
+//
+// If discarded memory is evicted, the data in the pages backing the evicted
+// virtual range is not copied to the eviction destination and the discard
+// status of the evicted pages is not cleared. Pages that have been discarded
+// will be selected for eviction before pages that require copies during
+// eviction.
+//
+// If UvmEnableReadDuplication/UvmDisableReadDuplication is called on a
+// discarded virtual address range, the discard status of the range is not
+// cleared.
+//
+// If discarded pages are in a processor's accessed-by list, mappings to those
+// pages are not guaranteed be created on the processor while the page is
+// discarded.
+//
+// If UvmSetPreferredLocation is called on a discarded virtual address range,
+// data from the pages backing the range will not be copied if those pages
+// require migration as a result of setting the preferred location.
+//
+// Calling this API while a non-fault-capable GPU is registered, will result in
+// the API returning an error. If a non-fault-capable GPU is registered after
+// pages have been discarded, UvmPreventMigrationRangeGroup will clear the
+// discard status of the range.
 //
 // Arguments:
-//     gpuUuid: (INPUT)
-//         UUID of the physical GPU if the GPU is not SMC capable or SMC
-//         enabled, or the GPU instance UUID of the partition to enable
-//         software-assisted system-wide atomics on.
+//     base: (INPUT)
+//         Base address of the virtual address range.
 //
-// Error codes:
+//     length: (INPUT)
+//         Length, in bytes, of the range.
+//
+//     flags: (INPUT)
+//         UvmDiscard operation flags.
+//            UVM_DISCARD_FLAGS_UNMAP: The discarded pages will be unmapped.
+//            This allows future writes to remove the discard status.
+//
+// Errors:
+//     NV_ERR_INVALID_ADDRESS:
+//         base and length are not properly aligned, the range does not
+//         represent a valid UVM allocation, or the range is not covered by a
+//         single UVM managed VA range.
+//
+//     NV_ERR_INVALID_ARGUMENT:
+//         the flags parameter is not valid.
+//
+//     NV_ERR_INVALID_DEVICE:
+//         At least one non-fault-capable GPU has a registered VA space.
+//
 //     NV_ERR_NO_MEMORY:
 //         Internal memory allocation failed.
 //
-//     NV_ERR_INVALID_DEVICE:
-//         The GPU referred to by gpuUuid was not registered.
-//
-//     NV_ERR_NOT_SUPPORTED:
-//         The GPU does not support system-wide atomic operations, or the GPU
-//         has hardware support for scoped atomic operations.
-//
-//     NV_ERR_GENERIC:
-//         Unexpected error. We try hard to avoid returning this error code,
-//         because it is not very informative.
-//
 //------------------------------------------------------------------------------
-NV_STATUS UvmEnableSystemWideAtomics(const NvProcessorUuid *gpuUuid);
-
-//------------------------------------------------------------------------------
-// UvmDisableSystemWideAtomics
-//
-// Disables software-assisted system-wide atomics support on the specified GPU.
-// Any atomic operation from this GPU is no longer guaranteed to be atomic with
-// respect to accesses from other processors in the system, even if the
-// operation has system-wide scope at the instruction level.
-//
-// The GPU must have been registered using UvmRegisterGpu prior to making this
-// call. It is however ok to call this API for GPUs that do not have support for
-// system-wide atomic operations enabled. If the GPU is unregistered via
-// UvmUnregisterGpu and then registered again via UvmRegisterGpu, support for
-// software-assisted system-wide atomics will be enabled.
-//
-// Arguments:
-//     gpuUuid: (INPUT)
-//         UUID of the physical GPU if the GPU is not SMC capable or SMC
-//         enabled, or the GPU instance UUID of the partition to disable
-//         software-assisted system-wide atomics on.
-//
-// Error codes:
-//     NV_ERR_INVALID_DEVICE:
-//         The GPU referred to by gpuUuid was not registered.
-//
-//     NV_ERR_NOT_SUPPORTED:
-//         The GPU does not support system-wide atomic operations, or the GPU
-//         has hardware support for scoped atomic operations.
-//
-//     NV_ERR_GENERIC:
-//         Unexpected error. We try hard to avoid returning this error code,
-//         because it is not very informative.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmDisableSystemWideAtomics(const NvProcessorUuid *gpuUuid);
+NV_STATUS UvmDiscard(void *base, NvLength length, NvU64 flags);
 
 //------------------------------------------------------------------------------
 // UvmGetFileDescriptor
@@ -2843,619 +2856,6 @@ NV_STATUS UvmIs8Supported(NvU32 *is8Supported);
 //------------------------------------------------------------------------------
 //    Tools API
 //------------------------------------------------------------------------------
-
-//------------------------------------------------------------------------------
-// UvmDebugGetVersion
-//
-// Returns the version number of the UVM debug library
-// See uvm_types.h for valid verion numbers, e.g. UVM_DEBUG_V1
-//
-//------------------------------------------------------------------------------
-unsigned UvmDebugVersion(void);
-
-//------------------------------------------------------------------------------
-// UvmDebugCreateSession
-//
-// Creates a handle for a debugging session.
-//
-// When the client initializes, it will pass in a process handle and get a
-// session ID for itself. Subsequent calls to the UVM API will take in that
-// session ID.
-//
-// There are security requirements to this call.
-// One of the following must be true:
-// 1.  The session owner must be running as an elevated user
-// 2.  The session owner and target must belong to the same user and the
-//     session owner is at least as privileged as the target.
-//
-// For CUDA 6.0 we can create at most 64 sessions per debugger process.
-//
-// Arguments:
-//     pid: (INPUT)
-//         Process id for which the debugging session will be created
-//
-//     session: (OUTPUT)
-//         Handle to the debugging session associated to that pid.
-//
-// Error codes:
-//     NV_ERR_PID_NOT_FOUND:
-//         pid is invalid/ not associated with UVM.
-//
-//     NV_ERR_INSUFFICIENT_PERMISSIONS:
-//         Function fails the security check.
-//
-//     NV_ERR_INSUFFICIENT_RESOURCES:
-//         Attempt is made to allocate more than 64 sessions per process.
-//
-//     NV_ERR_BUSY_RETRY:
-//         internal resources are blocked by other threads.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmDebugCreateSession(unsigned         pid,
-                                UvmDebugSession *session);
-
-//------------------------------------------------------------------------------
-// UvmDebugDestroySession
-//
-// Destroys a debugging session.
-//
-// Arguments:
-//     session: (INPUT)
-//         Handle to the debugging session associated to that pid.
-//
-// Error codes:
-//     NV_ERR_INVALID_ARGUMENT:
-//         session is invalid.
-//
-//     NV_ERR_BUSY_RETRY:
-//         ebug session is in use by some other thread.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmDebugDestroySession(UvmDebugSession session);
-
-//------------------------------------------------------------------------------
-// UvmDebugCountersEnable
-//
-// Enables the counters following the user specified configuration.
-//
-// The user must fill a list with the configuration of the counters it needs to
-// either enable or disable. It can only enable one counter per line.
-//
-// The structure (UvmCounterConfig) has several fields:
-//  - scope: Please see the UvmCounterScope  enum (above), for details.
-//  - name: Name of the counter. Please check UvmCounterName for list.
-//  - gpuid: Identifies the GPU for which the counter will be enabled/disabled
-//           This parameter is ignored in AllGpu scopes.
-//  - state: A value of 0 will disable the counter, a value of 1 will enable
-//           the counter.
-//
-//  Note: All counters are refcounted, that means that a counter will only be
-//  disable when its refcount reached zero.
-//
-// Arguments:
-//     session: (INPUT)
-//         Handle to the debugging session.
-//
-//     config: (INPUT)
-//         pointer to configuration list as per above.
-//
-//     count: (INPUT)
-//         number of entries in the config list.
-//
-// Error codes:
-//     NV_ERR_INSUFFICIENT_PERMISSIONS:
-//         Function fails the security check
-//
-//     RM_INVALID_ARGUMENT:
-//         debugging session is invalid or one of the counter lines is invalid.
-//         If call returns this value, no action specified by the config list
-//         will have taken effect.
-//
-//     NV_ERR_NOT_SUPPORTED:
-//         UvmCounterScopeGlobalSingleGpu is not supported for CUDA 6.0
-//
-//     NV_ERR_BUSY_RETRY:
-//         the debug session is in use by some other thread.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmDebugCountersEnable(UvmDebugSession   session,
-                                 UvmCounterConfig *config,
-                                 unsigned          count);
-
-//------------------------------------------------------------------------------
-// UvmDebugGetCounterHandle
-//
-// Returns handle to a particular counter. This is an opaque handle that the
-// implementation uses in order to find your counter, later. This handle can be
-// used in subsequent calls to UvmDebugGetCounterVal().
-//
-// Arguments:
-//     session: (INPUT)
-//         Handle to the debugging session.
-//
-//     scope: (INPUT)
-//         Scope that will be mapped.
-//
-//     counterName: (INPUT)
-//         Name of the counter in that scope.
-//
-//     gpu: (INPUT)
-//         UUID of the physical GPU if the GPU is not SMC capable or SMC
-//         enabled, or the GPU instance UUID of the partition of the scoped GPU.
-//         This parameter is ignored in AllGpu scopes.
-//
-//     pCounterHandle: (OUTPUT)
-//         Handle to the counter address.
-//
-// Error codes:
-//     NV_ERR_INVALID_ARGUMENT:
-//         Specified scope/gpu pair or session id is invalid
-//
-//     NV_ERR_NOT_SUPPORTED:
-//         UvmCounterScopeGlobalSingleGpu is not supported for CUDA 6.0
-//
-//     NV_ERR_BUSY_RETRY:
-//         debug session is in use by some other thread.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmDebugGetCounterHandle(UvmDebugSession  session,
-                                   UvmCounterScope  scope,
-                                   UvmCounterName   counterName,
-                                   NvProcessorUuid  gpu,
-                                   NvUPtr          *pCounterHandle);
-
-//------------------------------------------------------------------------------
-// UvmDebugGetCounterVal
-//
-// Returns the counter value specified by the counter name.
-//
-// Arguments:
-//     session: (INPUT)
-//         Handle to the debugging session.
-//
-//     counterHandleArray: (INPUT)
-//         Array of counter handles
-//
-//     handleCount: (INPUT)
-//         Number of handles in the pPCounterHandle array.
-//
-//     counterValArray: (OUTPUT)
-//         Array of counter values corresponding to the handles.
-//
-// Error codes:
-//     NV_ERR_INVALID_ARGUMENT:
-//         one of the specified handles is invalid.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmDebugGetCounterVal(UvmDebugSession     session,
-                                NvUPtr             *counterHandleArray,
-                                unsigned            handleCount,
-                                unsigned long long *counterValArray);
-
-//------------------------------------------------------------------------------
-// UvmEventQueueCreate
-//
-// This call creates an event queue of the given size.
-// No events are added in the queue until they are enabled by the user.
-// Event queue data is visible to the user even after the target process dies
-// if the session is active and queue is not freed.
-//
-// User doesn't need to serialize multiple UvmEventQueueCreate calls as
-// each call creates a new queue state associated with the returned queue
-// handle.
-//
-// Arguments:
-//     sessionHandle: (INPUT)
-//         Handle to the debugging session.
-//
-//     queueHandle: (OUTPUT)
-//         Handle to created queue.
-//
-//     queueSize: (INPUT)
-//         Size of the event queue buffer in units of UvmEventEntry's.
-//         This quantity must be > 1.
-//
-//     notificationCount: (INPUT)
-//         Number of entries after which the user should be notified that
-//         there are events to fetch.
-//         User is notified when queueEntries >= notification count.
-//
-// Error codes:
-//     NV_ERR_INSUFFICIENT_PERMISSIONS:
-//         Function fails the security check.
-//
-//     NV_ERR_INVALID_ARGUMENT:
-//         One of the arguments is invalid.
-//
-//     NV_ERR_INSUFFICIENT_RESOURCES:
-//         it's not possible to allocate a queue of requested size.
-//
-//     NV_ERR_BUSY_RETRY:
-//         internal resources are blocked by other threads.
-//
-//     NV_ERR_PID_NOT_FOUND:
-//         queue create call is made on a session after the target dies.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmEventQueueCreate(UvmDebugSession        sessionHandle,
-                              UvmEventQueueHandle   *queueHandle,
-                              NvS64                  queueSize,
-                              NvU64                  notificationCount,
-                              UvmEventTimeStampType  timeStampType);
-
-//------------------------------------------------------------------------------
-// UvmEventQueueDestroy
-//
-// This call frees all interal resources associated with the queue, including
-// unpinning of the memory associated with that queue. Freeing user buffer is
-// responsibility of a caller. Event queue might be also destroyed as a side
-// effect of destroying a session associated with this queue.
-//
-// User needs to ensure that a queue handle is not deleted while some other
-// thread is using the same queue handle.
-//
-// Arguments:
-//     sessionHandle: (INPUT)
-//         Handle to the debugging session.
-//
-//     queueHandle: (INPUT)
-//         Handle to the queue which is to be freed
-//
-// Error codes:
-//     RM_ERR_NOT_PERMITTED:
-//         Function fails the security check.
-//
-//     NV_ERR_INVALID_ARGUMENT:
-//         One of the arguments is invalid.
-//
-//     NV_ERR_BUSY_RETRY:
-//         internal resources are blocked by other threads.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmEventQueueDestroy(UvmDebugSession     sessionHandle,
-                               UvmEventQueueHandle queueHandle);
-
-//------------------------------------------------------------------------------
-// UvmEventEnable
-//
-// This call enables a particular event type in the event queue.
-// All events are disabled by default when a queue is created.
-//
-// This API does not access the queue state maintained in the user
-// library so the user doesn't need to acquire a lock to protect the queue
-// state.
-//
-// Arguments:
-//     sessionHandle: (INPUT)
-//         Handle to the debugging session.
-//
-//     queueHandle: (INPUT)
-//         Handle to the queue where events are to be enabled
-//
-//     eventTypeFlags: (INPUT)
-//         This field specifies the event types to be enabled. For example:
-//         To enable migration events and memory violations: pass flags
-//         "UVM_EVENT_ENABLE_MEMORY_VIOLATION |UVM_EVENT_ENABLE_MIGRATION"
-//
-// Error codes:
-//     RM_ERR_NOT_PERMITTED:
-//         Function fails the security check.
-//
-//     NV_ERR_INVALID_ARGUMENT:
-//         One of the arguments is invalid.
-//
-//     NV_ERR_PID_NOT_FOUND:
-//         this call is made after the target process dies
-//
-//     NV_ERR_BUSY_RETRY:
-//         internal resources are blocked by other threads.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmEventEnable(UvmDebugSession     sessionHandle,
-                         UvmEventQueueHandle queueHandle,
-                         unsigned            eventTypeFlags);
-
-//------------------------------------------------------------------------------
-// UvmEventDisable
-//
-// This call disables a particular event type in the queue.
-//
-// This API does not access the queue state maintained in the user
-// library so the user doesn't need to acquire a lock to protect the queue
-// state.
-//
-// Arguments:
-//     sessionHandle: (INPUT)
-//         Handle to the debugging session.
-//
-//     queueHandle: (INPUT)
-//         Handle to the queue where events are to be enabled
-//
-//     eventTypeFlags: (INPUT)
-//         This field specifies the event types to be enabled
-//         For example: To enable migration events and memory violations:
-//         pass "UVM_EVENT_ENABLE_MEMORY_VIOLATION |UVM_EVENT_ENABLE_MIGRATION"
-//         as flags
-//
-// Error codes:
-//     RM_ERR_NOT_PERMITTED:
-//         Function fails the security check.
-//
-//     NV_ERR_INVALID_ARGUMENT:
-//         One of the arguments is invalid.
-//
-//     NV_ERR_PID_NOT_FOUND:
-//         this call is made after the target process dies
-//
-//     NV_ERR_BUSY_RETRY:
-//         internal resources are blocked by other threads.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmEventDisable(UvmDebugSession     sessionHandle,
-                          UvmEventQueueHandle queueHandle,
-                          unsigned            eventTypeFlags);
-
-//------------------------------------------------------------------------------
-// UvmEventWaitOnQueueHandles
-//
-// User is notified when queueEntries >= notification count.
-// This call does a blocking wait for this notification. It returns when
-// at least one of the queue handles has events to be fetched or if it timeouts
-//
-//     This API accesses constant data maintained in the queue state. Hence,
-//     the user doesn't need to acquire a lock to protect the queue state.
-//
-// Arguments:
-//     queueHandles: (INPUT)
-//         array of queue handles.
-//
-//     arraySize: (INPUT)
-//         number of handles in array.
-//
-//     timeout: (INPUT)
-//         timeout in msec
-//
-//     pNotificationFlags: (OUTPUT)
-//         If a particular queue handle in the input array is notified then
-//         the respective bit flag is set in pNotificationFlags.
-//
-// Error codes:
-//     NV_ERR_INVALID_ARGUMENT:
-//         one of the queueHandles is invalid.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmEventWaitOnQueueHandles(UvmEventQueueHandle *queueHandleArray,
-                                     unsigned             arraySize,
-                                     NvU64                timeout,
-                                     unsigned            *pNotificationFlags);
-
-//------------------------------------------------------------------------------
-// UvmEventGetNotificationHandles
-//
-// User is notified when queueEntries >= notification count.
-// The user can directly get the queue notification handles rather than using
-// a UVM API to wait on queue handles. This helps the user to wait on other
-// objects (apart from queue notification) along with queue notification
-// handles in the same thread. The user can safely use this call along with the
-// library supported wait call UvmEventWaitOnQueueHandles.
-//
-// This API reads constant data maintained in the queue state. Hence,
-// the user doesn't need to acquire a lock to protect the queue state.
-//
-// Arguments:
-//     queueHandles: (INPUT)
-//         array of queue handles.
-//
-//     arraySize: (INPUT)
-//         number of handles in array.
-//
-//     notificationHandles: (OUTPUT)
-//         Windows: Output of this call contains an array of 'windows event
-//             handles' corresponding to the queue handles passes as input.
-//         Linux: All queues belonging to the same process share the same
-//             file descriptor(fd) for notification. If the user chooses to use
-//             UvmEventGetNotificationHandles then he should check all queues
-//             for new events (by calling UvmEventFetch) when notified on
-//             the fd.
-//
-// Error codes:
-//     NV_ERR_INVALID_ARGUMENT:
-//         One of the arguments is invalid.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmEventGetNotificationHandles(UvmEventQueueHandle  *queueHandleArray,
-                                         unsigned              arraySize,
-                                         void                **notificationHandleArray);
-
-//------------------------------------------------------------------------------
-// UvmEventGetGpuUuidTable
-//
-// Each migration event entry contains the gpu index to/from where data is
-// migrated. This index maps to a corresponding physical gpu UUID in the
-// gpuUuidTable. Using indices saves on the size of each event entry. This API
-// provides the gpuIndex to gpuUuid relation to the user.
-//
-// This API does not access the queue state maintained in the user
-// library and so the user doesn't need to acquire a lock to protect the
-// queue state.
-//
-// Arguments:
-//     gpuUuidTable: (OUTPUT)
-//         The return value is an array of physical GPU UUIDs. The array index
-//         is the corresponding gpuIndex. There can be at max 32 GPUs
-//         associated with UVM, so array size is 32.
-//
-//     validCount: (OUTPUT)
-//         The system doesn't normally contain 32 GPUs. This field gives the
-//         count of entries that are valid in the returned gpuUuidTable.
-//
-// Error codes:
-//     NV_ERR_BUSY_RETRY:
-//         internal resources are blocked by other threads.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmEventGetGpuUuidTable(NvProcessorUuid *gpuUuidTable,
-                                  unsigned        *validCount);
-
-//------------------------------------------------------------------------------
-// UvmEventFetch
-//
-// This call is used to fetch the queue entries in a user buffer.
-//
-// This API updates the queue state. Hence simultaneous calls to fetch/skip
-// events should be avoided as that might corrupt the queue state.
-//
-// Arguments:
-//     sessionHandle: (INPUT)
-//         Handle to the debugging session.
-//
-//     queueHandle: (INPUT)
-//         queue from where to fetch the events.
-//
-//     pBuffer: (OUTPUT)
-//         Pointer to the buffer where the API will copy the events. User
-//         shall ensure the size is enough.
-//
-//     nEntries: (INPUT/OUTPUT)
-//         It provides the maximum number of entries that will be fetched
-//         from the queue. If this number is larger than the size of the
-//         queue it will be internally capped to that value.
-//         As output it returns the actual number of entries copies to the
-//         buffer.
-//
-// Error codes:
-//     RM_ERR_NOT_PERMITTED:
-//         Function fails the security check.
-//
-//     NV_ERR_INVALID_ARGUMENT:
-//         One of the arguments is invalid.
-//
-//     NV_ERR_INVALID_INDEX:
-//         The indices of the queue have been corrupted.
-//
-//     NV_ERR_BUFFER_TOO_SMALL:
-//         The event queue buffer provided by the caller was too small to
-//         contain all of the events that occurred during this run.
-//         Events were therefore dropped (not recorded).
-//         Please re-run with a larger buffer.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmEventFetch(UvmDebugSession      sessionHandle,
-                        UvmEventQueueHandle  queueHandle,
-                        UvmEventEntry       *pBuffer,
-                        NvU64               *nEntries);
-
-//------------------------------------------------------------------------------
-// UvmEventSkipAll
-//
-// This API drops all event entries from the queue.
-//
-// This API updates the queue state. Hence simultaneous calls to fetch/
-// skip events should be avoided as that might corrupt the queue state.
-//
-// Arguments:
-//     sessionHandle: (INPUT)
-//         Handle to the debugging session.
-//
-//     queueHandle: (INPUT)
-//         target queue.
-//
-// Error codes:
-//     RM_ERR_NOT_PERMITTED:
-//         Function fails the security check.
-//
-//     NV_ERR_INVALID_ARGUMENT:
-//         One of the arguments is invalid.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmEventSkipAll(UvmDebugSession     sessionHandle,
-                          UvmEventQueueHandle queueHandle);
-
-//------------------------------------------------------------------------------
-// UvmEventQueryTimeStampType
-//
-// This API returns the type of time stamp used in an event entry for a given
-// queue.
-//
-// This API reads constant data maintained in the queue state. Hence,
-// the user doesn't need to acquire a lock to protect the queue state.
-//
-// Arguments:
-//     sessionHandle: (INPUT)
-//         Handle to the debugging session.
-//
-//     queueHandle: (INPUT)
-//         target queue.
-//
-//     timeStampType: (OUTPUT)
-//         type of time stamp used in event entry. See UvmEventTimestampType
-//         for supported types of time stamps.
-//
-// Error codes:
-//     RM_ERR_NOT_PERMITTED:
-//         Function fails the security check.
-//
-//     NV_ERR_INVALID_ARGUMENT:
-//         One of the arguments is invalid.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmEventQueryTimeStampType(UvmDebugSession        sessionHandle,
-                                     UvmEventQueueHandle    queueHandle,
-                                     UvmEventTimeStampType *timeStampType);
-
-//------------------------------------------------------------------------------
-// UvmDebugAccessMemory
-//
-// This call can be used by the debugger to read/write memory range. UVM driver
-// may not be aware of all the pages in this range. A bit per page is set by the
-// driver if it is read/written by UVM.
-//
-// Arguments:
-//     session: (INPUT)
-//         Handle to the debugging session.
-//
-//     baseAddress: (INPUT)
-//         base address from where memory is to be accessed
-//
-//     sizeInBytes: (INPUT)
-//         Number of bytes to be accessed
-//
-//     accessType: (INPUT)
-//         Read or write access request
-//
-//     buffer: (INPUT/OUTPUT)
-//         This buffer would be read or written to by the driver.
-//         User needs to allocate a big enough buffer to fit sizeInBytes.
-//
-//     isBitmaskSet: (INPUT/OUTPUT)
-//         Set to 1, if any field in bitmask is set
-//         NULL(INPUT) if unused
-//
-//     bitmask: (INPUT/OUTPUT)
-//         One bit per page is set if UVM reads or writes to it.
-//         User should allocate a bitmask big enough to fit one bit per page
-//         covered by baseAddress + sizeInBytes:
-//         (baseAlignmentBytes + sizeInBytes + pageSize - 1)/pageSize number
-//         of bits.
-//         NULL(IN) if unused.
-//
-// Error codes:
-//     NV_ERR_INVALID_ARGUMENT:
-//         One of the arguments is invalid.
-//
-//------------------------------------------------------------------------------
-NV_STATUS UvmDebugAccessMemory(UvmDebugSession     session,
-                               void               *baseAddress,
-                               NvU64               sizeInBytes,
-                               UvmDebugAccessType  accessType,
-                               void               *buffer,
-                               NvBool             *isBitmaskSet,
-                               NvU64              *bitmask);
-
-//
-// Uvm Tools uvm API
-//
-
 
 //------------------------------------------------------------------------------
 // UvmToolsCreateSession

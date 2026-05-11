@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -36,6 +36,7 @@
 #include "nverror.h"
 
 #include "published/volta/gv100/dev_fb.h"
+#include "published/volta/gv100/dev_hubmmu_base_addendum.h"
 #include "published/volta/gv100/dev_ram.h"
 #include "published/volta/gv100/dev_fault.h"
 
@@ -336,9 +337,7 @@ kgmmuInstBlkPageDirBaseGet_GV100
         }
         else if (pVAS != NULL)
         {
-            pPDB = (pParams->bIsClientAdmin) ?
-                           vaspaceGetKernelPageDirBase(pVAS, pGpu) :
-                           vaspaceGetPageDirBase(pVAS, pGpu);
+            pPDB = vaspaceGetPageDirBase(pVAS, pGpu);
         }
 
         if (pPDB == NULL)
@@ -417,52 +416,35 @@ kgmmuReportFaultBufferOverflow_GV100
 
     kgmmuReadFaultBufferGetPtr_HAL(pGpu, pKernelGmmu, NON_REPLAYABLE_FAULT_BUFFER,
                                   &faultBufferGet, NULL);
-    faultBufferGet = DRF_VAL(_PFB_PRI, _MMU_FAULT_BUFFER_GET, _PTR, faultBufferGet);
+    faultBufferGet = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_BUFFER_GET, _PTR, faultBufferGet);
 
     kgmmuReadFaultBufferPutPtr_HAL(pGpu, pKernelGmmu, NON_REPLAYABLE_FAULT_BUFFER,
                                   &faultBufferPut, NULL);
-    faultBufferPut = DRF_VAL(_PFB_PRI, _MMU_FAULT_BUFFER_PUT, _PTR, faultBufferPut);
+    faultBufferPut = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_BUFFER_PUT, _PTR, faultBufferPut);
 
     faultBufferSize = kgmmuReadMmuFaultBufferSize_HAL(pGpu, pKernelGmmu, NON_REPLAYABLE_FAULT_BUFFER, GPU_GFID_PF);
 
     if (kgmmuIsNonReplayableFaultPending_HAL(pGpu, pKernelGmmu, NULL))
     {
-        if (IsVOLTA(pGpu))
-        {
-            //
-            // Check if Non_replayable interrupt is set when overflow is seen.
-            // This shouldn't happen as this can cause a live-lock considering
-            // top-half will kept on coming and will not let overflow interrupt
-            // serviced. HW should disable the FAULT_INTR when overflow is
-            // detected.
-            //
-            NV_PRINTF(LEVEL_ERROR, "MMU Fault: GPU %d: HW-BUG : "
-                "NON_REPLAYABLE_INTR is high when OVERFLOW is detected\n",
-                pGpu->gpuInstance);
-            NV_ASSERT(0);
-        }
-        else
-        {
-            //
-            // With message-based MMU interrupts (Turing onwards), it is
-            // possible for us to get here - a real fault can happen while an
-            // overflow happens, and there is no ordering guarantee about the
-            // order of these interrupts in HW. However, if we write GET pointer
-            // with GET != PUT while overflow is detected, the fault interrupt
-            // will not be sent. Instead, the overflow interrupt will be sent,
-            // so this will not cause an interrupt storm with message-based
-            // interrupts. If HW does have a bug though, we'll see the below
-            // print repeatedly which can point to a HW bug where it isn't
-            // behaving the way it is designed to do.
-            //
-            NV_PRINTF(LEVEL_INFO, "MMU Fault: GPU %d: NON_REPLAYABLE_INTR "
-                "is high when OVERFLOW is detected\n", pGpu->gpuInstance);
-        }
+        //
+        // With message-based MMU interrupts (Turing onwards), it is
+        // possible for us to get here - a real fault can happen while an
+        // overflow happens, and there is no ordering guarantee about the
+        // order of these interrupts in HW. However, if we write GET pointer
+        // with GET != PUT while overflow is detected, the fault interrupt
+        // will not be sent. Instead, the overflow interrupt will be sent,
+        // so this will not cause an interrupt storm with message-based
+        // interrupts. If HW does have a bug though, we'll see the below
+        // print repeatedly which can point to a HW bug where it isn't
+        // behaving the way it is designed to do.
+        //
+        NV_PRINTF(LEVEL_INFO, "MMU Fault: GPU %d: NON_REPLAYABLE_INTR "
+            "is high when OVERFLOW is detected\n", pGpu->gpuInstance);
     }
 
     // Check if overflow is due to incorrect fault buffer size or GET > SIZE
-    if (FLD_TEST_DRF(_PFB_PRI, _MMU_FAULT_STATUS, _NON_REPLAYABLE_GETPTR_CORRUPTED, _SET, faultStatus) ||
-        FLD_TEST_DRF(_PFB_PRI, _MMU_FAULT_STATUS, _REPLAYABLE_GETPTR_CORRUPTED, _SET, faultStatus))
+    if (FLD_TEST_DRF(_HUBMMU, _PRI_MMU_FAULT_STATUS, _NON_REPLAYABLE_GETPTR_CORRUPTED, _SET, faultStatus) ||
+        FLD_TEST_DRF(_HUBMMU, _PRI_MMU_FAULT_STATUS, _REPLAYABLE_GETPTR_CORRUPTED, _SET, faultStatus))
     {
         NV_PRINTF(LEVEL_ERROR,
                   "MMU Fault: GPU %d: Buffer overflow detected due to GET > SIZE\n",
@@ -502,7 +484,7 @@ kgmmuReportFaultBufferOverflow_GV100
     krcBreakpoint(GPU_GET_KERNEL_RC(pGpu));
 
     faultStatus = kgmmuReadMmuFaultStatus_HAL(pGpu, pKernelGmmu, GPU_GFID_PF);
-    faultStatus = FLD_SET_DRF(_PFB_PRI, _MMU_FAULT_STATUS, _NON_REPLAYABLE_OVERFLOW, _RESET,
+    faultStatus = FLD_SET_DRF(_HUBMMU, _PRI_MMU_FAULT_STATUS, _NON_REPLAYABLE_OVERFLOW, _RESET,
                               faultStatus);
     kgmmuWriteMmuFaultStatus_HAL(pGpu, pKernelGmmu, faultStatus);
 
@@ -908,8 +890,8 @@ kgmmuCopyMmuFaults_GV100
     struct GMMU_FAULT_BUFFER *pFaultBuffer;
     NvU32 hwBufferPut = 0;
 
-    ct_assert(NV_PFB_PRI_MMU_NON_REPLAY_FAULT_BUFFER == NON_REPLAYABLE_FAULT_BUFFER);
-    ct_assert(NV_PFB_PRI_MMU_REPLAY_FAULT_BUFFER == REPLAYABLE_FAULT_BUFFER);
+    ct_assert(NV_HUBMMU_PRI_MMU_NON_REPLAY_FAULT_BUFFER == NON_REPLAYABLE_FAULT_BUFFER);
+    ct_assert(NV_HUBMMU_PRI_MMU_REPLAY_FAULT_BUFFER == REPLAYABLE_FAULT_BUFFER);
 
     NV_ASSERT_OR_RETURN(type == REPLAYABLE_FAULT_BUFFER ||
                         type == NON_REPLAYABLE_FAULT_BUFFER,
@@ -1347,7 +1329,7 @@ _kgmmuAllocShadowFaultBuffer_GV100
         NV_ASSERT_OR_RETURN(0, NV_ERR_INVALID_STATE);
     }
 
-    pFaultBuffer = &pKernelGmmu->mmuFaultBuffer[GPU_GFID_PF].hwFaultBuffers[NV_PFB_PRI_MMU_NON_REPLAY_FAULT_BUFFER];
+    pFaultBuffer = &pKernelGmmu->mmuFaultBuffer[GPU_GFID_PF].hwFaultBuffers[NV_HUBMMU_PRI_MMU_NON_REPLAY_FAULT_BUFFER];
     NV_ASSERT_OR_RETURN(pFaultBuffer->faultBufferSize != 0, NV_ERR_INVALID_ARGUMENT);
 
     // Allocate memory for queue dataStructure and initialize queue
@@ -1392,8 +1374,8 @@ kgmmuFaultBufferInit_GV100
         pKernelGmmu->getProperty(pKernelGmmu, PDB_PROP_KGMMU_FAULT_BUFFER_DISABLED))
         return NV_OK;
 
-    ct_assert(NV_PFB_PRI_MMU_REPLAY_FAULT_BUFFER == REPLAYABLE_FAULT_BUFFER);
-    ct_assert(NV_PFB_PRI_MMU_NON_REPLAY_FAULT_BUFFER == NON_REPLAYABLE_FAULT_BUFFER);
+    ct_assert(NV_HUBMMU_PRI_MMU_REPLAY_FAULT_BUFFER == REPLAYABLE_FAULT_BUFFER);
+    ct_assert(NV_HUBMMU_PRI_MMU_NON_REPLAY_FAULT_BUFFER == NON_REPLAYABLE_FAULT_BUFFER);
 
     faultBufferSize = kgmmuSetAndGetDefaultFaultBufferSize_HAL(pGpu, pKernelGmmu,
                                                                NON_REPLAYABLE_FAULT_BUFFER,
@@ -1487,7 +1469,7 @@ kgmmuEnableFaultBuffer_GV100
     kgmmuSetAndGetDefaultFaultBufferSize_HAL(pGpu, pKernelGmmu, index, gfid);
 
     regVal = kgmmuReadMmuFaultBufferSize_HAL(pGpu, pKernelGmmu, index, gfid);
-    regVal = FLD_SET_DRF(_PFB_PRI, _MMU_FAULT_BUFFER_SIZE, _ENABLE, _TRUE, regVal);
+    regVal = FLD_SET_DRF(_HUBMMU, _PRI_MMU_FAULT_BUFFER_SIZE, _ENABLE, _TRUE, regVal);
 
     if (index == NON_REPLAYABLE_FAULT_BUFFER)
     {
@@ -1496,7 +1478,7 @@ kgmmuEnableFaultBuffer_GV100
         // as overflow is considered fatal due to fault packet loss. Also
         // this interrupt will disable non_replayable interrupt when raised.
         //
-        regVal = FLD_SET_DRF(_PFB_PRI, _MMU_FAULT_BUFFER_SIZE, _OVERFLOW_INTR, _ENABLE, regVal);
+        regVal = FLD_SET_DRF(_HUBMMU, _PRI_MMU_FAULT_BUFFER_SIZE, _OVERFLOW_INTR, _ENABLE, regVal);
     }
     else
     {
@@ -1505,7 +1487,7 @@ kgmmuEnableFaultBuffer_GV100
         // as overflow is not considered fatal. There is no fault packet loss
         // due to replays.
         //
-        regVal = FLD_SET_DRF(_PFB_PRI, _MMU_FAULT_BUFFER_SIZE, _OVERFLOW_INTR, _DISABLE, regVal);
+        regVal = FLD_SET_DRF(_HUBMMU, _PRI_MMU_FAULT_BUFFER_SIZE, _OVERFLOW_INTR, _DISABLE, regVal);
     }
 
     kgmmuWriteMmuFaultBufferSize_HAL(pGpu, pKernelGmmu, index, regVal, gfid);
@@ -1553,7 +1535,7 @@ kgmmuDisableFaultBuffer_GV100
         RMTIMEOUT timeout;
         gpuSetTimeout(pGpu, GPU_TIMEOUT_DEFAULT, &timeout, 0);
 
-        while (FLD_TEST_DRF(_PFB_PRI, _MMU_FAULT_STATUS, _BUSY, _TRUE,
+        while (FLD_TEST_DRF(_HUBMMU, _PRI_MMU_FAULT_STATUS, _BUSY, _TRUE,
                 kgmmuReadMmuFaultStatus_HAL(pGpu, pKernelGmmu, gfid)))
         {
             rmStatus = gpuCheckTimeout(pGpu, &timeout);
@@ -1568,7 +1550,7 @@ kgmmuDisableFaultBuffer_GV100
     }
 
     faultBufferSize = kgmmuReadMmuFaultBufferSize_HAL(pGpu, pKernelGmmu, index, gfid);
-    faultBufferSize = FLD_SET_DRF(_PFB_PRI, _MMU_FAULT_BUFFER_SIZE, _ENABLE, _FALSE,
+    faultBufferSize = FLD_SET_DRF(_HUBMMU, _PRI_MMU_FAULT_BUFFER_SIZE, _ENABLE, _FALSE,
                                   faultBufferSize);
     kgmmuWriteMmuFaultBufferSize_HAL(pGpu, pKernelGmmu, index, faultBufferSize, gfid);
 
@@ -1897,15 +1879,14 @@ kgmmuHandleNonReplayableFaultPacket_GV100
     MmuExceptionData.addrHi = (NvU32)(parsedFaultEntry.mmuFaultAddress >> 32);
     MmuExceptionData.faultType = parsedFaultEntry.mmuFaultType;
     MmuExceptionData.clientId = parsedFaultEntry.mmuFaultClientId;
-    if (parsedFaultEntry.mmuFaultClientType == NV_PFAULT_MMU_CLIENT_TYPE_GPC)
+    MmuExceptionData.bGpc = parsedFaultEntry.mmuFaultClientType == NV_PFAULT_MMU_CLIENT_TYPE_GPC;
+    if (MmuExceptionData.bGpc)
     {
-        MmuExceptionData.bGpc  = NV_TRUE;
         MmuExceptionData.gpcId = parsedFaultEntry.mmuFaultGpcId;
     }
     else
     {
-        MmuExceptionData.bGpc  = NV_FALSE;
-        MmuExceptionData.gpcId = 0;
+        MmuExceptionData.dieletId = parsedFaultEntry.mmuFaultGpcId;
     }
     MmuExceptionData.accessType = parsedFaultEntry.mmuFaultAccessType;
     MmuExceptionData.faultEngineId = parsedFaultEntry.mmuFaultEngineId;
@@ -2191,7 +2172,8 @@ kgmmuServiceMmuFault_GV100
                                                pMmuExceptionData, pKernelChannel);
     if (NV_OK != rmStatus)
     {
-        NV_PRINTF(LEVEL_ERROR, "Could not service MMU fault for chid %x\n",
+        NV_PRINTF(LEVEL_ERROR,
+                  "Could not service MMU fault for " FMT_CHANNEL_DEBUG_TAG "\n",
                   kchannelGetDebugTag(pKernelChannel));
     }
 
@@ -2214,14 +2196,14 @@ kgmmuGetFaultInfoFromFaultPckt_GV100
     // This is a bit insane. We don't have any protection against changing bit position.
     // Still copying the bits and relying on fact that MMU_FAULT_INFO will always keep info consistent
     //
-    faultInfo = FLD_SET_DRF_NUM(_PFB_PRI, _MMU_FAULT_INFO, _FAULT_TYPE, pParsedFaultEntry->mmuFaultType, faultInfo);
-    faultInfo = FLD_SET_DRF_NUM(_PFB_PRI, _MMU_FAULT_INFO, _CLIENT, pParsedFaultEntry->mmuFaultClientId, faultInfo);
-    faultInfo = FLD_SET_DRF_NUM(_PFB_PRI, _MMU_FAULT_INFO, _ACCESS_TYPE, pParsedFaultEntry->mmuFaultAccessType, faultInfo);
-    faultInfo = FLD_SET_DRF_NUM(_PFB_PRI, _MMU_FAULT_INFO, _CLIENT_TYPE, pParsedFaultEntry->mmuFaultClientType, faultInfo);
-    faultInfo = FLD_SET_DRF_NUM(_PFB_PRI, _MMU_FAULT_INFO, _GPC_ID, pParsedFaultEntry->mmuFaultGpcId, faultInfo);
-    faultInfo = FLD_SET_DRF_NUM(_PFB_PRI, _MMU_FAULT_INFO, _PROTECTED_MODE, pParsedFaultEntry->bFaultInProtectedMode, faultInfo);
-    faultInfo = FLD_SET_DRF_NUM(_PFB_PRI, _MMU_FAULT_INFO, _REPLAYABLE_FAULT, pParsedFaultEntry->bFaultTypeReplayable, faultInfo);
-    faultInfo = FLD_SET_DRF_NUM(_PFB_PRI, _MMU_FAULT_INFO, _VALID, pParsedFaultEntry->bFaultEntryValid, faultInfo);
+    faultInfo = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_FAULT_INFO, _FAULT_TYPE, pParsedFaultEntry->mmuFaultType, faultInfo);
+    faultInfo = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_FAULT_INFO, _CLIENT, pParsedFaultEntry->mmuFaultClientId, faultInfo);
+    faultInfo = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_FAULT_INFO, _ACCESS_TYPE, pParsedFaultEntry->mmuFaultAccessType, faultInfo);
+    faultInfo = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_FAULT_INFO, _CLIENT_TYPE, pParsedFaultEntry->mmuFaultClientType, faultInfo);
+    faultInfo = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_FAULT_INFO, _GPC_ID, pParsedFaultEntry->mmuFaultGpcId, faultInfo);
+    faultInfo = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_FAULT_INFO, _PROTECTED_MODE, pParsedFaultEntry->bFaultInProtectedMode, faultInfo);
+    faultInfo = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_FAULT_INFO, _REPLAYABLE_FAULT, pParsedFaultEntry->bFaultTypeReplayable, faultInfo);
+    faultInfo = FLD_SET_DRF_NUM(_HUBMMU, _PRI_MMU_FAULT_INFO, _VALID, pParsedFaultEntry->bFaultEntryValid, faultInfo);
 
     return faultInfo;
 }
@@ -2246,24 +2228,24 @@ _kgmmuCreateExceptionDataFromPriv_GV100
     {
         kgmmuReadMmuFaultInstHiLo_HAL(pGpu, pKernelGmmu, &regDataHi, &regDataLo);
 
-        tempLo = DRF_VAL(_PFB_PRI, _MMU_FAULT_INST_LO, _ADDR, regDataLo);
-        tempHi = DRF_VAL(_PFB_PRI, _MMU_FAULT_INST_HI, _ADDR, regDataHi);
-        pParsedFaultEntry->mmuFaultInstBlock.address = tempLo + (tempHi << DRF_SIZE(NV_PFB_PRI_MMU_FAULT_INST_LO_ADDR));
-        pParsedFaultEntry->mmuFaultInstBlock.address <<= DRF_BASE(NV_PFB_PRI_MMU_FAULT_INST_LO_ADDR);
-        pParsedFaultEntry->mmuFaultInstBlock.aperture = DRF_VAL(_PFB_PRI, _MMU_FAULT_INST_LO, _APERTURE, regDataLo);
+        tempLo = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INST_LO, _ADDR, regDataLo);
+        tempHi = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INST_HI, _ADDR, regDataHi);
+        pParsedFaultEntry->mmuFaultInstBlock.address = tempLo + (tempHi << DRF_SIZE(NV_HUBMMU_PRI_MMU_FAULT_INST_LO_ADDR));
+        pParsedFaultEntry->mmuFaultInstBlock.address <<= DRF_BASE(NV_HUBMMU_PRI_MMU_FAULT_INST_LO_ADDR);
+        pParsedFaultEntry->mmuFaultInstBlock.aperture = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INST_LO, _APERTURE, regDataLo);
         pParsedFaultEntry->mmuFaultInstBlock.gfid = GPU_GFID_PF;
-        pParsedFaultEntry->mmuFaultEngineId = DRF_VAL(_PFB_PRI, _MMU_FAULT_INST_LO, _ENGINE_ID, regDataLo);
+        pParsedFaultEntry->mmuFaultEngineId = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INST_LO, _ENGINE_ID, regDataLo);
     }
 
     // Fault Addr
     {
         kgmmuReadMmuFaultAddrHiLo_HAL(pGpu, pKernelGmmu, &regDataHi, &regDataLo);
 
-        tempLo = DRF_VAL(_PFB_PRI, _MMU_FAULT_ADDR_LO, _ADDR, regDataLo);
-        tempHi = DRF_VAL(_PFB_PRI, _MMU_FAULT_ADDR_HI, _ADDR, regDataHi);
+        tempLo = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_ADDR_LO, _ADDR, regDataLo);
+        tempHi = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_ADDR_HI, _ADDR, regDataHi);
 
-        pParsedFaultEntry->mmuFaultAddress =  (tempLo + (tempHi << DRF_SIZE(NV_PFB_PRI_MMU_FAULT_ADDR_LO_ADDR))) <<
-                                              (DRF_BASE(NV_PFB_PRI_MMU_FAULT_ADDR_LO_ADDR));
+        pParsedFaultEntry->mmuFaultAddress =  (tempLo + (tempHi << DRF_SIZE(NV_HUBMMU_PRI_MMU_FAULT_ADDR_LO_ADDR))) <<
+                                              (DRF_BASE(NV_HUBMMU_PRI_MMU_FAULT_ADDR_LO_ADDR));
 
         kgmmuSignExtendFaultAddress_HAL(pGpu, pKernelGmmu, &pParsedFaultEntry->mmuFaultAddress);
     }
@@ -2272,17 +2254,17 @@ _kgmmuCreateExceptionDataFromPriv_GV100
     {
         regDataLo = kgmmuReadMmuFaultInfo_HAL(pGpu, pKernelGmmu);
 
-        rmStatus = kgmmuGetFaultType_HAL(pGpu, pKernelGmmu, DRF_VAL(_PFB_PRI, _MMU_FAULT_INFO, _FAULT_TYPE, regDataLo),
+        rmStatus = kgmmuGetFaultType_HAL(pGpu, pKernelGmmu, DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INFO, _FAULT_TYPE, regDataLo),
                                          &pParsedFaultEntry->mmuFaultType);
         NV_ASSERT_OR_RETURN(rmStatus == NV_OK, rmStatus);
-        pParsedFaultEntry->mmuFaultAccessType = DRF_VAL(_PFB_PRI, _MMU_FAULT_INFO, _ACCESS_TYPE, regDataLo);
-        pParsedFaultEntry->mmuFaultClientId = DRF_VAL(_PFB_PRI, _MMU_FAULT_INFO, _CLIENT, regDataLo);
-        pParsedFaultEntry->mmuFaultClientType = DRF_VAL(_PFB_PRI, _MMU_FAULT_INFO, _CLIENT_TYPE, regDataLo);
-        pParsedFaultEntry->mmuFaultGpcId = DRF_VAL(_PFB_PRI, _MMU_FAULT_INFO, _GPC_ID, regDataLo);
-        pParsedFaultEntry->bFaultEntryValid = DRF_VAL(_PFB_PRI, _MMU_FAULT_INFO, _VALID, regDataLo);
-        pParsedFaultEntry->bFaultInProtectedMode = DRF_VAL(_PFB_PRI, _MMU_FAULT_INFO, _PROTECTED_MODE, regDataLo);
-        pParsedFaultEntry->bFaultTypeReplayable = DRF_VAL(_PFB_PRI, _MMU_FAULT_INFO, _REPLAYABLE_FAULT, regDataLo);
-        pParsedFaultEntry->bReplayableFaultEn = DRF_VAL(_PFB_PRI, _MMU_FAULT_INFO, _REPLAYABLE_FAULT_EN, regDataLo);
+        pParsedFaultEntry->mmuFaultAccessType = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INFO, _ACCESS_TYPE, regDataLo);
+        pParsedFaultEntry->mmuFaultClientId = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INFO, _CLIENT, regDataLo);
+        pParsedFaultEntry->mmuFaultClientType = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INFO, _CLIENT_TYPE, regDataLo);
+        pParsedFaultEntry->mmuFaultGpcId = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INFO, _GPC_ID, regDataLo);
+        pParsedFaultEntry->bFaultEntryValid = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INFO, _VALID, regDataLo);
+        pParsedFaultEntry->bFaultInProtectedMode = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INFO, _PROTECTED_MODE, regDataLo);
+        pParsedFaultEntry->bFaultTypeReplayable = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INFO, _REPLAYABLE_FAULT, regDataLo);
+        pParsedFaultEntry->bReplayableFaultEn = DRF_VAL(_HUBMMU, _PRI_MMU_FAULT_INFO, _REPLAYABLE_FAULT_EN, regDataLo);
     }
 
     pMmuExceptionData->addrLo = (NvU32)(pParsedFaultEntry->mmuFaultAddress & 0xFFFFFFFFUL);
@@ -2323,9 +2305,9 @@ _kgmmuResetFaultBufferError_GV100
     NV_ASSERT_OR_RETURN((faultBufType < NUM_FAULT_BUFFERS), NV_ERR_INVALID_ARGUMENT);
 
     if (faultBufType == REPLAYABLE_FAULT_BUFFER)
-        return FLD_SET_DRF(_PFB_PRI, _MMU_FAULT_STATUS, _REPLAYABLE_ERROR, _RESET, faultBufStatus);
+        return FLD_SET_DRF(_HUBMMU, _PRI_MMU_FAULT_STATUS, _REPLAYABLE_ERROR, _RESET, faultBufStatus);
     else
-        return FLD_SET_DRF(_PFB_PRI, _MMU_FAULT_STATUS, _NON_REPLAYABLE_ERROR, _RESET, faultBufStatus);
+        return FLD_SET_DRF(_HUBMMU, _PRI_MMU_FAULT_STATUS, _NON_REPLAYABLE_ERROR, _RESET, faultBufStatus);
 }
 
 /**
@@ -2346,9 +2328,9 @@ _kgmmuServiceBar2Faults_GV100
     OBJUVM     *pUvm        = GPU_GET_UVM(pGpu);
     NvU32       i;
 
-    NvBool replayableFaultError = FLD_TEST_DRF(_PFB_PRI, _MMU_FAULT_STATUS,
+    NvBool replayableFaultError = FLD_TEST_DRF(_HUBMMU, _PRI_MMU_FAULT_STATUS,
                                                     _REPLAYABLE_ERROR, _SET, faultStatus);
-    NvBool nonReplayableFaultError = FLD_TEST_DRF(_PFB_PRI, _MMU_FAULT_STATUS,
+    NvBool nonReplayableFaultError = FLD_TEST_DRF(_HUBMMU, _PRI_MMU_FAULT_STATUS,
                                                       _NON_REPLAYABLE_ERROR, _SET, faultStatus);
     NvBool bServiceActrs = kgmmuCheckAccessCounterBar2FaultServicingState_HAL(pGpu, pKernelGmmu);
 
@@ -2442,7 +2424,7 @@ _kgmmuHandleReplayablePrivFault_GV100
     // fault is canceled
     //
     faultStatus = kgmmuReadMmuFaultStatus_HAL(pGpu, pKernelGmmu, GPU_GFID_PF);
-    faultStatus = FLD_SET_DRF(_PFB_PRI, _MMU_FAULT_STATUS, _VALID, _CLEAR, faultStatus);
+    faultStatus = FLD_SET_DRF(_HUBMMU, _PRI_MMU_FAULT_STATUS, _VALID, _CLEAR, faultStatus);
     kgmmuWriteMmuFaultStatus_HAL(pGpu, pKernelGmmu, faultStatus);
 
     return kgmmuFaultCancelTargeted_HAL(pGpu, pKernelGmmu, &cancelInfo);
@@ -2475,7 +2457,7 @@ kgmmuServicePriFaults_GV100
     NvBool bBarFault = NV_FALSE;
     NvU32 vfFaultType = NV2080_CTRL_CMD_GPU_HANDLE_VF_PRI_FAULT_TYPE_INVALID;
 
-    if (FLD_TEST_DRF(_PFB_PRI, _MMU_FAULT_STATUS, _VALID, _SET, faultStatus))
+    if (FLD_TEST_DRF(_HUBMMU, _PRI_MMU_FAULT_STATUS, _VALID, _SET, faultStatus))
     {
         NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, _kgmmuCreateExceptionDataFromPriv_GV100(pGpu, pKernelGmmu, &parsedFaultEntry, &mmuExceptionData));
 
@@ -2539,9 +2521,9 @@ kgmmuServicePriFaults_GV100
             // Replayable Faults - These faults will be cancelled as RM doesn't support replaying such
             //                     faults. Cancelling these faults will bring them back as non-replayable faults.
             //
-            NvBool bReplayableBufDis = FLD_TEST_DRF(_PFB_PRI, _MMU_FAULT_BUFFER_SIZE,_ENABLE, _FALSE,
+            NvBool bReplayableBufDis = FLD_TEST_DRF(_HUBMMU, _PRI_MMU_FAULT_BUFFER_SIZE,_ENABLE, _FALSE,
                                                     kgmmuReadMmuFaultBufferSize_HAL(pGpu, pKernelGmmu, REPLAYABLE_FAULT_BUFFER, GPU_GFID_PF));
-            NvBool bNonReplayBufDis = FLD_TEST_DRF(_PFB_PRI, _MMU_FAULT_BUFFER_SIZE,_ENABLE, _FALSE,
+            NvBool bNonReplayBufDis = FLD_TEST_DRF(_HUBMMU, _PRI_MMU_FAULT_BUFFER_SIZE,_ENABLE, _FALSE,
                                                     kgmmuReadMmuFaultBufferSize_HAL(pGpu, pKernelGmmu, NON_REPLAYABLE_FAULT_BUFFER, GPU_GFID_PF));
             if (bReplayableBufDis || bNonReplayBufDis)
             {
@@ -2575,7 +2557,7 @@ kgmmuServicePriFaults_GV100
             rmStatus = kgmmuServiceVfPriFaults(pGpu, pKernelGmmu, vfFaultType);
 
         // Clear the VALID bit to indicate we have seen this.
-        faultStatus = FLD_SET_DRF(_PFB_PRI, _MMU_FAULT_STATUS, _VALID, _CLEAR, faultStatus);
+        faultStatus = FLD_SET_DRF(_HUBMMU, _PRI_MMU_FAULT_STATUS, _VALID, _CLEAR, faultStatus);
         kgmmuWriteMmuFaultStatus_HAL(pGpu, pKernelGmmu, faultStatus);
 
         if (bBarFault && pKernelRC != NULL && pKernelRC->bRcOnBar2Fault)

@@ -284,9 +284,16 @@ reusemappingdbMap
         ReuseMappingDbEntry *pEntry = token.pList;
         NvU64 physicalOffset = pEntry->newMappingNode.physicalOffset;
         NvU64 virtualOffset = pEntry->newMappingNode.virtualOffset;
-        token.pList = pEntry->newMappingNode.pNextEntry;
+        NvU64 size          = pEntry->size;
 
-        pMemoryArea->pRanges[pMemoryArea->numRanges++] = mrangeMake(virtualOffset, range.size);
+        token.pList = pEntry->newMappingNode.pNextEntry;
+        pMemoryArea->numRanges++;
+
+        //
+        // The linked list is inserted in reverse order, so we reverse the list when inserting into
+        // final array.
+        //
+        pMemoryArea->pRanges[token.numNewEntries - pMemoryArea->numRanges] = mrangeMake(virtualOffset, size);
 
         // Add data to tracking structures only if the mapped range does not overlap
         if (bAddToMap)
@@ -309,7 +316,7 @@ err_unmap:
     {
         void *pCur = token.pList;
         pReuseMappingDb->pUnmapCb(pReuseMappingDb->pGlobalCtx, pAllocCtx,
-            mrangeMake(token.pList->newMappingNode.virtualOffset, range.size));
+            mrangeMake(token.pList->newMappingNode.virtualOffset, token.pList->size));
         token.pList = token.pList->newMappingNode.pNextEntry;
         PORT_FREE(pReuseMappingDb->pAllocator, pCur);
     }

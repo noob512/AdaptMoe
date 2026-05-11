@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -27,8 +27,8 @@
 #include "gpu/ce/kernel_ce_private.h"
 #include "gpu/bif/kernel_bif.h"
 
+#include "published/blackwell/gb202/dev_top_zb.h"
 #include "published/blackwell/gb202/dev_ce_base.h"
-#include "published/blackwell/gb202/dev_ce.h"
 
 // Defines for PCE-LCE mapping algorithm
 #define NV_CE_MAX_HSHUBS                  2
@@ -41,6 +41,9 @@
 #define NV_CE_PCE_PER_HSHUB               3
 #define NV_CE_NUM_PCES_NO_LINK_CASE       2
 #define NV_CE_MAX_PCE_PER_GRCE            1
+
+#define GET_DEVICE_ENTRY(gpu, type, instance, global, local, entry) \
+    gpuGetOneDeviceEntry(gpu, type, instance, global, local, entry)
 
 /*!
  * @brief Returns the size of the GRCE_CONFIG register array
@@ -113,14 +116,20 @@ kceMapAsyncLceDefault_GB202
     NvU32     numDefaultPces
 )
 {
-    NvU32       lceMask = 0;
-    NvU32       hshubId = 0;
-    NvU32       numPcesPerLce;
-    NvU32       numLces;
-    NvU32       supportedPceMask;
-    NvU32       supportedLceMask;
-    NvU32       pcesPerHshub;
-    NvU32       lceIndex, pceIndex, i, j;
+    CE_CAPABILITY ceCapsForLce[2];
+    NvU32         lceMask = 0;
+    NvU32         hshubId = 0;
+    NvU32         numPcesPerLce;
+    NvU32         numLces;
+    NvU32         supportedPceMask;
+    NvU32         supportedLceMask;
+    NvU32         pcesPerHshub;
+    NvU32         lceIndex, pceIndex, i, j;
+    NvBool        bPceAssigned;
+
+    // Set PCIe capabilities
+    ceCapsForLce[0] = NVBIT32(CE_CAPS_SYSMEM_READ);
+    ceCapsForLce[1] = NVBIT32(CE_CAPS_SYSMEM_WRITE);
 
     kceGetPceConfigForLceType(
         pGpu,
@@ -132,32 +141,51 @@ kceMapAsyncLceDefault_GB202
         &supportedLceMask,
         &pcesPerHshub);
 
+    NV_ASSERT_OR_RETURN(numLces <= 2, NV_ERR_INVALID_STATE);
     lceMask = supportedLceMask
               & (NV_CE_EVEN_ASYNC_LCE_MASK | NV_CE_ODD_ASYNC_LCE_MASK);
 
     //
     // Default mapping will match HW init values where PCEs 0,1 mapped to LCE 4
     // and PCEs 2,3 mapped to LCE 5.
+    //
     for (i = 0; i < numLces; i++)
     {
+        bPceAssigned = NV_FALSE;
+
         lceIndex = CE_GET_LOWEST_AVAILABLE_IDX(lceMask);
 
         for(j = 0; j < numPcesPerLce; j++)
         {
             pceIndex = CE_GET_LOWEST_AVAILABLE_IDX(supportedPceMask);
-            pceAvailableMaskPerHshub[hshubId] &= (~(NVBIT32(pceIndex)));
 
-            pLocalPceLceMap[pceIndex] = lceIndex;
+            if (pceIndex < kceGetPce2lceConfigSize1_HAL(pKCe))
+            {
+                pceAvailableMaskPerHshub[hshubId] &= (~(NVBIT32(pceIndex)));
 
-            supportedPceMask &= ~NVBIT32(pceIndex);
+                pLocalPceLceMap[pceIndex] = lceIndex;
 
+                supportedPceMask &= ~NVBIT32(pceIndex);
 
-            NV_PRINTF(LEVEL_INFO, "GPU%d <-> GPU%d PCE Index: %d LCE Index: %d\n",
-                      pGpu->gpuInstance, pGpu->gpuInstance, pceIndex, lceIndex);
+                bPceAssigned = NV_TRUE;
+
+                NV_PRINTF(LEVEL_INFO, "GPU%d <-> GPU%d PCE Index: %d LCE Index: %d\n",
+                          pGpu->gpuInstance, pGpu->gpuInstance, pceIndex, lceIndex);
+            }
         }
 
-        lceMask &= ~NVBIT32(lceIndex);
-        *pLocalExposeCeMask |= NVBIT32(lceIndex);
+        if (bPceAssigned)
+        {
+            lceMask &= ~NVBIT32(lceIndex);
+            *pLocalExposeCeMask |= NVBIT32(lceIndex);
+
+            // Set PCIe Caps
+            KernelCE *pKCeLce = GPU_GET_KCE(pGpu, lceIndex);
+            if (pKCeLce != NULL)
+            {
+                pKCeLce->ceCapsMask |= ceCapsForLce[i];
+            }
+        }
     }
 
     return NV_OK;
@@ -186,10 +214,12 @@ kceGetMappings_GB202
                                        pExposeCeMask,
                                        NV_CE_NUM_PCES_NO_LINK_CASE);
 
-    kceMapPceLceForGRCE_HAL(pGpu, pKCe,
-                              pTopoParams->pceAvailableMaskPerConnectingHub,
-                              pLocalPceLceMap, pExposeCeMask, pLocalGrceMap, pTopoParams->fbhubPceMask);
-
+    if (!gpuIsCCFeatureEnabled(pGpu))
+    {
+        kceMapPceLceForGRCE_HAL(pGpu, pKCe,
+                                pTopoParams->pceAvailableMaskPerConnectingHub,
+                                pLocalPceLceMap, pExposeCeMask, pLocalGrceMap, pTopoParams->fbhubPceMask);
+    }
 
     NV_PRINTF(LEVEL_INFO, "status = 0x%x\n", status);
 
@@ -273,10 +303,18 @@ kceGetGrceMaskReg_GB202
     NvU32    *pGrceMask
 )
 {
-    NV_ASSERT_OR_RETURN((pGrceMask != NULL), NV_ERR_INVALID_ARGUMENT); 
+    const DEVICE_INFO_ENTRY *pEntry;
 
-    *pGrceMask = DRF_VAL(_CE, _GRCE_MASK, _VALUE,
-                         GPU_REG_RD32(pGpu, NV_CE_GRCE_MASK));
+    NV_ASSERT_OK_OR_RETURN(GET_DEVICE_ENTRY(pGpu,
+                                            NV_PTOP_ZB_DEVICE_INFO_DEV_TYPE_ENUM_LCE,
+                                            DEVICE_INFO_DIELET_INSTANCE_ANY,
+                                            0,
+                                            DEVICE_INFO_DIE_LOCAL_INSTANCE_ID_ANY,
+                                            &pEntry));
+    NV_ASSERT_OR_RETURN((pGrceMask != NULL), NV_ERR_INVALID_ARGUMENT);
+
+    *pGrceMask = DRF_VAL(_CE_BASE, _GRCE_MASK, _VALUE,
+                         GPU_REG_RD32(pGpu, pEntry->devicePriBase + NV_CE_BASE_GRCE_MASK));
 
     return NV_OK;
 }

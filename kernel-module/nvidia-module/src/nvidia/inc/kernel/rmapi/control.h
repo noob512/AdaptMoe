@@ -69,9 +69,9 @@ struct RS_CONTROL_COOKIE
     const RS_ACCESS_MASK rightsRequired;
 
     NvBool              bFreeParamCopy;    ///< Indicates that param copies should be cleaned up
-    NvBool              bFreeEmbeddedCopy; ///< Indicates embedded param copies should be cleaned up
-
     RMAPI_PARAM_COPY    paramCopy;
+
+    NvBool              bFreeEmbeddedCopy; ///< Indicates embedded param copies should be cleaned up
     RMAPI_PARAM_COPY    embeddedParamCopies[4];   // Up to 4 embedded pointers per one RmControl identified
 };
 typedef RS_CONTROL_COOKIE RmCtrlExecuteCookie;
@@ -85,7 +85,7 @@ typedef RS_CONTROL_COOKIE RmCtrlExecuteCookie;
 
 typedef struct
 {
-   NvS32 volatile pending;
+   NvS32 PORT_ATOMIC pending;
    NvU32 cpuInst;
    RmCtrlParams rmCtrlDeferredParams;
    NvU8 paramBuffer[RMCTRL_DEFERRED_MAX_PARAM_SIZE];    // buffer to hold rmCtrlDeferredParams.pParams
@@ -129,9 +129,6 @@ NV_STATUS rmControlValidateClientPrivilegeAccess(NvHandle hClient, NvHandle hObj
 // Helper functions for handling embedded parameter copies
 NV_STATUS embeddedParamCopyIn(RMAPI_PARAM_COPY  *pParamCopy, RmCtrlParams *pRmCtrlParams);
 NV_STATUS embeddedParamCopyOut(RMAPI_PARAM_COPY  *pParamCopy, RmCtrlParams *pRmCtrlParams);
-
-#define RM_CLIENT_PTR_ACCESS_CHECK_READ     NVBIT(0)
-#define RM_CLIENT_PTR_ACCESS_CHECK_WRITE    NVBIT(1)
 
 //
 // For NVOC Exported functions
@@ -363,18 +360,6 @@ NV_STATUS embeddedParamCopyOut(RMAPI_PARAM_COPY  *pParamCopy, RmCtrlParams *pRmC
 //    This attribute only has an effect when the RM access rights implementation
 //    is enabled; see g_bRsAccessEnabled.
 //
-
-
-/*
- * On T234, RM is in kernel mode, so when RM is running in kernel mode it
- * does not allow usermode clients like MODs to call control calls that are
- * marked as KERNEL_PRIVILEGED.
- * So defining new macro DISPLAY_PRIVILEGED(i.e PRIVILEGED) for Tegra and mark
- * control calls needed by MODs with this so that MODs running as root can call
- * these control calls. However keeping same privilege level for DGPUs which
- * does not change the current behaviour.
- */
-#define DISPLAY_PRIVILEGED KERNEL_PRIVILEGED
 
 #endif // _CONTROL_H_
 

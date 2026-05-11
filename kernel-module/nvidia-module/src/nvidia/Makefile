@@ -38,7 +38,6 @@ CFLAGS += -I arch/nvalloc/unix/include
 CFLAGS += -I inc
 CFLAGS += -I inc/os
 CFLAGS += -I $(SRC_COMMON)/shared/inc
-CFLAGS += -I $(SRC_COMMON)/shared/msgq/inc
 CFLAGS += -I $(SRC_COMMON)/inc
 
 CFLAGS += -I $(SRC_COMMON)/uproc/os/libos-v2.0.0/include
@@ -64,9 +63,10 @@ $(call BUILD_OBJECT_LIST,$(LIBSPDM_SOURCES)): CFLAGS += $(addprefix -I ,$(LIBSPD
 $(call BUILD_OBJECT_LIST,$(LIBSPDM_SOURCES)): CFLAGS += $(addprefix -D,$(LIBSPDM_DEFINES))
 
 #if NV_USE_MBEDTLS
-CFLAGS += -I $(SRC_COMMON)/mbedtls/include
-CFLAGS += -I $(SRC_COMMON)/mbedtls/nvidia
-CFLAGS += -DMBEDTLS_USER_CONFIG_FILE=\"nvrm_mbedtls_config.h\"
+MBEDTLS_VERSION ?= 3.6.2
+CFLAGS += -I $(SRC_COMMON)/mbedtls/$(MBEDTLS_VERSION)/include
+CFLAGS += -I $(SRC_COMMON)/mbedtls/$(MBEDTLS_VERSION)/nvidia
+CFLAGS += -D"MBEDTLS_USER_CONFIG_FILE=<nvrm_mbedtls_config.h>"
 #endif
 
 CFLAGS += -Werror-implicit-function-declaration
@@ -178,12 +178,12 @@ ifeq ($(TARGET_ARCH),x86_64)
       $(shell $(VERSION_MK_DIR)/nv-compiler.sh version_is_at_least $(CC) 140000)
   endif
 
-  ifeq ($(FCF_SUPPORTED)-$(ENDBR_SUPPORTED),1-1)
+  ifeq ($(FCF_SUPPORTED)-$(ENDBR_SUPPORTED)-$(NV_KERNEL_TRACING),1-1-)
     CONDITIONAL_CFLAGS += $(call TEST_CC_ARG, -fcf-protection=branch)
   endif
   CONDITIONAL_CFLAGS += $(call TEST_CC_ARG, -fno-jump-tables)
   CONDITIONAL_CFLAGS += $(call TEST_CC_ARG, -mindirect-branch-register)
-  CONDITIONAL_CFLAGS += $(call TEST_CC_ARG, -mindirect-branch=thunk-extern)
+    CONDITIONAL_CFLAGS += $(call TEST_CC_ARG, -mindirect-branch=thunk-extern)
 endif
 
 CFLAGS += $(CONDITIONAL_CFLAGS)
@@ -209,11 +209,12 @@ all: $(NV_KERNEL_O)
 LINKER_SCRIPT = nv-kernel.ld
 
 NV_KERNEL_O_LDFLAGS += $(LDFLAGS)
+NV_KERNEL_O_LDFLAGS += -T $(LINKER_SCRIPT)
+
 
 $(NV_KERNEL_O): $(OBJS) $(EXPORTS_LINK_COMMAND) $(LINKER_SCRIPT)
 	$(call quiet_cmd,LD) \
 	  $(NV_KERNEL_O_LDFLAGS) \
-	  -T $(LINKER_SCRIPT) \
 	  -r -o $(NV_KERNEL_O) $(OBJS) @$(EXPORTS_LINK_COMMAND)
 	$(call quiet_cmd,OBJCOPY) \
 	  --localize-symbol=memset \

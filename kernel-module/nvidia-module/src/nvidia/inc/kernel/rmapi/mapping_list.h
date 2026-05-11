@@ -28,6 +28,7 @@
 #include "gpu/mem_mgr/mem_desc.h"
 #include "os/os.h"
 #include "rmapi/resource.h"
+#include "mmu/gmmu_fmt.h" // GMMU_APERTURE
 
 typedef struct VirtualMemory VirtualMemory;
 typedef struct Memory Memory;
@@ -38,7 +39,6 @@ typedef struct Memory Memory;
 
 // dma information definitions
 typedef struct _def_client_dma_mapping_info CLI_DMA_MAPPING_INFO, *PCLI_DMA_MAPPING_INFO;
-typedef struct _def_client_dma_mapping_info_iterator CLI_DMA_MAPPING_INFO_ITERATOR, *PCLI_DMA_MAPPING_INFO_ITERATOR;
 
 // mapping information definitions
 typedef struct _def_client_dma_alloc_map_info           CLI_DMA_ALLOC_MAP_INFO;
@@ -57,9 +57,12 @@ struct _def_client_dma_mapping_info
     NvU64                 FbApertureLen[NV_MAX_SUBDEVICES]; // GPU aperture mapped lengths
     MEMORY_DESCRIPTOR    *pMemDesc;                         // Subregion to be mapped
     NvU32                 Flags;
+    NvU32                 Flags2;
     NvBool                bP2P;
     NvU32                 gpuMask;
     NvU64                 mapPageSize;                      // Page size at which the memory is mapped.
+    GMMU_APERTURE         aperture;
+    NvBool                bNeedL2InvalidateAtUnmap;
     ADDRESS_TRANSLATION   addressTranslation;
     MEMORY_DESCRIPTOR    *pBar1P2PVirtMemDesc;              // The peer GPU mapped BAR1 region
     MEMORY_DESCRIPTOR    *pBar1P2PPhysMemDesc;              // The peer GPU vidmem sub region
@@ -163,14 +166,12 @@ CliUpdateDeviceMemoryMapping
 RsCpuMapping       *CliFindMappingInClient          (NvHandle, NvHandle, NvP64);
 
 // DMA Mappings
-NV_STATUS           intermapCreateDmaMapping        (RsClient *, VirtualMemory *, PCLI_DMA_MAPPING_INFO *, NvU32);
+NV_STATUS           intermapCreateDmaMapping        (RsClient *, VirtualMemory *, PCLI_DMA_MAPPING_INFO *, NvU32, NvU32);
 NV_STATUS           intermapRegisterDmaMapping      (RsClient *, VirtualMemory *, PCLI_DMA_MAPPING_INFO,  NvU64, NvU32);
 NV_STATUS           intermapDelDmaMapping           (RsClient *, VirtualMemory *, NvU64, NvU32);
 void                intermapFreeDmaMapping          (PCLI_DMA_MAPPING_INFO);
 CLI_DMA_MAPPING_INFO *intermapGetDmaMapping         (VirtualMemory *pVirtualMemory, NvU64 dmaOffset, NvU32 gpuMask);
 
 NvBool              CliGetDmaMappingInfo            (RsClient *, NvHandle, NvHandle, NvU64, NvU32, PCLI_DMA_MAPPING_INFO*);
-void                CliGetDmaMappingIterator        (PCLI_DMA_MAPPING_INFO *, PCLI_DMA_MAPPING_INFO_ITERATOR, PNODE pDmaMappingList);
-void                CliGetDmaMappingNext            (PCLI_DMA_MAPPING_INFO *, PCLI_DMA_MAPPING_INFO_ITERATOR);
 
 #endif

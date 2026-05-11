@@ -42,24 +42,21 @@
 #include "nv_uvm_interface.h"
 
 uvm_global_t g_uvm_global;
-static struct UvmOpsUvmEvents g_exported_uvm_ops;
+static struct UvmEventsLinux g_exported_uvm_events;
 static bool g_ops_registered = false;
 
 static NV_STATUS uvm_register_callbacks(void)
 {
     NV_STATUS status = NV_OK;
 
-    g_exported_uvm_ops.suspend = uvm_suspend_entry;
-    g_exported_uvm_ops.resume = uvm_resume_entry;
-    g_exported_uvm_ops.startDevice = NULL;
-    g_exported_uvm_ops.stopDevice  = NULL;
-    g_exported_uvm_ops.isrTopHalf  = uvm_isr_top_half_entry;
-
-    g_exported_uvm_ops.drainP2P = uvm_suspend_and_drainP2P_entry;
-    g_exported_uvm_ops.resumeP2P = uvm_resumeP2P_entry;
+    g_exported_uvm_events.isrTopHalf = uvm_isr_top_half_entry;
+    g_exported_uvm_events.suspend = uvm_suspend_entry;
+    g_exported_uvm_events.resume = uvm_resume_entry;
+    g_exported_uvm_events.drainP2P = uvm_suspend_and_drainP2P_entry;
+    g_exported_uvm_events.resumeP2P = uvm_resumeP2P_entry;
 
     // Register the UVM callbacks with the main GPU driver:
-    status = uvm_rm_locked_call(nvUvmInterfaceRegisterUvmCallbacks(&g_exported_uvm_ops));
+    status = uvm_rm_locked_call(nvUvmInterfaceRegisterUvmEvents(&g_exported_uvm_events));
     if (status != NV_OK)
         return status;
 
@@ -71,7 +68,7 @@ static NV_STATUS uvm_register_callbacks(void)
 static void uvm_unregister_callbacks(void)
 {
     if (g_ops_registered) {
-        uvm_rm_locked_call_void(nvUvmInterfaceDeRegisterUvmOps());
+        uvm_rm_locked_call_void(nvUvmInterfaceDeRegisterUvmEvents());
         g_ops_registered = false;
     }
 }
@@ -93,6 +90,7 @@ NV_STATUS uvm_global_init(void)
     INIT_LIST_HEAD(&g_uvm_global.va_spaces.list);
     uvm_mutex_init(&g_uvm_global.devmem_ranges.lock, UVM_LOCK_ORDER_LEAF);
     INIT_LIST_HEAD(&g_uvm_global.devmem_ranges.list);
+    INIT_LIST_HEAD(&g_uvm_global.pci_p2pdma_devices.list);
 
     status = uvm_kvmalloc_init();
     if (status != NV_OK) {
@@ -241,6 +239,7 @@ void uvm_global_exit(void)
     uvm_mem_global_exit();
     uvm_pmm_sysmem_exit();
     uvm_pmm_devmem_exit();
+    uvm_pmm_pci_p2pdma_cache_exit();
     uvm_gpu_exit();
     uvm_processor_mask_cache_exit();
 
@@ -314,10 +313,7 @@ static NV_STATUS uvm_suspend(void)
         // guarantees that all user channels have been preempted before
         // uvm_suspend() is called, which implies that no user channels can be
         // stalled on faults when this point is reached.
-        if (gpu->parent->replayable_faults_supported)
-            uvm_gpu_fault_buffer_flush(gpu);
-
-        // TODO: Bug 2535118: flush the non-replayable fault buffer
+        uvm_gpu_replayable_buffer_flush(gpu);
 
         // Stop access counter interrupt processing for the duration of this
         // sleep cycle to defend against potential interrupt storms in

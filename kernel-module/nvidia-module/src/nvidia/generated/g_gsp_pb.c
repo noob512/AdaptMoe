@@ -104,6 +104,18 @@ const PRB_FIELD_DESC prb_fields_gsp_rpcentry[] = {
         PRB_MAYBE_FIELD_NAME("duration")
         PRB_MAYBE_FIELD_DEFAULT(0)
     },
+    {
+        9,
+        {
+            PRB_OPTIONAL,
+            PRB_UINT32,
+            0,
+        },
+        0,
+        0,
+        PRB_MAYBE_FIELD_NAME("sequence")
+        PRB_MAYBE_FIELD_DEFAULT(0)
+    },
 };
 
 // 'RpcHistoryCpuToGsp' field defaults
@@ -250,10 +262,52 @@ const PRB_FIELD_DESC prb_fields_gsp_xidreport[] = {
     },
 };
 
+// 'RpcPerf' field defaults
+
+// 'RpcPerf' field descriptors
+const PRB_FIELD_DESC prb_fields_gsp_rpcperf[] = {
+    {
+        1,
+        {
+            PRB_OPTIONAL,
+            PRB_STRING,
+            0,
+        },
+        0,
+        0,
+        PRB_MAYBE_FIELD_NAME("msg")
+        PRB_MAYBE_FIELD_DEFAULT(0)
+    },
+    {
+        2,
+        {
+            PRB_OPTIONAL,
+            PRB_UINT32,
+            0,
+        },
+        0,
+        0,
+        PRB_MAYBE_FIELD_NAME("gpuInstance")
+        PRB_MAYBE_FIELD_DEFAULT(0)
+    },
+    {
+        3,
+        {
+            PRB_OPTIONAL,
+            PRB_MESSAGE,
+            0,
+        },
+        GSP_RPCENTRY,
+        0,
+        PRB_MAYBE_FIELD_NAME("activeRpc")
+        PRB_MAYBE_FIELD_DEFAULT(0)
+    },
+};
+
 // Message descriptors
 const PRB_MSG_DESC prb_messages_gsp[] = {
     {
-        8,
+        9,
         prb_fields_gsp_rpcentry,
         PRB_MAYBE_MESSAGE_NAME("Gsp.RpcEntry")
     },
@@ -276,6 +330,11 @@ const PRB_MSG_DESC prb_messages_gsp[] = {
         5,
         prb_fields_gsp_xidreport,
         PRB_MAYBE_MESSAGE_NAME("Gsp.XidReport")
+    },
+    {
+        3,
+        prb_fields_gsp_rpcperf,
+        PRB_MAYBE_MESSAGE_NAME("Gsp.RpcPerf")
     },
 };
 

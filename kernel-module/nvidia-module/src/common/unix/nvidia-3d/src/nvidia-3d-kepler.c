@@ -45,26 +45,6 @@ void _nv3dSetSpaVersionKepler(Nv3dChannelRec *p3dChannel)
         NV3D_V(A097, SET_SPA_VERSION, MINOR, minor));
 }
 
-void _nv3dInitChannelKepler(Nv3dChannelRec *p3dChannel)
-{
-    NvPushChannelPtr p = p3dChannel->pPushChannel;
-
-    // Configure constant buffer slot NV3D_CB_SLOT_BINDLESS_TEXTURE as the
-    // place the texture binding table is stored. This is obsolete on Volta and
-    // later, so don't run it there.
-    if (p3dChannel->p3dDevice->caps.hasSetBindlessTexture) {
-        nvPushImmedVal(p, NVA06F_SUBCHANNEL_3D,
-            NVA097_SET_BINDLESS_TEXTURE,
-            NV3D_V(A097, SET_BINDLESS_TEXTURE, CONSTANT_BUFFER_SLOT_SELECT,
-            NV3D_CB_SLOT_BINDLESS_TEXTURE));
-    }
-
-    // Disable shader exceptions.  This matches OpenGL driver behavior.
-    nvPushImmedVal(p, NVA06F_SUBCHANNEL_3D,
-        NV9097_SET_SHADER_EXCEPTIONS,
-        NV3D_C(9097, SET_SHADER_EXCEPTIONS, ENABLE, FALSE));
-}
-
 /*!
  * Upload data using the INLINE_TO_MEMORY methods embedded in the KEPLER_A
  * class.

@@ -103,7 +103,9 @@ PLAN_JSON="$RUN_ROOT/routing_phase_f_weight_plan.json"
 PLAN_REPORT="$RUN_ROOT/routing_phase_f_weight_plan_report.md"
 CHECK_JSON="$RUN_ROOT/phase_f_check.json"
 CHECK_MD="$RUN_ROOT/phase_f_check.md"
+PHASE_F_DEBUG_LOG="$RUN_ROOT/phase_f_user_debug.log"
 mkdir -p "$PROFILE_DIR" "$CHECK_DIR"
+export VLLM_UVM_PHASE_F_DEBUG_LOG="$PHASE_F_DEBUG_LOG"
 
 echo "==========================================================="
 echo " Stage M Phase F Check"
@@ -115,6 +117,7 @@ echo " request_rate: $REQUEST_RATE"
 echo " routing_trace: ${ROUTING_TRACE:-<generate>}"
 echo " weight_executor: $WEIGHT_EXECUTOR"
 echo " require_driver: $REQUIRE_DRIVER"
+echo " phase_f_user_debug_log: $PHASE_F_DEBUG_LOG"
 echo "==========================================================="
 
 echo "==========================================================="
@@ -219,6 +222,8 @@ WEIGHT_BATCH_EXECUTOR_ENABLE=1 \
   --init-weight-max-experts-per-layer 0 \
   --weight-plan-file "$PLAN_JSON" \
   --weight-executor "$WEIGHT_EXECUTOR" \
+  --uvm-enable-builtin-tests 1 \
+  --no-reset-counters \
   --weight-budget-cpu-offload-enable 0
 
 echo "==========================================================="
@@ -321,6 +326,17 @@ driver_results = [
     for key in ("driver_result", "driver_advise_result", "driver_prefetch_result")
     if r.get(key) not in (None, "")
 ]
+driver_success_records = sum(
+    1
+    for records in (init_records, prefetch_records)
+    for r in records
+    if r.get("executor") == "driver_batch" and r.get("success") is True
+)
+driver_positive_results = sum(
+    1
+    for value in driver_results
+    if isinstance(value, (int, float)) and value > 0
+)
 
 checks = {
     "prefetch_trace_present": prefetch_trace.exists(),
@@ -330,7 +346,14 @@ checks = {
     "init_batch_groups_are_multi_range": max(init_batch_sizes or [0]) > 1,
     "runtime_batch_groups_are_multi_range": max(runtime_batch_sizes or [0]) > 1,
     "driver_batch_seen_or_fallback_recorded": driver_records > 0 or fallback_records > 0,
-    "require_driver_satisfied": (driver_records > 0) if require_driver else True,
+    "driver_action_success_seen": (
+        driver_success_records > 0 or driver_positive_results > 0
+    ),
+    "require_driver_satisfied": (
+        driver_records > 0
+        and fallback_records == 0
+        and (driver_success_records > 0 or driver_positive_results > 0)
+    ) if require_driver else True,
     "router_topk_source_present": prefetch_sources.get("router_topk", 0) > 0,
     "runtime_cold_offload_disabled": runtime_offload_issued == 0,
     "no_runtime_offload_actions": sum(offload_actions.values()) == 0,
@@ -349,6 +372,8 @@ payload = {
     "driver_records": driver_records,
     "fallback_records": fallback_records,
     "cpp_records": cpp_records,
+    "driver_success_records": driver_success_records,
+    "driver_positive_results": driver_positive_results,
     "driver_results": driver_results[:20],
     "requested_executor": requested_executor,
     "require_driver": require_driver,
@@ -375,6 +400,8 @@ lines.extend([
     f"- requested_executor: {requested_executor}",
     f"- driver_records: {driver_records}",
     f"- fallback_records: {fallback_records}",
+    f"- driver_success_records: {driver_success_records}",
+    f"- driver_positive_results: {driver_positive_results}",
     f"- sample_driver_results: {driver_results[:8]}",
     f"- max_init_batch_size: {payload['max_init_batch_size']}",
     f"- max_runtime_batch_size: {payload['max_runtime_batch_size']}",

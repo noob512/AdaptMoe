@@ -122,8 +122,8 @@ void       rmLocksFree(OBJSYS *);
 NV_STATUS  rmLocksAcquireAll(NvU32 module);
 void       rmLocksReleaseAll(void);
 
-NV_STATUS   workItemLocksAcquire(NvU32 gpuInstance, NvU32 flags, NvU32 *pReleaseLocks, NvU32 *pGpuMask);
-void        workItemLocksRelease(NvU32 releaseLocks, NvU32 gpuMask);
+NV_STATUS   workItemLocksAcquire(NvU32 gpuInstance, OsQueueWorkItemFlags flags, OsQueueWorkItemFlags *pReleaseLocks, NvU32 *pGpuMask);
+void        workItemLocksRelease(OsQueueWorkItemFlags releaseLocks, NvU32 gpuMask);
 
 //
 // Thread priority boosting and throttling:

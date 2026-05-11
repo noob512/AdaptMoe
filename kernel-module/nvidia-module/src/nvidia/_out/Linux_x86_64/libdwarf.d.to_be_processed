@@ -4,7 +4,7 @@ _out/Linux_x86_64/libdwarf.o: \
  ../common/sdk/nvidia/inc/nvtypes.h ../common/sdk/nvidia/inc/cpuopsys.h \
  ../common/sdk/nvidia/inc/nvstatus.h ../common/sdk/nvidia/inc/nvtypes.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h inc/libraries/nvport/core.h \
- inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_gcc.h \
+ inc/libraries/nvport/atomic.h inc/libraries/nvport/inline/atomic_c11.h \
  inc/libraries/nvport/debug.h \
  inc/libraries/nvport/inline/debug_unix_kernel_os.h \
  ../common/sdk/nvidia/inc/nv-kernel-interface-api.h \
@@ -17,7 +17,7 @@ _out/Linux_x86_64/libdwarf.o: \
  inc/libraries/nvport/inline/safe_generic.h inc/libraries/nvport/thread.h \
  inc/libraries/nvport/crypto.h inc/libraries/nvport/string.h \
  inc/libraries/nvport/cpu.h ../common/uproc/os/common/include/libdwarf.h \
- ../common/uproc/os/common/include/libelf.h \
+ ../common/uproc/os/common/include/libelf.h ../common/inc/nvctassert.h \
  ../common/uproc/os/common/include/libos_status.h
 ../common/sdk/nvidia/inc/cpuopsys.h:
 inc/libraries/nvport/nvport.h:
@@ -28,7 +28,7 @@ inc/libraries/nvport/nvport.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 inc/libraries/nvport/core.h:
 inc/libraries/nvport/atomic.h:
-inc/libraries/nvport/inline/atomic_gcc.h:
+inc/libraries/nvport/inline/atomic_c11.h:
 inc/libraries/nvport/debug.h:
 inc/libraries/nvport/inline/debug_unix_kernel_os.h:
 ../common/sdk/nvidia/inc/nv-kernel-interface-api.h:
@@ -49,4 +49,5 @@ inc/libraries/nvport/string.h:
 inc/libraries/nvport/cpu.h:
 ../common/uproc/os/common/include/libdwarf.h:
 ../common/uproc/os/common/include/libelf.h:
+../common/inc/nvctassert.h:
 ../common/uproc/os/common/include/libos_status.h:

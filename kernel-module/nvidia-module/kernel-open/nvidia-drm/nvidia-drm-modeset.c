@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2015, 2025, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -20,9 +20,9 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#include "nvidia-drm-conftest.h" /* NV_DRM_ATOMIC_MODESET_AVAILABLE */
+#include "nvidia-drm-conftest.h" /* NV_DRM_AVAILABLE */
 
-#if defined(NV_DRM_ATOMIC_MODESET_AVAILABLE)
+#if defined(NV_DRM_AVAILABLE)
 
 #include "nvidia-drm-priv.h"
 #include "nvidia-drm-modeset.h"
@@ -34,10 +34,7 @@
 #include <drm/drmP.h>
 #endif
 
-#if defined(NV_DRM_DRM_VBLANK_H_PRESENT)
 #include <drm/drm_vblank.h>
-#endif
-
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc.h>
@@ -48,9 +45,7 @@
 #include <linux/host1x-next.h>
 #endif
 
-#if defined(NV_DRM_FENCE_AVAILABLE)
-#include "nvidia-dma-fence-helper.h"
-#endif
+#include <linux/dma-fence.h>
 
 struct nv_drm_atomic_state {
     struct NvKmsKapiRequestedModeSetConfig config;
@@ -113,8 +108,11 @@ static bool __will_generate_flip_event(struct drm_crtc *crtc,
         return false;
     }
 
-    /* Find out whether primary & overlay flip done events will be generated. */
-    nv_drm_for_each_plane_in_state(old_crtc_state->state,
+    /*
+     * Find out whether primary & overlay flip done events will be generated.
+     * Only called after drm_atomic_helper_swap_state, so we use old state.
+     */
+    for_each_old_plane_in_state(old_crtc_state->state,
         plane, old_plane_state, i) {
         if (old_plane_state->crtc != crtc) {
            continue;
@@ -156,24 +154,23 @@ static int __nv_drm_put_back_post_fence_fd(
     return ret;
 }
 
-#if defined(NV_DRM_FENCE_AVAILABLE)
 struct nv_drm_plane_fence_cb_data {
-    nv_dma_fence_cb_t dma_fence_cb;
+    struct dma_fence_cb dma_fence_cb;
     struct nv_drm_device *nv_dev;
     NvU32 semaphore_index;
 };
 
 static void
 __nv_drm_plane_fence_cb(
-    nv_dma_fence_t *fence,
-    nv_dma_fence_cb_t *cb_data
+    struct dma_fence *fence,
+    struct dma_fence_cb *cb_data
 )
 {
     struct nv_drm_plane_fence_cb_data *fence_data =
         container_of(cb_data, typeof(*fence_data), dma_fence_cb);
     struct nv_drm_device *nv_dev = fence_data->nv_dev;
 
-    nv_dma_fence_put(fence);
+    dma_fence_put(fence);
     nvKms->signalDisplaySemaphore(nv_dev->pDevice, fence_data->semaphore_index);
     nv_drm_free(fence_data);
 }
@@ -199,7 +196,7 @@ static int __nv_drm_convert_in_fences(
         return 0;
     }
 
-    nv_drm_for_each_new_plane_in_state(state, plane, plane_state, i) {
+    for_each_new_plane_in_state(state, plane, plane_state, i) {
         if ((plane->type == DRM_PLANE_TYPE_CURSOR) ||
             (plane_state->crtc != crtc) ||
             (plane_state->fence == NULL)) {
@@ -279,9 +276,9 @@ static int __nv_drm_convert_in_fences(
         fence_data->nv_dev = nv_dev;
         fence_data->semaphore_index = semaphore_index;
 
-        ret = nv_dma_fence_add_callback(plane_state->fence,
-                                        &fence_data->dma_fence_cb,
-                                        __nv_drm_plane_fence_cb);
+        ret = dma_fence_add_callback(plane_state->fence,
+                                     &fence_data->dma_fence_cb,
+                                     __nv_drm_plane_fence_cb);
 
         switch (ret) {
         case -ENOENT:
@@ -313,7 +310,6 @@ static int __nv_drm_convert_in_fences(
 
     return 0;
 }
-#endif /* defined(NV_DRM_FENCE_AVAILABLE) */
 
 static int __nv_drm_get_syncpt_data(
     struct nv_drm_device *nv_dev,
@@ -341,7 +337,8 @@ static int __nv_drm_get_syncpt_data(
 
     head_reply_config = &reply_config->headReplyConfig[nv_crtc->head];
 
-    nv_drm_for_each_plane_in_state(old_crtc_state->state, plane, old_plane_state, i) {
+    /* Use old state because this is only called after drm_atomic_helper_swap_state */
+    for_each_old_plane_in_state(old_crtc_state->state, plane, old_plane_state, i) {
         struct nv_drm_plane *nv_plane = to_nv_plane(plane);
 
         if (plane->type == DRM_PLANE_TYPE_CURSOR || old_plane_state->crtc != crtc) {
@@ -402,7 +399,7 @@ nv_drm_atomic_apply_modeset_config(struct drm_device *dev,
         &(to_nv_atomic_state(state)->config);
     struct NvKmsKapiModeSetReplyConfig reply_config = { };
     struct drm_crtc *crtc;
-    struct drm_crtc_state *crtc_state;
+    struct drm_crtc_state *old_crtc_state, *new_crtc_state;
     int i;
     int ret;
 
@@ -414,7 +411,6 @@ nv_drm_atomic_apply_modeset_config(struct drm_device *dev,
         return -EINVAL;
     }
 
-#if defined(NV_DRM_FRAMEBUFFER_OBJ_PRESENT)
     if (commit) {
         /*
          * This function does what is necessary to prepare the framebuffers
@@ -426,10 +422,6 @@ nv_drm_atomic_apply_modeset_config(struct drm_device *dev,
          * in the new state, prefering explicit sync fences when appropriate.
          * This must be done prior to converting the per-plane fences to
          * semaphore waits below.
-         *
-         * Note this only works when the drm_framebuffer:obj[] field is present
-         * and populated, so skip calling this function on kernels where that
-         * field is not present.
          */
         ret = drm_atomic_helper_prepare_planes(dev, state);
 
@@ -437,23 +429,14 @@ nv_drm_atomic_apply_modeset_config(struct drm_device *dev,
             return ret;
         }
     }
-#endif /* defined(NV_DRM_FRAMEBUFFER_OBJ_PRESENT) */
 
     memset(requested_config, 0, sizeof(*requested_config));
 
     /* Loop over affected crtcs and construct NvKmsKapiRequestedModeSetConfig */
-    nv_drm_for_each_crtc_in_state(state, crtc, crtc_state, i) {
-        /*
-         * When committing a state, the new state is already stored in
-         * crtc->state. When checking a proposed state, the proposed state is
-         * stored in crtc_state.
-         */
-        struct drm_crtc_state *new_crtc_state =
-                               commit ? crtc->state : crtc_state;
+    for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
         struct nv_drm_crtc *nv_crtc = to_nv_crtc(crtc);
 
         if (commit) {
-            struct drm_crtc_state *old_crtc_state = crtc_state;
             struct nv_drm_crtc_state *nv_new_crtc_state =
                 to_nv_crtc_state(new_crtc_state);
 
@@ -472,7 +455,6 @@ nv_drm_atomic_apply_modeset_config(struct drm_device *dev,
                 nv_new_crtc_state->nv_flip = NULL;
             }
 
-#if defined(NV_DRM_FENCE_AVAILABLE)
             ret = __nv_drm_convert_in_fences(nv_dev,
                                              state,
                                              crtc,
@@ -481,7 +463,6 @@ nv_drm_atomic_apply_modeset_config(struct drm_device *dev,
             if (ret != 0) {
                 return ret;
             }
-#endif /* defined(NV_DRM_FENCE_AVAILABLE) */
         }
 
         /*
@@ -512,18 +493,15 @@ nv_drm_atomic_apply_modeset_config(struct drm_device *dev,
     }
 
     if (commit && nv_dev->supportsSyncpts) {
-        nv_drm_for_each_crtc_in_state(state, crtc, crtc_state, i) {
+        /* commit is true so we check old state */
+        for_each_old_crtc_in_state(state, crtc, old_crtc_state, i) {
             /*! loop over affected crtcs and get NvKmsKapiModeSetReplyConfig */
             ret = __nv_drm_get_syncpt_data(
-                      nv_dev, crtc, crtc_state, requested_config, &reply_config);
+                      nv_dev, crtc, old_crtc_state, requested_config, &reply_config);
             if (ret != 0) {
                 return ret;
             }
         }
-    }
-
-    if (commit && nv_dev->requiresVrrSemaphores && reply_config.vrrFlip) {
-        nvKms->signalVrrSemaphore(nv_dev->pDevice, reply_config.vrrSemaphoreIndex);
     }
 
     return 0;
@@ -534,23 +512,47 @@ int nv_drm_atomic_check(struct drm_device *dev,
 {
     int ret = 0;
 
-#if defined(NV_DRM_COLOR_MGMT_AVAILABLE)
     struct drm_crtc *crtc;
     struct drm_crtc_state *crtc_state;
     int i;
 
-    nv_drm_for_each_crtc_in_state(state, crtc, crtc_state, i) {
+    struct drm_plane *plane;
+    struct drm_plane_state *plane_state;
+    int j;
+    bool cursor_surface_changed;
+    bool cursor_only_commit;
+
+    for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+
+        /*
+         * Committing cursor surface change without any other plane change can
+         * cause cursor surface in use by HW to be freed prematurely. Add all
+         * planes to the commit to avoid this. This is a workaround for bug 4966645.
+         */
+        cursor_surface_changed = false;
+        cursor_only_commit = true;
+        for_each_new_plane_in_state(crtc_state->state, plane, plane_state, j) {
+            if (plane->type == DRM_PLANE_TYPE_CURSOR) {
+                if (plane_state->fb != plane->state->fb) {
+                    cursor_surface_changed = true;
+                }
+            } else {
+                cursor_only_commit = false;
+                break;
+            }
+        }
+
         /*
          * if the color management changed on the crtc, we need to update the
          * crtc's plane's CSC matrices, so add the crtc's planes to the commit
          */
-        if (crtc_state->color_mgmt_changed) {
+        if (crtc_state->color_mgmt_changed ||
+            (cursor_surface_changed && cursor_only_commit)) {
             if ((ret = drm_atomic_add_affected_planes(state, crtc)) != 0) {
                 goto done;
             }
         }
     }
-#endif /* NV_DRM_COLOR_MGMT_AVAILABLE */
 
     if ((ret = drm_atomic_helper_check(dev, state)) != 0) {
         goto done;
@@ -636,7 +638,7 @@ int nv_drm_atomic_commit(struct drm_device *dev,
      * Our system already implements such a queue, but due to
      * bug 4054608, it is currently not used.
      */
-    nv_drm_for_each_crtc_in_state(state, crtc, crtc_state, i) {
+    for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
         struct nv_drm_crtc *nv_crtc = to_nv_crtc(crtc);
 
         /*
@@ -678,7 +680,6 @@ int nv_drm_atomic_commit(struct drm_device *dev,
             }
         }
 
-#if defined(NV_DRM_COLOR_MGMT_AVAILABLE)
         /*
          * If the legacy LUT needs to be updated, ensure that the previous LUT
          * update is complete first.
@@ -703,10 +704,7 @@ int nv_drm_atomic_commit(struct drm_device *dev,
                 }
             }
         }
-#endif
     }
-
-#if defined(NV_DRM_ATOMIC_HELPER_SWAP_STATE_HAS_STALL_ARG)
 
     /*
      * nv_drm_atomic_commit_internal()
@@ -718,18 +716,18 @@ int nv_drm_atomic_commit(struct drm_device *dev,
      * expected.
      */
 
-#if defined(NV_DRM_ATOMIC_HELPER_SWAP_STATE_RETURN_INT)
     ret = drm_atomic_helper_swap_state(state, false /* stall */);
     if (WARN_ON(ret != 0)) {
         return ret;
     }
-#else
-    drm_atomic_helper_swap_state(state, false /* stall */);
-#endif
 
-#else
-    drm_atomic_helper_swap_state(dev, state);
-#endif
+    /*
+     * Used to update legacy modeset state pointers to support UAPIs not updated
+     * by the core atomic modeset infrastructure.
+     *
+     * Example: /sys/class/drm/<card connector>/enabled
+     */
+    drm_atomic_helper_update_legacy_modeset_state(dev, state);
 
     /*
      * nv_drm_atomic_commit_internal() must not return failure after
@@ -747,7 +745,7 @@ int nv_drm_atomic_commit(struct drm_device *dev,
         goto done;
     }
 
-    nv_drm_for_each_crtc_in_state(state, crtc, crtc_state, i) {
+    for_each_old_crtc_in_state(state, crtc, crtc_state, i) {
         struct nv_drm_crtc *nv_crtc = to_nv_crtc(crtc);
         struct nv_drm_crtc_state *nv_new_crtc_state =
             to_nv_crtc_state(crtc->state);
@@ -831,7 +829,6 @@ int nv_drm_atomic_commit(struct drm_device *dev,
                 }
             }
 
-#if defined(NV_DRM_COLOR_MGMT_AVAILABLE)
             if (crtc_state->color_mgmt_changed) {
                 NvBool complete = nvKms->checkLutNotifier(nv_dev->pDevice,
                                                           nv_crtc->head,
@@ -842,20 +839,14 @@ int nv_drm_atomic_commit(struct drm_device *dev,
                         "LUT notifier timeout on head %u", nv_crtc->head);
                 }
             }
-#endif
         }
     }
 
 done:
 
-#if defined(NV_DRM_ATOMIC_STATE_REF_COUNTING_PRESENT)
     /*
-     * If ref counting is present, state will be freed when the caller
-     * drops its reference after we return.
+     * State will be freed when the caller drops its reference after we return.
      */
-#else
-    drm_atomic_state_free(state);
-#endif
 
     return 0;
 }

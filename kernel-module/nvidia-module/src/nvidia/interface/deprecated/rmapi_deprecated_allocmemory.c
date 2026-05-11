@@ -34,7 +34,6 @@
 #include "class/cl00c2.h" // NV01_MEMORY_LOCAL_PHYSICAL
 #include "class/cl84a0.h" // NV01_MEMORY_LIST_XXX
 #include "class/cl0076.h" // NV01_MEMORY_FRAMEBUFFER_CONSOLE
-#include "class/cl00f3.h" // NV01_MEMORY_FLA
 
 #include "ctrl/ctrl2080/ctrl2080fb.h" // NV2080_CTRL_FB_INFO
 
@@ -72,10 +71,6 @@ static NV_STATUS _rmAllocMemoryFramebufferConsole(DEPRECATED_CONTEXT *, NvHandle
                                                   NvHandle, NvU32, NvU32,
                                                   NvP64 *, NvU64 *);
 
-static NV_STATUS _rmAllocMemoryFromFlaObject(DEPRECATED_CONTEXT *, NvHandle, NvHandle,
-                                             NvHandle, NvU32, NvU32,
-                                             NvP64 *, NvU64 *);
-
 static const RmAllocMemoryEntry rmAllocMemoryTable[] =
 {
     { NV01_MEMORY_SYSTEM,                   _rmAllocMemorySystem },
@@ -87,7 +82,6 @@ static const RmAllocMemoryEntry rmAllocMemoryTable[] =
     { NV01_MEMORY_LIST_FBMEM,               _rmAllocMemoryList },
     { NV01_MEMORY_LIST_OBJECT,              _rmAllocMemoryList },
     { NV01_MEMORY_FRAMEBUFFER_CONSOLE,      _rmAllocMemoryFramebufferConsole },
-    { NV01_MEMORY_FLA,                      _rmAllocMemoryFromFlaObject },
 };
 
 static NvU32 rmAllocMemoryTableSize = NV_ARRAY_ELEMENTS(rmAllocMemoryTable);
@@ -461,7 +455,7 @@ _rmAllocMemoryList
 done:
     if (pPageArray)
     {
-        pContext->CopyUser(pContext, RMAPI_DEPRECATED_COPYRELEASE, RMAPI_DEPRECATED_BUFFER_ALLOCATE, 
+        pContext->CopyUser(pContext, RMAPI_DEPRECATED_COPYRELEASE, RMAPI_DEPRECATED_BUFFER_ALLOCATE,
                            pageArrayBase, pageArraySize, &pPageArray);
     }
 
@@ -469,60 +463,6 @@ done:
     {
         pContext->CopyUser(pContext, RMAPI_DEPRECATED_COPYRELEASE, RMAPI_DEPRECATED_BUFFER_ALLOCATE,
                            *pAddress, sizeof(Nv01MemoryList), (void**)&pMemoryList);
-    }
-
-    return status;
-}
-
-static NV_STATUS
-_rmAllocMemoryFromFlaObject
-(
-    DEPRECATED_CONTEXT *pContext,
-    NvHandle            hClient,
-    NvHandle            hParent,
-    NvHandle            hMemory,
-    NvU32               hClass,
-    NvU32               flags,
-    NvP64              *pAddress,
-    NvU64              *pLimit
-)
-{
-    NV_FLA_MEMORY_ALLOCATION_PARAMS  allocParams = {0};
-    NV_FLA_MEMORY_ALLOCATION_PARAMS *pMemoryFla = 0;
-    NV_STATUS                        status;
-
-    status = pContext->CopyUser(pContext,
-                               RMAPI_DEPRECATED_COPYIN,
-                               RMAPI_DEPRECATED_BUFFER_ALLOCATE,
-                               *pAddress, sizeof(NV_FLA_MEMORY_ALLOCATION_PARAMS),
-                               (void**)&pMemoryFla);
-    if (status != NV_OK)
-        goto done;
-
-    allocParams.limit = *pLimit;
-    allocParams.flagsOs02 = flags;
-
-#define COPY_FLA_FIELD(field) allocParams.field = pMemoryFla->field
-    COPY_FLA_FIELD(type);
-    COPY_FLA_FIELD(flags);
-    COPY_FLA_FIELD(attr);
-    COPY_FLA_FIELD(attr2);
-    COPY_FLA_FIELD(base);
-    COPY_FLA_FIELD(align);
-    COPY_FLA_FIELD(hExportSubdevice);
-    COPY_FLA_FIELD(hExportHandle);
-    COPY_FLA_FIELD(hExportClient);
-
-    status = pContext->RmAlloc(pContext, hClient, hParent, &hMemory, hClass, &allocParams, sizeof(allocParams));
-
-done:
-    if (pMemoryFla)
-    {
-        pContext->CopyUser(pContext,
-                           RMAPI_DEPRECATED_COPYRELEASE,
-                           RMAPI_DEPRECATED_BUFFER_ALLOCATE,
-                           *pAddress, sizeof(NV_FLA_MEMORY_ALLOCATION_PARAMS),
-                           (void**)&pMemoryFla);
     }
 
     return status;

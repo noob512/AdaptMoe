@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2016-2024 NVIDIA Corporation
+    Copyright (c) 2016-2025 NVIDIA Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -111,11 +111,15 @@ struct uvm_user_channel_struct
     // channel removal
     uvm_tracker_t clear_faulted_tracker;
 
-    // Address of the NV_CHRAM_CHANNEL register and the runlist PRI base
-    // register. Only valid on GPUs with
+    // Address of the NV_CHRAM_CHANNEL register. Only valid on GPUs with
     // non_replayable_faults_supported && !has_clear_faulted_channel_method.
     volatile NvU32 *chram_channel_register;
-    volatile NvU32 *runlist_pri_base_register;
+
+    // Address of the channel's doorbell.
+    volatile NvU32 *work_submission_offset;
+
+    // The value that is used when ringing the channel's doorbell.
+    NvU32 work_submission_token;
 
     // Id of the SMC engine this channel is bound to, or zero if the GPU
     // does not support SMC or it is a CE channel
@@ -205,6 +209,28 @@ struct uvm_user_channel_struct
 
         char fault_packet[UVM_GPU_MMU_MAX_FAULT_PACKET_SIZE];
     } kill_channel;
+
+    struct
+    {
+        struct
+        {
+            // ptr points to a 8-byte buffer within page. This page is readable
+            // and writable by user space.
+            NvU64 *ptr;
+
+            // page containing user's mapping. This field also acts as a flag
+            // indicating whether this channel has been registered for death
+            // checking.
+            struct page *page;
+
+            // Length of time to wait between detach and destroy to see if any
+            // dead channels are reported.
+            NvU32 delay_us;
+
+            // node in parent GPU's dead_channels list
+            struct list_head node;
+        } dead;
+    } test;
 };
 
 // Retains the user channel memory object. uvm_user_channel_destroy_detached and
@@ -253,5 +279,8 @@ void uvm_user_channel_detach(uvm_user_channel_t *user_channel, struct list_head 
 //
 // LOCKING: No lock is required, but the owning GPU must be retained.
 void uvm_user_channel_destroy_detached(uvm_user_channel_t *user_channel);
+
+NV_STATUS uvm_test_check_channel_va_space(UVM_TEST_CHECK_CHANNEL_VA_SPACE_PARAMS *params, struct file *filp);
+NV_STATUS uvm_test_dead_channel(UVM_TEST_DEAD_CHANNEL_PARAMS *params, struct file *filp);
 
 #endif // __UVM_USER_CHANNEL_H__

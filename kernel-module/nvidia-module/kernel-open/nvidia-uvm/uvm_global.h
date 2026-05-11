@@ -111,9 +111,9 @@ struct uvm_global_struct
 
     struct
     {
-        // Indicates whether the system HW supports ATS. This field is set once
-        // during global initialization (uvm_global_init), and can be read
-        // afterwards without acquiring any locks.
+        // Indicates whether any GPU in the system supports PASID ATS. This
+        // field is set once during global initialization (uvm_global_init), and
+        // can be read afterwards without acquiring any locks.
         bool supported;
 
         // On top of HW platform support, ATS support can be overridden using
@@ -156,7 +156,17 @@ struct uvm_global_struct
         uvm_mutex_t lock;
         struct list_head list;
     } devmem_ranges;
+
+    // List of all pci devices and the device information if the PCI P2PDMA registration
+    // is already done for the device. This is an optimization to prevent having to
+    // unregister and re-register on every add_gpu()/remove_gpu(). Depending on the
+    // size of BAR1 region, the cost of registration can be really high.
+    struct {
+        struct list_head list;
+    } pci_p2pdma_devices;
+
 };
+
 
 // Initialize global uvm state
 NV_STATUS uvm_global_init(void);
@@ -408,14 +418,14 @@ static uvm_gpu_t *uvm_gpu_find_next_valid_gpu_in_parent(uvm_parent_gpu_t *parent
     uvm_gpu_t *gpu = NULL;
     uvm_gpu_id_t gpu_id;
     NvU32 sub_processor_index;
-    NvU32 cur_sub_processor_index;
+    NvU32 start_search_index;
 
     UVM_ASSERT(parent_gpu);
 
     gpu_id = uvm_gpu_id_from_parent_gpu_id(parent_gpu->id);
-    cur_sub_processor_index = cur_gpu ? uvm_id_sub_processor_index(cur_gpu->id) : -1;
+    start_search_index = cur_gpu ? uvm_id_sub_processor_index(cur_gpu->id) + 1 : 0;
 
-    sub_processor_index = find_next_bit(parent_gpu->valid_gpus, UVM_PARENT_ID_MAX_SUB_PROCESSORS, cur_sub_processor_index + 1);
+    sub_processor_index = find_next_bit(parent_gpu->valid_gpus, UVM_PARENT_ID_MAX_SUB_PROCESSORS, start_search_index);
     if (sub_processor_index < UVM_PARENT_ID_MAX_SUB_PROCESSORS) {
         gpu = uvm_gpu_get(uvm_id_from_value(uvm_id_value(gpu_id) + sub_processor_index));
         UVM_ASSERT(gpu != NULL);

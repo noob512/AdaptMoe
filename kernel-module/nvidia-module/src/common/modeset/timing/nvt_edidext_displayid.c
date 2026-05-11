@@ -1,31 +1,29 @@
-//*****************************************************************************
-//
-//  SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-//  SPDX-License-Identifier: MIT
-//
-//  Permission is hereby granted, free of charge, to any person obtaining a
-//  copy of this software and associated documentation files (the "Software"),
-//  to deal in the Software without restriction, including without limitation
-//  the rights to use, copy, modify, merge, publish, distribute, sublicense,
-//  and/or sell copies of the Software, and to permit persons to whom the
-//  Software is furnished to do so, subject to the following conditions:
-//
-//  The above copyright notice and this permission notice shall be included in
-//  all copies or substantial portions of the Software.
-//
-//  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-//  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-//  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-//  THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-//  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-//  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-//  DEALINGS IN THE SOFTWARE.
-//
-//  File:       nvt_edidext_displayid.c
-//
-//  Purpose:    the provide edid related services
-//
-//*****************************************************************************
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2009-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: MIT
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+/** @file  nvt_edidext_displayid.c
+ *  @brief the provide EDID related services
+ */
 
 #include "nvBinSegment.h"
 #include "nvmisc.h"
@@ -505,6 +503,7 @@ static NVT_STATUS parseDisplayIdTiming1Descriptor(DISPLAYID_TIMING_1_DESCRIPTOR 
 
     // the pixel clock
     pT->pclk = (NvU32)((type1->pixel_clock_high << 16) + (type1->pixel_clock_mid << 8) + type1->pixel_clock_low_minus_0_01MHz + 1);
+    pT->pclk1khz = (pT->pclk << 3) + (pT->pclk << 1);
 
     // the DisplayID spec does not support border
     pT->HBorder = pT->VBorder = 0;
@@ -560,8 +559,8 @@ static NVT_STATUS parseDisplayIdTiming1Descriptor(DISPLAYID_TIMING_1_DESCRIPTOR 
     }
 
     // the refresh rate
-    pT->etc.rr = NvTiming_CalcRR(pT->pclk, pT->interlaced, pT->HTotal, pT->VTotal);
-    pT->etc.rrx1k = NvTiming_CalcRRx1k(pT->pclk, pT->interlaced, pT->HTotal, pT->VTotal);
+    pT->etc.rr = NvTiming_CalcRR(pT->pclk1khz, pT->interlaced, pT->HTotal, pT->VTotal);
+    pT->etc.rrx1k = NvTiming_CalcRRx1k(pT->pclk1khz, pT->interlaced, pT->HTotal, pT->VTotal);
     pT->etc.name[39] = '\0';
     pT->etc.rep = 0x1; // bit mask for no pixel repetition
 
@@ -632,6 +631,7 @@ static NVT_STATUS parseDisplayIdTiming2Descriptor(DISPLAYID_TIMING_2_DESCRIPTOR 
 
     // the pixel clock
     pT->pclk = (NvU32)((type2->pixel_clock_high << 16) + (type2->pixel_clock_mid << 8) + type2->pixel_clock_low_minus_0_01MHz + 1);
+    pT->pclk1khz = (pT->pclk << 3) + (pT->pclk << 1);
 
     // the DisplayID spec does not support border
     pT->HBorder = pT->VBorder = 0;
@@ -654,8 +654,8 @@ static NVT_STATUS parseDisplayIdTiming2Descriptor(DISPLAYID_TIMING_2_DESCRIPTOR 
     pT->interlaced = type2->options.interface_frame_scanning_type;
 
     // the refresh rate
-    pT->etc.rr = NvTiming_CalcRR(pT->pclk, pT->interlaced, pT->HTotal, pT->VTotal);
-    pT->etc.rrx1k = NvTiming_CalcRRx1k(pT->pclk, pT->interlaced, pT->HTotal, pT->VTotal);
+    pT->etc.rr = NvTiming_CalcRR(pT->pclk1khz, pT->interlaced, pT->HTotal, pT->VTotal);
+    pT->etc.rrx1k = NvTiming_CalcRRx1k(pT->pclk1khz, pT->interlaced, pT->HTotal, pT->VTotal);
 
     pT->etc.aspect = 0;
     pT->etc.name[39] = '\0';

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2012-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2012-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -62,7 +62,8 @@ static void      _gpuGc6ExitSwStateRestore(OBJGPU *);
  *    NV_ERR_GENERIC            Generic error (bad state or stuck)
  */
 NV_STATUS
-gpuGc6Exit_IMPL(
+gpuGc6Exit_IMPL
+(
     OBJGPU *pGpu,
     NV2080_CTRL_GC6_EXIT_PARAMS *pParams
 )
@@ -105,12 +106,6 @@ gpuGc6Exit_IMPL(
 
     }
 
-    // Check if we need to execute SR_EXIT step
-    if (GPU_IS_GC6_STEP_ID_SET(SR_ENTRY, pGpu->gc6State.executedStepMask))
-    {
-
-    }
-
 gpuGc6Exit_IMPL_exit:
     // Reset the executed step mask
     pGpu->gc6State.executedStepMask = 0;
@@ -134,7 +129,8 @@ gpuGc6Exit_IMPL_exit:
  *    NV_ERR_GENERIC            Generic error (bad state or stuck)
  */
 NV_STATUS
-gpuGc6Entry_IMPL(
+gpuGc6Entry_IMPL
+(
     OBJGPU *pGpu,
     NV2080_CTRL_GC6_ENTRY_PARAMS *pParams
 )
@@ -407,7 +403,11 @@ gpuIsOnTheBus_IMPL(OBJGPU *pGpu)
  *    NV_ERR                  Otherwise
  */
 static NV_STATUS
-_gpuGc6EntrySanityCheck(OBJGPU *pGpu, NV2080_CTRL_GC6_ENTRY_PARAMS *pParams)
+_gpuGc6EntrySanityCheck
+(
+    OBJGPU *pGpu,
+    NV2080_CTRL_GC6_ENTRY_PARAMS *pParams
+)
 {
     NV_STATUS status = NV_OK;
 
@@ -451,7 +451,11 @@ _gpuGc6EntrySanityCheck(OBJGPU *pGpu, NV2080_CTRL_GC6_ENTRY_PARAMS *pParams)
  * @param[in]   pParams    Pointer to RmCtrl parameters
  */
 static void
-_gpuGc6EntrySwStateUpdate(OBJGPU *pGpu, NV2080_CTRL_GC6_ENTRY_PARAMS *pParams)
+_gpuGc6EntrySwStateUpdate
+(
+    OBJGPU *pGpu,
+    NV2080_CTRL_GC6_ENTRY_PARAMS *pParams
+)
 {
 
     // set state if we are doing an MsHybrid GC6 cycle OR Fast GC6 cycle
@@ -524,8 +528,7 @@ _gpuGc6EntryStateUnload(OBJGPU *pGpu)
 static NV_STATUS
 _gpuGc6ExitSanityCheck(OBJGPU *pGpu)
 {
-    NV_STATUS status = NV_OK;
-
+    NV_STATUS status = NV_OK; // TODO: MPV
 
     // Make sure that the current GC6 state is GPU_STATE_ENTERED_GC6
     if (!IS_GPU_GC6_STATE_ENTERED(pGpu))
@@ -549,7 +552,11 @@ _gpuGc6ExitSanityCheck(OBJGPU *pGpu)
  *    NV_ERR                  Otherwise
  */
 static NV_STATUS
-_gpuGc6ExitGpuPowerOn(OBJGPU *pGpu, NV2080_CTRL_GC6_EXIT_PARAMS *pParams)
+_gpuGc6ExitGpuPowerOn
+(
+    OBJGPU *pGpu,
+    NV2080_CTRL_GC6_EXIT_PARAMS *pParams
+)
 {
     NV_STATUS status = NV_OK;
 
@@ -629,7 +636,11 @@ gpuCheckGc6inD3Hot_IMPL(OBJGPU *pGpu)
  *    NV_ERR                  Otherwise
  */
 static NV_STATUS
-_gpuGc6ExitStateLoad(OBJGPU *pGpu, NV2080_CTRL_GC6_EXIT_PARAMS *pParams)
+_gpuGc6ExitStateLoad
+(
+    OBJGPU *pGpu,
+    NV2080_CTRL_GC6_EXIT_PARAMS *pParams
+)
 {
     NV_STATUS status = NV_OK;
 

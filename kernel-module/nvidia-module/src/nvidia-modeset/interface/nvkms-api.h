@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2014-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2014-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -264,7 +264,6 @@ enum NvKmsIoctlCommand {
     NVKMS_IOCTL_RELEASE_SWAP_GROUP,
     NVKMS_IOCTL_SWITCH_MUX,
     NVKMS_IOCTL_GET_MUX_STATE,
-    NVKMS_IOCTL_EXPORT_VRR_SEMAPHORE_SURFACE,
     NVKMS_IOCTL_ENABLE_VBLANK_SYNC_OBJECT,
     NVKMS_IOCTL_DISABLE_VBLANK_SYNC_OBJECT,
     NVKMS_IOCTL_NOTIFY_VBLANK,
@@ -272,7 +271,6 @@ enum NvKmsIoctlCommand {
     NVKMS_IOCTL_ENABLE_VBLANK_SEM_CONTROL,
     NVKMS_IOCTL_DISABLE_VBLANK_SEM_CONTROL,
     NVKMS_IOCTL_ACCEL_VBLANK_SEM_CONTROLS,
-    NVKMS_IOCTL_VRR_SIGNAL_SEMAPHORE,
     NVKMS_IOCTL_FRAMEBUFFER_CONSOLE_DISABLED,
 };
 
@@ -297,9 +295,6 @@ enum NvKmsIoctlCommand {
 #define NVKMS_GUID_SIZE                                               16
 #define NVKMS_3DVISION_DONGLE_PARAM_BYTES                             20
 #define NVKMS_GPU_STRING_SIZE                                         80
-
-#define NVKMS_VRR_SEMAPHORE_SURFACE_COUNT                             256
-#define NVKMS_VRR_SEMAPHORE_SURFACE_SIZE                              (sizeof(NvU32) * NVKMS_VRR_SEMAPHORE_SURFACE_COUNT)
 
 /*
  * The GUID string has the form:
@@ -359,9 +354,8 @@ enum NvKmsModeValidationOverrides {
     NVKMS_MODE_VALIDATION_NO_HDMI2_CHECK                     = (1 << 14),
     NVKMS_MODE_VALIDATION_NO_RRX1K_CHECK                     = (1 << 15),
     NVKMS_MODE_VALIDATION_REQUIRE_BOOT_CLOCKS                = (1 << 16),
-    NVKMS_MODE_VALIDATION_ALLOW_DP_INTERLACED                = (1 << 17),
-    NVKMS_MODE_VALIDATION_NO_INTERLACED_MODES                = (1 << 18),
-    NVKMS_MODE_VALIDATION_MAX_ONE_HARDWARE_HEAD              = (1 << 19),
+    NVKMS_MODE_VALIDATION_MAX_ONE_HARDWARE_HEAD              = (1 << 17),
+    NVKMS_MODE_VALIDATION_PREFER_HDMI_FRL_MODE               = (1 << 18),
 };
 
 /*!
@@ -478,6 +472,19 @@ struct NvKmsModeValidationParams {
      * When dscOverrideBitsPerPixelX16 is 0, NVKMS compute the rate itself.
      */
     NvU32 dscOverrideBitsPerPixelX16;
+
+    /*!
+     * Maximum pixel depth (in bits) for each layer's usage bounds.
+     * When non-zero, NVKMS filters out surface memory formats with
+     * bpp > this value before performing the gpu extended capability check.
+     *
+     * This allows clients to constrain usage bounds based on the maximum
+     * pixel depth they will actually use, preventing bandwidth allocation
+     * for deeper formats that will never be validated or displayed.
+     *
+     * Value 0 means no constraint (backward compatible).
+     */
+    NvU8 maxUsageBoundPixelDepth[NVKMS_MAX_LAYERS_PER_HEAD];
 };
 
 /*!
@@ -1019,15 +1026,10 @@ struct NvKmsFlipCommonReplyOneHead {
 /*!
  * NVKMS_IOCTL_ALLOC_DEVICE: Allocate an NVKMS device object.
  *
- * This has the scope of a resman SLI device.
+ * This has the scope of a resman device.
  *
  * Multiple clients can allocate devices (DRM-KMS, multiple X
- * servers).  Clients should configure SLI before initializing NVKMS.
- * NVKMS will query resman for the current SLI topology.
- *
- * The SLI configuration (both the linked SLI device, and the sliMosaic
- * boolean below) will be latched when the specified GPU transitions
- * from zero NVKMS devices allocated to one NVKMS device allocated.
+ * servers).
  *
  * The returned information will remain static until the NVKMS device
  * object is freed.
@@ -1061,22 +1063,6 @@ struct NvKmsAllocDeviceRequest {
      * or a graphics capable MIG partition (= an SMG device).
      */
     struct NvKmsDeviceId deviceId;
-
-    /*!
-     * Whether SLI Mosaic is requested: i.e., multiple disps, one
-     * per physical GPU, for the SLI device.
-     */
-    NvBool sliMosaic;
-
-    /*!
-     * When tryInferSliMosaicFromExistingDevice=TRUE, then the above
-     * 'sliMosaic' field is ignored and the ALLOC_DEVICE request will
-     * inherit the current sliMosaic state of the existing device
-     * identified by deviceId.  If there is not an existing device for
-     * deviceId, then the ALLOC_DEVICE request will proceed normally, honoring
-     * the requested sliMosaic state.
-     */
-    NvBool tryInferSliMosaicFromExistingDevice;
 
     /*!
      * NVKMS will use the 3D engine for headSurface.  If clients want to avoid
@@ -1155,8 +1141,6 @@ struct NvKmsAllocDeviceReply {
      * IMPLEMENTATION NOTE: this is the portion of DispHalRec::caps
      * that can vary between EVO classes.
      */
-    NvBool requiresVrrSemaphores;
-    NvBool inputLutAppliesToBase;
 
     /*!
      * Whether the client can allocate and manipulate SwapGroup objects via
@@ -1168,13 +1152,6 @@ struct NvKmsAllocDeviceReply {
      * Whether NVKMS supports Warp and Blend on this device.
      */
     NvBool supportsWarpAndBlend;
-
-    /*!
-     * When nIsoSurfacesInVidmemOnly=TRUE, then only video memory
-     * surfaces can be used for the surface in
-     * NvKmsCompletionNotifierDescription or NvKmsSemaphore.
-     */
-    NvBool nIsoSurfacesInVidmemOnly;
 
     /*
      * When requiresAllAllocationsInSysmem=TRUE, then all memory allocations
@@ -1266,30 +1243,6 @@ struct NvKmsAllocDeviceReply {
      * generator sync objects that signal at vblank.
      */
     NvBool supportsVblankSyncObjects;
-
-    /*!
-     * 'supportsVblankSemControl' indicates whether the VBlank Semaphore Control
-     * interface:
-     *
-     *   NVKMS_IOCTL_ENABLE_VBLANK_SEM_CONTROL,
-     *   NVKMS_IOCTL_DISABLE_VBLANK_SEM_CONTROL,
-     *   NVKMS_IOCTL_ACCEL_VBLANK_SEM_CONTROLS,
-     *
-     * is supported.
-     */
-    NvBool supportsVblankSemControl;
-
-    /*!
-     * 'supportsInputColorSpace' indicates whether the HW supports setting the
-     * input color space.
-     */
-    NvBool supportsInputColorSpace;
-
-    /*!
-     * 'supportsInputColorRange' indicates whether the HW supports setting the
-     * input color range.
-     */
-    NvBool supportsInputColorRange;
 
     /*! framebuffer console base address and size. */
     NvU64 vtFbBaseAddress;
@@ -1554,6 +1507,9 @@ struct NvKmsQueryDpyDynamicDataReply {
         NvU8 widthInCM; /* horizontal screen size */
     } physicalDimensions;
 
+    NvU32 maxWidthInPixels;
+    NvU32 maxHeightInPixels;
+
     /*!
      * Which VRR type has been selected for this display, either true
      * G-SYNC, Adaptive-Sync defaultlisted, or Adaptive-Sync non-defaultlisted.
@@ -1614,6 +1570,22 @@ struct NvKmsQueryDpyDynamicDataParams {
     struct NvKmsQueryDpyDynamicDataReply reply;     /*! out */
 };
 
+/*! Values for the NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE attribute. */
+enum NvKmsDpyAttributeRequestedColorSpaceValue {
+    NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE_RGB = 0,
+    NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE_YCbCr422 = 1,
+    NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE_YCbCr444 = 2,
+};
+
+struct NvKmsDpyOutputColorParams {
+    /*! Output color format. Valid only when formatSpecified is true. */
+    enum NvKmsDpyAttributeRequestedColorSpaceValue format;
+    NvBool formatSpecified;
+
+    /*! Output color bpc. Valid only when bpcSpecified is true. */
+    enum NvKmsDpyAttributeColorBpcValue bpc;
+    NvBool bpcSpecified;
+};
 
 /*!
  * NVKMS_IOCTL_VALIDATE_MODE_INDEX: Validate a particular mode from a
@@ -1681,6 +1653,7 @@ struct NvKmsValidateModeIndexRequest {
     NvKmsDispHandle dispHandle;
     NVDpyId dpyId;
     struct NvKmsModeValidationParams modeValidation;
+    struct NvKmsDpyOutputColorParams dpyOutputColor;
     NvU32 modeIndex;
 
     /*
@@ -1756,6 +1729,7 @@ struct NvKmsValidateModeRequest {
     NvKmsDispHandle dispHandle;
     NVDpyId dpyId;
     struct NvKmsModeValidationParams modeValidation;
+    struct NvKmsDpyOutputColorParams dpyOutputColor;
     struct NvKmsMode mode;
 
     /*
@@ -1894,13 +1868,6 @@ enum NvKmsAllowAdaptiveSync {
     NVKMS_ALLOW_ADAPTIVE_SYNC_DISABLED = 0,
     NVKMS_ALLOW_ADAPTIVE_SYNC_DEFAULTLISTED_ONLY,
     NVKMS_ALLOW_ADAPTIVE_SYNC_ALL,
-};
-
-/*! Values for the NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE attribute. */
-enum NvKmsDpyAttributeRequestedColorSpaceValue {
-    NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE_RGB = 0,
-    NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE_YCbCr422 = 1,
-    NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE_YCbCr444 = 2,
 };
 
 /*!
@@ -2335,16 +2302,6 @@ enum NvKmsVrrFlipType {
 
 struct NvKmsFlipReply {
     /*!
-     * If vrrFlipType != NV_KMS_VRR_FLIP_NON_VRR, then VRR was used for the
-     * requested flip. In this case, vrrSemaphoreIndex indicates the index
-     * into the VRR semaphore surface that the client should release to
-     * trigger the flip.
-     *
-     * A value of -1 indicates that no VRR semaphore release is needed.
-     */
-    NvS32 vrrSemaphoreIndex;
-
-    /*!
      * Indicates whether the flip was non-VRR, was a VRR flip on one or more
      * G-SYNC displays, or was a VRR flip exclusively on Adaptive-Sync
      * displays.
@@ -2708,9 +2665,6 @@ enum NvKmsDpyAttribute {
     NV_KMS_DPY_ATTRIBUTE_CURRENT_DITHERING_MODE,
     NV_KMS_DPY_ATTRIBUTE_CURRENT_DITHERING_DEPTH,
     NV_KMS_DPY_ATTRIBUTE_DIGITAL_VIBRANCE,
-    NV_KMS_DPY_ATTRIBUTE_IMAGE_SHARPENING,
-    NV_KMS_DPY_ATTRIBUTE_IMAGE_SHARPENING_AVAILABLE,
-    NV_KMS_DPY_ATTRIBUTE_IMAGE_SHARPENING_DEFAULT,
     NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_SPACE,
     NV_KMS_DPY_ATTRIBUTE_CURRENT_COLOR_SPACE,
     NV_KMS_DPY_ATTRIBUTE_REQUESTED_COLOR_RANGE,
@@ -2720,6 +2674,7 @@ enum NvKmsDpyAttribute {
     NV_KMS_DPY_ATTRIBUTE_DIGITAL_LINK_TYPE,
     NV_KMS_DPY_ATTRIBUTE_DISPLAYPORT_LINK_RATE,
     NV_KMS_DPY_ATTRIBUTE_DISPLAYPORT_LINK_RATE_10MHZ,
+    NV_KMS_DPY_ATTRIBUTE_DISPLAYPORT_FORCE_ENABLE_FEC,
     NV_KMS_DPY_ATTRIBUTE_FRAMELOCK_DISPLAY_CONFIG,
     /*
      * XXX NVKMS TODO: Delete UPDATE_GLS_FRAMELOCK; this event-only
@@ -2772,6 +2727,7 @@ enum NvKmsDpyAttributeRequestedDitheringDepthValue {
     NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_DEPTH_AUTO = 0,
     NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_DEPTH_6_BITS = 1,
     NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_DEPTH_8_BITS = 2,
+    NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING_DEPTH_10_BITS = 3,
 };
 
 /*! Values for the NV_KMS_DPY_ATTRIBUTE_CURRENT_DITHERING_DEPTH attribute. */
@@ -2779,6 +2735,7 @@ enum NvKmsDpyAttributeCurrentDitheringDepthValue {
     NV_KMS_DPY_ATTRIBUTE_CURRENT_DITHERING_DEPTH_NONE = 0,
     NV_KMS_DPY_ATTRIBUTE_CURRENT_DITHERING_DEPTH_6_BITS = 1,
     NV_KMS_DPY_ATTRIBUTE_CURRENT_DITHERING_DEPTH_8_BITS = 2,
+    NV_KMS_DPY_ATTRIBUTE_CURRENT_DITHERING_DEPTH_10_BITS = 3,
 };
 
 /*! Values for the NV_KMS_DPY_ATTRIBUTE_CURRENT_COLOR_SPACE attribute. */
@@ -2815,8 +2772,6 @@ enum NvKmsDpyAttributeFrameLockDisplayConfigValue {
 /*! Values for the NV_KMS_DPY_ATTRIBUTE_DPMS attribute. */
 enum NvKmsDpyAttributeDpmsValue {
     NV_KMS_DPY_ATTRIBUTE_DPMS_ON,
-    NV_KMS_DPY_ATTRIBUTE_DPMS_STANDBY,
-    NV_KMS_DPY_ATTRIBUTE_DPMS_SUSPEND,
     NV_KMS_DPY_ATTRIBUTE_DPMS_OFF,
 };
 
@@ -3469,37 +3424,33 @@ enum NvKmsPermissionsType {
 
 struct NvKmsFlipPermissions {
     struct {
-        struct {
-            /*
-             * Bitmask of flippable layers, where each layer is
-             * indicated by '1 << layer'.  It is an error for bits
-             * above NVKMS_MAX_LAYERS_PER_HEAD to be set.
-             *
-             * Only applicable when type==FLIPPING.
-             */
-            NvU8 layerMask;
-        } head[NVKMS_MAX_HEADS_PER_DISP];
-    } disp[NVKMS_MAX_SUBDEVICES];
+        /*
+         * Bitmask of flippable layers, where each layer is
+         * indicated by '1 << layer'.  It is an error for bits
+         * above NVKMS_MAX_LAYERS_PER_HEAD to be set.
+         *
+         * Only applicable when type==FLIPPING.
+         */
+        NvU8 layerMask;
+    } head[NVKMS_MAX_HEADS_PER_DISP];
 };
 
 struct NvKmsModesetPermissions {
     struct {
-        struct {
-            /*
-             * A list of dpys which a particular NVKMS client is
-             * allowed to use when performing a modeset on this head.
-             *
-             * If the NVKMS client is not allowed to set a mode on
-             * this head, this list will be empty.
-             *
-             * If an NVKMS client can drive the head without
-             * restrictions, this will be nvAllDpyIdList().
-             *
-             * Only applicable when type==MODESET.
-             */
-            NVDpyIdList dpyIdList;
-        } head[NVKMS_MAX_HEADS_PER_DISP];
-    } disp[NVKMS_MAX_SUBDEVICES];
+        /*
+         * A list of dpys which a particular NVKMS client is
+         * allowed to use when performing a modeset on this head.
+         *
+         * If the NVKMS client is not allowed to set a mode on
+         * this head, this list will be empty.
+         *
+         * If an NVKMS client can drive the head without
+         * restrictions, this will be nvAllDpyIdList().
+         *
+         * Only applicable when type==MODESET.
+         */
+        NVDpyIdList dpyIdList;
+    } head[NVKMS_MAX_HEADS_PER_DISP];
 };
 
 struct NvKmsPermissions {
@@ -3781,7 +3732,7 @@ struct NvKmsUnregisterDeferredRequestFifoParams {
  *
  * An NVKMS client creates a SwapGroup by calling NVKMS_IOCTL_ALLOC_SWAP_GROUP
  * and specifying the heads in the SwapGroup with
- * NvKmsAllocSwapGroupRequest::disp[]::headMask.
+ * NvKmsAllocSwapGroupRequest::headMask.
  *
  * The SwapGroup can be shared with clients through
  * NVKMS_IOCTL_GRANT_SWAP_GROUP, and it is destroyed once all clients that have
@@ -3811,9 +3762,7 @@ struct NvKmsUnregisterDeferredRequestFifoParams {
  */
 
 struct NvKmsSwapGroupConfig {
-    struct {
-        NvU32 headMask;
-    } disp[NVKMS_MAX_SUBDEVICES];
+    NvU32 headMask;
 };
 
 struct NvKmsAllocSwapGroupRequest {
@@ -4102,28 +4051,6 @@ struct NvKmsGetMuxStateParams {
 };
 
 /*!
- * NVKMS_IOCTL_EXPORT_VRR_SEMAPHORE_SURFACE:
- *
- * Export the VRR semaphore surface onto the provided RM 'memFd'.
- * The RM memory FD should be "empty".  An empty FD can be allocated by calling
- * NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD with 'EMPTY_FD' set.
- */
-
-struct NvKmsExportVrrSemaphoreSurfaceRequest {
-    NvKmsDeviceHandle deviceHandle;
-    int memFd;
-};
-
-struct NvKmsExportVrrSemaphoreSurfaceReply {
-    NvU32 padding;
-};
-
-struct NvKmsExportVrrSemaphoreSurfaceParams {
-    struct NvKmsExportVrrSemaphoreSurfaceRequest request;
-    struct NvKmsExportVrrSemaphoreSurfaceReply reply;
-};
-
-/*!
  * NVKMS_IOCTL_ENABLE_VBLANK_SYNC_OBJECT:
  * NVKMS_IOCTL_DISABLE_VBLANK_SYNC_OBJECT:
  *
@@ -4231,11 +4158,7 @@ struct NvKmsNotifyVblankParams {
 
 struct NvKmsSetFlipLockGroupOneDev {
     NvKmsDeviceHandle deviceHandle;
-
-    NvU32 requestedDispsBitMask;
-    struct {
-        NvU32 requestedHeadsBitMask;
-    } disp[NVKMS_MAX_SUBDEVICES];
+    NvU32 requestedHeadsBitMask;
 };
 
 struct NvKmsSetFlipLockGroupRequest {
@@ -4337,9 +4260,6 @@ struct NvKmsSetFlipLockGroupParams {
  * set of heads, to set all vblank sem controls on those heads to have their
  * semaphore set to the value in their respective
  * NvKmsVblankSemControlDataOneHead::requestCounterAccel fields.
- *
- * These ioctls are only available when
- * NvKmsAllocDeviceReply::supportsVblankSemControl is true.
  */
 
 struct NvKmsEnableVblankSemControlRequest {
@@ -4386,27 +4306,6 @@ struct NvKmsAccelVblankSemControlsReply {
 struct NvKmsAccelVblankSemControlsParams {
     struct NvKmsAccelVblankSemControlsRequest request;
     struct NvKmsAccelVblankSemControlsReply reply;
-};
-
-/*!
- * NVKMS_IOCTL_VRR_SIGNAL_SEMAPHORE
- *
- * This IOCTL is used to signal a semaphore from VRR semaphore surface.
- * It should be invoked after flip if needed. If device does not supports
- * VRR semaphores, then this is a no-op action for compatibility.
- */
-struct NvKmsVrrSignalSemaphoreRequest {
-    NvKmsDeviceHandle deviceHandle;
-    NvS32 vrrSemaphoreIndex;
-};
-
-struct NvKmsVrrSignalSemaphoreReply {
-    NvU32 padding;
-};
-
-struct NvKmsVrrSignalSemaphoreParams {
-    struct NvKmsVrrSignalSemaphoreRequest request; /*! in */
-    struct NvKmsVrrSignalSemaphoreReply reply;     /*! out */
 };
 
 /*

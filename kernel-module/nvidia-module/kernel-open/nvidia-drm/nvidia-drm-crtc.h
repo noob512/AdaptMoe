@@ -25,7 +25,7 @@
 
 #include "nvidia-drm-conftest.h"
 
-#if defined(NV_DRM_ATOMIC_MODESET_AVAILABLE)
+#if defined(NV_DRM_AVAILABLE)
 
 #include "nvidia-drm-helper.h"
 
@@ -37,13 +37,7 @@
 
 #include "nvtypes.h"
 #include "nvkms-kapi.h"
-
-enum nv_drm_transfer_function {
-    NV_DRM_TRANSFER_FUNCTION_DEFAULT,
-    NV_DRM_TRANSFER_FUNCTION_LINEAR,
-    NV_DRM_TRANSFER_FUNCTION_PQ,
-    NV_DRM_TRANSFER_FUNCTION_MAX,
-};
+#include "nv_drm_common_ioctl.h"
 
 struct nv_drm_crtc {
     NvU32 head;
@@ -190,13 +184,6 @@ struct nv_drm_plane {
      * Index of this plane in the per head array of layers.
      */
     uint32_t layer_idx;
-
-    /**
-     * @supportsColorProperties
-     *
-     * If true, supports the COLOR_ENCODING and COLOR_RANGE properties.
-     */
-    bool supportsColorProperties;
 
     struct NvKmsLUTCaps ilut_caps;
     struct NvKmsLUTCaps tmo_caps;
@@ -349,6 +336,6 @@ int nv_drm_get_crtc_crc32_ioctl(struct drm_device *dev,
 int nv_drm_get_crtc_crc32_v2_ioctl(struct drm_device *dev,
                                    void *data, struct drm_file *filep);
 
-#endif /* NV_DRM_ATOMIC_MODESET_AVAILABLE */
+#endif /* NV_DRM_AVAILABLE */
 
 #endif /* __NVIDIA_DRM_CRTC_H__ */

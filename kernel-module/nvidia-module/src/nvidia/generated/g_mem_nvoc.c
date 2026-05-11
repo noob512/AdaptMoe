@@ -16,7 +16,7 @@
 
 
 #ifdef DEBUG
-char __nvoc_class_id_uniqueness_check__0x4789f2 = 1;
+char __nvoc_class_id_uniqueness_check__4789f2 = 1;
 #endif
 
 extern const struct NVOC_CLASS_DEF __nvoc_class_def_Memory;
@@ -29,7 +29,7 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_RmResource;
 void __nvoc_init__RmResource(RmResource*);
 void __nvoc_init__Memory(Memory*);
 void __nvoc_init_funcTable_Memory(Memory*);
-NV_STATUS __nvoc_ctor_Memory(Memory*, CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
+NV_STATUS __nvoc_ctor_Memory(Memory*, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
 void __nvoc_init_dataField_Memory(Memory*);
 void __nvoc_dtor_Memory(Memory*);
 
@@ -80,34 +80,35 @@ NV_STATUS __nvoc_up_thunk_RsResource_memUnmapFrom(struct Memory *pResource, RS_R
 NvU32 __nvoc_up_thunk_RsResource_memGetRefCount(struct Memory *pResource);    // this
 void __nvoc_up_thunk_RsResource_memAddAdditionalDependants(struct RsClient *pClient, struct Memory *pResource, RsResourceRef *pReference);    // this
 
+// Class-specific details for Memory
 const struct NVOC_CLASS_DEF __nvoc_class_def_Memory = 
 {
-    /*classInfo=*/ {
-        /*size=*/               sizeof(Memory),
-        /*classId=*/            classId(Memory),
-        /*providerId=*/         &__nvoc_rtti_provider,
+    .classInfo.size =               sizeof(Memory),
+    .classInfo.classId =            classId(Memory),
+    .classInfo.providerId =         &__nvoc_rtti_provider,
 #if NV_PRINTF_STRINGS_ALLOWED
-        /*name=*/               "Memory",
+    .classInfo.name =               "Memory",
 #endif
-    },
-    /*objCreatefn=*/        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_Memory,
-    /*pCastInfo=*/          &__nvoc_castinfo__Memory,
-    /*pExportInfo=*/        &__nvoc_export_info__Memory
+    .objCreatefn =        (NVOC_DYNAMIC_OBJ_CREATE) &__nvoc_objCreateDynamic_Memory,
+    .pCastInfo =          &__nvoc_castinfo__Memory,
+    .pExportInfo =        &__nvoc_export_info__Memory
 };
 
+// By default, all exported methods are enabled.
 #if !defined(NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG)
 #define NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(x)      (0)
 #endif
 
+// Exported method array
 static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_Memory[] = 
 {
     {               /*  [0] */
-#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x0u)
+#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x4u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) memCtrlCmdGetSurfacePhysAttrLvm_IMPL,
-#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x0u)
-        /*flags=*/      0x0u,
+        /*pFunc=*/      (void (*)(void)) &memCtrlCmdGetSurfacePhysAttrLvm_IMPL,
+#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x4u)
+        /*flags=*/      0x4u,
         /*accessRight=*/0x0u,
         /*methodId=*/   0x410103u,
         /*paramSize=*/  sizeof(NV0041_CTRL_GET_SURFACE_PHYS_ATTR_PARAMS),
@@ -120,7 +121,7 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_Memory[]
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) memCtrlCmdGetSurfaceInfoLvm_IMPL,
+        /*pFunc=*/      (void (*)(void)) &memCtrlCmdGetSurfaceInfoLvm_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*flags=*/      0x8u,
         /*accessRight=*/0x0u,
@@ -132,12 +133,12 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_Memory[]
 #endif
     },
     {               /*  [2] */
-#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x208u)
+#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x10208u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) memCtrlCmdGetSurfaceCompressionCoverageLvm_IMPL,
-#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x208u)
-        /*flags=*/      0x208u,
+        /*pFunc=*/      (void (*)(void)) &memCtrlCmdGetSurfaceCompressionCoverageLvm_IMPL,
+#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x10208u)
+        /*flags=*/      0x10208u,
         /*accessRight=*/0x0u,
         /*methodId=*/   0x410112u,
         /*paramSize=*/  sizeof(NV0041_CTRL_GET_SURFACE_COMPRESSION_COVERAGE_PARAMS),
@@ -150,7 +151,7 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_Memory[]
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) memCtrlCmdSurfaceFlushGpuCache_IMPL,
+        /*pFunc=*/      (void (*)(void)) &memCtrlCmdSurfaceFlushGpuCache_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*flags=*/      0x8u,
         /*accessRight=*/0x0u,
@@ -165,7 +166,7 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_Memory[]
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) memCtrlCmdGetMemPageSize_IMPL,
+        /*pFunc=*/      (void (*)(void)) &memCtrlCmdGetMemPageSize_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*flags=*/      0x8u,
         /*accessRight=*/0x0u,
@@ -180,7 +181,7 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_Memory[]
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) memCtrlCmdSetTag_IMPL,
+        /*pFunc=*/      (void (*)(void)) &memCtrlCmdSetTag_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*flags=*/      0x8u,
         /*accessRight=*/0x0u,
@@ -195,7 +196,7 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_Memory[]
 #if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*pFunc=*/      (void (*)(void)) NULL,
 #else
-        /*pFunc=*/      (void (*)(void)) memCtrlCmdGetTag_IMPL,
+        /*pFunc=*/      (void (*)(void)) &memCtrlCmdGetTag_IMPL,
 #endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
         /*flags=*/      0x8u,
         /*accessRight=*/0x0u,
@@ -206,7 +207,36 @@ static const struct NVOC_EXPORTED_METHOD_DEF __nvoc_exported_method_def_Memory[]
         /*func=*/       "memCtrlCmdGetTag"
 #endif
     },
-
+    {               /*  [7] */
+#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x0u)
+        /*pFunc=*/      (void (*)(void)) NULL,
+#else
+        /*pFunc=*/      (void (*)(void)) &memCtrlCmdMapMemoryForGpuAccess_IMPL,
+#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x0u)
+        /*flags=*/      0x0u,
+        /*accessRight=*/0x0u,
+        /*methodId=*/   0x410122u,
+        /*paramSize=*/  sizeof(NV0041_CTRL_MAP_MEMORY_FOR_GPU_ACCESS_PARAMS),
+        /*pClassInfo=*/ &(__nvoc_class_def_Memory.classInfo),
+#if NV_PRINTF_STRINGS_ALLOWED
+        /*func=*/       "memCtrlCmdMapMemoryForGpuAccess"
+#endif
+    },
+    {               /*  [8] */
+#if NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x0u)
+        /*pFunc=*/      (void (*)(void)) NULL,
+#else
+        /*pFunc=*/      (void (*)(void)) &memCtrlCmdUnmapMemoryForGpuAccess_IMPL,
+#endif // NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x0u)
+        /*flags=*/      0x0u,
+        /*accessRight=*/0x0u,
+        /*methodId=*/   0x410153u,
+        /*paramSize=*/  sizeof(NV0041_CTRL_UNMAP_MEMORY_FOR_GPU_ACCESS_PARAMS),
+        /*pClassInfo=*/ &(__nvoc_class_def_Memory.classInfo),
+#if NV_PRINTF_STRINGS_ALLOWED
+        /*func=*/       "memCtrlCmdUnmapMemoryForGpuAccess"
+#endif
+    },
 };
 
 
@@ -421,85 +451,62 @@ void __nvoc_up_thunk_RsResource_memAddAdditionalDependants(struct RsClient *pCli
 
 const struct NVOC_EXPORT_INFO __nvoc_export_info__Memory = 
 {
-    /*numEntries=*/     7,
-    /*pExportEntries=*/ __nvoc_exported_method_def_Memory
+    .numEntries=     9,
+    .pExportEntries= __nvoc_exported_method_def_Memory
 };
 
+
+// Destruct Memory object.
+void __nvoc_memDestruct(Memory*);
 void __nvoc_dtor_RmResource(RmResource*);
-void __nvoc_dtor_Memory(Memory *pThis) {
+void __nvoc_dtor_Memory(Memory* pThis) {
+
+// Call destructor.
     __nvoc_memDestruct(pThis);
+
+// Recurse to superclass destructors.
     __nvoc_dtor_RmResource(&pThis->__nvoc_base_RmResource);
+
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
-
 void __nvoc_init_dataField_Memory(Memory *pThis) {
     PORT_UNREFERENCED_VARIABLE(pThis);
 }
 
-NV_STATUS __nvoc_ctor_RmResource(RmResource* , CALL_CONTEXT *, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
-NV_STATUS __nvoc_ctor_Memory(Memory *pThis, CALL_CONTEXT * arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams) {
-    NV_STATUS status = NV_OK;
-    status = __nvoc_ctor_RmResource(&pThis->__nvoc_base_RmResource, arg_pCallContext, arg_pParams);
-    if (status != NV_OK) goto __nvoc_ctor_Memory_fail_RmResource;
-    __nvoc_init_dataField_Memory(pThis);
 
-    status = __nvoc_memConstruct(pThis, arg_pCallContext, arg_pParams);
+// Construct Memory object.
+NV_STATUS __nvoc_ctor_RmResource(RmResource *pResource, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);    // inline
+NV_STATUS __nvoc_ctor_Memory(Memory *pMemory, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams) {    // inline
+    NV_STATUS status = NV_OK;
+
+    // Recurse to ancestor constructor(s).
+    status = __nvoc_ctor_RmResource(&pMemory->__nvoc_base_RmResource, pCallContext, pParams);
+    if (status != NV_OK) goto __nvoc_ctor_Memory_fail_RmResource;
+
+    // Initialize data fields.
+    __nvoc_init_dataField_Memory(pMemory);
+
+    // Call the constructor for this class.
+    status = __nvoc_memConstruct(pMemory, pCallContext, pParams);
     if (status != NV_OK) goto __nvoc_ctor_Memory_fail__init;
     goto __nvoc_ctor_Memory_exit; // Success
 
+    // Unwind on error.
 __nvoc_ctor_Memory_fail__init:
-    __nvoc_dtor_RmResource(&pThis->__nvoc_base_RmResource);
+    __nvoc_dtor_RmResource(&pMemory->__nvoc_base_RmResource);
 __nvoc_ctor_Memory_fail_RmResource:
 __nvoc_ctor_Memory_exit:
-
     return status;
 }
 
 // Vtable initialization
 static void __nvoc_init_funcTable_Memory_1(Memory *pThis) {
     PORT_UNREFERENCED_VARIABLE(pThis);
-
-    // memCtrlCmdGetSurfaceCompressionCoverageLvm -- exported (id=0x410112)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x208u)
-    pThis->__memCtrlCmdGetSurfaceCompressionCoverageLvm__ = &memCtrlCmdGetSurfaceCompressionCoverageLvm_IMPL;
-#endif
-
-    // memCtrlCmdSurfaceFlushGpuCache -- exported (id=0x410116)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__memCtrlCmdSurfaceFlushGpuCache__ = &memCtrlCmdSurfaceFlushGpuCache_IMPL;
-#endif
-
-    // memCtrlCmdGetMemPageSize -- exported (id=0x410118)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__memCtrlCmdGetMemPageSize__ = &memCtrlCmdGetMemPageSize_IMPL;
-#endif
-
-    // memCtrlCmdSetTag -- exported (id=0x410120)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__memCtrlCmdSetTag__ = &memCtrlCmdSetTag_IMPL;
-#endif
-
-    // memCtrlCmdGetTag -- exported (id=0x410121)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__memCtrlCmdGetTag__ = &memCtrlCmdGetTag_IMPL;
-#endif
-
-    // memCtrlCmdGetSurfacePhysAttrLvm -- exported (id=0x410103)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x0u)
-    pThis->__memCtrlCmdGetSurfacePhysAttrLvm__ = &memCtrlCmdGetSurfacePhysAttrLvm_IMPL;
-#endif
-
-    // memCtrlCmdGetSurfaceInfoLvm -- exported (id=0x410110)
-#if !NVOC_EXPORTED_METHOD_DISABLED_BY_FLAG(0x8u)
-    pThis->__memCtrlCmdGetSurfaceInfoLvm__ = &memCtrlCmdGetSurfaceInfoLvm_IMPL;
-#endif
-} // End __nvoc_init_funcTable_Memory_1 with approximately 7 basic block(s).
+} // End __nvoc_init_funcTable_Memory_1
 
 
-// Initialize vtable(s) for 33 virtual method(s).
+// Initialize vtable(s) for 26 virtual method(s).
 void __nvoc_init_funcTable_Memory(Memory *pThis) {
-
-    // Initialize vtable(s) with 7 per-object function pointer(s).
     __nvoc_init_funcTable_Memory_1(pThis);
 }
 
@@ -527,68 +534,82 @@ void __nvoc_init__Memory(Memory *pThis) {
     __nvoc_init_funcTable_Memory(pThis);
 }
 
-NV_STATUS __nvoc_objCreate_Memory(Memory **ppThis, Dynamic *pParent, NvU32 createFlags, CALL_CONTEXT * arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams)
+NV_STATUS __nvoc_objCreate_Memory(Memory **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams)
 {
-    NV_STATUS status;
-    Object *pParentObj = NULL;
-    Memory *pThis;
+    NV_STATUS __nvoc_status;
+    Object *__nvoc_pParentObj = NULL;
+    Memory *__nvoc_pThis;
 
-    // Assign `pThis`, allocating memory unless suppressed by flag.
-    status = __nvoc_handleObjCreateMemAlloc(createFlags, sizeof(Memory), (void**)&pThis, (void**)ppThis);
-    if (status != NV_OK)
-        return status;
+    // Don't allocate memory if the caller has already done so.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+    {
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_ppThis != NULL && *__nvoc_ppThis != NULL, NV_ERR_INVALID_PARAMETER);
+        __nvoc_pThis = *__nvoc_ppThis;
+    }
+
+    // Allocate memory
+    else
+    {
+        __nvoc_pThis = portMemAllocNonPaged(sizeof(Memory));
+        NV_CHECK_OR_RETURN(LEVEL_ERROR, __nvoc_pThis != NULL, NV_ERR_NO_MEMORY);
+    }
 
     // Zero is the initial value for everything.
-    portMemSet(pThis, 0, sizeof(Memory));
+    portMemSet(__nvoc_pThis, 0, sizeof(Memory));
 
-    pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.createFlags = createFlags;
+    __nvoc_pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.createFlags = __nvoc_createFlags;
 
     // Link the child into the parent if there is one unless flagged not to do so.
-    if (pParent != NULL && !(createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
+    if (__nvoc_pParent != NULL && !(__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_PARENT_HALSPEC_ONLY))
     {
-        pParentObj = dynamicCast(pParent, Object);
-        objAddChild(pParentObj, &pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
+        __nvoc_pParentObj = dynamicCast(__nvoc_pParent, Object);
+        objAddChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
     }
     else
     {
-        pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.pParent = NULL;
+        __nvoc_pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object.pParent = NULL;
     }
 
-    __nvoc_init__Memory(pThis);
-    status = __nvoc_ctor_Memory(pThis, arg_pCallContext, arg_pParams);
-    if (status != NV_OK) goto __nvoc_objCreate_Memory_cleanup;
+    // Initialize vtable, RTTI, etc., then call constructor.
+    __nvoc_init__Memory(__nvoc_pThis);
+    __nvoc_status = __nvoc_ctor_Memory(__nvoc_pThis, pCallContext, pParams);
+    if (__nvoc_status != NV_OK) goto __nvoc_objCreate_Memory_cleanup;
 
     // Assignment has no effect if NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT is set.
-    *ppThis = pThis;
+    *__nvoc_ppThis = __nvoc_pThis;
 
+    // Success
     return NV_OK;
 
+    // Do not call destructors here since the constructor already called them.
 __nvoc_objCreate_Memory_cleanup:
 
     // Unlink the child from the parent if it was linked above.
-    if (pParentObj != NULL)
-        objRemoveChild(pParentObj, &pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
+    if (__nvoc_pParentObj != NULL)
+        objRemoveChild(__nvoc_pParentObj, &__nvoc_pThis->__nvoc_base_RmResource.__nvoc_base_RsResource.__nvoc_base_Object);
 
-    // Do not call destructors here since the constructor already called them.
-    if (createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
-        portMemSet(pThis, 0, sizeof(Memory));
+    // Zero out memory that was allocated by caller.
+    if (__nvoc_createFlags & NVOC_OBJ_CREATE_FLAGS_IN_PLACE_CONSTRUCT)
+        portMemSet(__nvoc_pThis, 0, sizeof(Memory));
+
+    // Free memory allocated by `__nvoc_handleObjCreateMemAlloc`.
     else
     {
-        portMemFree(pThis);
-        *ppThis = NULL;
+        portMemFree(__nvoc_pThis);
+        *__nvoc_ppThis = NULL;
     }
 
-    // coverity[leaked_storage:FALSE]
-    return status;
+    // Failure
+    return __nvoc_status;
 }
 
-NV_STATUS __nvoc_objCreateDynamic_Memory(Memory **ppThis, Dynamic *pParent, NvU32 createFlags, va_list args) {
-    NV_STATUS status;
-    CALL_CONTEXT * arg_pCallContext = va_arg(args, CALL_CONTEXT *);
-    struct RS_RES_ALLOC_PARAMS_INTERNAL * arg_pParams = va_arg(args, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
+NV_STATUS __nvoc_objCreateDynamic_Memory(Memory **__nvoc_ppThis, Dynamic *__nvoc_pParent, NvU32 __nvoc_createFlags, va_list __nvoc_args) {
+    NV_STATUS __nvoc_status;
+    CALL_CONTEXT *pCallContext = va_arg(__nvoc_args, CALL_CONTEXT *);
+    struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams = va_arg(__nvoc_args, struct RS_RES_ALLOC_PARAMS_INTERNAL *);
 
-    status = __nvoc_objCreate_Memory(ppThis, pParent, createFlags, arg_pCallContext, arg_pParams);
+    __nvoc_status = __nvoc_objCreate_Memory(__nvoc_ppThis, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams);
 
-    return status;
+    return __nvoc_status;
 }
 

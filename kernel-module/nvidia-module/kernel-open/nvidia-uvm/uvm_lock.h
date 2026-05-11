@@ -407,6 +407,11 @@
 //      Operations allowed while holding this lock
 //      - Pushing work to SEC2 channels
 //
+// - Access counters clear operations
+//     Order: UVM_LOCK_ACCESS_COUNTERS_CLEAR_OPS
+//
+//     It protects the parent_gpu's access counters clear tracker.
+//
 // - Concurrent push semaphore
 //      Order: UVM_LOCK_ORDER_PUSH
 //      Semaphore (uvm_semaphore_t)
@@ -431,11 +436,6 @@
 // - PMM root chunk lock (pmm->root_chunks.bitlocks)
 //      Order: UVM_LOCK_ORDER_PMM_ROOT_CHUNK
 //      Exclusive bitlock (mutex) per each root chunk internal to PMM.
-//
-// - Access counters clear operations
-//     Order: UVM_LOCK_ACCESS_COUNTERS_CLEAR_OPS
-//
-//     It protects the parent_gpu's access counters clear tracker.
 //
 // - Channel lock
 //      Order: UVM_LOCK_ORDER_CHANNEL
@@ -524,11 +524,11 @@ typedef enum
     UVM_LOCK_ORDER_KEY_ROTATION_WLC,
     UVM_LOCK_ORDER_CSL_WLC_PUSH,
     UVM_LOCK_ORDER_CSL_SEC2_PUSH,
+    UVM_LOCK_ACCESS_COUNTERS_CLEAR_OPS,
     UVM_LOCK_ORDER_PUSH,
     UVM_LOCK_ORDER_PMM,
     UVM_LOCK_ORDER_PMM_PMA,
     UVM_LOCK_ORDER_PMM_ROOT_CHUNK,
-    UVM_LOCK_ACCESS_COUNTERS_CLEAR_OPS,
     UVM_LOCK_ORDER_CHANNEL,
     UVM_LOCK_ORDER_WLC_CHANNEL,
     UVM_LOCK_ORDER_TOOLS_VA_SPACE_LIST,

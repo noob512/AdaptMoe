@@ -241,6 +241,10 @@ allocUpstreamTopPool
     {
         NvU64 *pPageStore = portMemAllocNonPaged(sizeof(NvU64) * numPages);
         NV_STATUS status = NV_OK;
+
+        if (pPageStore == NULL)
+            return NV_ERR_NO_MEMORY;
+
         NV_CHECK_OK_OR_GOTO(status, LEVEL_NOTICE,
             pmaAllocatePages(pMemReserveInfo->pPma,
                 numPages,

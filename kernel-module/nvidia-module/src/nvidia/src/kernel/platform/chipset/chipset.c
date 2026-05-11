@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -675,8 +675,7 @@ clInit_IMPL(
     //
     (void)clInitMappingPciBusDevice(pGpu, pCl);
 
-    if (kbifGetBusIntfType_HAL(GPU_GET_KERNEL_BIF(pGpu)) ==
-        NV2080_CTRL_BUS_INFO_TYPE_PCI_EXPRESS)
+    if (gpuGetBusIntfType_HAL(pGpu) == NV2080_CTRL_BUS_INFO_TYPE_PCI_EXPRESS)
     {
         return clInitPcie(pGpu, pCl);
     }
@@ -694,8 +693,7 @@ clUpdateConfig_IMPL
     // Common code for all buses
     clInitMappingPciBusDevice(pGpu, pCl);
 
-    if (kbifGetBusIntfType_HAL(GPU_GET_KERNEL_BIF(pGpu)) ==
-        NV2080_CTRL_BUS_INFO_TYPE_PCI_EXPRESS)
+    if (gpuGetBusIntfType_HAL(pGpu) == NV2080_CTRL_BUS_INFO_TYPE_PCI_EXPRESS)
     {
         clUpdatePcieConfig(pGpu, pCl);
         return;
@@ -710,16 +708,9 @@ clTeardown_IMPL(
     OBJCL  *pCl
 )
 {
-    KernelBif *pKernelBif = GPU_GET_KERNEL_BIF(pGpu);
-
-    if (pKernelBif == NULL)
-    {
-        return NV_ERR_NOT_SUPPORTED;
-    }
-
     clFreeBusTopologyCache(pCl);
 
-    switch (kbifGetBusIntfType_HAL(pKernelBif))
+    switch (gpuGetBusIntfType_HAL(pGpu))
     {
         case NV2080_CTRL_BUS_INFO_TYPE_PCI_EXPRESS:
             return clTeardownPcie(pGpu, pCl);
@@ -733,42 +724,11 @@ clTeardown_IMPL(
     }
 }
 
-NV_STATUS
-subdeviceCtrlCmdBusGetBFD_IMPL
-(
-    Subdevice *pSubdevice,
-    NV2080_CTRL_BUS_GET_BFD_PARAMSARR *pBusGetBFDParams
-)
-{
-    OBJSYS *pSys = SYS_GET_INSTANCE();
-    OBJCL  *pCl = SYS_GET_CL(pSys);
-    BUSTOPOLOGYINFO *pBusTopologyInfo = pCl->pBusTopologyInfo;
-    NvU32 i = 0;
-
-    while(pBusTopologyInfo && i < 32)
-    {
-        pBusGetBFDParams->params[i].valid    = NV_TRUE;
-        pBusGetBFDParams->params[i].deviceID = pBusTopologyInfo->busInfo.deviceID;
-        pBusGetBFDParams->params[i].vendorID = pBusTopologyInfo->busInfo.vendorID;
-        pBusGetBFDParams->params[i].domain   = pBusTopologyInfo->domain;
-        pBusGetBFDParams->params[i].bus      = (NvU16)pBusTopologyInfo->bus;
-        pBusGetBFDParams->params[i].device   = (NvU16)pBusTopologyInfo->device;
-        pBusGetBFDParams->params[i].function = (NvU8)pBusTopologyInfo->func;
-        i++;
-        pBusTopologyInfo = pBusTopologyInfo->next;
-    }
-    if(i < 32)
-    {
-        pBusGetBFDParams->params[i].valid = NV_FALSE;
-    }
-
-    pBusTopologyInfo = pCl->pBusTopologyInfo;
-    return NV_OK;
-}
-
 void clSyncWithGsp_IMPL(OBJCL *pCl, GspSystemInfo *pGSI)
 {
     NvU32 idx = 0;
+    pGSI->clPdbProperties = 0;
+
 #define CL_SYNC_PDB(prop)                                                       \
     do {                                                                        \
         pGSI->clPdbProperties |= pCl->getProperty(pCl, prop) ? NVBIT64(idx) : 0;\
@@ -785,6 +745,7 @@ void clSyncWithGsp_IMPL(OBJCL *pCl, GspSystemInfo *pGSI)
     CL_SYNC_PDB(PDB_PROP_CL_IS_CHIPSET_IN_ASPM_POR_LIST);
     CL_SYNC_PDB(PDB_PROP_CL_ASPM_L0S_CHIPSET_DISABLED);
     CL_SYNC_PDB(PDB_PROP_CL_ASPM_L1_CHIPSET_DISABLED);
+    CL_SYNC_PDB(PDB_PROP_CL_WAR_4802761_ENABLED);
     CL_SYNC_PDB(PDB_PROP_CL_ASPM_L0S_CHIPSET_ENABLED_MOBILE_ONLY);
     CL_SYNC_PDB(PDB_PROP_CL_ASPM_L1_CHIPSET_ENABLED_MOBILE_ONLY);
     CL_SYNC_PDB(PDB_PROP_CL_ASPM_L1_UPSTREAM_PORT_SUPPORTED);
@@ -811,6 +772,7 @@ void clSyncWithGsp_IMPL(OBJCL *pCl, GspSystemInfo *pGSI)
     CL_SYNC_PDB(PDB_PROP_CL_HAS_RESIZABLE_BAR_ISSUE);
     CL_SYNC_PDB(PDB_PROP_CL_BUG_3751839_GEN_SPEED_WAR);
     CL_SYNC_PDB(PDB_PROP_CL_BUG_3562968_WAR_ALLOW_PCIE_ATOMICS);
+    CL_SYNC_PDB(PDB_PROP_CL_WAR_AMD_5107271);
 
 #undef CL_SYNC_PDB
 

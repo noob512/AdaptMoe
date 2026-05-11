@@ -47,34 +47,24 @@ extern "C" {
 #include "core/core.h"
 #include "gpu/mem_mgr/mem_desc.h"
 #include "rmapi/resource.h"
-#include "rmapi/event.h"
+#include "rmapi/event_api.h"
 #include "ctrl/ctrl0002.h"
 #include "rmapi/control.h" // for macro RMCTRL_EXPORT etc.
 #include "nvlimits.h"
 
-
 struct Device;
 
-#ifndef __NVOC_CLASS_Device_TYPEDEF__
-#define __NVOC_CLASS_Device_TYPEDEF__
-typedef struct Device Device;
-#endif /* __NVOC_CLASS_Device_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_Device
-#define __nvoc_class_id_Device 0xe0ac20
+#define __nvoc_class_id_Device 0xe0ac20u
+typedef struct Device Device;
 #endif /* __nvoc_class_id_Device */
-
 
 
 struct Memory;
 
-#ifndef __NVOC_CLASS_Memory_TYPEDEF__
-#define __NVOC_CLASS_Memory_TYPEDEF__
-typedef struct Memory Memory;
-#endif /* __NVOC_CLASS_Memory_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_Memory
-#define __nvoc_class_id_Memory 0x4789f2
+#define __nvoc_class_id_Memory 0x4789f2u
+typedef struct Memory Memory;
 #endif /* __nvoc_class_id_Memory */
 
 
@@ -120,11 +110,6 @@ struct ContextDma {
     struct INotifier *__nvoc_pbase_INotifier;    // inotify super^2
     struct Notifier *__nvoc_pbase_Notifier;    // notify super
     struct ContextDma *__nvoc_pbase_ContextDma;    // ctxdma
-
-    // Vtable with 3 per-object function pointers
-    NV_STATUS (*__ctxdmaCtrlCmdUpdateContextdma__)(struct ContextDma * /*this*/, NV0002_CTRL_UPDATE_CONTEXTDMA_PARAMS *);  // exported (id=0x20101)
-    NV_STATUS (*__ctxdmaCtrlCmdBindContextdma__)(struct ContextDma * /*this*/, NV0002_CTRL_BIND_CONTEXTDMA_PARAMS *);  // exported (id=0x20102)
-    NV_STATUS (*__ctxdmaCtrlCmdUnbindContextdma__)(struct ContextDma * /*this*/, NV0002_CTRL_UNBIND_CONTEXTDMA_PARAMS *);  // exported (id=0x20103)
 
     // Data members
     NvU32 Class;
@@ -186,13 +171,9 @@ struct NVOC_METADATA__ContextDma {
     const struct NVOC_VTABLE__ContextDma vtable;
 };
 
-#ifndef __NVOC_CLASS_ContextDma_TYPEDEF__
-#define __NVOC_CLASS_ContextDma_TYPEDEF__
-typedef struct ContextDma ContextDma;
-#endif /* __NVOC_CLASS_ContextDma_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_ContextDma
-#define __nvoc_class_id_ContextDma 0x88441b
+#define __nvoc_class_id_ContextDma 0x88441bu
+typedef struct ContextDma ContextDma;
 #endif /* __nvoc_class_id_ContextDma */
 
 // Casting support
@@ -210,22 +191,87 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_ContextDma;
 
 NV_STATUS __nvoc_objCreateDynamic_ContextDma(ContextDma**, Dynamic*, NvU32, va_list);
 
-NV_STATUS __nvoc_objCreate_ContextDma(ContextDma**, Dynamic*, NvU32, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-#define __objCreate_ContextDma(ppNewObj, pParent, createFlags, arg_pCallContext, arg_pParams) \
-    __nvoc_objCreate_ContextDma((ppNewObj), staticCast((pParent), Dynamic), (createFlags), arg_pCallContext, arg_pParams)
+NV_STATUS __nvoc_objCreate_ContextDma(ContextDma**, Dynamic*, NvU32, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __objCreate_ContextDma(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags, pCallContext, pParams) \
+    __nvoc_objCreate_ContextDma((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags), pCallContext, pParams)
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS ctxdmaConstruct_IMPL(struct ContextDma *pCtxdma, struct CALL_CONTEXT *pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *pParams);
+#define __nvoc_ctxdmaConstruct(pCtxdma, pCallContext, pParams) ctxdmaConstruct_IMPL(pCtxdma, pCallContext, pParams)
+
+void ctxdmaDestruct_IMPL(struct ContextDma *pCtxdma);
+#define __nvoc_ctxdmaDestruct(pCtxdma) ctxdmaDestruct_IMPL(pCtxdma)
+
+NV_STATUS ctxdmaValidate_IMPL(struct ContextDma *pContextDma, NvU64 start, NvU64 len);
+#ifdef __nvoc_context_dma_h_disabled
+static inline NV_STATUS ctxdmaValidate(struct ContextDma *pContextDma, NvU64 start, NvU64 len) {
+    NV_ASSERT_FAILED_PRECOMP("ContextDma was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_context_dma_h_disabled
+#define ctxdmaValidate(pContextDma, start, len) ctxdmaValidate_IMPL(pContextDma, start, len)
+#endif // __nvoc_context_dma_h_disabled
+
+NV_STATUS ctxdmaGetKernelVA_IMPL(struct ContextDma *pContextDma, NvU64 start, NvU64 len, void **arg4, NvU32 VA_idx);
+#ifdef __nvoc_context_dma_h_disabled
+static inline NV_STATUS ctxdmaGetKernelVA(struct ContextDma *pContextDma, NvU64 start, NvU64 len, void **arg4, NvU32 VA_idx) {
+    NV_ASSERT_FAILED_PRECOMP("ContextDma was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_context_dma_h_disabled
+#define ctxdmaGetKernelVA(pContextDma, start, len, arg4, VA_idx) ctxdmaGetKernelVA_IMPL(pContextDma, start, len, arg4, VA_idx)
+#endif // __nvoc_context_dma_h_disabled
+
+NvBool ctxdmaIsBound_IMPL(struct ContextDma *pContextDma);
+#ifdef __nvoc_context_dma_h_disabled
+static inline NvBool ctxdmaIsBound(struct ContextDma *pContextDma) {
+    NV_ASSERT_FAILED_PRECOMP("ContextDma was disabled!");
+    return NV_FALSE;
+}
+#else // __nvoc_context_dma_h_disabled
+#define ctxdmaIsBound(pContextDma) ctxdmaIsBound_IMPL(pContextDma)
+#endif // __nvoc_context_dma_h_disabled
+
+NV_STATUS ctxdmaGetByHandle_IMPL(struct RsClient *pClient, NvHandle hContextDma, struct ContextDma **arg3);
+#define ctxdmaGetByHandle(pClient, hContextDma, arg3) ctxdmaGetByHandle_IMPL(pClient, hContextDma, arg3)
+
+NV_STATUS ctxdmaCtrlCmdUpdateContextdma_IMPL(struct ContextDma *pContextDma, NV0002_CTRL_UPDATE_CONTEXTDMA_PARAMS *pUpdateCtxtDmaParams);
+#ifdef __nvoc_context_dma_h_disabled
+static inline NV_STATUS ctxdmaCtrlCmdUpdateContextdma(struct ContextDma *pContextDma, NV0002_CTRL_UPDATE_CONTEXTDMA_PARAMS *pUpdateCtxtDmaParams) {
+    NV_ASSERT_FAILED_PRECOMP("ContextDma was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_context_dma_h_disabled
+#define ctxdmaCtrlCmdUpdateContextdma(pContextDma, pUpdateCtxtDmaParams) ctxdmaCtrlCmdUpdateContextdma_IMPL(pContextDma, pUpdateCtxtDmaParams)
+#endif // __nvoc_context_dma_h_disabled
+
+NV_STATUS ctxdmaCtrlCmdBindContextdma_IMPL(struct ContextDma *pContextDma, NV0002_CTRL_BIND_CONTEXTDMA_PARAMS *pBindCtxtDmaParams);
+#ifdef __nvoc_context_dma_h_disabled
+static inline NV_STATUS ctxdmaCtrlCmdBindContextdma(struct ContextDma *pContextDma, NV0002_CTRL_BIND_CONTEXTDMA_PARAMS *pBindCtxtDmaParams) {
+    NV_ASSERT_FAILED_PRECOMP("ContextDma was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_context_dma_h_disabled
+#define ctxdmaCtrlCmdBindContextdma(pContextDma, pBindCtxtDmaParams) ctxdmaCtrlCmdBindContextdma_IMPL(pContextDma, pBindCtxtDmaParams)
+#endif // __nvoc_context_dma_h_disabled
+
+NV_STATUS ctxdmaCtrlCmdUnbindContextdma_IMPL(struct ContextDma *pContextDma, NV0002_CTRL_UNBIND_CONTEXTDMA_PARAMS *pUnbindCtxtDmaParams);
+#ifdef __nvoc_context_dma_h_disabled
+static inline NV_STATUS ctxdmaCtrlCmdUnbindContextdma(struct ContextDma *pContextDma, NV0002_CTRL_UNBIND_CONTEXTDMA_PARAMS *pUnbindCtxtDmaParams) {
+    NV_ASSERT_FAILED_PRECOMP("ContextDma was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_context_dma_h_disabled
+#define ctxdmaCtrlCmdUnbindContextdma(pContextDma, pUnbindCtxtDmaParams) ctxdmaCtrlCmdUnbindContextdma_IMPL(pContextDma, pUnbindCtxtDmaParams)
+#endif // __nvoc_context_dma_h_disabled
+
+
+// Wrapper macros for halified functions
 #define ctxdmaMapTo_FNPTR(pContextDma) pContextDma->__nvoc_metadata_ptr->vtable.__ctxdmaMapTo__
 #define ctxdmaMapTo(pContextDma, pParams) ctxdmaMapTo_DISPATCH(pContextDma, pParams)
 #define ctxdmaUnmapFrom_FNPTR(pContextDma) pContextDma->__nvoc_metadata_ptr->vtable.__ctxdmaUnmapFrom__
 #define ctxdmaUnmapFrom(pContextDma, pParams) ctxdmaUnmapFrom_DISPATCH(pContextDma, pParams)
-#define ctxdmaCtrlCmdUpdateContextdma_FNPTR(pContextDma) pContextDma->__ctxdmaCtrlCmdUpdateContextdma__
-#define ctxdmaCtrlCmdUpdateContextdma(pContextDma, pUpdateCtxtDmaParams) ctxdmaCtrlCmdUpdateContextdma_DISPATCH(pContextDma, pUpdateCtxtDmaParams)
-#define ctxdmaCtrlCmdBindContextdma_FNPTR(pContextDma) pContextDma->__ctxdmaCtrlCmdBindContextdma__
-#define ctxdmaCtrlCmdBindContextdma(pContextDma, pBindCtxtDmaParams) ctxdmaCtrlCmdBindContextdma_DISPATCH(pContextDma, pBindCtxtDmaParams)
-#define ctxdmaCtrlCmdUnbindContextdma_FNPTR(pContextDma) pContextDma->__ctxdmaCtrlCmdUnbindContextdma__
-#define ctxdmaCtrlCmdUnbindContextdma(pContextDma, pUnbindCtxtDmaParams) ctxdmaCtrlCmdUnbindContextdma_DISPATCH(pContextDma, pUnbindCtxtDmaParams)
 #define ctxdmaAccessCallback_FNPTR(pResource) pResource->__nvoc_base_RmResource.__nvoc_metadata_ptr->vtable.__rmresAccessCallback__
 #define ctxdmaAccessCallback(pResource, pInvokingClient, pAllocParams, accessRight) ctxdmaAccessCallback_DISPATCH(pResource, pInvokingClient, pAllocParams, accessRight)
 #define ctxdmaShareCallback_FNPTR(pResource) pResource->__nvoc_base_RmResource.__nvoc_metadata_ptr->vtable.__rmresShareCallback__
@@ -282,18 +328,6 @@ static inline NV_STATUS ctxdmaMapTo_DISPATCH(struct ContextDma *pContextDma, str
 
 static inline NV_STATUS ctxdmaUnmapFrom_DISPATCH(struct ContextDma *pContextDma, struct RS_RES_UNMAP_FROM_PARAMS *pParams) {
     return pContextDma->__nvoc_metadata_ptr->vtable.__ctxdmaUnmapFrom__(pContextDma, pParams);
-}
-
-static inline NV_STATUS ctxdmaCtrlCmdUpdateContextdma_DISPATCH(struct ContextDma *pContextDma, NV0002_CTRL_UPDATE_CONTEXTDMA_PARAMS *pUpdateCtxtDmaParams) {
-    return pContextDma->__ctxdmaCtrlCmdUpdateContextdma__(pContextDma, pUpdateCtxtDmaParams);
-}
-
-static inline NV_STATUS ctxdmaCtrlCmdBindContextdma_DISPATCH(struct ContextDma *pContextDma, NV0002_CTRL_BIND_CONTEXTDMA_PARAMS *pBindCtxtDmaParams) {
-    return pContextDma->__ctxdmaCtrlCmdBindContextdma__(pContextDma, pBindCtxtDmaParams);
-}
-
-static inline NV_STATUS ctxdmaCtrlCmdUnbindContextdma_DISPATCH(struct ContextDma *pContextDma, NV0002_CTRL_UNBIND_CONTEXTDMA_PARAMS *pUnbindCtxtDmaParams) {
-    return pContextDma->__ctxdmaCtrlCmdUnbindContextdma__(pContextDma, pUnbindCtxtDmaParams);
 }
 
 static inline NvBool ctxdmaAccessCallback_DISPATCH(struct ContextDma *pResource, struct RsClient *pInvokingClient, void *pAllocParams, RsAccessRight accessRight) {
@@ -392,58 +426,22 @@ static inline NV_STATUS ctxdmaGetOrAllocNotifShare_DISPATCH(struct ContextDma *p
     return pNotifier->__nvoc_metadata_ptr->vtable.__ctxdmaGetOrAllocNotifShare__(pNotifier, hNotifierClient, hNotifierResource, ppNotifShare);
 }
 
+// Virtual method declarations and/or inline definitions
 NV_STATUS ctxdmaMapTo_IMPL(struct ContextDma *pContextDma, struct RS_RES_MAP_TO_PARAMS *pParams);
 
 NV_STATUS ctxdmaUnmapFrom_IMPL(struct ContextDma *pContextDma, struct RS_RES_UNMAP_FROM_PARAMS *pParams);
 
+// Exported method declarations and/or inline definitions
 NV_STATUS ctxdmaCtrlCmdUpdateContextdma_IMPL(struct ContextDma *pContextDma, NV0002_CTRL_UPDATE_CONTEXTDMA_PARAMS *pUpdateCtxtDmaParams);
 
 NV_STATUS ctxdmaCtrlCmdBindContextdma_IMPL(struct ContextDma *pContextDma, NV0002_CTRL_BIND_CONTEXTDMA_PARAMS *pBindCtxtDmaParams);
 
 NV_STATUS ctxdmaCtrlCmdUnbindContextdma_IMPL(struct ContextDma *pContextDma, NV0002_CTRL_UNBIND_CONTEXTDMA_PARAMS *pUnbindCtxtDmaParams);
 
-NV_STATUS ctxdmaConstruct_IMPL(struct ContextDma *arg_pCtxdma, struct CALL_CONTEXT *arg_pCallContext, struct RS_RES_ALLOC_PARAMS_INTERNAL *arg_pParams);
-
-#define __nvoc_ctxdmaConstruct(arg_pCtxdma, arg_pCallContext, arg_pParams) ctxdmaConstruct_IMPL(arg_pCtxdma, arg_pCallContext, arg_pParams)
-void ctxdmaDestruct_IMPL(struct ContextDma *pCtxdma);
-
-#define __nvoc_ctxdmaDestruct(pCtxdma) ctxdmaDestruct_IMPL(pCtxdma)
-NV_STATUS ctxdmaValidate_IMPL(struct ContextDma *pContextDma, NvU64 start, NvU64 len);
-
-#ifdef __nvoc_context_dma_h_disabled
-static inline NV_STATUS ctxdmaValidate(struct ContextDma *pContextDma, NvU64 start, NvU64 len) {
-    NV_ASSERT_FAILED_PRECOMP("ContextDma was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_context_dma_h_disabled
-#define ctxdmaValidate(pContextDma, start, len) ctxdmaValidate_IMPL(pContextDma, start, len)
-#endif //__nvoc_context_dma_h_disabled
-
-NV_STATUS ctxdmaGetKernelVA_IMPL(struct ContextDma *pContextDma, NvU64 start, NvU64 len, void **arg4, NvU32 VA_idx);
-
-#ifdef __nvoc_context_dma_h_disabled
-static inline NV_STATUS ctxdmaGetKernelVA(struct ContextDma *pContextDma, NvU64 start, NvU64 len, void **arg4, NvU32 VA_idx) {
-    NV_ASSERT_FAILED_PRECOMP("ContextDma was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_context_dma_h_disabled
-#define ctxdmaGetKernelVA(pContextDma, start, len, arg4, VA_idx) ctxdmaGetKernelVA_IMPL(pContextDma, start, len, arg4, VA_idx)
-#endif //__nvoc_context_dma_h_disabled
-
-NvBool ctxdmaIsBound_IMPL(struct ContextDma *pContextDma);
-
-#ifdef __nvoc_context_dma_h_disabled
-static inline NvBool ctxdmaIsBound(struct ContextDma *pContextDma) {
-    NV_ASSERT_FAILED_PRECOMP("ContextDma was disabled!");
-    return NV_FALSE;
-}
-#else //__nvoc_context_dma_h_disabled
-#define ctxdmaIsBound(pContextDma) ctxdmaIsBound_IMPL(pContextDma)
-#endif //__nvoc_context_dma_h_disabled
-
-NV_STATUS ctxdmaGetByHandle_IMPL(struct RsClient *pClient, NvHandle hContextDma, struct ContextDma **arg3);
-
-#define ctxdmaGetByHandle(pClient, hContextDma, arg3) ctxdmaGetByHandle_IMPL(pClient, hContextDma, arg3)
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 

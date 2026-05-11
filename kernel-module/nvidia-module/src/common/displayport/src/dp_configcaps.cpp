@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -76,21 +76,13 @@ void DPCDHALImpl::configureDpTunnelBwAllocation()
 {
     NvU8 byte = 0;
 
-    // Client has not requested or it is not enabled due to regkey override
-    if (!this->bEnableDpTunnelBwAllocationSupport)
-    {
-        bIsDpTunnelBwAllocationEnabled = false;
-        return;
-    }
-
-    bIsDpTunnelBwAllocationEnabled = false;
-
+    // 0xE000D, DP Tunneling capabilities for DIA
     if (AuxRetry::ack ==
         bus.read(NV_DPCD20_DP_TUNNEL_CAPABILITIES, &byte, sizeof byte))
     {
         caps.dpInTunnelingCaps.bIsSupported =
-            FLD_TEST_DRF(_DPCD20, _DP_TUNNEL_CAPABILITIES,
-                            _DPTUNNELING_SUPPORT, _YES, byte);
+        FLD_TEST_DRF(_DPCD20, _DP_TUNNEL_CAPABILITIES,
+                    _DPTUNNELING_SUPPORT, _YES, byte);
 
         caps.dpInTunnelingCaps.bIsPanelReplayOptimizationSupported =
             FLD_TEST_DRF(_DPCD20, _DP_TUNNEL_CAPABILITIES,
@@ -102,7 +94,14 @@ void DPCDHALImpl::configureDpTunnelBwAllocation()
                             _DPIN_BW_ALLOCATION_MODE_SUPPORT,
                             _YES, byte);
     }
+    // Client has not requested or it is not enabled due to regkey override
+    if (!this->bEnableDpTunnelBwAllocationSupport)
+    {
+        bIsDpTunnelBwAllocationEnabled = false;
+        return;
+    }
 
+    bIsDpTunnelBwAllocationEnabled = false;
 
     if (caps.dpInTunnelingCaps.bIsSupported)
     {
@@ -423,23 +422,6 @@ void DPCDHALImpl::parseAndReadCaps()
                     }
                     caps.repeaterCaps.bAuxlessALPMSupported =
                         FLD_TEST_DRF(_DPCD20, _PHY_REPEATER_ALPM_CAPS, _AUX_LESS, _SUPPORTED, buffer[9]);
-
-                    if (lttprIsAtLeastVersion(2, 0))
-                    {
-                        // 0xE000D, DP Tunneling capabilities for DIA which acts as LTTPR.
-                        if (AuxRetry::ack ==
-                                bus.read(NV_DPCD20_DP_TUNNEL_CAPABILITIES, &byte, sizeof byte))
-                        {
-                            caps.repeaterCaps.bDpTunnelingSupported =
-                                                FLD_TEST_DRF(_DPCD20, _DP_TUNNEL_CAPABILITIES,
-                                                            _DPTUNNELING_SUPPORT, _YES, byte);
-
-                            caps.repeaterCaps.bDpTunnelingBwAllocModeSupported =
-                                                FLD_TEST_DRF(_DPCD20, _DP_TUNNEL_CAPABILITIES,
-                                                            _DPIN_BW_ALLOCATION_MODE_SUPPORT,
-                                                            _YES, byte);
-                        }
-                    }
                 }
                 else
                 {
@@ -1333,6 +1315,13 @@ AuxRetry::status DPCDHALImpl::setMessagingEnable(bool _uprequestEnable, bool _up
     {
         bMultistream = false;
     }
+
+    if (isDpInTunnelingSupported())
+    {
+        if (!bMultistream)
+            return AuxRetry::ack;
+    }
+
     mstmCtrl = 0;
 
     if (bMultistream)
@@ -1688,7 +1677,7 @@ void DPCDHALImpl::fetchLinkStatusESI()
 {
     NvU8                    buffer[16]              = {0};
     NvS32                   rxIndex;
-    MainLinkChannelCoding   mainLinkChannelCoding   = getMainLinkChannelCoding();
+
     // LINK_STATUS_ESI from 0x200C to 0x200E
     int bytesToRead = 3;
 
@@ -1698,9 +1687,6 @@ void DPCDHALImpl::fetchLinkStatusESI()
     {
         if (rxIndex != NV0073_CTRL_DP_DATA_TARGET_SINK)
         {
-            // Ignore LTTPR Link Status for 128b/132b
-            if (mainLinkChannelCoding == ChannelCoding128B132B)
-                continue;
             readLTTPRLinkStatus(rxIndex, &buffer[0xC]);
         }
         else
@@ -2147,17 +2133,12 @@ void DPCDHALImpl::payloadTableClearACT()
 
 bool DPCDHALImpl::payloadWaitForACTReceived()
 {
-    NvU8 byte = 0;
-    int retries = 0;
+    NvU8  byte               = 0;
+    NvU8  timeoutSeconds     = 1;
 
-    while (true)
+    Timeout timeout(timer, timeoutSeconds * 1000);
+    do
     {
-        if (++retries > 40)
-        {
-            DP_PRINTF(DP_ERROR, "DPHAL> ACT Not received by sink device!");
-            return false;
-        }
-
         if (AuxRetry::ack == bus.read(NV_DPCD_PAYLOAD_TABLE_UPDATE_STATUS, &byte, sizeof byte))
         {
             if (FLD_TEST_DRF(_DPCD, _PAYLOAD_TABLE_UPDATE_STATUS, _ACT_HANDLED, _YES, byte))
@@ -2166,7 +2147,19 @@ bool DPCDHALImpl::payloadWaitForACTReceived()
                 return true;
             }
         }
-    }
+        else
+        {
+            DP_PRINTF(DP_ERROR, "DPHAL> Read NV_DPCD_PAYLOAD_TABLE_UPDATE_STATUS failed.");
+            if (!auxAccessAvailable())
+            {
+                DP_PRINTF(DP_ERROR, "DPHAL> AUX access not available, cannot wait for ACT.");
+                return false;
+            }
+        }
+        timer->sleep(1); // 1ms
+    } while (timeout.valid());
+
+    return false;
 }
 
 bool DPCDHALImpl::payloadAllocate(unsigned streamId, unsigned begin, unsigned count)

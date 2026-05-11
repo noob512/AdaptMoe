@@ -30,7 +30,24 @@ NV_STATUS
 kheadConstruct_IMPL(KernelHead *pKernelHead)
 {
     pKernelHead->Vblank.IntrState = NV_HEAD_VBLANK_INTR_UNAVAILABLE;
+
+    pKernelHead->Vblank.pSpinlock = (PORT_SPINLOCK *) portSyncSpinlockCreate(portMemAllocatorGetGlobalNonPaged());
+    NV_ASSERT_OR_RETURN(pKernelHead->Vblank.pSpinlock != NULL, NV_ERR_INSUFFICIENT_RESOURCES);
+
     return NV_OK;
+}
+
+void
+kheadDestruct_IMPL
+(
+    KernelHead *pKernelHead
+)
+{
+    if (pKernelHead->Vblank.pSpinlock != NULL)
+    {
+        portSyncSpinlockDestroy(pKernelHead->Vblank.pSpinlock);
+        pKernelHead->Vblank.pSpinlock = NULL;
+    }
 }
 
 NvU32

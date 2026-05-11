@@ -19,7 +19,7 @@ _out/Linux_x86_64/nvidia-push.o: \
  ../common/sdk/nvidia/inc/class/cl9010.h \
  ../common/sdk/nvidia/inc/class/cl9010_callback.h \
  ../common/unix/nvidia-push/interface/nvidia-push-methods.h \
- ../common/sdk/nvidia/inc/class/cla16f.h \
+ ../common/sdk/nvidia/inc/class/clc46f.h \
  ../common/unix/nvidia-push/interface/nvidia-push-utils.h \
  ../common/unix/nvidia-push/include/nvidia-push-priv.h \
  ../common/unix/nvidia-push/include/nvidia-push-priv-imports.h \
@@ -28,11 +28,6 @@ _out/Linux_x86_64/nvidia-push.o: \
  ../common/sdk/nvidia/inc/cpuopsys.h \
  ../common/sdk/nvidia/inc/class/cl2080.h \
  ../common/sdk/nvidia/inc/class/cl2080_notification.h \
- ../common/sdk/nvidia/inc/class/cla26f.h \
- ../common/sdk/nvidia/inc/class/clb06f.h \
- ../common/sdk/nvidia/inc/class/clc06f.h \
- ../common/sdk/nvidia/inc/class/clc36f.h \
- ../common/sdk/nvidia/inc/class/clc46f.h \
  ../common/sdk/nvidia/inc/class/clc56f.h \
  ../common/sdk/nvidia/inc/class/clc86f.h \
  ../common/sdk/nvidia/inc/class/clc361.h \
@@ -65,7 +60,7 @@ _out/Linux_x86_64/nvidia-push.o: \
 ../common/sdk/nvidia/inc/class/cl9010.h:
 ../common/sdk/nvidia/inc/class/cl9010_callback.h:
 ../common/unix/nvidia-push/interface/nvidia-push-methods.h:
-../common/sdk/nvidia/inc/class/cla16f.h:
+../common/sdk/nvidia/inc/class/clc46f.h:
 ../common/unix/nvidia-push/interface/nvidia-push-utils.h:
 ../common/unix/nvidia-push/include/nvidia-push-priv.h:
 ../common/unix/nvidia-push/include/nvidia-push-priv-imports.h:
@@ -75,11 +70,6 @@ _out/Linux_x86_64/nvidia-push.o: \
 ../common/sdk/nvidia/inc/cpuopsys.h:
 ../common/sdk/nvidia/inc/class/cl2080.h:
 ../common/sdk/nvidia/inc/class/cl2080_notification.h:
-../common/sdk/nvidia/inc/class/cla26f.h:
-../common/sdk/nvidia/inc/class/clb06f.h:
-../common/sdk/nvidia/inc/class/clc06f.h:
-../common/sdk/nvidia/inc/class/clc36f.h:
-../common/sdk/nvidia/inc/class/clc46f.h:
 ../common/sdk/nvidia/inc/class/clc56f.h:
 ../common/sdk/nvidia/inc/class/clc86f.h:
 ../common/sdk/nvidia/inc/class/clc361.h:

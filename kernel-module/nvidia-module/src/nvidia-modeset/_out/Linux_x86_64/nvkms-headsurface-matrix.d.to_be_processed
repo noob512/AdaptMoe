@@ -18,14 +18,16 @@ _out/Linux_x86_64/nvkms-headsurface-matrix.o: \
  ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h \
- ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080unix.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gpu.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080base.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080gr.h \
- ../common/sdk/nvidia/inc/nvcfg_sdk.h ../common/sdk/nvidia/inc/nvstatus.h \
+ ../common/sdk/nvidia/inc/nvcfg_sdk.h \
+ ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h \
+ ../common/sdk/nvidia/inc/nvstatus.h \
  ../common/sdk/nvidia/inc/nvstatuscodes.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl30f1.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl5070/ctrl5070system.h \
@@ -55,15 +57,16 @@ _out/Linux_x86_64/nvkms-headsurface-matrix.o: \
  ../common/modeset/hdmipacket/nvhdmi_frlInterface.h \
  ../common/modeset/hdmipacket/nvhdmipkt.h ../common/inc/nvHdmiFrlCommon.h \
  ../common/modeset/hdmipacket/../timing/nvtiming.h ../common/inc/nv_smg.h \
- ../common/inc/nvrmcontext.h ../common/inc/nv_mig_types.h \
- include/nvkms-softfloat.h ../common/softfloat/nvidia/nv-softfloat.h \
+ ../common/inc/nvctassert.h ../common/inc/nvrmcontext.h \
+ ../common/inc/nv_mig_types.h include/nvkms-softfloat.h \
+ ../common/softfloat/nvidia/nv-softfloat.h \
  ../common/softfloat/source/include/softfloat.h \
  ../common/softfloat/source/include/softfloat_types.h \
  ../common/softfloat/nvidia/platform.h \
  ../common/unix/nvidia-headsurface/nvidia-headsurface-types.h \
  ../common/unix/nvidia-3d/interface/nvidia-3d-types.h \
  ../common/unix/nvidia-push/interface/nvidia-push-methods.h \
- ../common/sdk/nvidia/inc/class/cla16f.h \
+ ../common/sdk/nvidia/inc/class/clc46f.h \
  ../common/unix/nvidia-3d/interface/nvidia-3d-shaders.h \
  ../common/sdk/nvidia/inc/class/cl9097.h src/shaders/g_shader_names.h \
  include/nvkms-softfloat.h ../common/unix/common/inc/nv-float.h
@@ -94,7 +97,7 @@ interface/nvkms-format.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000gpu.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000base.h:
-../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h:
+../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080nvlink_common.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080unix.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gpu.h:
@@ -102,6 +105,7 @@ interface/nvkms-format.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080gr.h:
 ../common/sdk/nvidia/inc/nvcfg_sdk.h:
+../common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000system.h:
 ../common/sdk/nvidia/inc/nvstatus.h:
 ../common/sdk/nvidia/inc/nvstatuscodes.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl30f1.h:
@@ -140,6 +144,7 @@ include/nvkms-prealloc-types.h:
 ../common/inc/nvHdmiFrlCommon.h:
 ../common/modeset/hdmipacket/../timing/nvtiming.h:
 ../common/inc/nv_smg.h:
+../common/inc/nvctassert.h:
 ../common/inc/nvrmcontext.h:
 ../common/inc/nv_mig_types.h:
 include/nvkms-softfloat.h:
@@ -150,7 +155,7 @@ include/nvkms-softfloat.h:
 ../common/unix/nvidia-headsurface/nvidia-headsurface-types.h:
 ../common/unix/nvidia-3d/interface/nvidia-3d-types.h:
 ../common/unix/nvidia-push/interface/nvidia-push-methods.h:
-../common/sdk/nvidia/inc/class/cla16f.h:
+../common/sdk/nvidia/inc/class/clc46f.h:
 ../common/unix/nvidia-3d/interface/nvidia-3d-shaders.h:
 ../common/sdk/nvidia/inc/class/cl9097.h:
 src/shaders/g_shader_names.h:

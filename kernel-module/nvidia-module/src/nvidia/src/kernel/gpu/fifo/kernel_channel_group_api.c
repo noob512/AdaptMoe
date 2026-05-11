@@ -45,8 +45,6 @@
 #include "rmapi/rs_utils.h"
 #include "containers/eheap_old.h"
 
-#include "nv-gpu-sched-hooks.h"  // GPU scheduler eBPF hook functions
-
 NV_STATUS
 kchangrpapiConstruct_IMPL
 (
@@ -256,7 +254,7 @@ kchangrpapiConstruct_IMPL
         // RM reserved heap. This avoids a constant memory allocation from appearing
         // due to the ctxBufPool reservation out of PMA.
         //
-        if ((pRmClient == NULL) || !(pRmClient->Flags & RMAPI_CLIENT_FLAG_RM_INTERNAL_CLIENT))
+        if ((pRmClient == NULL) || !serverIsClientInternal(&g_resServ, pParams->hClient))
         {
             NV_ASSERT_OK_OR_GOTO(rmStatus,
                 ctxBufPoolInit(pGpu, pHeap, &pKernelChannelGroup->pCtxBufPool),
@@ -561,7 +559,7 @@ done:
         if (rmStatus != NV_OK)
         {
             // Acquire the lock again for the cleanup path
-            NV_ASSERT_OK_OR_RETURN(rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_FIFO));
+            NV_ASSERT_OK_OR_RETURN(rmDeviceGpuLocksAcquire(pGpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_FIFO));
             bLockAcquired = NV_TRUE;
             goto failed;
         }
@@ -1091,24 +1089,6 @@ kchangrpapiCtrlCmdGpFifoSchedule_IMPL
                   pResourceRef->externalClassId);
     }
     NV_ASSERT_OR_RETURN((pClass != NULL), NV_ERR_NOT_SUPPORTED);
-
-    // eBPF hook: bind - TSG bind to hardware runlist (admission control)
-    {
-        NvU32 subdevInst = gpumgrGetSubDeviceInstanceFromGpu(pGpu);
-        struct nv_gpu_bind_ctx ctx = {0};
-        ctx.tsg_id = pKernelChannelGroup->grpID;
-        ctx.runlist_id = pKernelChannelGroup->runlistId;
-        ctx.channel_count = pKernelChannelGroup->chanCount;
-        ctx.timeslice_us = pKernelChannelGroup->timesliceUs;
-        ctx.interleave_level = pKernelChannelGroup->pInterleaveLevel[subdevInst];
-        ctx.allow = 1;  // Default: allow
-        nv_gpu_sched_bind(&ctx);
-        // Admission control: eBPF can reject binding
-        if (!ctx.allow)
-        {
-            return NV_ERR_BUSY_RETRY;
-        }
-    }
 
     //
     // Bug 1737765: Prevent Externally Owned Channels from running unless bound

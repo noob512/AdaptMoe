@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -37,5 +37,20 @@
 #define NVC97D_HEAD_SET_SW_SPARE_A_CODE_VPLL_REF                                1:0
 #define NVC97D_HEAD_SET_SW_SPARE_A_CODE_VPLL_REF_NO_PREF                        (0x00000000)
 #define NVC97D_HEAD_SET_SW_SPARE_A_CODE_VPLL_REF_QSYNC                          (0x00000001)
+
+//
+// DRR (Dynamic Refresh Rate) is a power saving feature that lowers the refresh
+// rate when a high flip rate is not required.  A modeset is required in order
+// to change the target refresh rate for DRR purposes.  Such a modeset
+// (indicated by the DRR_MODESET bit) does not change any IMP-relevant
+// parameters except back porch (and vertical total), so IMP can optimize such
+// modesets by, for example, skipping disablement of mclk switch.
+//
+// If any head has the DRR_MODESET bit set, no other head that is changing is
+// allowed to execute a non-DRR transition as part of the same modeset.
+//
+#define NVC97D_HEAD_SET_SW_RESERVED_DRR_MODESET                                 31:31
+#define NVC97D_HEAD_SET_SW_RESERVED_DRR_MODESET_FALSE                           (0x00000000)
+#define NVC97D_HEAD_SET_SW_RESERVED_DRR_MODESET_TRUE                            (0x00000001)
 
 #endif // _clc97d_sw_spare_h_   

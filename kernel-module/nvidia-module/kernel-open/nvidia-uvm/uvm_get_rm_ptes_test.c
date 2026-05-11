@@ -28,6 +28,7 @@
 #include "uvm_va_space.h"
 #include "uvm_mmu.h"
 #include "nv_uvm_types.h"
+#include "nv_uvm_user_types.h"
 #include "nv_uvm_interface.h"
 #include "uvm_common.h"
 
@@ -39,13 +40,23 @@
                                            size,         \
                                            ext_map_info))
 
+// TODO: Bug 5310168: Expand test coverage of external mappings. The existing
+// get_aperture() and is_cacheable() are only correct for the subset of external
+// mappings that are currently tested.
 static uvm_aperture_t get_aperture(uvm_va_space_t *va_space,
                                    uvm_gpu_t *memory_owning_gpu,
                                    uvm_gpu_t *memory_mapping_gpu,
                                    UvmGpuMemoryInfo *memory_info,
-                                   bool sli_supported)
+                                   bool sli_supported,
+                                   UvmGpuExternalMappingInfo *ext_mapping_info)
 {
     if (memory_info->sysmem) {
+        // TODO: Bug 5310178: Do not use integrated GPU as a proxy for a fully
+        // coherent L2 cache.
+        if (memory_mapping_gpu->parent->is_integrated_gpu &&
+            ext_mapping_info->cachingType == UvmGpuCachingTypeForceCached)
+                return UVM_APERTURE_SYS_NON_COHERENT;
+
         return UVM_APERTURE_SYS;
     }
     else {
@@ -57,9 +68,9 @@ static uvm_aperture_t get_aperture(uvm_va_space_t *va_space,
 
 static bool is_cacheable(UvmGpuExternalMappingInfo *ext_mapping_info, uvm_aperture_t aperture)
 {
-    if (ext_mapping_info->cachingType == UvmRmGpuCachingTypeForceCached)
+    if (ext_mapping_info->cachingType == UvmGpuCachingTypeForceCached)
         return true;
-    else if (ext_mapping_info->cachingType == UvmRmGpuCachingTypeForceUncached)
+    else if (ext_mapping_info->cachingType == UvmGpuCachingTypeForceUncached)
         return false;
     else if (aperture == UVM_APERTURE_VID)
         return true;
@@ -69,10 +80,10 @@ static bool is_cacheable(UvmGpuExternalMappingInfo *ext_mapping_info, uvm_apertu
 
 static NvU32 get_protection(UvmGpuExternalMappingInfo *ext_mapping_info)
 {
-    if (ext_mapping_info->mappingType == UvmRmGpuMappingTypeReadWriteAtomic ||
-        ext_mapping_info->mappingType == UvmRmGpuMappingTypeDefault)
+    if (ext_mapping_info->mappingType == UvmGpuMappingTypeReadWriteAtomic ||
+        ext_mapping_info->mappingType == UvmGpuMappingTypeDefault)
         return UVM_PROT_READ_WRITE_ATOMIC;
-    else if (ext_mapping_info->mappingType == UvmRmGpuMappingTypeReadWrite)
+    else if (ext_mapping_info->mappingType == UvmGpuMappingTypeReadWrite)
         return UVM_PROT_READ_WRITE;
     else
         return UVM_PROT_READ_ONLY;
@@ -119,7 +130,12 @@ static NV_STATUS verify_mapping_info(uvm_va_space_t *va_space,
     if (!memory_owning_gpu)
         return NV_ERR_INVALID_DEVICE;
 
-    aperture = get_aperture(va_space, memory_owning_gpu, memory_mapping_gpu, memory_info, sli_supported);
+    aperture = get_aperture(va_space,
+                            memory_owning_gpu,
+                            memory_mapping_gpu,
+                            memory_info,
+                            sli_supported,
+                            ext_mapping_info);
 
     if (is_cacheable(ext_mapping_info, aperture))
         pte_flags |= UVM_MMU_PTE_FLAGS_CACHED;
@@ -128,10 +144,21 @@ static NV_STATUS verify_mapping_info(uvm_va_space_t *va_space,
 
     phys_offset = mapping_offset;
 
-    // Add the physical offset for nvswitch connected peer mappings
-    if (uvm_aperture_is_peer(aperture) &&
-        uvm_parent_gpus_are_nvswitch_connected(memory_mapping_gpu->parent, memory_owning_gpu->parent))
-        phys_offset += memory_owning_gpu->parent->nvswitch_info.fabric_memory_window_start;
+    // Add the physical offset for peer mappings
+    if (uvm_aperture_is_peer(aperture)) {
+        if (uvm_parent_gpus_are_nvlink_direct_connected(memory_mapping_gpu->parent, memory_owning_gpu->parent))
+            phys_offset += memory_owning_gpu->parent->peer_address_info.peer_gpa_memory_window_start;
+        else if (uvm_parent_gpus_are_nvswitch_connected(memory_mapping_gpu->parent, memory_owning_gpu->parent))
+            phys_offset += memory_owning_gpu->parent->nvswitch_info.fabric_memory_window_start;
+    }
+
+    // Add DMA offset for bar1 p2p.
+    if (uvm_aperture_is_sys(aperture) && !memory_info->sysmem) {
+        uvm_gpu_phys_address_t phys_address = uvm_gpu_peer_phys_address(memory_owning_gpu, memory_info->physAddr, memory_mapping_gpu);
+
+        UVM_ASSERT(uvm_aperture_is_sys(phys_address.aperture));
+        phys_offset += (phys_address.address - memory_info->physAddr);
+    }
 
     for (index = 0; index < ext_mapping_info->numWrittenPtes; index++) {
 
@@ -140,6 +167,16 @@ static NV_STATUS verify_mapping_info(uvm_va_space_t *va_space,
                             prot,
                             pte_flags);
 
+        if (pte != ext_mapping_info->pteBuffer[index * skip]) {
+            UVM_ERR_PRINT("PTE mismatch for %s->%s at %d (aperture: %s) %llx vs. %llx (address: %llx)\n",
+                          uvm_parent_gpu_name(memory_mapping_gpu->parent),
+                          uvm_parent_gpu_name(memory_owning_gpu->parent),
+                          index,
+                          uvm_aperture_string(aperture),
+                          pte,
+                          ext_mapping_info->pteBuffer[index * skip],
+                          memory_info->physAddr);
+        }
         TEST_CHECK_RET(pte == ext_mapping_info->pteBuffer[index * skip]);
 
         phys_offset += page_size;
@@ -228,8 +265,8 @@ static NV_STATUS test_get_rm_ptes_single_gpu(uvm_va_space_t *va_space, UVM_TEST_
                                         &memory_info,
                                         false) == NV_OK, done);
 
-    ext_mapping_info.mappingType = UvmRmGpuMappingTypeReadWrite;
-    ext_mapping_info.cachingType = UvmRmGpuCachingTypeForceCached;
+    ext_mapping_info.mappingType = UvmGpuMappingTypeReadWrite;
+    ext_mapping_info.cachingType = UvmGpuCachingTypeForceCached;
     TEST_CHECK_GOTO(get_rm_ptes(memory_info.pageSize, size - memory_info.pageSize, &ext_mapping_info) == NV_OK, done);
     TEST_CHECK_GOTO(verify_mapping_info(va_space,
                                         memory_mapping_gpu,
@@ -239,8 +276,8 @@ static NV_STATUS test_get_rm_ptes_single_gpu(uvm_va_space_t *va_space, UVM_TEST_
                                         &memory_info,
                                         false) == NV_OK, done);
 
-    ext_mapping_info.mappingType = UvmRmGpuMappingTypeReadOnly;
-    ext_mapping_info.cachingType = UvmRmGpuCachingTypeForceUncached;
+    ext_mapping_info.mappingType = UvmGpuMappingTypeReadOnly;
+    ext_mapping_info.cachingType = UvmGpuCachingTypeForceUncached;
     TEST_CHECK_GOTO(get_rm_ptes(size - memory_info.pageSize, memory_info.pageSize, &ext_mapping_info) == NV_OK, done);
     TEST_CHECK_GOTO(verify_mapping_info(va_space,
                                         memory_mapping_gpu,

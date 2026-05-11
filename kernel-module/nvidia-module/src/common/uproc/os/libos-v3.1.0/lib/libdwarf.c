@@ -179,8 +179,8 @@ enum
 LibosStatus LibosDebugResolverConstruct(LibosDebugResolver *pThis, LibosElfImage * image)
 {
 
-    LibosElf64SectionHeader * debugLine = LibosElfFindSectionByName(image, ".debug_line");
-    if (!debugLine || LibosOk != LibosElfMapSection(image, debugLine, &pThis->debugLineStart, &pThis->debugLineEnd))
+    LibosElfSectionHeaderPtr debugLine = LibosElfFindSectionByName(image, ".debug_line");
+    if (debugLine.raw == NULL || LibosOk != LibosElfMapSection(image, debugLine, &pThis->debugLineStart, &pThis->debugLineEnd))
         pThis->debugLineStart = pThis->debugLineEnd = 0;
 
     //
@@ -188,24 +188,24 @@ LibosStatus LibosDebugResolverConstruct(LibosDebugResolver *pThis, LibosElfImage
     // OK to fail mapping if we won't dealing with DWARFv5 data.
     //
     pThis->debugLineStrStart = pThis->debugLineStrEnd = NULL;
-    LibosElf64SectionHeader * debugLineStr = LibosElfFindSectionByName(image, ".debug_line_str");
+    LibosElfSectionHeaderPtr debugLineStr = LibosElfFindSectionByName(image, ".debug_line_str");
 
-    if (debugLineStr != NULL &&
+    if (debugLineStr.raw != NULL &&
         LibosElfMapSection(image, debugLineStr, &pThis->debugLineStrStart, &pThis->debugLineStrEnd) != LibosOk)
     {
         DWARF_DEBUG_LOG(".debug_line_str present but failed to map\n");
     }
 
-    LibosElf64SectionHeader * debugARanges = LibosElfFindSectionByName(image, ".debug_aranges");
-    if (!debugARanges || LibosOk != LibosElfMapSection(image, debugARanges, &pThis->debugARangesStart, &pThis->debugARangesEnd))
+    LibosElfSectionHeaderPtr debugARanges = LibosElfFindSectionByName(image, ".debug_aranges");
+    if (debugARanges.raw == NULL || LibosOk != LibosElfMapSection(image, debugARanges, &pThis->debugARangesStart, &pThis->debugARangesEnd))
         pThis->debugARangesStart = pThis->debugARangesEnd = 0;
 
-    LibosElf64SectionHeader * debugSymTab = LibosElfFindSectionByName(image, ".symtab");
-    if (!debugSymTab || LibosOk != LibosElfMapSection(image, debugSymTab, &pThis->symtabStart, &pThis->symtabEnd))
+    LibosElfSectionHeaderPtr debugSymTab = LibosElfFindSectionByName(image, ".symtab");
+    if (debugSymTab.raw == NULL || LibosOk != LibosElfMapSection(image, debugSymTab, &pThis->symtabStart, &pThis->symtabEnd))
         pThis->symtabStart = pThis->symtabEnd = 0;
 
-    LibosElf64SectionHeader * debugStrTab = LibosElfFindSectionByName(image, ".strtab");
-    if (!debugStrTab || LibosOk != LibosElfMapSection(image, debugStrTab, &pThis->strtabStart, &pThis->strtabEnd))
+    LibosElfSectionHeaderPtr debugStrTab = LibosElfFindSectionByName(image, ".strtab");
+    if (debugStrTab.raw == NULL || LibosOk != LibosElfMapSection(image, debugStrTab, &pThis->strtabStart, &pThis->strtabEnd))
         pThis->strtabStart = pThis->strtabEnd = 0;
 
     libosDwarfBuildTables(pThis);

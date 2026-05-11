@@ -22,24 +22,9 @@
  */
 
 #include "nvidia-3d-pascal.h"
-#include "nvidia-3d-maxwell.h"
 #include "nvidia-3d.h"
 
-#include "class/clc197.h" /* NVC197_SET_GO_IDLE_TIMEOUT */
 #include "class/clc097tex.h"
-#include <class/cla06fsubch.h>
-
-void _nv3dInitChannelPascal(Nv3dChannelRec *p3dChannel)
-{
-    NvPushChannelPtr p = p3dChannel->pPushChannel;
-
-    _nv3dInitChannelMaxwell(p3dChannel);
-
-    if (!p3dChannel->hasFrameBoundaries) {
-        nvPushMethod(p, NVA06F_SUBCHANNEL_3D, NVC197_SET_GO_IDLE_TIMEOUT, 1);
-        nvPushSetMethodData(p, 0x800);
-    }
-}
 
 void _nv3dAssignNv3dTexturePascal(
     Nv3dRenderTexInfo info,

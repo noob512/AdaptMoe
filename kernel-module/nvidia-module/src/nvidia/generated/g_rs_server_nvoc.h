@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2015-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2015-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -49,6 +49,11 @@ extern "C" {
 #include "resserv/rs_client.h"
 #include "nvoc/object.h"
 
+#if !defined(PORT_ATOMIC)
+// UTF
+#define PORT_ATOMIC volatile
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -69,14 +74,14 @@ enum CLIENT_LOCK_TYPE
  */
 struct CLIENT_ENTRY
 {
-    PORT_RWLOCK    *pLock;
-    struct RsClient       *pClient;
-    NvHandle        hClient;
-    NvU64           lockOwnerTid; ///< Thread id of the write lock owner
-    volatile NvU32  lockReadOwnerCnt;
-    NvU32           refCount;
-    NvBool          bPendingFree;
-    ListNode        node;
+    PORT_RWLOCK        *pLock;
+    struct RsClient           *pClient;
+    NvHandle           hClient;
+    NvU64              lockOwnerTid; ///< Thread id of the write lock owner
+    PORT_ATOMIC NvU32  lockReadOwnerCnt;
+    PORT_ATOMIC NvU32  refCount;
+    NvBool             bPendingFree;
+    ListNode           node;
 
 #if LOCK_VAL_ENABLED
     LOCK_VAL_LOCK   lockVal;
@@ -122,7 +127,7 @@ struct RsShared {
     struct RsShared *__nvoc_pbase_RsShared;    // shr
 
     // Data members
-    NvS32 refCount;
+    _Atomic(NvS32) refCount;
     struct MapNode node;
 };
 
@@ -133,13 +138,9 @@ struct NVOC_METADATA__RsShared {
     const struct NVOC_METADATA__Object metadata__Object;
 };
 
-#ifndef __NVOC_CLASS_RsShared_TYPEDEF__
-#define __NVOC_CLASS_RsShared_TYPEDEF__
-typedef struct RsShared RsShared;
-#endif /* __NVOC_CLASS_RsShared_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_RsShared
-#define __nvoc_class_id_RsShared 0x830542
+#define __nvoc_class_id_RsShared 0x830542u
+typedef struct RsShared RsShared;
 #endif /* __nvoc_class_id_RsShared */
 
 // Casting support
@@ -158,19 +159,27 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_RsShared;
 NV_STATUS __nvoc_objCreateDynamic_RsShared(RsShared**, Dynamic*, NvU32, va_list);
 
 NV_STATUS __nvoc_objCreate_RsShared(RsShared**, Dynamic*, NvU32);
-#define __objCreate_RsShared(ppNewObj, pParent, createFlags) \
-    __nvoc_objCreate_RsShared((ppNewObj), staticCast((pParent), Dynamic), (createFlags))
+#define __objCreate_RsShared(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags) \
+    __nvoc_objCreate_RsShared((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags))
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS shrConstruct_IMPL(struct RsShared *pShared);
+#define __nvoc_shrConstruct(pShared) shrConstruct_IMPL(pShared)
+
+void shrDestruct_IMPL(struct RsShared *pShared);
+#define __nvoc_shrDestruct(pShared) shrDestruct_IMPL(pShared)
+
+
+// Wrapper macros for halified functions
 
 // Dispatch functions
-NV_STATUS shrConstruct_IMPL(struct RsShared *arg_pShared);
-
-#define __nvoc_shrConstruct(arg_pShared) shrConstruct_IMPL(arg_pShared)
-void shrDestruct_IMPL(struct RsShared *pShared);
-
-#define __nvoc_shrDestruct(pShared) shrDestruct_IMPL(pShared)
+// Virtual method declarations and/or inline definitions
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 MAKE_INTRUSIVE_MAP(RsSharedMap, RsShared, node);
@@ -235,13 +244,9 @@ struct NVOC_METADATA__RsSession {
     const struct NVOC_VTABLE__RsSession vtable;
 };
 
-#ifndef __NVOC_CLASS_RsSession_TYPEDEF__
-#define __NVOC_CLASS_RsSession_TYPEDEF__
-typedef struct RsSession RsSession;
-#endif /* __NVOC_CLASS_RsSession_TYPEDEF__ */
-
 #ifndef __nvoc_class_id_RsSession
-#define __nvoc_class_id_RsSession 0x830d90
+#define __nvoc_class_id_RsSession 0x830d90u
+typedef struct RsSession RsSession;
 #endif /* __nvoc_class_id_RsSession */
 
 // Casting support
@@ -260,11 +265,58 @@ extern const struct NVOC_CLASS_DEF __nvoc_class_def_RsSession;
 NV_STATUS __nvoc_objCreateDynamic_RsSession(RsSession**, Dynamic*, NvU32, va_list);
 
 NV_STATUS __nvoc_objCreate_RsSession(RsSession**, Dynamic*, NvU32);
-#define __objCreate_RsSession(ppNewObj, pParent, createFlags) \
-    __nvoc_objCreate_RsSession((ppNewObj), staticCast((pParent), Dynamic), (createFlags))
+#define __objCreate_RsSession(__nvoc_ppNewObj, __nvoc_pParent, __nvoc_createFlags) \
+    __nvoc_objCreate_RsSession((__nvoc_ppNewObj), staticCast((__nvoc_pParent), Dynamic), (__nvoc_createFlags))
 
 
-// Wrapper macros
+// Wrapper macros for implementation functions
+NV_STATUS sessionConstruct_IMPL(struct RsSession *pSession);
+#define __nvoc_sessionConstruct(pSession) sessionConstruct_IMPL(pSession)
+
+void sessionDestruct_IMPL(struct RsSession *pSession);
+#define __nvoc_sessionDestruct(pSession) sessionDestruct_IMPL(pSession)
+
+NV_STATUS sessionAddDependant_IMPL(struct RsSession *pSession, struct RsResourceRef *pResourceRef);
+#ifdef __nvoc_rs_server_h_disabled
+static inline NV_STATUS sessionAddDependant(struct RsSession *pSession, struct RsResourceRef *pResourceRef) {
+    NV_ASSERT_FAILED_PRECOMP("RsSession was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_rs_server_h_disabled
+#define sessionAddDependant(pSession, pResourceRef) sessionAddDependant_IMPL(pSession, pResourceRef)
+#endif // __nvoc_rs_server_h_disabled
+
+NV_STATUS sessionAddDependency_IMPL(struct RsSession *pSession, struct RsResourceRef *pResourceRef);
+#ifdef __nvoc_rs_server_h_disabled
+static inline NV_STATUS sessionAddDependency(struct RsSession *pSession, struct RsResourceRef *pResourceRef) {
+    NV_ASSERT_FAILED_PRECOMP("RsSession was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_rs_server_h_disabled
+#define sessionAddDependency(pSession, pResourceRef) sessionAddDependency_IMPL(pSession, pResourceRef)
+#endif // __nvoc_rs_server_h_disabled
+
+NV_STATUS sessionCheckLocksForAdd_IMPL(struct RsSession *pSession, struct RsResourceRef *pResourceRef);
+#ifdef __nvoc_rs_server_h_disabled
+static inline NV_STATUS sessionCheckLocksForAdd(struct RsSession *pSession, struct RsResourceRef *pResourceRef) {
+    NV_ASSERT_FAILED_PRECOMP("RsSession was disabled!");
+    return NV_ERR_NOT_SUPPORTED;
+}
+#else // __nvoc_rs_server_h_disabled
+#define sessionCheckLocksForAdd(pSession, pResourceRef) sessionCheckLocksForAdd_IMPL(pSession, pResourceRef)
+#endif // __nvoc_rs_server_h_disabled
+
+void sessionCheckLocksForRemove_IMPL(struct RsSession *pSession, struct RsResourceRef *pResourceRef);
+#ifdef __nvoc_rs_server_h_disabled
+static inline void sessionCheckLocksForRemove(struct RsSession *pSession, struct RsResourceRef *pResourceRef) {
+    NV_ASSERT_FAILED_PRECOMP("RsSession was disabled!");
+}
+#else // __nvoc_rs_server_h_disabled
+#define sessionCheckLocksForRemove(pSession, pResourceRef) sessionCheckLocksForRemove_IMPL(pSession, pResourceRef)
+#endif // __nvoc_rs_server_h_disabled
+
+
+// Wrapper macros for halified functions
 #define sessionRemoveDependant_FNPTR(pSession) pSession->__nvoc_metadata_ptr->vtable.__sessionRemoveDependant__
 #define sessionRemoveDependant(pSession, pResourceRef) sessionRemoveDependant_DISPATCH(pSession, pResourceRef)
 #define sessionRemoveDependency_FNPTR(pSession) pSession->__nvoc_metadata_ptr->vtable.__sessionRemoveDependency__
@@ -279,59 +331,16 @@ static inline void sessionRemoveDependency_DISPATCH(struct RsSession *pSession, 
     pSession->__nvoc_metadata_ptr->vtable.__sessionRemoveDependency__(pSession, pResourceRef);
 }
 
+// Virtual method declarations and/or inline definitions
 void sessionRemoveDependant_IMPL(struct RsSession *pSession, struct RsResourceRef *pResourceRef);
 
 void sessionRemoveDependency_IMPL(struct RsSession *pSession, struct RsResourceRef *pResourceRef);
 
-NV_STATUS sessionConstruct_IMPL(struct RsSession *arg_pSession);
-
-#define __nvoc_sessionConstruct(arg_pSession) sessionConstruct_IMPL(arg_pSession)
-void sessionDestruct_IMPL(struct RsSession *pSession);
-
-#define __nvoc_sessionDestruct(pSession) sessionDestruct_IMPL(pSession)
-NV_STATUS sessionAddDependant_IMPL(struct RsSession *pSession, struct RsResourceRef *pResourceRef);
-
-#ifdef __nvoc_rs_server_h_disabled
-static inline NV_STATUS sessionAddDependant(struct RsSession *pSession, struct RsResourceRef *pResourceRef) {
-    NV_ASSERT_FAILED_PRECOMP("RsSession was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_rs_server_h_disabled
-#define sessionAddDependant(pSession, pResourceRef) sessionAddDependant_IMPL(pSession, pResourceRef)
-#endif //__nvoc_rs_server_h_disabled
-
-NV_STATUS sessionAddDependency_IMPL(struct RsSession *pSession, struct RsResourceRef *pResourceRef);
-
-#ifdef __nvoc_rs_server_h_disabled
-static inline NV_STATUS sessionAddDependency(struct RsSession *pSession, struct RsResourceRef *pResourceRef) {
-    NV_ASSERT_FAILED_PRECOMP("RsSession was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_rs_server_h_disabled
-#define sessionAddDependency(pSession, pResourceRef) sessionAddDependency_IMPL(pSession, pResourceRef)
-#endif //__nvoc_rs_server_h_disabled
-
-NV_STATUS sessionCheckLocksForAdd_IMPL(struct RsSession *pSession, struct RsResourceRef *pResourceRef);
-
-#ifdef __nvoc_rs_server_h_disabled
-static inline NV_STATUS sessionCheckLocksForAdd(struct RsSession *pSession, struct RsResourceRef *pResourceRef) {
-    NV_ASSERT_FAILED_PRECOMP("RsSession was disabled!");
-    return NV_ERR_NOT_SUPPORTED;
-}
-#else //__nvoc_rs_server_h_disabled
-#define sessionCheckLocksForAdd(pSession, pResourceRef) sessionCheckLocksForAdd_IMPL(pSession, pResourceRef)
-#endif //__nvoc_rs_server_h_disabled
-
-void sessionCheckLocksForRemove_IMPL(struct RsSession *pSession, struct RsResourceRef *pResourceRef);
-
-#ifdef __nvoc_rs_server_h_disabled
-static inline void sessionCheckLocksForRemove(struct RsSession *pSession, struct RsResourceRef *pResourceRef) {
-    NV_ASSERT_FAILED_PRECOMP("RsSession was disabled!");
-}
-#else //__nvoc_rs_server_h_disabled
-#define sessionCheckLocksForRemove(pSession, pResourceRef) sessionCheckLocksForRemove_IMPL(pSession, pResourceRef)
-#endif //__nvoc_rs_server_h_disabled
-
+// Exported method declarations and/or inline definitions
+// HAL method declarations without bodies
+// Inline HAL method definitions
+// Static dispatch method declarations
+// Static inline method definitions
 #undef PRIVATE_FIELD
 
 
@@ -419,8 +428,8 @@ struct RsServer
     NvU32                     internalHandleBase;
     NvU32                     clientHandleBase;
 
-    NvU32                     activeClientCount;
-    NvU64                     activeResourceCount;
+    PORT_ATOMIC NvU32         activeClientCount;
+    PORT_ATOMIC NvU64         activeResourceCount;
 
     /// List of clients that are de-activated and pending free
     RsDisabledClientList      disabledClientList;
@@ -835,8 +844,9 @@ extern void serverSessionLock_Epilogue(RsServer *pServer, LOCK_ACCESS_TYPE acces
  * @param[in]       access          LOCK_ACCESS_READ or LOCK_ACCESS_WRITE
  * @param[inout]    pLockInfo       Lock state
  * @param[inout]    pReleaseFlags   Output flags indicating the locks that need to be released
+ * @param[in]       gpuMask         Bitmask of additional GPUs to lock
  */
-extern NV_STATUS serverResLock_Prologue(RsServer *pServer, LOCK_ACCESS_TYPE access, RS_LOCK_INFO *pLockInfo, NvU32 *pReleaseFlags);
+extern NV_STATUS serverResLock_Prologue(RsServer *pServer, LOCK_ACCESS_TYPE access, RS_LOCK_INFO *pLockInfo, NvU32 *pReleaseFlags, NvU32 gpuMask);
 
 /**
  * Releases a resource-level lock. User-implemented.

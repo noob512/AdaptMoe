@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -33,8 +33,10 @@
 #include "gpu/gpu.h"
 #include "gpu/mem_mgr/mem_mgr.h"
 #include "gpu/mem_mgr/heap.h"
+#include "gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.h"
 #include "kernel/gpu/mig_mgr/kernel_mig_manager.h"
 #include "kernel/gpu/fifo/kernel_fifo.h"
+#include "kernel/gpu/nvlink/kernel_nvlink.h"
 #include "gpu/conf_compute/conf_compute_api.h"
 #include "gpu/subdevice/subdevice.h"
 #include "class/clcb33.h" // NV_CONFIDENTIAL_COMPUTE
@@ -73,6 +75,8 @@ confComputeApiCtrlCmdSystemGetCapabilities_IMPL
 {
     OBJSYS    *pSys = SYS_GET_INSTANCE();
     CONF_COMPUTE_CAPS *pCcCaps = pConfComputeApi->pCcCaps;
+    NvU32 gpuCount = 0;
+    NvU32 gpuMask  = 0;
 
     NV_ASSERT_OR_RETURN(rmapiLockIsOwner() && rmGpuLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
 
@@ -132,13 +136,15 @@ confComputeApiCtrlCmdSystemGetCapabilities_IMPL
         pParams->environment = NV_CONF_COMPUTE_SYSTEM_ENVIRONMENT_SIM;
     }
 
+    gpumgrGetGpuAttachInfo(&gpuCount, &gpuMask);
+
     if (pCcCaps->bMultiGpuProtectedPcieModeEnabled)
     {
         // Do not advertise HCC as ON to callers when PPCIe is ON
         pParams->ccFeature = NV_CONF_COMPUTE_SYSTEM_FEATURE_DISABLED;
         pParams->multiGpuMode = NV_CONF_COMPUTE_SYSTEM_MULTI_GPU_MODE_PROTECTED_PCIE;
     }
-    else if (pCcCaps->bMultiGpuNvleModeEnabled)
+    else if (pCcCaps->bMultiGpuNvleModeEnabled && gpuCount > 1)
     {
         pParams->multiGpuMode = NV_CONF_COMPUTE_SYSTEM_MULTI_GPU_MODE_NVLE;
     }
@@ -171,7 +177,7 @@ confComputeApiCtrlCmdSystemSetGpusState_IMPL
     NvU32      gpuMask;
     NvU32      gpuInstance = 0;
     RM_API    *pRmApi      = NULL;
-    NV_STATUS  status = NV_OK;
+    NV_STATUS  status      = NV_OK;
     NV2080_CTRL_CMD_INTERNAL_CONF_COMPUTE_SET_GPU_STATE_PARAMS params = {0};
 
     NV_ASSERT_OR_RETURN(rmapiLockIsOwner() && rmGpuLockIsOwner(), NV_ERR_INVALID_LOCK_STATE);
@@ -191,6 +197,14 @@ confComputeApiCtrlCmdSystemSetGpusState_IMPL
 
     while ((pGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
     {
+
+    KernelNvlink *pKernelNvlink = GPU_GET_KERNEL_NVLINK(pGpu);
+    if (pKernelNvlink && pKernelNvlink->getProperty(pGpu, PDB_PROP_KNVLINK_ENCRYPTION_ENABLED))
+    {
+        // Update NVLE related topology infomation for all the GPUs 
+        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, knvlinkSetupNvleRemapTables(pGpu, pKernelNvlink));
+    }
+
         if (IS_VIRTUAL(pGpu))
             return NV_ERR_NOT_SUPPORTED;
 
@@ -253,8 +267,8 @@ confComputeApiCtrlCmdGpuGetVidmemSize_IMPL
              pHeap = pMemoryPartitionHeap;
     }
 
-    pmaGetTotalProtectedMemory(&pHeap->pmaObject, &totalProtectedBytes);
-    pmaGetTotalUnprotectedMemory(&pHeap->pmaObject, &totalUnprotectedBytes);
+    pmaGetTotalProtectedMemory(pHeap->pPmaObject, &totalProtectedBytes);
+    pmaGetTotalUnprotectedMemory(pHeap->pPmaObject, &totalUnprotectedBytes);
 
     pParams->protectedMemSizeInKb = totalProtectedBytes >> 10;
     pParams->unprotectedMemSizeInKb = totalUnprotectedBytes >> 10;

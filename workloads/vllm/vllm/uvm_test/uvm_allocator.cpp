@@ -22,6 +22,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <cstdarg>
+#include <cerrno>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -79,6 +81,47 @@ constexpr PhaseFUuid CPU_UUID = {{
     0x50, 0x47, 0x41, 0x2c, 0x14, 0x2a, 0x77, 0x73
 }};
 
+std::mutex phase_f_log_mutex;
+
+const char* phase_f_action_name(uint32_t action) {
+    switch (action) {
+        case UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU:
+            return "PREFETCH_CPU";
+        case UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU:
+            return "PREFETCH_GPU";
+        case UVM_TEST_PHASE_F_ACTION_ADVISE_CPU:
+            return "ADVISE_CPU";
+        case UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY:
+            return "QUERY_RESIDENCY";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+void phase_f_debug_log(const char* fmt, ...) {
+    const char* path = std::getenv("VLLM_UVM_PHASE_F_DEBUG_LOG");
+    if (path == nullptr || path[0] == '\0') return;
+
+    std::lock_guard<std::mutex> guard(phase_f_log_mutex);
+    FILE* fp = std::fopen(path, "a");
+    if (fp == nullptr) return;
+
+    auto now = std::chrono::system_clock::now();
+    auto now_time = std::chrono::system_clock::to_time_t(now);
+    struct tm tm_buf;
+    gmtime_r(&now_time, &tm_buf);
+    char ts[64];
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+
+    std::fprintf(fp, "[%s] ", ts);
+    va_list args;
+    va_start(args, fmt);
+    std::vfprintf(fp, fmt, args);
+    va_end(args);
+    std::fprintf(fp, "\n");
+    std::fclose(fp);
+}
+
 bool get_cuda_device_uuid(int device, PhaseFUuid* uuid) {
     if (uuid == nullptr) return false;
     if (device < 0) {
@@ -120,6 +163,8 @@ int uvm_driver_batch_execute_internal(const uintptr_t* ptrs,
     if ((action == UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU ||
          action == UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY) &&
         !get_cuda_device_uuid(device, &params.gpu_uuid)) {
+        phase_f_debug_log("driver_batch action=%s count=%zu device=%d uuid_lookup_failed",
+                          phase_f_action_name(action), count, device);
         return -3;
     }
 
@@ -129,23 +174,75 @@ int uvm_driver_batch_execute_internal(const uintptr_t* ptrs,
     }
 
     int fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
-    if (fd < 0) return -4;
+    if (fd < 0) {
+        phase_f_debug_log("driver_batch action=%s count=%zu open_failed errno=%d",
+                          phase_f_action_name(action), count, errno);
+        return -4;
+    }
 
     UvmInitializeParams init_params{};
     if (ioctl(fd, UVM_INITIALIZE_IOCTL, &init_params) != 0 ||
         init_params.rmStatus != 0) {
+        int saved_errno = errno;
+        phase_f_debug_log("driver_batch action=%s count=%zu init_failed errno=%d rmStatus=%u",
+                          phase_f_action_name(action), count, saved_errno,
+                          init_params.rmStatus);
         close(fd);
         return -5;
     }
 
+    phase_f_debug_log("driver_batch action=%s count=%zu device=%d async=%d ioctl_begin first_base=0x%llx first_len=%llu",
+                      phase_f_action_name(action), count, device, async,
+                      count > 0 ? (unsigned long long)params.ranges[0].base : 0ULL,
+                      count > 0 ? (unsigned long long)params.ranges[0].length : 0ULL);
     int ret = ioctl(fd, UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL, &params);
+    int saved_errno = errno;
     close(fd);
+    phase_f_debug_log("driver_batch action=%s count=%zu ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u first_status=%u",
+                      phase_f_action_name(action), count, ret, saved_errno,
+                      params.rmStatus, params.success_count, params.failure_count,
+                      count > 0 ? params.results[0].status : 0);
     if (ret != 0) return -6;
     if (failure_count_out != nullptr) *failure_count_out = params.failure_count;
     if (params.rmStatus != 0 && params.success_count == 0) {
         return -static_cast<int>(params.rmStatus);
     }
     return static_cast<int>(params.success_count);
+}
+
+int uvm_driver_phase_f_ping_internal() {
+    PhaseFBatchExecutorParams params{};
+    params.action = UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY;
+    params.count = 0;
+    params.async = 0;
+    params.gpu_uuid = CPU_UUID;
+
+    int fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        phase_f_debug_log("driver_ping open_failed errno=%d", errno);
+        return -4;
+    }
+
+    UvmInitializeParams init_params{};
+    if (ioctl(fd, UVM_INITIALIZE_IOCTL, &init_params) != 0 ||
+        init_params.rmStatus != 0) {
+        int saved_errno = errno;
+        phase_f_debug_log("driver_ping init_failed errno=%d rmStatus=%u",
+                          saved_errno, init_params.rmStatus);
+        close(fd);
+        return -5;
+    }
+
+    phase_f_debug_log("driver_ping ioctl_begin");
+    int ret = ioctl(fd, UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL, &params);
+    int saved_errno = errno;
+    close(fd);
+    phase_f_debug_log("driver_ping ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u",
+                      ret, saved_errno, params.rmStatus,
+                      params.success_count, params.failure_count);
+    if (ret != 0) return -6;
+    if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+    return 0;
 }
 
 }  // namespace
@@ -4337,6 +4434,10 @@ int uvm_driver_batch_prefetch_cpu(const uintptr_t* ptrs,
         -1,
         async,
         nullptr);
+}
+
+int uvm_driver_phase_f_ping() {
+    return uvm_driver_phase_f_ping_internal();
 }
 
 int uvm_driver_batch_prefetch_gpu(const uintptr_t* ptrs,

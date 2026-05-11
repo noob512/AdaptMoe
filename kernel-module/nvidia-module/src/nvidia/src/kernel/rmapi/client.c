@@ -90,6 +90,7 @@ rmclientConstruct_IMPL
     pClient->pSecurityToken  = NULL;
     pClient->pOSInfo         = pSecInfo->clientOSInfo;
     pClient->imexChannel     = -1;
+    pClient->clientGfid      = GPU_GFID_PF;
 
     pClient->cachedPrivilege = pSecInfo->privLevel;
 
@@ -166,7 +167,7 @@ rmclientConstruct_IMPL
         bReleaseLock = NV_TRUE;
     }
 
-    _registerOSInfo(pClient, pClient->pOSInfo);
+    NV_ASSERT_OK_OR_GOTO(status, _registerOSInfo(pClient, pClient->pOSInfo), out);
 
     pClient->bIsClientVirtualMode = (pSecInfo->pProcessToken != NULL);
 
@@ -202,21 +203,27 @@ rmclientConstruct_IMPL
 
                 if (pSecurityToken != NULL && !pClient->bIsClientVirtualMode)
                     portMemFree(pSecurityToken);
+
+                goto out;
             }
         }
     }
 
     if (listAppendValue(&g_clientListBehindGpusLock, (void*)&pClient) == NULL)
+    {
         status = NV_ERR_INSUFFICIENT_RESOURCES;
+        goto out;
+    }
 
     if (bReleaseLock)
     {
         // UNLOCK: release GPUs lock
         rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+        bReleaseLock = NV_FALSE;
     }
 
     // RM gets the client handle from the allocation parameters
-    if (status == NV_OK && pParams->pAllocParams != NULL)
+    if (pParams->pAllocParams != NULL)
         *(NvHandle*)(pParams->pAllocParams) = pParams->hClient;
 
     eventSystemInitEventQueue(&pClient->CliSysEventInfo.eventQueue);
@@ -224,12 +231,33 @@ rmclientConstruct_IMPL
     NV_PRINTF(LEVEL_INFO, "New RM Client: hClient=0x%08x (%c), ProcID=%u, name='%s'\n",
         pRsClient->hClient, (pRsClient->type == CLIENT_TYPE_USER) ? 'U' : 'K', pClient->ProcID, pClient->name);
 
+    return NV_OK;
+
 out:
-    if (status != NV_OK)
+    if (pClient->pUserInfo != NULL)
     {
-        osPutPidInfo(pClient->pOsPidInfo);
-        pClient->pOsPidInfo = NULL;
+        _unregisterUserInfo(pClient->pUserInfo);
+        pClient->pUserInfo = NULL;
     }
+
+    if (pClient->pSecurityToken != NULL && !pClient->bIsClientVirtualMode)
+    {
+        portMemFree(pClient->pSecurityToken);
+        pClient->pSecurityToken = NULL;
+    }
+
+    _unregisterOSInfo(pClient, pClient->pOSInfo);
+
+    // Clean up on error path
+    if (bReleaseLock)
+    {
+        // UNLOCK: release GPUs lock
+        rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+        bReleaseLock = NV_FALSE;
+    }
+
+    osPutPidInfo(pClient->pOsPidInfo);
+    pClient->pOsPidInfo = NULL;
 
     return status;
 }
@@ -248,10 +276,9 @@ rmclientDestruct_IMPL
     // Bug 4193761 - allow internal clients to be created with the GPU lock,
     // GR-2409 will remove the possible race condition with the client list.
     //
-    NV_ASSERT_OR_ELSE(rmapiLockIsWriteOwner() ||
+    NV_ASSERT(rmapiLockIsWriteOwner() ||
         (serverIsClientInternal(&g_resServ, staticCast(pClient, RsClient)->hClient) &&
-         rmGpuLockIsOwner()),
-        return);
+         rmGpuLockIsOwner()));
 
     NV_PRINTF(LEVEL_INFO, "    type: client\n");
 
@@ -321,12 +348,14 @@ rmclientInterMap_IMPL
     // Use virtual MapTo to perform the class-specific mapping to pMapperRef
     portMemSet(&mapToParams, 0, sizeof(mapToParams));
 
-    mapToParams.pMemoryRef = pMappableRef;
-    mapToParams.offset     = pParams->offset;
-    mapToParams.length     = pParams->length;
-    mapToParams.flags      = pParams->flags;
-    mapToParams.pDmaOffset = &pParams->dmaOffset;
-    mapToParams.ppMemDesc = (MEMORY_DESCRIPTOR**)&pParams->pMemDesc;
+    mapToParams.pMemoryRef   = pMappableRef;
+    mapToParams.offset       = pParams->offset;
+    mapToParams.length       = pParams->length;
+    mapToParams.flags        = pParams->flags;
+    mapToParams.flags2       = pParams->flags2;
+    mapToParams.kindOverride = pParams->kindOverride;
+    mapToParams.pDmaOffset   = &pParams->dmaOffset;
+    mapToParams.ppMemDesc    = (MEMORY_DESCRIPTOR**)&pParams->pMemDesc;
 
     mapToParams.pGpu             = pPrivate->pGpu;
     mapToParams.pSrcGpu          = pPrivate->pSrcGpu;
@@ -812,11 +841,14 @@ rmclientFreeResource_IMPL
     NvBool bBcState;
     NvBool bRestoreBcState = NV_FALSE;
     RsClient *pRsClient = staticCast(pClient, RsClient);
+    NvU32  prevGpuInst = NV_U32_MAX;
 
     if (gpuGetByRef(pRmFreeParams->pResourceRef, NULL, &pGpu) == NV_OK)
     {
         bBcState = gpumgrGetBcEnabledStatus(pGpu);
         bRestoreBcState = NV_TRUE;
+
+        prevGpuInst = gpumgrSetCurrentGpuInstance(pGpu->gpuInstance);
     }
 
     rmapiFreeResourcePrologue(pRmFreeParams);
@@ -836,18 +868,21 @@ rmclientFreeResource_IMPL
     if (bRestoreBcState)
     {
         gpumgrSetBcEnabledStatus(pGpu, bBcState);
+        gpumgrSetCurrentGpuInstance(prevGpuInst);
     }
     return status;
 }
 
 static NvBool _rmclientIsCapable
 (
-    NvHandle hClient,
+    RsClient *pRsClient,
     NvU32 capability
 )
 {
     NvU32 internalClassId;
     RsResourceRef *pResourceRef = NULL;
+    NvHandle  hClient = pRsClient->hClient;
+    NvBool bSearchDescenants = NV_FALSE;
 
     switch(capability)
     {
@@ -878,11 +913,28 @@ static NvBool _rmclientIsCapable
         }
     }
 
-    // Check if client has allocated a given class
-    pResourceRef = serverutilFindChildRefByType(hClient, hClient, internalClassId, NV_TRUE);
-    if (pResourceRef == NULL)
+    if (bSearchDescenants)
     {
+        RS_ITERATOR devIt;
+
+        devIt = clientRefIter(pRsClient, NULL, internalClassId, RS_ITERATE_DESCENDANTS, NV_TRUE);
+        while (clientRefIterNext(pRsClient, &devIt))
+        {
+            if (objDynamicCastById(devIt.pResourceRef->pResource, internalClassId))
+            {
+                return NV_TRUE;
+            }
+        }
         return NV_FALSE;
+    }
+    else
+    {
+        // Check if client has allocated a given class under root client.
+        pResourceRef = serverutilFindChildRefByType(hClient, hClient, internalClassId, NV_TRUE);
+        if (pResourceRef == NULL)
+        {
+            return NV_FALSE;
+        }
     }
 
     return NV_TRUE;
@@ -895,15 +947,13 @@ NvBool rmclientIsCapableOrAdmin_IMPL
     RS_PRIV_LEVEL privLevel
 )
 {
-    RsClient *pRsClient = staticCast(pClient, RsClient);
-    NvHandle  hClient = pRsClient->hClient;
 
     if (rmclientIsAdmin(pClient, privLevel))
     {
         return NV_TRUE;
     }
 
-    return _rmclientIsCapable(hClient, capability);
+    return _rmclientIsCapable(staticCast(pClient, RsClient), capability);
 }
 
 NvBool rmclientIsCapable_IMPL
@@ -912,10 +962,7 @@ NvBool rmclientIsCapable_IMPL
     NvU32 capability
 )
 {
-    RsClient *pRsClient = staticCast(pClient, RsClient);
-    NvHandle  hClient = pRsClient->hClient;
-
-    return _rmclientIsCapable(hClient, capability);
+    return _rmclientIsCapable(staticCast(pClient, RsClient), capability);
 }
 
 /**

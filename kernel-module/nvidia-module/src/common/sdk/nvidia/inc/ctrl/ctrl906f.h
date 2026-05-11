@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2007-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2007-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  * 
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -127,12 +127,13 @@ typedef struct NV906F_CTRL_GET_CLASS_ENGINEID_PARAMS {
 #define NV906F_CTRL_CMD_RESET_CHANNEL_REASON_DEFAULT             0
 #define NV906F_CTRL_CMD_RESET_CHANNEL_REASON_VERIF               1
 #define NV906F_CTRL_CMD_RESET_CHANNEL_REASON_MMU_FLT             2
-#define NV906F_CTRL_CMD_RESET_CHANNEL_REASON_ENUM_MAX            3
+#define NV906F_CTRL_CMD_RESET_CHANNEL_REASON_KILL_PROCESS        3
+#define NV906F_CTRL_CMD_RESET_CHANNEL_REASON_ENUM_MAX            4
 /*
  * Internal values for NV906F_CTRL_CMD_RESET_REASON. External values will be
  * checked and enforced to be < NV906F_CTRL_CMD_RESET_CHANNEL_REASON_ENUM_MAX
  */
-#define NV906F_CTRL_CMD_INTERNAL_RESET_CHANNEL_REASON_FAKE_ERROR (0x4) /* finn: Evaluated from "NV906F_CTRL_CMD_RESET_CHANNEL_REASON_ENUM_MAX + 1" */
+#define NV906F_CTRL_CMD_INTERNAL_RESET_CHANNEL_REASON_FAKE_ERROR (0x5) /* finn: Evaluated from "NV906F_CTRL_CMD_RESET_CHANNEL_REASON_ENUM_MAX + 1" */
 
 
 #define NV906F_CTRL_CMD_RESET_CHANNEL                            (0x906f0102) /* finn: Evaluated from "((FINN_GF100_CHANNEL_GPFIFO_GPFIFO_INTERFACE_ID << 8) | NV906F_CTRL_CMD_RESET_CHANNEL_PARAMS_MESSAGE_ID)" */

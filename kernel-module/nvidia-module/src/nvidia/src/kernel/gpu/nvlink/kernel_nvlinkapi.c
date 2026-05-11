@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -53,6 +53,9 @@ subdeviceCtrlCmdNvlinkGetErrorRecoveries_IMPL
                                      kmigmgrIsMIGNvlinkP2PSupported(pGpu, pKernelMIGManager));
     NV_STATUS  status  = NV_OK;
     NvU32      i;
+    NVLINK_BIT_VECTOR localLinkMask;
+    NVLINK_BIT_VECTOR *pEnabledLinkMask;
+    NVLINK_BIT_VECTOR matchingLinkMask;
 
     if ((pKernelNvlink == NULL) || !bMIGNvLinkP2PSupported)
     {
@@ -60,14 +63,32 @@ subdeviceCtrlCmdNvlinkGetErrorRecoveries_IMPL
         return NV_ERR_NOT_SUPPORTED;
     }
 
-    FOR_EACH_INDEX_IN_MASK(32, i, pParams->linkMask & KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 32))
+    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+        convertLinkMasksToBitVector(&pParams->linkMask, sizeof(pParams->linkMask),
+                                    &pParams->links, &localLinkMask));
+
+    pEnabledLinkMask = knvlinkGetEnabledLinkMask(pGpu, pKernelNvlink);
+
+    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, bitVectorClrAll(&matchingLinkMask));
+
+    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+        bitVectorAnd(&matchingLinkMask, &localLinkMask, pEnabledLinkMask));
+
+    FOR_EACH_IN_BITVECTOR(&matchingLinkMask, i)
     {
+        // errorRecoveries will need to be updated to handle greater than NVLINK_MAX_LINKS_SW
+        if (i >= NVLINK_MAX_LINKS_SW)
+        {
+            NV_PRINTF(LEVEL_ERROR, "Requested link exceeds max allowed links: %d\n", i);
+            break;
+        }
+
         pParams->numRecoveries[i] = pKernelNvlink->errorRecoveries[i];
 
         // Clear the counts
         pKernelNvlink->errorRecoveries[i] = 0;
     }
-    FOR_EACH_INDEX_IN_MASK_END;
+    FOR_EACH_IN_BITVECTOR_END();
 
     return status;
 }
@@ -90,6 +111,9 @@ subdeviceCtrlCmdNvlinkSetPowerState_IMPL
     NvBool bMIGNvLinkP2PSupported = ((pKernelMIGManager != NULL) &&
                                      kmigmgrIsMIGNvlinkP2PSupported(pGpu, pKernelMIGManager));
     NV_STATUS status  = NV_OK;
+    NVLINK_BIT_VECTOR localLinkMask;
+    NVLINK_BIT_VECTOR matchingLinkMask;
+    NVLINK_BIT_VECTOR *pEnabledLinkMask;
 
     if ((pKernelNvlink == NULL) || !bMIGNvLinkP2PSupported)
     {
@@ -97,8 +121,17 @@ subdeviceCtrlCmdNvlinkSetPowerState_IMPL
         return NV_ERR_NOT_SUPPORTED;
     }
 
+    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+        convertLinkMasksToBitVector(&pParams->linkMask, sizeof(pParams->linkMask),
+                                    &pParams->links, &localLinkMask));
+
+    pEnabledLinkMask = knvlinkGetEnabledLinkMask(pGpu, pKernelNvlink);
+
+    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+        bitVectorAnd(&matchingLinkMask, &localLinkMask, pEnabledLinkMask));
+
     // Verify the mask of links requested are enabled on the GPU
-    if ((pParams->linkMask & KNVLINK_GET_MASK(pKernelNvlink, enabledLinks, 32)) != pParams->linkMask)
+    if (!bitVectorTestEqual(&localLinkMask, &matchingLinkMask))
     {
         NV_PRINTF(LEVEL_INFO, "Links not enabled. Return.\n");
 
@@ -110,15 +143,15 @@ subdeviceCtrlCmdNvlinkSetPowerState_IMPL
         case NV2080_CTRL_NVLINK_POWER_STATE_L0:
         {
             status = knvlinkEnterExitSleep(pGpu, pKernelNvlink,
-                                           pParams->linkMask,
+                                           &localLinkMask,
                                            NV_FALSE);
 
             if (status == NV_WARN_MORE_PROCESSING_REQUIRED)
             {
                 NV_PRINTF(LEVEL_INFO,
-                          "Transition to L0 for GPU%d: linkMask 0x%x in progress... Waiting for "
+                          "Transition to L0 for GPU%d: linkMask "NV_BITVECTOR_INLINE_FMTX" in progress... Waiting for "
                           "remote endpoints to request L2 exit\n",
-                          pGpu->gpuInstance, pParams->linkMask);
+                          pGpu->gpuInstance, NV_BITVECTOR_INLINE_PRINTF_ARG(&localLinkMask));
 
                 return NV_WARN_MORE_PROCESSING_REQUIRED;
             }
@@ -126,8 +159,8 @@ subdeviceCtrlCmdNvlinkSetPowerState_IMPL
             if (status != NV_OK)
             {
                 NV_PRINTF(LEVEL_ERROR,
-                          "Error setting power state %d on linkmask 0x%x\n",
-                          pParams->powerState, pParams->linkMask);
+                          "Error setting power state %d on linkmask "NV_BITVECTOR_INLINE_FMTX"\n",
+                          pParams->powerState, NV_BITVECTOR_INLINE_PRINTF_ARG(&localLinkMask));
 
                 return status;
             }
@@ -137,15 +170,15 @@ subdeviceCtrlCmdNvlinkSetPowerState_IMPL
         case NV2080_CTRL_NVLINK_POWER_STATE_L2:
         {
             status = knvlinkEnterExitSleep(pGpu, pKernelNvlink,
-                                           pParams->linkMask,
+                                           &localLinkMask,
                                            NV_TRUE);
 
             if (status == NV_WARN_MORE_PROCESSING_REQUIRED)
             {
                 NV_PRINTF(LEVEL_INFO,
-                          "Transition to L2 for GPU%d: linkMask 0x%x in progress... Waiting for "
+                          "Transition to L2 for GPU%d: linkMask "NV_BITVECTOR_INLINE_FMTX" in progress... Waiting for "
                           "remote endpoints to request L2 entry\n",
-                          pGpu->gpuInstance, pParams->linkMask);
+                          pGpu->gpuInstance, NV_BITVECTOR_INLINE_PRINTF_ARG(&localLinkMask));
 
                 return NV_WARN_MORE_PROCESSING_REQUIRED;
             }
@@ -153,8 +186,8 @@ subdeviceCtrlCmdNvlinkSetPowerState_IMPL
             if (status != NV_OK)
             {
                 NV_PRINTF(LEVEL_ERROR,
-                          "Error setting power state %d on linkmask 0x%x\n",
-                          pParams->powerState, pParams->linkMask);
+                          "Error setting power state %d on linkmask "NV_BITVECTOR_INLINE_FMTX"\n",
+                          pParams->powerState, NV_BITVECTOR_INLINE_PRINTF_ARG(&localLinkMask));
 
                 return status;
             }
@@ -378,9 +411,6 @@ subdeviceCtrlCmdNvlinkGetLocalDeviceInfo_IMPL
     OBJGPU *pGpu = GPU_RES_GET_GPU(pSubdevice);
     KernelNvlink *pKernelNvlink = GPU_GET_KERNEL_NVLINK(pGpu);
 
-    if (pKernelNvlink == NULL)
-        return NV_ERR_NOT_SUPPORTED;
-
     pParams->localDeviceInfo.domain      = gpuGetDomain(pGpu);
     pParams->localDeviceInfo.bus         = gpuGetBus(pGpu);
     pParams->localDeviceInfo.device      = gpuGetDevice(pGpu);
@@ -396,6 +426,13 @@ subdeviceCtrlCmdNvlinkGetLocalDeviceInfo_IMPL
     }
 
     pParams->localDeviceInfo.fabricRecoveryStatusMask = 0x0;
+
+    if (IS_VIRTUAL(pGpu))
+        return NV_OK;
+
+    if (pKernelNvlink == NULL)
+        return NV_ERR_NOT_SUPPORTED;
+
     if (knvlinkGetDegradedMode(pGpu, pKernelNvlink))
     {
         pParams->localDeviceInfo.fabricRecoveryStatusMask =

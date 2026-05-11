@@ -1,1 +1,9 @@
-# Intentionally blank: keep files uploadable.
+.*.cmd
+*.ko
+*.mod
+*.mod.c
+conftest/
+conftest[0-9]*.c
+modules.order
+Module.symvers
+nv_compiler.h

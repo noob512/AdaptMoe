@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -27,6 +27,7 @@
 
 #include "rmconfig.h"
 #include "gpu/gsp/kernel_gsp.h"
+#include "gpu/rc/kernel_rc.h"
 
 #include "ctrl/ctrl2080/ctrl2080gpu.h"
 
@@ -72,8 +73,9 @@ kgspEccServiceUncorrError_GB100
     KernelGsp *pKernelGsp
 )
 {
-    NvU32 eccStatus = GPU_REG_RD32(pGpu, NV_PGSP_FALCON_ECC_STATUS);
-    NvU32 errorType = ROBUST_CHANNEL_GPU_ECC_DBE;
+    KernelRc *pKernelRc = GPU_GET_KERNEL_RC(pGpu);
+    NvU32     eccStatus = GPU_REG_RD32(pGpu, NV_PGSP_FALCON_ECC_STATUS);
+    NvU32     errorType = ROBUST_CHANNEL_GPU_ECC_DBE;
 
     NV_ASSERT_OR_RETURN_VOID(eccStatus != 0);
 
@@ -129,7 +131,12 @@ kgspEccServiceUncorrError_GB100
         MODS_ARCH_ERROR_PRINTF("NV_PGSP_FALCON_ECC_STATUS_UNCORRECTED_ERR_EMEM\n");
 
         pKernelGsp->bFatalError = NV_TRUE;
-        kgspRcAndNotifyAllChannels(pGpu, pKernelGsp, errorType, NV_TRUE);
+
+        if (pKernelRc != NULL)
+        {
+            krcRcAndNotifyAllChannels(pGpu, pKernelRc, errorType, NV_TRUE);
+        }
+
         NV_ASSERT_OK(gpuMarkDeviceForReset(pGpu));
     }
 
@@ -137,4 +144,5 @@ kgspEccServiceUncorrError_GB100
     gpuNotifySubDeviceEvent(pGpu, NV2080_NOTIFIERS_ECC_DBE, NULL, 0, 0,
                             (NvU16)NV2080_CTRL_GPU_ECC_UNIT_GSP);
     nvErrorLog_va((void *)pGpu, errorType, "GSP-RISCV uncorrectable ECC error");
+    nvErrorLog_va((void *)pGpu, UNCORRECTABLE_SRAM_ERROR, "GSP-RISCV, Uncorrectable SRAM error");
 }

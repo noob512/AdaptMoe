@@ -32,12 +32,13 @@
 #include "nvkms-api.h"
 
 #include <nvmisc.h>
+#include <ctrl/ctrlc372/ctrlc372chnc.h>
 
 static size_t GetSizeForType(NVDevEvoPtr pDevEvo, enum NVPreallocType type)
 {
     switch (type) {
     case PREALLOC_TYPE_IMP_PARAMS:
-        return pDevEvo->hal->caps.impStructSize;
+        return sizeof(NVC372_CTRL_IS_MODE_POSSIBLE_PARAMS);
     case PREALLOC_TYPE_SHUT_DOWN_HEADS_SET_MODE: /* fall through */
     case PREALLOC_TYPE_RESTORE_CONSOLE_SET_MODE:
         return sizeof(struct NvKmsSetModeParams);

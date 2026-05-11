@@ -20,7 +20,6 @@ _out/Linux_x86_64/rmapi_deprecated_vidheapctrl.o: \
  ../common/sdk/nvidia/inc/class/cl0071.h \
  ../common/sdk/nvidia/inc/class/cl50a0.h \
  ../common/sdk/nvidia/inc/class/cl0040.h \
- ../common/sdk/nvidia/inc/class/cl0042.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl0041.h \
  ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h \
  ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h \
@@ -50,7 +49,6 @@ interface/deprecated/rmapi_deprecated.h:
 ../common/sdk/nvidia/inc/class/cl0071.h:
 ../common/sdk/nvidia/inc/class/cl50a0.h:
 ../common/sdk/nvidia/inc/class/cl0040.h:
-../common/sdk/nvidia/inc/class/cl0042.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl0041.h:
 ../common/sdk/nvidia/inc/ctrl/ctrlxxxx.h:
 ../common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h:

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2017-2025, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -22,26 +22,19 @@
 
 #include "nvidia-drm-conftest.h"
 
-#if defined(NV_DRM_ATOMIC_MODESET_AVAILABLE)
+#if defined(NV_DRM_AVAILABLE)
 
 #include "nvidia-drm-gem-nvkms-memory.h"
 #include "nvidia-drm-helper.h"
-#include "nvidia-drm-ioctl.h"
+#include "nv_drm_common_ioctl.h"
 
-#if defined(NV_DRM_DRM_DRV_H_PRESENT)
 #include <drm/drm_drv.h>
-#endif
-
-#if defined(NV_DRM_DRM_PRIME_H_PRESENT)
 #include <drm/drm_prime.h>
-#endif
 
 #include <linux/io.h>
 #if defined(NV_BSD)
 #include <vm/vm_pageout.h>
 #endif
-
-#include "nv-mm.h"
 
 static void __nv_drm_gem_nvkms_memory_free(struct nv_drm_gem_object *nv_gem)
 {
@@ -62,6 +55,11 @@ static void __nv_drm_gem_nvkms_memory_free(struct nv_drm_gem_object *nv_gem)
 
     if (nv_nvkms_memory->pages_count != 0) {
         nvKms->freeMemoryPages((NvU64 *)nv_nvkms_memory->pages);
+    }
+
+    /* Decrement GC6 blocker if it's still held */
+    if (nv_nvkms_memory->was_mmapped) {
+        nvKms->gc6BlockerRefCntDec(nv_dev->pDevice);
     }
 
     /* Free NvKmsKapiMemory handle associated with this gem object */
@@ -85,6 +83,23 @@ static int __nv_drm_gem_nvkms_mmap(struct nv_drm_gem_object *nv_gem,
        return ret;
     }
 
+    if (nvKms->isVidmem(nv_nvkms_memory->base.pMemory)) {
+        /*
+         * Usermode clients can't be trusted not to access mappings while the GPU
+         * is in GC6. Increment the GC6 blocker refcount to keep the GPU awake
+         * while this mapping is active.
+         */
+        mutex_lock(&nv_nvkms_memory->map_lock);
+        if (!nv_nvkms_memory->was_mmapped) {
+            if (!nvKms->gc6BlockerRefCntInc(nv_gem->nv_dev->pDevice)) {
+                mutex_unlock(&nv_nvkms_memory->map_lock);
+                return -ENOMEM;
+            }
+            nv_nvkms_memory->was_mmapped = true;
+        }
+        mutex_unlock(&nv_nvkms_memory->map_lock);
+    }
+
     return drm_gem_mmap_obj(&nv_gem->base,
                 drm_vma_node_size(&nv_gem->base.vma_node) << PAGE_SHIFT, vma);
 }
@@ -94,10 +109,9 @@ static vm_fault_t __nv_drm_gem_nvkms_handle_vma_fault(
     struct vm_area_struct *vma,
     struct vm_fault *vmf)
 {
-#if defined(NV_DRM_ATOMIC_MODESET_AVAILABLE)
     struct nv_drm_gem_nvkms_memory *nv_nvkms_memory =
         to_nv_nvkms_memory(nv_gem);
-    unsigned long address = nv_page_fault_va(vmf);
+    unsigned long address = vmf->address;
     struct drm_gem_object *gem = vma->vm_private_data;
     unsigned long page_offset, pfn;
     vm_fault_t ret;
@@ -146,8 +160,6 @@ static vm_fault_t __nv_drm_gem_nvkms_handle_vma_fault(
     }
 #endif /* defined(NV_VMF_INSERT_PFN_PRESENT) */
     return ret;
-#endif /* defined(NV_DRM_ATOMIC_MODESET_AVAILABLE) */
-    return VM_FAULT_SIGBUS;
 }
 
 static struct drm_gem_object *__nv_drm_gem_nvkms_prime_dup(
@@ -168,6 +180,21 @@ static int __nv_drm_gem_nvkms_map(
     }
 
     if (!nvKms->isVidmem(pMemory)) {
+        goto done;
+    }
+
+    /*
+     * XXX Physical mapping currently broken in cases where we can't guarantee
+     * that the mapping is contiguous. Fail on platforms that don't have
+     * guaranteed contiguous physical mappings.
+     */
+    if (!nv_dev->contiguousPhysicalMappings) {
+        NV_DRM_DEV_LOG_INFO(
+            nv_dev,
+            "Mapping vidmem NvKmsKapiMemory 0x%p is currently "
+            "unsupported on coherent GPU memory configurations",
+            pMemory);
+        ret = -ENOMEM;
         goto done;
     }
 
@@ -213,6 +240,14 @@ static void *__nv_drm_gem_nvkms_prime_vmap(
     }
 
     if (nv_nvkms_memory->physically_mapped) {
+        /*
+         * For CPU mappings of vidmem, increment the GC6 blocker refcount to
+         * keep the GPU awake while the kernel is using the mapping.
+         */
+        if (nvKms->isVidmem(nv_gem->pMemory) &&
+            !nvKms->gc6BlockerRefCntInc(nv_gem->nv_dev->pDevice)) {
+            return ERR_PTR(-ENOMEM);
+        }
         return nv_nvkms_memory->pWriteCombinedIORemapAddress;
     }
 
@@ -240,6 +275,15 @@ static void __nv_drm_gem_nvkms_prime_vunmap(
     if (!nv_nvkms_memory->physically_mapped &&
         nv_nvkms_memory->pages_count > 0) {
         nv_drm_vunmap(address);
+    }
+
+    if (nv_nvkms_memory->physically_mapped &&
+        nvKms->isVidmem(nv_gem->pMemory)) {
+        /*
+         * Decrement the GC6 blocker refcount now that the mapping is no longer
+         * needed.
+         */
+        nvKms->gc6BlockerRefCntDec(nv_gem->nv_dev->pDevice);
     }
 }
 
@@ -307,6 +351,7 @@ static int __nv_drm_nvkms_gem_obj_init(
     nv_nvkms_memory->pPhysicalAddress = NULL;
     nv_nvkms_memory->pWriteCombinedIORemapAddress = NULL;
     nv_nvkms_memory->physically_mapped = false;
+    nv_nvkms_memory->was_mmapped = false;
 
     if (!nvKms->isVidmem(pMemory) &&
         !nvKms->getMemoryPages(nv_dev->pDevice,
@@ -340,6 +385,7 @@ int nv_drm_dumb_create(
     struct nv_drm_gem_nvkms_memory *nv_nvkms_memory;
     uint8_t compressible = 0;
     struct NvKmsKapiMemory *pMemory;
+    struct NvKmsKapiAllocateMemoryParams allocParams = { };
     int ret = 0;
 
     args->pitch = roundup(args->width * ((args->bpp + 7) >> 3),
@@ -357,20 +403,14 @@ int nv_drm_dumb_create(
         goto fail;
     }
 
-    if (nv_dev->hasVideoMemory) {
-        pMemory = nvKms->allocateVideoMemory(nv_dev->pDevice,
-                                             NvKmsSurfaceMemoryLayoutPitch,
-                                             NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT,
-                                             args->size,
-                                             &compressible);
-    } else {
-        pMemory = nvKms->allocateSystemMemory(nv_dev->pDevice,
-                                              NvKmsSurfaceMemoryLayoutPitch,
-                                              NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT,
-                                              args->size,
-                                              &compressible);
-    }
+    allocParams.layout = NvKmsSurfaceMemoryLayoutPitch;
+    allocParams.type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
+    allocParams.size = args->size;
+    allocParams.noDisplayCaching = true;
+    allocParams.useVideoMemory = nv_dev->hasVideoMemory;
+    allocParams.compressible = &compressible;
 
+    pMemory = nvKms->allocateMemory(nv_dev->pDevice, &allocParams);
     if (pMemory == NULL) {
         ret = -ENOMEM;
         NV_DRM_DEV_LOG_ERR(
@@ -384,8 +424,6 @@ int nv_drm_dumb_create(
     if (ret) {
         goto nvkms_gem_obj_init_failed;
     }
-
-    nv_nvkms_memory->base.is_drm_dumb = true;
 
     /* Always map dumb buffer memory up front.  Clients are only expected
      * to use dumb buffers for software rendering, so they're not much use
@@ -482,7 +520,6 @@ int nv_drm_gem_export_nvkms_memory_ioctl(struct drm_device *dev,
     }
 
     if ((nv_nvkms_memory = nv_drm_gem_object_nvkms_memory_lookup(
-                    dev,
                     filep,
                     p->handle)) == NULL) {
         ret = -EINVAL;
@@ -519,8 +556,7 @@ int nv_drm_gem_alloc_nvkms_memory_ioctl(struct drm_device *dev,
     struct drm_nvidia_gem_alloc_nvkms_memory_params *p = data;
     struct nv_drm_gem_nvkms_memory *nv_nvkms_memory = NULL;
     struct NvKmsKapiMemory *pMemory;
-    enum NvKmsSurfaceMemoryLayout layout;
-    enum NvKmsKapiAllocationType type;
+    struct NvKmsKapiAllocateMemoryParams allocParams = { };
     int ret = 0;
 
     if (!drm_core_check_feature(dev, DRIVER_MODESET)) {
@@ -540,23 +576,21 @@ int nv_drm_gem_alloc_nvkms_memory_ioctl(struct drm_device *dev,
         goto failed;
     }
 
-    layout = p->block_linear ?
+    allocParams.layout = p->block_linear ?
         NvKmsSurfaceMemoryLayoutBlockLinear : NvKmsSurfaceMemoryLayoutPitch;
-    type = (p->flags & NV_GEM_ALLOC_NO_SCANOUT) ?
+    allocParams.type = (p->flags & NV_GEM_ALLOC_NO_SCANOUT) ?
         NVKMS_KAPI_ALLOCATION_TYPE_OFFSCREEN : NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
+    allocParams.size = p->memory_size;
+    allocParams.useVideoMemory = nv_dev->hasVideoMemory;
+    allocParams.compressible = &p->compressible;
 
-    if (nv_dev->hasVideoMemory) {
-        pMemory = nvKms->allocateVideoMemory(nv_dev->pDevice,
-                                             layout,
-                                             type,
-                                             p->memory_size,
-                                             &p->compressible);
-    } else {
-        pMemory = nvKms->allocateSystemMemory(nv_dev->pDevice,
-                                              layout,
-                                              type,
-                                              p->memory_size,
-                                              &p->compressible);
+    pMemory = nvKms->allocateMemory(nv_dev->pDevice, &allocParams);
+    if (pMemory == NULL && (p->flags & NV_GEM_ALLOC_NO_SCANOUT)) {
+        NV_DRM_DEV_LOG_INFO(
+                nv_dev,
+                "Failed to allocate NVKMS video memory for GEM object, trying to fall back to sysmem");
+        allocParams.useVideoMemory = false;
+        pMemory = nvKms->allocateMemory(nv_dev->pDevice, &allocParams);
     }
 
     if (pMemory == NULL) {
@@ -640,7 +674,6 @@ int nv_drm_dumb_map_offset(struct drm_file *file,
     int ret = -EINVAL;
 
     if ((nv_nvkms_memory = nv_drm_gem_object_nvkms_memory_lookup(
-                    dev,
                     file,
                     handle)) == NULL) {
         NV_DRM_DEV_LOG_ERR(

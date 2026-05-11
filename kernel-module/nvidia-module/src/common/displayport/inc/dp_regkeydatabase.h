@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -34,6 +34,7 @@
 #include "dp_auxdefs.h"
 
 // Regkey Names
+#define NV_DP_REGKEY_DISABLE_QSES                     "DISABLE_QSES"
 #define NV_DP_REGKEY_OVERRIDE_DPCD_REV                "OVERRIDE_DPCD_REV"
 #define NV_DP_REGKEY_DISABLE_SSC                      "DISABLE_SSC" // SSC (Stream Status Changed)
 #define NV_DP_REGKEY_ENABLE_FAST_LINK_TRAINING        "ENABLE_FAST_LINK_TRAINING"
@@ -47,7 +48,8 @@
 #define NV_DP_REGKEY_APPLY_MAX_LINK_RATE_OVERRIDES    "APPLY_OVERRIDES_FOR_BUG_2489143"
 #define NV_DP_REGKEY_DISABLE_DSC                      "DISABLE_DSC"
 #define NV_DP_REGKEY_SKIP_ASSESSLINK_FOR_EDP          "HP_WAR_2189772"
-#define NV_DP_REGKEY_HDCP_AUTH_ONLY_ON_DEMAND         "DP_HDCP_AUTH_ONLY_ON_DEMAND"
+#define NV_DP_REGKEY_MST_AUTO_HDCP_AUTH_AT_ATTACH     "DP_MST_AUTO_HDCP_AUTH_AT_ATTACH"
+#define NV_DP_REGKEY_MST_RESTORE_HDCP_AT_ATTACH_SKIPPED "DP_MST_RESTORE_HDCP_AT_ATTACH_SKIPPED"
 #define NV_DP_REGKEY_ENABLE_MSA_OVER_MST              "ENABLE_MSA_OVER_MST"
 #define NV_DP_REGKEY_DISABLE_DOWNSPREAD               "DISABLE_DOWNSPREAD"
 
@@ -81,9 +83,11 @@
 
 #define NV_DP2X_IGNORE_CABLE_ID_CAPS                    "DP2X_IGNORE_CABLE_ID_CAPS"
 
-#define NV_DP2X_REGKEY_DISABLE_EFF_BPP_SST_8b10b        "DP2X_REGKEY_DISABLE_EFF_BPP_SST_8b10b"
-
 #define NV_DP2X_REGKEY_VCONN_SOURCE_UNKNOWN_WAR         "DP2X_VCONN_SOURCE_UNKNOWN_WAR"
+
+#define NV_DP2X_REGKEY_DISABLE_WATERMARK_CACHING        "DP2X_DISABLE_WATERMARK_CACHING"
+
+#define NV_DP2X_REGKEY_DISABLE_EFF_BPP_SST_8b10b        "DP2X_REGKEY_DISABLE_EFF_BPP_SST_8b10b"
 
 //
 // Bug 4388987 : This regkey will disable reading PCON caps for MST.
@@ -91,18 +95,31 @@
 #define NV_DP_REGKEY_MST_PCON_CAPS_READ_DISABLED    "DP_BUG_4388987_WAR"
 #define NV_DP_REGKEY_DISABLE_TUNNEL_BW_ALLOCATION   "DP_DISABLE_TUNNEL_BW_ALLOCATION"
 
-#define NV_DP_REGKEY_DISABLE_AVOID_HBR3_WAR            "DP_DISABLE_AVOID_HBR3_WAR"
+#define NV_DP_REGKEY_DISABLE_AVOID_HBR3_WAR         "DP_DISABLE_AVOID_HBR3_WAR"
 
 // Bug 4793112 : On eDP panel, do not cache source OUI if it reads zero
 #define NV_DP_REGKEY_SKIP_ZERO_OUI_CACHE            "DP_SKIP_ZERO_OUI_CACHE"
 
-#define NV_DP_REGKEY_ENABLE_FIX_FOR_5147205         "DP_ENABLE_5147205_FIX"
 // Bug 5088957 : Force head shutdown in DpLib
 #define NV_DP_REGKEY_FORCE_HEAD_SHUTDOWN            "DP_WAR_5088957"
 
-// Bug 5041041 : Enable Lower BPP check for DSC
-#define NV_DP_REGKEY_ENABLE_LOWER_BPP_CHECK_FOR_DSC "DP_ENABLE_LOWER_BPP_CHECK"
+// Use max DSC compression for MST topologies
+#define NV_DP_REGKEY_USE_MAX_DSC_COMPRESSION_MST   "DP_USE_MAX_DSC_COMPRESSION_MST"
 
+// This regkey forces devID to be exposed to vendors via DPCD 0x309 for DSC-enabled SKUs.
+#define NV_DP_REGKEY_EXPOSE_DSC_DEVID_WAR           "DP_DSC_DEVID_WAR"
+
+#define NV_DP_REGKEY_ENABLE_CQA_STATS_COLLECTION    "DP_ENABLE_CQA_STATS_COLLECTION"
+
+#define NV_DP_REGKEY_IGNORE_CAPS_AND_FORCE_HIGHEST_LC  "DP_IGNORE_CAPS_AND_FORCE_HIGHEST_LC_WAR"
+
+// This regkey disables GR-3336 that disables minimizing link config if it is 128b/132b.
+#define NV_DP_REGKEY_ENABLE_128b132b_DSC_LNK_CFG_REDUCTION   "ENABLE_128b132b_DSC_LNK_CFG_REDUCTION"
+
+#define NV_DP_REGKEY_DISABLE_NATIVE_DISPLAYID2X_SUPPORT    "DISABLE_NATIVE_DISPLAYID2X_SUPPORT"
+#define NV_DP_REGKEY_FORCE_NLPIGNORE_DDS                   "DP_FORCE_NLPIGNORE_DDS"
+
+#define NV_DP_REGKEY_ENABLE_CLEAR_MSA_WHEN_NOT_USED          "DP_ENABLE_CLEAR_MSA_WHEN_NOT_USED"
 
 //
 // Data Base used to store all the regkey values.
@@ -115,6 +132,7 @@ struct DP_REGKEY_DATABASE
 {
     bool  bInitialized; // set to true after the first EvoMainLink instance is constructed
     // Below are regkey values
+    bool  bQsesDisabled;
     NvU32 dpcdRevOveride;
     bool  bSscDisabled;
     bool  bFastLinkTrainingEnabled;
@@ -127,7 +145,8 @@ struct DP_REGKEY_DATABASE
     NvU32 applyMaxLinkRateOverrides;
     bool  bDscDisabled;
     bool  bAssesslinkForEdpSkipped;
-    bool  bHdcpAuthOnlyOnDemand;
+    bool  bMstAutoHdcpAuthAtAttach;
+    bool  bMstRestoreHdcpAtAttachSkipped;
     bool  bMsaOverMstEnabled;
     bool  bOptLinkKeptAlive;
     bool  bOptLinkKeptAliveMst;
@@ -138,15 +157,22 @@ struct DP_REGKEY_DATABASE
     NvU32 supportInternalUhbrOnFpga;
     bool  bIgnoreCableIdCaps;
     bool  bDisableEffBppSST8b10b;
+    bool  bDisableWatermarkCaching;
     bool  bMSTPCONCapsReadDisabled;
     bool  bForceDisableTunnelBwAllocation;
     bool  bDownspreadDisabled;
     bool  bDisableAvoidHBR3War;
     bool  bCableVconnSourceUnknownWar;
     bool  bSkipZeroOuiCache;
-    bool  bEnable5147205Fix;
     bool  bForceHeadShutdown;
-    bool  bEnableLowerBppCheckForDsc;
+    bool  bEnableDevId;
+    bool  bEnableCqaStatsCollection;
+    bool  bIgnoreCapsAndForceHighestLc;
+    bool  bEnable128b132bDSCLnkCfgReduction;
+    bool  bDisableNativeDisplayId2xSupport;
+    bool  bUseMaxDSCCompressionMST;
+    bool  bIgnoreUnplugUnlessRequested;
+    bool  bEnableClearMSAWhenNotUsed;
 };
 
 extern struct DP_REGKEY_DATABASE dpRegkeyDatabase;

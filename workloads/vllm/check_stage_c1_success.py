@@ -124,7 +124,7 @@ def run_experiment(args: argparse.Namespace, out_dir: Path) -> tuple[Path, Path]
 
 
 def parse_localized_stats_line(line: str) -> dict[str, int]:
-    patterns = {
+    localized_patterns = {
         "batch_faults": r"本批次总缺页实例数=([0-9]+)",
         "batch_after_dedup": r"本批次总缺页实例数=[0-9]+,去重后=([0-9]+)",
         "batch_kv_faults": r"KV类的总缺页数=([0-9]+)",
@@ -134,11 +134,23 @@ def parse_localized_stats_line(line: str) -> dict[str, int]:
         "total_kv_faults": r"kv总错误数=([0-9]+)",
         "total_kv_after_dedup": r"kv总错误数=[0-9]+,去重后=([0-9]+)",
     }
+    key_value_patterns = {
+        "batch_faults": r"\bbatch_faults=([0-9]+)",
+        "batch_after_dedup": r"\bbatch_after_dedup=([0-9]+)",
+        "batch_kv_faults": r"\bbatch_kv_faults=([0-9]+)",
+        "batch_kv_after_dedup": r"\bbatch_kv_after_dedup=([0-9]+)",
+        "total_faults": r"\btotal_faults=([0-9]+)",
+        "total_after_dedup": r"\btotal_after_dedup=([0-9]+)",
+        "total_kv_faults": r"\btotal_kv_faults=([0-9]+)",
+        "total_kv_after_dedup": r"\btotal_kv_after_dedup=([0-9]+)",
+    }
     parsed: dict[str, int] = {}
-    for key, pattern in patterns.items():
-        match = re.search(pattern, line)
-        if match:
-            parsed[key] = int(match.group(1))
+    for key in localized_patterns:
+        for pattern in (localized_patterns[key], key_value_patterns[key]):
+            match = re.search(pattern, line)
+            if match:
+                parsed[key] = int(match.group(1))
+                break
     return parsed
 
 

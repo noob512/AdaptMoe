@@ -242,11 +242,21 @@ static NV_STATUS uvm_test_phase_f_batch_executor(UVM_TEST_PHASE_F_BATCH_EXECUTOR
     NvU32 i;
     NV_STATUS first_error = NV_OK;
 
-    if (params->count > UVM_TEST_PHASE_F_MAX_RANGES)
+    if (params->count > UVM_TEST_PHASE_F_MAX_RANGES) {
+        UVM_INFO_PRINT("phase_f_batch invalid count=%u max=%u action=%u\n",
+                       params->count, UVM_TEST_PHASE_F_MAX_RANGES, params->action);
         return NV_ERR_INVALID_ARGUMENT;
+    }
 
     params->success_count = 0;
     params->failure_count = 0;
+
+    UVM_INFO_PRINT("phase_f_batch begin action=%u count=%u async=%u first_base=0x%llx first_len=%llu\n",
+                   params->action,
+                   params->count,
+                   params->async,
+                   params->count > 0 ? params->ranges[0].base : 0,
+                   params->count > 0 ? params->ranges[0].length : 0);
 
     for (i = 0; i < params->count; ++i) {
         NV_STATUS status = NV_OK;
@@ -318,6 +328,13 @@ static NV_STATUS uvm_test_phase_f_batch_executor(UVM_TEST_PHASE_F_BATCH_EXECUTOR
                 first_error = status;
         }
     }
+
+    UVM_INFO_PRINT("phase_f_batch end action=%u count=%u success=%u failure=%u first_error=0x%x\n",
+                   params->action,
+                   params->count,
+                   params->success_count,
+                   params->failure_count,
+                   first_error);
 
     return first_error;
 }

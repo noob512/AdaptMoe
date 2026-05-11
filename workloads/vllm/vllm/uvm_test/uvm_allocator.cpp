@@ -35,7 +35,7 @@ namespace {
 
 constexpr unsigned int UVM_INITIALIZE_IOCTL = 0x30000001;
 constexpr unsigned int UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL =
-    200 + 110;
+    200 + 115;
 constexpr size_t UVM_TEST_PHASE_F_MAX_RANGES = 64;
 
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU = 1;

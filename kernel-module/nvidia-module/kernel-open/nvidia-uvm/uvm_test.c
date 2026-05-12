@@ -237,20 +237,93 @@ static NV_STATUS uvm_test_inject_nvlink_error(UVM_TEST_INJECT_NVLINK_ERROR_PARAM
     return status;
 }
 
-static NV_STATUS uvm_test_phase_f_batch_executor(UVM_TEST_PHASE_F_BATCH_EXECUTOR_PARAMS *params, struct file *filp)
+static NV_STATUS uvm_test_phase_f_ping(UVM_TEST_PHASE_F_PING_PARAMS *params, struct file *filp)
 {
-    NvU32 i;
-    NV_STATUS first_error = NV_OK;
+    UVM_INFO_PRINT("phase_f_ping begin magic=0x%x\n", params->magic);
+    uvm_phase_f_route_log("phase_f_ping begin magic=0x%x\n", params->magic);
+    UVM_INFO_PRINT("phase_f_ping end magic=0x%x\n", params->magic);
+    uvm_phase_f_route_log("phase_f_ping end magic=0x%x\n", params->magic);
+    return NV_OK;
+}
 
-    if (params->count > UVM_TEST_PHASE_F_MAX_RANGES) {
-        UVM_INFO_PRINT("phase_f_batch invalid count=%u max=%u action=%u\n",
-                       params->count, UVM_TEST_PHASE_F_MAX_RANGES, params->action);
-        return NV_ERR_INVALID_ARGUMENT;
-    }
+static NV_STATUS uvm_test_phase_f_batch_mini(UVM_TEST_PHASE_F_BATCH_MINI_PARAMS *params, struct file *filp)
+{
+    NV_STATUS status = NV_OK;
 
     params->success_count = 0;
     params->failure_count = 0;
 
+    UVM_INFO_PRINT("phase_f_batch_mini begin action=%u count=%u base=0x%llx length=%llu\n",
+                   params->action,
+                   params->count,
+                   params->base,
+                   params->length);
+    uvm_phase_f_route_log("phase_f_batch_mini begin action=%u count=%u base=0x%llx length=%llu\n",
+                          params->action,
+                          params->count,
+                          params->base,
+                          params->length);
+
+    if (params->count > 1) {
+        status = NV_ERR_INVALID_ARGUMENT;
+    }
+    else if (params->count == 0) {
+        params->success_count = 0;
+    }
+    else if (params->base == 0 || params->length == 0) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        params->failure_count = 1;
+    }
+    else {
+        params->success_count = 1;
+    }
+
+    UVM_INFO_PRINT("phase_f_batch_mini end action=%u count=%u success=%u failure=%u status=0x%x\n",
+                   params->action,
+                   params->count,
+                   params->success_count,
+                   params->failure_count,
+                   status);
+    uvm_phase_f_route_log("phase_f_batch_mini end action=%u count=%u success=%u failure=%u status=0x%x\n",
+                          params->action,
+                          params->count,
+                          params->success_count,
+                          params->failure_count,
+                          status);
+
+    return status;
+}
+
+static NV_STATUS uvm_test_phase_f_batch_executor(UVM_TEST_PHASE_F_BATCH_EXECUTOR_PARAMS *params,
+                                                 struct file *filp)
+{
+    // 遍历 batch 中每个 range 的索引。
+    NvU32 i;
+
+    // 记录第一个失败的 NV_STATUS。
+    // 如果所有 range 都成功，最终保持 NV_OK。
+    NV_STATUS first_error = NV_OK;
+
+    // 防御性检查：用户态传入的 range 数量不能超过驱动定义的最大值。
+    // 如果 count 过大，后续访问 params->ranges/results 可能越界。
+    if (params->count > UVM_TEST_PHASE_F_MAX_RANGES) {
+        // 打印到内核日志 dmesg。
+        UVM_INFO_PRINT("phase_f_batch invalid count=%u max=%u action=%u\n",
+                       params->count, UVM_TEST_PHASE_F_MAX_RANGES, params->action);
+
+        // 同时写入新增的 /proc/driver/nvidia-uvm/phase_f_route_log 环形日志。
+        uvm_phase_f_route_log("phase_f_batch invalid count=%u max=%u action=%u\n",
+                              params->count, UVM_TEST_PHASE_F_MAX_RANGES, params->action);
+
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    // 初始化返回给用户态的统计字段。
+    params->success_count = 0;
+    params->failure_count = 0;
+
+    // 打印 batch executor 入口信息。
+    // 如果 count == 0，则不会访问 ranges[0]，而是打印 base=0、len=0。
     UVM_INFO_PRINT("phase_f_batch begin action=%u count=%u async=%u first_base=0x%llx first_len=%llu\n",
                    params->action,
                    params->count,
@@ -258,77 +331,130 @@ static NV_STATUS uvm_test_phase_f_batch_executor(UVM_TEST_PHASE_F_BATCH_EXECUTOR
                    params->count > 0 ? params->ranges[0].base : 0,
                    params->count > 0 ? params->ranges[0].length : 0);
 
+    uvm_phase_f_route_log("phase_f_batch begin action=%u count=%u async=%u first_base=0x%llx first_len=%llu\n",
+                          params->action,
+                          params->count,
+                          params->async,
+                          params->count > 0 ? params->ranges[0].base : 0,
+                          params->count > 0 ? params->ranges[0].length : 0);
+
+    // 遍历每个用户态传入的 VA range。
+    // 对 ping-ioctl 来说，count == 0，因此这个循环不会执行。
     for (i = 0; i < params->count; ++i) {
         NV_STATUS status = NV_OK;
         NvU64 base = params->ranges[i].base;
         NvU64 length = params->ranges[i].length;
 
+        // 初始化当前 range 的结果。
         params->results[i].status = NV_OK;
         params->results[i].resident_on_count = 0;
         params->results[i].resident_on_cpu = NV_FALSE;
         params->results[i].resident_on_gpu = NV_FALSE;
 
+        // base 或 length 非法，直接标记当前 range 失败。
         if (base == 0 || length == 0) {
             status = NV_ERR_INVALID_ARGUMENT;
         }
+        // 将 preferred location 设置为 CPU。
         else if (params->action == UVM_TEST_PHASE_F_ACTION_ADVISE_CPU) {
-            UVM_SET_PREFERRED_LOCATION_PARAMS advise_params = {0};
+            UVM_SET_PREFERRED_LOCATION_PARAMS *advise_params =
+                uvm_kvmalloc_zero(sizeof(*advise_params));
 
-            advise_params.requestedBase = base;
-            advise_params.length = length;
-            advise_params.preferredLocation = NV_PROCESSOR_UUID_CPU_DEFAULT;
-            advise_params.preferredCpuNumaNode = NUMA_NO_NODE;
-            status = uvm_api_set_preferred_location(&advise_params, filp);
-        }
-        else if (params->action == UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU ||
-                 params->action == UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU) {
-            UVM_MIGRATE_PARAMS migrate_params = {0};
+            if (!advise_params) {
+                status = NV_ERR_NO_MEMORY;
+            }
+            else {
+                advise_params->requestedBase = base;
+                advise_params->length = length;
+                advise_params->preferredLocation = NV_PROCESSOR_UUID_CPU_DEFAULT;
+                advise_params->preferredCpuNumaNode = NUMA_NO_NODE;
 
-            migrate_params.base = base;
-            migrate_params.length = length;
-            migrate_params.destinationUuid =
-                params->action == UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU ?
-                    NV_PROCESSOR_UUID_CPU_DEFAULT : params->gpu_uuid;
-            migrate_params.flags = params->async ? UVM_MIGRATE_FLAG_ASYNC : 0;
-            migrate_params.semaphoreAddress = 0;
-            migrate_params.semaphorePayload = 0;
-            migrate_params.cpuNumaNode = NUMA_NO_NODE;
-            status = uvm_api_migrate(&migrate_params, filp);
-        }
-        else if (params->action == UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY) {
-            UVM_TEST_VA_RESIDENCY_INFO_PARAMS query_params = {0};
-            NvU32 resident_index;
-
-            query_params.lookup_address = base;
-            query_params.is_async = params->async;
-            status = uvm_test_va_residency_info(&query_params, filp);
-            if (status == NV_OK) {
-                params->results[i].resident_on_count = query_params.resident_on_count;
-                for (resident_index = 0;
-                     resident_index < query_params.resident_on_count && resident_index < UVM_MAX_PROCESSORS;
-                     ++resident_index) {
-                    if (uvm_uuid_eq(&query_params.resident_on[resident_index], &NV_PROCESSOR_UUID_CPU_DEFAULT))
-                        params->results[i].resident_on_cpu = NV_TRUE;
-                    if (uvm_uuid_eq(&query_params.resident_on[resident_index], &params->gpu_uuid))
-                        params->results[i].resident_on_gpu = NV_TRUE;
-                }
+                status = uvm_api_set_preferred_location(advise_params, filp);
+                uvm_kvfree(advise_params);
             }
         }
+        // 将 range 迁移到 CPU 或 GPU。
+        else if (params->action == UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU ||
+                 params->action == UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU) {
+            UVM_MIGRATE_PARAMS *migrate_params =
+                uvm_kvmalloc_zero(sizeof(*migrate_params));
+
+            if (!migrate_params) {
+                status = NV_ERR_NO_MEMORY;
+            }
+            else {
+                migrate_params->base = base;
+                migrate_params->length = length;
+                migrate_params->destinationUuid =
+                    params->action == UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU ?
+                        NV_PROCESSOR_UUID_CPU_DEFAULT : params->gpu_uuid;
+                migrate_params->flags = params->async ? UVM_MIGRATE_FLAG_ASYNC : 0;
+                migrate_params->semaphoreAddress = 0;
+                migrate_params->semaphorePayload = 0;
+                migrate_params->cpuNumaNode = NUMA_NO_NODE;
+
+                status = uvm_api_migrate(migrate_params, filp);
+                uvm_kvfree(migrate_params);
+            }
+        }
+        // 查询当前地址驻留在哪些 processor 上。
+        else if (params->action == UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY) {
+            UVM_TEST_VA_RESIDENCY_INFO_PARAMS *query_params =
+                uvm_kvmalloc_zero(sizeof(*query_params));
+            NvU32 resident_index;
+
+            if (!query_params) {
+                status = NV_ERR_NO_MEMORY;
+            }
+            else {
+                query_params->lookup_address = base;
+                query_params->is_async = params->async;
+
+                status = uvm_test_va_residency_info(query_params, filp);
+
+                // 查询成功后，把详细 UUID 结果转换成简化字段返回给用户态。
+                if (status == NV_OK) {
+                    params->results[i].resident_on_count = query_params->resident_on_count;
+
+                    for (resident_index = 0;
+                         resident_index < query_params->resident_on_count &&
+                         resident_index < UVM_MAX_PROCESSORS;
+                         ++resident_index) {
+                        if (uvm_uuid_eq(&query_params->resident_on[resident_index],
+                                        &NV_PROCESSOR_UUID_CPU_DEFAULT))
+                            params->results[i].resident_on_cpu = NV_TRUE;
+
+                        if (uvm_uuid_eq(&query_params->resident_on[resident_index],
+                                        &params->gpu_uuid))
+                            params->results[i].resident_on_gpu = NV_TRUE;
+                    }
+                }
+
+                uvm_kvfree(query_params);
+            }
+        }
+        // 未识别的 action。
         else {
             status = NV_ERR_INVALID_ARGUMENT;
         }
 
+        // 写回当前 range 的执行状态。
         params->results[i].status = status;
+
+        // 更新 batch 级别的成功/失败计数。
         if (status == NV_OK) {
             ++params->success_count;
         }
         else {
             ++params->failure_count;
+
+            // 只记录第一个错误，作为函数最终返回值。
             if (first_error == NV_OK)
                 first_error = status;
         }
     }
 
+    // 打印 batch executor 结束信息。
     UVM_INFO_PRINT("phase_f_batch end action=%u count=%u success=%u failure=%u first_error=0x%x\n",
                    params->action,
                    params->count,
@@ -336,8 +462,17 @@ static NV_STATUS uvm_test_phase_f_batch_executor(UVM_TEST_PHASE_F_BATCH_EXECUTOR
                    params->failure_count,
                    first_error);
 
+    uvm_phase_f_route_log("phase_f_batch end action=%u count=%u success=%u failure=%u first_error=0x%x\n",
+                          params->action,
+                          params->count,
+                          params->success_count,
+                          params->failure_count,
+                          first_error);
+
+    // 返回第一个错误；如果没有错误则返回 NV_OK。
     return first_error;
 }
+
 
 long uvm_test_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
@@ -345,9 +480,10 @@ long uvm_test_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     // These should not be enabled in a production environment.
     if (!uvm_enable_builtin_tests) {
         UVM_INFO_PRINT("ioctl %d not found. Did you mean to insmod with uvm_enable_builtin_tests=1?\n", cmd);
+        uvm_phase_f_route_log("ioctl %d not found. Did you mean to insmod with uvm_enable_builtin_tests=1?\n", cmd);
         return -ENOSYS;
     }
-
+    uvm_phase_f_route_log("ioctl begin cmd=%u\n", cmd);
     switch (cmd)
     {
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_TEST_GET_GPU_REF_COUNT,            uvm_test_get_gpu_ref_count);
@@ -457,6 +593,8 @@ long uvm_test_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_TEST_FILE_INITIALIZE,           uvm_test_file_initialize);
         UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_TEST_FILE_UNMAP,                uvm_test_file_unmap);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_TEST_QUERY_ACCESS_COUNTERS,        uvm_test_query_access_counters);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_TEST_PHASE_F_PING,                 uvm_test_phase_f_ping);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_TEST_PHASE_F_BATCH_MINI,           uvm_test_phase_f_batch_mini);
         UVM_ROUTE_CMD_ALLOC_INIT_CHECK(UVM_TEST_PHASE_F_BATCH_EXECUTOR,       uvm_test_phase_f_batch_executor);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_TEST_VA_BLOCK_DISCARD_STATUS,      uvm_test_va_block_discard_status);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_TEST_PMM_GET_ALLOC_LIST,           uvm_test_pmm_get_alloc_list);

@@ -34,9 +34,14 @@
 namespace {
 
 constexpr unsigned int UVM_INITIALIZE_IOCTL = 0x30000001;
-constexpr unsigned int UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL =
+constexpr unsigned int UVM_TEST_PHASE_F_PING_IOCTL =
     200 + 115;
+constexpr unsigned int UVM_TEST_PHASE_F_BATCH_MINI_IOCTL =
+    200 + 116;
+constexpr unsigned int UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL =
+    200 + 117;
 constexpr size_t UVM_TEST_PHASE_F_MAX_RANGES = 64;
+constexpr uint32_t UVM_TEST_PHASE_F_PING_MAGIC = 0x50464e47;  // "PFNG"
 
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU = 1;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU = 2;
@@ -76,6 +81,21 @@ struct PhaseFBatchExecutorParams {
     uint32_t rmStatus;
 };
 
+struct PhaseFPingParams {
+    uint32_t magic;
+    uint32_t rmStatus;
+};
+
+struct PhaseFBatchMiniParams {
+    uint32_t action;
+    uint32_t count;
+    uint64_t base;
+    uint64_t length;
+    uint32_t success_count;
+    uint32_t failure_count;
+    uint32_t rmStatus;
+};
+
 constexpr PhaseFUuid CPU_UUID = {{
     0xa6, 0x5e, 0x0f, 0x4e, 0xd7, 0xd4, 0x7b, 0xa2,
     0x50, 0x47, 0x41, 0x2c, 0x14, 0x2a, 0x77, 0x73
@@ -98,6 +118,8 @@ const char* phase_f_action_name(uint32_t action) {
     }
 }
 
+
+
 void phase_f_debug_log(const char* fmt, ...) {
     const char* path = std::getenv("VLLM_UVM_PHASE_F_DEBUG_LOG");
     if (path == nullptr || path[0] == '\0') return;
@@ -119,8 +141,12 @@ void phase_f_debug_log(const char* fmt, ...) {
     std::vfprintf(fp, fmt, args);
     va_end(args);
     std::fprintf(fp, "\n");
+
+    std::fflush(fp);
+    fsync(fileno(fp));
     std::fclose(fp);
 }
+
 
 bool get_cuda_device_uuid(int device, PhaseFUuid* uuid) {
     if (uuid == nullptr) return false;
@@ -211,18 +237,52 @@ int uvm_driver_batch_execute_internal(const uintptr_t* ptrs,
 }
 
 int uvm_driver_phase_f_ping_internal() {
+    // 构造正式 Phase F batch executor ioctl 的最小参数。
+    //
+    // 这里刻意设置 count=0：
+    //   - 不传任何 user pointer；
+    //   - 不访问 cudaMallocManaged allocation；
+    //   - 不进入 per-range query/prefetch/advise 逻辑；
+    //   - 只验证 batch executor ioctl 的空请求路径能否安全进入内核并返回。
+    //
+    // action 仍设置为 QUERY_RESIDENCY，是为了复用 batch executor 的标准参数格式；
+    // 由于 count=0，内核侧不会真正查询任何 range residency。
+    phase_f_debug_log("driver_ping before_params_init");
     PhaseFBatchExecutorParams params{};
     params.action = UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY;
     params.count = 0;
     params.async = 0;
-    params.gpu_uuid = CPU_UUID;
 
+    // count=0 时 gpu_uuid 理论上不会被内核使用。
+    // 这里填 CPU_UUID 是一个安全占位，避免结构体字段未初始化。
+    params.gpu_uuid = CPU_UUID;
+    phase_f_debug_log("driver_ping after_gpu_uuid_init action=%u count=%u async=%u",
+                      params.action, params.count, params.async);
+
+    // 打开 UVM 设备节点。
+    //
+    // 如果失败，通常说明：
+    //   - nvidia_uvm 模块没有加载；
+    //   - /dev/nvidia-uvm 不存在；
+    //   - 当前用户没有权限；
+    //   - driver 状态异常。
+    //
+    // 返回 -4 给 phase_f_smoke；shell 日志中会看到 step result 为负数。
+    
     int fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         phase_f_debug_log("driver_ping open_failed errno=%d", errno);
         return -4;
     }
 
+    // 初始化当前 fd 对应的 UVM file/VA space 状态。
+    //
+    // UVM_INITIALIZE_IOCTL 是普通 UVM 初始化入口，不是 Phase F 自定义 ioctl。
+    // 后续 test ioctl 使用 UVM_ROUTE_CMD_*_INIT_CHECK 路由时，需要这个初始化状态。
+    //
+    // 如果这里失败，函数会记录：
+    //   driver_ping init_failed errno=<errno> rmStatus=<rmStatus>
+    // 然后 close fd 并返回 -5。
     UvmInitializeParams init_params{};
     if (ioctl(fd, UVM_INITIALIZE_IOCTL, &init_params) != 0 ||
         init_params.rmStatus != 0) {
@@ -233,16 +293,171 @@ int uvm_driver_phase_f_ping_internal() {
         return -5;
     }
 
+    // 到这里说明：
+    //   - /dev/nvidia-uvm 已经打开；
+    //   - UVM_INITIALIZE_IOCTL 已经成功；
+    //   - 接下来即将进入 Phase F batch executor test ioctl。
+    //
+    // 如果 crash 诊断日志最后停在 "driver_ping ioctl_begin"，
+    // 但没有 "driver_ping ioctl_done"，重点怀疑下面这个 ioctl
+    // 或其内核侧处理函数 uvm_test_phase_f_batch_executor()。
     phase_f_debug_log("driver_ping ioctl_begin");
+
+    // 正式进入 Phase F batch executor ioctl。
+    //
+    // UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL 对应内核侧：
+    //   uvm_test_ioctl()
+    //     -> UVM_TEST_PHASE_F_BATCH_EXECUTOR
+    //     -> uvm_test_phase_f_batch_executor()
+    //
+    // 由于 params.count=0，内核侧期望行为是：
+    //   - 检查 count <= UVM_TEST_PHASE_F_MAX_RANGES；
+    //   - 清零 success_count/failure_count；
+    //   - 打印 begin/end；
+    //   - for 循环不执行；
+    //   - 返回 NV_OK。
     int ret = ioctl(fd, UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL, &params);
+
+    // ioctl 返回后立刻保存 errno，因为 close() 或后续调用可能覆盖 errno。
     int saved_errno = errno;
+
+    // ioctl 已返回，关闭 fd。
     close(fd);
+
+    // 记录 ioctl 返回结果和内核写回的参数。
+    //
+    // 正常成功期望：
+    //   ret=0
+    //   errno 通常不重要
+    //   rmStatus=0
+    //   success_count=0
+    //   failure_count=0
+    //
+    // 如果日志能看到 ioctl_done，说明至少 ioctl 没有永久卡死或直接导致系统立刻崩溃。
     phase_f_debug_log("driver_ping ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u",
                       ret, saved_errno, params.rmStatus,
+                      params.success_count, params.failure_count);
+
+    // Linux ioctl 系统调用本身失败，例如返回 -1。
+    // 这里统一映射为 -6。
+    if (ret != 0) return -6;
+
+    // ioctl 系统调用成功，但内核侧通过 rmStatus 返回 NVIDIA/UVM 错误。
+    // 这里转成负数返回，方便 run_step() 判定失败。
+    if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+
+    // 完整成功：open、UVM initialize、Phase F batch executor 空 ioctl 都成功。
+    return 0;
+}
+
+int uvm_driver_phase_f_small_ping_internal() {
+    PhaseFPingParams params{};
+    params.magic = UVM_TEST_PHASE_F_PING_MAGIC;
+
+    int fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        phase_f_debug_log("driver_small_ping open_failed errno=%d", errno);
+        return -4;
+    }
+
+    UvmInitializeParams init_params{};
+    if (ioctl(fd, UVM_INITIALIZE_IOCTL, &init_params) != 0 ||
+        init_params.rmStatus != 0) {
+        int saved_errno = errno;
+        phase_f_debug_log("driver_small_ping init_failed errno=%d rmStatus=%u",
+                          saved_errno, init_params.rmStatus);
+        close(fd);
+        return -5;
+    }
+
+    phase_f_debug_log("driver_small_ping ioctl_begin magic=0x%x", params.magic);
+    int ret = ioctl(fd, UVM_TEST_PHASE_F_PING_IOCTL, &params);
+    int saved_errno = errno;
+    close(fd);
+    phase_f_debug_log("driver_small_ping ioctl_done ret=%d errno=%d rmStatus=%u magic=0x%x",
+                      ret, saved_errno, params.rmStatus, params.magic);
+    if (ret != 0) return -6;
+    if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+    return 0;
+}
+
+int uvm_driver_phase_f_batch_mini_internal(uint32_t count, uintptr_t base, size_t length) {
+    PhaseFBatchMiniParams params{};
+    params.action = UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY;
+    params.count = count;
+    params.base = static_cast<uint64_t>(base);
+    params.length = static_cast<uint64_t>(length);
+
+    int fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        phase_f_debug_log("driver_batch_mini count=%u open_failed errno=%d", count, errno);
+        return -4;
+    }
+
+    UvmInitializeParams init_params{};
+    if (ioctl(fd, UVM_INITIALIZE_IOCTL, &init_params) != 0 ||
+        init_params.rmStatus != 0) {
+        int saved_errno = errno;
+        phase_f_debug_log("driver_batch_mini count=%u init_failed errno=%d rmStatus=%u",
+                          count, saved_errno, init_params.rmStatus);
+        close(fd);
+        return -5;
+    }
+
+    phase_f_debug_log("driver_batch_mini count=%u ioctl_begin base=0x%llx length=%llu",
+                      count,
+                      static_cast<unsigned long long>(params.base),
+                      static_cast<unsigned long long>(params.length));
+    int ret = ioctl(fd, UVM_TEST_PHASE_F_BATCH_MINI_IOCTL, &params);
+    int saved_errno = errno;
+    close(fd);
+    phase_f_debug_log("driver_batch_mini count=%u ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u",
+                      count, ret, saved_errno, params.rmStatus,
                       params.success_count, params.failure_count);
     if (ret != 0) return -6;
     if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
     return 0;
+}
+
+int uvm_driver_phase_f_open_only_internal() {
+    int fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        phase_f_debug_log("driver_open open_failed errno=%d", errno);
+        return -4;
+    }
+
+    phase_f_debug_log("driver_open open_done fd=%d", fd);
+    close(fd);
+    phase_f_debug_log("driver_open close_done");
+    return 0;
+}
+
+int uvm_driver_phase_f_init_only_internal() {
+    UvmInitializeParams init_params{};
+
+    int fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        phase_f_debug_log("driver_init open_failed errno=%d", errno);
+        return -4;
+    }
+
+    phase_f_debug_log("driver_init open_done fd=%d", fd);
+    if (ioctl(fd, UVM_INITIALIZE_IOCTL, &init_params) != 0 || init_params.rmStatus != 0) {
+        int saved_errno = errno;
+        phase_f_debug_log("driver_init init_failed errno=%d rmStatus=%u",
+                          saved_errno, init_params.rmStatus);
+        close(fd);
+        return -5;
+    }
+
+    phase_f_debug_log("driver_init init_done rmStatus=%u", init_params.rmStatus);
+    close(fd);
+    phase_f_debug_log("driver_init close_done");
+    return 0;
+}
+
+int uvm_driver_phase_f_ioctl_only_internal() {
+    return uvm_driver_phase_f_ping_internal();
 }
 
 }  // namespace
@@ -4438,6 +4653,30 @@ int uvm_driver_batch_prefetch_cpu(const uintptr_t* ptrs,
 
 int uvm_driver_phase_f_ping() {
     return uvm_driver_phase_f_ping_internal();
+}
+
+int uvm_driver_phase_f_small_ping() {
+    return uvm_driver_phase_f_small_ping_internal();
+}
+
+int uvm_driver_phase_f_batch_mini0() {
+    return uvm_driver_phase_f_batch_mini_internal(0, 0, 0);
+}
+
+int uvm_driver_phase_f_batch_mini1(uintptr_t base, size_t length) {
+    return uvm_driver_phase_f_batch_mini_internal(1, base, length);
+}
+
+int uvm_driver_phase_f_open_only() {
+    return uvm_driver_phase_f_open_only_internal();
+}
+
+int uvm_driver_phase_f_init_only() {
+    return uvm_driver_phase_f_init_only_internal();
+}
+
+int uvm_driver_phase_f_ioctl_only() {
+    return uvm_driver_phase_f_ioctl_only_internal();
 }
 
 int uvm_driver_batch_prefetch_gpu(const uintptr_t* ptrs,

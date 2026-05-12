@@ -32,12 +32,19 @@
 #include "uvm_thread_context.h"
 #include "uvm_kvmalloc.h"
 #include "uvm_va_space.h"
+#include "uvm_procfs.h"
 #include "nv_uvm_user_types.h"
 
 // This weird number comes from UVM_PREVENT_MIGRATION_RANGE_GROUPS_PARAMS. That
 // ioctl is called frequently so we don't want to allocate a copy every time.
 // It's a little over 256 bytes in size.
 #define UVM_MAX_IOCTL_PARAM_STACK_SIZE 288
+
+#define UVM_ROUTE_ALLOC_PRINT(fmt, ...)                         \
+    do {                                                        \
+        uvm_phase_f_route_log(fmt, ##__VA_ARGS__);              \
+        UVM_INFO_PRINT(fmt, ##__VA_ARGS__);                     \
+    } while (0)
 
 // The UVM_ROUTE_CMD_* macros are only intended for use in the ioctl routines
 
@@ -80,29 +87,64 @@
     case cmd:                                                                           \
     {                                                                                   \
         int ret = 0;                                                                    \
+        UVM_ROUTE_ALLOC_PRINT("route_alloc enter cmd=%u size=%zu init_check=%u\n",      \
+                              (unsigned)(cmd), sizeof(params_type), (unsigned)(do_init_check));\
         params_type *params = uvm_kvmalloc(sizeof(*params));                            \
-        if (!params)                                                                    \
+        if (!params) {                                                                  \
+            UVM_ROUTE_ALLOC_PRINT("route_alloc alloc_failed cmd=%u size=%zu\n",         \
+                                  (unsigned)(cmd), sizeof(params_type));                \
             return -ENOMEM;                                                             \
+        }                                                                               \
+        UVM_ROUTE_ALLOC_PRINT("route_alloc alloc_done cmd=%u params=0x%px size=%zu\n",  \
+                              (unsigned)(cmd), params, sizeof(*params));                \
         BUILD_BUG_ON(sizeof(*params) <= UVM_MAX_IOCTL_PARAM_STACK_SIZE);                \
         if (copy_from_user(params, (void __user*)arg, sizeof(*params))) {               \
+            UVM_ROUTE_ALLOC_PRINT("route_alloc copy_from_user_failed cmd=%u arg=0x%px size=%zu\n",\
+                                  (unsigned)(cmd), (void __user*)arg, sizeof(*params)); \
             uvm_kvfree(params);                                                         \
             return -EFAULT;                                                             \
         }                                                                               \
+        UVM_ROUTE_ALLOC_PRINT("route_alloc copy_from_user_done cmd=%u rmStatus_before=0x%x\n",\
+                              (unsigned)(cmd), params->rmStatus);                       \
                                                                                         \
         params->rmStatus = uvm_global_get_status();                                     \
+        UVM_ROUTE_ALLOC_PRINT("route_alloc global_status cmd=%u rmStatus=0x%x\n",       \
+                              (unsigned)(cmd), params->rmStatus);                       \
         if (params->rmStatus == NV_OK) {                                                \
+            UVM_ROUTE_ALLOC_PRINT("route_alloc going_to_init_check cmd=%u\n",           \
+                                  (unsigned)(cmd));                                     \
             if (do_init_check) {                                                        \
+                UVM_ROUTE_ALLOC_PRINT("route_alloc init_check_begin cmd=%u\n",          \
+                                      (unsigned)(cmd));                                 \
                 if (!uvm_fd_va_space(filp))                                             \
                     params->rmStatus = NV_ERR_ILLEGAL_ACTION;                           \
+                UVM_ROUTE_ALLOC_PRINT("route_alloc init_check_done cmd=%u rmStatus=0x%x\n",\
+                                      (unsigned)(cmd), params->rmStatus);               \
             }                                                                           \
-            if (likely(params->rmStatus == NV_OK))                                      \
+            if (likely(params->rmStatus == NV_OK)) {                                    \
+                UVM_ROUTE_ALLOC_PRINT("route_alloc handler_begin cmd=%u\n",             \
+                                      (unsigned)(cmd));                                 \
                 params->rmStatus = function_name(params, filp);                         \
+                UVM_ROUTE_ALLOC_PRINT("route_alloc handler_done cmd=%u rmStatus=0x%x\n",\
+                                      (unsigned)(cmd), params->rmStatus);               \
+            }                                                                           \
         }                                                                               \
                                                                                         \
-        if (copy_to_user((void __user*)arg, params, sizeof(*params)))                   \
+        UVM_ROUTE_ALLOC_PRINT("route_alloc copy_to_user_begin cmd=%u rmStatus=0x%x\n",  \
+                              (unsigned)(cmd), params->rmStatus);                       \
+        if (copy_to_user((void __user*)arg, params, sizeof(*params))) {                 \
+            UVM_ROUTE_ALLOC_PRINT("route_alloc copy_to_user_failed cmd=%u arg=0x%px size=%zu\n",\
+                                  (unsigned)(cmd), (void __user*)arg, sizeof(*params)); \
             ret = -EFAULT;                                                              \
+        }                                                                               \
+        else {                                                                          \
+            UVM_ROUTE_ALLOC_PRINT("route_alloc copy_to_user_done cmd=%u\n",             \
+                                  (unsigned)(cmd));                                     \
+        }                                                                               \
                                                                                         \
         uvm_kvfree(params);                                                             \
+        UVM_ROUTE_ALLOC_PRINT("route_alloc return cmd=%u ret=%d\n",                     \
+                              (unsigned)(cmd), ret);                                    \
         return ret;                                                                     \
     }
 

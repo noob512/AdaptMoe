@@ -1653,7 +1653,26 @@ typedef struct
     NvBool    resident_on_gpu;     // Out, query only
 } UVM_TEST_PHASE_F_RANGE_RESULT;
 
-#define UVM_TEST_PHASE_F_BATCH_EXECUTOR                  UVM_TEST_IOCTL_BASE(115)
+#define UVM_TEST_PHASE_F_PING                            UVM_TEST_IOCTL_BASE(115)
+typedef struct
+{
+    NvU32     magic;     // In
+    NV_STATUS rmStatus;  // Out
+} UVM_TEST_PHASE_F_PING_PARAMS;
+
+#define UVM_TEST_PHASE_F_BATCH_MINI                      UVM_TEST_IOCTL_BASE(116)
+typedef struct
+{
+    NvU32     action;         // In
+    NvU32     count;          // In, 0 or 1
+    NvU64     base   NV_ALIGN_BYTES(8); // In
+    NvU64     length NV_ALIGN_BYTES(8); // In
+    NvU32     success_count;  // Out
+    NvU32     failure_count;  // Out
+    NV_STATUS rmStatus;       // Out
+} UVM_TEST_PHASE_F_BATCH_MINI_PARAMS;
+
+#define UVM_TEST_PHASE_F_BATCH_EXECUTOR                  UVM_TEST_IOCTL_BASE(117)
 typedef struct
 {
     NvU32                         action;                                      // In

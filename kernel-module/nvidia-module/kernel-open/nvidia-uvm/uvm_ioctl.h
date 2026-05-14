@@ -1002,6 +1002,96 @@ typedef struct
 } UVM_CLEAR_ALL_ACCESS_COUNTERS_PARAMS;
 
 //
+// UvmPhaseFBatchExecutor
+//
+// Minimal production-facing Phase F batch executor. User space still owns
+// policy decisions and submits explicit VA ranges plus an action. The driver
+// only batches the existing UVM operations.
+//
+#define UVM_PHASE_F_MAX_RANGES                                         64
+
+typedef enum
+{
+    UVM_PHASE_F_ACTION_PREFETCH_CPU = 1,
+    UVM_PHASE_F_ACTION_PREFETCH_GPU = 2,
+    UVM_PHASE_F_ACTION_ADVISE_CPU = 3,
+    UVM_PHASE_F_ACTION_QUERY_RESIDENCY = 4,
+} UVM_PHASE_F_ACTION;
+
+typedef struct
+{
+    NvU64 base   NV_ALIGN_BYTES(8); // IN
+    NvU64 length NV_ALIGN_BYTES(8); // IN
+} UVM_PHASE_F_RANGE;
+
+typedef struct
+{
+    NvU64 region_id NV_ALIGN_BYTES(8); // IN
+    NvU64 base      NV_ALIGN_BYTES(8); // IN
+    NvU64 length    NV_ALIGN_BYTES(8); // IN
+    NvU32 pool;                        // IN
+    NvU32 layer_id;                    // IN
+    NvU32 expert_id;                   // IN
+    NvU32 role;                        // IN
+    NvU32 flags;                       // IN
+} UVM_PHASE_F_REGION;
+
+typedef struct
+{
+    NV_STATUS status;              // OUT
+    NvU32     resident_on_count;   // OUT, query only
+    NvBool    resident_on_cpu;     // OUT, query only
+    NvBool    resident_on_gpu;     // OUT, query only
+    NvU64     queried_bytes        NV_ALIGN_BYTES(8); // OUT, query only
+    NvU64     resident_gpu_bytes   NV_ALIGN_BYTES(8); // OUT, query only
+    NvU64     resident_cpu_bytes   NV_ALIGN_BYTES(8); // OUT, query only
+    NvU64     resident_any_bytes   NV_ALIGN_BYTES(8); // OUT, query only
+    NvU64     resident_unknown_bytes NV_ALIGN_BYTES(8); // OUT, query only
+} UVM_PHASE_F_RANGE_RESULT;
+
+#define UVM_PHASE_F_BATCH_EXECUTOR                                     UVM_IOCTL_BASE(81)
+typedef struct
+{
+    NvU32                    action;                                // IN
+    NvU32                    count;                                 // IN
+    NvProcessorUuid          gpu_uuid;                              // IN
+    NvBool                   async;                                 // IN
+    NvU32                    success_count;                         // OUT
+    NvU32                    failure_count;                         // OUT
+    UVM_PHASE_F_RANGE        ranges[UVM_PHASE_F_MAX_RANGES];        // IN
+    UVM_PHASE_F_RANGE_RESULT results[UVM_PHASE_F_MAX_RANGES];       // OUT
+    NV_STATUS                rmStatus;                              // OUT
+} UVM_PHASE_F_BATCH_EXECUTOR_PARAMS;
+
+#define UVM_PHASE_F_REGISTER_REGION                                   UVM_IOCTL_BASE(82)
+typedef struct
+{
+    UVM_PHASE_F_REGION region;     // IN
+    NV_STATUS          rmStatus;   // OUT
+} UVM_PHASE_F_REGISTER_REGION_PARAMS;
+
+#define UVM_PHASE_F_UNREGISTER_REGION                                 UVM_IOCTL_BASE(83)
+typedef struct
+{
+    NvU64     region_id NV_ALIGN_BYTES(8); // IN
+    NV_STATUS rmStatus;                    // OUT
+} UVM_PHASE_F_UNREGISTER_REGION_PARAMS;
+
+#define UVM_PHASE_F_BATCH_REGIONS                                      UVM_IOCTL_BASE(84)
+typedef struct
+{
+    NvU32                    action;                                // IN
+    NvU32                    count;                                 // IN
+    NvProcessorUuid          gpu_uuid;                              // IN
+    NvBool                   async;                                 // IN
+    NvU32                    success_count;                         // OUT
+    NvU32                    failure_count;                         // OUT
+    NvU64                    region_ids[UVM_PHASE_F_MAX_RANGES];    // IN
+    UVM_PHASE_F_RANGE_RESULT results[UVM_PHASE_F_MAX_RANGES];       // OUT
+    NV_STATUS                rmStatus;                              // OUT
+} UVM_PHASE_F_BATCH_REGIONS_PARAMS;
+
+//
 // UvmDiscard
 //
 #define UVM_DISCARD                                                   UVM_IOCTL_BASE(80)

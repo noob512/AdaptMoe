@@ -54,3 +54,14 @@ modules.order
 # Large local datasets (do not commit)
 /workloads/vllm/datasets/
 workloads/vllm/results/uvm_kv_bench_single_process.log
+
+# vLLM experiment outputs (do not commit generated logs/summaries/traces)
+/workloads/vllm/log/
+/workloads/vllm/results/
+/workloads/vllm/**/real_residency*.json
+/workloads/vllm/**/real_residency*.jsonl
+/workloads/vllm/**/*_summary.json
+/workloads/vllm/**/*_summary.csv
+/workloads/vllm/**/*_metrics.json
+/workloads/vllm/**/*_trace.jsonl
+/workloads/vllm/**/*_stats.json

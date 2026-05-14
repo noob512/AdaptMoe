@@ -24,6 +24,7 @@ STARTUP_TIMEOUT=600
 CHECK_INTERVAL=2
 SERVER_MAX_NUM_SEQS="${VLLM_SERVER_MAX_NUM_SEQS:-8}"
 SERVER_GPU_MEMORY_UTILIZATION="${VLLM_SERVER_GPU_MEMORY_UTILIZATION:-0.85}"
+UVM_PHASE_F_ROUTE_LOG_DELAY_MS="${UVM_PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
 
 DATASET_PATH="${DATASET_PATH:-$SCRIPT_DIR/datasets/ShareGPT_V3_unfiltered_cleaned_split.json}"
 ADDRESS_LOG="/tmp/vllm_uvm_address_regions.log"
@@ -120,6 +121,7 @@ UVM_POOL_COORDINATOR_PRIORITY="${VLLM_UVM_POOL_COORDINATOR_PRIORITY:-kv,weights,
 UVM_RESIDENCY_ENABLE="${VLLM_UVM_RESIDENCY_ENABLE:-0}"
 UVM_RESIDENCY_STAGE="${VLLM_UVM_RESIDENCY_STAGE:-stage_l0}"
 UVM_RESIDENCY_MODE="${VLLM_UVM_RESIDENCY_MODE:-trace_only}"
+UVM_RESIDENCY_TRACE_ENABLE="${VLLM_UVM_RESIDENCY_TRACE_ENABLE:-1}"
 UVM_RESIDENCY_TRACE_FILE="${VLLM_UVM_RESIDENCY_TRACE_FILE:-}"
 UVM_RESIDENCY_GLOBAL_GPU_BYTES="${VLLM_UVM_RESIDENCY_GLOBAL_GPU_BYTES:-0}"
 UVM_RESIDENCY_WEIGHT_GPU_BYTES="${VLLM_UVM_RESIDENCY_WEIGHT_GPU_BYTES:-0}"
@@ -146,6 +148,15 @@ UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD="${VLLM_UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD:-1}"
 UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP="${VLLM_UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP:-0}"
 UVM_RESIDENCY_WEIGHT_VICTIM_POLICY="${VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_POLICY:-cold_plan_lru}"
 UVM_RESIDENCY_WEIGHT_VICTIM_ACTION="${VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_ACTION:-offload_cpu}"
+UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE="${VLLM_UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE:-0}"
+UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="${VLLM_UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER:-0}"
+UVM_REAL_RESIDENCY_ENABLE="${VLLM_UVM_REAL_RESIDENCY_ENABLE:-0}"
+UVM_REAL_RESIDENCY_TRACE_FILE="${VLLM_UVM_REAL_RESIDENCY_TRACE_FILE:-}"
+UVM_REAL_RESIDENCY_DEVICE="${VLLM_UVM_REAL_RESIDENCY_DEVICE:-0}"
+UVM_REAL_RESIDENCY_ON_REGISTER_EVERY="${VLLM_UVM_REAL_RESIDENCY_ON_REGISTER_EVERY:-0}"
+UVM_REAL_RESIDENCY_ON_ACTION_EVERY="${VLLM_UVM_REAL_RESIDENCY_ON_ACTION_EVERY:-0}"
+UVM_REAL_RESIDENCY_MAX_SNAPSHOTS="${VLLM_UVM_REAL_RESIDENCY_MAX_SNAPSHOTS:-0}"
+UVM_REAL_RESIDENCY_MAX_REGIONS_PER_POOL="${VLLM_UVM_REAL_RESIDENCY_MAX_REGIONS_PER_POOL:-0}"
 UVM_POOL_REGISTRY_ENABLE="${VLLM_UVM_POOL_REGISTRY_ENABLE:-0}"
 UVM_SCRATCH_POOL_ENABLE="${VLLM_UVM_SCRATCH_POOL_ENABLE:-0}"
 UVM_SCRATCH_POOL_BUDGET_BYTES="${VLLM_UVM_SCRATCH_POOL_BUDGET_BYTES:-1048576}"
@@ -491,6 +502,8 @@ Options:
   --uvm-enable-builtin-tests <0|1>
                              Set uvm_enable_builtin_tests at insmod time.
                              Required for Phase F test ioctl driver executor.
+  --uvm-phase-f-route-log-delay-ms <n>
+                             Set uvm_phase_f_route_log_delay_ms at insmod time (default: 0)
   --keep                     Keep UVM params on exit (no rollback)
   -h, --help                 Show help
 
@@ -722,6 +735,7 @@ start_server() {
                 VLLM_UVM_RESIDENCY_ENABLE='$UVM_RESIDENCY_ENABLE' \
                 VLLM_UVM_RESIDENCY_STAGE='$UVM_RESIDENCY_STAGE' \
                 VLLM_UVM_RESIDENCY_MODE='$UVM_RESIDENCY_MODE' \
+                VLLM_UVM_RESIDENCY_TRACE_ENABLE='$UVM_RESIDENCY_TRACE_ENABLE' \
                 VLLM_UVM_RESIDENCY_TRACE_FILE='$UVM_RESIDENCY_TRACE_FILE' \
                 VLLM_UVM_RESIDENCY_GLOBAL_GPU_BYTES='$UVM_RESIDENCY_GLOBAL_GPU_BYTES' \
                 VLLM_UVM_RESIDENCY_WEIGHT_GPU_BYTES='$UVM_RESIDENCY_WEIGHT_GPU_BYTES' \
@@ -748,6 +762,15 @@ start_server() {
                 VLLM_UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP='$UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP' \
                 VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_POLICY='$UVM_RESIDENCY_WEIGHT_VICTIM_POLICY' \
                 VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_ACTION='$UVM_RESIDENCY_WEIGHT_VICTIM_ACTION' \
+                VLLM_UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE='$UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE' \
+                VLLM_UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER='$UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER' \
+                VLLM_UVM_REAL_RESIDENCY_ENABLE='$UVM_REAL_RESIDENCY_ENABLE' \
+                VLLM_UVM_REAL_RESIDENCY_TRACE_FILE='$UVM_REAL_RESIDENCY_TRACE_FILE' \
+                VLLM_UVM_REAL_RESIDENCY_DEVICE='$UVM_REAL_RESIDENCY_DEVICE' \
+                VLLM_UVM_REAL_RESIDENCY_ON_REGISTER_EVERY='$UVM_REAL_RESIDENCY_ON_REGISTER_EVERY' \
+                VLLM_UVM_REAL_RESIDENCY_ON_ACTION_EVERY='$UVM_REAL_RESIDENCY_ON_ACTION_EVERY' \
+                VLLM_UVM_REAL_RESIDENCY_MAX_SNAPSHOTS='$UVM_REAL_RESIDENCY_MAX_SNAPSHOTS' \
+                VLLM_UVM_REAL_RESIDENCY_MAX_REGIONS_PER_POOL='$UVM_REAL_RESIDENCY_MAX_REGIONS_PER_POOL' \
                 VLLM_UVM_POOL_REGISTRY_ENABLE='$UVM_POOL_REGISTRY_ENABLE' \
                 VLLM_UVM_SCRATCH_POOL_ENABLE='$UVM_SCRATCH_POOL_ENABLE' \
                 VLLM_UVM_SCRATCH_POOL_BUDGET_BYTES='$UVM_SCRATCH_POOL_BUDGET_BYTES' \
@@ -951,6 +974,7 @@ reload_uvm_module_for_counter_reset() {
   sudo insmod "$UVM_KO_PATH" \
     uvm_enable_debug_procfs="$UVM_ENABLE_DEBUG_PROCFS" \
     uvm_enable_builtin_tests="$UVM_ENABLE_BUILTIN_TESTS" \
+    uvm_phase_f_route_log_delay_ms="$UVM_PHASE_F_ROUTE_LOG_DELAY_MS" \
     uvm_perf_fault_log_destination=0 \
     uvm_perf_fault_log_counters=0 \
     uvm_perf_fault_log_addresses=0 \
@@ -968,6 +992,12 @@ reload_uvm_module_for_counter_reset() {
     tests_val="$(cat "$PARAM_DIR/uvm_enable_builtin_tests" 2>/dev/null || true)"
     [ "$tests_val" = "$UVM_ENABLE_BUILTIN_TESTS" ] \
       || die "uvm_enable_builtin_tests expected $UVM_ENABLE_BUILTIN_TESTS, got $tests_val"
+  fi
+  if [ -r "$PARAM_DIR/uvm_phase_f_route_log_delay_ms" ]; then
+    local route_delay_val
+    route_delay_val="$(cat "$PARAM_DIR/uvm_phase_f_route_log_delay_ms" 2>/dev/null || true)"
+    [ "$route_delay_val" = "$UVM_PHASE_F_ROUTE_LOG_DELAY_MS" ] \
+      || die "uvm_phase_f_route_log_delay_ms expected $UVM_PHASE_F_ROUTE_LOG_DELAY_MS, got $route_delay_val"
   fi
 
   # Optional: clear old kernel ring lines so dmesg mode only shows this run.
@@ -1189,6 +1219,7 @@ parse_args() {
       --uvm-residency-enable) UVM_RESIDENCY_ENABLE="$2"; shift 2 ;; # Stage L0 estimated residency ledger
       --uvm-residency-stage) UVM_RESIDENCY_STAGE="$2"; shift 2 ;; # Stage L JSONL label
       --uvm-residency-mode) UVM_RESIDENCY_MODE="$2"; shift 2 ;; # Stage L0 mode trace_only/enforce
+      --uvm-residency-trace-enable) UVM_RESIDENCY_TRACE_ENABLE="$2"; shift 2 ;; # Stage L0 JSONL trace gate
       --uvm-residency-trace-file) UVM_RESIDENCY_TRACE_FILE="$2"; shift 2 ;; # Stage L0 JSONL trace
       --uvm-residency-global-gpu-bytes) UVM_RESIDENCY_GLOBAL_GPU_BYTES="$2"; shift 2 ;; # Stage L0 global estimated GPU budget
       --uvm-residency-weight-gpu-bytes) UVM_RESIDENCY_WEIGHT_GPU_BYTES="$2"; shift 2 ;; # Stage L0 weights estimated GPU budget
@@ -1215,6 +1246,8 @@ parse_args() {
       --uvm-residency-weight-max-victims-per-step) UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP="$2"; shift 2 ;; # Stage L2 victim cap
       --uvm-residency-weight-victim-policy) UVM_RESIDENCY_WEIGHT_VICTIM_POLICY="$2"; shift 2 ;; # Stage L2 victim policy label
       --uvm-residency-weight-victim-action) UVM_RESIDENCY_WEIGHT_VICTIM_ACTION="$2"; shift 2 ;; # Stage L2 victim action
+      --uvm-residency-weight-active-evict-enable) UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE="$2"; shift 2 ;; # Stage L2 active-set eviction gate
+      --uvm-residency-weight-active-evict-max-experts-per-layer) UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;; # Stage L2 active-set eviction cap
       --uvm-pool-registry-enable) UVM_POOL_REGISTRY_ENABLE="$2"; shift 2 ;; # Stage F unified pool registry telemetry
       --uvm-scratch-pool-enable) UVM_SCRATCH_POOL_ENABLE="$2"; shift 2 ;; # Stage G scratch pool admission control
       --uvm-scratch-pool-budget-bytes) UVM_SCRATCH_POOL_BUDGET_BYTES="$2"; shift 2 ;; # Stage G scratch pool device-direct live bytes budget
@@ -1247,6 +1280,7 @@ parse_args() {
       --uvm-ko-path) UVM_KO_PATH="$2"; shift 2 ;;              # 指定 nvidia-uvm.ko 的绝对路径
       --uvm-enable-debug-procfs) UVM_ENABLE_DEBUG_PROCFS="$2"; shift 2 ;; # insmod 时的 debug procfs 开关
       --uvm-enable-builtin-tests) UVM_ENABLE_BUILTIN_TESTS="$2"; shift 2 ;; # insmod 时开启 builtin tests
+      --uvm-phase-f-route-log-delay-ms) UVM_PHASE_F_ROUTE_LOG_DELAY_MS="$2"; shift 2 ;; # insmod 时的 Phase F route log 人工延迟
       --keep) KEEP_ON_EXIT=1; shift ;;                         # 退出时不重置内核状态
 
       # ==========================================
@@ -1376,6 +1410,7 @@ validate_inputs() {
     [[ "$UVM_POOL_COORDINATOR_SCRATCH_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-pool-coordinator-scratch-bytes-per-step must be a non-negative integer"
     [ -n "$UVM_POOL_COORDINATOR_PRIORITY" ] || die "--uvm-pool-coordinator-priority must not be empty"
     [[ "$UVM_RESIDENCY_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-enable must be 0 or 1"
+    [[ "$UVM_RESIDENCY_TRACE_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-trace-enable must be 0 or 1"
     [ -n "$UVM_RESIDENCY_STAGE" ] || die "--uvm-residency-stage must not be empty"
     [[ "$UVM_RESIDENCY_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-residency-mode must be trace_only or enforce"
     [[ "$UVM_RESIDENCY_GLOBAL_GPU_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-residency-global-gpu-bytes must be a non-negative integer"
@@ -1402,6 +1437,8 @@ validate_inputs() {
     [[ "$UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-residency-weight-max-victims-per-step must be a non-negative integer"
     [ -n "$UVM_RESIDENCY_WEIGHT_VICTIM_POLICY" ] || die "--uvm-residency-weight-victim-policy must not be empty"
     [[ "$UVM_RESIDENCY_WEIGHT_VICTIM_ACTION" =~ ^(advise_cpu|prefetch_cpu|offload_cpu)$ ]] || die "--uvm-residency-weight-victim-action must be advise_cpu, prefetch_cpu, or offload_cpu"
+    [[ "$UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-weight-active-evict-enable must be 0 or 1"
+    [[ "$UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-residency-weight-active-evict-max-experts-per-layer must be a non-negative integer"
     [[ "$UVM_POOL_REGISTRY_ENABLE" =~ ^[01]$ ]] || die "--uvm-pool-registry-enable must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_ENABLE" =~ ^[01]$ ]] || die "--uvm-scratch-pool-enable must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-scratch-pool-budget-bytes must be a non-negative integer"

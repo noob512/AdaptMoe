@@ -62,6 +62,32 @@ int uvm_driver_batch_query_residency(const uintptr_t* ptrs,
                                      const size_t* sizes,
                                      size_t count,
                                      int device);
+int uvm_driver_batch_query_residency_bytes(const uintptr_t* ptrs,
+                                           const size_t* sizes,
+                                           size_t count,
+                                           int device,
+                                           uint64_t* gpu_bytes_out,
+                                           uint64_t* cpu_bytes_out,
+                                           uint64_t* any_bytes_out,
+                                           uint64_t* unknown_bytes_out,
+                                           uint64_t* queried_bytes_out);
+int uvm_driver_phase_f_register_region(uint64_t region_id,
+                                       uintptr_t base,
+                                       size_t length,
+                                       uint32_t pool,
+                                       uint32_t layer_id,
+                                       uint32_t expert_id,
+                                       uint32_t role,
+                                       uint32_t flags);
+int uvm_driver_phase_f_unregister_region(uint64_t region_id);
+int uvm_driver_batch_query_residency_regions(const uint64_t* region_ids,
+                                             size_t count,
+                                             int device);
+int uvm_driver_phase_f_register_query_region(uint64_t region_id,
+                                             uintptr_t base,
+                                             size_t length,
+                                             int device);
+int uvm_driver_phase_f_probe_existing_uvm_fd();
 }
 
 namespace {
@@ -70,7 +96,7 @@ namespace {
 // shell 脚本 run_stage_m_phase_f_smoke.sh 会把同名 --step 继续传进来。
 void usage(const char* argv0) {
     std::fprintf(stderr,
-                 "Usage: %s [--step all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|query|prefetch-gpu|advise-cpu|prefetch-cpu] "
+                 "Usage: %s [--step all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|register-region|query-region|query|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu] "
                  "[--bytes N] [--device N] [--async 0|1]\n",
                  argv0);
 }
@@ -260,6 +286,16 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
     trace("after_managed_allocation_ready");
 
+    // Step 6.5: 探测 CUDA runtime 是否已经在当前进程打开 /dev/nvidia-uvm。
+    // 返回 1 表示找到并成功 dup；返回 0 表示当前进程 fd 表中没有可采用的 UVM fd。
+    if (want_step(step, "probe-uvm-fd")) {
+        trace("before_probe_uvm_fd");
+        int failed = run_step("probe-uvm-fd", uvm_driver_phase_f_probe_existing_uvm_fd());
+        trace("after_probe_uvm_fd");
+        cudaFree(ptr);
+        return failed;
+    }
+
     // Step 7: mini batch ioctl，count=1，传真实 managed range。
     // 这一步用来区分“空 ioctl 路径没问题”与“带 range 参数后出问题”。
     if (want_step(step, "batch-mini1")) {
@@ -276,10 +312,61 @@ int main(int argc, char** argv) {
     // 会调用 Phase F batch executor，action=QUERY_RESIDENCY，count=1。
     if (want_step(step, "query")) {
         trace("before_query");
-        int failed = run_step(
-            "query", uvm_driver_batch_query_residency(&base, &size, 1, device));
+        uint64_t gpu_bytes = 0;
+        uint64_t cpu_bytes = 0;
+        uint64_t any_bytes = 0;
+        uint64_t unknown_bytes = 0;
+        uint64_t queried_bytes = 0;
+        int query_result = uvm_driver_batch_query_residency_bytes(&base,
+                                                                  &size,
+                                                                  1,
+                                                                  device,
+                                                                  &gpu_bytes,
+                                                                  &cpu_bytes,
+                                                                  &any_bytes,
+                                                                  &unknown_bytes,
+                                                                  &queried_bytes);
+        std::printf("phase_f_smoke residency_bytes queried=%llu gpu=%llu cpu=%llu any=%llu unknown=%llu\n",
+                    static_cast<unsigned long long>(queried_bytes),
+                    static_cast<unsigned long long>(gpu_bytes),
+                    static_cast<unsigned long long>(cpu_bytes),
+                    static_cast<unsigned long long>(any_bytes),
+                    static_cast<unsigned long long>(unknown_bytes));
+        int failed = run_step("query", query_result);
         trace("after_query");
         if (failed || step == "query") {
+            cudaFree(ptr);
+            return failed;
+        }
+    }
+
+    const uint64_t region_id = 1;
+
+    // Step 8.1: 按 region id 查询 residency。
+    // helper 会在同一个 UVM fd 生命周期内完成 register -> query -> unregister，
+    // 避免 region 随 fd close 立刻消失。
+    if (want_step(step, "query-region")) {
+        trace("before_query_region");
+        int failed = run_step(
+            "query-region",
+            uvm_driver_phase_f_register_query_region(region_id, base, size, device));
+        trace("after_query_region");
+        if (failed || step == "query-region") {
+            cudaFree(ptr);
+            return failed;
+        }
+    }
+
+    // Step 8.2: 只注册一个 Phase F policy region。
+    // 单独跑 register-region 时只验证注册 ioctl；由于 helper 会关闭 fd，
+    // 这个 region 的生命周期也会随该 VA space 结束。
+    if (want_step(step, "register-region")) {
+        trace("before_register_region");
+        int failed = run_step(
+            "register-region",
+            uvm_driver_phase_f_register_region(region_id, base, size, 1, 0, 0, 0, 0));
+        trace("after_register_region");
+        if (failed || step == "register-region") {
             cudaFree(ptr);
             return failed;
         }
@@ -297,6 +384,48 @@ int main(int argc, char** argv) {
             cudaFree(ptr);
             return failed;
         }
+    }
+
+    // Step 9.1: 在同一个 managed allocation 上先 prefetch 到 GPU，再查询 residency bytes。
+    // 这是验证真实 GPU resident bytes 的最小闭环；不能拆成两个脚本运行，
+    // 因为两次运行会创建不同的 managed allocation。
+    if (want_step(step, "prefetch-gpu-query")) {
+        trace("before_prefetch_gpu_query_prefetch");
+        int failed = run_step(
+            "prefetch-gpu",
+            uvm_driver_batch_prefetch_gpu(&base, &size, 1, device, async));
+        cudaDeviceSynchronize();
+        trace("after_prefetch_gpu_query_prefetch");
+        if (failed) {
+            cudaFree(ptr);
+            return failed;
+        }
+
+        uint64_t gpu_bytes = 0;
+        uint64_t cpu_bytes = 0;
+        uint64_t any_bytes = 0;
+        uint64_t unknown_bytes = 0;
+        uint64_t queried_bytes = 0;
+        trace("before_prefetch_gpu_query_query");
+        int query_result = uvm_driver_batch_query_residency_bytes(&base,
+                                                                  &size,
+                                                                  1,
+                                                                  device,
+                                                                  &gpu_bytes,
+                                                                  &cpu_bytes,
+                                                                  &any_bytes,
+                                                                  &unknown_bytes,
+                                                                  &queried_bytes);
+        std::printf("phase_f_smoke residency_bytes_after_prefetch_gpu queried=%llu gpu=%llu cpu=%llu any=%llu unknown=%llu\n",
+                    static_cast<unsigned long long>(queried_bytes),
+                    static_cast<unsigned long long>(gpu_bytes),
+                    static_cast<unsigned long long>(cpu_bytes),
+                    static_cast<unsigned long long>(any_bytes),
+                    static_cast<unsigned long long>(unknown_bytes));
+        failed = run_step("prefetch-gpu-query", query_result);
+        trace("after_prefetch_gpu_query_query");
+        cudaFree(ptr);
+        return failed;
     }
 
     // Step 10: advise managed range 的 preferred location 为 CPU。

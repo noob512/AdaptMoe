@@ -54,6 +54,8 @@ WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP="${WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP:-26843545
 WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER="${WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER:-8}"
 WEIGHT_MAX_VICTIMS_PER_STEP="${WEIGHT_MAX_VICTIMS_PER_STEP:-16}"
 WEIGHT_VICTIM_ACTION="${WEIGHT_VICTIM_ACTION:-offload_cpu}"
+WEIGHT_ACTIVE_EVICT_ENABLE="${WEIGHT_ACTIVE_EVICT_ENABLE:-0}"
+WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="${WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER:-0}"
 WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE="${WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE:-0}"
 INIT_KV_MIN_BLOCKS="${INIT_KV_MIN_BLOCKS:-128}"
 INIT_WEIGHT_MAX_BYTES="${INIT_WEIGHT_MAX_BYTES:-8589934592}"
@@ -65,6 +67,18 @@ COORDINATOR_KV_BYTES_PER_STEP="${COORDINATOR_KV_BYTES_PER_STEP:-268435456}"
 COORDINATOR_WEIGHT_BYTES_PER_STEP="${COORDINATOR_WEIGHT_BYTES_PER_STEP:-268435456}"
 COORDINATOR_SCRATCH_BYTES_PER_STEP="${COORDINATOR_SCRATCH_BYTES_PER_STEP:-16777216}"
 COORDINATOR_PRIORITY="${COORDINATOR_PRIORITY:-kv,scratch,weights}"
+
+SCRATCH_DEVICE_DIRECT_ENABLE="${SCRATCH_DEVICE_DIRECT_ENABLE:-1}"
+SCRATCH_POOL_ENABLE="${SCRATCH_POOL_ENABLE:-1}"
+RESIDENCY_ENABLE="${RESIDENCY_ENABLE:-1}"
+RESIDENCY_TRACE_ENABLE="${RESIDENCY_TRACE_ENABLE:-1}"
+KV_RUNTIME_ENABLE="${KV_RUNTIME_ENABLE:-1}"
+WEIGHT_RUNTIME_PREFETCH_ENABLE="${WEIGHT_RUNTIME_PREFETCH_ENABLE:-1}"
+INIT_WEIGHT_OFFLOAD_ENABLE="${INIT_WEIGHT_OFFLOAD_ENABLE:-1}"
+POOL_COORDINATOR_ENABLE="${POOL_COORDINATOR_ENABLE:-1}"
+POOL_REGISTRY_ENABLE="${POOL_REGISTRY_ENABLE:-1}"
+AUTO_GAP_WATCH_ENABLE="${AUTO_GAP_WATCH_ENABLE:-1}"
+FAULT_ADDRESS_LOG_ENABLE="${FAULT_ADDRESS_LOG_ENABLE:-1}"
 
 usage() {
   cat <<'USAGE'
@@ -134,8 +148,22 @@ Runtime enforcement controls:
   --init-weight-max-bytes <n>            default: 8GiB
   --init-weight-max-experts-per-layer <n> default: 16
   --weight-max-victims-per-step <n>      default: 16
+  --weight-active-evict-enable <0|1>     evict non-active experts each step
+  --weight-active-evict-max-experts-per-layer <n>
+                                         cap non-active expert scan/offload
   --weight-budget-cpu-offload-enable <0|1>
                                          default: 0
+  --scratch-device-direct-enable <0|1>   full_impl scratch device-direct action
+  --scratch-pool-enable <0|1>            full_impl scratch pool enforcement
+  --residency-enable <0|1>               full_impl Stage L residency policy
+  --residency-trace-enable <0|1>         write Stage L residency JSONL
+  --kv-runtime-enable <0|1>              full_impl Stage J runtime KV policy
+  --weight-runtime-prefetch-enable <0|1> full_impl runtime weight prefetch
+  --init-weight-offload-enable <0|1>     full_impl init cold-weight offload
+  --pool-coordinator-enable <0|1>        full_impl Stage K coordinator
+  --pool-registry-enable <0|1>           full_impl pool registry
+  --auto-gap-watch-enable <0|1>          auto gap-watch probe/main flow
+  --fault-address-log-enable <0|1>       kernel per-fault address trace
 
 Outputs:
   <run-root>/summary.csv
@@ -184,7 +212,20 @@ while [ $# -gt 0 ]; do
     --init-weight-max-experts-per-layer) INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;;
     --weight-max-victims-per-step) WEIGHT_MAX_VICTIMS_PER_STEP="$2"; shift 2 ;;
     --weight-victim-action) WEIGHT_VICTIM_ACTION="$2"; shift 2 ;;
+    --weight-active-evict-enable) WEIGHT_ACTIVE_EVICT_ENABLE="$2"; shift 2 ;;
+    --weight-active-evict-max-experts-per-layer) WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;;
     --weight-budget-cpu-offload-enable) WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE="$2"; shift 2 ;;
+    --scratch-device-direct-enable) SCRATCH_DEVICE_DIRECT_ENABLE="$2"; shift 2 ;;
+    --scratch-pool-enable) SCRATCH_POOL_ENABLE="$2"; shift 2 ;;
+    --residency-enable) RESIDENCY_ENABLE="$2"; shift 2 ;;
+    --residency-trace-enable) RESIDENCY_TRACE_ENABLE="$2"; shift 2 ;;
+    --kv-runtime-enable) KV_RUNTIME_ENABLE="$2"; shift 2 ;;
+    --weight-runtime-prefetch-enable) WEIGHT_RUNTIME_PREFETCH_ENABLE="$2"; shift 2 ;;
+    --init-weight-offload-enable) INIT_WEIGHT_OFFLOAD_ENABLE="$2"; shift 2 ;;
+    --pool-coordinator-enable) POOL_COORDINATOR_ENABLE="$2"; shift 2 ;;
+    --pool-registry-enable) POOL_REGISTRY_ENABLE="$2"; shift 2 ;;
+    --auto-gap-watch-enable) AUTO_GAP_WATCH_ENABLE="$2"; shift 2 ;;
+    --fault-address-log-enable) FAULT_ADDRESS_LOG_ENABLE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -216,6 +257,14 @@ if ! [[ "$WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE" =~ ^[01]$ ]]; then
   echo "--weight-budget-cpu-offload-enable must be 0 or 1" >&2
   exit 2
 fi
+if ! [[ "$WEIGHT_ACTIVE_EVICT_ENABLE" =~ ^[01]$ ]]; then
+  echo "--weight-active-evict-enable must be 0 or 1" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]]; then
+  echo "--weight-active-evict-max-experts-per-layer must be a non-negative integer" >&2
+  exit 2
+fi
 WEIGHT_EXECUTOR="${WEIGHT_EXECUTOR:-cpp_batch}"
 if ! [[ "$WEIGHT_EXECUTOR" =~ ^(cpp_batch|driver_batch|auto)$ ]]; then
   echo "--weight-executor must be cpp_batch, driver_batch, or auto" >&2
@@ -228,6 +277,27 @@ if ! [[ "$UVM_ENABLE_BUILTIN_TESTS" =~ ^[01]$ ]]; then
 fi
 if ! [[ "$RESET_COUNTERS" =~ ^[01]$ ]]; then
   echo "RESET_COUNTERS must be 0 or 1" >&2
+  exit 2
+fi
+for item in \
+  SCRATCH_DEVICE_DIRECT_ENABLE \
+  SCRATCH_POOL_ENABLE \
+  RESIDENCY_ENABLE \
+  RESIDENCY_TRACE_ENABLE \
+  KV_RUNTIME_ENABLE \
+  WEIGHT_RUNTIME_PREFETCH_ENABLE \
+  INIT_WEIGHT_OFFLOAD_ENABLE \
+  POOL_COORDINATOR_ENABLE \
+  POOL_REGISTRY_ENABLE \
+  AUTO_GAP_WATCH_ENABLE \
+  FAULT_ADDRESS_LOG_ENABLE; do
+  if ! [[ "${!item}" =~ ^[01]$ ]]; then
+    echo "$item must be 0 or 1" >&2
+    exit 2
+  fi
+done
+if [ "$AUTO_GAP_WATCH_ENABLE" = "1" ] && [ "$FAULT_ADDRESS_LOG_ENABLE" = "0" ]; then
+  echo "--auto-gap-watch-enable=1 requires --fault-address-log-enable=1" >&2
   exit 2
 fi
 
@@ -273,6 +343,8 @@ echo " weight_plan_experts: $WEIGHT_PLAN_EXPERTS"
 echo " weight_plan_file: ${WEIGHT_PLAN_FILE:-<generated_broad_cold_plan>}"
 echo " weight_max_victims_per_step: $WEIGHT_MAX_VICTIMS_PER_STEP"
 echo " weight_victim_action: $WEIGHT_VICTIM_ACTION"
+echo " weight_active_evict_enable: $WEIGHT_ACTIVE_EVICT_ENABLE"
+echo " weight_active_evict_max_experts_per_layer: $WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER"
 echo " weight_budget_cpu_offload_enable: $WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE"
 echo " weight_batch_executor_enable: ${WEIGHT_BATCH_EXECUTOR_ENABLE:-1}"
 echo " weight_executor: $WEIGHT_EXECUTOR"
@@ -281,6 +353,17 @@ echo " reset_counters: $RESET_COUNTERS"
 echo " init_kv_min_blocks: $INIT_KV_MIN_BLOCKS"
 echo " init_weight_max_bytes: $INIT_WEIGHT_MAX_BYTES"
 echo " init_weight_max_experts_per_layer: $INIT_WEIGHT_MAX_EXPERTS_PER_LAYER"
+echo " scratch_device_direct_enable: $SCRATCH_DEVICE_DIRECT_ENABLE"
+echo " scratch_pool_enable: $SCRATCH_POOL_ENABLE"
+echo " residency_enable: $RESIDENCY_ENABLE"
+echo " residency_trace_enable: $RESIDENCY_TRACE_ENABLE"
+echo " kv_runtime_enable: $KV_RUNTIME_ENABLE"
+echo " weight_runtime_prefetch_enable: $WEIGHT_RUNTIME_PREFETCH_ENABLE"
+echo " init_weight_offload_enable: $INIT_WEIGHT_OFFLOAD_ENABLE"
+echo " pool_coordinator_enable: $POOL_COORDINATOR_ENABLE"
+echo " pool_registry_enable: $POOL_REGISTRY_ENABLE"
+echo " auto_gap_watch_enable: $AUTO_GAP_WATCH_ENABLE"
+echo " fault_address_log_enable: $FAULT_ADDRESS_LOG_ENABLE"
 echo "==========================================================="
 
 write_weight_plan() {
@@ -318,10 +401,8 @@ base_args() {
   printf '%s\0' \
     --model "$MODEL" \
     --mode trace \
-    --with-address-log \
     --allocator-log "$run_dir/vllm_uvm_allocator_trace_${label}.log" \
     --trace-log "$run_dir/uvm_kv_fault_stats_${label}.log" \
-    --address-trace-log "$run_dir/uvm_kv_fault_addrs_${label}.log" \
     --address-log "$run_dir/vllm_uvm_address_regions_${label}.log" \
     --server-log "$run_dir/vllm_server_${label}.log" \
     --bench-log "$run_dir/vllm_bench_${label}.log" \
@@ -331,18 +412,28 @@ base_args() {
     --uvm-gap-watch-name "$label" \
     --uvm-gap-watch-all-classes 1 \
     --uvm-gap-watch-min-bytes 4096 \
-    --auto-gap-watch-enable 1 \
-    --auto-gap-watch-probe-prompts 1 \
-    --auto-gap-watch-target-gap "$SCRATCH_TARGET_GAP" \
-    --auto-gap-watch-target-class-override "$SCRATCH_TARGET_CLASS" \
-    --auto-gap-watch-summary-json "$run_dir/auto_gap_watch_probe_${label}.json" \
-    --auto-gap-watch-post-main-summary-json "$run_dir/auto_gap_watch_post_main_${label}.json" \
     --gap-watch-metrics-summary-json "$run_dir/gap_watch_metrics_${label}.json" \
     --server-max-num-seqs "$SERVER_MAX_NUM_SEQS" \
     --server-gpu-memory-utilization "$SERVER_GPU_MEMORY_UTILIZATION" \
     --prompts "$PROMPTS" \
     --request-rate "$REQUEST_RATE" \
     --output-len "$OUTPUT_LEN"
+  if [ "$FAULT_ADDRESS_LOG_ENABLE" = "1" ]; then
+    printf '%s\0' \
+      --with-address-log \
+      --address-trace-log "$run_dir/uvm_kv_fault_addrs_${label}.log"
+  fi
+  if [ "$AUTO_GAP_WATCH_ENABLE" = "1" ]; then
+    printf '%s\0' \
+      --auto-gap-watch-enable 1 \
+      --auto-gap-watch-probe-prompts 1 \
+      --auto-gap-watch-target-gap "$SCRATCH_TARGET_GAP" \
+      --auto-gap-watch-target-class-override "$SCRATCH_TARGET_CLASS" \
+      --auto-gap-watch-summary-json "$run_dir/auto_gap_watch_probe_${label}.json" \
+      --auto-gap-watch-post-main-summary-json "$run_dir/auto_gap_watch_post_main_${label}.json"
+  else
+    printf '%s\0' --auto-gap-watch-enable 0
+  fi
   if [ "$RESET_COUNTERS" = "0" ]; then
     printf '%s\0' --no-reset-counters
   fi
@@ -406,6 +497,10 @@ run_one() {
     full_impl_enforce)
       local plan_json="$run_dir/weight_broad_cold_plan.json"
       local require_routing_plan=0
+      local gap_watch_action="device_direct"
+      if [ "$SCRATCH_DEVICE_DIRECT_ENABLE" = "0" ]; then
+        gap_watch_action="observe"
+      fi
       if [ -n "$WEIGHT_PLAN_FILE" ]; then
         cp "$WEIGHT_PLAN_FILE" "$plan_json"
         require_routing_plan=1
@@ -414,17 +509,18 @@ run_one() {
       fi
       args+=(
         --uvm-policy-enable 1
-        --uvm-device-direct-enable 1
+        --uvm-device-direct-enable "$SCRATCH_DEVICE_DIRECT_ENABLE"
         --uvm-device-direct-min-bytes "$SCRATCH_MIN_BYTES"
         --uvm-device-direct-max-bytes "$SCRATCH_MAX_BYTES"
         --uvm-device-direct-max-total-bytes "$SCRATCH_MAX_TOTAL_BYTES"
         --uvm-device-direct-backend "$SCRATCH_BACKEND"
         --uvm-device-direct-pool-release-threshold "$SCRATCH_POOL_RELEASE_THRESHOLD"
         --uvm-device-direct-target-phases "$SCRATCH_TARGET_PHASES"
-        --auto-gap-watch-policy-action-override device_direct
-        --uvm-residency-enable 1
+        --auto-gap-watch-policy-action-override "$gap_watch_action"
+        --uvm-residency-enable "$RESIDENCY_ENABLE"
         --uvm-residency-stage stage_l6
         --uvm-residency-mode enforce
+        --uvm-residency-trace-enable "$RESIDENCY_TRACE_ENABLE"
         --uvm-residency-trace-file "$run_dir/vllm_uvm_pool_residency_${label}.jsonl"
         --uvm-residency-global-gpu-bytes "$GLOBAL_GPU_BYTES"
         --uvm-residency-weight-gpu-bytes "$WEIGHT_GPU_BYTES"
@@ -438,13 +534,13 @@ run_one() {
         --uvm-residency-kv-prefetch-back-mode prefetch
         --uvm-residency-kv-max-offload-blocks-per-step "$KV_MAX_OFFLOAD_BLOCKS"
         --uvm-residency-kv-pointer-map-file "$run_dir/vllm_uvm_kv_pointer_map_${label}.jsonl"
-        --uvm-kv-runtime-enable 1
+        --uvm-kv-runtime-enable "$KV_RUNTIME_ENABLE"
         --uvm-kv-runtime-mode enforce
         --uvm-kv-runtime-budget-blocks "$KV_RUNTIME_BUDGET_BLOCKS"
         --uvm-kv-runtime-trace-file "$run_dir/vllm_uvm_kv_runtime_${label}.jsonl"
         --uvm-kv-runtime-candidate-limit "$KV_RUNTIME_CANDIDATE_LIMIT"
         --uvm-kv-runtime-prefix-evict-enable 0
-        --uvm-weight-prefetch-enable 1
+        --uvm-weight-prefetch-enable "$WEIGHT_RUNTIME_PREFETCH_ENABLE"
         --uvm-weight-prefetch-mode prefetch
         --uvm-weight-prefetch-trace-file "$run_dir/vllm_uvm_weight_prefetch_${label}.jsonl"
         --uvm-weight-prefetch-plan-file "$plan_json"
@@ -466,7 +562,7 @@ run_one() {
         --uvm-init-kv-max-bytes "$KV_GPU_BYTES"
         --uvm-init-kv-min-blocks "$INIT_KV_MIN_BLOCKS"
         --uvm-init-kv-trace-file "$run_dir/vllm_uvm_init_kv_sizing_${label}.jsonl"
-        --uvm-init-weight-offload-enable 1
+        --uvm-init-weight-offload-enable "$INIT_WEIGHT_OFFLOAD_ENABLE"
         --uvm-init-weight-offload-mode offload_cpu
         --uvm-init-weight-plan-file "$plan_json"
         --uvm-init-weight-target-roles moe_gate_up,moe_down
@@ -481,13 +577,15 @@ run_one() {
         --uvm-residency-weight-max-victims-per-step "$WEIGHT_MAX_VICTIMS_PER_STEP"
         --uvm-residency-weight-victim-policy cold_plan_lru
         --uvm-residency-weight-victim-action "$WEIGHT_VICTIM_ACTION"
+        --uvm-residency-weight-active-evict-enable "$WEIGHT_ACTIVE_EVICT_ENABLE"
+        --uvm-residency-weight-active-evict-max-experts-per-layer "$WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER"
         --uvm-weight-budget-cpu-offload-enable "$WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE"
-        --uvm-pool-registry-enable 1
-        --uvm-scratch-pool-enable 1
+        --uvm-pool-registry-enable "$POOL_REGISTRY_ENABLE"
+        --uvm-scratch-pool-enable "$SCRATCH_POOL_ENABLE"
         --uvm-scratch-pool-budget-bytes "$SCRATCH_MAX_TOTAL_BYTES"
         --uvm-scratch-pool-mode enforce
         --uvm-scratch-pool-target-phases "$SCRATCH_TARGET_PHASES"
-        --uvm-pool-coordinator-enable 1
+        --uvm-pool-coordinator-enable "$POOL_COORDINATOR_ENABLE"
         --uvm-pool-coordinator-mode enforce
         --uvm-pool-coordinator-trace-file "$run_dir/vllm_uvm_pool_coordinator_${label}.jsonl"
         --uvm-pool-coordinator-global-bytes-per-step "$COORDINATOR_GLOBAL_BYTES_PER_STEP"

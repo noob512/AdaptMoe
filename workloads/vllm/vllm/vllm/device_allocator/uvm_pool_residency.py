@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Stage L0 UVM pool residency accounting.
 
-This module is intentionally trace/accounting-only.  It maintains an
-application-level estimate of GPU residency intent for weights, KV, and scratch
-pools.  It does not query CUDA driver page residency and does not migrate,
-evict, or prefetch memory by itself.
+This module maintains an application-level estimate of GPU residency intent for
+weights, KV, and scratch pools.  When explicitly enabled, it can also sample
+page-granular real UVM residency from inside the vLLM process.  It does not
+migrate, evict, or prefetch memory by itself.
 """
 
 from __future__ import annotations
@@ -30,6 +30,16 @@ VALID_STATES = {
     "prefetching_cpu",
     "released",
 }
+
+
+def _empty_real_residency_totals() -> dict[str, int]:
+    return {
+        "queried_bytes": 0,
+        "gpu_bytes": 0,
+        "cpu_bytes": 0,
+        "any_bytes": 0,
+        "unknown_bytes": 0,
+    }
 
 
 def _read_bool_env(name: str, default: bool = False) -> bool:
@@ -125,9 +135,14 @@ class UvmPoolResidencyManager:
     def __init__(self) -> None:
         self.enabled = _read_bool_env("VLLM_UVM_RESIDENCY_ENABLE", False)
         self.mode = _read_mode_env()
-        self.trace_file = os.environ.get(
-            "VLLM_UVM_RESIDENCY_TRACE_FILE",
-            "vllm_uvm_pool_residency_stage_l.jsonl",
+        self.trace_enabled = _read_bool_env("VLLM_UVM_RESIDENCY_TRACE_ENABLE", True)
+        self.trace_file = (
+            os.environ.get(
+                "VLLM_UVM_RESIDENCY_TRACE_FILE",
+                "vllm_uvm_pool_residency_stage_l.jsonl",
+            )
+            if self.trace_enabled
+            else ""
         )
         self.global_budget_bytes = _read_int_env(
             "VLLM_UVM_RESIDENCY_GLOBAL_GPU_BYTES", 0
@@ -186,6 +201,35 @@ class UvmPoolResidencyManager:
         self.weight_victim_policy = os.environ.get(
             "VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_POLICY", "cold_plan_lru"
         )
+        self.real_residency_enable = _read_bool_env(
+            "VLLM_UVM_REAL_RESIDENCY_ENABLE", False
+        )
+        self.real_residency_trace_file = (
+            os.environ.get(
+                "VLLM_UVM_REAL_RESIDENCY_TRACE_FILE",
+                "vllm_uvm_real_residency_stage_l.jsonl",
+            )
+            if self.real_residency_enable
+            else ""
+        )
+        self.real_residency_device = _read_int_env(
+            "VLLM_UVM_REAL_RESIDENCY_DEVICE", 0
+        )
+        self.real_residency_on_register_every = _read_int_env(
+            "VLLM_UVM_REAL_RESIDENCY_ON_REGISTER_EVERY", 0
+        )
+        self.real_residency_on_action_every = _read_int_env(
+            "VLLM_UVM_REAL_RESIDENCY_ON_ACTION_EVERY", 0
+        )
+        self.real_residency_max_snapshots = _read_int_env(
+            "VLLM_UVM_REAL_RESIDENCY_MAX_SNAPSHOTS", 0
+        )
+        self.real_residency_max_regions_per_pool = _read_int_env(
+            "VLLM_UVM_REAL_RESIDENCY_MAX_REGIONS_PER_POOL", 0
+        )
+        self._real_residency_snapshots = 0
+        self._real_residency_errors = 0
+        self._last_real_residency: dict[str, Any] | None = None
         self._lock = threading.Lock()
         self._config_recorded = False
         self._regions: dict[str, UvmResidencyRegion] = {}
@@ -250,7 +294,7 @@ class UvmPoolResidencyManager:
 
     @property
     def active(self) -> bool:
-        return self.enabled and bool(self.trace_file)
+        return self.enabled
 
     def register_region(
         self,
@@ -306,6 +350,7 @@ class UvmPoolResidencyManager:
                 self._pool_estimated_bytes[pool] += bytes
 
             self._summary["register_region_records"] += 1
+            register_count = self._summary["register_region_records"]
             self._write_locked(
                 {
                     "action": "residency_register_region",
@@ -321,6 +366,15 @@ class UvmPoolResidencyManager:
                 }
             )
             self._record_summary_locked()
+            if (
+                self.real_residency_on_register_every > 0
+                and register_count % self.real_residency_on_register_every == 0
+            ):
+                self._record_real_residency_locked(
+                    trigger="register_region",
+                    trigger_count=register_count,
+                    trigger_region_id=region_id,
+                )
             return region
 
     def request_gpu_residency(
@@ -554,6 +608,7 @@ class UvmPoolResidencyManager:
         with self._lock:
             self._record_config_locked()
             self._summary["real_action_records"] += 1
+            action_count = self._summary["real_action_records"]
             if pool == "kv":
                 if action == "residency_kv_data_offload_attempt":
                     self._summary["kv_data_offload_attempt_records"] += 1
@@ -579,6 +634,21 @@ class UvmPoolResidencyManager:
             record.update(extra)
             self._write_locked(record)
             self._record_summary_locked()
+            if (
+                self.real_residency_on_action_every > 0
+                and action_count % self.real_residency_on_action_every == 0
+            ):
+                self._record_real_residency_locked(
+                    trigger="record_action",
+                    trigger_count=action_count,
+                    trigger_region_id=region_id,
+                    trigger_action=action,
+                )
+
+    def real_residency_snapshot(self, *, trigger: str = "manual") -> dict[str, Any]:
+        with self._lock:
+            self._record_config_locked()
+            return self._record_real_residency_locked(trigger=trigger)
 
     def record_scratch_summary(
         self,
@@ -903,6 +973,17 @@ class UvmPoolResidencyManager:
                 "kv_metadata_enable": self.kv_metadata_enable,
                 "kv_data_offload_enable": self.kv_data_offload_enable,
                 "kv_prefetch_back_enable": self.kv_prefetch_back_enable,
+                "real_residency_enable": self.real_residency_enable,
+                "real_residency_trace_file": self.real_residency_trace_file,
+                "real_residency_device": self.real_residency_device,
+                "real_residency_on_register_every": (
+                    self.real_residency_on_register_every
+                ),
+                "real_residency_on_action_every": self.real_residency_on_action_every,
+                "real_residency_max_snapshots": self.real_residency_max_snapshots,
+                "real_residency_max_regions_per_pool": (
+                    self.real_residency_max_regions_per_pool
+                ),
             }
         )
 
@@ -932,6 +1013,11 @@ class UvmPoolResidencyManager:
             "global_gpu_budget_bytes": self.global_budget_bytes,
             "pool_region_counts": pool_region_counts,
             "region_records": len(self._regions),
+            "real_residency_enabled": self.real_residency_enable,
+            "real_residency_trace_file": self.real_residency_trace_file,
+            "real_residency_snapshots": self._real_residency_snapshots,
+            "real_residency_errors": self._real_residency_errors,
+            "real_residency_last": self._last_real_residency,
             **self._scratch_summary,
             **self._kv_sizing_summary,
             **self._summary,
@@ -939,6 +1025,136 @@ class UvmPoolResidencyManager:
 
     def _global_estimated_bytes_locked(self) -> int:
         return sum(self._pool_estimated_bytes.values())
+
+    def _record_real_residency_locked(
+        self,
+        *,
+        trigger: str,
+        trigger_count: int | None = None,
+        trigger_region_id: str | None = None,
+        trigger_action: str | None = None,
+    ) -> dict[str, Any]:
+        if not self.real_residency_enable:
+            return {"enabled": False, "reason": "disabled"}
+        if (
+            self.real_residency_max_snapshots > 0
+            and self._real_residency_snapshots >= self.real_residency_max_snapshots
+        ):
+            return {"enabled": True, "skipped": True, "reason": "max_snapshots"}
+
+        regions_by_pool: dict[str, list[UvmResidencyRegion]] = {
+            "weights": [],
+            "kv": [],
+            "scratch": [],
+        }
+        skipped_regions = 0
+        for region in self._regions.values():
+            if region.pool not in regions_by_pool:
+                skipped_regions += 1
+                continue
+            if not isinstance(region.ptr, int) or region.ptr <= 0 or region.bytes <= 0:
+                skipped_regions += 1
+                continue
+            regions_by_pool[region.pool].append(region)
+
+        try:
+            from vllm.device_allocator.uvm import (
+                driver_batch_query_ranges_residency_bytes,
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            self._real_residency_errors += 1
+            record = {
+                "action": "real_residency_snapshot",
+                "ok": False,
+                "trigger": trigger,
+                "trigger_count": trigger_count,
+                "trigger_region_id": trigger_region_id,
+                "trigger_action": trigger_action,
+                "reason": "import_failed",
+                "error": repr(exc),
+                "device": self.real_residency_device,
+            }
+            self._write_real_locked(record)
+            self._last_real_residency = record
+            return record
+
+        totals = _empty_real_residency_totals()
+        by_pool: dict[str, dict[str, Any]] = {}
+        ok = True
+        max_regions = self.real_residency_max_regions_per_pool
+        query_batch_size = 64
+        for pool, pool_regions in regions_by_pool.items():
+            queried_regions = pool_regions[:max_regions] if max_regions > 0 else pool_regions
+            ranges = [(region.ptr or 0, region.bytes) for region in queried_regions]
+            pool_record: dict[str, Any] = {
+                "region_count": len(pool_regions),
+                "queried_region_count": len(queried_regions),
+                "registered_bytes": sum(region.bytes for region in pool_regions),
+                **_empty_real_residency_totals(),
+                "status": 0,
+                "ok": True,
+                "query_batch_size": query_batch_size,
+                "query_batches": 0,
+                "failed_batches": 0,
+                "sample_statuses": [],
+            }
+            if ranges:
+                for start in range(0, len(ranges), query_batch_size):
+                    batch = ranges[start:start + query_batch_size]
+                    pool_record["query_batches"] += 1
+                    try:
+                        result = driver_batch_query_ranges_residency_bytes(
+                            batch,
+                            device=self.real_residency_device,
+                        )
+                    except Exception as exc:  # pragma: no cover - diagnostic path
+                        result = {
+                            "ok": False,
+                            "status": -1,
+                            "error": repr(exc),
+                            **_empty_real_residency_totals(),
+                        }
+
+                    status = int(result.get("status") or 0)
+                    if len(pool_record["sample_statuses"]) < 8:
+                        pool_record["sample_statuses"].append(status)
+                    if not bool(result.get("ok")):
+                        pool_record["ok"] = False
+                        pool_record["failed_batches"] += 1
+                        pool_record["status"] = status
+                        if "error" in result and "error" not in pool_record:
+                            pool_record["error"] = result["error"]
+
+                    for key in _empty_real_residency_totals():
+                        pool_record[key] += int(result.get(key) or 0)
+                ok = ok and bool(pool_record.get("ok"))
+            for key in totals:
+                totals[key] += int(pool_record.get(key) or 0)
+            by_pool[pool] = pool_record
+
+        self._real_residency_snapshots += 1
+        if not ok:
+            self._real_residency_errors += 1
+
+        record = {
+            "action": "real_residency_snapshot",
+            "ok": ok,
+            "snapshot_index": self._real_residency_snapshots,
+            "trigger": trigger,
+            "trigger_count": trigger_count,
+            "trigger_region_id": trigger_region_id,
+            "trigger_action": trigger_action,
+            "device": self.real_residency_device,
+            "region_records": len(self._regions),
+            "skipped_regions": skipped_regions,
+            "max_regions_per_pool": max_regions,
+            "query_batch_size": query_batch_size,
+            **totals,
+            "by_pool": by_pool,
+        }
+        self._last_real_residency = record
+        self._write_real_locked(record)
+        return record
 
     def _write_locked(self, record: dict[str, Any]) -> None:
         if not self.trace_file:
@@ -948,6 +1164,16 @@ class UvmPoolResidencyManager:
         line = json.dumps(record, sort_keys=True, separators=(",", ":"))
         os.makedirs(os.path.dirname(self.trace_file) or ".", exist_ok=True)
         with open(self.trace_file, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+    def _write_real_locked(self, record: dict[str, Any]) -> None:
+        if not self.real_residency_trace_file:
+            return
+        record.setdefault("ts", time.time())
+        record.setdefault("stage", self.stage_label)
+        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        os.makedirs(os.path.dirname(self.real_residency_trace_file) or ".", exist_ok=True)
+        with open(self.real_residency_trace_file, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
 
@@ -1034,6 +1260,10 @@ def record_uvm_residency_access(
 
 def get_uvm_residency_snapshot() -> dict[str, Any]:
     return get_uvm_pool_residency_manager().snapshot()
+
+
+def get_uvm_real_residency_snapshot(trigger: str = "manual") -> dict[str, Any]:
+    return get_uvm_pool_residency_manager().real_residency_snapshot(trigger=trigger)
 
 
 def get_uvm_residency_region_snapshot(region_id: str) -> dict[str, Any] | None:

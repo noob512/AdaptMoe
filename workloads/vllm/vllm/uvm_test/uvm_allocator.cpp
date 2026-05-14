@@ -24,12 +24,15 @@
 #include <cctype>
 #include <cstdarg>
 #include <cerrno>
+#include <dirent.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -40,6 +43,10 @@ constexpr unsigned int UVM_TEST_PHASE_F_BATCH_MINI_IOCTL =
     200 + 116;
 constexpr unsigned int UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL =
     200 + 117;
+constexpr unsigned int UVM_PHASE_F_BATCH_EXECUTOR_IOCTL = 81;
+constexpr unsigned int UVM_PHASE_F_REGISTER_REGION_IOCTL = 82;
+constexpr unsigned int UVM_PHASE_F_UNREGISTER_REGION_IOCTL = 83;
+constexpr unsigned int UVM_PHASE_F_BATCH_REGIONS_IOCTL = 84;
 constexpr size_t UVM_TEST_PHASE_F_MAX_RANGES = 64;
 constexpr uint32_t UVM_TEST_PHASE_F_PING_MAGIC = 0x50464e47;  // "PFNG"
 
@@ -62,11 +69,27 @@ struct PhaseFRange {
     uint64_t length;
 };
 
+struct PhaseFRegion {
+    uint64_t region_id;
+    uint64_t base;
+    uint64_t length;
+    uint32_t pool;
+    uint32_t layer_id;
+    uint32_t expert_id;
+    uint32_t role;
+    uint32_t flags;
+};
+
 struct PhaseFRangeResult {
     uint32_t status;
     uint32_t resident_on_count;
     uint8_t resident_on_cpu;
     uint8_t resident_on_gpu;
+    uint64_t queried_bytes;
+    uint64_t resident_gpu_bytes;
+    uint64_t resident_cpu_bytes;
+    uint64_t resident_any_bytes;
+    uint64_t resident_unknown_bytes;
 };
 
 struct PhaseFBatchExecutorParams {
@@ -77,6 +100,28 @@ struct PhaseFBatchExecutorParams {
     uint32_t success_count;
     uint32_t failure_count;
     PhaseFRange ranges[UVM_TEST_PHASE_F_MAX_RANGES];
+    PhaseFRangeResult results[UVM_TEST_PHASE_F_MAX_RANGES];
+    uint32_t rmStatus;
+};
+
+struct PhaseFRegisterRegionParams {
+    PhaseFRegion region;
+    uint32_t rmStatus;
+};
+
+struct PhaseFUnregisterRegionParams {
+    uint64_t region_id;
+    uint32_t rmStatus;
+};
+
+struct PhaseFBatchRegionsParams {
+    uint32_t action;
+    uint32_t count;
+    PhaseFUuid gpu_uuid;
+    uint8_t async;
+    uint32_t success_count;
+    uint32_t failure_count;
+    uint64_t region_ids[UVM_TEST_PHASE_F_MAX_RANGES];
     PhaseFRangeResult results[UVM_TEST_PHASE_F_MAX_RANGES];
     uint32_t rmStatus;
 };
@@ -102,6 +147,151 @@ constexpr PhaseFUuid CPU_UUID = {{
 }};
 
 std::mutex phase_f_log_mutex;
+
+void phase_f_debug_log(const char* fmt, ...);
+
+struct UvmFdCandidate {
+    int source_fd;
+    std::string path;
+};
+
+bool phase_f_use_test_ioctl() {
+    const char* mode = std::getenv("VLLM_UVM_PHASE_F_IOCTL_MODE");
+    return mode != nullptr &&
+           (std::strcmp(mode, "test") == 0 ||
+            std::strcmp(mode, "builtin_test") == 0);
+}
+
+unsigned int phase_f_batch_ioctl_cmd() {
+    return phase_f_use_test_ioctl() ?
+        UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL :
+        UVM_PHASE_F_BATCH_EXECUTOR_IOCTL;
+}
+
+const char* phase_f_batch_ioctl_name() {
+    return phase_f_use_test_ioctl() ? "test" : "policy";
+}
+
+bool phase_f_adopt_cuda_uvm_fd_enabled() {
+    const char* mode = std::getenv("VLLM_UVM_PHASE_F_FD_MODE");
+    if (mode == nullptr || mode[0] == '\0') return true;
+
+    return std::strcmp(mode, "new") != 0 &&
+           std::strcmp(mode, "fresh") != 0 &&
+           std::strcmp(mode, "open") != 0;
+}
+
+bool phase_f_fd_link_is_uvm(const char* link_target) {
+    if (link_target == nullptr) return false;
+
+    const char* base = std::strrchr(link_target, '/');
+    base = base == nullptr ? link_target : base + 1;
+
+    return std::strcmp(base, "nvidia-uvm") == 0 ||
+           std::strncmp(base, "nvidia-uvm ", strlen("nvidia-uvm ")) == 0;
+}
+
+std::vector<UvmFdCandidate> collect_existing_uvm_fd_candidates(const char* op_name) {
+    std::vector<UvmFdCandidate> candidates;
+    DIR* dir = opendir("/proc/self/fd");
+    if (dir == nullptr) {
+        phase_f_debug_log("%s adopt_fd opendir_failed errno=%d", op_name, errno);
+        return candidates;
+    }
+
+    int dir_fd = dirfd(dir);
+    struct dirent* entry = nullptr;
+
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_name[0] == '.') continue;
+
+        char* end = nullptr;
+        long fd_long = std::strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0') continue;
+        if (fd_long < 0 || fd_long > INT_MAX) continue;
+
+        int candidate_fd = static_cast<int>(fd_long);
+        if (candidate_fd == dir_fd) continue;
+
+        char fd_path[64];
+        char link_target[PATH_MAX];
+        std::snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", candidate_fd);
+
+        ssize_t link_len = readlink(fd_path, link_target, sizeof(link_target) - 1);
+        if (link_len < 0) continue;
+        link_target[link_len] = '\0';
+
+        if (!phase_f_fd_link_is_uvm(link_target)) continue;
+
+        candidates.push_back(UvmFdCandidate{candidate_fd, link_target});
+    }
+
+    closedir(dir);
+
+    std::sort(candidates.begin(), candidates.end(), [](const UvmFdCandidate& a, const UvmFdCandidate& b) {
+        return a.source_fd < b.source_fd;
+    });
+
+    if (candidates.empty())
+        phase_f_debug_log("%s adopt_fd no_existing_cuda_uvm_fd", op_name);
+    else
+        phase_f_debug_log("%s adopt_fd candidates=%zu", op_name, candidates.size());
+
+    return candidates;
+}
+
+int duplicate_uvm_fd_candidate(const char* op_name, const UvmFdCandidate& candidate) {
+    int dup_fd = fcntl(candidate.source_fd, F_DUPFD_CLOEXEC, 3);
+    if (dup_fd < 0) {
+        phase_f_debug_log("%s adopt_fd duplicate_failed candidate_fd=%d path=%s errno=%d",
+                          op_name, candidate.source_fd, candidate.path.c_str(), errno);
+        return -1;
+    }
+
+    return dup_fd;
+}
+
+int adopt_existing_uvm_fd(const char* op_name) {
+    std::vector<UvmFdCandidate> candidates = collect_existing_uvm_fd_candidates(op_name);
+    if (candidates.empty())
+        return -1;
+
+    const UvmFdCandidate& selected = candidates.front();
+    int dup_fd = duplicate_uvm_fd_candidate(op_name, selected);
+    if (dup_fd < 0)
+        return -1;
+
+    phase_f_debug_log("%s adopt_fd adopted candidate_fd=%d dup_fd=%d path=%s",
+                      op_name, selected.source_fd, dup_fd, selected.path.c_str());
+    return dup_fd;
+}
+
+int open_initialized_uvm_fd(const char* op_name, bool prefer_existing = false) {
+    if (prefer_existing && phase_f_adopt_cuda_uvm_fd_enabled()) {
+        int adopted_fd = adopt_existing_uvm_fd(op_name);
+        if (adopted_fd >= 0)
+            return adopted_fd;
+    }
+
+    int fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        phase_f_debug_log("%s open_failed errno=%d", op_name, errno);
+        return -1;
+    }
+
+    UvmInitializeParams init_params{};
+    if (ioctl(fd, UVM_INITIALIZE_IOCTL, &init_params) != 0 ||
+        init_params.rmStatus != 0) {
+        int saved_errno = errno;
+        phase_f_debug_log("%s init_failed errno=%d rmStatus=%u",
+                          op_name, saved_errno, init_params.rmStatus);
+        close(fd);
+        return -1;
+    }
+
+    phase_f_debug_log("%s open_new_initialized fd=%d", op_name, fd);
+    return fd;
+}
 
 const char* phase_f_action_name(uint32_t action) {
     switch (action) {
@@ -176,7 +366,8 @@ int uvm_driver_batch_execute_internal(const uintptr_t* ptrs,
                                       uint32_t action,
                                       int device,
                                       int async,
-                                      uint32_t* failure_count_out) {
+                                      uint32_t* failure_count_out,
+                                      PhaseFRangeResult* results_out = nullptr) {
     if (failure_count_out != nullptr) *failure_count_out = 0;
     if (ptrs == nullptr || sizes == nullptr || count == 0) return 0;
     if (count > UVM_TEST_PHASE_F_MAX_RANGES) return -2;
@@ -199,41 +390,291 @@ int uvm_driver_batch_execute_internal(const uintptr_t* ptrs,
         params.ranges[i].length = static_cast<uint64_t>(sizes[i]);
     }
 
-    int fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
-    if (fd < 0) {
-        phase_f_debug_log("driver_batch action=%s count=%zu open_failed errno=%d",
-                          phase_f_action_name(action), count, errno);
-        return -4;
-    }
+    unsigned int ioctl_cmd = phase_f_batch_ioctl_cmd();
+    const char* ioctl_name = phase_f_batch_ioctl_name();
+    int final_result = -4;
+    uint32_t final_failure_count = 0;
+    bool attempted_existing_fd = false;
+    std::vector<UvmFdCandidate> fd_candidates;
 
-    UvmInitializeParams init_params{};
-    if (ioctl(fd, UVM_INITIALIZE_IOCTL, &init_params) != 0 ||
-        init_params.rmStatus != 0) {
+    if (phase_f_adopt_cuda_uvm_fd_enabled())
+        fd_candidates = collect_existing_uvm_fd_candidates("driver_batch");
+
+    auto try_ioctl = [&](int fd, int source_fd, const char* fd_source, const char* path) {
+        PhaseFBatchExecutorParams attempt = params;
+        phase_f_debug_log("driver_batch ioctl=%s cmd=%u fd_source=%s source_fd=%d fd=%d path=%s action=%s count=%zu device=%d async=%d ioctl_begin first_base=0x%llx first_len=%llu",
+                          ioctl_name, ioctl_cmd, fd_source, source_fd, fd, path ? path : "",
+                          phase_f_action_name(action), count, device, async,
+                          count > 0 ? (unsigned long long)attempt.ranges[0].base : 0ULL,
+                          count > 0 ? (unsigned long long)attempt.ranges[0].length : 0ULL);
+        int ret = ioctl(fd, ioctl_cmd, &attempt);
         int saved_errno = errno;
-        phase_f_debug_log("driver_batch action=%s count=%zu init_failed errno=%d rmStatus=%u",
-                          phase_f_action_name(action), count, saved_errno,
-                          init_params.rmStatus);
-        close(fd);
-        return -5;
+        phase_f_debug_log("driver_batch ioctl=%s cmd=%u fd_source=%s source_fd=%d fd=%d action=%s count=%zu ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u first_status=%u first_queried=%llu first_gpu_bytes=%llu first_cpu_bytes=%llu first_any_bytes=%llu first_unknown_bytes=%llu",
+                          ioctl_name, ioctl_cmd, fd_source, source_fd, fd,
+                          phase_f_action_name(action), count, ret, saved_errno,
+                          attempt.rmStatus, attempt.success_count, attempt.failure_count,
+                          count > 0 ? attempt.results[0].status : 0,
+                          count > 0 ? static_cast<unsigned long long>(attempt.results[0].queried_bytes) : 0ULL,
+                          count > 0 ? static_cast<unsigned long long>(attempt.results[0].resident_gpu_bytes) : 0ULL,
+                          count > 0 ? static_cast<unsigned long long>(attempt.results[0].resident_cpu_bytes) : 0ULL,
+                          count > 0 ? static_cast<unsigned long long>(attempt.results[0].resident_any_bytes) : 0ULL,
+                          count > 0 ? static_cast<unsigned long long>(attempt.results[0].resident_unknown_bytes) : 0ULL);
+
+        final_failure_count = attempt.failure_count;
+        if (ret != 0) {
+            final_result = -6;
+            return false;
+        }
+
+        if (attempt.rmStatus != 0 && attempt.success_count == 0) {
+            final_result = -static_cast<int>(attempt.rmStatus);
+            return false;
+        }
+
+        if (results_out != nullptr)
+            std::copy(attempt.results, attempt.results + count, results_out);
+
+        final_result = static_cast<int>(attempt.success_count);
+        return true;
+    };
+
+    for (const UvmFdCandidate& candidate : fd_candidates) {
+        int adopted_fd = duplicate_uvm_fd_candidate("driver_batch", candidate);
+        if (adopted_fd < 0)
+            continue;
+
+        attempted_existing_fd = true;
+        bool success = try_ioctl(
+            adopted_fd, candidate.source_fd, "adopted", candidate.path.c_str());
+        close(adopted_fd);
+        if (success) {
+            if (failure_count_out != nullptr)
+                *failure_count_out = final_failure_count;
+            return final_result;
+        }
     }
 
-    phase_f_debug_log("driver_batch action=%s count=%zu device=%d async=%d ioctl_begin first_base=0x%llx first_len=%llu",
-                      phase_f_action_name(action), count, device, async,
-                      count > 0 ? (unsigned long long)params.ranges[0].base : 0ULL,
-                      count > 0 ? (unsigned long long)params.ranges[0].length : 0ULL);
-    int ret = ioctl(fd, UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL, &params);
+    int fd = open_initialized_uvm_fd("driver_batch", false);
+    if (fd >= 0) {
+        bool success = try_ioctl(fd, -1, "new", "/dev/nvidia-uvm");
+        close(fd);
+        if (success || !attempted_existing_fd) {
+            if (failure_count_out != nullptr)
+                *failure_count_out = final_failure_count;
+            return final_result;
+        }
+    }
+
+    if (failure_count_out != nullptr)
+        *failure_count_out = final_failure_count;
+    return final_result;
+}
+
+int uvm_driver_phase_f_register_region_fd(int fd,
+                                          uint64_t region_id,
+                                          uintptr_t base,
+                                          size_t length,
+                                          uint32_t pool,
+                                          uint32_t layer_id,
+                                          uint32_t expert_id,
+                                          uint32_t role,
+                                          uint32_t flags) {
+    PhaseFRegisterRegionParams params{};
+    params.region.region_id = region_id;
+    params.region.base = static_cast<uint64_t>(base);
+    params.region.length = static_cast<uint64_t>(length);
+    params.region.pool = pool;
+    params.region.layer_id = layer_id;
+    params.region.expert_id = expert_id;
+    params.region.role = role;
+    params.region.flags = flags;
+
+    phase_f_debug_log("driver_register_region cmd=%u id=%llu base=0x%llx length=%llu ioctl_begin",
+                      UVM_PHASE_F_REGISTER_REGION_IOCTL,
+                      static_cast<unsigned long long>(params.region.region_id),
+                      static_cast<unsigned long long>(params.region.base),
+                      static_cast<unsigned long long>(params.region.length));
+    int ret = ioctl(fd, UVM_PHASE_F_REGISTER_REGION_IOCTL, &params);
     int saved_errno = errno;
+    phase_f_debug_log("driver_register_region cmd=%u id=%llu ioctl_done ret=%d errno=%d rmStatus=%u",
+                      UVM_PHASE_F_REGISTER_REGION_IOCTL,
+                      static_cast<unsigned long long>(region_id),
+                      ret,
+                      saved_errno,
+                      params.rmStatus);
+
+    if (ret != 0) return -6;
+    if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+    return 1;
+}
+
+int uvm_driver_phase_f_register_region_internal(uint64_t region_id,
+                                                uintptr_t base,
+                                                size_t length,
+                                                uint32_t pool,
+                                                uint32_t layer_id,
+                                                uint32_t expert_id,
+                                                uint32_t role,
+                                                uint32_t flags) {
+    int fd = open_initialized_uvm_fd("driver_register_region", true);
+    int result;
+
+    if (fd < 0) return -4;
+    result = uvm_driver_phase_f_register_region_fd(
+        fd, region_id, base, length, pool, layer_id, expert_id, role, flags);
     close(fd);
-    phase_f_debug_log("driver_batch action=%s count=%zu ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u first_status=%u",
-                      phase_f_action_name(action), count, ret, saved_errno,
-                      params.rmStatus, params.success_count, params.failure_count,
+    return result;
+}
+
+int uvm_driver_phase_f_unregister_region_fd(int fd, uint64_t region_id) {
+    PhaseFUnregisterRegionParams params{};
+    params.region_id = region_id;
+
+    phase_f_debug_log("driver_unregister_region cmd=%u id=%llu ioctl_begin",
+                      UVM_PHASE_F_UNREGISTER_REGION_IOCTL,
+                      static_cast<unsigned long long>(region_id));
+    int ret = ioctl(fd, UVM_PHASE_F_UNREGISTER_REGION_IOCTL, &params);
+    int saved_errno = errno;
+    phase_f_debug_log("driver_unregister_region cmd=%u id=%llu ioctl_done ret=%d errno=%d rmStatus=%u",
+                      UVM_PHASE_F_UNREGISTER_REGION_IOCTL,
+                      static_cast<unsigned long long>(region_id),
+                      ret,
+                      saved_errno,
+                      params.rmStatus);
+
+    if (ret != 0) return -6;
+    if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+    return 1;
+}
+
+int uvm_driver_phase_f_unregister_region_internal(uint64_t region_id) {
+    int fd = open_initialized_uvm_fd("driver_unregister_region", true);
+    int result;
+
+    if (fd < 0) return -4;
+    result = uvm_driver_phase_f_unregister_region_fd(fd, region_id);
+    close(fd);
+    return result;
+}
+
+int uvm_driver_phase_f_batch_regions_fd(int fd,
+                                        const uint64_t* region_ids,
+                                        size_t count,
+                                        uint32_t action,
+                                        int device,
+                                        int async,
+                                        uint32_t* failure_count_out) {
+    if (failure_count_out != nullptr) *failure_count_out = 0;
+    if (region_ids == nullptr || count == 0) return 0;
+    if (count > UVM_TEST_PHASE_F_MAX_RANGES) return -2;
+
+    PhaseFBatchRegionsParams params{};
+    params.action = action;
+    params.count = static_cast<uint32_t>(count);
+    params.async = async ? 1 : 0;
+    params.gpu_uuid = CPU_UUID;
+    if ((action == UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU ||
+         action == UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY) &&
+        !get_cuda_device_uuid(device, &params.gpu_uuid)) {
+        phase_f_debug_log("driver_batch_regions action=%s count=%zu device=%d uuid_lookup_failed",
+                          phase_f_action_name(action), count, device);
+        return -3;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        params.region_ids[i] = region_ids[i];
+    }
+
+    phase_f_debug_log("driver_batch_regions cmd=%u action=%s count=%zu device=%d async=%d ioctl_begin first_region=%llu",
+                      UVM_PHASE_F_BATCH_REGIONS_IOCTL,
+                      phase_f_action_name(action),
+                      count,
+                      device,
+                      async,
+                      count > 0 ? static_cast<unsigned long long>(params.region_ids[0]) : 0ULL);
+    int ret = ioctl(fd, UVM_PHASE_F_BATCH_REGIONS_IOCTL, &params);
+    int saved_errno = errno;
+    phase_f_debug_log("driver_batch_regions cmd=%u action=%s count=%zu ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u first_status=%u",
+                      UVM_PHASE_F_BATCH_REGIONS_IOCTL,
+                      phase_f_action_name(action),
+                      count,
+                      ret,
+                      saved_errno,
+                      params.rmStatus,
+                      params.success_count,
+                      params.failure_count,
                       count > 0 ? params.results[0].status : 0);
+
     if (ret != 0) return -6;
     if (failure_count_out != nullptr) *failure_count_out = params.failure_count;
     if (params.rmStatus != 0 && params.success_count == 0) {
         return -static_cast<int>(params.rmStatus);
     }
     return static_cast<int>(params.success_count);
+}
+
+int uvm_driver_phase_f_batch_regions_internal(const uint64_t* region_ids,
+                                              size_t count,
+                                              uint32_t action,
+                                              int device,
+                                              int async,
+                                              uint32_t* failure_count_out) {
+    int fd = open_initialized_uvm_fd("driver_batch_regions", true);
+    int result;
+
+    if (fd < 0) return -4;
+    result = uvm_driver_phase_f_batch_regions_fd(
+        fd, region_ids, count, action, device, async, failure_count_out);
+    close(fd);
+    return result;
+}
+
+int uvm_driver_phase_f_register_query_region_internal(uint64_t region_id,
+                                                      uintptr_t base,
+                                                      size_t length,
+                                                      int device) {
+    int fd = open_initialized_uvm_fd("driver_register_query_region", true);
+    int register_result;
+    int query_result;
+    int unregister_result;
+
+    if (fd < 0) return -4;
+
+    register_result = uvm_driver_phase_f_register_region_fd(
+        fd, region_id, base, length, 1, 0, 0, 0, 0);
+    if (register_result < 0) {
+        close(fd);
+        return register_result;
+    }
+
+    query_result = uvm_driver_phase_f_batch_regions_fd(
+        fd,
+        &region_id,
+        1,
+        UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY,
+        device,
+        0,
+        nullptr);
+
+    unregister_result = uvm_driver_phase_f_unregister_region_fd(fd, region_id);
+    close(fd);
+
+    if (query_result < 0)
+        return query_result;
+    if (unregister_result < 0)
+        return unregister_result;
+
+    return query_result;
+}
+
+int uvm_driver_phase_f_probe_existing_uvm_fd_internal() {
+    int fd = adopt_existing_uvm_fd("driver_probe_existing_uvm_fd");
+
+    if (fd < 0)
+        return 0;
+
+    close(fd);
+    return 1;
 }
 
 int uvm_driver_phase_f_ping_internal() {
@@ -301,7 +742,10 @@ int uvm_driver_phase_f_ping_internal() {
     // 如果 crash 诊断日志最后停在 "driver_ping ioctl_begin"，
     // 但没有 "driver_ping ioctl_done"，重点怀疑下面这个 ioctl
     // 或其内核侧处理函数 uvm_test_phase_f_batch_executor()。
-    phase_f_debug_log("driver_ping ioctl_begin");
+    unsigned int ioctl_cmd = phase_f_batch_ioctl_cmd();
+    const char* ioctl_name = phase_f_batch_ioctl_name();
+
+    phase_f_debug_log("driver_ping ioctl=%s cmd=%u ioctl_begin", ioctl_name, ioctl_cmd);
 
     // 正式进入 Phase F batch executor ioctl。
     //
@@ -316,7 +760,7 @@ int uvm_driver_phase_f_ping_internal() {
     //   - 打印 begin/end；
     //   - for 循环不执行；
     //   - 返回 NV_OK。
-    int ret = ioctl(fd, UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL, &params);
+    int ret = ioctl(fd, ioctl_cmd, &params);
 
     // ioctl 返回后立刻保存 errno，因为 close() 或后续调用可能覆盖 errno。
     int saved_errno = errno;
@@ -334,8 +778,8 @@ int uvm_driver_phase_f_ping_internal() {
     //   failure_count=0
     //
     // 如果日志能看到 ioctl_done，说明至少 ioctl 没有永久卡死或直接导致系统立刻崩溃。
-    phase_f_debug_log("driver_ping ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u",
-                      ret, saved_errno, params.rmStatus,
+    phase_f_debug_log("driver_ping ioctl=%s cmd=%u ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u",
+                      ioctl_name, ioctl_cmd, ret, saved_errno, params.rmStatus,
                       params.success_count, params.failure_count);
 
     // Linux ioctl 系统调用本身失败，例如返回 -1。
@@ -4679,6 +5123,29 @@ int uvm_driver_phase_f_ioctl_only() {
     return uvm_driver_phase_f_ioctl_only_internal();
 }
 
+int uvm_driver_phase_f_register_region(uint64_t region_id,
+                                       uintptr_t base,
+                                       size_t length,
+                                       uint32_t pool,
+                                       uint32_t layer_id,
+                                       uint32_t expert_id,
+                                       uint32_t role,
+                                       uint32_t flags) {
+    return uvm_driver_phase_f_register_region_internal(
+        region_id,
+        base,
+        length,
+        pool,
+        layer_id,
+        expert_id,
+        role,
+        flags);
+}
+
+int uvm_driver_phase_f_unregister_region(uint64_t region_id) {
+    return uvm_driver_phase_f_unregister_region_internal(region_id);
+}
+
 int uvm_driver_batch_prefetch_gpu(const uintptr_t* ptrs,
                                   const size_t* sizes,
                                   size_t count,
@@ -4719,6 +5186,120 @@ int uvm_driver_batch_query_residency(const uintptr_t* ptrs,
         device,
         0,
         nullptr);
+}
+
+int uvm_driver_batch_query_residency_bytes(const uintptr_t* ptrs,
+                                           const size_t* sizes,
+                                           size_t count,
+                                           int device,
+                                           uint64_t* gpu_bytes_out,
+                                           uint64_t* cpu_bytes_out,
+                                           uint64_t* any_bytes_out,
+                                           uint64_t* unknown_bytes_out,
+                                           uint64_t* queried_bytes_out) {
+    uint64_t gpu_bytes = 0;
+    uint64_t cpu_bytes = 0;
+    uint64_t any_bytes = 0;
+    uint64_t unknown_bytes = 0;
+    uint64_t queried_bytes = 0;
+
+    if (gpu_bytes_out != nullptr) *gpu_bytes_out = 0;
+    if (cpu_bytes_out != nullptr) *cpu_bytes_out = 0;
+    if (any_bytes_out != nullptr) *any_bytes_out = 0;
+    if (unknown_bytes_out != nullptr) *unknown_bytes_out = 0;
+    if (queried_bytes_out != nullptr) *queried_bytes_out = 0;
+
+    if (count > UVM_TEST_PHASE_F_MAX_RANGES)
+        return -2;
+
+    std::vector<PhaseFRangeResult> results(count);
+    int ret = uvm_driver_batch_execute_internal(
+        ptrs,
+        sizes,
+        count,
+        UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY,
+        device,
+        0,
+        nullptr,
+        results.empty() ? nullptr : results.data());
+
+    if (ret < 0)
+        return ret;
+
+    for (size_t i = 0; i < count; ++i) {
+        if (results[i].status != 0)
+            continue;
+
+        gpu_bytes += results[i].resident_gpu_bytes;
+        cpu_bytes += results[i].resident_cpu_bytes;
+        any_bytes += results[i].resident_any_bytes;
+        unknown_bytes += results[i].resident_unknown_bytes;
+        queried_bytes += results[i].queried_bytes;
+    }
+
+    if (gpu_bytes_out != nullptr) *gpu_bytes_out = gpu_bytes;
+    if (cpu_bytes_out != nullptr) *cpu_bytes_out = cpu_bytes;
+    if (any_bytes_out != nullptr) *any_bytes_out = any_bytes;
+    if (unknown_bytes_out != nullptr) *unknown_bytes_out = unknown_bytes;
+    if (queried_bytes_out != nullptr) *queried_bytes_out = queried_bytes;
+    return ret;
+}
+
+int uvm_is_managed_pointer(uintptr_t ptr, size_t size) {
+    if (ptr == 0 || size == 0) return -1;
+
+    cudaPointerAttributes attrs{};
+    cudaError_t err = cudaPointerGetAttributes(
+        &attrs,
+        reinterpret_cast<const void*>(ptr));
+    if (err != cudaSuccess) {
+        phase_f_debug_log("managed_probe ptr=0x%llx size=%zu cuda_error=%d error=%s",
+                          static_cast<unsigned long long>(ptr),
+                          size,
+                          static_cast<int>(err),
+                          cudaGetErrorString(err));
+        // Clear the sticky runtime error so this diagnostic probe does not
+        // poison later CUDA calls in the serving process.
+        (void)cudaGetLastError();
+        return -static_cast<int>(err);
+    }
+
+    phase_f_debug_log("managed_probe ptr=0x%llx size=%zu type=%d device=%d device_ptr=%p host_ptr=%p",
+                      static_cast<unsigned long long>(ptr),
+                      size,
+                      static_cast<int>(attrs.type),
+                      attrs.device,
+                      attrs.devicePointer,
+                      attrs.hostPointer);
+
+    return attrs.type == cudaMemoryTypeManaged ? 1 : 0;
+}
+
+int uvm_driver_batch_query_residency_regions(const uint64_t* region_ids,
+                                             size_t count,
+                                             int device) {
+    return uvm_driver_phase_f_batch_regions_internal(
+        region_ids,
+        count,
+        UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY,
+        device,
+        0,
+        nullptr);
+}
+
+int uvm_driver_phase_f_register_query_region(uint64_t region_id,
+                                             uintptr_t base,
+                                             size_t length,
+                                             int device) {
+    return uvm_driver_phase_f_register_query_region_internal(
+        region_id,
+        base,
+        length,
+        device);
+}
+
+int uvm_driver_phase_f_probe_existing_uvm_fd() {
+    return uvm_driver_phase_f_probe_existing_uvm_fd_internal();
 }
 
 }  // extern "C"

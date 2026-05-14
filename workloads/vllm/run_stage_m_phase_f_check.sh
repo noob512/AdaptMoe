@@ -24,6 +24,20 @@ SERVER_MAX_NUM_SEQS="${SERVER_MAX_NUM_SEQS:-1}"
 SERVER_GPU_MEMORY_UTILIZATION="${SERVER_GPU_MEMORY_UTILIZATION:-0.70}"
 WEIGHT_EXECUTOR="${WEIGHT_EXECUTOR:-auto}"
 REQUIRE_DRIVER=0
+SCRATCH_DEVICE_DIRECT_ENABLE="${SCRATCH_DEVICE_DIRECT_ENABLE:-1}"
+SCRATCH_POOL_ENABLE="${SCRATCH_POOL_ENABLE:-1}"
+RESIDENCY_ENABLE="${RESIDENCY_ENABLE:-1}"
+RESIDENCY_TRACE_ENABLE="${RESIDENCY_TRACE_ENABLE:-1}"
+KV_RUNTIME_ENABLE="${KV_RUNTIME_ENABLE:-1}"
+WEIGHT_RUNTIME_PREFETCH_ENABLE="${WEIGHT_RUNTIME_PREFETCH_ENABLE:-1}"
+INIT_WEIGHT_OFFLOAD_ENABLE="${INIT_WEIGHT_OFFLOAD_ENABLE:-1}"
+POOL_COORDINATOR_ENABLE="${POOL_COORDINATOR_ENABLE:-1}"
+POOL_REGISTRY_ENABLE="${POOL_REGISTRY_ENABLE:-1}"
+AUTO_GAP_WATCH_ENABLE="${AUTO_GAP_WATCH_ENABLE:-1}"
+FAULT_ADDRESS_LOG_ENABLE="${FAULT_ADDRESS_LOG_ENABLE:-1}"
+WEIGHT_ACTIVE_EVICT_ENABLE="${WEIGHT_ACTIVE_EVICT_ENABLE:-0}"
+WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="${WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER:-0}"
+WEIGHT_MAX_VICTIMS_PER_STEP="${WEIGHT_MAX_VICTIMS_PER_STEP:-16}"
 
 usage() {
   cat <<'USAGE'
@@ -54,6 +68,21 @@ Options:
   --server-gpu-memory-utilization <f>    default: 0.70
   --weight-executor <mode>               auto|driver_batch|cpp_batch (default: auto)
   --require-driver                       fail unless executor=driver_batch is observed
+  --scratch-device-direct-enable <0|1>   default: 1
+  --scratch-pool-enable <0|1>            default: 1
+  --residency-enable <0|1>               default: 1
+  --residency-trace-enable <0|1>         default: 1
+  --kv-runtime-enable <0|1>              default: 1
+  --weight-runtime-prefetch-enable <0|1> default: 1
+  --init-weight-offload-enable <0|1>     default: 1
+  --pool-coordinator-enable <0|1>        default: 1
+  --pool-registry-enable <0|1>           default: 1
+  --auto-gap-watch-enable <0|1>          default: 1
+  --fault-address-log-enable <0|1>       default: 1
+  --weight-active-evict-enable <0|1>     default: 0
+  --weight-active-evict-max-experts-per-layer <n>
+                                           default: 0
+  --weight-max-victims-per-step <n>      default: 16
   -h, --help
 
 Example:
@@ -79,10 +108,57 @@ while [ $# -gt 0 ]; do
     --server-gpu-memory-utilization) SERVER_GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
     --weight-executor) WEIGHT_EXECUTOR="$2"; shift 2 ;;
     --require-driver) REQUIRE_DRIVER=1; shift ;;
+    --scratch-device-direct-enable) SCRATCH_DEVICE_DIRECT_ENABLE="$2"; shift 2 ;;
+    --scratch-pool-enable) SCRATCH_POOL_ENABLE="$2"; shift 2 ;;
+    --residency-enable) RESIDENCY_ENABLE="$2"; shift 2 ;;
+    --residency-trace-enable) RESIDENCY_TRACE_ENABLE="$2"; shift 2 ;;
+    --kv-runtime-enable) KV_RUNTIME_ENABLE="$2"; shift 2 ;;
+    --weight-runtime-prefetch-enable) WEIGHT_RUNTIME_PREFETCH_ENABLE="$2"; shift 2 ;;
+    --init-weight-offload-enable) INIT_WEIGHT_OFFLOAD_ENABLE="$2"; shift 2 ;;
+    --pool-coordinator-enable) POOL_COORDINATOR_ENABLE="$2"; shift 2 ;;
+    --pool-registry-enable) POOL_REGISTRY_ENABLE="$2"; shift 2 ;;
+    --auto-gap-watch-enable) AUTO_GAP_WATCH_ENABLE="$2"; shift 2 ;;
+    --fault-address-log-enable) FAULT_ADDRESS_LOG_ENABLE="$2"; shift 2 ;;
+    --weight-active-evict-enable) WEIGHT_ACTIVE_EVICT_ENABLE="$2"; shift 2 ;;
+    --weight-active-evict-max-experts-per-layer) WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;;
+    --weight-max-victims-per-step) WEIGHT_MAX_VICTIMS_PER_STEP="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+for item in \
+  SCRATCH_DEVICE_DIRECT_ENABLE \
+  SCRATCH_POOL_ENABLE \
+  RESIDENCY_ENABLE \
+  RESIDENCY_TRACE_ENABLE \
+  KV_RUNTIME_ENABLE \
+  WEIGHT_RUNTIME_PREFETCH_ENABLE \
+  INIT_WEIGHT_OFFLOAD_ENABLE \
+  POOL_COORDINATOR_ENABLE \
+  POOL_REGISTRY_ENABLE \
+  AUTO_GAP_WATCH_ENABLE \
+  WEIGHT_ACTIVE_EVICT_ENABLE \
+  FAULT_ADDRESS_LOG_ENABLE; do
+  if ! [[ "${!item}" =~ ^[01]$ ]]; then
+    echo "$item must be 0 or 1" >&2
+    exit 2
+  fi
+done
+if [ "$REQUIRE_DRIVER" = "1" ] \
+  && [ "$INIT_WEIGHT_OFFLOAD_ENABLE" = "0" ] \
+  && [ "$WEIGHT_RUNTIME_PREFETCH_ENABLE" = "0" ]; then
+  echo "--require-driver needs init offload or runtime prefetch enabled" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]]; then
+  echo "WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_MAX_VICTIMS_PER_STEP" =~ ^[0-9]+$ ]]; then
+  echo "WEIGHT_MAX_VICTIMS_PER_STEP must be a non-negative integer" >&2
+  exit 2
+fi
 
 mkdir -p "$RUN_ROOT"
 if [ -z "$LOG_FILE" ]; then
@@ -117,6 +193,20 @@ echo " request_rate: $REQUEST_RATE"
 echo " routing_trace: ${ROUTING_TRACE:-<generate>}"
 echo " weight_executor: $WEIGHT_EXECUTOR"
 echo " require_driver: $REQUIRE_DRIVER"
+echo " scratch_device_direct_enable: $SCRATCH_DEVICE_DIRECT_ENABLE"
+echo " scratch_pool_enable: $SCRATCH_POOL_ENABLE"
+echo " residency_enable: $RESIDENCY_ENABLE"
+echo " residency_trace_enable: $RESIDENCY_TRACE_ENABLE"
+echo " kv_runtime_enable: $KV_RUNTIME_ENABLE"
+echo " weight_runtime_prefetch_enable: $WEIGHT_RUNTIME_PREFETCH_ENABLE"
+echo " init_weight_offload_enable: $INIT_WEIGHT_OFFLOAD_ENABLE"
+echo " pool_coordinator_enable: $POOL_COORDINATOR_ENABLE"
+echo " pool_registry_enable: $POOL_REGISTRY_ENABLE"
+echo " auto_gap_watch_enable: $AUTO_GAP_WATCH_ENABLE"
+echo " fault_address_log_enable: $FAULT_ADDRESS_LOG_ENABLE"
+echo " weight_active_evict_enable: $WEIGHT_ACTIVE_EVICT_ENABLE"
+echo " weight_active_evict_max_experts_per_layer: $WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER"
+echo " weight_max_victims_per_step: $WEIGHT_MAX_VICTIMS_PER_STEP"
 echo " phase_f_user_debug_log: $PHASE_F_DEBUG_LOG"
 echo "==========================================================="
 
@@ -224,12 +314,26 @@ WEIGHT_BATCH_EXECUTOR_ENABLE=1 \
   --weight-executor "$WEIGHT_EXECUTOR" \
   --uvm-enable-builtin-tests 1 \
   --no-reset-counters \
-  --weight-budget-cpu-offload-enable 0
+  --weight-budget-cpu-offload-enable 0 \
+  --scratch-device-direct-enable "$SCRATCH_DEVICE_DIRECT_ENABLE" \
+  --scratch-pool-enable "$SCRATCH_POOL_ENABLE" \
+  --residency-enable "$RESIDENCY_ENABLE" \
+  --residency-trace-enable "$RESIDENCY_TRACE_ENABLE" \
+  --kv-runtime-enable "$KV_RUNTIME_ENABLE" \
+  --weight-runtime-prefetch-enable "$WEIGHT_RUNTIME_PREFETCH_ENABLE" \
+  --init-weight-offload-enable "$INIT_WEIGHT_OFFLOAD_ENABLE" \
+  --pool-coordinator-enable "$POOL_COORDINATOR_ENABLE" \
+  --pool-registry-enable "$POOL_REGISTRY_ENABLE" \
+  --auto-gap-watch-enable "$AUTO_GAP_WATCH_ENABLE" \
+  --weight-active-evict-enable "$WEIGHT_ACTIVE_EVICT_ENABLE" \
+  --weight-active-evict-max-experts-per-layer "$WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER" \
+  --weight-max-victims-per-step "$WEIGHT_MAX_VICTIMS_PER_STEP" \
+  --fault-address-log-enable "$FAULT_ADDRESS_LOG_ENABLE"
 
 echo "==========================================================="
 echo " [5/5] Validate Phase F traces"
 echo "==========================================================="
-python3 - "$CHECK_DIR" "$CHECK_JSON" "$CHECK_MD" "$REQUIRE_DRIVER" "$WEIGHT_EXECUTOR" <<'PY'
+python3 - "$CHECK_DIR" "$CHECK_JSON" "$CHECK_MD" "$REQUIRE_DRIVER" "$WEIGHT_EXECUTOR" "$INIT_WEIGHT_OFFLOAD_ENABLE" "$WEIGHT_RUNTIME_PREFETCH_ENABLE" <<'PY'
 import csv
 import json
 import sys
@@ -241,6 +345,8 @@ out_json = Path(sys.argv[2])
 out_md = Path(sys.argv[3])
 require_driver = sys.argv[4] == "1"
 requested_executor = sys.argv[5]
+init_weight_offload_enabled = sys.argv[6] == "1"
+runtime_prefetch_enabled = sys.argv[7] == "1"
 run_dir = check_dir / "runs" / "full_impl_enforce_rep1"
 prefetch_trace = run_dir / "vllm_uvm_weight_prefetch_full_impl_enforce_rep1.jsonl"
 init_trace = run_dir / "vllm_uvm_init_weight_offload_full_impl_enforce_rep1.jsonl"
@@ -339,12 +445,20 @@ driver_positive_results = sum(
 )
 
 checks = {
-    "prefetch_trace_present": prefetch_trace.exists(),
-    "init_trace_present": init_trace.exists(),
-    "init_phase_f_executor_seen": init_batch_records > 0,
-    "runtime_phase_f_executor_seen": runtime_batch_records > 0,
-    "init_batch_groups_are_multi_range": max(init_batch_sizes or [0]) > 1,
-    "runtime_batch_groups_are_multi_range": max(runtime_batch_sizes or [0]) > 1,
+    "prefetch_trace_present": prefetch_trace.exists() if runtime_prefetch_enabled else True,
+    "init_trace_present": init_trace.exists() if init_weight_offload_enabled else True,
+    "init_phase_f_executor_seen": (
+        init_batch_records > 0 if init_weight_offload_enabled else init_batch_records == 0
+    ),
+    "runtime_phase_f_executor_seen": (
+        runtime_batch_records > 0 if runtime_prefetch_enabled else runtime_batch_records == 0
+    ),
+    "init_batch_groups_are_multi_range": (
+        max(init_batch_sizes or [0]) > 1 if init_weight_offload_enabled else True
+    ),
+    "runtime_batch_groups_are_multi_range": (
+        max(runtime_batch_sizes or [0]) > 1 if runtime_prefetch_enabled else True
+    ),
     "driver_batch_seen_or_fallback_recorded": driver_records > 0 or fallback_records > 0,
     "driver_action_success_seen": (
         driver_success_records > 0 or driver_positive_results > 0
@@ -354,7 +468,9 @@ checks = {
         and fallback_records == 0
         and (driver_success_records > 0 or driver_positive_results > 0)
     ) if require_driver else True,
-    "router_topk_source_present": prefetch_sources.get("router_topk", 0) > 0,
+    "router_topk_source_present": (
+        prefetch_sources.get("router_topk", 0) > 0 if runtime_prefetch_enabled else True
+    ),
     "runtime_cold_offload_disabled": runtime_offload_issued == 0,
     "no_runtime_offload_actions": sum(offload_actions.values()) == 0,
     "benchmark_exit_zero": exit_code == 0,
@@ -377,6 +493,8 @@ payload = {
     "driver_results": driver_results[:20],
     "requested_executor": requested_executor,
     "require_driver": require_driver,
+    "init_weight_offload_enabled": init_weight_offload_enabled,
+    "runtime_prefetch_enabled": runtime_prefetch_enabled,
     "max_init_batch_size": max(init_batch_sizes or [0]),
     "max_runtime_batch_size": max(runtime_batch_sizes or [0]),
     "failed_requests": failed_requests,

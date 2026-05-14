@@ -50,6 +50,7 @@ logger = init_logger(__name__)
 _uvm_enabled = False
 _uvm_lib: Optional[ctypes.CDLL] = None
 _uvm_phase_stack: list[str] = []
+_UVM_DRIVER_BATCH_MAX_RANGES = 64
 
 
 def find_uvm_allocator_library() -> Optional[str]:
@@ -219,6 +220,25 @@ def load_uvm_library() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_size_t),
         ctypes.c_size_t,
         ctypes.c_int,
+    ]
+
+    lib.uvm_driver_batch_query_residency_bytes.restype = ctypes.c_int
+    lib.uvm_driver_batch_query_residency_bytes.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+
+    lib.uvm_is_managed_pointer.restype = ctypes.c_int
+    lib.uvm_is_managed_pointer.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_size_t,
     ]
 
     lib.uvm_close_log.restype = None
@@ -460,6 +480,36 @@ def prefetch_range_to_cpu(ptr: int, size: int) -> bool:
     return prefetch_range_to_device(ptr, size, device=-1)
 
 
+def probe_driver_capable_range(ptr: int, size: int) -> tuple[bool, str, int]:
+    """Return whether a raw range is CUDA managed and suitable for driver ioctls.
+
+    The Phase F driver executor only works on ranges visible to UVM as managed
+    VA blocks. This probe records the CUDA runtime's pointer classification so
+    weight traces can distinguish non-managed tensors from driver plumbing bugs.
+    """
+    if not _uvm_enabled:
+        return False, "uvm_disabled", -1
+    if _uvm_lib is None:
+        return False, "uvm_library_unavailable", -2
+    if ptr <= 0 or size <= 0:
+        return False, "invalid_range", -3
+    try:
+        result = int(
+            _uvm_lib.uvm_is_managed_pointer(
+                ctypes.c_uint64(ptr),
+                ctypes.c_size_t(size),
+            )
+        )
+    except Exception:
+        logger.debug("Failed to probe UVM pointer attributes", exc_info=True)
+        return False, "probe_exception", -4
+    if result == 1:
+        return True, "cuda_managed", result
+    if result == 0:
+        return False, "not_cuda_managed", result
+    return False, f"cuda_pointer_probe_failed:{result}", result
+
+
 def _prepare_uvm_range_arrays(
     ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
 ) -> tuple[ctypes.Array[ctypes.c_uint64], ctypes.Array[ctypes.c_size_t], int]:
@@ -561,27 +611,38 @@ def driver_batch_prefetch_ranges_to_device(
     """Try Phase F driver batch prefetch. Negative return means unavailable."""
     if not _uvm_enabled or _uvm_lib is None:
         return -1
-    ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
-    if count <= 0:
+    range_list = list(ranges)
+    if not range_list:
         return 0
-    if device < 0:
-        return int(
-            _uvm_lib.uvm_driver_batch_prefetch_cpu(
-                ptr_array,
-                size_array,
-                ctypes.c_size_t(count),
-                ctypes.c_int(1 if async_ else 0),
+    total = 0
+    for start in range(0, len(range_list), _UVM_DRIVER_BATCH_MAX_RANGES):
+        chunk = range_list[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
+        ptr_array, size_array, count = _prepare_uvm_range_arrays(chunk)
+        if count <= 0:
+            continue
+        if device < 0:
+            result = int(
+                _uvm_lib.uvm_driver_batch_prefetch_cpu(
+                    ptr_array,
+                    size_array,
+                    ctypes.c_size_t(count),
+                    ctypes.c_int(1 if async_ else 0),
+                )
             )
-        )
-    return int(
-        _uvm_lib.uvm_driver_batch_prefetch_gpu(
-            ptr_array,
-            size_array,
-            ctypes.c_size_t(count),
-            ctypes.c_int(device),
-            ctypes.c_int(1 if async_ else 0),
-        )
-    )
+        else:
+            result = int(
+                _uvm_lib.uvm_driver_batch_prefetch_gpu(
+                    ptr_array,
+                    size_array,
+                    ctypes.c_size_t(count),
+                    ctypes.c_int(device),
+                    ctypes.c_int(1 if async_ else 0),
+                )
+            )
+        if result < 0:
+            return result
+        total += result
+    return total
 
 
 def driver_batch_advise_ranges_cpu(
@@ -590,16 +651,24 @@ def driver_batch_advise_ranges_cpu(
     """Try Phase F driver batch CPU preferred-location advise."""
     if not _uvm_enabled or _uvm_lib is None:
         return -1
-    ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
-    if count <= 0:
+    range_list = list(ranges)
+    if not range_list:
         return 0
-    return int(
-        _uvm_lib.uvm_driver_batch_advise_cpu(
+    total = 0
+    for start in range(0, len(range_list), _UVM_DRIVER_BATCH_MAX_RANGES):
+        chunk = range_list[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
+        ptr_array, size_array, count = _prepare_uvm_range_arrays(chunk)
+        if count <= 0:
+            continue
+        result = int(_uvm_lib.uvm_driver_batch_advise_cpu(
             ptr_array,
             size_array,
             ctypes.c_size_t(count),
-        )
-    )
+        ))
+        if result < 0:
+            return result
+        total += result
+    return total
 
 
 def driver_batch_query_ranges_residency(
@@ -609,17 +678,80 @@ def driver_batch_query_ranges_residency(
     """Try Phase F driver batch residency query. Returns successes or negative."""
     if not _uvm_enabled or _uvm_lib is None:
         return -1
-    ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
-    if count <= 0:
+    range_list = list(ranges)
+    if not range_list:
         return 0
-    return int(
-        _uvm_lib.uvm_driver_batch_query_residency(
+    total = 0
+    for start in range(0, len(range_list), _UVM_DRIVER_BATCH_MAX_RANGES):
+        chunk = range_list[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
+        ptr_array, size_array, count = _prepare_uvm_range_arrays(chunk)
+        if count <= 0:
+            continue
+        result = int(_uvm_lib.uvm_driver_batch_query_residency(
             ptr_array,
             size_array,
             ctypes.c_size_t(count),
             ctypes.c_int(device),
+        ))
+        if result < 0:
+            return result
+        total += result
+    return total
+
+
+def driver_batch_query_ranges_residency_bytes(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    device: int = 0,
+) -> dict[str, int | bool]:
+    """Query page-granular real UVM residency bytes for managed ranges."""
+    result: dict[str, int | bool] = {
+        "ok": False,
+        "status": -1,
+        "queried_bytes": 0,
+        "gpu_bytes": 0,
+        "cpu_bytes": 0,
+        "any_bytes": 0,
+        "unknown_bytes": 0,
+    }
+    if not _uvm_enabled or _uvm_lib is None:
+        return result
+
+    ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
+    if count <= 0:
+        result["ok"] = True
+        result["status"] = 0
+        return result
+
+    gpu_bytes = ctypes.c_uint64(0)
+    cpu_bytes = ctypes.c_uint64(0)
+    any_bytes = ctypes.c_uint64(0)
+    unknown_bytes = ctypes.c_uint64(0)
+    queried_bytes = ctypes.c_uint64(0)
+    status = int(
+        _uvm_lib.uvm_driver_batch_query_residency_bytes(
+            ptr_array,
+            size_array,
+            ctypes.c_size_t(count),
+            ctypes.c_int(device),
+            ctypes.byref(gpu_bytes),
+            ctypes.byref(cpu_bytes),
+            ctypes.byref(any_bytes),
+            ctypes.byref(unknown_bytes),
+            ctypes.byref(queried_bytes),
         )
     )
+    result.update(
+        {
+            "ok": status >= 0,
+            "status": status,
+            "queried_bytes": int(queried_bytes.value),
+            "gpu_bytes": int(gpu_bytes.value),
+            "cpu_bytes": int(cpu_bytes.value),
+            "any_bytes": int(any_bytes.value),
+            "unknown_bytes": int(unknown_bytes.value),
+        }
+    )
+    return result
 
 
 def batch_prefetch_ranges_to_device_with_executor(

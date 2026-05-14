@@ -1651,6 +1651,11 @@ typedef struct
     NvU32     resident_on_count;   // Out, query only
     NvBool    resident_on_cpu;     // Out, query only
     NvBool    resident_on_gpu;     // Out, query only
+    NvU64     queried_bytes          NV_ALIGN_BYTES(8); // Out, policy ioctl only
+    NvU64     resident_gpu_bytes     NV_ALIGN_BYTES(8); // Out, policy ioctl only
+    NvU64     resident_cpu_bytes     NV_ALIGN_BYTES(8); // Out, policy ioctl only
+    NvU64     resident_any_bytes     NV_ALIGN_BYTES(8); // Out, policy ioctl only
+    NvU64     resident_unknown_bytes NV_ALIGN_BYTES(8); // Out, policy ioctl only
 } UVM_TEST_PHASE_F_RANGE_RESULT;
 
 #define UVM_TEST_PHASE_F_PING                            UVM_TEST_IOCTL_BASE(115)

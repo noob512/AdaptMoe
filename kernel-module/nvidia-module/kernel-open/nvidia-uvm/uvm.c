@@ -993,6 +993,544 @@ static NV_STATUS uvm_api_pageable_mem_access(UVM_PAGEABLE_MEM_ACCESS_PARAMS *par
     return NV_OK;
 }
 
+static NvU64 uvm_phase_f_page_overlap_bytes(NvU64 page_start, NvU64 query_start, NvU64 query_end)
+{
+    NvU64 page_end = page_start + PAGE_SIZE;
+    NvU64 overlap_start = max(page_start, query_start);
+    NvU64 overlap_end = min(page_end, query_end);
+
+    if (overlap_start >= overlap_end)
+        return 0;
+
+    return overlap_end - overlap_start;
+}
+
+static void uvm_phase_f_add_resident_bytes_from_block(uvm_va_block_t *block,
+                                                      uvm_gpu_t *gpu,
+                                                      NvU64 query_start,
+                                                      NvU64 query_end,
+                                                      UVM_PHASE_F_RANGE_RESULT *result)
+{
+    uvm_page_mask_t *gpu_resident = uvm_va_block_resident_mask_get(block, gpu->id, NUMA_NO_NODE);
+    uvm_page_mask_t *cpu_resident = uvm_va_block_resident_mask_get(block, UVM_ID_CPU, NUMA_NO_NODE);
+    NvU64 first_addr;
+    NvU64 last_addr;
+    uvm_page_index_t first_page_index;
+    uvm_page_index_t last_page_index;
+    uvm_page_index_t page_index;
+
+    if (query_start >= query_end)
+        return;
+
+    first_addr = UVM_ALIGN_DOWN(max(query_start, block->start), PAGE_SIZE);
+    last_addr = UVM_ALIGN_DOWN(min(query_end - 1, block->end), PAGE_SIZE);
+    first_page_index = uvm_va_block_cpu_page_index(block, first_addr);
+    last_page_index = uvm_va_block_cpu_page_index(block, last_addr);
+
+    for (page_index = first_page_index; page_index <= last_page_index; ++page_index) {
+        NvU64 page_start = block->start + (NvU64)page_index * PAGE_SIZE;
+        NvU64 bytes = uvm_phase_f_page_overlap_bytes(page_start, query_start, query_end);
+        bool on_gpu = gpu_resident && uvm_page_mask_test(gpu_resident, page_index);
+        bool on_cpu = cpu_resident && uvm_page_mask_test(cpu_resident, page_index);
+
+        if (on_gpu)
+            result->resident_gpu_bytes += bytes;
+        if (on_cpu)
+            result->resident_cpu_bytes += bytes;
+        if (on_gpu || on_cpu)
+            result->resident_any_bytes += bytes;
+        else
+            result->resident_unknown_bytes += bytes;
+    }
+}
+
+static NV_STATUS uvm_phase_f_query_resident_bytes(const NvProcessorUuid *gpu_uuid,
+                                                  NvBool async,
+                                                  NvU64 base,
+                                                  NvU64 length,
+                                                  UVM_PHASE_F_RANGE_RESULT *result,
+                                                  struct file *filp)
+{
+    NV_STATUS status = NV_OK;
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_va_range_managed_t *managed_range = NULL;
+    uvm_va_range_managed_t *managed_range_last = NULL;
+    uvm_gpu_t *gpu = NULL;
+    struct mm_struct *mm = NULL;
+    NvU64 query_start;
+    NvU64 query_end;
+    NvU64 last_address;
+
+    result->queried_bytes = length;
+    result->resident_gpu_bytes = 0;
+    result->resident_cpu_bytes = 0;
+    result->resident_any_bytes = 0;
+    result->resident_unknown_bytes = 0;
+
+    if (uvm_api_range_invalid(base, length))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    query_start = base;
+    query_end = base + length;
+    last_address = query_end - 1;
+
+    mm = uvm_va_space_mm_or_current_retain_lock(va_space);
+    uvm_va_space_down_read(va_space);
+
+    gpu = uvm_va_space_get_gpu_by_uuid(va_space, gpu_uuid);
+    if (!gpu) {
+        status = NV_ERR_INVALID_DEVICE;
+        goto out;
+    }
+
+    if (uvm_api_range_type_check(va_space, mm, base, length) != UVM_API_RANGE_TYPE_MANAGED) {
+        status = NV_ERR_INVALID_ADDRESS;
+        goto out;
+    }
+
+    uvm_for_each_va_range_managed_in_contig(managed_range, va_space, base, last_address) {
+        const NvU64 range_start = max(query_start, managed_range->va_range.node.start);
+        const NvU64 range_end = min(query_end - 1, managed_range->va_range.node.end);
+        const size_t first_block_index = uvm_va_range_block_index(managed_range, range_start);
+        const size_t last_block_index = uvm_va_range_block_index(managed_range, range_end);
+        size_t block_index;
+
+        managed_range_last = managed_range;
+
+        for (block_index = first_block_index; block_index <= last_block_index; ++block_index) {
+            uvm_va_block_t *block = uvm_va_range_block(managed_range, block_index);
+            const NvU64 block_start = block ? max(query_start, block->start) : 0;
+            const NvU64 block_end = block ? min(query_end, block->end + 1) : 0;
+
+            if (!block) {
+                NvU64 managed_aligned_start = UVM_ALIGN_DOWN(managed_range->va_range.node.start, UVM_VA_BLOCK_SIZE);
+                NvU64 missing_block_start = max(query_start,
+                                                max(managed_range->va_range.node.start,
+                                                    managed_aligned_start + (NvU64)block_index * UVM_VA_BLOCK_SIZE));
+                NvU64 missing_block_end = min(query_end,
+                                              min(managed_range->va_range.node.end + 1,
+                                                  managed_aligned_start +
+                                                      (NvU64)(block_index + 1) * UVM_VA_BLOCK_SIZE));
+                if (missing_block_start < missing_block_end)
+                    result->resident_unknown_bytes += missing_block_end - missing_block_start;
+                continue;
+            }
+
+            uvm_mutex_lock(&block->lock);
+            if (!async)
+                status = uvm_tracker_wait(&block->tracker);
+            if (status == NV_OK)
+                uvm_phase_f_add_resident_bytes_from_block(block, gpu, block_start, block_end, result);
+            uvm_mutex_unlock(&block->lock);
+
+            if (status != NV_OK)
+                goto out;
+        }
+    }
+
+    if (!managed_range_last || managed_range_last->va_range.node.end < last_address)
+        status = NV_ERR_INVALID_ADDRESS;
+
+out:
+    uvm_va_space_up_read(va_space);
+    uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+
+    uvm_phase_f_route_log("phase_f_resident_bytes base=0x%llx length=%llu status=0x%x queried=%llu gpu=%llu cpu=%llu any=%llu unknown=%llu\n",
+                          base,
+                          length,
+                          status,
+                          result->queried_bytes,
+                          result->resident_gpu_bytes,
+                          result->resident_cpu_bytes,
+                          result->resident_any_bytes,
+                          result->resident_unknown_bytes);
+    return status;
+}
+
+static NV_STATUS uvm_phase_f_execute_range(NvU32 action,
+                                           const NvProcessorUuid *gpu_uuid,
+                                           NvBool async,
+                                           NvU64 base,
+                                           NvU64 length,
+                                           UVM_PHASE_F_RANGE_RESULT *result,
+                                           struct file *filp)
+{
+    NV_STATUS status = NV_OK;
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    struct mm_struct *mm = NULL;
+    uvm_va_range_t *va_range = NULL;
+    uvm_api_range_type_t range_type = UVM_API_RANGE_TYPE_INVALID;
+    const char *range_type_name = "INVALID";
+    NvU64 last_address = 0;
+    bool range_invalid = true;
+    bool range_empty = true;
+
+    result->status = NV_OK;
+    result->resident_on_count = 0;
+    result->resident_on_cpu = NV_FALSE;
+    result->resident_on_gpu = NV_FALSE;
+    result->queried_bytes = 0;
+    result->resident_gpu_bytes = 0;
+    result->resident_cpu_bytes = 0;
+    result->resident_any_bytes = 0;
+    result->resident_unknown_bytes = 0;
+
+    if (base != 0 && length != 0) {
+        range_invalid = uvm_api_range_invalid(base, length);
+        if (!range_invalid)
+            last_address = base + length - 1;
+
+        mm = uvm_va_space_mm_or_current_retain_lock(va_space);
+        uvm_va_space_down_read(va_space);
+
+        if (!range_invalid) {
+            va_range = uvm_va_range_find(va_space, base);
+            range_empty = uvm_va_space_range_empty(va_space, base, last_address);
+            range_type = uvm_api_range_type_check(va_space, mm, base, length);
+        }
+
+        if (range_type == UVM_API_RANGE_TYPE_MANAGED)
+            range_type_name = "MANAGED";
+        else if (range_type == UVM_API_RANGE_TYPE_HMM)
+            range_type_name = "HMM";
+        else if (range_type == UVM_API_RANGE_TYPE_ATS)
+            range_type_name = "ATS";
+
+        uvm_phase_f_route_log("phase_f_range_diag action=%u base=0x%llx length=%llu last=0x%llx range_invalid=%u base_page_aligned=%u length_page_aligned=%u type=%s range_empty=%u va_range=%p va_range_type=%d va_start=0x%llx va_end=0x%llx va_space=%p mm=%p current_mm=%p\n",
+                              action,
+                              base,
+                              length,
+                              last_address,
+                              range_invalid,
+                              IS_ALIGNED(base, PAGE_SIZE),
+                              IS_ALIGNED(length, PAGE_SIZE),
+                              range_type_name,
+                              range_empty,
+                              va_range,
+                              va_range ? va_range->type : UVM_VA_RANGE_TYPE_INVALID,
+                              va_range ? va_range->node.start : 0,
+                              va_range ? va_range->node.end : 0,
+                              va_space,
+                              mm,
+                              current->mm);
+
+        uvm_va_space_up_read(va_space);
+        uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+    }
+
+    if (base == 0 || length == 0) {
+        status = NV_ERR_INVALID_ARGUMENT;
+    }
+    else if (action == UVM_PHASE_F_ACTION_ADVISE_CPU) {
+        UVM_SET_PREFERRED_LOCATION_PARAMS *advise_params =
+            uvm_kvmalloc_zero(sizeof(*advise_params));
+
+        if (!advise_params) {
+            status = NV_ERR_NO_MEMORY;
+        }
+        else {
+            advise_params->requestedBase = base;
+            advise_params->length = length;
+            advise_params->preferredLocation = NV_PROCESSOR_UUID_CPU_DEFAULT;
+            advise_params->preferredCpuNumaNode = NUMA_NO_NODE;
+
+            status = uvm_api_set_preferred_location(advise_params, filp);
+            uvm_kvfree(advise_params);
+        }
+    }
+    else if (action == UVM_PHASE_F_ACTION_PREFETCH_CPU ||
+             action == UVM_PHASE_F_ACTION_PREFETCH_GPU) {
+        UVM_MIGRATE_PARAMS *migrate_params =
+            uvm_kvmalloc_zero(sizeof(*migrate_params));
+
+        if (!migrate_params) {
+            status = NV_ERR_NO_MEMORY;
+        }
+        else {
+            migrate_params->base = base;
+            migrate_params->length = length;
+            migrate_params->destinationUuid =
+                action == UVM_PHASE_F_ACTION_PREFETCH_CPU ?
+                    NV_PROCESSOR_UUID_CPU_DEFAULT : *gpu_uuid;
+            migrate_params->flags = async ? UVM_MIGRATE_FLAG_ASYNC : 0;
+            migrate_params->semaphoreAddress = 0;
+            migrate_params->semaphorePayload = 0;
+            migrate_params->cpuNumaNode = NUMA_NO_NODE;
+
+            status = uvm_api_migrate(migrate_params, filp);
+            uvm_kvfree(migrate_params);
+        }
+    }
+    else if (action == UVM_PHASE_F_ACTION_QUERY_RESIDENCY) {
+        UVM_TEST_VA_RESIDENCY_INFO_PARAMS *query_params =
+            uvm_kvmalloc_zero(sizeof(*query_params));
+        NvU32 resident_index;
+
+        if (!query_params) {
+            status = NV_ERR_NO_MEMORY;
+        }
+        else {
+            query_params->lookup_address = base;
+            query_params->is_async = async;
+
+            status = uvm_test_va_residency_info(query_params, filp);
+            if (status == NV_OK) {
+                result->resident_on_count = query_params->resident_on_count;
+
+                for (resident_index = 0;
+                     resident_index < query_params->resident_on_count &&
+                     resident_index < UVM_MAX_PROCESSORS;
+                     ++resident_index) {
+                    if (uvm_uuid_eq(&query_params->resident_on[resident_index],
+                                    &NV_PROCESSOR_UUID_CPU_DEFAULT))
+                        result->resident_on_cpu = NV_TRUE;
+
+                    if (uvm_uuid_eq(&query_params->resident_on[resident_index],
+                                    gpu_uuid))
+                        result->resident_on_gpu = NV_TRUE;
+                }
+            }
+
+            uvm_kvfree(query_params);
+
+            if (status == NV_OK) {
+                status = uvm_phase_f_query_resident_bytes(gpu_uuid,
+                                                          async,
+                                                          base,
+                                                          length,
+                                                          result,
+                                                          filp);
+            }
+        }
+    }
+    else {
+        status = NV_ERR_INVALID_ARGUMENT;
+    }
+
+    result->status = status;
+    return status;
+}
+
+static NV_STATUS uvm_phase_f_note_status(NV_STATUS status,
+                                         NvU32 *success_count,
+                                         NvU32 *failure_count,
+                                         NV_STATUS *first_error)
+{
+    if (status == NV_OK) {
+        ++*success_count;
+    }
+    else {
+        ++*failure_count;
+        if (*first_error == NV_OK)
+            *first_error = status;
+    }
+
+    return status;
+}
+
+static NV_STATUS uvm_api_phase_f_batch_executor(UVM_PHASE_F_BATCH_EXECUTOR_PARAMS *params, struct file *filp)
+{
+    NvU32 i;
+    NV_STATUS first_error = NV_OK;
+
+    if (params->count > UVM_PHASE_F_MAX_RANGES)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    params->success_count = 0;
+    params->failure_count = 0;
+
+    UVM_INFO_PRINT("phase_f_policy_batch begin action=%u count=%u async=%u first_base=0x%llx first_len=%llu\n",
+                   params->action,
+                   params->count,
+                   params->async,
+                   params->count > 0 ? params->ranges[0].base : 0,
+                   params->count > 0 ? params->ranges[0].length : 0);
+    uvm_phase_f_route_log("phase_f_policy_batch begin action=%u count=%u async=%u first_base=0x%llx first_len=%llu\n",
+                          params->action,
+                          params->count,
+                          params->async,
+                          params->count > 0 ? params->ranges[0].base : 0,
+                          params->count > 0 ? params->ranges[0].length : 0);
+
+    for (i = 0; i < params->count; ++i) {
+        NV_STATUS status = uvm_phase_f_execute_range(params->action,
+                                                     &params->gpu_uuid,
+                                                     params->async,
+                                                     params->ranges[i].base,
+                                                     params->ranges[i].length,
+                                                     &params->results[i],
+                                                     filp);
+        uvm_phase_f_note_status(status,
+                                &params->success_count,
+                                &params->failure_count,
+                                &first_error);
+    }
+
+    UVM_INFO_PRINT("phase_f_policy_batch end action=%u count=%u success=%u failure=%u first_error=0x%x\n",
+                   params->action,
+                   params->count,
+                   params->success_count,
+                   params->failure_count,
+                   first_error);
+    uvm_phase_f_route_log("phase_f_policy_batch end action=%u count=%u success=%u failure=%u first_error=0x%x\n",
+                          params->action,
+                          params->count,
+                          params->success_count,
+                          params->failure_count,
+                          first_error);
+
+    return first_error;
+}
+
+static NV_STATUS uvm_api_phase_f_register_region(UVM_PHASE_F_REGISTER_REGION_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_phase_f_region_t *region;
+    NV_STATUS status;
+    int ret;
+
+    if (params->region.region_id == 0 || params->region.base == 0 || params->region.length == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    region = uvm_kvmalloc_zero(sizeof(*region));
+    if (!region)
+        return NV_ERR_NO_MEMORY;
+
+    region->region_id = params->region.region_id;
+    region->base = params->region.base;
+    region->length = params->region.length;
+    region->pool = params->region.pool;
+    region->layer_id = params->region.layer_id;
+    region->expert_id = params->region.expert_id;
+    region->role = params->region.role;
+    region->flags = params->region.flags;
+
+    uvm_va_space_down_write(va_space);
+    ret = radix_tree_insert(&va_space->phase_f_regions, region->region_id, region);
+    status = errno_to_nv_status(ret);
+    uvm_va_space_up_write(va_space);
+
+    if (status != NV_OK) {
+        uvm_kvfree(region);
+        return status;
+    }
+
+    uvm_phase_f_route_log("phase_f_register_region id=%llu base=0x%llx length=%llu pool=%u layer=%u expert=%u role=%u flags=0x%x\n",
+                          region->region_id,
+                          region->base,
+                          region->length,
+                          region->pool,
+                          region->layer_id,
+                          region->expert_id,
+                          region->role,
+                          region->flags);
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_api_phase_f_unregister_region(UVM_PHASE_F_UNREGISTER_REGION_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_phase_f_region_t *region;
+
+    if (params->region_id == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    uvm_va_space_down_write(va_space);
+    region = radix_tree_delete(&va_space->phase_f_regions, params->region_id);
+    uvm_va_space_up_write(va_space);
+
+    if (!region)
+        return NV_ERR_OBJECT_NOT_FOUND;
+
+    uvm_phase_f_route_log("phase_f_unregister_region id=%llu base=0x%llx length=%llu\n",
+                          region->region_id,
+                          region->base,
+                          region->length);
+    uvm_kvfree(region);
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    NvU32 i;
+    NV_STATUS first_error = NV_OK;
+
+    if (params->count > UVM_PHASE_F_MAX_RANGES)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    params->success_count = 0;
+    params->failure_count = 0;
+
+    uvm_phase_f_route_log("phase_f_policy_batch_regions begin action=%u count=%u async=%u first_region=%llu\n",
+                          params->action,
+                          params->count,
+                          params->async,
+                          params->count > 0 ? params->region_ids[0] : 0);
+
+    for (i = 0; i < params->count; ++i) {
+        uvm_phase_f_region_t *region;
+        NvU64 base = 0;
+        NvU64 length = 0;
+        NV_STATUS status = NV_OK;
+
+        params->results[i].status = NV_OK;
+        params->results[i].resident_on_count = 0;
+        params->results[i].resident_on_cpu = NV_FALSE;
+        params->results[i].resident_on_gpu = NV_FALSE;
+        params->results[i].queried_bytes = 0;
+        params->results[i].resident_gpu_bytes = 0;
+        params->results[i].resident_cpu_bytes = 0;
+        params->results[i].resident_any_bytes = 0;
+        params->results[i].resident_unknown_bytes = 0;
+
+        if (params->region_ids[i] == 0) {
+            status = NV_ERR_INVALID_ARGUMENT;
+        }
+        else {
+            uvm_va_space_down_read(va_space);
+            region = radix_tree_lookup(&va_space->phase_f_regions, params->region_ids[i]);
+            if (region) {
+                base = region->base;
+                length = region->length;
+            }
+            uvm_va_space_up_read(va_space);
+
+            if (!region)
+                status = NV_ERR_OBJECT_NOT_FOUND;
+        }
+
+        if (status == NV_OK) {
+            status = uvm_phase_f_execute_range(params->action,
+                                               &params->gpu_uuid,
+                                               params->async,
+                                               base,
+                                               length,
+                                               &params->results[i],
+                                               filp);
+        }
+        else {
+            params->results[i].status = status;
+        }
+
+        uvm_phase_f_note_status(status,
+                                &params->success_count,
+                                &params->failure_count,
+                                &first_error);
+    }
+
+    uvm_phase_f_route_log("phase_f_policy_batch_regions end action=%u count=%u success=%u failure=%u first_error=0x%x\n",
+                          params->action,
+                          params->count,
+                          params->success_count,
+                          params->failure_count,
+                          first_error);
+
+    return first_error;
+}
+
 static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     switch (cmd)
@@ -1044,6 +1582,10 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2,uvm_api_tools_get_processor_uuid_table_v2);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_ALLOC_DEVICE_P2P,               uvm_api_alloc_device_p2p);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_CLEAR_ALL_ACCESS_COUNTERS,      uvm_api_clear_all_access_counters);
+        UVM_ROUTE_CMD_ALLOC_INIT_CHECK(UVM_PHASE_F_BATCH_EXECUTOR,         uvm_api_phase_f_batch_executor);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_F_REGISTER_REGION,        uvm_api_phase_f_register_region);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_F_UNREGISTER_REGION,      uvm_api_phase_f_unregister_region);
+        UVM_ROUTE_CMD_ALLOC_INIT_CHECK(UVM_PHASE_F_BATCH_REGIONS,          uvm_api_phase_f_batch_regions);
     }
 
     // Try the test ioctls if none of the above matched

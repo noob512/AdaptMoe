@@ -350,6 +350,11 @@ static NV_STATUS uvm_test_phase_f_batch_executor(UVM_TEST_PHASE_F_BATCH_EXECUTOR
         params->results[i].resident_on_count = 0;
         params->results[i].resident_on_cpu = NV_FALSE;
         params->results[i].resident_on_gpu = NV_FALSE;
+        params->results[i].queried_bytes = 0;
+        params->results[i].resident_gpu_bytes = 0;
+        params->results[i].resident_cpu_bytes = 0;
+        params->results[i].resident_any_bytes = 0;
+        params->results[i].resident_unknown_bytes = 0;
 
         // base 或 length 非法，直接标记当前 range 失败。
         if (base == 0 || length == 0) {

@@ -61,6 +61,18 @@ typedef enum
 
 typedef struct
 {
+    NvU64 region_id;
+    NvU64 base;
+    NvU64 length;
+    NvU32 pool;
+    NvU32 layer_id;
+    NvU32 expert_id;
+    NvU32 role;
+    NvU32 flags;
+} uvm_phase_f_region_t;
+
+typedef struct
+{
     uvm_deferred_free_object_type_t type;
     struct list_head list_node;
 } uvm_deferred_free_object_t;
@@ -220,6 +232,9 @@ struct uvm_va_space_struct
     // Range groups
     struct radix_tree_root range_groups;
     uvm_range_tree_t range_group_ranges;
+
+    // Phase F policy regions, indexed by userspace-provided region IDs.
+    struct radix_tree_root phase_f_regions;
 
     // Peer to peer table
     // A bitmask of peer to peer pairs enabled in this va_space

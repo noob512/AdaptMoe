@@ -14,7 +14,7 @@
 #
 #   特别注意：--step ping-ioctl 只走 count=0 的 batch executor ioctl，
 #   不会分配 cudaMallocManaged buffer。真正分配 managed memory 的 step
-#   是 batch-mini1/query/prefetch-gpu/advise-cpu/prefetch-cpu/all。
+#   是 batch-mini1/query/query-region/prefetch-gpu/prefetch-gpu-query/advise-cpu/prefetch-cpu/all。
 
 # 严格 shell 模式：
 #   -e: 命令失败时退出；
@@ -53,6 +53,10 @@ DEVICE="${DEVICE:-0}"
 ASYNC="${ASYNC:-0}"
 STEP="all"
 
+# policy ioctl 是生产路径，不依赖 builtin test ioctl。默认/显式 test 模式仍然
+# 需要 uvm_enable_builtin_tests=1。
+PHASE_F_IOCTL_MODE="${VLLM_UVM_PHASE_F_IOCTL_MODE:-test}"
+
 # ENABLE_BUILTIN_TESTS=1 时，脚本会尝试通过 sysfs 打开 builtin tests。
 # --no-enable-tests 会把它改成 0：脚本不主动写 sysfs，但仍然会检查
 # 当前 nvidia_uvm 是否已经启用了 uvm_enable_builtin_tests=1。
@@ -73,7 +77,7 @@ Options:
   --bytes <n>             managed allocation size, default 1048576
   --device <n>            CUDA device, default 0
   --async <0|1>           use async migrate flag for prefetch, default 0
-  --step <name>           run only one step: all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|query|prefetch-gpu|advise-cpu|prefetch-cpu
+  --step <name>           run only one step: all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|query|register-region|query-region|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu
   --no-enable-tests       do not try to enable uvm_enable_builtin_tests
   --force-reload-uvm      last-resort: reload nvidia_uvm with builtin tests
   --reload-uvm            deprecated alias for --force-reload-uvm
@@ -240,6 +244,7 @@ echo "bytes: $BYTES"
 echo "device: $DEVICE"
 echo "async: $ASYNC"
 echo "step: $STEP"
+echo "phase_f_ioctl_mode: $PHASE_F_IOCTL_MODE"
 echo "enable_builtin_tests: $ENABLE_BUILTIN_TESTS"
 echo "force_reload_uvm: $FORCE_RELOAD_UVM"
 echo "uvm_ko_path: $UVM_KO_PATH"
@@ -309,18 +314,22 @@ else
 fi
 trace_marker "after_module_state"
 
-# Phase F 的 test ioctl 挂在 builtin tests 入口下。
-# 如果 uvm_enable_builtin_tests 不是 1，后面 ioctl 会被内核拒绝，因此这里提前失败。
-trace_marker "before_tests_enabled_check"
+# Phase F 的 test ioctl 挂在 builtin tests 入口下；policy ioctl 是正式路径，
+# 不依赖 uvm_enable_builtin_tests。
+trace_marker "before_tests_enabled_check ioctl_mode=$PHASE_F_IOCTL_MODE"
 tests_enabled="$(cat /sys/module/nvidia_uvm/parameters/uvm_enable_builtin_tests 2>/dev/null || echo missing)"
-if [ "$tests_enabled" != "1" ]; then
-  echo "ERROR: Phase F test ioctl requires uvm_enable_builtin_tests=1, got '$tests_enabled'." >&2
-  echo "Preferred fix: rebuild/load the updated UVM module once so the parameter is writable." >&2
-  echo "Last resort: re-run with --force-reload-uvm, but that path has caused crashes." >&2
-  trace_marker "tests_enabled_check_failed value=$tests_enabled"
-  exit 3
+if [ "$PHASE_F_IOCTL_MODE" != "policy" ]; then
+  if [ "$tests_enabled" != "1" ]; then
+    echo "ERROR: Phase F test ioctl requires uvm_enable_builtin_tests=1, got '$tests_enabled'." >&2
+    echo "Preferred fix: rebuild/load the updated UVM module once so the parameter is writable." >&2
+    echo "Last resort: re-run with --force-reload-uvm, but that path has caused crashes." >&2
+    trace_marker "tests_enabled_check_failed value=$tests_enabled ioctl_mode=$PHASE_F_IOCTL_MODE"
+    exit 3
+  fi
+else
+  echo "Skipping builtin-test check because VLLM_UVM_PHASE_F_IOCTL_MODE=policy."
 fi
-trace_marker "after_tests_enabled_check value=$tests_enabled"
+trace_marker "after_tests_enabled_check value=$tests_enabled ioctl_mode=$PHASE_F_IOCTL_MODE"
 
 # 告诉 uvm_allocator.cpp 把用户态 ioctl 诊断写到 $PHASE_F_DEBUG_LOG。
 export VLLM_UVM_PHASE_F_DEBUG_LOG="$PHASE_F_DEBUG_LOG"
@@ -340,7 +349,7 @@ case "$STEP" in
     #   batch-mini1 : 分配 managed memory 后对一个 range 走 mini batch；
     #   ping-ioctl  : 走正式 batch executor ioctl，count=0；
     #   ping        : ping-ioctl 的同类路径；
-    #   query/prefetch/advise: 对真实 managed range 执行 Phase F 操作。
+    #   query/query-region/prefetch/advise: 对真实 managed range 执行 Phase F 操作。
     trace_marker "case_all_begin"
     run_step "ping-open" "$SMOKE" --step ping-open --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
     run_step "ping-init" "$SMOKE" --step ping-init --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
@@ -349,14 +358,17 @@ case "$STEP" in
     run_step "batch-mini1" "$SMOKE" --step batch-mini1 --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
     run_step "ping-ioctl" "$SMOKE" --step ping-ioctl --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
     run_step "ping" "$SMOKE" --step ping --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
+    run_step "probe-uvm-fd" "$SMOKE" --step probe-uvm-fd --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
     run_step "query" "$SMOKE" --step query --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
+    run_step "query-region" "$SMOKE" --step query-region --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
     run_step "prefetch-gpu" "$SMOKE" --step prefetch-gpu --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
+    run_step "prefetch-gpu-query" "$SMOKE" --step prefetch-gpu-query --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
     run_step "advise-cpu" "$SMOKE" --step advise-cpu --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
     run_step "prefetch-cpu" "$SMOKE" --step prefetch-cpu --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
     run_step "all" "$SMOKE" --step all --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
     trace_marker "case_all_end"
     ;;
-  ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|query|prefetch-gpu|advise-cpu|prefetch-cpu)
+  ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|query|register-region|query-region|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu)
     # 单步诊断模式。你给的命令 --step ping-ioctl 会进入这里，只执行一个子进程。
     trace_marker "case_single_begin selected=$STEP"
     run_step "$STEP" "$SMOKE" --step "$STEP" --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"

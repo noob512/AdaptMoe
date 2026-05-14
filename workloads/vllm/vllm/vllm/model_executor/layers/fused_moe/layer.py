@@ -28,6 +28,7 @@ from vllm.device_allocator.uvm import (
     batch_prefetch_ranges_to_device_with_executor,
     offload_range_to_cpu,
     prefetch_range_to_device,
+    probe_driver_capable_range,
     uvm_enabled_allocation_phase,
 )
 from vllm.device_allocator.uvm_pool_coordinator import request_uvm_pool_action
@@ -913,6 +914,14 @@ class FusedMoE(CustomOp):
                 self.uvm_residency_weight_victim_action,
             )
             self.uvm_residency_weight_victim_action = "offload_cpu"
+        self.uvm_residency_weight_active_evict_enable = _env_flag_enabled(
+            "VLLM_UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE",
+            default=False,
+        )
+        self.uvm_residency_weight_active_evict_max_experts_per_layer = _env_int(
+            "VLLM_UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER",
+            default=0,
+        )
 
         self.quant_config = quant_config
 
@@ -2186,6 +2195,11 @@ class FusedMoE(CustomOp):
         active_this_step: bool,
         source_action: str,
     ) -> dict[str, object]:
+        (
+            driver_capable,
+            driver_capability_reason,
+            driver_capability_code,
+        ) = probe_driver_capable_range(ptr, size_bytes)
         return {
             "source": "stage_i",
             "stage": "stage_l1",
@@ -2196,6 +2210,9 @@ class FusedMoE(CustomOp):
             "role": role,
             "ptr": f"0x{ptr:x}",
             "bytes": size_bytes,
+            "driver_capable": driver_capable,
+            "driver_capability_reason": driver_capability_reason,
+            "driver_capability_code": driver_capability_code,
             "plan_hot": (
                 layer_id is not None
                 and (layer_id, global_expert_id)
@@ -2208,6 +2225,19 @@ class FusedMoE(CustomOp):
             ),
             "active_this_step": active_this_step,
             "source_action": source_action,
+        }
+
+    def _uvm_driver_capability_trace_fields(
+        self, metadata: dict[str, object]
+    ) -> dict[str, object]:
+        return {
+            "driver_capable": bool(metadata.get("driver_capable", False)),
+            "driver_capability_reason": str(
+                metadata.get("driver_capability_reason") or ""
+            ),
+            "driver_capability_code": int(
+                metadata.get("driver_capability_code") or 0
+            ),
         }
 
     def _uvm_weight_region_is_estimated_gpu(self, region_id: str) -> bool:
@@ -2400,6 +2430,185 @@ class FusedMoE(CustomOp):
                 },
                 success=success,
             )
+        return issued
+
+    def _evict_uvm_non_active_expert_weights(
+        self,
+        *,
+        layer_id: int | None,
+        active_global_experts: set[int],
+        active_region_ids: set[str],
+        scope_key: str,
+    ) -> int:
+        if not self.uvm_residency_weight_active_evict_enable:
+            return 0
+        if layer_id is None:
+            return 0
+
+        candidate_pairs = [
+            (global_expert_id, self._uvm_global_to_local_expert(global_expert_id))
+            for global_expert_id in range(int(self.global_num_experts))
+            if global_expert_id not in active_global_experts
+        ]
+        candidate_pairs = [
+            (global_expert_id, local_expert_id)
+            for global_expert_id, local_expert_id in candidate_pairs
+            if 0 <= local_expert_id < int(self.local_num_experts)
+        ]
+        max_experts = self.uvm_residency_weight_active_evict_max_experts_per_layer
+        if max_experts > 0:
+            candidate_pairs = candidate_pairs[:max_experts]
+
+        batch_items: list[dict[str, object]] = []
+        skipped_active = 0
+        skipped_cpu = 0
+        for global_expert_id, local_expert_id in candidate_pairs:
+            for role, ptr, size_bytes in self._uvm_expert_weight_slices(
+                local_expert_id,
+                self.uvm_weight_offload_target_roles,
+            ):
+                region_id = self._uvm_expert_weight_region_id(
+                    layer_id,
+                    global_expert_id,
+                    role,
+                )
+                if region_id in active_region_ids:
+                    skipped_active += 1
+                    continue
+                metadata = self._uvm_expert_weight_residency_metadata(
+                    layer_id=layer_id,
+                    global_expert_id=global_expert_id,
+                    local_expert_id=local_expert_id,
+                    role=role,
+                    ptr=ptr,
+                    size_bytes=size_bytes,
+                    active_this_step=False,
+                    source_action="active_set_evict",
+                )
+                snapshot = get_uvm_residency_region_snapshot(region_id)
+                register_uvm_residency_region(
+                    pool="weights",
+                    region_id=region_id,
+                    ptr=ptr,
+                    bytes=size_bytes,
+                    state=(
+                        str(snapshot.get("state"))
+                        if snapshot is not None
+                        else self.uvm_residency_weight_initial_state
+                    ),
+                    evictable=True,
+                    active=False,
+                    metadata=metadata,
+                )
+                if self._uvm_weight_region_is_estimated_gpu(region_id) is False:
+                    skipped_cpu += 1
+                    continue
+                batch_items.append(
+                    {
+                        "region_id": region_id,
+                        "ptr": ptr,
+                        "bytes": size_bytes,
+                        "metadata": metadata,
+                    }
+                )
+
+        if not batch_items:
+            record_uvm_residency_action(
+                action="residency_weight_active_evict_noop",
+                pool="weights",
+                metadata={
+                    "stage": "stage_l2_active_evict",
+                    "layer_id": layer_id,
+                    "scope_key": scope_key,
+                    "active_experts": sorted(active_global_experts),
+                    "candidate_experts": len(candidate_pairs),
+                    "skipped_active_records": skipped_active,
+                    "skipped_cpu_records": skipped_cpu,
+                },
+            )
+            return 0
+
+        ranges = [
+            (int(item["ptr"]), int(item["bytes"]))
+            for item in batch_items
+        ]
+        (
+            batch_successes,
+            executor_used,
+            driver_advise_result,
+            driver_prefetch_result,
+        ) = batch_offload_ranges_to_cpu_with_executor(
+            ranges,
+            sync=self.uvm_residency_weight_sync_offload,
+            executor=self.uvm_weight_executor,
+        )
+
+        issued = 0
+        for batch_index, item in enumerate(batch_items):
+            success = batch_index < batch_successes
+            region_id = str(item["region_id"])
+            if success:
+                issued += 1
+                mark_uvm_residency_state(
+                    region_id=region_id,
+                    state=(
+                        "cpu"
+                        if self.uvm_residency_weight_sync_offload
+                        else "prefetching_cpu"
+                    ),
+                    metadata={
+                        **cast(dict[str, object], item["metadata"]),
+                        "stage": "stage_l2_active_evict",
+                        "scope_key": scope_key,
+                        "executor": executor_used,
+                    },
+                )
+            record_uvm_residency_action(
+                action=(
+                    "residency_weight_active_evict_issued"
+                    if success
+                    else "residency_weight_active_evict_failed"
+                ),
+                pool="weights",
+                region_id=region_id,
+                bytes=int(item["bytes"]),
+                metadata={
+                    **cast(dict[str, object], item["metadata"]),
+                    "stage": "stage_l2_active_evict",
+                    "scope_key": scope_key,
+                    "executor": executor_used,
+                    "requested_executor": self.uvm_weight_executor,
+                    "batch_index": batch_index,
+                    "batch_size": len(batch_items),
+                    "batch_successes": batch_successes,
+                    "driver_advise_result": driver_advise_result,
+                    "driver_prefetch_result": driver_prefetch_result,
+                    "sync_offload": self.uvm_residency_weight_sync_offload,
+                },
+                success=success,
+            )
+
+        self._append_uvm_weight_prefetch_trace(
+            {
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "layer_name": self.layer_name,
+                "step": self._uvm_moe_trace_step,
+                "mode": "active_set_evict",
+                "prefetch_source": self.uvm_weight_prefetch_source,
+                "action": "active_set_evict_summary",
+                "active_global_experts": sorted(active_global_experts),
+                "candidate_experts": len(candidate_pairs),
+                "attempted_records": len(batch_items),
+                "issued_records": issued,
+                "executor": executor_used,
+                "requested_executor": self.uvm_weight_executor,
+                "driver_advise_result": driver_advise_result,
+                "driver_prefetch_result": driver_prefetch_result,
+                "skipped_active_records": skipped_active,
+                "skipped_cpu_records": skipped_cpu,
+            }
+        )
         return issued
 
     def _append_uvm_weight_prefetch_trace(self, record: dict[str, object]) -> None:
@@ -2599,6 +2808,9 @@ class FusedMoE(CustomOp):
                                 "local_expert_id": local_expert_id,
                                 "ptr": f"0x{ptr:x}",
                                 "bytes": size_bytes,
+                                **self._uvm_driver_capability_trace_fields(
+                                    residency_metadata
+                                ),
                                 "issued_bytes_before": issued_bytes,
                                 "max_bytes": self.uvm_init_weight_offload_max_bytes,
                             }
@@ -2624,6 +2836,9 @@ class FusedMoE(CustomOp):
                                 "local_expert_id": local_expert_id,
                                 "ptr": ptr,
                                 "bytes": size_bytes,
+                                **self._uvm_driver_capability_trace_fields(
+                                    residency_metadata
+                                ),
                                 "device": -1,
                                 "sync_offload": self.uvm_init_weight_offload_sync,
                                 "plan_policy": self.uvm_init_weight_plan_policy,
@@ -2698,6 +2913,9 @@ class FusedMoE(CustomOp):
                             "local_expert_id": local_expert_id,
                             "ptr": f"0x{ptr:x}",
                             "bytes": size_bytes,
+                            **self._uvm_driver_capability_trace_fields(
+                                residency_metadata
+                            ),
                             "device": -1,
                             "success": success,
                             "advise_cpu_success": (
@@ -3006,6 +3224,9 @@ class FusedMoE(CustomOp):
                                 "local_expert_id": local_expert_id,
                                 "ptr": f"0x{ptr:x}",
                                 "bytes": size_bytes,
+                                **self._uvm_driver_capability_trace_fields(
+                                    residency_metadata
+                                ),
                             }
                         )
                         continue
@@ -3039,6 +3260,9 @@ class FusedMoE(CustomOp):
                                 "local_expert_id": local_expert_id,
                                 "ptr": f"0x{ptr:x}",
                                 "bytes": size_bytes,
+                                **self._uvm_driver_capability_trace_fields(
+                                    residency_metadata
+                                ),
                                 "issued_bytes_before": issued_bytes,
                                 "max_bytes_per_step": (
                                     self.uvm_weight_prefetch_max_bytes_per_step
@@ -3090,6 +3314,9 @@ class FusedMoE(CustomOp):
                                 "local_expert_id": local_expert_id,
                                 "ptr": f"0x{ptr:x}",
                                 "bytes": size_bytes,
+                                **self._uvm_driver_capability_trace_fields(
+                                    residency_metadata
+                                ),
                                 "pool": coordinator_decision.pool,
                                 "coordinator_mode": coordinator_decision.mode,
                                 "coordinator_reason": coordinator_decision.reason,
@@ -3130,6 +3357,9 @@ class FusedMoE(CustomOp):
                                 "local_expert_id": local_expert_id,
                                 "ptr": ptr,
                                 "bytes": size_bytes,
+                                **self._uvm_driver_capability_trace_fields(
+                                    residency_metadata
+                                ),
                                 "device": device,
                                 "coordinator_allowed": (
                                     coordinator_decision.allowed
@@ -3179,6 +3409,9 @@ class FusedMoE(CustomOp):
                             "local_expert_id": local_expert_id,
                             "ptr": f"0x{ptr:x}",
                             "bytes": size_bytes,
+                            **self._uvm_driver_capability_trace_fields(
+                                residency_metadata
+                            ),
                             "device": device,
                             "success": success,
                             "coordinator_allowed": coordinator_decision.allowed,
@@ -3259,6 +3492,12 @@ class FusedMoE(CustomOp):
                         ),
                     }
                 )
+            self._evict_uvm_non_active_expert_weights(
+                layer_id=layer_id,
+                active_global_experts=all_active_global_experts,
+                active_region_ids=active_region_ids,
+                scope_key=f"moe_step:{os.getpid()}:{self._uvm_moe_trace_step}",
+            )
         except Exception:
             logger.debug("Failed to run UVM expert prefetch", exc_info=True)
 
@@ -3356,6 +3595,9 @@ class FusedMoE(CustomOp):
                                 "local_expert_id": local_expert_id,
                                 "ptr": f"0x{ptr:x}",
                                 "bytes": size_bytes,
+                                **self._uvm_driver_capability_trace_fields(
+                                    residency_metadata
+                                ),
                                 "issued_bytes_before": issued_bytes,
                                 "max_bytes_per_step": (
                                     self.uvm_weight_offload_max_bytes_per_step
@@ -3397,6 +3639,9 @@ class FusedMoE(CustomOp):
                                 "local_expert_id": local_expert_id,
                                 "ptr": f"0x{ptr:x}",
                                 "bytes": size_bytes,
+                                **self._uvm_driver_capability_trace_fields(
+                                    residency_metadata
+                                ),
                                 "pool": coordinator_decision.pool,
                                 "coordinator_mode": coordinator_decision.mode,
                                 "coordinator_reason": coordinator_decision.reason,
@@ -3449,6 +3694,9 @@ class FusedMoE(CustomOp):
                             "local_expert_id": local_expert_id,
                             "ptr": f"0x{ptr:x}",
                             "bytes": size_bytes,
+                            **self._uvm_driver_capability_trace_fields(
+                                residency_metadata
+                            ),
                             "device": -1,
                             "success": success,
                             "coordinator_allowed": coordinator_decision.allowed,

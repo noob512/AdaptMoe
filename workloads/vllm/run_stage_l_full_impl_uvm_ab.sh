@@ -50,16 +50,36 @@ WEIGHT_PLAN_FILE="${WEIGHT_PLAN_FILE:-}"
 WEIGHT_PLAN_IS_EXTERNAL=0
 WEIGHT_PREFETCH_MAX_BYTES_PER_STEP="${WEIGHT_PREFETCH_MAX_BYTES_PER_STEP:-33554432}"
 WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER="${WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER:-2}"
+WEIGHT_PREFETCH_TRACE_ENABLE="${WEIGHT_PREFETCH_TRACE_ENABLE:-1}"
+WEIGHT_ROUTER_TOPK_EVERY_N_STEPS="${WEIGHT_ROUTER_TOPK_EVERY_N_STEPS:-1}"
+WEIGHT_PREFETCH_SKIP_RESIDENT="${WEIGHT_PREFETCH_SKIP_RESIDENT:-1}"
+WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE="${WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE:-1}"
+WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS="${WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS:-8}"
+WEIGHT_PREFETCH_SOURCE="${WEIGHT_PREFETCH_SOURCE:-router_topk}"
+ORACLE_EXPERT_TRACE_FILE="${ORACLE_EXPERT_TRACE_FILE:-}"
+ORACLE_PREFETCH_LOOKAHEAD_STEPS="${ORACLE_PREFETCH_LOOKAHEAD_STEPS:-1}"
+WEIGHT_PREFETCH_HIT_TRACE_ENABLE="${WEIGHT_PREFETCH_HIT_TRACE_ENABLE:-0}"
+WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE="${WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE:-0}"
+WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP="${WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP:-64}"
 WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP="${WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP:-268435456}"
 WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER="${WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER:-8}"
 WEIGHT_MAX_VICTIMS_PER_STEP="${WEIGHT_MAX_VICTIMS_PER_STEP:-16}"
 WEIGHT_VICTIM_ACTION="${WEIGHT_VICTIM_ACTION:-offload_cpu}"
 WEIGHT_ACTIVE_EVICT_ENABLE="${WEIGHT_ACTIVE_EVICT_ENABLE:-0}"
 WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="${WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER:-0}"
+WEIGHT_EVICT_PROTECT_RECENT_STEPS="${WEIGHT_EVICT_PROTECT_RECENT_STEPS:-8}"
 WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE="${WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE:-0}"
 INIT_KV_MIN_BLOCKS="${INIT_KV_MIN_BLOCKS:-128}"
 INIT_WEIGHT_MAX_BYTES="${INIT_WEIGHT_MAX_BYTES:-8589934592}"
 INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="${INIT_WEIGHT_MAX_EXPERTS_PER_LAYER:-16}"
+INIT_WEIGHT_HOT_PREFETCH_ENABLE="${INIT_WEIGHT_HOT_PREFETCH_ENABLE:-0}"
+INIT_WEIGHT_HOT_PREFETCH_SYNC="${INIT_WEIGHT_HOT_PREFETCH_SYNC:-1}"
+INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES="${INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES:-0}"
+INIT_WEIGHT_HOT_PREFETCH_DEVICE="${INIT_WEIGHT_HOT_PREFETCH_DEVICE:--1}"
+INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE="${INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE:-0}"
+HOT_RESIDENCY_STAGE_TRACE_ENABLE="${HOT_RESIDENCY_STAGE_TRACE_ENABLE:-0}"
+HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS="${HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS:-1}"
+HOT_RESIDENCY_STAGE_DEVICE="${HOT_RESIDENCY_STAGE_DEVICE:--1}"
 RESET_COUNTERS="${RESET_COUNTERS:-1}"
 
 COORDINATOR_GLOBAL_BYTES_PER_STEP="${COORDINATOR_GLOBAL_BYTES_PER_STEP:-536870912}"
@@ -67,6 +87,7 @@ COORDINATOR_KV_BYTES_PER_STEP="${COORDINATOR_KV_BYTES_PER_STEP:-268435456}"
 COORDINATOR_WEIGHT_BYTES_PER_STEP="${COORDINATOR_WEIGHT_BYTES_PER_STEP:-268435456}"
 COORDINATOR_SCRATCH_BYTES_PER_STEP="${COORDINATOR_SCRATCH_BYTES_PER_STEP:-16777216}"
 COORDINATOR_PRIORITY="${COORDINATOR_PRIORITY:-kv,scratch,weights}"
+POOL_COORDINATOR_TRACE_ENABLE="${POOL_COORDINATOR_TRACE_ENABLE:-1}"
 
 SCRATCH_DEVICE_DIRECT_ENABLE="${SCRATCH_DEVICE_DIRECT_ENABLE:-1}"
 SCRATCH_POOL_ENABLE="${SCRATCH_POOL_ENABLE:-1}"
@@ -141,6 +162,16 @@ Runtime enforcement controls:
   --weight-plan-experts <n>              default: 128
   --weight-plan-file <path>              optional external prefetch/offload plan
   --weight-executor <mode>               cpp_batch|driver_batch|auto (default: cpp_batch)
+  --weight-prefetch-trace-enable <0|1>   write runtime weight prefetch JSONL
+  --weight-router-topk-every-n-steps <n> run router_topk prefetch every n MoE calls
+  --weight-prefetch-skip-resident <0|1>  skip already-GPU regions before coordinator
+  --weight-prefetch-expert-cache-enable <0|1>
+                                            skip roles for fully GPU-resident experts
+  --weight-prefetch-region-cooldown-steps <n>
+                                         avoid repeated prefetch for same region
+  --weight-prefetch-source <source>      router_topk|plan_intersection|oracle_replay
+  --oracle-expert-trace-file <path>      routing trace JSONL for oracle_replay
+  --oracle-prefetch-lookahead-steps <n>  per-layer replay lookahead
   --uvm-enable-builtin-tests <0|1>       keep UVM test ioctl enabled across
                                          counter-reset reloads (default: 0)
   --no-reset-counters                    do not reload nvidia_uvm between runs
@@ -151,6 +182,8 @@ Runtime enforcement controls:
   --weight-active-evict-enable <0|1>     evict non-active experts each step
   --weight-active-evict-max-experts-per-layer <n>
                                          cap non-active expert scan/offload
+  --weight-evict-protect-recent-steps <n>
+                                         protect recently active regions
   --weight-budget-cpu-offload-enable <0|1>
                                          default: 0
   --scratch-device-direct-enable <0|1>   full_impl scratch device-direct action
@@ -161,6 +194,7 @@ Runtime enforcement controls:
   --weight-runtime-prefetch-enable <0|1> full_impl runtime weight prefetch
   --init-weight-offload-enable <0|1>     full_impl init cold-weight offload
   --pool-coordinator-enable <0|1>        full_impl Stage K coordinator
+  --pool-coordinator-trace-enable <0|1>  write Stage K coordinator JSONL
   --pool-registry-enable <0|1>           full_impl pool registry
   --auto-gap-watch-enable <0|1>          auto gap-watch probe/main flow
   --fault-address-log-enable <0|1>       kernel per-fault address trace
@@ -205,15 +239,37 @@ while [ $# -gt 0 ]; do
     --weight-plan-experts) WEIGHT_PLAN_EXPERTS="$2"; shift 2 ;;
     --weight-plan-file) WEIGHT_PLAN_FILE="$2"; shift 2 ;;
     --weight-executor) WEIGHT_EXECUTOR="$2"; shift 2 ;;
+    --weight-prefetch-max-bytes-per-step) WEIGHT_PREFETCH_MAX_BYTES_PER_STEP="$2"; shift 2 ;;
+    --weight-prefetch-max-experts-per-layer) WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;;
+    --weight-prefetch-trace-enable) WEIGHT_PREFETCH_TRACE_ENABLE="$2"; shift 2 ;;
+    --weight-router-topk-every-n-steps) WEIGHT_ROUTER_TOPK_EVERY_N_STEPS="$2"; shift 2 ;;
+    --weight-prefetch-skip-resident) WEIGHT_PREFETCH_SKIP_RESIDENT="$2"; shift 2 ;;
+    --weight-prefetch-expert-cache-enable) WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE="$2"; shift 2 ;;
+    --weight-prefetch-region-cooldown-steps) WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS="$2"; shift 2 ;;
+    --weight-prefetch-source) WEIGHT_PREFETCH_SOURCE="$2"; shift 2 ;;
+    --oracle-expert-trace-file) ORACLE_EXPERT_TRACE_FILE="$2"; shift 2 ;;
+    --oracle-prefetch-lookahead-steps) ORACLE_PREFETCH_LOOKAHEAD_STEPS="$2"; shift 2 ;;
+    --weight-prefetch-hit-trace-enable) WEIGHT_PREFETCH_HIT_TRACE_ENABLE="$2"; shift 2 ;;
+    --weight-prefetch-hit-driver-query-enable) WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE="$2"; shift 2 ;;
+    --weight-prefetch-hit-max-regions-per-step) WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP="$2"; shift 2 ;;
     --uvm-enable-builtin-tests) UVM_ENABLE_BUILTIN_TESTS="$2"; shift 2 ;;
     --no-reset-counters) RESET_COUNTERS=0; shift ;;
     --init-kv-min-blocks) INIT_KV_MIN_BLOCKS="$2"; shift 2 ;;
     --init-weight-max-bytes) INIT_WEIGHT_MAX_BYTES="$2"; shift 2 ;;
     --init-weight-max-experts-per-layer) INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;;
+    --init-weight-hot-prefetch-enable) INIT_WEIGHT_HOT_PREFETCH_ENABLE="$2"; shift 2 ;;
+    --init-weight-hot-prefetch-sync) INIT_WEIGHT_HOT_PREFETCH_SYNC="$2"; shift 2 ;;
+    --init-weight-hot-prefetch-max-bytes) INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES="$2"; shift 2 ;;
+    --init-weight-hot-prefetch-device) INIT_WEIGHT_HOT_PREFETCH_DEVICE="$2"; shift 2 ;;
+    --init-weight-hot-prefetch-real-query-enable) INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE="$2"; shift 2 ;;
+    --hot-residency-stage-trace-enable) HOT_RESIDENCY_STAGE_TRACE_ENABLE="$2"; shift 2 ;;
+    --hot-residency-stage-max-num-tokens) HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS="$2"; shift 2 ;;
+    --hot-residency-stage-device) HOT_RESIDENCY_STAGE_DEVICE="$2"; shift 2 ;;
     --weight-max-victims-per-step) WEIGHT_MAX_VICTIMS_PER_STEP="$2"; shift 2 ;;
     --weight-victim-action) WEIGHT_VICTIM_ACTION="$2"; shift 2 ;;
     --weight-active-evict-enable) WEIGHT_ACTIVE_EVICT_ENABLE="$2"; shift 2 ;;
     --weight-active-evict-max-experts-per-layer) WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;;
+    --weight-evict-protect-recent-steps) WEIGHT_EVICT_PROTECT_RECENT_STEPS="$2"; shift 2 ;;
     --weight-budget-cpu-offload-enable) WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE="$2"; shift 2 ;;
     --scratch-device-direct-enable) SCRATCH_DEVICE_DIRECT_ENABLE="$2"; shift 2 ;;
     --scratch-pool-enable) SCRATCH_POOL_ENABLE="$2"; shift 2 ;;
@@ -223,6 +279,7 @@ while [ $# -gt 0 ]; do
     --weight-runtime-prefetch-enable) WEIGHT_RUNTIME_PREFETCH_ENABLE="$2"; shift 2 ;;
     --init-weight-offload-enable) INIT_WEIGHT_OFFLOAD_ENABLE="$2"; shift 2 ;;
     --pool-coordinator-enable) POOL_COORDINATOR_ENABLE="$2"; shift 2 ;;
+    --pool-coordinator-trace-enable) POOL_COORDINATOR_TRACE_ENABLE="$2"; shift 2 ;;
     --pool-registry-enable) POOL_REGISTRY_ENABLE="$2"; shift 2 ;;
     --auto-gap-watch-enable) AUTO_GAP_WATCH_ENABLE="$2"; shift 2 ;;
     --fault-address-log-enable) FAULT_ADDRESS_LOG_ENABLE="$2"; shift 2 ;;
@@ -265,6 +322,22 @@ if ! [[ "$WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]]; then
   echo "--weight-active-evict-max-experts-per-layer must be a non-negative integer" >&2
   exit 2
 fi
+if ! [[ "$WEIGHT_ROUTER_TOPK_EVERY_N_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "--weight-router-topk-every-n-steps must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "--weight-prefetch-region-cooldown-steps must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP" =~ ^[0-9]+$ ]]; then
+  echo "--weight-prefetch-hit-max-regions-per-step must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_EVICT_PROTECT_RECENT_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "--weight-evict-protect-recent-steps must be a non-negative integer" >&2
+  exit 2
+fi
 WEIGHT_EXECUTOR="${WEIGHT_EXECUTOR:-cpp_batch}"
 if ! [[ "$WEIGHT_EXECUTOR" =~ ^(cpp_batch|driver_batch|auto)$ ]]; then
   echo "--weight-executor must be cpp_batch, driver_batch, or auto" >&2
@@ -286,8 +359,18 @@ for item in \
   RESIDENCY_TRACE_ENABLE \
   KV_RUNTIME_ENABLE \
   WEIGHT_RUNTIME_PREFETCH_ENABLE \
+  WEIGHT_PREFETCH_TRACE_ENABLE \
+  WEIGHT_PREFETCH_SKIP_RESIDENT \
+  WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE \
+  WEIGHT_PREFETCH_HIT_TRACE_ENABLE \
+  WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE \
   INIT_WEIGHT_OFFLOAD_ENABLE \
+  INIT_WEIGHT_HOT_PREFETCH_ENABLE \
+  INIT_WEIGHT_HOT_PREFETCH_SYNC \
+  INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE \
+  HOT_RESIDENCY_STAGE_TRACE_ENABLE \
   POOL_COORDINATOR_ENABLE \
+  POOL_COORDINATOR_TRACE_ENABLE \
   POOL_REGISTRY_ENABLE \
   AUTO_GAP_WATCH_ENABLE \
   FAULT_ADDRESS_LOG_ENABLE; do
@@ -298,6 +381,14 @@ for item in \
 done
 if [ "$AUTO_GAP_WATCH_ENABLE" = "1" ] && [ "$FAULT_ADDRESS_LOG_ENABLE" = "0" ]; then
   echo "--auto-gap-watch-enable=1 requires --fault-address-log-enable=1" >&2
+  exit 2
+fi
+if ! [[ "$INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES" =~ ^[0-9]+$ ]]; then
+  echo "INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$INIT_WEIGHT_HOT_PREFETCH_DEVICE" =~ ^-?[0-9]+$ ]]; then
+  echo "INIT_WEIGHT_HOT_PREFETCH_DEVICE must be an integer" >&2
   exit 2
 fi
 
@@ -345,6 +436,18 @@ echo " weight_max_victims_per_step: $WEIGHT_MAX_VICTIMS_PER_STEP"
 echo " weight_victim_action: $WEIGHT_VICTIM_ACTION"
 echo " weight_active_evict_enable: $WEIGHT_ACTIVE_EVICT_ENABLE"
 echo " weight_active_evict_max_experts_per_layer: $WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER"
+echo " weight_prefetch_trace_enable: $WEIGHT_PREFETCH_TRACE_ENABLE"
+echo " weight_router_topk_every_n_steps: $WEIGHT_ROUTER_TOPK_EVERY_N_STEPS"
+echo " weight_prefetch_skip_resident: $WEIGHT_PREFETCH_SKIP_RESIDENT"
+echo " weight_prefetch_expert_cache_enable: $WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE"
+echo " weight_prefetch_region_cooldown_steps: $WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS"
+echo " weight_prefetch_source: $WEIGHT_PREFETCH_SOURCE"
+echo " oracle_expert_trace_file: ${ORACLE_EXPERT_TRACE_FILE:-<none>}"
+echo " oracle_prefetch_lookahead_steps: $ORACLE_PREFETCH_LOOKAHEAD_STEPS"
+echo " weight_prefetch_hit_trace_enable: $WEIGHT_PREFETCH_HIT_TRACE_ENABLE"
+echo " weight_prefetch_hit_driver_query_enable: $WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE"
+echo " weight_prefetch_hit_max_regions_per_step: $WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP"
+echo " weight_evict_protect_recent_steps: $WEIGHT_EVICT_PROTECT_RECENT_STEPS"
 echo " weight_budget_cpu_offload_enable: $WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE"
 echo " weight_batch_executor_enable: ${WEIGHT_BATCH_EXECUTOR_ENABLE:-1}"
 echo " weight_executor: $WEIGHT_EXECUTOR"
@@ -353,6 +456,14 @@ echo " reset_counters: $RESET_COUNTERS"
 echo " init_kv_min_blocks: $INIT_KV_MIN_BLOCKS"
 echo " init_weight_max_bytes: $INIT_WEIGHT_MAX_BYTES"
 echo " init_weight_max_experts_per_layer: $INIT_WEIGHT_MAX_EXPERTS_PER_LAYER"
+echo " init_weight_hot_prefetch_enable: $INIT_WEIGHT_HOT_PREFETCH_ENABLE"
+echo " init_weight_hot_prefetch_sync: $INIT_WEIGHT_HOT_PREFETCH_SYNC"
+echo " init_weight_hot_prefetch_max_bytes: $INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES"
+echo " init_weight_hot_prefetch_device: $INIT_WEIGHT_HOT_PREFETCH_DEVICE"
+echo " init_weight_hot_prefetch_real_query_enable: $INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE"
+echo " hot_residency_stage_trace_enable: $HOT_RESIDENCY_STAGE_TRACE_ENABLE"
+echo " hot_residency_stage_max_num_tokens: $HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS"
+echo " hot_residency_stage_device: $HOT_RESIDENCY_STAGE_DEVICE"
 echo " scratch_device_direct_enable: $SCRATCH_DEVICE_DIRECT_ENABLE"
 echo " scratch_pool_enable: $SCRATCH_POOL_ENABLE"
 echo " residency_enable: $RESIDENCY_ENABLE"
@@ -361,6 +472,7 @@ echo " kv_runtime_enable: $KV_RUNTIME_ENABLE"
 echo " weight_runtime_prefetch_enable: $WEIGHT_RUNTIME_PREFETCH_ENABLE"
 echo " init_weight_offload_enable: $INIT_WEIGHT_OFFLOAD_ENABLE"
 echo " pool_coordinator_enable: $POOL_COORDINATOR_ENABLE"
+echo " pool_coordinator_trace_enable: $POOL_COORDINATOR_TRACE_ENABLE"
 echo " pool_registry_enable: $POOL_REGISTRY_ENABLE"
 echo " auto_gap_watch_enable: $AUTO_GAP_WATCH_ENABLE"
 echo " fault_address_log_enable: $FAULT_ADDRESS_LOG_ENABLE"
@@ -542,10 +654,20 @@ run_one() {
         --uvm-kv-runtime-prefix-evict-enable 0
         --uvm-weight-prefetch-enable "$WEIGHT_RUNTIME_PREFETCH_ENABLE"
         --uvm-weight-prefetch-mode prefetch
+        --uvm-weight-prefetch-trace-enable "$WEIGHT_PREFETCH_TRACE_ENABLE"
+        --uvm-weight-router-topk-every-n-steps "$WEIGHT_ROUTER_TOPK_EVERY_N_STEPS"
+        --uvm-weight-prefetch-skip-resident "$WEIGHT_PREFETCH_SKIP_RESIDENT"
+        --uvm-weight-prefetch-expert-cache-enable "$WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE"
+        --uvm-weight-prefetch-region-cooldown-steps "$WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS"
         --uvm-weight-prefetch-trace-file "$run_dir/vllm_uvm_weight_prefetch_${label}.jsonl"
         --uvm-weight-prefetch-plan-file "$plan_json"
         --uvm-weight-prefetch-require-plan 0
-        --uvm-weight-prefetch-source router_topk
+        --uvm-weight-prefetch-source "$WEIGHT_PREFETCH_SOURCE"
+        --uvm-oracle-expert-trace-file "$ORACLE_EXPERT_TRACE_FILE"
+        --uvm-oracle-prefetch-lookahead-steps "$ORACLE_PREFETCH_LOOKAHEAD_STEPS"
+        --uvm-weight-prefetch-hit-trace-enable "$WEIGHT_PREFETCH_HIT_TRACE_ENABLE"
+        --uvm-weight-prefetch-hit-driver-query-enable "$WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE"
+        --uvm-weight-prefetch-hit-max-regions-per-step "$WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP"
         --uvm-weight-batch-executor-enable "${WEIGHT_BATCH_EXECUTOR_ENABLE:-1}"
         --uvm-weight-executor "$WEIGHT_EXECUTOR"
         --uvm-weight-prefetch-max-bytes-per-step "$WEIGHT_PREFETCH_MAX_BYTES_PER_STEP"
@@ -569,6 +691,14 @@ run_one() {
         --uvm-init-weight-max-bytes "$INIT_WEIGHT_MAX_BYTES"
         --uvm-init-weight-max-experts-per-layer "$INIT_WEIGHT_MAX_EXPERTS_PER_LAYER"
         --uvm-init-weight-sync 1
+        --uvm-init-weight-hot-prefetch-enable "$INIT_WEIGHT_HOT_PREFETCH_ENABLE"
+        --uvm-init-weight-hot-prefetch-sync "$INIT_WEIGHT_HOT_PREFETCH_SYNC"
+        --uvm-init-weight-hot-prefetch-max-bytes "$INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES"
+        --uvm-init-weight-hot-prefetch-device "$INIT_WEIGHT_HOT_PREFETCH_DEVICE"
+        --uvm-init-weight-hot-prefetch-real-query-enable "$INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE"
+        --uvm-hot-residency-stage-trace-enable "$HOT_RESIDENCY_STAGE_TRACE_ENABLE"
+        --uvm-hot-residency-stage-max-num-tokens "$HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS"
+        --uvm-hot-residency-stage-device "$HOT_RESIDENCY_STAGE_DEVICE"
         --uvm-init-weight-require-routing-plan "$require_routing_plan"
         --uvm-init-weight-trace-file "$run_dir/vllm_uvm_init_weight_offload_${label}.jsonl"
         --uvm-residency-weight-initial-state gpu
@@ -579,6 +709,7 @@ run_one() {
         --uvm-residency-weight-victim-action "$WEIGHT_VICTIM_ACTION"
         --uvm-residency-weight-active-evict-enable "$WEIGHT_ACTIVE_EVICT_ENABLE"
         --uvm-residency-weight-active-evict-max-experts-per-layer "$WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER"
+        --uvm-residency-weight-evict-protect-recent-steps "$WEIGHT_EVICT_PROTECT_RECENT_STEPS"
         --uvm-weight-budget-cpu-offload-enable "$WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE"
         --uvm-pool-registry-enable "$POOL_REGISTRY_ENABLE"
         --uvm-scratch-pool-enable "$SCRATCH_POOL_ENABLE"
@@ -587,6 +718,7 @@ run_one() {
         --uvm-scratch-pool-target-phases "$SCRATCH_TARGET_PHASES"
         --uvm-pool-coordinator-enable "$POOL_COORDINATOR_ENABLE"
         --uvm-pool-coordinator-mode enforce
+        --uvm-pool-coordinator-trace-enable "$POOL_COORDINATOR_TRACE_ENABLE"
         --uvm-pool-coordinator-trace-file "$run_dir/vllm_uvm_pool_coordinator_${label}.jsonl"
         --uvm-pool-coordinator-global-bytes-per-step "$COORDINATOR_GLOBAL_BYTES_PER_STEP"
         --uvm-pool-coordinator-kv-bytes-per-step "$COORDINATOR_KV_BYTES_PER_STEP"
@@ -776,7 +908,11 @@ for run_dir in sorted(runs_dir.glob("*_rep*")):
     residency_counts = count_actions(read_jsonl(residency_path)) if residency_path else {}
     residency_records = read_jsonl(residency_path) if residency_path else []
     runtime_counts = count_actions(read_jsonl(runtime_path)) if runtime_path else {}
-    weight_counts = count_actions(read_jsonl(weight_path)) if weight_path else {}
+    weight_records = read_jsonl(weight_path) if weight_path else []
+    weight_counts = count_actions(weight_records)
+    weight_step_summaries = [
+        item for item in weight_records if item.get("action") == "step_summary"
+    ]
     init_kv_records = read_jsonl(init_kv_path) if init_kv_path else []
     init_weight_records = read_jsonl(init_weight_path) if init_weight_path else []
     init_weight_counts = count_actions(init_weight_records)
@@ -815,6 +951,15 @@ for run_dir in sorted(runs_dir.glob("*_rep*")):
         "device_direct_eligible_records": metrics.get("device_direct_eligible_records"),
         "device_direct_budget_reject_records": metrics.get("device_direct_budget_reject_records"),
         "device_direct_peak_live_bytes": metrics.get("device_direct_peak_live_bytes_observed"),
+        "scratch_pool_enabled": metrics.get("scratch_pool_enabled"),
+        "scratch_pool_mode": metrics.get("scratch_pool_mode"),
+        "scratch_pool_trace_records": metrics.get("scratch_pool_trace_records"),
+        "scratch_pool_eligible_records": metrics.get("scratch_pool_eligible_records"),
+        "scratch_pool_device_direct_records": metrics.get("scratch_pool_device_direct_records"),
+        "scratch_pool_budget_over_records": metrics.get("scratch_pool_budget_over_records"),
+        "scratch_pool_budget_reject_records": metrics.get("scratch_pool_budget_reject_records"),
+        "scratch_pool_live_bytes": metrics.get("scratch_pool_live_bytes"),
+        "scratch_pool_peak_live_bytes": metrics.get("scratch_pool_peak_live_bytes"),
         "kv_live_bytes": metrics.get("kv_live_bytes"),
         "kv_peak_live_bytes": metrics.get("kv_peak_live_bytes_observed"),
         "weight_live_bytes": metrics.get("weight_live_bytes"),
@@ -827,6 +972,38 @@ for run_dir in sorted(runs_dir.glob("*_rep*")):
         "residency_weight_victim_offload_issued": residency_counts.get("residency_weight_victim_offload_issued", 0),
         "weight_prefetch_issued": weight_counts.get("prefetch_issued", 0),
         "weight_offload_prefetch_cpu_issued": weight_counts.get("offload_prefetch_cpu_issued", 0),
+        "weight_prefetch_candidate_experts": sum(int(item.get("candidate_expert_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_expert_resident_skip": sum(int(item.get("expert_resident_skip_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_expert_expanded": sum(int(item.get("expert_expanded_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_candidate_regions": sum(int(item.get("candidate_region_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_resident_skip": sum(int(item.get("resident_skip_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_cooldown_skip": sum(int(item.get("cooldown_skip_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_cpu_unknown_regions": sum(int(item.get("cpu_unknown_region_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_active_region_id_builds": sum(int(item.get("active_region_ids_build_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_cold_candidate_register_calls": sum(int(item.get("cold_candidate_register_calls") or 0) for item in weight_step_summaries),
+        "weight_prefetch_reaccess_after_evict": sum(int(item.get("reaccess_after_evict_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_access_probe_records": sum(int(item.get("prefetch_access_probe_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_access_active_experts": sum(int(item.get("prefetch_access_active_expert_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_access_regions": sum(int(item.get("prefetch_access_region_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_before_access_candidates": sum(int(item.get("prefetch_before_access_candidate_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_hit_before_access_estimated": sum(int(item.get("prefetch_hit_before_access_estimated_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_miss_before_access_estimated": sum(int(item.get("prefetch_miss_before_access_estimated_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_same_step_access": sum(int(item.get("prefetch_same_step_access_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_access_no_prior_prefetch": sum(int(item.get("prefetch_access_no_prior_prefetch_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_hit_step_lag_sum": sum(int(item.get("prefetch_hit_step_lag_sum") or 0) for item in weight_step_summaries),
+        "weight_prefetch_hit_step_lag_max": max([int(item.get("prefetch_hit_step_lag_max") or 0) for item in weight_step_summaries] or [0]),
+        "weight_prefetch_hit_before_access_real_query_records": sum(int(item.get("prefetch_hit_before_access_real_query_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_hit_before_access_real_query_ranges": sum(int(item.get("prefetch_hit_before_access_real_query_ranges") or 0) for item in weight_step_summaries),
+        "weight_prefetch_hit_before_access_real_queried_bytes": sum(int(item.get("prefetch_hit_before_access_real_queried_bytes") or 0) for item in weight_step_summaries),
+        "weight_prefetch_hit_before_access_real_gpu_bytes": sum(int(item.get("prefetch_hit_before_access_real_gpu_bytes") or 0) for item in weight_step_summaries),
+        "weight_prefetch_hit_before_access_real_cpu_bytes": sum(int(item.get("prefetch_hit_before_access_real_cpu_bytes") or 0) for item in weight_step_summaries),
+        "weight_prefetch_hit_before_access_real_unknown_bytes": sum(int(item.get("prefetch_hit_before_access_real_unknown_bytes") or 0) for item in weight_step_summaries),
+        "weight_prefetch_oracle_replay_records": sum(int(item.get("oracle_replay_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_oracle_match_records": sum(int(item.get("oracle_match_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_oracle_mismatch_records": sum(int(item.get("oracle_mismatch_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_oracle_trace_missing_records": sum(int(item.get("oracle_trace_missing_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_oracle_future_missing_records": sum(int(item.get("oracle_future_missing_records") or 0) for item in weight_step_summaries),
+        "weight_prefetch_oracle_candidate_experts": sum(int(item.get("oracle_candidate_expert_records") or 0) for item in weight_step_summaries),
         "init_kv_sizing_records": len(init_kv_records),
         "init_kv_applied_worker0": init_kv_worker0.get("applied"),
         "init_kv_original_bytes_worker0": init_kv_worker0.get("original_bytes"),
@@ -839,10 +1016,44 @@ for run_dir in sorted(runs_dir.glob("*_rep*")):
             init_weight_counts.get("init_weight_offload_prefetch_cpu_issued", 0)
             + init_weight_counts.get("init_weight_offload_offload_cpu_issued", 0)
         ),
+        "init_weight_hot_prefetch_issued": init_weight_counts.get("init_weight_hot_prefetch_issued", 0),
+        "init_weight_hot_prefetch_skipped": init_weight_counts.get("init_weight_hot_prefetch_skipped", 0),
+        "init_weight_hot_prefetch_budget_reject": init_weight_counts.get("init_weight_hot_prefetch_budget_reject", 0),
+        "init_weight_hot_prefetch_summary_issued_records": sum(int(item.get("hot_prefetch_issued_records") or 0) for item in init_weight_records if item.get("action") == "init_weight_offload_summary"),
+        "init_weight_hot_prefetch_summary_issued_bytes": sum(int(item.get("hot_prefetch_issued_bytes") or 0) for item in init_weight_records if item.get("action") == "init_weight_offload_summary"),
+        "init_weight_hot_prefetch_real_query_records": sum(int(item.get("hot_prefetch_real_query_records") or 0) for item in init_weight_records if item.get("action") == "init_weight_offload_summary"),
+        "init_weight_hot_prefetch_real_query_ranges": sum(int(item.get("hot_prefetch_real_query_ranges") or 0) for item in init_weight_records if item.get("action") == "init_weight_offload_summary"),
+        "init_weight_hot_prefetch_real_queried_bytes": sum(int(item.get("hot_prefetch_real_queried_bytes") or 0) for item in init_weight_records if item.get("action") == "init_weight_offload_summary"),
+        "init_weight_hot_prefetch_real_gpu_bytes": sum(int(item.get("hot_prefetch_real_gpu_bytes") or 0) for item in init_weight_records if item.get("action") == "init_weight_offload_summary"),
+        "init_weight_hot_prefetch_real_cpu_bytes": sum(int(item.get("hot_prefetch_real_cpu_bytes") or 0) for item in init_weight_records if item.get("action") == "init_weight_offload_summary"),
+        "init_weight_hot_prefetch_real_unknown_bytes": sum(int(item.get("hot_prefetch_real_unknown_bytes") or 0) for item in init_weight_records if item.get("action") == "init_weight_offload_summary"),
+        "init_weight_hot_registered_records": sum(int(item.get("hot_registered_records") or 0) for item in init_weight_records if item.get("action") == "init_weight_offload_summary"),
         "init_weight_offload_advise_cpu_issued": init_weight_counts.get("init_weight_offload_advise_cpu_issued", 0),
         "init_weight_offload_budget_reject": init_weight_counts.get("init_weight_offload_budget_reject", 0),
         "coordinator_records": sum(coord_counts.values()),
     }
+    before_access_candidates = row["weight_prefetch_before_access_candidates"]
+    if before_access_candidates:
+        row["weight_prefetch_hit_before_access_estimated_rate"] = (
+            row["weight_prefetch_hit_before_access_estimated"]
+            / before_access_candidates
+        )
+        row["weight_prefetch_hit_step_lag_avg"] = (
+            row["weight_prefetch_hit_step_lag_sum"]
+            / before_access_candidates
+        )
+    real_queried_bytes = row["weight_prefetch_hit_before_access_real_queried_bytes"]
+    if real_queried_bytes:
+        row["weight_prefetch_hit_before_access_real_gpu_ratio"] = (
+            row["weight_prefetch_hit_before_access_real_gpu_bytes"]
+            / real_queried_bytes
+        )
+    init_hot_real_queried_bytes = row["init_weight_hot_prefetch_real_queried_bytes"]
+    if init_hot_real_queried_bytes:
+        row["init_weight_hot_prefetch_real_gpu_ratio"] = (
+            row["init_weight_hot_prefetch_real_gpu_bytes"]
+            / init_hot_real_queried_bytes
+        )
     rows.append(row)
 
 # Parse fault deltas from the top-level shell log. Because run_kv_fault_ratio
@@ -903,6 +1114,10 @@ for variant, items in by_variant.items():
         "post_unknown_faults_median": median([item.get("post_unknown_faults") for item in items]),
         "post_gap_faults_median": median([item.get("post_gap_faults") for item in items]),
         "device_direct_actual_records_median": median([item.get("device_direct_actual_records") for item in items]),
+        "scratch_pool_eligible_records_median": median([item.get("scratch_pool_eligible_records") for item in items]),
+        "scratch_pool_device_direct_records_median": median([item.get("scratch_pool_device_direct_records") for item in items]),
+        "scratch_pool_budget_reject_records_median": median([item.get("scratch_pool_budget_reject_records") for item in items]),
+        "scratch_pool_peak_live_bytes_median": median([item.get("scratch_pool_peak_live_bytes") for item in items]),
         "kv_peak_live_bytes_median": median([item.get("kv_peak_live_bytes") for item in items]),
         "weight_peak_live_bytes_median": median([item.get("weight_peak_live_bytes") for item in items]),
         "residency_weight_estimated_gpu_bytes_median": median([item.get("residency_weight_estimated_gpu_bytes") for item in items]),
@@ -915,6 +1130,36 @@ for variant, items in by_variant.items():
         "init_weight_offload_prefetch_cpu_issued_median": median([item.get("init_weight_offload_prefetch_cpu_issued") for item in items]),
         "init_weight_offload_offload_cpu_issued_median": median([item.get("init_weight_offload_offload_cpu_issued") for item in items]),
         "init_weight_offload_cpu_issued_total_median": median([item.get("init_weight_offload_cpu_issued_total") for item in items]),
+        "init_weight_hot_prefetch_issued_median": median([item.get("init_weight_hot_prefetch_issued") for item in items]),
+        "init_weight_hot_prefetch_summary_issued_records_median": median([item.get("init_weight_hot_prefetch_summary_issued_records") for item in items]),
+        "init_weight_hot_prefetch_summary_issued_bytes_median": median([item.get("init_weight_hot_prefetch_summary_issued_bytes") for item in items]),
+        "init_weight_hot_prefetch_real_query_records_median": median([item.get("init_weight_hot_prefetch_real_query_records") for item in items]),
+        "init_weight_hot_prefetch_real_query_ranges_median": median([item.get("init_weight_hot_prefetch_real_query_ranges") for item in items]),
+        "init_weight_hot_prefetch_real_queried_bytes_median": median([item.get("init_weight_hot_prefetch_real_queried_bytes") for item in items]),
+        "init_weight_hot_prefetch_real_gpu_bytes_median": median([item.get("init_weight_hot_prefetch_real_gpu_bytes") for item in items]),
+        "init_weight_hot_prefetch_real_gpu_ratio_median": median([item.get("init_weight_hot_prefetch_real_gpu_ratio") for item in items]),
+        "init_weight_hot_registered_records_median": median([item.get("init_weight_hot_registered_records") for item in items]),
+        "weight_prefetch_issued_median": median([item.get("weight_prefetch_issued") for item in items]),
+        "weight_prefetch_candidate_regions_median": median([item.get("weight_prefetch_candidate_regions") for item in items]),
+        "weight_prefetch_access_probe_records_median": median([item.get("weight_prefetch_access_probe_records") for item in items]),
+        "weight_prefetch_before_access_candidates_median": median([item.get("weight_prefetch_before_access_candidates") for item in items]),
+        "weight_prefetch_hit_before_access_estimated_median": median([item.get("weight_prefetch_hit_before_access_estimated") for item in items]),
+        "weight_prefetch_miss_before_access_estimated_median": median([item.get("weight_prefetch_miss_before_access_estimated") for item in items]),
+        "weight_prefetch_hit_before_access_estimated_rate_median": median([item.get("weight_prefetch_hit_before_access_estimated_rate") for item in items]),
+        "weight_prefetch_same_step_access_median": median([item.get("weight_prefetch_same_step_access") for item in items]),
+        "weight_prefetch_access_no_prior_prefetch_median": median([item.get("weight_prefetch_access_no_prior_prefetch") for item in items]),
+        "weight_prefetch_hit_step_lag_avg_median": median([item.get("weight_prefetch_hit_step_lag_avg") for item in items]),
+        "weight_prefetch_hit_before_access_real_query_records_median": median([item.get("weight_prefetch_hit_before_access_real_query_records") for item in items]),
+        "weight_prefetch_hit_before_access_real_query_ranges_median": median([item.get("weight_prefetch_hit_before_access_real_query_ranges") for item in items]),
+        "weight_prefetch_hit_before_access_real_queried_bytes_median": median([item.get("weight_prefetch_hit_before_access_real_queried_bytes") for item in items]),
+        "weight_prefetch_hit_before_access_real_gpu_bytes_median": median([item.get("weight_prefetch_hit_before_access_real_gpu_bytes") for item in items]),
+        "weight_prefetch_hit_before_access_real_gpu_ratio_median": median([item.get("weight_prefetch_hit_before_access_real_gpu_ratio") for item in items]),
+        "weight_prefetch_oracle_replay_records_median": median([item.get("weight_prefetch_oracle_replay_records") for item in items]),
+        "weight_prefetch_oracle_match_records_median": median([item.get("weight_prefetch_oracle_match_records") for item in items]),
+        "weight_prefetch_oracle_mismatch_records_median": median([item.get("weight_prefetch_oracle_mismatch_records") for item in items]),
+        "weight_prefetch_oracle_trace_missing_records_median": median([item.get("weight_prefetch_oracle_trace_missing_records") for item in items]),
+        "weight_prefetch_oracle_future_missing_records_median": median([item.get("weight_prefetch_oracle_future_missing_records") for item in items]),
+        "weight_prefetch_oracle_candidate_experts_median": median([item.get("weight_prefetch_oracle_candidate_experts") for item in items]),
     }
 
 def pct(new, old):

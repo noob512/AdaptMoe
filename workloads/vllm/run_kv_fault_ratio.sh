@@ -79,14 +79,24 @@ UVM_MOE_ROUTING_TRACE_ENABLE="${VLLM_UVM_MOE_ROUTING_TRACE_ENABLE:-0}"
 UVM_MOE_ROUTING_TRACE_FILE="${VLLM_UVM_MOE_ROUTING_TRACE_FILE:-}"
 UVM_WEIGHT_PREFETCH_ENABLE="${VLLM_UVM_WEIGHT_PREFETCH_ENABLE:-0}"
 UVM_WEIGHT_PREFETCH_MODE="${VLLM_UVM_WEIGHT_PREFETCH_MODE:-trace_only}"
+UVM_WEIGHT_PREFETCH_TRACE_ENABLE="${VLLM_UVM_WEIGHT_PREFETCH_TRACE_ENABLE:-1}"
 UVM_WEIGHT_PREFETCH_TRACE_FILE="${VLLM_UVM_WEIGHT_PREFETCH_TRACE_FILE:-}"
 UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP="${VLLM_UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP:-67108864}"
 UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER="${VLLM_UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER:-2}"
+UVM_WEIGHT_PREFETCH_SKIP_RESIDENT="${VLLM_UVM_WEIGHT_PREFETCH_SKIP_RESIDENT:-1}"
+UVM_WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE="${VLLM_UVM_WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE:-1}"
+UVM_WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS="${VLLM_UVM_WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS:-8}"
+UVM_WEIGHT_ROUTER_TOPK_EVERY_N_STEPS="${VLLM_UVM_WEIGHT_ROUTER_TOPK_EVERY_N_STEPS:-1}"
 UVM_WEIGHT_PREFETCH_TARGET_ROLES="${VLLM_UVM_WEIGHT_PREFETCH_TARGET_ROLES:-moe_gate_up,moe_down}"
 UVM_WEIGHT_PREFETCH_DEVICE="${VLLM_UVM_WEIGHT_PREFETCH_DEVICE:--1}"
 UVM_WEIGHT_PREFETCH_PLAN_FILE="${VLLM_UVM_WEIGHT_PREFETCH_PLAN_FILE:-}"
 UVM_WEIGHT_PREFETCH_REQUIRE_PLAN="${VLLM_UVM_WEIGHT_PREFETCH_REQUIRE_PLAN:-0}"
 UVM_WEIGHT_PREFETCH_SOURCE="${VLLM_UVM_WEIGHT_PREFETCH_SOURCE:-router_topk}"
+UVM_ORACLE_EXPERT_TRACE_FILE="${VLLM_UVM_ORACLE_EXPERT_TRACE_FILE:-}"
+UVM_ORACLE_PREFETCH_LOOKAHEAD_STEPS="${VLLM_UVM_ORACLE_PREFETCH_LOOKAHEAD_STEPS:-1}"
+UVM_WEIGHT_PREFETCH_HIT_TRACE_ENABLE="${VLLM_UVM_WEIGHT_PREFETCH_HIT_TRACE_ENABLE:-0}"
+UVM_WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE="${VLLM_UVM_WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE:-0}"
+UVM_WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP="${VLLM_UVM_WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP:-64}"
 UVM_WEIGHT_BATCH_EXECUTOR_ENABLE="${VLLM_UVM_WEIGHT_BATCH_EXECUTOR_ENABLE:-1}"
 UVM_WEIGHT_EXECUTOR="${VLLM_UVM_WEIGHT_EXECUTOR:-cpp_batch}"
 UVM_WEIGHT_OFFLOAD_ENABLE="${VLLM_UVM_WEIGHT_OFFLOAD_ENABLE:-0}"
@@ -108,10 +118,19 @@ UVM_INIT_WEIGHT_TARGET_ROLES="${VLLM_UVM_INIT_WEIGHT_TARGET_ROLES:-moe_gate_up,m
 UVM_INIT_WEIGHT_MAX_BYTES="${VLLM_UVM_INIT_WEIGHT_MAX_BYTES:-0}"
 UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="${VLLM_UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER:-0}"
 UVM_INIT_WEIGHT_SYNC="${VLLM_UVM_INIT_WEIGHT_SYNC:-1}"
+UVM_INIT_WEIGHT_HOT_PREFETCH_ENABLE="${VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_ENABLE:-0}"
+UVM_INIT_WEIGHT_HOT_PREFETCH_SYNC="${VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_SYNC:-1}"
+UVM_INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES="${VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES:-0}"
+UVM_INIT_WEIGHT_HOT_PREFETCH_DEVICE="${VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_DEVICE:--1}"
+UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE="${VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE:-0}"
+UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE="${VLLM_UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE:-0}"
+UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS="${VLLM_UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS:-1}"
+UVM_HOT_RESIDENCY_STAGE_DEVICE="${VLLM_UVM_HOT_RESIDENCY_STAGE_DEVICE:--1}"
 UVM_INIT_WEIGHT_TRACE_FILE="${VLLM_UVM_INIT_WEIGHT_TRACE_FILE:-}"
 UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN="${VLLM_UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN:-0}"
 UVM_POOL_COORDINATOR_ENABLE="${VLLM_UVM_POOL_COORDINATOR_ENABLE:-0}"
 UVM_POOL_COORDINATOR_MODE="${VLLM_UVM_POOL_COORDINATOR_MODE:-trace_only}"
+UVM_POOL_COORDINATOR_TRACE_ENABLE="${VLLM_UVM_POOL_COORDINATOR_TRACE_ENABLE:-1}"
 UVM_POOL_COORDINATOR_TRACE_FILE="${VLLM_UVM_POOL_COORDINATOR_TRACE_FILE:-}"
 UVM_POOL_COORDINATOR_GLOBAL_BYTES_PER_STEP="${VLLM_UVM_POOL_COORDINATOR_GLOBAL_BYTES_PER_STEP:-0}"
 UVM_POOL_COORDINATOR_WEIGHT_BYTES_PER_STEP="${VLLM_UVM_POOL_COORDINATOR_WEIGHT_BYTES_PER_STEP:-0}"
@@ -150,6 +169,7 @@ UVM_RESIDENCY_WEIGHT_VICTIM_POLICY="${VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_POLICY:-c
 UVM_RESIDENCY_WEIGHT_VICTIM_ACTION="${VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_ACTION:-offload_cpu}"
 UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE="${VLLM_UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE:-0}"
 UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="${VLLM_UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER:-0}"
+UVM_RESIDENCY_WEIGHT_EVICT_PROTECT_RECENT_STEPS="${VLLM_UVM_RESIDENCY_WEIGHT_EVICT_PROTECT_RECENT_STEPS:-8}"
 UVM_REAL_RESIDENCY_ENABLE="${VLLM_UVM_REAL_RESIDENCY_ENABLE:-0}"
 UVM_REAL_RESIDENCY_TRACE_FILE="${VLLM_UVM_REAL_RESIDENCY_TRACE_FILE:-}"
 UVM_REAL_RESIDENCY_DEVICE="${VLLM_UVM_REAL_RESIDENCY_DEVICE:-0}"
@@ -328,12 +348,22 @@ Options:
   --uvm-weight-prefetch-mode <mode>
                              Stage I mode: trace_only|prefetch. prefetch issues
                              cudaMemPrefetchAsync on active expert weight slices.
+  --uvm-weight-prefetch-trace-enable <0|1>
+                             Stage I prefetch JSONL trace gate.
   --uvm-weight-prefetch-trace-file <path>
                              Stage I expert prefetch JSONL trace path
   --uvm-weight-prefetch-max-bytes-per-step <n>
                              Max expert weight bytes prefetched per MoE layer call
   --uvm-weight-prefetch-max-experts-per-layer <n>
                              Max active experts considered per MoE layer call
+  --uvm-weight-prefetch-skip-resident <0|1>
+                             Skip coordinator/driver calls for already-GPU regions
+  --uvm-weight-prefetch-expert-cache-enable <0|1>
+                             Skip all roles for experts cached as fully GPU-resident
+  --uvm-weight-prefetch-region-cooldown-steps <n>
+                             Skip repeated prefetch of same region for N MoE steps
+  --uvm-weight-router-topk-every-n-steps <n>
+                             Run router_topk prefetch/offload only every n MoE calls
   --uvm-weight-prefetch-target-roles <csv>
                              Expert weight roles to prefetch (default: moe_gate_up,moe_down)
   --uvm-weight-prefetch-device <n>
@@ -344,6 +374,12 @@ Options:
   --uvm-weight-prefetch-require-plan <0|1>
                              Require a Stage H prefetch plan before issuing
                              active-expert prefetch actions (default: 0).
+  --uvm-weight-prefetch-source <source>
+                             router_topk|plan_intersection|oracle_replay.
+  --uvm-oracle-expert-trace-file <path>
+                             Routing trace JSONL used when source=oracle_replay.
+  --uvm-oracle-prefetch-lookahead-steps <n>
+                             Per-layer replay lookahead for oracle_replay.
   --uvm-weight-executor <mode>
                              Stage M/F weight action executor:
                              cpp_batch|driver_batch|auto (default: cpp_batch).
@@ -366,6 +402,8 @@ Options:
   --uvm-pool-coordinator-mode <mode>
                              Stage K mode: trace_only|enforce. trace_only
                              records would-deny but does not skip actions.
+  --uvm-pool-coordinator-trace-enable <0|1>
+                             Stage K coordinator JSONL trace gate.
   --uvm-pool-coordinator-trace-file <path>
                              Stage K unified coordinator JSONL trace path.
   --uvm-pool-coordinator-global-bytes-per-step <n>
@@ -449,6 +487,8 @@ Options:
                              L2 weight victim policy label.
   --uvm-residency-weight-victim-action <mode>
                              L2 victim action: advise_cpu|prefetch_cpu|offload_cpu.
+  --uvm-residency-weight-evict-protect-recent-steps <n>
+                             Protect recently active weight regions from eviction.
   --uvm-pool-registry-enable <0|1>
                              Stage F unified pool registry telemetry.
                              Records kv_cache/weights/runtime_scratch objects
@@ -693,14 +733,24 @@ start_server() {
                 VLLM_UVM_MOE_ROUTING_TRACE_FILE='$UVM_MOE_ROUTING_TRACE_FILE' \
                 VLLM_UVM_WEIGHT_PREFETCH_ENABLE='$UVM_WEIGHT_PREFETCH_ENABLE' \
                 VLLM_UVM_WEIGHT_PREFETCH_MODE='$UVM_WEIGHT_PREFETCH_MODE' \
+                VLLM_UVM_WEIGHT_PREFETCH_TRACE_ENABLE='$UVM_WEIGHT_PREFETCH_TRACE_ENABLE' \
                 VLLM_UVM_WEIGHT_PREFETCH_TRACE_FILE='$UVM_WEIGHT_PREFETCH_TRACE_FILE' \
                 VLLM_UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP='$UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP' \
                 VLLM_UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER='$UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER' \
+                VLLM_UVM_WEIGHT_PREFETCH_SKIP_RESIDENT='$UVM_WEIGHT_PREFETCH_SKIP_RESIDENT' \
+                VLLM_UVM_WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE='$UVM_WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE' \
+                VLLM_UVM_WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS='$UVM_WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS' \
+                VLLM_UVM_WEIGHT_ROUTER_TOPK_EVERY_N_STEPS='$UVM_WEIGHT_ROUTER_TOPK_EVERY_N_STEPS' \
                 VLLM_UVM_WEIGHT_PREFETCH_TARGET_ROLES='$UVM_WEIGHT_PREFETCH_TARGET_ROLES' \
                 VLLM_UVM_WEIGHT_PREFETCH_DEVICE='$UVM_WEIGHT_PREFETCH_DEVICE' \
                 VLLM_UVM_WEIGHT_PREFETCH_PLAN_FILE='$UVM_WEIGHT_PREFETCH_PLAN_FILE' \
                 VLLM_UVM_WEIGHT_PREFETCH_REQUIRE_PLAN='$UVM_WEIGHT_PREFETCH_REQUIRE_PLAN' \
                 VLLM_UVM_WEIGHT_PREFETCH_SOURCE='$UVM_WEIGHT_PREFETCH_SOURCE' \
+                VLLM_UVM_ORACLE_EXPERT_TRACE_FILE='$UVM_ORACLE_EXPERT_TRACE_FILE' \
+                VLLM_UVM_ORACLE_PREFETCH_LOOKAHEAD_STEPS='$UVM_ORACLE_PREFETCH_LOOKAHEAD_STEPS' \
+                VLLM_UVM_WEIGHT_PREFETCH_HIT_TRACE_ENABLE='$UVM_WEIGHT_PREFETCH_HIT_TRACE_ENABLE' \
+                VLLM_UVM_WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE='$UVM_WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE' \
+                VLLM_UVM_WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP='$UVM_WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP' \
                 VLLM_UVM_WEIGHT_BATCH_EXECUTOR_ENABLE='$UVM_WEIGHT_BATCH_EXECUTOR_ENABLE' \
                 VLLM_UVM_WEIGHT_EXECUTOR='$UVM_WEIGHT_EXECUTOR' \
                 VLLM_UVM_WEIGHT_OFFLOAD_ENABLE='$UVM_WEIGHT_OFFLOAD_ENABLE' \
@@ -722,10 +772,19 @@ start_server() {
                 VLLM_UVM_INIT_WEIGHT_MAX_BYTES='$UVM_INIT_WEIGHT_MAX_BYTES' \
                 VLLM_UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER='$UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER' \
                 VLLM_UVM_INIT_WEIGHT_SYNC='$UVM_INIT_WEIGHT_SYNC' \
+                VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_ENABLE='$UVM_INIT_WEIGHT_HOT_PREFETCH_ENABLE' \
+                VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_SYNC='$UVM_INIT_WEIGHT_HOT_PREFETCH_SYNC' \
+                VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES='$UVM_INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES' \
+                VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_DEVICE='$UVM_INIT_WEIGHT_HOT_PREFETCH_DEVICE' \
+                VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE='$UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE' \
+                VLLM_UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE='$UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE' \
+                VLLM_UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS='$UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS' \
+                VLLM_UVM_HOT_RESIDENCY_STAGE_DEVICE='$UVM_HOT_RESIDENCY_STAGE_DEVICE' \
                 VLLM_UVM_INIT_WEIGHT_TRACE_FILE='$UVM_INIT_WEIGHT_TRACE_FILE' \
                 VLLM_UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN='$UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN' \
                 VLLM_UVM_POOL_COORDINATOR_ENABLE='$UVM_POOL_COORDINATOR_ENABLE' \
                 VLLM_UVM_POOL_COORDINATOR_MODE='$UVM_POOL_COORDINATOR_MODE' \
+                VLLM_UVM_POOL_COORDINATOR_TRACE_ENABLE='$UVM_POOL_COORDINATOR_TRACE_ENABLE' \
                 VLLM_UVM_POOL_COORDINATOR_TRACE_FILE='$UVM_POOL_COORDINATOR_TRACE_FILE' \
                 VLLM_UVM_POOL_COORDINATOR_GLOBAL_BYTES_PER_STEP='$UVM_POOL_COORDINATOR_GLOBAL_BYTES_PER_STEP' \
                 VLLM_UVM_POOL_COORDINATOR_WEIGHT_BYTES_PER_STEP='$UVM_POOL_COORDINATOR_WEIGHT_BYTES_PER_STEP' \
@@ -764,6 +823,7 @@ start_server() {
                 VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_ACTION='$UVM_RESIDENCY_WEIGHT_VICTIM_ACTION' \
                 VLLM_UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE='$UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE' \
                 VLLM_UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER='$UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER' \
+                VLLM_UVM_RESIDENCY_WEIGHT_EVICT_PROTECT_RECENT_STEPS='$UVM_RESIDENCY_WEIGHT_EVICT_PROTECT_RECENT_STEPS' \
                 VLLM_UVM_REAL_RESIDENCY_ENABLE='$UVM_REAL_RESIDENCY_ENABLE' \
                 VLLM_UVM_REAL_RESIDENCY_TRACE_FILE='$UVM_REAL_RESIDENCY_TRACE_FILE' \
                 VLLM_UVM_REAL_RESIDENCY_DEVICE='$UVM_REAL_RESIDENCY_DEVICE' \
@@ -1177,14 +1237,24 @@ parse_args() {
       --uvm-moe-routing-trace-file) UVM_MOE_ROUTING_TRACE_FILE="$2"; shift 2 ;; # Stage E MoE routing trace JSONL
       --uvm-weight-prefetch-enable) UVM_WEIGHT_PREFETCH_ENABLE="$2"; shift 2 ;; # Stage I expert weight prefetch 开关
       --uvm-weight-prefetch-mode) UVM_WEIGHT_PREFETCH_MODE="$2"; shift 2 ;; # Stage I mode trace_only/prefetch
+      --uvm-weight-prefetch-trace-enable) UVM_WEIGHT_PREFETCH_TRACE_ENABLE="$2"; shift 2 ;; # Stage I prefetch trace gate
       --uvm-weight-prefetch-trace-file) UVM_WEIGHT_PREFETCH_TRACE_FILE="$2"; shift 2 ;; # Stage I prefetch trace JSONL
       --uvm-weight-prefetch-max-bytes-per-step) UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP="$2"; shift 2 ;; # Stage I 每层调用 prefetch 字节预算
       --uvm-weight-prefetch-max-experts-per-layer) UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;; # Stage I 每层最多 active experts
+      --uvm-weight-prefetch-skip-resident) UVM_WEIGHT_PREFETCH_SKIP_RESIDENT="$2"; shift 2 ;; # Stage I 跳过已 resident region
+      --uvm-weight-prefetch-expert-cache-enable) UVM_WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE="$2"; shift 2 ;; # Stage I 跳过全 resident expert
+      --uvm-weight-prefetch-region-cooldown-steps) UVM_WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS="$2"; shift 2 ;; # Stage I region prefetch cooldown
+      --uvm-weight-router-topk-every-n-steps) UVM_WEIGHT_ROUTER_TOPK_EVERY_N_STEPS="$2"; shift 2 ;; # Stage I router_topk 低频触发
       --uvm-weight-prefetch-target-roles) UVM_WEIGHT_PREFETCH_TARGET_ROLES="$2"; shift 2 ;; # Stage I prefetch roles
       --uvm-weight-prefetch-device) UVM_WEIGHT_PREFETCH_DEVICE="$2"; shift 2 ;; # Stage I target device
       --uvm-weight-prefetch-plan-file) UVM_WEIGHT_PREFETCH_PLAN_FILE="$2"; shift 2 ;; # Stage I Stage H prefetch plan JSON
       --uvm-weight-prefetch-require-plan) UVM_WEIGHT_PREFETCH_REQUIRE_PLAN="$2"; shift 2 ;; # Stage I 是否要求 prefetch_plan 命中
-      --uvm-weight-prefetch-source) UVM_WEIGHT_PREFETCH_SOURCE="$2"; shift 2 ;; # Stage I source router_topk/plan_intersection
+      --uvm-weight-prefetch-source) UVM_WEIGHT_PREFETCH_SOURCE="$2"; shift 2 ;; # Stage I source router_topk/plan_intersection/oracle_replay
+      --uvm-oracle-expert-trace-file) UVM_ORACLE_EXPERT_TRACE_FILE="$2"; shift 2 ;; # Stage M oracle replay routing trace
+      --uvm-oracle-prefetch-lookahead-steps) UVM_ORACLE_PREFETCH_LOOKAHEAD_STEPS="$2"; shift 2 ;; # Stage M oracle replay lookahead
+      --uvm-weight-prefetch-hit-trace-enable) UVM_WEIGHT_PREFETCH_HIT_TRACE_ENABLE="$2"; shift 2 ;; # Stage M prefetch hit-before-access probe
+      --uvm-weight-prefetch-hit-driver-query-enable) UVM_WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE="$2"; shift 2 ;; # Stage M real residency query before access
+      --uvm-weight-prefetch-hit-max-regions-per-step) UVM_WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP="$2"; shift 2 ;; # Stage M real query sample limit
       --uvm-weight-batch-executor-enable) UVM_WEIGHT_BATCH_EXECUTOR_ENABLE="$2"; shift 2 ;; # Stage M/E C++ batch executor gate
       --uvm-weight-executor) UVM_WEIGHT_EXECUTOR="$2"; shift 2 ;; # Stage M/F executor cpp_batch/driver_batch/auto
       --uvm-weight-offload-enable) UVM_WEIGHT_OFFLOAD_ENABLE="$2"; shift 2 ;; # Stage I cold expert offload/advise 开关
@@ -1206,10 +1276,19 @@ parse_args() {
       --uvm-init-weight-max-bytes) UVM_INIT_WEIGHT_MAX_BYTES="$2"; shift 2 ;; # Stage M total pre-offload byte cap
       --uvm-init-weight-max-experts-per-layer) UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;; # Stage M per-layer cold expert cap
       --uvm-init-weight-sync) UVM_INIT_WEIGHT_SYNC="$2"; shift 2 ;; # Stage M synchronize after pre-offload
+      --uvm-init-weight-hot-prefetch-enable) UVM_INIT_WEIGHT_HOT_PREFETCH_ENABLE="$2"; shift 2 ;; # Stage M init hot expert GPU prefetch gate
+      --uvm-init-weight-hot-prefetch-sync) UVM_INIT_WEIGHT_HOT_PREFETCH_SYNC="$2"; shift 2 ;; # Stage M synchronize after init hot GPU prefetch
+      --uvm-init-weight-hot-prefetch-max-bytes) UVM_INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES="$2"; shift 2 ;; # Stage M total init hot GPU prefetch byte cap
+      --uvm-init-weight-hot-prefetch-device) UVM_INIT_WEIGHT_HOT_PREFETCH_DEVICE="$2"; shift 2 ;; # Stage M init hot GPU prefetch target device
+      --uvm-init-weight-hot-prefetch-real-query-enable) UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE="$2"; shift 2 ;; # Query real GPU residency after init hot prefetch
+      --uvm-hot-residency-stage-trace-enable) UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE="$2"; shift 2 ;; # Query hot plan residency at stage markers
+      --uvm-hot-residency-stage-max-num-tokens) UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS="$2"; shift 2 ;; # Decode marker threshold
+      --uvm-hot-residency-stage-device) UVM_HOT_RESIDENCY_STAGE_DEVICE="$2"; shift 2 ;; # Stage marker query device
       --uvm-init-weight-trace-file) UVM_INIT_WEIGHT_TRACE_FILE="$2"; shift 2 ;; # Stage M weight JSONL trace
       --uvm-init-weight-require-routing-plan) UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN="$2"; shift 2 ;; # Stage M require routing_heatmap_v1 plan
       --uvm-pool-coordinator-enable) UVM_POOL_COORDINATOR_ENABLE="$2"; shift 2 ;; # Stage K global coordinator gate
       --uvm-pool-coordinator-mode) UVM_POOL_COORDINATOR_MODE="$2"; shift 2 ;; # Stage K mode trace_only/enforce
+      --uvm-pool-coordinator-trace-enable) UVM_POOL_COORDINATOR_TRACE_ENABLE="$2"; shift 2 ;; # Stage K coordinator trace gate
       --uvm-pool-coordinator-trace-file) UVM_POOL_COORDINATOR_TRACE_FILE="$2"; shift 2 ;; # Stage K JSONL trace
       --uvm-pool-coordinator-global-bytes-per-step) UVM_POOL_COORDINATOR_GLOBAL_BYTES_PER_STEP="$2"; shift 2 ;; # Stage K global action budget
       --uvm-pool-coordinator-weight-bytes-per-step) UVM_POOL_COORDINATOR_WEIGHT_BYTES_PER_STEP="$2"; shift 2 ;; # Stage K weights action budget
@@ -1248,6 +1327,7 @@ parse_args() {
       --uvm-residency-weight-victim-action) UVM_RESIDENCY_WEIGHT_VICTIM_ACTION="$2"; shift 2 ;; # Stage L2 victim action
       --uvm-residency-weight-active-evict-enable) UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE="$2"; shift 2 ;; # Stage L2 active-set eviction gate
       --uvm-residency-weight-active-evict-max-experts-per-layer) UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;; # Stage L2 active-set eviction cap
+      --uvm-residency-weight-evict-protect-recent-steps) UVM_RESIDENCY_WEIGHT_EVICT_PROTECT_RECENT_STEPS="$2"; shift 2 ;; # Stage L2 recent active protection
       --uvm-pool-registry-enable) UVM_POOL_REGISTRY_ENABLE="$2"; shift 2 ;; # Stage F unified pool registry telemetry
       --uvm-scratch-pool-enable) UVM_SCRATCH_POOL_ENABLE="$2"; shift 2 ;; # Stage G scratch pool admission control
       --uvm-scratch-pool-budget-bytes) UVM_SCRATCH_POOL_BUDGET_BYTES="$2"; shift 2 ;; # Stage G scratch pool device-direct live bytes budget
@@ -1379,10 +1459,20 @@ validate_inputs() {
     [[ "$UVM_WEIGHT_PREFETCH_MODE" =~ ^(trace_only|prefetch)$ ]] || die "--uvm-weight-prefetch-mode must be trace_only or prefetch"
     [[ "$UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-weight-prefetch-max-bytes-per-step must be a non-negative integer"
     [[ "$UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-weight-prefetch-max-experts-per-layer must be a non-negative integer"
+    [[ "$UVM_WEIGHT_PREFETCH_SKIP_RESIDENT" =~ ^[01]$ ]] || die "--uvm-weight-prefetch-skip-resident must be 0 or 1"
+    [[ "$UVM_WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-prefetch-expert-cache-enable must be 0 or 1"
+    [[ "$UVM_WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS" =~ ^[0-9]+$ ]] || die "--uvm-weight-prefetch-region-cooldown-steps must be a non-negative integer"
     [ -n "$UVM_WEIGHT_PREFETCH_TARGET_ROLES" ] || die "--uvm-weight-prefetch-target-roles must not be empty"
     [[ "$UVM_WEIGHT_PREFETCH_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-weight-prefetch-device must be an integer"
     [[ "$UVM_WEIGHT_PREFETCH_REQUIRE_PLAN" =~ ^[01]$ ]] || die "--uvm-weight-prefetch-require-plan must be 0 or 1"
-    [[ "$UVM_WEIGHT_PREFETCH_SOURCE" =~ ^(router_topk|plan_intersection)$ ]] || die "--uvm-weight-prefetch-source must be router_topk or plan_intersection"
+    [[ "$UVM_WEIGHT_PREFETCH_SOURCE" =~ ^(router_topk|plan_intersection|oracle_replay)$ ]] || die "--uvm-weight-prefetch-source must be router_topk, plan_intersection, or oracle_replay"
+    [[ "$UVM_ORACLE_PREFETCH_LOOKAHEAD_STEPS" =~ ^[0-9]+$ ]] || die "--uvm-oracle-prefetch-lookahead-steps must be a non-negative integer"
+    [[ "$UVM_WEIGHT_PREFETCH_HIT_TRACE_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-prefetch-hit-trace-enable must be 0 or 1"
+    [[ "$UVM_WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-prefetch-hit-driver-query-enable must be 0 or 1"
+    [[ "$UVM_WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-weight-prefetch-hit-max-regions-per-step must be a non-negative integer"
+    if [ "$UVM_WEIGHT_PREFETCH_SOURCE" = "oracle_replay" ] && [ -z "$UVM_ORACLE_EXPERT_TRACE_FILE" ]; then
+      die "--uvm-oracle-expert-trace-file is required when --uvm-weight-prefetch-source=oracle_replay"
+    fi
     [[ "$UVM_WEIGHT_BATCH_EXECUTOR_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-batch-executor-enable must be 0 or 1"
     [[ "$UVM_WEIGHT_EXECUTOR" =~ ^(cpp_batch|driver_batch|auto)$ ]] || die "--uvm-weight-executor must be cpp_batch, driver_batch, or auto"
     [[ "$UVM_WEIGHT_OFFLOAD_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-offload-enable must be 0 or 1"
@@ -1401,6 +1491,14 @@ validate_inputs() {
     [[ "$UVM_INIT_WEIGHT_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-init-weight-max-bytes must be a non-negative integer"
     [[ "$UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-init-weight-max-experts-per-layer must be a non-negative integer"
     [[ "$UVM_INIT_WEIGHT_SYNC" =~ ^[01]$ ]] || die "--uvm-init-weight-sync must be 0 or 1"
+    [[ "$UVM_INIT_WEIGHT_HOT_PREFETCH_ENABLE" =~ ^[01]$ ]] || die "--uvm-init-weight-hot-prefetch-enable must be 0 or 1"
+    [[ "$UVM_INIT_WEIGHT_HOT_PREFETCH_SYNC" =~ ^[01]$ ]] || die "--uvm-init-weight-hot-prefetch-sync must be 0 or 1"
+    [[ "$UVM_INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-init-weight-hot-prefetch-max-bytes must be a non-negative integer"
+    [[ "$UVM_INIT_WEIGHT_HOT_PREFETCH_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-init-weight-hot-prefetch-device must be an integer"
+    [[ "$UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE" =~ ^[01]$ ]] || die "--uvm-init-weight-hot-prefetch-real-query-enable must be 0 or 1"
+    [[ "$UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE" =~ ^[01]$ ]] || die "--uvm-hot-residency-stage-trace-enable must be 0 or 1"
+    [[ "$UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS" =~ ^[0-9]+$ ]] || die "--uvm-hot-residency-stage-max-num-tokens must be a non-negative integer"
+    [[ "$UVM_HOT_RESIDENCY_STAGE_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-hot-residency-stage-device must be an integer"
     [[ "$UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN" =~ ^[01]$ ]] || die "--uvm-init-weight-require-routing-plan must be 0 or 1"
     [[ "$UVM_POOL_COORDINATOR_ENABLE" =~ ^[01]$ ]] || die "--uvm-pool-coordinator-enable must be 0 or 1"
     [[ "$UVM_POOL_COORDINATOR_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-pool-coordinator-mode must be trace_only or enforce"
@@ -1439,6 +1537,7 @@ validate_inputs() {
     [[ "$UVM_RESIDENCY_WEIGHT_VICTIM_ACTION" =~ ^(advise_cpu|prefetch_cpu|offload_cpu)$ ]] || die "--uvm-residency-weight-victim-action must be advise_cpu, prefetch_cpu, or offload_cpu"
     [[ "$UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-weight-active-evict-enable must be 0 or 1"
     [[ "$UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-residency-weight-active-evict-max-experts-per-layer must be a non-negative integer"
+    [[ "$UVM_RESIDENCY_WEIGHT_EVICT_PROTECT_RECENT_STEPS" =~ ^[0-9]+$ ]] || die "--uvm-residency-weight-evict-protect-recent-steps must be a non-negative integer"
     [[ "$UVM_POOL_REGISTRY_ENABLE" =~ ^[01]$ ]] || die "--uvm-pool-registry-enable must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_ENABLE" =~ ^[01]$ ]] || die "--uvm-scratch-pool-enable must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-scratch-pool-budget-bytes must be a non-negative integer"

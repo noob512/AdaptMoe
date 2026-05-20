@@ -18,6 +18,7 @@ HOT_EXPERTS_PER_LAYER="${HOT_EXPERTS_PER_LAYER:-8}"
 COLD_EXPERTS_PER_LAYER="${COLD_EXPERTS_PER_LAYER:-8}"
 WEIGHT_PLAN_LAYERS="${WEIGHT_PLAN_LAYERS:-48}"
 WEIGHT_PLAN_EXPERTS="${WEIGHT_PLAN_EXPERTS:-128}"
+WEIGHT_PLAN_FILE="${WEIGHT_PLAN_FILE:-}"
 WEIGHT_GPU_BYTES="${WEIGHT_GPU_BYTES:-10737418240}"
 KV_GPU_BYTES="${KV_GPU_BYTES:-2147483648}"
 SERVER_MAX_NUM_SEQS="${SERVER_MAX_NUM_SEQS:-1}"
@@ -30,13 +31,38 @@ RESIDENCY_ENABLE="${RESIDENCY_ENABLE:-1}"
 RESIDENCY_TRACE_ENABLE="${RESIDENCY_TRACE_ENABLE:-1}"
 KV_RUNTIME_ENABLE="${KV_RUNTIME_ENABLE:-1}"
 WEIGHT_RUNTIME_PREFETCH_ENABLE="${WEIGHT_RUNTIME_PREFETCH_ENABLE:-1}"
+WEIGHT_PREFETCH_TRACE_ENABLE="${WEIGHT_PREFETCH_TRACE_ENABLE:-1}"
+WEIGHT_PREFETCH_MAX_BYTES_PER_STEP="${WEIGHT_PREFETCH_MAX_BYTES_PER_STEP:-33554432}"
+WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER="${WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER:-2}"
+WEIGHT_ROUTER_TOPK_EVERY_N_STEPS="${WEIGHT_ROUTER_TOPK_EVERY_N_STEPS:-1}"
+WEIGHT_PREFETCH_SKIP_RESIDENT="${WEIGHT_PREFETCH_SKIP_RESIDENT:-1}"
+WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE="${WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE:-1}"
+WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS="${WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS:-8}"
+WEIGHT_PREFETCH_SOURCE="${WEIGHT_PREFETCH_SOURCE:-router_topk}"
+ORACLE_EXPERT_TRACE_FILE="${ORACLE_EXPERT_TRACE_FILE:-}"
+ORACLE_PREFETCH_LOOKAHEAD_STEPS="${ORACLE_PREFETCH_LOOKAHEAD_STEPS:-1}"
+WEIGHT_PREFETCH_HIT_TRACE_ENABLE="${WEIGHT_PREFETCH_HIT_TRACE_ENABLE:-0}"
+WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE="${WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE:-0}"
+WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP="${WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP:-64}"
 INIT_WEIGHT_OFFLOAD_ENABLE="${INIT_WEIGHT_OFFLOAD_ENABLE:-1}"
+INIT_WEIGHT_MAX_BYTES="${INIT_WEIGHT_MAX_BYTES:-}"
+INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="${INIT_WEIGHT_MAX_EXPERTS_PER_LAYER:-0}"
+INIT_WEIGHT_HOT_PREFETCH_ENABLE="${INIT_WEIGHT_HOT_PREFETCH_ENABLE:-0}"
+INIT_WEIGHT_HOT_PREFETCH_SYNC="${INIT_WEIGHT_HOT_PREFETCH_SYNC:-1}"
+INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES="${INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES:-0}"
+INIT_WEIGHT_HOT_PREFETCH_DEVICE="${INIT_WEIGHT_HOT_PREFETCH_DEVICE:--1}"
+INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE="${INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE:-0}"
+HOT_RESIDENCY_STAGE_TRACE_ENABLE="${HOT_RESIDENCY_STAGE_TRACE_ENABLE:-0}"
+HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS="${HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS:-1}"
+HOT_RESIDENCY_STAGE_DEVICE="${HOT_RESIDENCY_STAGE_DEVICE:--1}"
 POOL_COORDINATOR_ENABLE="${POOL_COORDINATOR_ENABLE:-1}"
+POOL_COORDINATOR_TRACE_ENABLE="${POOL_COORDINATOR_TRACE_ENABLE:-1}"
 POOL_REGISTRY_ENABLE="${POOL_REGISTRY_ENABLE:-1}"
 AUTO_GAP_WATCH_ENABLE="${AUTO_GAP_WATCH_ENABLE:-1}"
 FAULT_ADDRESS_LOG_ENABLE="${FAULT_ADDRESS_LOG_ENABLE:-1}"
 WEIGHT_ACTIVE_EVICT_ENABLE="${WEIGHT_ACTIVE_EVICT_ENABLE:-0}"
 WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="${WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER:-0}"
+WEIGHT_EVICT_PROTECT_RECENT_STEPS="${WEIGHT_EVICT_PROTECT_RECENT_STEPS:-8}"
 WEIGHT_MAX_VICTIMS_PER_STEP="${WEIGHT_MAX_VICTIMS_PER_STEP:-16}"
 
 usage() {
@@ -62,6 +88,7 @@ Options:
   --request-rate <f>                     default: 1
   --hot-experts-per-layer <n>            default: 8
   --cold-experts-per-layer <n>           default: 8
+  --weight-plan-file <path>              optional external prefetch/offload plan
   --weight-gpu-bytes <n>                 default: 10GiB
   --kv-gpu-bytes <n>                     default: 2GiB
   --server-max-num-seqs <n>              default: 1
@@ -74,14 +101,39 @@ Options:
   --residency-trace-enable <0|1>         default: 1
   --kv-runtime-enable <0|1>              default: 1
   --weight-runtime-prefetch-enable <0|1> default: 1
+  --weight-prefetch-trace-enable <0|1>   default: 1
+  --weight-prefetch-max-bytes-per-step <n> default: 33554432
+  --weight-prefetch-max-experts-per-layer <n> default: 2, 0 means unlimited
+  --weight-router-topk-every-n-steps <n> default: 1
+  --weight-prefetch-skip-resident <0|1>  default: 1
+  --weight-prefetch-expert-cache-enable <0|1> default: 1
+  --weight-prefetch-region-cooldown-steps <n> default: 8
+  --weight-prefetch-source <source>      router_topk|plan_intersection|oracle_replay
+  --oracle-expert-trace-file <path>      routing trace JSONL for oracle_replay
+  --oracle-prefetch-lookahead-steps <n>  per-layer replay lookahead
+  --weight-prefetch-hit-trace-enable <0|1> default: 0
+  --weight-prefetch-hit-driver-query-enable <0|1> default: 0
+  --weight-prefetch-hit-max-regions-per-step <n> default: 64
   --init-weight-offload-enable <0|1>     default: 1
+  --init-weight-max-bytes <n>            default: weight-gpu-bytes
+  --init-weight-max-experts-per-layer <n> default: 0 means unlimited
+  --init-weight-hot-prefetch-enable <0|1> default: 0
+  --init-weight-hot-prefetch-sync <0|1>  default: 1
+  --init-weight-hot-prefetch-max-bytes <n> default: 0 means unlimited
+  --init-weight-hot-prefetch-device <id> default: -1/current
+  --init-weight-hot-prefetch-real-query-enable <0|1> default: 0
+  --hot-residency-stage-trace-enable <0|1> default: 0
+  --hot-residency-stage-max-num-tokens <n> default: 1
+  --hot-residency-stage-device <id> default: -1/current
   --pool-coordinator-enable <0|1>        default: 1
+  --pool-coordinator-trace-enable <0|1>  default: 1
   --pool-registry-enable <0|1>           default: 1
   --auto-gap-watch-enable <0|1>          default: 1
   --fault-address-log-enable <0|1>       default: 1
   --weight-active-evict-enable <0|1>     default: 0
   --weight-active-evict-max-experts-per-layer <n>
                                            default: 0
+  --weight-evict-protect-recent-steps <n> default: 8
   --weight-max-victims-per-step <n>      default: 16
   -h, --help
 
@@ -102,6 +154,7 @@ while [ $# -gt 0 ]; do
     --request-rate) REQUEST_RATE="$2"; shift 2 ;;
     --hot-experts-per-layer) HOT_EXPERTS_PER_LAYER="$2"; shift 2 ;;
     --cold-experts-per-layer) COLD_EXPERTS_PER_LAYER="$2"; shift 2 ;;
+    --weight-plan-file) WEIGHT_PLAN_FILE="$2"; shift 2 ;;
     --weight-gpu-bytes) WEIGHT_GPU_BYTES="$2"; shift 2 ;;
     --kv-gpu-bytes) KV_GPU_BYTES="$2"; shift 2 ;;
     --server-max-num-seqs) SERVER_MAX_NUM_SEQS="$2"; shift 2 ;;
@@ -114,13 +167,38 @@ while [ $# -gt 0 ]; do
     --residency-trace-enable) RESIDENCY_TRACE_ENABLE="$2"; shift 2 ;;
     --kv-runtime-enable) KV_RUNTIME_ENABLE="$2"; shift 2 ;;
     --weight-runtime-prefetch-enable) WEIGHT_RUNTIME_PREFETCH_ENABLE="$2"; shift 2 ;;
+    --weight-prefetch-trace-enable) WEIGHT_PREFETCH_TRACE_ENABLE="$2"; shift 2 ;;
+    --weight-prefetch-max-bytes-per-step) WEIGHT_PREFETCH_MAX_BYTES_PER_STEP="$2"; shift 2 ;;
+    --weight-prefetch-max-experts-per-layer) WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;;
+    --weight-router-topk-every-n-steps) WEIGHT_ROUTER_TOPK_EVERY_N_STEPS="$2"; shift 2 ;;
+    --weight-prefetch-skip-resident) WEIGHT_PREFETCH_SKIP_RESIDENT="$2"; shift 2 ;;
+    --weight-prefetch-expert-cache-enable) WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE="$2"; shift 2 ;;
+    --weight-prefetch-region-cooldown-steps) WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS="$2"; shift 2 ;;
+    --weight-prefetch-source) WEIGHT_PREFETCH_SOURCE="$2"; shift 2 ;;
+    --oracle-expert-trace-file) ORACLE_EXPERT_TRACE_FILE="$2"; shift 2 ;;
+    --oracle-prefetch-lookahead-steps) ORACLE_PREFETCH_LOOKAHEAD_STEPS="$2"; shift 2 ;;
+    --weight-prefetch-hit-trace-enable) WEIGHT_PREFETCH_HIT_TRACE_ENABLE="$2"; shift 2 ;;
+    --weight-prefetch-hit-driver-query-enable) WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE="$2"; shift 2 ;;
+    --weight-prefetch-hit-max-regions-per-step) WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP="$2"; shift 2 ;;
     --init-weight-offload-enable) INIT_WEIGHT_OFFLOAD_ENABLE="$2"; shift 2 ;;
+    --init-weight-max-bytes) INIT_WEIGHT_MAX_BYTES="$2"; shift 2 ;;
+    --init-weight-max-experts-per-layer) INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;;
+    --init-weight-hot-prefetch-enable) INIT_WEIGHT_HOT_PREFETCH_ENABLE="$2"; shift 2 ;;
+    --init-weight-hot-prefetch-sync) INIT_WEIGHT_HOT_PREFETCH_SYNC="$2"; shift 2 ;;
+    --init-weight-hot-prefetch-max-bytes) INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES="$2"; shift 2 ;;
+    --init-weight-hot-prefetch-device) INIT_WEIGHT_HOT_PREFETCH_DEVICE="$2"; shift 2 ;;
+    --init-weight-hot-prefetch-real-query-enable) INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE="$2"; shift 2 ;;
+    --hot-residency-stage-trace-enable) HOT_RESIDENCY_STAGE_TRACE_ENABLE="$2"; shift 2 ;;
+    --hot-residency-stage-max-num-tokens) HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS="$2"; shift 2 ;;
+    --hot-residency-stage-device) HOT_RESIDENCY_STAGE_DEVICE="$2"; shift 2 ;;
     --pool-coordinator-enable) POOL_COORDINATOR_ENABLE="$2"; shift 2 ;;
+    --pool-coordinator-trace-enable) POOL_COORDINATOR_TRACE_ENABLE="$2"; shift 2 ;;
     --pool-registry-enable) POOL_REGISTRY_ENABLE="$2"; shift 2 ;;
     --auto-gap-watch-enable) AUTO_GAP_WATCH_ENABLE="$2"; shift 2 ;;
     --fault-address-log-enable) FAULT_ADDRESS_LOG_ENABLE="$2"; shift 2 ;;
     --weight-active-evict-enable) WEIGHT_ACTIVE_EVICT_ENABLE="$2"; shift 2 ;;
     --weight-active-evict-max-experts-per-layer) WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;;
+    --weight-evict-protect-recent-steps) WEIGHT_EVICT_PROTECT_RECENT_STEPS="$2"; shift 2 ;;
     --weight-max-victims-per-step) WEIGHT_MAX_VICTIMS_PER_STEP="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -134,8 +212,18 @@ for item in \
   RESIDENCY_TRACE_ENABLE \
   KV_RUNTIME_ENABLE \
   WEIGHT_RUNTIME_PREFETCH_ENABLE \
+  WEIGHT_PREFETCH_TRACE_ENABLE \
+  WEIGHT_PREFETCH_SKIP_RESIDENT \
+  WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE \
+  WEIGHT_PREFETCH_HIT_TRACE_ENABLE \
+  WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE \
   INIT_WEIGHT_OFFLOAD_ENABLE \
+  INIT_WEIGHT_HOT_PREFETCH_ENABLE \
+  INIT_WEIGHT_HOT_PREFETCH_SYNC \
+  INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE \
+  HOT_RESIDENCY_STAGE_TRACE_ENABLE \
   POOL_COORDINATOR_ENABLE \
+  POOL_COORDINATOR_TRACE_ENABLE \
   POOL_REGISTRY_ENABLE \
   AUTO_GAP_WATCH_ENABLE \
   WEIGHT_ACTIVE_EVICT_ENABLE \
@@ -157,6 +245,61 @@ if ! [[ "$WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]]; then
 fi
 if ! [[ "$WEIGHT_MAX_VICTIMS_PER_STEP" =~ ^[0-9]+$ ]]; then
   echo "WEIGHT_MAX_VICTIMS_PER_STEP must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_ROUTER_TOPK_EVERY_N_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "WEIGHT_ROUTER_TOPK_EVERY_N_STEPS must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_PREFETCH_MAX_BYTES_PER_STEP" =~ ^[0-9]+$ ]]; then
+  echo "WEIGHT_PREFETCH_MAX_BYTES_PER_STEP must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]]; then
+  echo "WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_PREFETCH_SOURCE" =~ ^(router_topk|plan_intersection|oracle_replay)$ ]]; then
+  echo "WEIGHT_PREFETCH_SOURCE must be router_topk, plan_intersection, or oracle_replay" >&2
+  exit 2
+fi
+if ! [[ "$ORACLE_PREFETCH_LOOKAHEAD_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "ORACLE_PREFETCH_LOOKAHEAD_STEPS must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP" =~ ^[0-9]+$ ]]; then
+  echo "WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP must be a non-negative integer" >&2
+  exit 2
+fi
+if [ -z "$INIT_WEIGHT_MAX_BYTES" ]; then
+  INIT_WEIGHT_MAX_BYTES="$WEIGHT_GPU_BYTES"
+fi
+if ! [[ "$INIT_WEIGHT_MAX_BYTES" =~ ^[0-9]+$ ]]; then
+  echo "INIT_WEIGHT_MAX_BYTES must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$INIT_WEIGHT_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]]; then
+  echo "INIT_WEIGHT_MAX_EXPERTS_PER_LAYER must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES" =~ ^[0-9]+$ ]]; then
+  echo "INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$INIT_WEIGHT_HOT_PREFETCH_DEVICE" =~ ^-?[0-9]+$ ]]; then
+  echo "INIT_WEIGHT_HOT_PREFETCH_DEVICE must be an integer" >&2
+  exit 2
+fi
+if [ "$WEIGHT_PREFETCH_SOURCE" = "oracle_replay" ] && [ -z "$ORACLE_EXPERT_TRACE_FILE" ]; then
+  echo "ORACLE_EXPERT_TRACE_FILE is required when WEIGHT_PREFETCH_SOURCE=oracle_replay" >&2
+  exit 2
+fi
+if ! [[ "$WEIGHT_EVICT_PROTECT_RECENT_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "WEIGHT_EVICT_PROTECT_RECENT_STEPS must be a non-negative integer" >&2
   exit 2
 fi
 
@@ -191,6 +334,7 @@ echo " prompts: $PROMPTS"
 echo " output_len: $OUTPUT_LEN"
 echo " request_rate: $REQUEST_RATE"
 echo " routing_trace: ${ROUTING_TRACE:-<generate>}"
+echo " weight_plan_file: ${WEIGHT_PLAN_FILE:-<generate>}"
 echo " weight_executor: $WEIGHT_EXECUTOR"
 echo " require_driver: $REQUIRE_DRIVER"
 echo " scratch_device_direct_enable: $SCRATCH_DEVICE_DIRECT_ENABLE"
@@ -199,13 +343,38 @@ echo " residency_enable: $RESIDENCY_ENABLE"
 echo " residency_trace_enable: $RESIDENCY_TRACE_ENABLE"
 echo " kv_runtime_enable: $KV_RUNTIME_ENABLE"
 echo " weight_runtime_prefetch_enable: $WEIGHT_RUNTIME_PREFETCH_ENABLE"
+echo " weight_prefetch_trace_enable: $WEIGHT_PREFETCH_TRACE_ENABLE"
+echo " weight_prefetch_max_bytes_per_step: $WEIGHT_PREFETCH_MAX_BYTES_PER_STEP"
+echo " weight_prefetch_max_experts_per_layer: $WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER"
+echo " weight_router_topk_every_n_steps: $WEIGHT_ROUTER_TOPK_EVERY_N_STEPS"
+echo " weight_prefetch_skip_resident: $WEIGHT_PREFETCH_SKIP_RESIDENT"
+echo " weight_prefetch_expert_cache_enable: $WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE"
+echo " weight_prefetch_region_cooldown_steps: $WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS"
+echo " weight_prefetch_source: $WEIGHT_PREFETCH_SOURCE"
+echo " oracle_expert_trace_file: ${ORACLE_EXPERT_TRACE_FILE:-<none>}"
+echo " oracle_prefetch_lookahead_steps: $ORACLE_PREFETCH_LOOKAHEAD_STEPS"
+echo " weight_prefetch_hit_trace_enable: $WEIGHT_PREFETCH_HIT_TRACE_ENABLE"
+echo " weight_prefetch_hit_driver_query_enable: $WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE"
+echo " weight_prefetch_hit_max_regions_per_step: $WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP"
 echo " init_weight_offload_enable: $INIT_WEIGHT_OFFLOAD_ENABLE"
+echo " init_weight_max_bytes: $INIT_WEIGHT_MAX_BYTES"
+echo " init_weight_max_experts_per_layer: $INIT_WEIGHT_MAX_EXPERTS_PER_LAYER"
+echo " init_weight_hot_prefetch_enable: $INIT_WEIGHT_HOT_PREFETCH_ENABLE"
+echo " init_weight_hot_prefetch_sync: $INIT_WEIGHT_HOT_PREFETCH_SYNC"
+echo " init_weight_hot_prefetch_max_bytes: $INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES"
+echo " init_weight_hot_prefetch_device: $INIT_WEIGHT_HOT_PREFETCH_DEVICE"
+echo " init_weight_hot_prefetch_real_query_enable: $INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE"
+echo " hot_residency_stage_trace_enable: $HOT_RESIDENCY_STAGE_TRACE_ENABLE"
+echo " hot_residency_stage_max_num_tokens: $HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS"
+echo " hot_residency_stage_device: $HOT_RESIDENCY_STAGE_DEVICE"
 echo " pool_coordinator_enable: $POOL_COORDINATOR_ENABLE"
+echo " pool_coordinator_trace_enable: $POOL_COORDINATOR_TRACE_ENABLE"
 echo " pool_registry_enable: $POOL_REGISTRY_ENABLE"
 echo " auto_gap_watch_enable: $AUTO_GAP_WATCH_ENABLE"
 echo " fault_address_log_enable: $FAULT_ADDRESS_LOG_ENABLE"
 echo " weight_active_evict_enable: $WEIGHT_ACTIVE_EVICT_ENABLE"
 echo " weight_active_evict_max_experts_per_layer: $WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER"
+echo " weight_evict_protect_recent_steps: $WEIGHT_EVICT_PROTECT_RECENT_STEPS"
 echo " weight_max_victims_per_step: $WEIGHT_MAX_VICTIMS_PER_STEP"
 echo " phase_f_user_debug_log: $PHASE_F_DEBUG_LOG"
 echo "==========================================================="
@@ -281,15 +450,20 @@ fi
 echo "==========================================================="
 echo " [3/5] Build routing-aware weight plan"
 echo "==========================================================="
-python3 "$SCRIPT_DIR/build_stage_m_hot_cold_weight_plan.py" \
-  --routing-trace "$ROUTING_TRACE" \
-  --output-plan "$PLAN_JSON" \
-  --report-md "$PLAN_REPORT" \
-  --hot-experts-per-layer "$HOT_EXPERTS_PER_LAYER" \
-  --cold-experts-per-layer "$COLD_EXPERTS_PER_LAYER" \
-  --fallback-layers "$WEIGHT_PLAN_LAYERS" \
-  --fallback-experts "$WEIGHT_PLAN_EXPERTS" \
-  --min-routing-records 1
+if [ -n "$WEIGHT_PLAN_FILE" ]; then
+  cp "$WEIGHT_PLAN_FILE" "$PLAN_JSON"
+  echo "external_weight_plan=$WEIGHT_PLAN_FILE"
+else
+  python3 "$SCRIPT_DIR/build_stage_m_hot_cold_weight_plan.py" \
+    --routing-trace "$ROUTING_TRACE" \
+    --output-plan "$PLAN_JSON" \
+    --report-md "$PLAN_REPORT" \
+    --hot-experts-per-layer "$HOT_EXPERTS_PER_LAYER" \
+    --cold-experts-per-layer "$COLD_EXPERTS_PER_LAYER" \
+    --fallback-layers "$WEIGHT_PLAN_LAYERS" \
+    --fallback-experts "$WEIGHT_PLAN_EXPERTS" \
+    --min-routing-records 1
+fi
 
 echo "==========================================================="
 echo " [4/5] Run full_impl with Phase F executor mode"
@@ -308,8 +482,8 @@ WEIGHT_BATCH_EXECUTOR_ENABLE=1 \
   --server-gpu-memory-utilization "$SERVER_GPU_MEMORY_UTILIZATION" \
   --weight-gpu-bytes "$WEIGHT_GPU_BYTES" \
   --kv-gpu-bytes "$KV_GPU_BYTES" \
-  --init-weight-max-bytes "$WEIGHT_GPU_BYTES" \
-  --init-weight-max-experts-per-layer 0 \
+  --init-weight-max-bytes "$INIT_WEIGHT_MAX_BYTES" \
+  --init-weight-max-experts-per-layer "$INIT_WEIGHT_MAX_EXPERTS_PER_LAYER" \
   --weight-plan-file "$PLAN_JSON" \
   --weight-executor "$WEIGHT_EXECUTOR" \
   --uvm-enable-builtin-tests 1 \
@@ -321,19 +495,42 @@ WEIGHT_BATCH_EXECUTOR_ENABLE=1 \
   --residency-trace-enable "$RESIDENCY_TRACE_ENABLE" \
   --kv-runtime-enable "$KV_RUNTIME_ENABLE" \
   --weight-runtime-prefetch-enable "$WEIGHT_RUNTIME_PREFETCH_ENABLE" \
+  --weight-prefetch-trace-enable "$WEIGHT_PREFETCH_TRACE_ENABLE" \
+  --weight-prefetch-max-bytes-per-step "$WEIGHT_PREFETCH_MAX_BYTES_PER_STEP" \
+  --weight-prefetch-max-experts-per-layer "$WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER" \
+  --weight-router-topk-every-n-steps "$WEIGHT_ROUTER_TOPK_EVERY_N_STEPS" \
+  --weight-prefetch-skip-resident "$WEIGHT_PREFETCH_SKIP_RESIDENT" \
+  --weight-prefetch-expert-cache-enable "$WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE" \
+  --weight-prefetch-region-cooldown-steps "$WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS" \
+  --weight-prefetch-source "$WEIGHT_PREFETCH_SOURCE" \
+  --oracle-expert-trace-file "$ORACLE_EXPERT_TRACE_FILE" \
+  --oracle-prefetch-lookahead-steps "$ORACLE_PREFETCH_LOOKAHEAD_STEPS" \
+  --weight-prefetch-hit-trace-enable "$WEIGHT_PREFETCH_HIT_TRACE_ENABLE" \
+  --weight-prefetch-hit-driver-query-enable "$WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE" \
+  --weight-prefetch-hit-max-regions-per-step "$WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP" \
   --init-weight-offload-enable "$INIT_WEIGHT_OFFLOAD_ENABLE" \
+  --init-weight-hot-prefetch-enable "$INIT_WEIGHT_HOT_PREFETCH_ENABLE" \
+  --init-weight-hot-prefetch-sync "$INIT_WEIGHT_HOT_PREFETCH_SYNC" \
+  --init-weight-hot-prefetch-max-bytes "$INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES" \
+  --init-weight-hot-prefetch-device "$INIT_WEIGHT_HOT_PREFETCH_DEVICE" \
+  --init-weight-hot-prefetch-real-query-enable "$INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE" \
+  --hot-residency-stage-trace-enable "$HOT_RESIDENCY_STAGE_TRACE_ENABLE" \
+  --hot-residency-stage-max-num-tokens "$HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS" \
+  --hot-residency-stage-device "$HOT_RESIDENCY_STAGE_DEVICE" \
   --pool-coordinator-enable "$POOL_COORDINATOR_ENABLE" \
+  --pool-coordinator-trace-enable "$POOL_COORDINATOR_TRACE_ENABLE" \
   --pool-registry-enable "$POOL_REGISTRY_ENABLE" \
   --auto-gap-watch-enable "$AUTO_GAP_WATCH_ENABLE" \
   --weight-active-evict-enable "$WEIGHT_ACTIVE_EVICT_ENABLE" \
   --weight-active-evict-max-experts-per-layer "$WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER" \
+  --weight-evict-protect-recent-steps "$WEIGHT_EVICT_PROTECT_RECENT_STEPS" \
   --weight-max-victims-per-step "$WEIGHT_MAX_VICTIMS_PER_STEP" \
   --fault-address-log-enable "$FAULT_ADDRESS_LOG_ENABLE"
 
 echo "==========================================================="
 echo " [5/5] Validate Phase F traces"
 echo "==========================================================="
-python3 - "$CHECK_DIR" "$CHECK_JSON" "$CHECK_MD" "$REQUIRE_DRIVER" "$WEIGHT_EXECUTOR" "$INIT_WEIGHT_OFFLOAD_ENABLE" "$WEIGHT_RUNTIME_PREFETCH_ENABLE" <<'PY'
+python3 - "$CHECK_DIR" "$CHECK_JSON" "$CHECK_MD" "$REQUIRE_DRIVER" "$WEIGHT_EXECUTOR" "$INIT_WEIGHT_OFFLOAD_ENABLE" "$WEIGHT_RUNTIME_PREFETCH_ENABLE" "$WEIGHT_PREFETCH_TRACE_ENABLE" "$WEIGHT_PREFETCH_SOURCE" <<'PY'
 import csv
 import json
 import sys
@@ -347,6 +544,8 @@ require_driver = sys.argv[4] == "1"
 requested_executor = sys.argv[5]
 init_weight_offload_enabled = sys.argv[6] == "1"
 runtime_prefetch_enabled = sys.argv[7] == "1"
+weight_prefetch_trace_enabled = sys.argv[8] == "1"
+requested_prefetch_source = sys.argv[9]
 run_dir = check_dir / "runs" / "full_impl_enforce_rep1"
 prefetch_trace = run_dir / "vllm_uvm_weight_prefetch_full_impl_enforce_rep1.jsonl"
 init_trace = run_dir / "vllm_uvm_init_weight_offload_full_impl_enforce_rep1.jsonl"
@@ -415,6 +614,116 @@ if requested_executor == "cpp_batch":
     accepted_executors.add("cpp_batch")
 init_batch_records = sum(init_executors.get(name, 0) for name in accepted_executors)
 runtime_batch_records = sum(prefetch_executors.get(name, 0) for name in accepted_executors)
+runtime_summary_records = prefetch_actions.get("step_summary", 0)
+runtime_candidate_records = sum(
+    int(r.get("candidate_region_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_candidate_expert_records = sum(
+    int(r.get("candidate_expert_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_expert_resident_skip_records = sum(
+    int(r.get("expert_resident_skip_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_resident_skip_records = sum(
+    int(r.get("resident_skip_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_cooldown_skip_records = sum(
+    int(r.get("cooldown_skip_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_oracle_replay_records = sum(
+    int(r.get("oracle_replay_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_oracle_match_records = sum(
+    int(r.get("oracle_match_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_oracle_mismatch_records = sum(
+    int(r.get("oracle_mismatch_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_oracle_missing_records = sum(
+    int(r.get("oracle_trace_missing_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_prefetch_access_probe_records = sum(
+    int(r.get("prefetch_access_probe_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_prefetch_before_access_candidates = sum(
+    int(r.get("prefetch_before_access_candidate_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_prefetch_hit_before_access_estimated = sum(
+    int(r.get("prefetch_hit_before_access_estimated_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_prefetch_miss_before_access_estimated = sum(
+    int(r.get("prefetch_miss_before_access_estimated_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_prefetch_same_step_access = sum(
+    int(r.get("prefetch_same_step_access_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_prefetch_access_no_prior_prefetch = sum(
+    int(r.get("prefetch_access_no_prior_prefetch_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_prefetch_real_query_records = sum(
+    int(r.get("prefetch_hit_before_access_real_query_records") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_prefetch_real_query_ranges = sum(
+    int(r.get("prefetch_hit_before_access_real_query_ranges") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_prefetch_real_queried_bytes = sum(
+    int(r.get("prefetch_hit_before_access_real_queried_bytes") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_prefetch_real_gpu_bytes = sum(
+    int(r.get("prefetch_hit_before_access_real_gpu_bytes") or 0)
+    for r in prefetch_records
+    if r.get("action") == "step_summary"
+)
+runtime_prefetch_hit_estimated_rate = (
+    runtime_prefetch_hit_before_access_estimated
+    / runtime_prefetch_before_access_candidates
+    if runtime_prefetch_before_access_candidates
+    else None
+)
+runtime_prefetch_real_gpu_ratio = (
+    runtime_prefetch_real_gpu_bytes / runtime_prefetch_real_queried_bytes
+    if runtime_prefetch_real_queried_bytes
+    else None
+)
+runtime_filtered_noop_records = (
+    runtime_resident_skip_records + runtime_expert_resident_skip_records
+)
 init_batch_sizes = [
     int(r.get("batch_size", 0))
     for r in init_records
@@ -445,19 +754,27 @@ driver_positive_results = sum(
 )
 
 checks = {
-    "prefetch_trace_present": prefetch_trace.exists() if runtime_prefetch_enabled else True,
+    "prefetch_trace_present": (
+        prefetch_trace.exists()
+        if runtime_prefetch_enabled and weight_prefetch_trace_enabled
+        else True
+    ),
     "init_trace_present": init_trace.exists() if init_weight_offload_enabled else True,
     "init_phase_f_executor_seen": (
         init_batch_records > 0 if init_weight_offload_enabled else init_batch_records == 0
     ),
     "runtime_phase_f_executor_seen": (
-        runtime_batch_records > 0 if runtime_prefetch_enabled else runtime_batch_records == 0
+        runtime_batch_records > 0 or runtime_filtered_noop_records > 0
+        if runtime_prefetch_enabled and weight_prefetch_trace_enabled
+        else True
     ),
     "init_batch_groups_are_multi_range": (
         max(init_batch_sizes or [0]) > 1 if init_weight_offload_enabled else True
     ),
     "runtime_batch_groups_are_multi_range": (
-        max(runtime_batch_sizes or [0]) > 1 if runtime_prefetch_enabled else True
+        max(runtime_batch_sizes or [0]) > 1 or runtime_filtered_noop_records > 0
+        if runtime_prefetch_enabled and weight_prefetch_trace_enabled
+        else True
     ),
     "driver_batch_seen_or_fallback_recorded": driver_records > 0 or fallback_records > 0,
     "driver_action_success_seen": (
@@ -468,8 +785,18 @@ checks = {
         and fallback_records == 0
         and (driver_success_records > 0 or driver_positive_results > 0)
     ) if require_driver else True,
-    "router_topk_source_present": (
-        prefetch_sources.get("router_topk", 0) > 0 if runtime_prefetch_enabled else True
+    "requested_prefetch_source_present": (
+        prefetch_sources.get(requested_prefetch_source, 0) > 0
+        if runtime_prefetch_enabled and weight_prefetch_trace_enabled
+        else True
+    ),
+    "oracle_replay_matchable": (
+        runtime_oracle_replay_records > 0
+        and runtime_oracle_missing_records == 0
+        if runtime_prefetch_enabled
+        and weight_prefetch_trace_enabled
+        and requested_prefetch_source == "oracle_replay"
+        else True
     ),
     "runtime_cold_offload_disabled": runtime_offload_issued == 0,
     "no_runtime_offload_actions": sum(offload_actions.values()) == 0,
@@ -492,11 +819,35 @@ payload = {
     "driver_positive_results": driver_positive_results,
     "driver_results": driver_results[:20],
     "requested_executor": requested_executor,
+    "requested_prefetch_source": requested_prefetch_source,
     "require_driver": require_driver,
     "init_weight_offload_enabled": init_weight_offload_enabled,
     "runtime_prefetch_enabled": runtime_prefetch_enabled,
     "max_init_batch_size": max(init_batch_sizes or [0]),
     "max_runtime_batch_size": max(runtime_batch_sizes or [0]),
+    "runtime_summary_records": runtime_summary_records,
+    "runtime_candidate_expert_records": runtime_candidate_expert_records,
+    "runtime_expert_resident_skip_records": runtime_expert_resident_skip_records,
+    "runtime_filtered_noop_records": runtime_filtered_noop_records,
+    "runtime_candidate_records": runtime_candidate_records,
+    "runtime_resident_skip_records": runtime_resident_skip_records,
+    "runtime_cooldown_skip_records": runtime_cooldown_skip_records,
+    "runtime_oracle_replay_records": runtime_oracle_replay_records,
+    "runtime_oracle_match_records": runtime_oracle_match_records,
+    "runtime_oracle_mismatch_records": runtime_oracle_mismatch_records,
+    "runtime_oracle_missing_records": runtime_oracle_missing_records,
+    "runtime_prefetch_access_probe_records": runtime_prefetch_access_probe_records,
+    "runtime_prefetch_before_access_candidates": runtime_prefetch_before_access_candidates,
+    "runtime_prefetch_hit_before_access_estimated": runtime_prefetch_hit_before_access_estimated,
+    "runtime_prefetch_miss_before_access_estimated": runtime_prefetch_miss_before_access_estimated,
+    "runtime_prefetch_hit_before_access_estimated_rate": runtime_prefetch_hit_estimated_rate,
+    "runtime_prefetch_same_step_access": runtime_prefetch_same_step_access,
+    "runtime_prefetch_access_no_prior_prefetch": runtime_prefetch_access_no_prior_prefetch,
+    "runtime_prefetch_hit_before_access_real_query_records": runtime_prefetch_real_query_records,
+    "runtime_prefetch_hit_before_access_real_query_ranges": runtime_prefetch_real_query_ranges,
+    "runtime_prefetch_hit_before_access_real_queried_bytes": runtime_prefetch_real_queried_bytes,
+    "runtime_prefetch_hit_before_access_real_gpu_bytes": runtime_prefetch_real_gpu_bytes,
+    "runtime_prefetch_hit_before_access_real_gpu_ratio": runtime_prefetch_real_gpu_ratio,
     "failed_requests": failed_requests,
     "exit_code": exit_code,
     "runtime_offload_issued": runtime_offload_issued,
@@ -516,6 +867,7 @@ lines.extend([
     f"- init_executors: {dict(init_executors)}",
     f"- prefetch_executors: {dict(prefetch_executors)}",
     f"- requested_executor: {requested_executor}",
+    f"- requested_prefetch_source: {requested_prefetch_source}",
     f"- driver_records: {driver_records}",
     f"- fallback_records: {fallback_records}",
     f"- driver_success_records: {driver_success_records}",
@@ -523,6 +875,29 @@ lines.extend([
     f"- sample_driver_results: {driver_results[:8]}",
     f"- max_init_batch_size: {payload['max_init_batch_size']}",
     f"- max_runtime_batch_size: {payload['max_runtime_batch_size']}",
+    f"- runtime_summary_records: {runtime_summary_records}",
+    f"- runtime_candidate_expert_records: {runtime_candidate_expert_records}",
+    f"- runtime_expert_resident_skip_records: {runtime_expert_resident_skip_records}",
+    f"- runtime_filtered_noop_records: {runtime_filtered_noop_records}",
+    f"- runtime_candidate_records: {runtime_candidate_records}",
+    f"- runtime_resident_skip_records: {runtime_resident_skip_records}",
+    f"- runtime_cooldown_skip_records: {runtime_cooldown_skip_records}",
+    f"- runtime_oracle_replay_records: {runtime_oracle_replay_records}",
+    f"- runtime_oracle_match_records: {runtime_oracle_match_records}",
+    f"- runtime_oracle_mismatch_records: {runtime_oracle_mismatch_records}",
+    f"- runtime_oracle_missing_records: {runtime_oracle_missing_records}",
+    f"- runtime_prefetch_access_probe_records: {runtime_prefetch_access_probe_records}",
+    f"- runtime_prefetch_before_access_candidates: {runtime_prefetch_before_access_candidates}",
+    f"- runtime_prefetch_hit_before_access_estimated: {runtime_prefetch_hit_before_access_estimated}",
+    f"- runtime_prefetch_miss_before_access_estimated: {runtime_prefetch_miss_before_access_estimated}",
+    f"- runtime_prefetch_hit_before_access_estimated_rate: {runtime_prefetch_hit_estimated_rate}",
+    f"- runtime_prefetch_same_step_access: {runtime_prefetch_same_step_access}",
+    f"- runtime_prefetch_access_no_prior_prefetch: {runtime_prefetch_access_no_prior_prefetch}",
+    f"- runtime_prefetch_hit_before_access_real_query_records: {runtime_prefetch_real_query_records}",
+    f"- runtime_prefetch_hit_before_access_real_query_ranges: {runtime_prefetch_real_query_ranges}",
+    f"- runtime_prefetch_hit_before_access_real_queried_bytes: {runtime_prefetch_real_queried_bytes}",
+    f"- runtime_prefetch_hit_before_access_real_gpu_bytes: {runtime_prefetch_real_gpu_bytes}",
+    f"- runtime_prefetch_hit_before_access_real_gpu_ratio: {runtime_prefetch_real_gpu_ratio}",
     f"- prefetch_sources: {dict(prefetch_sources)}",
     f"- runtime_offload_issued: {runtime_offload_issued}",
 ])

@@ -32,6 +32,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report-md", type=Path, default=None)
     parser.add_argument("--hot-experts-per-layer", type=int, default=16)
     parser.add_argument("--cold-experts-per-layer", type=int, default=16)
+    parser.add_argument(
+        "--policy",
+        choices=("routing_heatmap_v1", "exact_used_oracle"),
+        default="routing_heatmap_v1",
+        help=(
+            "routing_heatmap_v1 keeps the existing top-hot/bottom-cold policy; "
+            "exact_used_oracle puts every observed expert in prefetch_plan and "
+            "every unobserved expert in offload_plan."
+        ),
+    )
     parser.add_argument("--fallback-layers", type=int, default=48)
     parser.add_argument("--fallback-experts", type=int, default=128)
     parser.add_argument(
@@ -53,6 +63,18 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Fail if fewer routing records are parsed.",
     )
+    parser.add_argument(
+        "--min-num-tokens",
+        type=int,
+        default=None,
+        help="Only count routing records with num_tokens >= this value.",
+    )
+    parser.add_argument(
+        "--max-num-tokens",
+        type=int,
+        default=None,
+        help="Only count routing records with num_tokens <= this value.",
+    )
     return parser.parse_args()
 
 
@@ -70,9 +92,13 @@ def layer_id_from_name(name: str) -> int | None:
 
 def read_routing_counts(
     routing_trace: Path,
-) -> tuple[dict[int, Counter[int]], int, int]:
+    *,
+    min_num_tokens: int | None = None,
+    max_num_tokens: int | None = None,
+) -> tuple[dict[int, Counter[int]], int, int, int]:
     counts: dict[int, Counter[int]] = defaultdict(Counter)
-    num_records = 0
+    records_seen = 0
+    records_used = 0
     max_experts_seen = 0
 
     with routing_trace.open("r", encoding="utf-8", errors="replace") as handle:
@@ -100,20 +126,33 @@ def read_routing_counts(
             expert_counts = record.get("expert_token_counts") or {}
             if not isinstance(expert_counts, dict):
                 continue
+            records_seen += 1
+
+            if min_num_tokens is not None or max_num_tokens is not None:
+                try:
+                    num_tokens = int(record.get("num_tokens"))
+                except (TypeError, ValueError):
+                    continue
+                if min_num_tokens is not None and num_tokens < min_num_tokens:
+                    continue
+                if max_num_tokens is not None and num_tokens > max_num_tokens:
+                    continue
+
             for expert_id, count in expert_counts.items():
                 try:
                     counts[layer_id][int(expert_id)] += int(count)
                 except (TypeError, ValueError):
                     continue
-            num_records += 1
+            records_used += 1
 
-    return counts, num_records, max_experts_seen
+    return counts, records_seen, records_used, max_experts_seen
 
 
 def build_plan(
     *,
     counts: dict[int, Counter[int]],
-    num_records: int,
+    records_seen: int,
+    records_used: int,
     num_experts: int,
     layers: list[int],
     hot_experts_per_layer: int,
@@ -121,6 +160,9 @@ def build_plan(
     target_roles: list[str],
     cold_require_zero_hit: bool,
     routing_trace: Path,
+    policy: str,
+    min_num_tokens: int | None,
+    max_num_tokens: int | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     prefetch_plan: list[dict[str, Any]] = []
     offload_plan: list[dict[str, Any]] = []
@@ -130,26 +172,44 @@ def build_plan(
         layer_counts = counts.get(layer_id, Counter())
         all_experts = list(range(num_experts))
 
-        ranked_hot = sorted(
-            all_experts,
-            key=lambda expert_id: (-layer_counts.get(expert_id, 0), expert_id),
-        )
-        ranked_cold = sorted(
-            all_experts,
-            key=lambda expert_id: (layer_counts.get(expert_id, 0), expert_id),
-        )
+        if policy == "exact_used_oracle":
+            hot = [
+                expert_id
+                for expert_id in all_experts
+                if layer_counts.get(expert_id, 0) > 0
+            ]
+            cold = [
+                expert_id
+                for expert_id in all_experts
+                if layer_counts.get(expert_id, 0) == 0
+            ]
+            plan_policy = "exact_used_oracle_v1"
+            hot_reason = "exact_used_oracle_observed"
+            cold_reason = "exact_used_oracle_unobserved"
+        else:
+            ranked_hot = sorted(
+                all_experts,
+                key=lambda expert_id: (-layer_counts.get(expert_id, 0), expert_id),
+            )
+            ranked_cold = sorted(
+                all_experts,
+                key=lambda expert_id: (layer_counts.get(expert_id, 0), expert_id),
+            )
 
-        hot = ranked_hot[: max(hot_experts_per_layer, 0)]
-        hot_set = set(hot)
-        cold: list[int] = []
-        for expert_id in ranked_cold:
-            if expert_id in hot_set:
-                continue
-            if cold_require_zero_hit and layer_counts.get(expert_id, 0) != 0:
-                continue
-            cold.append(expert_id)
-            if len(cold) >= max(cold_experts_per_layer, 0):
-                break
+            hot = ranked_hot[: max(hot_experts_per_layer, 0)]
+            hot_set = set(hot)
+            cold = []
+            for expert_id in ranked_cold:
+                if expert_id in hot_set:
+                    continue
+                if cold_require_zero_hit and layer_counts.get(expert_id, 0) != 0:
+                    continue
+                cold.append(expert_id)
+                if len(cold) >= max(cold_experts_per_layer, 0):
+                    break
+            plan_policy = "routing_heatmap_v1"
+            hot_reason = "routing_heatmap_top_hot"
+            cold_reason = "routing_heatmap_bottom_cold"
 
         for expert_id in hot:
             prefetch_plan.append(
@@ -157,7 +217,7 @@ def build_plan(
                     "layer_id": layer_id,
                     "expert_id": expert_id,
                     "score": layer_counts.get(expert_id, 0),
-                    "reason": "routing_heatmap_top_hot",
+                    "reason": hot_reason,
                 }
             )
         for expert_id in cold:
@@ -166,7 +226,7 @@ def build_plan(
                     "layer_id": layer_id,
                     "expert_id": expert_id,
                     "score": layer_counts.get(expert_id, 0),
-                    "reason": "routing_heatmap_bottom_cold",
+                    "reason": cold_reason,
                 }
             )
 
@@ -175,6 +235,12 @@ def build_plan(
                 "layer_id": layer_id,
                 "observed_experts": len(layer_counts),
                 "total_tokens": sum(layer_counts.values()),
+                "used_experts": sum(
+                    1 for expert_id in all_experts if layer_counts.get(expert_id, 0) > 0
+                ),
+                "unused_experts": sum(
+                    1 for expert_id in all_experts if layer_counts.get(expert_id, 0) == 0
+                ),
                 "hot": [
                     {"expert_id": expert_id, "score": layer_counts.get(expert_id, 0)}
                     for expert_id in hot[:8]
@@ -188,9 +254,14 @@ def build_plan(
 
     plan = {
         "metadata": {
-            "policy": "routing_heatmap_v1",
+            "policy": plan_policy,
+            "requested_policy": policy,
             "routing_trace": str(routing_trace),
-            "routing_records": num_records,
+            "routing_records": records_used,
+            "routing_records_seen": records_seen,
+            "routing_records_used": records_used,
+            "min_num_tokens": min_num_tokens,
+            "max_num_tokens": max_num_tokens,
             "hot_experts_per_layer": hot_experts_per_layer,
             "cold_experts_per_layer": cold_experts_per_layer,
             "cold_require_zero_hit": cold_require_zero_hit,
@@ -219,6 +290,11 @@ def write_report(
         "",
         f"- routing_trace: `{routing_trace}`",
         f"- routing_records: {metadata['routing_records']}",
+        f"- routing_records_seen: {metadata.get('routing_records_seen')}",
+        f"- routing_records_used: {metadata.get('routing_records_used')}",
+        f"- min_num_tokens: {metadata.get('min_num_tokens')}",
+        f"- max_num_tokens: {metadata.get('max_num_tokens')}",
+        f"- policy: {metadata['policy']}",
         f"- layers: {metadata['num_layers']}",
         f"- experts_per_layer: {metadata['num_experts']}",
         f"- hot_experts_per_layer: {metadata['hot_experts_per_layer']}",
@@ -235,6 +311,8 @@ def write_report(
                 "",
                 f"### Layer {item['layer_id']}",
                 f"- observed_experts: {item['observed_experts']}",
+                f"- used_experts: {item['used_experts']}",
+                f"- unused_experts: {item['unused_experts']}",
                 f"- total_tokens: {item['total_tokens']}",
                 f"- hot_sample: {item['hot']}",
                 f"- cold_sample: {item['cold']}",
@@ -248,11 +326,15 @@ def main() -> int:
     if not args.routing_trace.exists():
         raise SystemExit(f"routing trace not found: {args.routing_trace}")
 
-    counts, num_records, max_experts_seen = read_routing_counts(args.routing_trace)
-    if num_records < args.min_routing_records:
+    counts, records_seen, records_used, max_experts_seen = read_routing_counts(
+        args.routing_trace,
+        min_num_tokens=args.min_num_tokens,
+        max_num_tokens=args.max_num_tokens,
+    )
+    if records_used < args.min_routing_records:
         raise SystemExit(
             "not enough routing records: "
-            f"{num_records} < {args.min_routing_records}"
+            f"{records_used} < {args.min_routing_records}"
         )
 
     layers = sorted(counts) if counts else list(range(max(args.fallback_layers, 0)))
@@ -265,7 +347,8 @@ def main() -> int:
     target_roles = [role.strip() for role in args.target_roles.split(",") if role.strip()]
     plan, layer_summaries = build_plan(
         counts=counts,
-        num_records=num_records,
+        records_seen=records_seen,
+        records_used=records_used,
         num_experts=num_experts,
         layers=layers,
         hot_experts_per_layer=args.hot_experts_per_layer,
@@ -273,6 +356,9 @@ def main() -> int:
         target_roles=target_roles,
         cold_require_zero_hit=args.cold_require_zero_hit,
         routing_trace=args.routing_trace,
+        policy=args.policy,
+        min_num_tokens=args.min_num_tokens,
+        max_num_tokens=args.max_num_tokens,
     )
 
     args.output_plan.parent.mkdir(parents=True, exist_ok=True)
@@ -289,7 +375,9 @@ def main() -> int:
             layer_summaries=layer_summaries,
         )
 
-    print(f"routing_records={num_records}")
+    print(f"routing_records_seen={records_seen}")
+    print(f"routing_records_used={records_used}")
+    print(f"routing_records={records_used}")
     print(f"layers={len(layers)}")
     print(f"experts_per_layer={num_experts}")
     print(f"prefetch_plan_records={plan['prefetch_plan_records']}")

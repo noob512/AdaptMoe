@@ -518,6 +518,7 @@ class UvmPoolResidencyManager:
             after_pool = self._pool_estimated_bytes.get(region.pool, 0)
             region.state = state
             region.estimated_gpu_resident = new_estimated
+            region.metadata.update(metadata)
             region.last_state_update_ts = time.time()
             self._summary["state_updates"] += 1
             self._write_locked(

@@ -75,6 +75,9 @@ class UvmPoolCoordinator:
     def __init__(self) -> None:
         self.enabled = _read_bool_env("VLLM_UVM_POOL_COORDINATOR_ENABLE", False)
         self.mode = _read_mode_env()
+        self.trace_enabled = _read_bool_env(
+            "VLLM_UVM_POOL_COORDINATOR_TRACE_ENABLE", True
+        )
         self.trace_file = os.environ.get(
             "VLLM_UVM_POOL_COORDINATOR_TRACE_FILE",
             "vllm_uvm_pool_coordinator_stage_k.jsonl",
@@ -117,7 +120,7 @@ class UvmPoolCoordinator:
 
     @property
     def active(self) -> bool:
-        return self.enabled and bool(self.trace_file)
+        return self.enabled
 
     def request_action(
         self,
@@ -321,7 +324,7 @@ class UvmPoolCoordinator:
         self._write_locked({"action": "coordinator_summary", **self._summary})
 
     def _write_locked(self, record: dict[str, Any]) -> None:
-        if not self.trace_file:
+        if not self.trace_enabled or not self.trace_file:
             return
         record.setdefault("ts", time.time())
         record.setdefault("stage", "stage_k")

@@ -320,6 +320,8 @@ class KVCacheManager:
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:
+            self._maybe_protect_active_kv_blocks(request.request_id,
+                                                 "allocate_slots_delay_cache")
             return self.create_kv_cache_blocks(new_blocks)
 
         # NOTE(woosuk): We want to commit (cache) up to num_computed_tokens +
@@ -330,8 +332,18 @@ class KVCacheManager:
             num_computed_tokens + num_new_tokens, request.num_tokens
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        self._maybe_protect_active_kv_blocks(request.request_id,
+                                             "allocate_slots")
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def _maybe_protect_active_kv_blocks(self, request_id: str, reason: str) -> None:
+        """Submit active KV protection for the request's current block table."""
+        self.uvm_kv_runtime_policy.protect_active_blocks(
+            request_id=request_id,
+            blocks_by_group=self.coordinator.get_blocks(request_id),
+            reason=reason,
+        )
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

@@ -24,6 +24,7 @@ STARTUP_TIMEOUT=600
 CHECK_INTERVAL=2
 SERVER_MAX_NUM_SEQS="${VLLM_SERVER_MAX_NUM_SEQS:-8}"
 SERVER_GPU_MEMORY_UTILIZATION="${VLLM_SERVER_GPU_MEMORY_UTILIZATION:-0.85}"
+SERVER_MAX_MODEL_LEN="${VLLM_SERVER_MAX_MODEL_LEN:-}"
 UVM_PHASE_F_ROUTE_LOG_DELAY_MS="${UVM_PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
 
 DATASET_PATH="${DATASET_PATH:-$SCRIPT_DIR/datasets/ShareGPT_V3_unfiltered_cleaned_split.json}"
@@ -40,6 +41,7 @@ UVM_POLICY_ENABLE="${VLLM_UVM_POLICY_ENABLE:-1}"
 UVM_POLICY_MODE="${VLLM_UVM_POLICY_MODE:-trace_only}"
 UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES="${VLLM_UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES:-1048576}"
 UVM_POLICY_WARMUP_ADVISE_GPU="${VLLM_UVM_POLICY_WARMUP_ADVISE_GPU:-0}"
+UVM_POLICY_RUNTIME_ENABLE="${VLLM_UVM_POLICY_RUNTIME_ENABLE:-0}"
 UVM_UNKNOWN_DETAIL_ENABLE="${VLLM_UVM_UNKNOWN_DETAIL_ENABLE:-0}"
 UVM_UNKNOWN_DETAIL_MIN_BYTES="${VLLM_UVM_UNKNOWN_DETAIL_MIN_BYTES:-0}"
 UVM_GAP_WATCH_ENABLE="${VLLM_UVM_GAP_WATCH_ENABLE:-0}"
@@ -70,6 +72,10 @@ UVM_KV_RUNTIME_EVICTION_POLICY="${VLLM_UVM_KV_RUNTIME_EVICTION_POLICY:-lru_prefi
 UVM_KV_RUNTIME_CANDIDATE_LIMIT="${VLLM_UVM_KV_RUNTIME_CANDIDATE_LIMIT:-16}"
 UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE="${VLLM_UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE:-0}"
 UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS="${VLLM_UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS:-0}"
+UVM_KV_ACTIVE_PROTECT_ENABLE="${VLLM_UVM_KV_ACTIVE_PROTECT_ENABLE:-0}"
+UVM_KV_ACTIVE_PROTECT_MODE="${VLLM_UVM_KV_ACTIVE_PROTECT_MODE:-trace_only}"
+UVM_KV_ACTIVE_PROTECT_DEVICE="${VLLM_UVM_KV_ACTIVE_PROTECT_DEVICE:-0}"
+UVM_KV_ACTIVE_PROTECT_MAX_BLOCKS="${VLLM_UVM_KV_ACTIVE_PROTECT_MAX_BLOCKS:-0}"
 UVM_WEIGHT_BUDGET_BYTES="${VLLM_UVM_WEIGHT_BUDGET_BYTES:-0}"
 UVM_WEIGHT_BUDGET_MODE="${VLLM_UVM_WEIGHT_BUDGET_MODE:-trace_only}"
 UVM_WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE="${VLLM_UVM_WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE:-0}"
@@ -247,6 +253,8 @@ Options:
                              Min warmup allocation size for policy prefetch (default: 1048576)
   --uvm-policy-warmup-advise-gpu <0|1>
                              Also set PreferredLocation=GPU for warmup policy prefetch (default: 0)
+  --uvm-policy-runtime-enable <0|1>
+                             Enable Stage M in-process policy runtime facade.
   --uvm-unknown-detail-enable <0|1>
                              Emit TRACE_UNKNOWN_DETAIL for unknown_managed allocations (default: 0)
   --uvm-unknown-detail-min-bytes <n>
@@ -325,6 +333,15 @@ Options:
   --uvm-kv-runtime-prefix-evict-max-blocks <n>
                              Max prefix-cache free blocks to evict per pressure
                              event. 0 means use pressure_blocks.
+  --uvm-kv-active-protect-enable <0|1>
+                             Enable Stage M active KV protection.
+  --uvm-kv-active-protect-mode <mode>
+                             Active KV protection mode:
+                             trace_only|advise|prefetch|advise_prefetch.
+  --uvm-kv-active-protect-device <int>
+                             GPU device id for active KV prefetch/advise.
+  --uvm-kv-active-protect-max-blocks <n>
+                             Max active KV blocks to protect per request; 0 means all.
   --uvm-weight-budget-bytes <n>
                              Stage E model weights logical budget in bytes.
                              0 means unlimited telemetry-only budget (default: 0)
@@ -532,6 +549,7 @@ Options:
   --server-max-num-seqs <n>  vLLM server --max-num-seqs (default: 8)
   --server-gpu-memory-utilization <f>
                              vLLM server --gpu-memory-utilization (default: 0.85)
+  --max-model-len <n>        vLLM server --max-model-len
   --with-address-log         Also enable per-fault address logs
   --no-cleanup               Skip workloads/cleanup_gpu.py before run
   --no-bench                 Configure params only, do not run benchmark
@@ -694,6 +712,7 @@ start_server() {
                 VLLM_UVM_POLICY_MODE='$UVM_POLICY_MODE' \
                 VLLM_UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES='$UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES' \
                 VLLM_UVM_POLICY_WARMUP_ADVISE_GPU='$UVM_POLICY_WARMUP_ADVISE_GPU' \
+                VLLM_UVM_POLICY_RUNTIME_ENABLE='$UVM_POLICY_RUNTIME_ENABLE' \
                 VLLM_UVM_UNKNOWN_DETAIL_ENABLE='$UVM_UNKNOWN_DETAIL_ENABLE' \
                 VLLM_UVM_UNKNOWN_DETAIL_MIN_BYTES='$UVM_UNKNOWN_DETAIL_MIN_BYTES' \
                 VLLM_UVM_GAP_WATCH_ENABLE='$UVM_GAP_WATCH_ENABLE' \
@@ -724,6 +743,10 @@ start_server() {
                 VLLM_UVM_KV_RUNTIME_CANDIDATE_LIMIT='$UVM_KV_RUNTIME_CANDIDATE_LIMIT' \
                 VLLM_UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE='$UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE' \
                 VLLM_UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS='$UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS' \
+                VLLM_UVM_KV_ACTIVE_PROTECT_ENABLE='$UVM_KV_ACTIVE_PROTECT_ENABLE' \
+                VLLM_UVM_KV_ACTIVE_PROTECT_MODE='$UVM_KV_ACTIVE_PROTECT_MODE' \
+                VLLM_UVM_KV_ACTIVE_PROTECT_DEVICE='$UVM_KV_ACTIVE_PROTECT_DEVICE' \
+                VLLM_UVM_KV_ACTIVE_PROTECT_MAX_BLOCKS='$UVM_KV_ACTIVE_PROTECT_MAX_BLOCKS' \
                 VLLM_UVM_WEIGHT_BUDGET_BYTES='$UVM_WEIGHT_BUDGET_BYTES' \
                 VLLM_UVM_WEIGHT_BUDGET_MODE='$UVM_WEIGHT_BUDGET_MODE' \
                 VLLM_UVM_WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE='$UVM_WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE' \
@@ -838,6 +861,10 @@ start_server() {
                 VLLM_UVM_SCRATCH_POOL_TARGET_PHASES='$UVM_SCRATCH_POOL_TARGET_PHASES'"
 
     # 3. 构造服务器启动指令
+    local max_model_len_arg=""
+    if [ -n "$SERVER_MAX_MODEL_LEN" ]; then
+      max_model_len_arg="--max-model-len '$SERVER_MAX_MODEL_LEN'"
+    fi
     local server_cmd
     # 指令解析：
     # - cd '$SCRIPT_DIR': 切换到脚本目录，确保相对路径正确
@@ -858,6 +885,7 @@ start_server() {
                 uv run vllm serve '$MODEL' \
                 --enforce-eager \
                 --max-num-seqs '$SERVER_MAX_NUM_SEQS' \
+                $max_model_len_arg \
                 --gpu-memory-utilization '$SERVER_GPU_MEMORY_UTILIZATION' \
                 --port '$PORT' > '$SERVER_LOG' 2>&1"
 
@@ -1198,6 +1226,7 @@ parse_args() {
       --uvm-policy-mode) UVM_POLICY_MODE="$2"; shift 2 ;; # allocator policy 模式
       --uvm-policy-warmup-prefetch-min-bytes) UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES="$2"; shift 2 ;; # warmup prefetch 最小阈值
       --uvm-policy-warmup-advise-gpu) UVM_POLICY_WARMUP_ADVISE_GPU="$2"; shift 2 ;; # warmup prefetch 时是否设置 GPU preferred location
+      --uvm-policy-runtime-enable) UVM_POLICY_RUNTIME_ENABLE="$2"; shift 2 ;; # Stage M in-process policy runtime
       --uvm-unknown-detail-enable) UVM_UNKNOWN_DETAIL_ENABLE="$2"; shift 2 ;; # 是否记录 unknown_managed 细粒度日志
       --uvm-unknown-detail-min-bytes) UVM_UNKNOWN_DETAIL_MIN_BYTES="$2"; shift 2 ;; # unknown_managed 细粒度日志的最小尺寸
       --uvm-gap-watch-enable) UVM_GAP_WATCH_ENABLE="$2"; shift 2 ;; # 是否启用 gap 地址段观察
@@ -1228,6 +1257,10 @@ parse_args() {
       --uvm-kv-runtime-candidate-limit) UVM_KV_RUNTIME_CANDIDATE_LIMIT="$2"; shift 2 ;; # Stage J candidate trace cap
       --uvm-kv-runtime-prefix-evict-enable) UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE="$2"; shift 2 ;; # Stage J prefix-cache executor gate
       --uvm-kv-runtime-prefix-evict-max-blocks) UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS="$2"; shift 2 ;; # Stage J prefix-cache max evict blocks
+      --uvm-kv-active-protect-enable) UVM_KV_ACTIVE_PROTECT_ENABLE="$2"; shift 2 ;; # Stage M active KV protection gate
+      --uvm-kv-active-protect-mode) UVM_KV_ACTIVE_PROTECT_MODE="$2"; shift 2 ;; # Stage M active KV protection action
+      --uvm-kv-active-protect-device) UVM_KV_ACTIVE_PROTECT_DEVICE="$2"; shift 2 ;; # Stage M active KV protection device
+      --uvm-kv-active-protect-max-blocks) UVM_KV_ACTIVE_PROTECT_MAX_BLOCKS="$2"; shift 2 ;; # Stage M active KV block cap
       --uvm-weight-budget-bytes) UVM_WEIGHT_BUDGET_BYTES="$2"; shift 2 ;; # Stage E weights 独立预算，0 表示不限额
       --uvm-weight-budget-mode) UVM_WEIGHT_BUDGET_MODE="$2"; shift 2 ;; # Stage E weight budget 模式 trace_only/enforce
       --uvm-weight-budget-cpu-offload-enable) UVM_WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE="$2"; shift 2 ;; # Stage G allocator-level CPU offload gate
@@ -1346,6 +1379,7 @@ parse_args() {
       --check-interval) CHECK_INTERVAL="$2"; shift 2 ;;     # 设置轮询检查的间隔时间
       --server-max-num-seqs) SERVER_MAX_NUM_SEQS="$2"; shift 2 ;; # 设置 vLLM server 最大并发序列数
       --server-gpu-memory-utilization) SERVER_GPU_MEMORY_UTILIZATION="$2"; shift 2 ;; # 设置 vLLM server 显存利用率
+      --max-model-len) SERVER_MAX_MODEL_LEN="$2"; shift 2 ;; # 设置 vLLM server max model len
 
       # ==========================================
       # 布尔开关类型参数 (Boolean Flags): 只需要出现该选项即可，不需要值
@@ -1425,6 +1459,7 @@ validate_inputs() {
     [[ "$UVM_POLICY_MODE" =~ ^(trace_only|prefetch|warmup_prefetch)$ ]] || die "--uvm-policy-mode must be trace_only, prefetch, or warmup_prefetch"
     [[ "$UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-policy-warmup-prefetch-min-bytes must be a non-negative integer"
     [[ "$UVM_POLICY_WARMUP_ADVISE_GPU" =~ ^[01]$ ]] || die "--uvm-policy-warmup-advise-gpu must be 0 or 1"
+    [[ "$UVM_POLICY_RUNTIME_ENABLE" =~ ^[01]$ ]] || die "--uvm-policy-runtime-enable must be 0 or 1"
     [[ "$UVM_UNKNOWN_DETAIL_ENABLE" =~ ^[01]$ ]] || die "--uvm-unknown-detail-enable must be 0 or 1"
     [[ "$UVM_UNKNOWN_DETAIL_MIN_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-unknown-detail-min-bytes must be a non-negative integer"
     [[ "$UVM_GAP_WATCH_ENABLE" =~ ^[01]$ ]] || die "--uvm-gap-watch-enable must be 0 or 1"
@@ -1451,6 +1486,10 @@ validate_inputs() {
     [[ "$UVM_KV_RUNTIME_CANDIDATE_LIMIT" =~ ^[0-9]+$ ]] || die "--uvm-kv-runtime-candidate-limit must be a non-negative integer"
     [[ "$UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE" =~ ^[01]$ ]] || die "--uvm-kv-runtime-prefix-evict-enable must be 0 or 1"
     [[ "$UVM_KV_RUNTIME_PREFIX_EVICT_MAX_BLOCKS" =~ ^[0-9]+$ ]] || die "--uvm-kv-runtime-prefix-evict-max-blocks must be a non-negative integer"
+    [[ "$UVM_KV_ACTIVE_PROTECT_ENABLE" =~ ^[01]$ ]] || die "--uvm-kv-active-protect-enable must be 0 or 1"
+    [[ "$UVM_KV_ACTIVE_PROTECT_MODE" =~ ^(trace_only|advise|prefetch|advise_prefetch)$ ]] || die "--uvm-kv-active-protect-mode must be trace_only, advise, prefetch, or advise_prefetch"
+    [[ "$UVM_KV_ACTIVE_PROTECT_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-kv-active-protect-device must be an integer"
+    [[ "$UVM_KV_ACTIVE_PROTECT_MAX_BLOCKS" =~ ^[0-9]+$ ]] || die "--uvm-kv-active-protect-max-blocks must be a non-negative integer"
     [[ "$UVM_WEIGHT_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-weight-budget-bytes must be a non-negative integer"
     [[ "$UVM_WEIGHT_BUDGET_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-weight-budget-mode must be trace_only or enforce"
     [[ "$UVM_WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-budget-cpu-offload-enable must be 0 or 1"

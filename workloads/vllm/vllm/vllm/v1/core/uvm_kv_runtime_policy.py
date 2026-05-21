@@ -19,6 +19,7 @@ from vllm.device_allocator.uvm_pool_coordinator import (
     record_uvm_pool_pressure,
     request_uvm_pool_action,
 )
+from vllm.device_allocator.uvm_policy_runtime import get_uvm_policy_runtime
 from vllm.device_allocator.uvm import (
     prefetch_range_to_cpu,
     prefetch_range_to_device,
@@ -124,6 +125,18 @@ class UvmKvRuntimePolicy:
             "trace_only",
             {"trace_only", "prefetch"},
         )
+        self.active_protect_enable = _read_bool_env(
+            "VLLM_UVM_KV_ACTIVE_PROTECT_ENABLE",
+            False,
+        )
+        self.active_protect_mode = _read_action_mode_env(
+            "VLLM_UVM_KV_ACTIVE_PROTECT_MODE",
+            "trace_only",
+            {"trace_only", "advise", "prefetch", "advise_prefetch"},
+        )
+        self.active_protect_max_blocks = _read_int_env(
+            "VLLM_UVM_KV_ACTIVE_PROTECT_MAX_BLOCKS", 0
+        )
         try:
             self.stage_l6_device = int(
                 os.environ.get("VLLM_UVM_RESIDENCY_KV_PREFETCH_DEVICE", "0") or 0
@@ -133,6 +146,17 @@ class UvmKvRuntimePolicy:
                 "Ignoring invalid VLLM_UVM_RESIDENCY_KV_PREFETCH_DEVICE; using 0."
             )
             self.stage_l6_device = 0
+        try:
+            self.active_protect_device = int(
+                os.environ.get("VLLM_UVM_KV_ACTIVE_PROTECT_DEVICE",
+                               str(self.stage_l6_device)) or self.stage_l6_device
+            )
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid VLLM_UVM_KV_ACTIVE_PROTECT_DEVICE; using %d.",
+                self.stage_l6_device,
+            )
+            self.active_protect_device = self.stage_l6_device
         self.stage_l6_max_offload_blocks = _read_int_env(
             "VLLM_UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP", 0
         )
@@ -198,6 +222,11 @@ class UvmKvRuntimePolicy:
             "stage_l6_prefetch_back_issued_records": 0,
             "stage_l6_prefetch_back_fallback_records": 0,
             "stage_l6_unsafe_offload_records": 0,
+            "active_protect_attempt_records": 0,
+            "active_protect_issued_records": 0,
+            "active_protect_fallback_records": 0,
+            "active_protect_blocks": 0,
+            "active_protect_bytes": 0,
         }
 
     @property
@@ -227,6 +256,10 @@ class UvmKvRuntimePolicy:
                 "stage_l6_prefetch_back_enable": self.stage_l6_prefetch_back_enable,
                 "stage_l6_data_offload_mode": self.stage_l6_data_offload_mode,
                 "stage_l6_prefetch_back_mode": self.stage_l6_prefetch_back_mode,
+                "active_protect_enable": self.active_protect_enable,
+                "active_protect_mode": self.active_protect_mode,
+                "active_protect_device": self.active_protect_device,
+                "active_protect_max_blocks": self.active_protect_max_blocks,
                 "stage_l6_max_offload_blocks": self.stage_l6_max_offload_blocks,
                 "stage_l6_pointer_map_file": self.stage_l6_pointer_map_file,
                 "num_kv_cache_groups": self.num_kv_cache_groups,
@@ -338,8 +371,14 @@ class UvmKvRuntimePolicy:
             return
         self._stage_l6_pointer_map_loaded = True
         if (
-            not self.active
-            or not self.stage_l6_data_offload_enable
+            not self.enabled
+            or not (
+                self.stage_l6_data_offload_enable
+                or (
+                    self.active_protect_enable
+                    and self.active_protect_mode != "trace_only"
+                )
+            )
             or not self.stage_l6_pointer_map_file
         ):
             return
@@ -707,6 +746,127 @@ class UvmKvRuntimePolicy:
                     reason=reason,
                     ref_cnt=getattr(block, "ref_cnt", None),
                 )
+
+    def protect_active_blocks(
+        self,
+        *,
+        request_id: str,
+        blocks_by_group: tuple[list[Any], ...],
+        reason: str,
+    ) -> None:
+        """Mark active request KV blocks as protected GPU-resident regions."""
+        if not self.active or not self.active_protect_enable:
+            return
+        self.record_config()
+        if self.active_protect_mode != "trace_only":
+            self._maybe_load_stage_l6_pointer_map()
+
+        runtime = get_uvm_policy_runtime()
+        if not runtime.active:
+            self._write(
+                {
+                    "action": "active_kv_protect_skipped",
+                    "request_id": request_id,
+                    "reason": "policy_runtime_disabled",
+                    "protect_mode": self.active_protect_mode,
+                }
+            )
+            return
+
+        active_region_ids: set[str] = set()
+        candidates: list[tuple[int, int, Any, str]] = []
+        for group_id, blocks in enumerate(blocks_by_group):
+            for block in blocks:
+                block_id = int(getattr(block, "block_id", -1))
+                if block_id < 0 or bool(getattr(block, "is_null", False)):
+                    continue
+                region_id = f"kv:{group_id}:{block_id}"
+                active_region_ids.add(region_id)
+                candidates.append((group_id, block_id, block, region_id))
+
+        if self.active_protect_max_blocks > 0:
+            candidates = candidates[: self.active_protect_max_blocks]
+        if not candidates:
+            self._write(
+                {
+                    "action": "active_kv_protect_noop",
+                    "request_id": request_id,
+                    "reason": reason,
+                    "protect_mode": self.active_protect_mode,
+                }
+            )
+            return
+
+        attempted = 0
+        issued = 0
+        fallback = 0
+        issued_bytes = 0
+        for group_id, block_id, block, region_id in candidates:
+            snapshot = get_uvm_residency_region_snapshot(region_id)
+            ranges = self._stage_l6_pointer_ranges.get(region_id)
+            size_bytes = int(
+                (snapshot or {}).get("bytes")
+                or sum(size for _, size in (ranges or ()))
+                or self.bytes_per_group_block
+            )
+            metadata = dict((snapshot or {}).get("metadata") or {})
+            protect_metadata = {
+                **metadata,
+                "stage": "stage_m",
+                "source": "kv_active_protection",
+                "request_id": request_id,
+                "reason": reason,
+                "block_id": block_id,
+                "group_id": group_id,
+                "ref_cnt": getattr(block, "ref_cnt", None),
+                "is_prefix_cache": getattr(block, "block_hash", None) is not None,
+                "block_hash": _block_hash_to_text(getattr(block, "block_hash", None)),
+                "metadata_only": not bool(ranges),
+            }
+            result = runtime.protect_kv_region(
+                region_id=region_id,
+                block_id=block_id,
+                group_id=group_id,
+                bytes=size_bytes,
+                ranges=ranges,
+                mode=self.active_protect_mode,
+                device=self.active_protect_device,
+                scope_key=f"kv_active:{request_id}",
+                active_region_ids=active_region_ids,
+                metadata=protect_metadata,
+            )
+            attempted += 1
+            if result.issued:
+                issued += 1
+                issued_bytes += result.bytes
+            else:
+                fallback += 1
+            self._write(
+                {
+                    "action": (
+                        "active_kv_protect_issued"
+                        if result.issued
+                        else "active_kv_protect_fallback"
+                    ),
+                    "request_id": request_id,
+                    "region_id": region_id,
+                    "block_id": block_id,
+                    "group_id": group_id,
+                    "bytes": result.bytes,
+                    "range_count": result.range_count,
+                    "protect_mode": result.mode,
+                    "result_reason": result.reason,
+                    "runtime_enabled": result.enabled,
+                    "allowed": result.allowed,
+                }
+            )
+
+        self._summary["active_protect_attempt_records"] += attempted
+        self._summary["active_protect_issued_records"] += issued
+        self._summary["active_protect_fallback_records"] += fallback
+        self._summary["active_protect_blocks"] += issued
+        self._summary["active_protect_bytes"] += issued_bytes
+        self._record_summary()
 
     def on_blocks_freed(self, *, blocks: list[Any], reason: str) -> None:
         if not self.active or not self.stage_l5_metadata_enable:

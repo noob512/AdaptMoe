@@ -1300,7 +1300,114 @@ VLLM_UVM_KV_ACTIVE_PROTECT_MODE=advise_prefetch
 VLLM_UVM_RESIDENCY_KV_POINTER_MAP_FILE=<kv_pointer_map_jsonl>
 ```
 
-### 20.3 Verification
+### 20.3 Completed: KV active protection Phase 5/6 experiment
+
+已完成 Phase 5/6 实验脚本与一次 p10 运行：
+
+```text
+workloads/vllm/run_stage_m_kv_active_protection_p10.sh
+log/stage_m_kv_active_protection_p10_run/kv_active_protection_summary.md
+```
+
+结果说明：
+
+```text
+device_direct_baseline:      KV faults=22928 TPOT=246.07ms tok/s=3.89
+kv_active_trace:             KV faults=34600 TPOT=297.15ms tok/s=3.23
+kv_active_advise_prefetch:   KV faults=41798 TPOT=328.67ms tok/s=2.93
+```
+
+结论：
+
+```text
+active KV block 识别和调用链已经打通。
+trace / advise_prefetch 都能产生 issued 记录，且 fallback=0。
+当前策略没有降低 KV faults，TPOT 和吞吐反而变差。
+因此 KV active protection 先标记为功能闭环完成、性能不达标，继续推进后续 phase。
+```
+
+### 20.4 Completed: scratch size-bucket reuse cache MVP
+
+已实现 Phase 7 第一版 scratch device_direct reuse cache：
+
+```text
+vllm/uvm_test/uvm_allocator.cpp
+```
+
+行为：
+
+```text
+仅在 scratch_pool + device_direct + cuda_malloc_async 路径启用。
+默认关闭。
+free 阶段将合格 scratch device-direct 指针按 size_bucket 保留。
+alloc 阶段先按 size_bucket 分组、exact size 匹配复用。
+cache entry 带 CUDA event，只有释放流上的 event ready 后才允许复用。
+cache 保留的物理显存继续占用 device_direct / scratch pool budget。
+```
+
+新增环境变量：
+
+```bash
+VLLM_UVM_SCRATCH_POOL_REUSE_CACHE_ENABLE=1
+VLLM_UVM_SCRATCH_POOL_REUSE_CACHE_MAX_BYTES=67108864
+VLLM_UVM_SCRATCH_POOL_REUSE_CACHE_MAX_ENTRIES_PER_BUCKET=8
+```
+
+已在通用 runner 中透传：
+
+```text
+workloads/vllm/run_kv_fault_ratio.sh
+```
+
+新增 CLI：
+
+```bash
+--uvm-scratch-pool-reuse-cache-enable <0|1>
+--uvm-scratch-pool-reuse-cache-max-bytes <n>
+--uvm-scratch-pool-reuse-cache-max-entries-per-bucket <n>
+```
+
+已扩展 metrics 汇总：
+
+```text
+workloads/vllm/summarize_gap_watch_metrics.py
+```
+
+新增实验脚本：
+
+```text
+workloads/vllm/run_stage_m_scratch_size_bucket_reuse_cache_ab_p10.sh
+```
+
+对比项：
+
+```text
+scratch_direct_no_cache
+scratch_direct_bucket_cache
+```
+
+核心观测：
+
+```text
+cache_hits
+cache_misses
+cache_fresh_backend_allocations
+cache_inserts
+cache_insert_rejects
+cache_peak_cached_bytes
+TPOT / tok/s / TTFT
+raw replayable faults / dedup faults
+gap2 unknown faults
+```
+
+运行方式：
+
+```bash
+cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
+./run_stage_m_scratch_size_bucket_reuse_cache_ab_p10.sh
+```
+
+### 20.5 Verification
 
 已完成 Python 静态编译检查：
 
@@ -1313,28 +1420,24 @@ python3 -m py_compile \
 
 结果：通过。
 
-### 20.4 Next implementation steps
+当前新增 Phase 7 之后还需要执行：
+
+```bash
+bash -n workloads/vllm/run_kv_fault_ratio.sh
+bash -n workloads/vllm/run_stage_m_scratch_size_bucket_reuse_cache_ab_p10.sh
+python3 -m py_compile workloads/vllm/summarize_gap_watch_metrics.py
+make -C workloads/vllm/vllm/uvm_test uvm
+cp workloads/vllm/vllm/uvm_test/uvm_allocator.so \
+  workloads/vllm/vllm/vllm/uvm_allocator.abi3.so
+```
+
+### 20.6 Next implementation steps
 
 下一批修改建议：
 
-1. 为 scratch device_direct 加 size-bucket reuse cache，降低短生命周期 scratch allocator overhead。
-2. 将 FusedMoE 中已有 hot expert prefetch / cold evict 逐步接入 `uvm_policy_runtime`，先保持行为等价。
-3. 增加 Stage M 专用运行脚本，开启：
-
-```bash
-VLLM_UVM_POLICY_RUNTIME_ENABLE=1
-VLLM_UVM_KV_ACTIVE_PROTECT_ENABLE=1
-VLLM_UVM_KV_ACTIVE_PROTECT_MODE=trace_only
-```
-
-4. 跑一次 wide phase device_direct + KV active trace，对比：
-
-```text
-KV faults
-unknown faults
-weight faults
-TPOT
-active_protect_attempt_records
-active_protect_issued_records
-active_protect_fallback_records
-```
+1. 跑 Phase 7 `scratch_direct_no_cache` vs `scratch_direct_bucket_cache`，确认 allocator overhead 是否下降、TPOT 是否稳定。
+2. 将 FusedMoE 中已有 hot expert prefetch 逐步接入 `uvm_policy_runtime`，先保持行为等价。
+3. 增加 cold expert evict 保守策略，只 evict long-cold experts，先 trace 再 enforce。
+4. 统一全局 HBM BudgetMap，显式协调 `weight_hot_budget + kv_active_budget + scratch_reserved_budget + safety_margin`。
+5. 拆分 compute / prefetch / evict stream，减少同步路径干扰。
+6. 与 vLLM pure CPU offload 做最终 A/B，对比 TPOT、tok/s、failed requests 和 fault 结构。

@@ -343,7 +343,7 @@ lines = [
     f"- summary_json: `{summary_json}`",
     f"- summary_csv: `{summary_csv}`",
     "- baseline: gap-watch trace only; device_direct disabled",
-    "- treatment: gap-watch device_direct; scratch_pool enforce; backend cuda_malloc",
+    f"- treatment: gap-watch device_direct; scratch_pool enforce; backend {direct.get('device_direct_backend_counts')}",
     "- dynamic prefetch/offload/residency policies: disabled",
     "",
     "| case | parsed main faults | weight | unknown | gap2 | gap2/unknown | raw replayable delta | dedup delta | tok/s | TPOT ms | TTFT ms | direct actual | direct peak MiB |",

@@ -113,6 +113,8 @@ def main() -> int:
     device_direct_reason_counter: Counter[str] = Counter()
     lifetime_values: list[float] = []
     session_summary: dict[str, str] = {}
+    current_session_summary: dict[str, str] = {}
+    session_summaries: list[dict[str, str]] = []
     in_summary = False
     device_direct_trace_records = 0
     device_direct_eligible_records = 0
@@ -238,14 +240,19 @@ def main() -> int:
         for line in handle:
             if "Session Summary" in line:
                 in_summary = True
+                current_session_summary = {}
                 continue
             if in_summary:
                 if line.startswith("========================================"):
                     in_summary = False
+                    if current_session_summary:
+                        session_summaries.append(current_session_summary)
                     continue
                 summary_match = SUMMARY_KEY_RE.search(line)
                 if summary_match is not None:
-                    session_summary[summary_match.group("key")] = summary_match.group("value")
+                    current_session_summary[summary_match.group("key")] = (
+                        summary_match.group("value")
+                    )
 
             policy_match = TRACE_POLICY_RE.search(line)
             if policy_match is not None:
@@ -399,6 +406,14 @@ def main() -> int:
                         int(kv_fields["pool_runtime_scratch_live_bytes"])
                     )
                 continue
+
+    if in_summary and current_session_summary:
+        session_summaries.append(current_session_summary)
+    if session_summaries:
+        session_summary = max(
+            session_summaries,
+            key=lambda item: optional_int(item.get("Total allocations")) or 0,
+        )
 
     summary = {
         "allocator_log": str(allocator_log),
@@ -723,6 +738,55 @@ def main() -> int:
             )
         ),
         "scratch_pool_reason_counts": dict(scratch_pool_reason_counter),
+        "scratch_pool_reuse_cache_enabled": optional_bool_from_int(
+            session_summary.get("Scratch pool reuse cache enabled")
+        ),
+        "scratch_pool_reuse_cache_max_bytes": optional_int(
+            session_summary.get("Scratch pool reuse cache max bytes")
+        ),
+        "scratch_pool_reuse_cache_max_entries_per_bucket": optional_int(
+            session_summary.get(
+                "Scratch pool reuse cache max entries per bucket"
+            )
+        ),
+        "scratch_pool_reuse_cache_hits": optional_int(
+            session_summary.get("Scratch pool reuse cache hits")
+        ),
+        "scratch_pool_reuse_cache_misses": optional_int(
+            session_summary.get("Scratch pool reuse cache misses")
+        ),
+        "scratch_pool_reuse_cache_fresh_backend_allocations": optional_int(
+            session_summary.get(
+                "Scratch pool reuse cache fresh backend allocations"
+            )
+        ),
+        "scratch_pool_reuse_cache_inserts": optional_int(
+            session_summary.get("Scratch pool reuse cache inserts")
+        ),
+        "scratch_pool_reuse_cache_insert_rejects": optional_int(
+            session_summary.get("Scratch pool reuse cache insert rejects")
+        ),
+        "scratch_pool_reuse_cache_hit_bytes": optional_int(
+            session_summary.get("Scratch pool reuse cache hit bytes")
+        ),
+        "scratch_pool_reuse_cache_insert_bytes": optional_int(
+            session_summary.get("Scratch pool reuse cache insert bytes")
+        ),
+        "scratch_pool_reuse_cache_cached_bytes": optional_int(
+            session_summary.get("Scratch pool reuse cache cached bytes")
+        ),
+        "scratch_pool_reuse_cache_peak_cached_bytes": optional_int(
+            session_summary.get("Scratch pool reuse cache peak cached bytes")
+        ),
+        "scratch_pool_reuse_cache_cached_entries": optional_int(
+            session_summary.get("Scratch pool reuse cache cached entries")
+        ),
+        "scratch_pool_reuse_cache_event_not_ready": optional_int(
+            session_summary.get("Scratch pool reuse cache event not ready")
+        ),
+        "scratch_pool_reuse_cache_event_errors": optional_int(
+            session_summary.get("Scratch pool reuse cache event errors")
+        ),
         "hot_gap_match_records": hot_gap_match_records,
         "median_lifetime_s": (
             sorted(lifetime_values)[len(lifetime_values) // 2]
@@ -829,6 +893,14 @@ def main() -> int:
     print(f"- scratch_pool_budget_over_records={summary['scratch_pool_budget_over_records']}")
     print(f"- scratch_pool_budget_reject_records={summary['scratch_pool_budget_reject_records']}")
     print(f"- scratch_pool_reason_counts={summary['scratch_pool_reason_counts']}")
+    print(f"- scratch_pool_reuse_cache_enabled={summary['scratch_pool_reuse_cache_enabled']}")
+    print(f"- scratch_pool_reuse_cache_hits={summary['scratch_pool_reuse_cache_hits']}")
+    print(f"- scratch_pool_reuse_cache_misses={summary['scratch_pool_reuse_cache_misses']}")
+    print(f"- scratch_pool_reuse_cache_fresh_backend_allocations={summary['scratch_pool_reuse_cache_fresh_backend_allocations']}")
+    print(f"- scratch_pool_reuse_cache_inserts={summary['scratch_pool_reuse_cache_inserts']}")
+    print(f"- scratch_pool_reuse_cache_insert_rejects={summary['scratch_pool_reuse_cache_insert_rejects']}")
+    print(f"- scratch_pool_reuse_cache_peak_cached_bytes={summary['scratch_pool_reuse_cache_peak_cached_bytes']}")
+    print(f"- scratch_pool_reuse_cache_cached_entries={summary['scratch_pool_reuse_cache_cached_entries']}")
     print(f"- hot_gap_match_records={hot_gap_match_records}")
     print(f"- median_lifetime_s={summary['median_lifetime_s']}")
     return 0

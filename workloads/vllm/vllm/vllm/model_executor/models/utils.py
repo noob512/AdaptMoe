@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import json
+import os
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, overload
@@ -560,15 +563,65 @@ class PPMissingLayer(torch.nn.Identity):
 
 _CPU_OFFLOAD_BYTES = 0
 _CPU_OFFLOAD_MAX_BYTES = 0
+_CPU_OFFLOAD_ORDER = 0
+
+
+def _cpu_offload_manifest_file() -> str:
+    return os.environ.get("VLLM_CPU_OFFLOAD_MANIFEST_FILE", "")
+
+
+def _append_cpu_offload_manifest(record: dict[str, Any]) -> None:
+    manifest_file = _cpu_offload_manifest_file()
+    if not manifest_file:
+        return
+    try:
+        os.makedirs(os.path.dirname(manifest_file) or ".", exist_ok=True)
+        with open(manifest_file, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError as exc:
+        logger.warning(
+            "Failed to append vLLM CPU offload manifest %s: %s",
+            manifest_file,
+            exc,
+        )
 
 
 def set_cpu_offload_max_bytes(max_bytes: int) -> None:
-    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
+    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES, _CPU_OFFLOAD_ORDER
     _CPU_OFFLOAD_BYTES = 0
     _CPU_OFFLOAD_MAX_BYTES = max_bytes
+    _CPU_OFFLOAD_ORDER = 0
+    manifest_file = _cpu_offload_manifest_file()
+    if manifest_file and os.environ.get(
+        "VLLM_CPU_OFFLOAD_MANIFEST_RESET", "1"
+    ) == "1":
+        try:
+            os.makedirs(os.path.dirname(manifest_file) or ".", exist_ok=True)
+            with open(manifest_file, "w", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "event": "cpu_offload_config",
+                            "timestamp": time.time(),
+                            "pid": os.getpid(),
+                            "max_offload_bytes": int(max_bytes),
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+        except OSError as exc:
+            logger.warning(
+                "Failed to initialize vLLM CPU offload manifest %s: %s",
+                manifest_file,
+                exc,
+            )
 
 
-def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
+def maybe_offload_to_cpu(
+    module: torch.nn.Module,
+    module_prefix: str | None = None,
+) -> torch.nn.Module:
     if (params := next(module.parameters(), None)) is None:
         return module
 
@@ -577,7 +630,7 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     if device == torch.device("cpu"):
         return module
 
-    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
+    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES, _CPU_OFFLOAD_ORDER
     if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
         return module
 
@@ -590,11 +643,17 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     # offload parameters to CPU
     # use pin_memory if possible, which helps cudagraph capture speed
     offloaded_parameters = False
-    for p in module.parameters():
+    for param_index, (param_name, p) in enumerate(module.named_parameters()):
         if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
             # we use per-parameter offloading
             # one module might have some parameters offloaded and some not
             break
+        bytes_before = p.data.numel() * p.data.element_size()
+        full_parameter_name = (
+            f"{module_prefix}.{param_name}"
+            if module_prefix and param_name
+            else (module_prefix or param_name)
+        )
 
         # `torch.empty_like` does not support `pin_memory` argument
         cpu_data = torch.empty_strided(
@@ -612,8 +671,36 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
             # keep the cpu data alive
             p._vllm_offloaded_cpu_data = cpu_data
             p.data = get_cuda_view_from_cpu_tensor(cpu_data)
-        _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
+        _CPU_OFFLOAD_BYTES += bytes_before
         offloaded_parameters = True
+        _CPU_OFFLOAD_ORDER += 1
+        _append_cpu_offload_manifest(
+            {
+                "event": "cpu_offload_parameter",
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "module_prefix": module_prefix,
+                "module_class": module.__class__.__name__,
+                "parameter_name": param_name,
+                "full_parameter_name": full_parameter_name,
+                "param_index_in_module": param_index,
+                "offload_order": _CPU_OFFLOAD_ORDER,
+                "shape": list(p.data.size()),
+                "stride": list(p.data.stride()),
+                "dtype": str(p.data.dtype),
+                "bytes": int(bytes_before),
+                "cumulative_offload_bytes": int(_CPU_OFFLOAD_BYTES),
+                "max_offload_bytes": int(_CPU_OFFLOAD_MAX_BYTES),
+                "pin_memory": bool(pin_memory),
+                "uva_available": bool(uva_available),
+                "uva_offloading": bool(uva_offloading),
+                "device_before": str(device),
+                "device_after": str(p.data.device),
+                "cpu_data_pinned": bool(
+                    cpu_data.is_pinned() if hasattr(cpu_data, "is_pinned") else False
+                ),
+            }
+        )
 
     if offloaded_parameters and not uva_offloading:
         original_forward = module.forward
@@ -652,7 +739,10 @@ def make_layers(
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)]
         + [
-            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
+            maybe_offload_to_cpu(
+                layer_fn(prefix=f"{prefix}.{idx}"),
+                module_prefix=f"{prefix}.{idx}",
+            )
             for idx in range(start_layer, end_layer)
         ]
         + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]

@@ -5,6 +5,7 @@ import gc
 import itertools
 import json
 import os
+import re
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -51,6 +52,10 @@ from vllm.distributed.parallel_state import (
     prepare_communication_buffer_for_model,
 )
 from vllm.device_allocator.uvm import (
+    batch_advise_ranges_cpu_with_executor,
+    batch_offload_ranges_to_cpu_with_executor,
+    batch_prefetch_ranges_to_device,
+    probe_driver_capable_range,
     uvm_allocation_phase,
     uvm_enabled_allocation_phase,
 )
@@ -605,6 +610,9 @@ class GPUModelRunner(
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
+        self._layer_timing_hooks: list[Any] = []
+        self._layer_timing_step_id = 0
+        self._layer_timing_context: dict[str, object] = {}
         self.kv_connector_output: KVConnectorOutput | None = None
         self._logged_weight_ptrs: set[int] = set()
         self._logged_kv_ptrs: set[int] = set()
@@ -2768,6 +2776,106 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _layer_timing_phase(
+        self,
+        num_scheduled_tokens_np: np.ndarray,
+        max_num_scheduled_tokens: int,
+        num_reqs: int,
+    ) -> str:
+        if num_reqs > 0 and (
+            max_num_scheduled_tokens == self.uniform_decode_query_len
+        ) and int(num_scheduled_tokens_np.sum()) == (
+            num_reqs * max_num_scheduled_tokens
+        ):
+            return "decode"
+        if max_num_scheduled_tokens == int(num_scheduled_tokens_np.sum()):
+            return "prefill"
+        return "mixed"
+
+    def _setup_layer_timing_hooks(self) -> None:
+        if os.environ.get("VLLM_LAYER_TIMING_ENABLE", "0") != "1":
+            return
+        if self._layer_timing_hooks:
+            return
+        timing_file = os.environ.get("VLLM_LAYER_TIMING_FILE", "")
+        if not timing_file:
+            logger.warning(
+                "VLLM_LAYER_TIMING_ENABLE=1 but VLLM_LAYER_TIMING_FILE is empty"
+            )
+            return
+        os.makedirs(os.path.dirname(timing_file) or ".", exist_ok=True)
+        pattern_text = os.environ.get(
+            "VLLM_LAYER_TIMING_PATTERN",
+            r"model\.layers\.\d+$|model\.layers\.\d+\.(self_attn|mlp)$",
+        )
+        try:
+            pattern = re.compile(pattern_text)
+        except re.error as exc:
+            logger.warning("Invalid VLLM_LAYER_TIMING_PATTERN=%r: %s",
+                           pattern_text, exc)
+            return
+        sync = os.environ.get("VLLM_LAYER_TIMING_SYNC", "1") == "1"
+        min_ms = float(os.environ.get("VLLM_LAYER_TIMING_MIN_MS", "0") or "0")
+        max_records = int(os.environ.get(
+            "VLLM_LAYER_TIMING_MAX_RECORDS", "0"
+        ) or "0")
+        record_count = 0
+
+        def append_record(record: dict[str, object]) -> None:
+            nonlocal record_count
+            if max_records > 0 and record_count >= max_records:
+                return
+            record_count += 1
+            try:
+                with open(timing_file, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
+            except OSError as exc:
+                logger.warning("Failed to write layer timing trace %s: %s",
+                               timing_file, exc)
+
+        def pre_hook(module: nn.Module, args: tuple[object, ...]) -> None:
+            if sync and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            stack = getattr(module, "_vllm_layer_timing_stack", None)
+            if stack is None:
+                stack = []
+                setattr(module, "_vllm_layer_timing_stack", stack)
+            stack.append(time.perf_counter_ns())
+
+        def post_hook(
+            module: nn.Module,
+            args: tuple[object, ...],
+            output: object,
+        ) -> None:
+            stack = getattr(module, "_vllm_layer_timing_stack", None)
+            if not stack:
+                return
+            if sync and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elapsed_ms = (time.perf_counter_ns() - stack.pop()) / 1_000_000.0
+            if elapsed_ms < min_ms:
+                return
+            append_record({
+                "event": "layer_timing",
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "module_name": getattr(module, "_vllm_layer_timing_name", ""),
+                "module_class": module.__class__.__name__,
+                "elapsed_ms": elapsed_ms,
+                "sync": sync,
+                **self._layer_timing_context,
+            })
+
+        model = self.get_model()
+        for name, module in model.named_modules():
+            if not name or not pattern.search(name):
+                continue
+            setattr(module, "_vllm_layer_timing_name", name)
+            self._layer_timing_hooks.append(module.register_forward_pre_hook(pre_hook))
+            self._layer_timing_hooks.append(module.register_forward_hook(post_hook))
+        logger.info("Layer timing hooks installed for %d modules; trace=%s",
+                    len(self._layer_timing_hooks) // 2, timing_file)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2839,6 +2947,11 @@ class GPUModelRunner(
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+                layer_timing_phase = self._layer_timing_phase(
+                    num_scheduled_tokens_np,
+                    max_num_scheduled_tokens,
+                    num_reqs,
+                )
 
                 (
                     logits_indices,
@@ -2926,6 +3039,19 @@ class GPUModelRunner(
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         enabled_step_phase = self._uvm_enabled_step_phase(scheduler_output)
+        self._layer_timing_step_id += 1
+        self._layer_timing_context = {
+            "step_id": self._layer_timing_step_id,
+            "phase": layer_timing_phase,
+            "enabled_step_phase": enabled_step_phase,
+            "num_reqs": int(num_reqs),
+            "num_input_tokens": int(num_input_tokens),
+            "total_num_scheduled_tokens": int(total_num_scheduled_tokens),
+            "max_num_scheduled_tokens": int(max_num_scheduled_tokens),
+            "num_scheduled_tokens": [
+                int(value) for value in num_scheduled_tokens_np.tolist()
+            ],
+        }
         with (
             uvm_allocation_phase(enabled_step_phase),
             set_forward_context(
@@ -4100,6 +4226,7 @@ class GPUModelRunner(
             
             # 为分布式训练/推理准备通信缓冲区（例如为张量并行分配 All-Reduce 缓冲区）
             prepare_communication_buffer_for_model(self.model)
+            self._setup_layer_timing_hooks()
             # 如果存在草稿模型，同样为其准备通信缓冲区
             if (drafter := getattr(self, "drafter", None)) and (
                 drafter_model := getattr(drafter, "model", None)
@@ -4954,6 +5081,7 @@ class GPUModelRunner(
             gc.collect()
 
     def run_uvm_init_time_weight_placement(self) -> None:
+        matched_issued = self._run_uvm_matched_cpu_offload_manifest()
         if os.environ.get("VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE", "0") != "1":
             return
         if getattr(self, "_uvm_init_weight_placement_done", False):
@@ -4978,6 +5106,267 @@ class GPUModelRunner(
                 "Stage M init-time weight placement visited %d MoE modules.",
                 issued_modules,
             )
+        if matched_issued:
+            logger.info(
+                "Stage M matched CPU offload issued %d parameter ranges.",
+                matched_issued,
+            )
+
+    def _load_uvm_matched_cpu_offload_manifest(self) -> list[dict[str, object]]:
+        manifest_file = os.environ.get(
+            "VLLM_UVM_MATCHED_CPU_OFFLOAD_MANIFEST_FILE", ""
+        )
+        if not manifest_file:
+            return []
+        records: list[dict[str, object]] = []
+        seen_names: set[str] = set()
+        try:
+            with open(manifest_file, encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if record.get("event") != "cpu_offload_parameter":
+                        continue
+                    name = record.get("full_parameter_name")
+                    if (
+                        isinstance(name, str)
+                        and name
+                        and name not in seen_names
+                    ):
+                        records.append(record)
+                        seen_names.add(name)
+        except OSError as exc:
+            logger.warning(
+                "Failed to read matched CPU offload manifest %s: %s",
+                manifest_file,
+                exc,
+            )
+        return records
+
+    def _uvm_matched_named_tensor_index(
+        self,
+    ) -> dict[str, tuple[torch.Tensor, str]]:
+        model = self.get_model()
+        index: dict[str, tuple[torch.Tensor, str]] = {}
+        for name, tensor in model.named_parameters(remove_duplicate=False):
+            index.setdefault(name, (tensor, "parameter"))
+        for name, tensor in model.named_buffers(remove_duplicate=False):
+            index.setdefault(name, (tensor, "buffer"))
+        return index
+
+    def _append_uvm_matched_cpu_offload_trace(
+        self,
+        record: dict[str, object],
+    ) -> None:
+        trace_file = os.environ.get("VLLM_UVM_MATCHED_CPU_OFFLOAD_TRACE_FILE", "")
+        if not trace_file:
+            return
+        try:
+            os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
+            with open(trace_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError as exc:
+            logger.warning(
+                "Failed to write matched UVM CPU offload trace %s: %s",
+                trace_file,
+                exc,
+            )
+
+    def _run_uvm_matched_cpu_offload_manifest(self) -> int:
+        if os.environ.get("VLLM_UVM_MATCHED_CPU_OFFLOAD_ENABLE", "0") != "1":
+            return 0
+        if getattr(self, "_uvm_matched_cpu_offload_done", False):
+            return 0
+        self._uvm_matched_cpu_offload_done = True
+
+        manifest_records = self._load_uvm_matched_cpu_offload_manifest()
+        mode = os.environ.get(
+            "VLLM_UVM_MATCHED_CPU_OFFLOAD_MODE", "offload_cpu"
+        )
+        if mode not in {
+            "trace_only",
+            "advise_cpu",
+            "prefetch_cpu",
+            "offload_cpu",
+            "prefetch_gpu",
+        }:
+            logger.warning(
+                "Unknown VLLM_UVM_MATCHED_CPU_OFFLOAD_MODE=%s; using trace_only",
+                mode,
+            )
+            mode = "trace_only"
+        executor = os.environ.get("VLLM_UVM_MATCHED_CPU_OFFLOAD_EXECUTOR", "auto")
+        if executor not in {"cpp_batch", "driver_batch", "auto"}:
+            logger.warning(
+                "Unknown VLLM_UVM_MATCHED_CPU_OFFLOAD_EXECUTOR=%s; using auto",
+                executor,
+            )
+            executor = "auto"
+        sync = os.environ.get("VLLM_UVM_MATCHED_CPU_OFFLOAD_SYNC", "1") == "1"
+        max_bytes = int(os.environ.get(
+            "VLLM_UVM_MATCHED_CPU_OFFLOAD_MAX_BYTES", "0"
+        ) or "0")
+        if not manifest_records:
+            self._append_uvm_matched_cpu_offload_trace(
+                {
+                    "event": "matched_cpu_offload_no_manifest_names",
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "mode": mode,
+                }
+            )
+            return 0
+
+        ranges: list[tuple[int, int]] = []
+        items: list[dict[str, object]] = []
+        attempted_bytes = 0
+        tensor_index = self._uvm_matched_named_tensor_index()
+        matched_names: set[str] = set()
+        for order, record in enumerate(manifest_records, start=1):
+            name = record.get("full_parameter_name")
+            if not isinstance(name, str) or not name:
+                continue
+            tensor_entry = tensor_index.get(name)
+            if tensor_entry is None:
+                self._append_uvm_matched_cpu_offload_trace(
+                    {
+                        "event": "matched_cpu_offload_missing_parameter",
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "parameter_name": name,
+                        "mode": mode,
+                        "manifest_bytes": record.get("bytes"),
+                        "manifest_shape": record.get("shape"),
+                        "manifest_dtype": record.get("dtype"),
+                    }
+                )
+                continue
+            tensor, tensor_kind = tensor_entry
+            bytes_ = int(tensor.numel() * tensor.element_size())
+            if max_bytes > 0 and attempted_bytes + bytes_ > max_bytes:
+                self._append_uvm_matched_cpu_offload_trace(
+                    {
+                        "event": "matched_cpu_offload_budget_reject",
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "parameter_name": name,
+                        "bytes": bytes_,
+                        "attempted_bytes_before": attempted_bytes,
+                        "max_bytes": max_bytes,
+                    }
+                )
+                continue
+            ptr = int(tensor.data_ptr())
+            driver_capable, driver_reason, driver_probe_result = (
+                probe_driver_capable_range(ptr, bytes_)
+            )
+            ranges.append((ptr, bytes_))
+            items.append(
+                {
+                    "event": "matched_cpu_offload_parameter",
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "mode": mode,
+                    "parameter_name": name,
+                    "parameter_order": order,
+                    "tensor_kind": tensor_kind,
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "device": str(tensor.device),
+                    "ptr": f"0x{ptr:x}",
+                    "bytes": bytes_,
+                    "manifest_bytes": record.get("bytes"),
+                    "manifest_shape": record.get("shape"),
+                    "manifest_dtype": record.get("dtype"),
+                    "driver_capable": driver_capable,
+                    "driver_capability_reason": driver_reason,
+                    "driver_probe_result": driver_probe_result,
+                }
+            )
+            attempted_bytes += bytes_
+            matched_names.add(name)
+
+        if not ranges:
+            self._append_uvm_matched_cpu_offload_trace(
+                {
+                    "event": "matched_cpu_offload_no_matched_parameters",
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "mode": mode,
+                    "matched_manifest_count": len(manifest_records),
+                }
+            )
+            return 0
+
+        if mode == "trace_only":
+            successes = len(ranges)
+            executor_used = "trace_only"
+            driver_advise_result = 0
+            driver_prefetch_result = 0
+        elif mode == "advise_cpu":
+            successes, executor_used, driver_advise_result = (
+                batch_advise_ranges_cpu_with_executor(
+                    ranges,
+                    executor=executor,
+                )
+            )
+            driver_prefetch_result = 0
+        elif mode in {"prefetch_cpu", "offload_cpu"}:
+            successes, executor_used, driver_advise_result, driver_prefetch_result = (
+                batch_offload_ranges_to_cpu_with_executor(
+                    ranges,
+                    sync=sync,
+                    executor=executor,
+                )
+            )
+        else:
+            successes = batch_prefetch_ranges_to_device(ranges, device=0)
+            executor_used = "cpp_batch"
+            driver_advise_result = 0
+            driver_prefetch_result = successes
+
+        for index, item in enumerate(items):
+            self._append_uvm_matched_cpu_offload_trace(
+                {
+                    **item,
+                    "success": index < successes,
+                    "batch_successes": successes,
+                    "executor": executor_used,
+                    "requested_executor": executor,
+                    "driver_advise_result": driver_advise_result,
+                    "driver_prefetch_result": driver_prefetch_result,
+                    "sync": sync,
+                    "matched_manifest_count": len(manifest_records),
+                    "matched_parameter_count": len(items),
+                    "attempted_bytes": attempted_bytes,
+                }
+            )
+
+        if sync and successes > 0:
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                logger.debug(
+                    "Failed to synchronize after matched UVM CPU offload",
+                    exc_info=True,
+                )
+        logger.info(
+            "Matched UVM CPU offload mode=%s manifest_names=%d matched=%d "
+            "missing=%d successes=%d attempted_bytes=%d executor=%s",
+            mode,
+            len(manifest_records),
+            len(items),
+            len(manifest_records) - len(matched_names),
+            successes,
+            attempted_bytes,
+            executor_used,
+        )
+        return successes
 
     def capture_model(self) -> int:
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:

@@ -32,6 +32,7 @@
 #include <unistd.h>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -958,6 +959,9 @@ static int scratch_pool_enable = 0;
 static size_t scratch_pool_budget_bytes = 1 * 1024 * 1024;
 static std::string scratch_pool_mode = "trace_only";
 static std::string scratch_pool_target_phases = "enabled:attention";
+static int scratch_pool_reuse_cache_enable = 0;
+static size_t scratch_pool_reuse_cache_max_bytes = 64 * 1024 * 1024;
+static size_t scratch_pool_reuse_cache_max_entries_per_bucket = 8;
 static bool gap_watch_control_seen = false;
 static uint64_t gap_watch_control_mtime_ns = 0;
 static off_t gap_watch_control_size = -1;
@@ -968,9 +972,24 @@ static std::chrono::steady_clock::time_point gap_watch_last_refresh_check =
 static FILE* log_file = nullptr;
 static std::mutex log_mutex;
 static std::mutex device_direct_pool_mutex;
+static std::mutex scratch_pool_reuse_cache_mutex;
 static std::chrono::steady_clock::time_point start_time;
 static bool log_initialized = false;
 static std::string current_phase = "unscoped";
+
+struct ScratchPoolReuseCacheEntry {
+    void* ptr = nullptr;
+    size_t size = 0;
+    int device = -1;
+    std::string size_bucket;
+    cudaEvent_t ready_event = nullptr;
+    bool has_ready_event = false;
+};
+
+static std::unordered_map<std::string, std::vector<ScratchPoolReuseCacheEntry>>
+    scratch_pool_reuse_cache;
+static size_t scratch_pool_reuse_cache_current_bytes = 0;
+static size_t scratch_pool_reuse_cache_current_entries = 0;
 
 // =============================================================================
 // 全局策略遥测与效能评估指标 (Global Policy Telemetry Metrics)
@@ -1164,6 +1183,42 @@ static std::atomic<size_t> scratch_pool_budget_reject_allocs{0};
 
 /// @brief Stage G：runtime scratch pool device-direct free 成功次数。
 static std::atomic<size_t> scratch_pool_device_direct_free_success_allocs{0};
+
+/// @brief Phase 7：scratch device-direct reuse cache 命中次数。
+static std::atomic<size_t> scratch_pool_reuse_cache_hit_allocs{0};
+
+/// @brief Phase 7：scratch device-direct reuse cache 未命中次数。
+static std::atomic<size_t> scratch_pool_reuse_cache_miss_allocs{0};
+
+/// @brief Phase 7：未命中后走新 cudaMallocAsync backend 的次数。
+static std::atomic<size_t> scratch_pool_reuse_cache_fresh_backend_allocs{0};
+
+/// @brief Phase 7：device-direct scratch 释放时被保留进 reuse cache 的次数。
+static std::atomic<size_t> scratch_pool_reuse_cache_insert_allocs{0};
+
+/// @brief Phase 7：device-direct scratch 释放时因容量/事件失败未保留的次数。
+static std::atomic<size_t> scratch_pool_reuse_cache_insert_reject_allocs{0};
+
+/// @brief Phase 7：reuse cache 命中累计复用字节数。
+static std::atomic<size_t> scratch_pool_reuse_cache_hit_bytes{0};
+
+/// @brief Phase 7：reuse cache 成功保留累计字节数。
+static std::atomic<size_t> scratch_pool_reuse_cache_insert_bytes{0};
+
+/// @brief Phase 7：当前 cache 中保留的 device-direct 字节数。
+static std::atomic<size_t> scratch_pool_reuse_cache_cached_bytes{0};
+
+/// @brief Phase 7：cache 保留字节高水位。
+static std::atomic<size_t> scratch_pool_reuse_cache_peak_cached_bytes{0};
+
+/// @brief Phase 7：当前 cache 中保留的条目数。
+static std::atomic<size_t> scratch_pool_reuse_cache_cached_entries{0};
+
+/// @brief Phase 7：cache 条目事件尚未完成导致不能复用的次数。
+static std::atomic<size_t> scratch_pool_reuse_cache_event_not_ready{0};
+
+/// @brief Phase 7：cache 条目事件查询/记录失败次数。
+static std::atomic<size_t> scratch_pool_reuse_cache_event_errors{0};
 
 /**
  * @struct AllocationInfo
@@ -2111,6 +2166,206 @@ static size_t scratch_pool_budget_remaining_snapshot(size_t live) {
         : scratch_pool_budget_bytes - live;
 }
 
+static void update_scratch_pool_reuse_cache_peak_cached(size_t current_cached) {
+    size_t peak = scratch_pool_reuse_cache_peak_cached_bytes.load();
+    while (current_cached > peak) {
+        if (scratch_pool_reuse_cache_peak_cached_bytes.compare_exchange_weak(
+                peak,
+                current_cached
+            )) {
+            break;
+        }
+    }
+}
+
+static bool scratch_pool_reuse_cache_available(void) {
+    return scratch_pool_reuse_cache_enable != 0 &&
+           device_direct_backend == "cuda_malloc_async";
+}
+
+static bool try_pop_scratch_pool_reuse_cache(const char* size_bucket,
+                                             size_t size,
+                                             int device,
+                                             ScratchPoolReuseCacheEntry* out_entry) {
+    if (!out_entry ||
+        !scratch_pool_reuse_cache_available() ||
+        !size_bucket ||
+        size == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(scratch_pool_reuse_cache_mutex);
+    auto bucket_it = scratch_pool_reuse_cache.find(size_bucket);
+    if (bucket_it == scratch_pool_reuse_cache.end()) {
+        scratch_pool_reuse_cache_miss_allocs.fetch_add(1);
+        return false;
+    }
+
+    auto& entries = bucket_it->second;
+    for (size_t i = entries.size(); i > 0; --i) {
+        size_t index = i - 1;
+        ScratchPoolReuseCacheEntry& candidate = entries[index];
+        if (candidate.size != size || candidate.device != device) {
+            continue;
+        }
+
+        if (candidate.has_ready_event && candidate.ready_event != nullptr) {
+            cudaError_t event_status = cudaEventQuery(candidate.ready_event);
+            if (event_status == cudaErrorNotReady) {
+                scratch_pool_reuse_cache_event_not_ready.fetch_add(1);
+                continue;
+            }
+            if (event_status != cudaSuccess) {
+                scratch_pool_reuse_cache_event_errors.fetch_add(1);
+                continue;
+            }
+            cudaEventDestroy(candidate.ready_event);
+            candidate.ready_event = nullptr;
+            candidate.has_ready_event = false;
+        }
+
+        *out_entry = candidate;
+        entries.erase(entries.begin() + index);
+        if (entries.empty()) {
+            scratch_pool_reuse_cache.erase(bucket_it);
+        }
+
+        scratch_pool_reuse_cache_current_bytes =
+            scratch_pool_reuse_cache_current_bytes >= size
+                ? scratch_pool_reuse_cache_current_bytes - size
+                : 0;
+        scratch_pool_reuse_cache_current_entries =
+            scratch_pool_reuse_cache_current_entries > 0
+                ? scratch_pool_reuse_cache_current_entries - 1
+                : 0;
+        scratch_pool_reuse_cache_cached_bytes.store(
+            scratch_pool_reuse_cache_current_bytes
+        );
+        scratch_pool_reuse_cache_cached_entries.store(
+            scratch_pool_reuse_cache_current_entries
+        );
+        scratch_pool_reuse_cache_hit_allocs.fetch_add(1);
+        scratch_pool_reuse_cache_hit_bytes.fetch_add(size);
+        return true;
+    }
+
+    scratch_pool_reuse_cache_miss_allocs.fetch_add(1);
+    return false;
+}
+
+static bool try_insert_scratch_pool_reuse_cache(void* ptr,
+                                                size_t size,
+                                                int device,
+                                                const std::string& size_bucket,
+                                                cudaStream_t stream) {
+    if (!ptr ||
+        !scratch_pool_reuse_cache_available() ||
+        size == 0 ||
+        size_bucket.empty() ||
+        scratch_pool_reuse_cache_max_bytes == 0 ||
+        scratch_pool_reuse_cache_max_entries_per_bucket == 0) {
+        return false;
+    }
+
+    cudaEvent_t ready_event = nullptr;
+    cudaError_t event_err = cudaEventCreateWithFlags(
+        &ready_event,
+        cudaEventDisableTiming
+    );
+    if (event_err != cudaSuccess) {
+        scratch_pool_reuse_cache_event_errors.fetch_add(1);
+        scratch_pool_reuse_cache_insert_reject_allocs.fetch_add(1);
+        return false;
+    }
+    event_err = cudaEventRecord(ready_event, stream);
+    if (event_err != cudaSuccess) {
+        cudaEventDestroy(ready_event);
+        scratch_pool_reuse_cache_event_errors.fetch_add(1);
+        scratch_pool_reuse_cache_insert_reject_allocs.fetch_add(1);
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(scratch_pool_reuse_cache_mutex);
+        auto& entries = scratch_pool_reuse_cache[size_bucket];
+        bool bucket_full =
+            entries.size() >= scratch_pool_reuse_cache_max_entries_per_bucket;
+        bool byte_full =
+            size > scratch_pool_reuse_cache_max_bytes ||
+            scratch_pool_reuse_cache_current_bytes >
+                scratch_pool_reuse_cache_max_bytes - size;
+        if (bucket_full || byte_full) {
+            cudaEventDestroy(ready_event);
+            scratch_pool_reuse_cache_insert_reject_allocs.fetch_add(1);
+            return false;
+        }
+
+        entries.push_back(ScratchPoolReuseCacheEntry{
+            ptr,
+            size,
+            device,
+            size_bucket,
+            ready_event,
+            true,
+        });
+        scratch_pool_reuse_cache_current_bytes += size;
+        scratch_pool_reuse_cache_current_entries += 1;
+        scratch_pool_reuse_cache_cached_bytes.store(
+            scratch_pool_reuse_cache_current_bytes
+        );
+        scratch_pool_reuse_cache_cached_entries.store(
+            scratch_pool_reuse_cache_current_entries
+        );
+        update_scratch_pool_reuse_cache_peak_cached(
+            scratch_pool_reuse_cache_current_bytes
+        );
+    }
+
+    scratch_pool_reuse_cache_insert_allocs.fetch_add(1);
+    scratch_pool_reuse_cache_insert_bytes.fetch_add(size);
+    return true;
+}
+
+static void clear_scratch_pool_reuse_cache(void) {
+    std::vector<ScratchPoolReuseCacheEntry> entries_to_free;
+    {
+        std::lock_guard<std::mutex> lock(scratch_pool_reuse_cache_mutex);
+        for (auto& bucket : scratch_pool_reuse_cache) {
+            for (auto& entry : bucket.second) {
+                entries_to_free.push_back(std::move(entry));
+            }
+        }
+        scratch_pool_reuse_cache.clear();
+        scratch_pool_reuse_cache_current_bytes = 0;
+        scratch_pool_reuse_cache_current_entries = 0;
+        scratch_pool_reuse_cache_cached_bytes.store(0);
+        scratch_pool_reuse_cache_cached_entries.store(0);
+    }
+
+    int previous_device = -1;
+    cudaError_t get_device_err = cudaGetDevice(&previous_device);
+    for (auto& entry : entries_to_free) {
+        if (entry.has_ready_event && entry.ready_event != nullptr) {
+            cudaEventSynchronize(entry.ready_event);
+            cudaEventDestroy(entry.ready_event);
+            entry.ready_event = nullptr;
+            entry.has_ready_event = false;
+        }
+        if (entry.device >= 0) {
+            cudaSetDevice(entry.device);
+        }
+        cudaError_t free_err = cudaFreeAsync(entry.ptr, 0);
+        if (free_err == cudaSuccess) {
+            cudaStreamSynchronize(0);
+        } else {
+            cudaFree(entry.ptr);
+        }
+    }
+    if (get_device_err == cudaSuccess && previous_device >= 0) {
+        cudaSetDevice(previous_device);
+    }
+}
+
 static const char* size_bucket_for(size_t size) {
     if (size < 64 * 1024) return "<64KiB";
     if (size < 256 * 1024) return "64KiB-256KiB";
@@ -2809,6 +3064,20 @@ static void init_log_file() {
             "VLLM_UVM_SCRATCH_POOL_TARGET_PHASES",
             scratch_pool_target_phases.c_str()
         );
+        scratch_pool_reuse_cache_enable =
+            read_bool_from_env(
+                "VLLM_UVM_SCRATCH_POOL_REUSE_CACHE_ENABLE",
+                false
+            ) ? 1 : 0;
+        scratch_pool_reuse_cache_max_bytes = read_size_from_env_allow_zero(
+            "VLLM_UVM_SCRATCH_POOL_REUSE_CACHE_MAX_BYTES",
+            scratch_pool_reuse_cache_max_bytes
+        );
+        scratch_pool_reuse_cache_max_entries_per_bucket =
+            read_size_from_env_allow_zero(
+                "VLLM_UVM_SCRATCH_POOL_REUSE_CACHE_MAX_ENTRIES_PER_BUCKET",
+                scratch_pool_reuse_cache_max_entries_per_bucket
+            );
         uintptr_t parsed_gap_start = 0;
         uintptr_t parsed_gap_end = 0;
         if (read_hex_u64_from_env("VLLM_UVM_GAP_WATCH_START", &parsed_gap_start) &&
@@ -2863,7 +3132,10 @@ static void init_log_file() {
                 "weight_budget_cpu_offload_enable=%d "
                 "pool_registry_enabled=%d "
                 "scratch_pool_enable=%d scratch_pool_budget_bytes=%zu "
-                "scratch_pool_mode=%s scratch_pool_target_phases=%s\n",
+                "scratch_pool_mode=%s scratch_pool_target_phases=%s "
+                "scratch_pool_reuse_cache_enable=%d "
+                "scratch_pool_reuse_cache_max_bytes=%zu "
+                "scratch_pool_reuse_cache_max_entries_per_bucket=%zu\n",
                 timestamp, policy_enabled, policy_mode.c_str(),
                 policy_warmup_prefetch_enabled, policy_warmup_prefetch_min_bytes,
                 policy_warmup_advise_gpu,
@@ -2896,7 +3168,10 @@ static void init_log_file() {
                 scratch_pool_enable,
                 scratch_pool_budget_bytes,
                 scratch_pool_mode.c_str(),
-                scratch_pool_target_phases.c_str()
+                scratch_pool_target_phases.c_str(),
+                scratch_pool_reuse_cache_enable,
+                scratch_pool_reuse_cache_max_bytes,
+                scratch_pool_reuse_cache_max_entries_per_bucket
             );
             fprintf(log_file, "========================================\n");
 
@@ -3977,11 +4252,44 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             ptr != NULL) {
 
         void* device_ptr = NULL;
+        ScratchPoolReuseCacheEntry reuse_cache_entry{};
+        bool scratch_pool_reuse_cache_hit = false;
+        bool device_direct_budget_reserved_for_request = false;
+
+        int previous_device = -1;
+        cudaError_t get_device_err = cudaGetDevice(&previous_device);
+        if (device >= 0) {
+            cudaSetDevice(device);
+        }
 
         // 5.2 预算预留 (Stage C1 核心逻辑)：
         // 在进行任何物理分配前，先尝试在账本中扣除预算（max_total_bytes）。
         // 这确保了纯显存的占用始终在安全范围内，防止因 Direct 分配导致 GPU 整体 OOM。
-        bool budget_reserved = reserve_device_direct_budget(static_cast<size_t>(size));
+        bool use_async_backend = device_direct_backend == "cuda_malloc_async";
+        if (scratch_pool_budget_reserved && use_async_backend) {
+            scratch_pool_reuse_cache_hit = try_pop_scratch_pool_reuse_cache(
+                size_bucket,
+                static_cast<size_t>(size),
+                device,
+                &reuse_cache_entry
+            );
+            if (scratch_pool_reuse_cache_hit) {
+                device_ptr = reuse_cache_entry.ptr;
+                release_scratch_pool_device_direct_budget(
+                    static_cast<size_t>(size)
+                );
+                scratch_pool_budget_reserved = false;
+                scratch_pool_reason = "scratch_pool_reuse_cache_hit";
+            }
+        }
+
+        bool budget_reserved = scratch_pool_reuse_cache_hit;
+        if (!budget_reserved) {
+            budget_reserved = reserve_device_direct_budget(
+                static_cast<size_t>(size)
+            );
+            device_direct_budget_reserved_for_request = budget_reserved;
+        }
 
         if (!budget_reserved) {
             // 如果预算不足，记录原因并增加拒绝计数，随后程序将直接使用原本的 managed (UVM) 指针。
@@ -3993,20 +4301,12 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
                 scratch_pool_reason = "scratch_pool_global_device_direct_budget_exceeded";
             }
         } else {
-            // 5.3 准备执行环境：切换 CUDA 设备
-            int previous_device = -1;
-            cudaError_t get_device_err = cudaGetDevice(&previous_device);
-            if (device >= 0) {
-                cudaSetDevice(device);
-            }
-
             // 5.4 后端选择与配置 (Stage C2 核心逻辑)：
             // 判断是使用同步的 cudaMalloc 还是异步的 cudaMallocAsync。
-            bool use_async_backend = device_direct_backend == "cuda_malloc_async";
             bool pool_config_ready = true;
             std::string pool_config_error_snapshot = "none";
 
-            if (use_async_backend) {
+            if (!scratch_pool_reuse_cache_hit && use_async_backend) {
                 // 如果使用异步后端，尝试配置 CUDA 默认内存池（如设置 Release Threshold）。
                 pool_config_ready = configure_device_direct_async_pool_if_needed(device);
                 if (!pool_config_ready) {
@@ -4018,18 +4318,15 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
 
             // 5.5 执行物理显存申请：
             cudaError_t device_alloc_err = cudaSuccess;
-            if (pool_config_ready) {
+            if (scratch_pool_reuse_cache_hit) {
+                device_alloc_err = cudaSuccess;
+            } else if (pool_config_ready) {
                 // 根据 backend 配置，调用对应的 CUDA API 申请纯显存（GPU-only）。
                 device_alloc_err = use_async_backend
                     ? cudaMallocAsync(&device_ptr, static_cast<size_t>(size), stream)
                     : cudaMalloc(&device_ptr, static_cast<size_t>(size));
             } else {
                 device_alloc_err = cudaErrorInvalidValue;
-            }
-
-            // 5.6 环境恢复：切回之前的 CUDA 设备
-            if (get_device_err == cudaSuccess && previous_device >= 0) {
-                cudaSetDevice(previous_device);
             }
 
             /* ====================================================================
@@ -4053,17 +4350,29 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
                     device_direct_backend_used = device_direct_backend.c_str();
                     policy_action_success = true;
                     policy_action_error = "none";
-                    device_direct_reason = "device_direct_enabled";
-                    if (scratch_pool_budget_reserved) {
+                    device_direct_reason = scratch_pool_reuse_cache_hit
+                        ? "device_direct_reuse_cache_hit"
+                        : "device_direct_enabled";
+                    if (scratch_pool_budget_reserved ||
+                            scratch_pool_reuse_cache_hit) {
                         scratch_pool_device_direct = true;
-                        scratch_pool_reason =
-                            scratch_pool_budget_over_budget
-                                ? "scratch_pool_trace_only_over_budget_device_direct"
-                                : "scratch_pool_device_direct_enabled";
+                        if (scratch_pool_reuse_cache_hit) {
+                            scratch_pool_reason = "scratch_pool_reuse_cache_hit";
+                        } else {
+                            scratch_pool_reason =
+                                scratch_pool_budget_over_budget
+                                    ? "scratch_pool_trace_only_over_budget_device_direct"
+                                    : "scratch_pool_device_direct_enabled";
+                        }
                         scratch_pool_device_direct_allocs.fetch_add(1);
                         scratch_pool_device_direct_bytes.fetch_add(
                             static_cast<size_t>(size)
                         );
+                        if (!scratch_pool_reuse_cache_hit &&
+                                scratch_pool_reuse_cache_available()) {
+                            scratch_pool_reuse_cache_fresh_backend_allocs
+                                .fetch_add(1);
+                        }
                     }
 
                     // 更新统计指标
@@ -4072,14 +4381,23 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
                 } else {
                     // 6.3 异常分支 A：Managed 内存释放失败
                     // 这是一个极其罕见的异常。为了防止内存泄露，必须立刻释放刚申请的 device_ptr。
-                    cudaError_t cleanup_device_err = use_async_backend
-                        ? cudaFreeAsync(device_ptr, stream)
-                        : cudaFree(device_ptr);
+                    cudaError_t cleanup_device_err =
+                        (use_async_backend || scratch_pool_reuse_cache_hit)
+                            ? cudaFreeAsync(device_ptr, stream)
+                            : cudaFree(device_ptr);
 
                     // 释放刚才预留的预算，因为这次替换失败了。
                     if (cleanup_device_err == cudaSuccess) {
-                        release_device_direct_budget(static_cast<size_t>(size));
-                        if (scratch_pool_budget_reserved) {
+                        if (scratch_pool_reuse_cache_hit) {
+                            release_device_direct_budget(static_cast<size_t>(size));
+                            release_scratch_pool_device_direct_budget(
+                                static_cast<size_t>(size)
+                            );
+                        } else if (device_direct_budget_reserved_for_request) {
+                            release_device_direct_budget(static_cast<size_t>(size));
+                        }
+                        if (!scratch_pool_reuse_cache_hit &&
+                                scratch_pool_budget_reserved) {
                             release_scratch_pool_device_direct_budget(
                                 static_cast<size_t>(size)
                             );
@@ -4102,7 +4420,9 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
                 // 如果因为显存不足等原因导致 cudaMalloc(Async) 失败：
 
                 // 释放预留预算
-                release_device_direct_budget(static_cast<size_t>(size));
+                if (device_direct_budget_reserved_for_request) {
+                    release_device_direct_budget(static_cast<size_t>(size));
+                }
                 if (scratch_pool_budget_reserved) {
                     release_scratch_pool_device_direct_budget(
                         static_cast<size_t>(size)
@@ -4136,6 +4456,11 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
                 // 回退（Fallback）：记录回退计数。
                 device_direct_fallback_allocs.fetch_add(1);
             }
+        }
+
+        // 5.6 环境恢复：切回之前的 CUDA 设备
+        if (get_device_err == cudaSuccess && previous_device >= 0) {
+            cudaSetDevice(previous_device);
         }
     }
 
@@ -4534,10 +4859,27 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
             is_device_direct &&
             info.device_direct_backend_name == "cuda_malloc_async";
 
-        // 执行真实的 CUDA 释放操作
-        cudaError_t err = use_async_backend
-            ? cudaFreeAsync(ptr, stream)
-            : cudaFree(ptr);
+        bool retained_in_scratch_reuse_cache = false;
+        if (is_device_direct &&
+                info.scratch_pool_device_direct &&
+                use_async_backend &&
+                scratch_pool_reuse_cache_available()) {
+            retained_in_scratch_reuse_cache = try_insert_scratch_pool_reuse_cache(
+                ptr,
+                info.size,
+                info.device,
+                info.size_bucket,
+                stream
+            );
+        }
+
+        // 执行真实的 CUDA 释放操作；Phase 7 cache 命中时只做逻辑 free，物理指针保留复用。
+        cudaError_t err = cudaSuccess;
+        if (!retained_in_scratch_reuse_cache) {
+            err = use_async_backend
+                ? cudaFreeAsync(ptr, stream)
+                : cudaFree(ptr);
+        }
 
         if (err != cudaSuccess) {
             fprintf(stderr, "[vLLM UVM] %s failed: %s\n",
@@ -4559,11 +4901,13 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
         if (has_info &&
             info.placement_backend_name == "device_direct" &&
             err == cudaSuccess) {
-            release_device_direct_budget(info.size);
-            device_direct_free_success_allocs.fetch_add(1);
-            if (info.scratch_pool_device_direct) {
-                release_scratch_pool_device_direct_budget(info.size);
-                scratch_pool_device_direct_free_success_allocs.fetch_add(1);
+            if (!retained_in_scratch_reuse_cache) {
+                release_device_direct_budget(info.size);
+                device_direct_free_success_allocs.fetch_add(1);
+                if (info.scratch_pool_device_direct) {
+                    release_scratch_pool_device_direct_budget(info.size);
+                    scratch_pool_device_direct_free_success_allocs.fetch_add(1);
+                }
             }
         }
 
@@ -4723,6 +5067,7 @@ void uvm_reset_peak_stats(void) {
  * Reset all statistics
  */
 void uvm_reset_all_stats(void) {
+    clear_scratch_pool_reuse_cache();
     total_allocated.store(0);
     peak_allocated.store(0);
     num_allocs.store(0);
@@ -4775,6 +5120,18 @@ void uvm_reset_all_stats(void) {
     scratch_pool_budget_over_allocs.store(0);
     scratch_pool_budget_reject_allocs.store(0);
     scratch_pool_device_direct_free_success_allocs.store(0);
+    scratch_pool_reuse_cache_hit_allocs.store(0);
+    scratch_pool_reuse_cache_miss_allocs.store(0);
+    scratch_pool_reuse_cache_fresh_backend_allocs.store(0);
+    scratch_pool_reuse_cache_insert_allocs.store(0);
+    scratch_pool_reuse_cache_insert_reject_allocs.store(0);
+    scratch_pool_reuse_cache_hit_bytes.store(0);
+    scratch_pool_reuse_cache_insert_bytes.store(0);
+    scratch_pool_reuse_cache_cached_bytes.store(0);
+    scratch_pool_reuse_cache_peak_cached_bytes.store(0);
+    scratch_pool_reuse_cache_cached_entries.store(0);
+    scratch_pool_reuse_cache_event_not_ready.store(0);
+    scratch_pool_reuse_cache_event_errors.store(0);
 }
 
 /**
@@ -4917,6 +5274,12 @@ void uvm_close_log(void) {
             scratch_pool_mode.c_str());
     fprintf(log_file, "  Scratch pool target phases: %s\n",
             scratch_pool_target_phases.c_str());
+    fprintf(log_file, "  Scratch pool reuse cache enabled: %d\n",
+            scratch_pool_reuse_cache_enable);
+    fprintf(log_file, "  Scratch pool reuse cache max bytes: %zu\n",
+            scratch_pool_reuse_cache_max_bytes);
+    fprintf(log_file, "  Scratch pool reuse cache max entries per bucket: %zu\n",
+            scratch_pool_reuse_cache_max_entries_per_bucket);
     fprintf(log_file, "  Scratch pool trace allocations: %zu\n",
             scratch_pool_trace_allocs.load());
     fprintf(log_file, "  Scratch pool eligible allocations: %zu\n",
@@ -4939,6 +5302,30 @@ void uvm_close_log(void) {
             scratch_pool_budget_reject_allocs.load());
     fprintf(log_file, "  Scratch pool device-direct free success: %zu\n",
             scratch_pool_device_direct_free_success_allocs.load());
+    fprintf(log_file, "  Scratch pool reuse cache hits: %zu\n",
+            scratch_pool_reuse_cache_hit_allocs.load());
+    fprintf(log_file, "  Scratch pool reuse cache misses: %zu\n",
+            scratch_pool_reuse_cache_miss_allocs.load());
+    fprintf(log_file, "  Scratch pool reuse cache fresh backend allocations: %zu\n",
+            scratch_pool_reuse_cache_fresh_backend_allocs.load());
+    fprintf(log_file, "  Scratch pool reuse cache inserts: %zu\n",
+            scratch_pool_reuse_cache_insert_allocs.load());
+    fprintf(log_file, "  Scratch pool reuse cache insert rejects: %zu\n",
+            scratch_pool_reuse_cache_insert_reject_allocs.load());
+    fprintf(log_file, "  Scratch pool reuse cache hit bytes: %zu\n",
+            scratch_pool_reuse_cache_hit_bytes.load());
+    fprintf(log_file, "  Scratch pool reuse cache insert bytes: %zu\n",
+            scratch_pool_reuse_cache_insert_bytes.load());
+    fprintf(log_file, "  Scratch pool reuse cache cached bytes: %zu\n",
+            scratch_pool_reuse_cache_cached_bytes.load());
+    fprintf(log_file, "  Scratch pool reuse cache peak cached bytes: %zu\n",
+            scratch_pool_reuse_cache_peak_cached_bytes.load());
+    fprintf(log_file, "  Scratch pool reuse cache cached entries: %zu\n",
+            scratch_pool_reuse_cache_cached_entries.load());
+    fprintf(log_file, "  Scratch pool reuse cache event not ready: %zu\n",
+            scratch_pool_reuse_cache_event_not_ready.load());
+    fprintf(log_file, "  Scratch pool reuse cache event errors: %zu\n",
+            scratch_pool_reuse_cache_event_errors.load());
     fprintf(log_file, "========================================\n\n");
 
     fflush(log_file);

@@ -723,6 +723,8 @@ gpu_fault_stats_print_common(uvm_parent_gpu_t *parent_gpu, struct seq_file *s)
     NvU64 kv_ratio_x100 = replayable_faults > 0 ? (kv_faults * 10000ULL) / replayable_faults : 0;
     NvU64 kv_after_dedup_ratio_x100 = replayable_after_dedup > 0 ?
                                       (kv_after_dedup * 10000ULL) / replayable_after_dedup : 0;
+    NvU32 pool;
+    NvU32 role;
 
     UVM_ASSERT(uvm_procfs_is_debug_enabled());
 
@@ -738,6 +740,34 @@ gpu_fault_stats_print_common(uvm_parent_gpu_t *parent_gpu, struct seq_file *s)
     UVM_SEQ_OR_DBG_PRINT(s, "kv_after_dedup_ratio   %llu.%02llu%%\n",
                          kv_after_dedup_ratio_x100 / 100ULL,
                          kv_after_dedup_ratio_x100 % 100ULL);
+    UVM_SEQ_OR_DBG_PRINT(s, "faults_by_phase_n_pool:\n");
+    for (pool = 0; pool < UVM_GPU_FAULT_STATS_PHASE_N_POOL_MAX; ++pool) {
+        UVM_SEQ_OR_DBG_PRINT(s, "  pool_%u               %llu\n",
+                             pool,
+                             parent_gpu->fault_buffer.replayable.stats.num_phase_n_faults_by_pool[pool]);
+    }
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_duplicate_faults_by_pool:\n");
+    for (pool = 0; pool < UVM_GPU_FAULT_STATS_PHASE_N_POOL_MAX; ++pool) {
+        UVM_SEQ_OR_DBG_PRINT(s, "  pool_%u               %llu\n",
+                             pool,
+                             parent_gpu->fault_buffer.replayable.stats.num_phase_n_duplicate_faults_by_pool[pool]);
+    }
+    UVM_SEQ_OR_DBG_PRINT(s, "faults_by_phase_n_role:\n");
+    for (role = 0; role < UVM_GPU_FAULT_STATS_PHASE_N_ROLE_MAX; ++role) {
+        UVM_SEQ_OR_DBG_PRINT(s, "  role_%u               %llu\n",
+                             role,
+                             parent_gpu->fault_buffer.replayable.stats.num_phase_n_faults_by_role[role]);
+    }
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_duplicate_faults_by_role:\n");
+    for (role = 0; role < UVM_GPU_FAULT_STATS_PHASE_N_ROLE_MAX; ++role) {
+        UVM_SEQ_OR_DBG_PRINT(s, "  role_%u               %llu\n",
+                             role,
+                             parent_gpu->fault_buffer.replayable.stats.num_phase_n_duplicate_faults_by_role[role]);
+    }
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_unregistered_faults %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_unregistered_faults);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_unregistered_duplicate_faults %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_unregistered_duplicate_faults);
     UVM_SEQ_OR_DBG_PRINT(s, "faults_by_access_type:\n");
     UVM_SEQ_OR_DBG_PRINT(s, "  prefetch             %llu\n",
                          parent_gpu->fault_buffer.replayable.stats.num_prefetch_faults);
@@ -1978,6 +2008,53 @@ static void update_stats_parent_gpu_fault_instance(uvm_parent_gpu_t *parent_gpu,
     ++parent_gpu->stats.num_replayable_faults;
 }
 
+static uvm_phase_f_region_t *uvm_phase_n_fault_region_from_address(uvm_va_space_t *va_space, NvU64 fault_address)
+{
+    uvm_range_tree_node_t *node;
+
+    UVM_ASSERT(va_space);
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    node = uvm_range_tree_find(&va_space->phase_f_region_ranges, fault_address);
+    if (!node)
+        return NULL;
+
+    return container_of(node, uvm_phase_f_region_t, va_node);
+}
+
+static void update_stats_parent_gpu_phase_n_fault_instance(uvm_parent_gpu_t *parent_gpu,
+                                                           uvm_va_space_t *va_space,
+                                                           const uvm_fault_buffer_entry_t *fault_entry,
+                                                           bool is_duplicate)
+{
+    uvm_phase_f_region_t *region;
+    NvU32 pool_index;
+    NvU32 role_index;
+
+    if (!fault_entry->is_replayable || !fault_entry->is_virtual)
+        return;
+
+    region = uvm_phase_n_fault_region_from_address(va_space, fault_entry->fault_address);
+    if (!region) {
+        if (is_duplicate || fault_entry->filtered)
+            ++parent_gpu->fault_buffer.replayable.stats.num_phase_n_unregistered_duplicate_faults;
+        else
+            ++parent_gpu->fault_buffer.replayable.stats.num_phase_n_unregistered_faults;
+        return;
+    }
+
+    pool_index = region->pool < UVM_GPU_FAULT_STATS_PHASE_N_POOL_MAX ? region->pool : 0;
+    role_index = region->role < UVM_GPU_FAULT_STATS_PHASE_N_ROLE_MAX ? region->role : 0;
+
+    ++parent_gpu->fault_buffer.replayable.stats.num_phase_n_faults_by_pool[pool_index];
+    ++parent_gpu->fault_buffer.replayable.stats.num_phase_n_faults_by_role[role_index];
+
+    if (is_duplicate || fault_entry->filtered) {
+        ++parent_gpu->fault_buffer.replayable.stats.num_phase_n_duplicate_faults_by_pool[pool_index];
+        ++parent_gpu->fault_buffer.replayable.stats.num_phase_n_duplicate_faults_by_role[role_index];
+    }
+}
+
 static void update_stats_fault_cb(uvm_va_space_t *va_space,
                                   uvm_perf_event_t event_id,
                                   uvm_perf_event_data_t *event_data)
@@ -1996,13 +2073,23 @@ static void update_stats_fault_cb(uvm_va_space_t *va_space,
     parent_gpu = uvm_gpu_get(event_data->fault.proc_id)->parent;
 
     fault_entry = event_data->fault.gpu.buffer_entry;
+    uvm_assert_rwsem_locked(&va_space->lock);
 
     // Update the stats using the representative fault entry and the rest of
     // instances
     update_stats_parent_gpu_fault_instance(parent_gpu, fault_entry, event_data->fault.gpu.is_duplicate);
+    update_stats_parent_gpu_phase_n_fault_instance(parent_gpu,
+                                                   va_space,
+                                                   fault_entry,
+                                                   event_data->fault.gpu.is_duplicate);
 
-    list_for_each_entry(fault_instance, &fault_entry->merged_instances_list, merged_instances_list)
+    list_for_each_entry(fault_instance, &fault_entry->merged_instances_list, merged_instances_list) {
         update_stats_parent_gpu_fault_instance(parent_gpu, fault_instance, event_data->fault.gpu.is_duplicate);
+        update_stats_parent_gpu_phase_n_fault_instance(parent_gpu,
+                                                       va_space,
+                                                       fault_instance,
+                                                       event_data->fault.gpu.is_duplicate);
+    }
 }
 
 static void update_stats_migration_cb(uvm_va_space_t *va_space,

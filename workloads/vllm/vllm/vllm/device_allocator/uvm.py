@@ -317,6 +317,21 @@ def load_uvm_library() -> ctypes.CDLL:
             ctypes.c_size_t,
         ]
 
+    if hasattr(lib, "uvm_driver_phase_n_reclaim_pool"):
+        lib.uvm_driver_phase_n_reclaim_pool.restype = ctypes.c_int
+        lib.uvm_driver_phase_n_reclaim_pool.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_size_t,
+        ]
+
     if hasattr(lib, "uvm_driver_phase_n_update_region_state"):
         lib.uvm_driver_phase_n_update_region_state.restype = ctypes.c_int
         lib.uvm_driver_phase_n_update_region_state.argtypes = [
@@ -1021,7 +1036,7 @@ def driver_get_pool_state(pool: int, gpu_id: int = 0) -> dict[str, int] | None:
     """Return Stage N driver pool state, or None when unavailable/failing."""
     if not has_pool_budget_ioctl() or pool < 0:
         return None
-    values = (ctypes.c_uint64 * 11)()
+    values = (ctypes.c_uint64 * 36)()
     try:
         status = int(
             _uvm_lib.uvm_driver_phase_n_get_pool_state(
@@ -1043,13 +1058,136 @@ def driver_get_pool_state(pool: int, gpu_id: int = 0) -> dict[str, int] | None:
         "reclaim_bytes",
         "protected_bytes",
         "evictable_bytes",
+        "over_budget_bytes",
+        "reclaim_target_bytes",
+        "victim_candidate_bytes",
+        "victim_candidate_regions",
+        "selected_victim_region_id",
+        "selected_victim_bytes",
+        "victim_count",
+        "reserved",
+        "victim_region_id_0",
+        "victim_region_id_1",
+        "victim_region_id_2",
+        "victim_region_id_3",
+        "victim_region_id_4",
+        "victim_region_id_5",
+        "victim_region_id_6",
+        "victim_region_id_7",
+        "victim_bytes_0",
+        "victim_bytes_1",
+        "victim_bytes_2",
+        "victim_bytes_3",
+        "victim_bytes_4",
+        "victim_bytes_5",
+        "victim_bytes_6",
+        "victim_bytes_7",
         "over_budget_events",
         "reclaim_success_events",
         "reclaim_failed_events",
+        "accounting_corrections",
         "mode",
         "flags",
     )
     return {key: int(values[i]) for i, key in enumerate(keys)}
+
+
+def driver_reclaim_pool(
+    pool: int,
+    *,
+    gpu_id: int = 0,
+    target_bytes: int = 0,
+    current_epoch: int = 0,
+    cooldown_epochs: int = 0,
+    max_victims: int = 8,
+    async_reclaim: bool = False,
+    flags: int = 0,
+) -> dict[str, int] | None:
+    """Trigger Stage N driver-owned soft reclaim for one pool."""
+    if not has_pool_reclaim_ioctl() or pool < 0:
+        return None
+    values = (ctypes.c_uint64 * 45)()
+    try:
+        status = int(
+            _uvm_lib.uvm_driver_phase_n_reclaim_pool(
+                ctypes.c_uint32(int(pool)),
+                ctypes.c_uint32(max(int(gpu_id), 0)),
+                ctypes.c_uint64(max(int(target_bytes), 0)),
+                ctypes.c_uint64(max(int(current_epoch), 0)),
+                ctypes.c_uint64(max(int(cooldown_epochs), 0)),
+                ctypes.c_uint32(max(int(max_victims), 0)),
+                ctypes.c_uint32(1 if async_reclaim else 0),
+                ctypes.c_uint32(max(int(flags), 0)),
+                values,
+                ctypes.c_size_t(len(values)),
+            )
+        )
+    except Exception:
+        logger.debug("Failed to trigger Phase N driver pool reclaim",
+                     exc_info=True)
+        return None
+    if status < 0:
+        return None
+
+    keys = (
+        "attempted_regions",
+        "success_regions",
+        "failure_regions",
+        "victim_count",
+        "budget_bytes",
+        "resident_gpu_bytes_before",
+        "over_budget_bytes",
+        "reclaim_target_bytes",
+        "attempted_bytes",
+        "reclaimed_bytes",
+        "failed_bytes",
+        "victim_candidate_bytes",
+        "victim_candidate_regions",
+        "cooldown_skipped_bytes",
+        "cooldown_skipped_regions",
+        "victim_region_id_0",
+        "victim_region_id_1",
+        "victim_region_id_2",
+        "victim_region_id_3",
+        "victim_region_id_4",
+        "victim_region_id_5",
+        "victim_region_id_6",
+        "victim_region_id_7",
+        "victim_bytes_0",
+        "victim_bytes_1",
+        "victim_bytes_2",
+        "victim_bytes_3",
+        "victim_bytes_4",
+        "victim_bytes_5",
+        "victim_bytes_6",
+        "victim_bytes_7",
+        "victim_status_0",
+        "victim_status_1",
+        "victim_status_2",
+        "victim_status_3",
+        "victim_status_4",
+        "victim_status_5",
+        "victim_status_6",
+        "victim_status_7",
+        "reclaim_success_events",
+        "reclaim_failed_events",
+        "mode",
+        "pool_flags",
+        "rmStatus",
+        "flags",
+    )
+    result = {key: int(values[i]) for i, key in enumerate(keys)}
+    victim_count = int(result.get("victim_count", 0))
+    result["victims"] = [
+        {
+            "region_id": int(result.get(f"victim_region_id_{i}", 0)),
+            "bytes": int(result.get(f"victim_bytes_{i}", 0)),
+            "status": int(result.get(f"victim_status_{i}", 0)),
+        }
+        for i in range(min(max(victim_count, 0), 8))
+        if int(result.get(f"victim_region_id_{i}", 0)) != 0
+    ]
+    return result
 
 
 def driver_update_region_state(
@@ -1162,6 +1300,11 @@ def has_pool_budget_ioctl() -> bool:
             "uvm_driver_phase_n_get_pool_state",
         )
     )
+
+
+def has_pool_reclaim_ioctl() -> bool:
+    return has_pool_budget_ioctl() and hasattr(
+        _uvm_lib, "uvm_driver_phase_n_reclaim_pool")
 
 
 def has_region_state_ioctl() -> bool:

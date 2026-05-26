@@ -1118,6 +1118,15 @@ typedef enum
     UVM_PHASE_N_REGION_STATE_INACTIVE = 5,
 } UVM_PHASE_N_REGION_STATE;
 
+#define UVM_PHASE_N_REGION_FLAG_EVICTABLE                            (1U << 0)
+#define UVM_PHASE_N_REGION_FLAG_PROTECTED                            (1U << 1)
+#define UVM_PHASE_N_REGION_FLAG_ACTIVE                               (1U << 2)
+#define UVM_PHASE_N_REGION_FLAG_PREFETCHABLE                         (1U << 3)
+#define UVM_PHASE_N_REGION_FLAG_PINNED                               (1U << 4)
+#define UVM_PHASE_N_REGION_FLAG_TRANSIENT                            (1U << 5)
+
+#define UVM_PHASE_N_TRACE_VICTIM_MAX                                 8
+
 #define UVM_PHASE_N_SET_POOL_BUDGET                                  UVM_IOCTL_BASE(85)
 typedef struct
 {
@@ -1140,9 +1149,20 @@ typedef struct
     NvU64     reclaim_bytes NV_ALIGN_BYTES(8); // OUT
     NvU64     protected_bytes NV_ALIGN_BYTES(8); // OUT
     NvU64     evictable_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     over_budget_bytes NV_ALIGN_BYTES(8); // OUT, trace-only pressure
+    NvU64     reclaim_target_bytes NV_ALIGN_BYTES(8); // OUT, trace-only target
+    NvU64     victim_candidate_bytes NV_ALIGN_BYTES(8); // OUT, resident candidate bytes
+    NvU64     victim_candidate_regions NV_ALIGN_BYTES(8); // OUT
+    NvU64     selected_victim_region_id NV_ALIGN_BYTES(8); // OUT, trace-only best candidate
+    NvU64     selected_victim_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU32     victim_count;                 // OUT, trace-only victim list length
+    NvU32     reserved;                     // OUT
+    NvU64     victim_region_ids[UVM_PHASE_N_TRACE_VICTIM_MAX] NV_ALIGN_BYTES(8); // OUT
+    NvU64     victim_bytes[UVM_PHASE_N_TRACE_VICTIM_MAX] NV_ALIGN_BYTES(8); // OUT
     NvU64     over_budget_events NV_ALIGN_BYTES(8); // OUT
     NvU64     reclaim_success_events NV_ALIGN_BYTES(8); // OUT
     NvU64     reclaim_failed_events NV_ALIGN_BYTES(8); // OUT
+    NvU64     accounting_corrections NV_ALIGN_BYTES(8); // OUT
     NvU32     mode;                         // OUT
     NvU32     flags;                        // OUT
     NV_STATUS rmStatus;                     // OUT
@@ -1197,6 +1217,42 @@ typedef struct
     NvU64     last_access_epoch NV_ALIGN_BYTES(8); // OUT
     NV_STATUS rmStatus;                     // OUT
 } UVM_PHASE_N_QUERY_REGION_BY_VA_PARAMS;
+
+#define UVM_PHASE_N_RECLAIM_POOL                                     UVM_IOCTL_BASE(90)
+typedef struct
+{
+    NvU32     pool;                         // IN
+    NvU32     gpu_id;                       // IN
+    NvU64     target_bytes NV_ALIGN_BYTES(8); // IN, 0 uses over-budget + hysteresis
+    NvU64     current_epoch NV_ALIGN_BYTES(8); // IN, 0 disables epoch cooldown
+    NvU64     cooldown_epochs NV_ALIGN_BYTES(8); // IN, 0 disables epoch cooldown
+    NvU32     max_victims;                  // IN, 0 uses UVM_PHASE_N_TRACE_VICTIM_MAX
+    NvBool    async;                        // IN
+    NvU32     flags;                        // IN
+    NvU32     attempted_regions;            // OUT
+    NvU32     success_regions;              // OUT
+    NvU32     failure_regions;              // OUT
+    NvU32     victim_count;                 // OUT
+    NvU64     budget_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     resident_gpu_bytes_before NV_ALIGN_BYTES(8); // OUT
+    NvU64     over_budget_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     reclaim_target_bytes NV_ALIGN_BYTES(8); // OUT, effective target
+    NvU64     attempted_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     reclaimed_bytes NV_ALIGN_BYTES(8); // OUT, best-effort pre-scan bytes
+    NvU64     failed_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     victim_candidate_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     victim_candidate_regions NV_ALIGN_BYTES(8); // OUT
+    NvU64     cooldown_skipped_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     cooldown_skipped_regions NV_ALIGN_BYTES(8); // OUT
+    NvU64     victim_region_ids[UVM_PHASE_N_TRACE_VICTIM_MAX] NV_ALIGN_BYTES(8); // OUT
+    NvU64     victim_bytes[UVM_PHASE_N_TRACE_VICTIM_MAX] NV_ALIGN_BYTES(8); // OUT
+    NV_STATUS victim_status[UVM_PHASE_N_TRACE_VICTIM_MAX]; // OUT
+    NvU64     reclaim_success_events NV_ALIGN_BYTES(8); // OUT
+    NvU64     reclaim_failed_events NV_ALIGN_BYTES(8); // OUT
+    NvU32     mode;                         // OUT
+    NvU32     pool_flags;                   // OUT
+    NV_STATUS rmStatus;                     // OUT
+} UVM_PHASE_N_RECLAIM_POOL_PARAMS;
 
 //
 // UvmDiscard

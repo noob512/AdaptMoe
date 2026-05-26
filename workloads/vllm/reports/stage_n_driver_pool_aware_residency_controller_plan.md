@@ -50,8 +50,8 @@ Temp scratch pool:
 因此当前阶段定义为：
 
 ```text
-当前阶段: P1b/P1c/P2-control/P3-control 已落地，三池预算语义已明确，P4/P5/P6 尚未开始
-下一检查点: 重新加载新 UVM 模块后运行 phase-n-region smoke 和 vLLM tag-only 三池 smoke
+当前阶段: P5 批量 victim selection trace 已完成第一版，P6 soft reclaim 控制面已开始
+下一检查点: 完整重载 nvidia/nvidia-uvm 后运行 phase-n-reclaim smoke，再评估是否接入 fault/make-resident 自动触发
 ```
 
 ## 1. 实时计划表
@@ -65,11 +65,11 @@ Temp scratch pool:
 | P1a: Driver region ioctl 基础 | Done | 支持 register/unregister/batch-region action | `uvm_ioctl.h` 已有 `UVM_PHASE_F_REGISTER_REGION`、`UNREGISTER_REGION`、`BATCH_REGIONS`；`uvm.c` 已注册到 `phase_f_regions` | 保持兼容，扩展 state/query ioctl | smoke test 可注册 region 并按 region id query/action |
 | P1b: Python ctypes region 封装 | Done | Python 能调用 driver region ioctl | `uvm.py` 已新增 `driver_register_region`、`driver_unregister_region`、`driver_batch_query_regions_residency`、feature probe | 补 Python/GPU smoke | Python self-test 可注册、查询、注销 region |
 | P1c: vLLM tag-only 接入 | In Progress | vLLM 只打 tag，不主动迁移 | `uvm_pool_residency.py` 已可将 registered region 同步到 driver；新增 tag-only 安全阀；region state/access 会尝试同步到 driver | 跑 vLLM smoke，确认 driver log 和 trace | driver 能看到 region；应用不调用 prefetch/offload/safe_offload |
-| P2: Driver VA->region lookup | Control Plane Done | fault/evict 路径能由 VA 找到 pool/role/flags | driver register/unregister 已维护 `phase_f_region_ranges`，新增 `QUERY_REGION_BY_VA` | 接入 replayable fault stats 分类 | fault stats 可按 pool/role 分类地址 |
+| P2: Driver VA->region lookup | Fault Stats Classification In Progress | fault/evict 路径能由 VA 找到 pool/role/flags | driver register/unregister 已维护 `phase_f_region_ranges`，`QUERY_REGION_BY_VA` 已可用；replayable fault stats 已开始按 VA->region 做 pool/role 分类 | 继续补齐 fault stats 观测与回归验证 | fault stats 可按 pool/role 分类地址 |
 | P3: Pool budget/state ioctl | Control Plane Done | 三池预算和 region state 下沉到 driver | 已新增 `SET_POOL_BUDGET`、`GET_POOL_STATE`、`UPDATE_REGION_STATE`、`QUERY_REGION`、`QUERY_REGION_BY_VA`；Python/C++ helper 已封装；scratch 默认可配置约 100MiB temp budget | 运行 phase-n-region smoke；接入 vLLM 启动配置 | driver 内部保存并查询 KV/weight/temp-scratch budget/state |
-| P4: Real residency accounting | Pending | driver 维护真实 resident bytes | Phase F 可 query range residency，但不是持续账本 | 先 scan 校准，再接 migrate/make-resident/evict/free 增量更新 | `pool_resident_gpu_bytes` 与 query 误差可控 |
-| P5: Driver victim selection | Pending | driver 自主选择 victim | 应用层已有估算式 victim selection；Stage M 证明 scratch 小池有效 | C 版 cold-first/LRU，跳过 protected/active，同 pool 优先；scratch 使用 transient/size-class reuse 优先 | 超 budget 时 driver 选出同 pool 可驱逐页面/region |
-| P6: 接入 UVM eviction/migration | Pending | 使用 UVM 原生路径执行 reclaim | Phase F 目前是显式 action executor | 在 make-resident/PMM eviction/migrate 路径接入 pool-aware policy | 应用不再发起 CPU/GPU prefetch，driver 能 reclaim 后重试 |
+| P4: Real residency accounting | Scan Calibration Done | driver 维护真实 resident bytes | `GET_POOL_STATE` 已对已注册 region 做 scan/query 汇总并写回 per-pool resident_gpu/resident_cpu/reclaim bytes | 接 migrate/make-resident/evict/free 增量更新 | `pool_resident_gpu_bytes` 与 query 误差可控 |
+| P5: Driver victim selection | Batch Trace Done | driver 自主选择 victim | `GET_POOL_STATE` 已计算 over_budget/reclaim_target/victim_candidate/selected_victim trace 字段，并返回最多 8 个 batch victim 候选；scratch 只把 `TRANSIENT|EVICTABLE` 且非 active/protected 的 region 作为候选 | 用 vLLM 三池 smoke 验证候选质量 | 超 budget 时 driver 选出同 pool 可驱逐页面/region |
+| P6: 接入 UVM eviction/migration | Soft Reclaim Control Plane Started | 使用 UVM 原生路径执行 reclaim | 新增 `UVM_PHASE_N_RECLAIM_POOL`，driver 按同 pool top victims 调用 UVM migrate-to-CPU 路径；支持 hysteresis 和 epoch cooldown；Python/C++ helper 已封装 | 完整重载模块并运行 `phase-n-reclaim` smoke；再接 make-resident/PMM eviction 自动触发 | 应用不再发起 CPU/GPU prefetch，driver 能 reclaim 后重试 |
 | P7: 稳定性和性能优化 | Pending | 降低抖动、带宽竞争和锁开销 | Stage M cache A/B 显示应用层策略可能带来开销 | 批量 reclaim、hysteresis、cooldown、限速、采样 | TPOT/TTFT 不明显恶化，fault 更稳定 |
 | P8: BPF 可选插件 | Pending | 快速实验 victim scoring | 当前不需要 BPF 承载正确性 | 暴露只读 kfunc/struct_ops score hook | 不加载 BPF 时 C 策略完整可用 |
 | P9: 通用化 | Pending | 支持非 vLLM workload | vLLM 内已有较多专用接入 | 提供 C/Python tag SDK，适配 llama.cpp/SGLang | 新应用只需少量 tag 接入 |
@@ -316,6 +316,7 @@ UVM_PHASE_N_GET_POOL_STATE
 UVM_PHASE_N_UPDATE_REGION_STATE
 UVM_PHASE_N_QUERY_REGION
 UVM_PHASE_N_QUERY_REGION_BY_VA
+UVM_PHASE_N_RECLAIM_POOL
 ```
 
 建议结构：
@@ -341,9 +342,16 @@ typedef struct
     NvU64 reclaim_bytes NV_ALIGN_BYTES(8);
     NvU64 protected_bytes NV_ALIGN_BYTES(8);
     NvU64 evictable_bytes NV_ALIGN_BYTES(8);
+    NvU64 over_budget_bytes NV_ALIGN_BYTES(8);
+    NvU64 reclaim_target_bytes NV_ALIGN_BYTES(8);
+    NvU64 victim_candidate_bytes NV_ALIGN_BYTES(8);
+    NvU64 victim_candidate_regions NV_ALIGN_BYTES(8);
+    NvU64 selected_victim_region_id NV_ALIGN_BYTES(8);
+    NvU64 selected_victim_bytes NV_ALIGN_BYTES(8);
     NvU64 over_budget_events NV_ALIGN_BYTES(8);
     NvU64 reclaim_success_events NV_ALIGN_BYTES(8);
     NvU64 reclaim_failed_events NV_ALIGN_BYTES(8);
+    NvU64 accounting_corrections NV_ALIGN_BYTES(8);
     NV_STATUS rmStatus;
 } UVM_PHASE_N_GET_POOL_STATE_PARAMS;
 
@@ -357,6 +365,32 @@ typedef struct
     NvU64 last_access_epoch NV_ALIGN_BYTES(8);
     NV_STATUS rmStatus;
 } UVM_PHASE_N_UPDATE_REGION_STATE_PARAMS;
+
+typedef struct
+{
+    NvU32 pool;
+    NvU32 gpu_id;
+    NvU64 target_bytes NV_ALIGN_BYTES(8);
+    NvU64 current_epoch NV_ALIGN_BYTES(8);
+    NvU64 cooldown_epochs NV_ALIGN_BYTES(8);
+    NvU32 max_victims;
+    NvBool async;
+    NvU32 flags;
+    NvU32 attempted_regions;
+    NvU32 success_regions;
+    NvU32 failure_regions;
+    NvU32 victim_count;
+    NvU64 resident_gpu_bytes_before NV_ALIGN_BYTES(8);
+    NvU64 over_budget_bytes NV_ALIGN_BYTES(8);
+    NvU64 reclaim_target_bytes NV_ALIGN_BYTES(8);
+    NvU64 attempted_bytes NV_ALIGN_BYTES(8);
+    NvU64 reclaimed_bytes NV_ALIGN_BYTES(8);
+    NvU64 cooldown_skipped_bytes NV_ALIGN_BYTES(8);
+    NvU64 victim_region_ids[8] NV_ALIGN_BYTES(8);
+    NvU64 victim_bytes[8] NV_ALIGN_BYTES(8);
+    NV_STATUS victim_status[8];
+    NV_STATUS rmStatus;
+} UVM_PHASE_N_RECLAIM_POOL_PARAMS;
 ```
 
 ## 5. Driver 数据结构
@@ -431,7 +465,12 @@ typedef struct
     NvU64 resident_cpu_bytes;
     NvU64 protected_bytes;
     NvU64 evictable_bytes;
+    NvU64 over_budget_bytes;
     NvU64 reclaim_target_bytes;
+    NvU64 victim_candidate_bytes;
+    NvU64 victim_candidate_regions;
+    NvU64 selected_victim_region_id;
+    NvU64 selected_victim_bytes;
 
     NvU64 over_budget_events;
     NvU64 reclaim_attempt_events;
@@ -481,6 +520,30 @@ periodic scan region table
 不是实时
 大 region 多时有扫描开销
 不能作为最终 eviction fast path 的唯一依据
+```
+
+当前实现状态：
+
+```text
+已实现于 P4 scan calibration:
+  GET_POOL_STATE(pool)
+    -> 快照当前 pool 已注册 region
+    -> 对每个 region 调用真实 residency query
+    -> 汇总 resident_gpu_bytes / resident_cpu_bytes
+    -> 对无法查询的 region 累加 reclaim_bytes
+    -> 若 resident_gpu_bytes > budget，计算 over_budget_bytes
+    -> 在同 pool 内筛选 trace-only victim candidate
+       KV/weight: EVICTABLE && !PROTECTED && !ACTIVE && !PINNED
+       scratch/temp: TRANSIENT && EVICTABLE && !PROTECTED && !ACTIVE && !PINNED
+    -> 计算 reclaim_target_bytes、victim_candidate_bytes、
+       victim_candidate_regions、selected_victim_region_id
+    -> 写回 va_space->phase_n_pools[pool]
+
+当前限制:
+  这是 ioctl 查询时同步 scan，不是 fault/migrate 热路径增量账本。
+  大量 region 时有 O(region_count) 查询开销，因此不应在每个 decode step 调用。
+  victim selection 目前是 trace-only，不执行 migrate/evict。
+  它适合 smoke、周期性校准、策略调试和 P5/P6 reclaim 前的基线观测。
 ```
 
 ### 6.2 第二版：增量 accounting
@@ -725,6 +788,49 @@ fallback action
 3. 不在高频 fault handler 中扫描全量 region。
 4. region table 更新由 ioctl 慢路径完成。
 5. accounting 更新必须避免对全局锁造成长时间持有。
+
+### 8.4 P6 soft reclaim 控制面第一版
+
+当前实现先落地 control-plane soft reclaim，而不是直接修改 hot fault path：
+
+```text
+UVM_PHASE_N_RECLAIM_POOL:
+  1. driver 扫描同 pool registered regions
+  2. query 每个 region 的真实 GPU resident bytes
+  3. 过滤 victim:
+       EVICTABLE
+       !PROTECTED
+       !ACTIVE
+       !PINNED
+       scratch 额外要求 TRANSIENT
+  4. 按 priority、last_access_epoch、region_id 选最多 8 个 victims
+  5. 如果 pool mode 是 SOFT/ENFORCE，则 driver 调 UVM migrate-to-CPU 路径
+  6. 失败只记录 failure，不破坏请求正确性
+```
+
+hysteresis：
+
+```text
+target = resident_gpu_bytes - budget + reclaim_margin
+KV/weight margin cap: 64MiB
+scratch margin cap: 16MiB
+```
+
+cooldown：
+
+```text
+current_epoch/cooldown_epochs 由调用者传入
+last_access_epoch 距离当前 epoch 太近的 region 会被跳过
+```
+
+当前限制：
+
+```text
+仍由控制面 ioctl 手动触发 soft reclaim
+尚未在 make-resident / PMM eviction / replayable fault service 中自动触发
+reclaimed_bytes 是迁移前 resident bytes 的 best-effort 估算
+增量 accounting 仍待 P7/P4 第二版接入
+```
 
 ## 9. vLLM Tag Adapter 改造
 
@@ -1256,6 +1362,10 @@ TPOT/TTFT 稳定，fault ratio 可解释
   UVM 原生 migrate/evict 路径 reclaim hook
 ```
 
+补充更新：P6 soft reclaim 控制面第一版也已经落地。它仍不是最终 hot-path
+driver reclaim，但已经把“driver 选 victim 并执行迁移”从应用层下沉到了 UVM
+ioctl handler 内。
+
 代码改动：
 
 ```text
@@ -1271,18 +1381,27 @@ kernel-module/nvidia-module/kernel-open/nvidia-uvm/uvm.c
   register/unregister region 同步维护 id radix tree 和 VA range tree。
   新增 SET_POOL_BUDGET、GET_POOL_STATE、UPDATE_REGION_STATE、
   QUERY_REGION、QUERY_REGION_BY_VA handler。
+  新增 RECLAIM_POOL handler：扫描同 pool region，按 driver victim policy
+  选择最多 8 个 victim，并在 SOFT/ENFORCE mode 下调用 UVM migrate-to-CPU。
 
 workloads/vllm/vllm/uvm_test/uvm_allocator.cpp
 workloads/vllm/vllm/uvm_test/phase_f_smoke.cpp
   新增 Stage N userspace helper 和 `--step phase-n-region` smoke。
+  新增 `uvm_driver_phase_n_reclaim_pool` helper 和 `--step phase-n-reclaim`
+  smoke。
 
 workloads/vllm/vllm/vllm/device_allocator/uvm.py
   新增 Stage N ctypes wrapper、feature probe 和 query helper。
+  `driver_get_pool_state` 返回 over_budget/reclaim_target/victim_candidate 字段。
+  新增 `driver_reclaim_pool()` 和 `has_pool_reclaim_ioctl()`。
 
 workloads/vllm/vllm/vllm/device_allocator/uvm_pool_residency.py
   tag-only 模式下 request_gpu_residency 不做应用层决策。
   register/state/access 会尝试同步 driver tag/state。
   `VLLM_UVM_DRIVER_POOL_BUDGETS` 可把 pool budget 写入 driver。
+  `get_uvm_driver_pool_state_snapshot()` 可抓取三池 driver state。
+  新增 `soft_reclaim_uvm_driver_pool()` 诊断入口；默认不在 vLLM 热路径中
+  自动触发。
 ```
 
 新增运行配置：
@@ -1294,6 +1413,8 @@ VLLM_UVM_DRIVER_POOL_BUDGET_ENABLE=1
 VLLM_UVM_DRIVER_POOL_BUDGET_MODE=trace_only|soft|enforce
 VLLM_UVM_DRIVER_TEMP_BUFFER_BYTES=104857600
 VLLM_UVM_DRIVER_POOL_BUDGETS=kv=10737418240,weights=10737418240,scratch=104857600
+# temp/workspace 会被解析为 scratch alias:
+VLLM_UVM_DRIVER_POOL_BUDGETS=kv=10737418240,weight=10737418240,temp=104857600
 ```
 
 三池预算建议：
@@ -1319,13 +1440,14 @@ python3 -m py_compile uvm.py uvm_pool_residency.py
 git diff --check
   PASS
 
-make -B uvm phase_f_smoke
+make -C workloads/vllm/vllm/uvm_test -j2 phase_f_smoke
   PASS
 
 make -C kernel-module/nvidia-module/kernel-open modules NV_KERNEL_MODULES=nvidia-uvm
-  uvm.c / uvm_va_space.c 编译通过
+  uvm.c / uvm_va_space.c 编译通过，nvidia-uvm.o 链接通过
   最终 modpost 因只构建 nvidia-uvm、缺少 nvidia 核心模块符号失败
   这不是 Stage N 代码编译错误
+  当前仍有既有 warning: uvm_ioctl frame size 1152 > 1024
 ```
 
 下一检查点：
@@ -1334,13 +1456,21 @@ make -C kernel-module/nvidia-module/kernel-open modules NV_KERNEL_MODULES=nvidia
 1. 完整构建并重新加载 nvidia/nvidia-uvm 模块。
 2. 运行:
    workloads/vllm/run_stage_m_phase_f_smoke.sh --step phase-n-region
+   workloads/vllm/run_stage_m_phase_f_smoke.sh --step phase-n-reclaim
 3. 启动 vLLM tag-only smoke，确认:
    - trace 中有 residency_driver_pool_budget_config
+   - 可调用 get_uvm_driver_pool_state_snapshot()，看到 KV/weight/scratch 三池
+     resident/over_budget/victim_candidate trace 字段
    - driver log 中有 phase_f_register_region / phase_n_update_region_state
    - request_gpu_residency reason 为 tag_only_no_application_residency_decision
    - scratch pool budget 为 104857600 或显式配置值
-4. 下一轮接 replayable fault stats 的 VA->region 分类，并新增 scratch/temp
-   size-class hit/miss/reclaim telemetry。
+4. 验证 `phase-n-reclaim`:
+   - SOFT mode 下 attempted_regions/success_regions 增加
+   - victim_status 为 0 或可解释错误
+   - reclaim_success_events/reclaim_failed_events 正常累计
+   - cooldown_epochs 能跳过近期访问 region
+5. 下一轮把 soft reclaim 从手动 ioctl 接到 make-resident/PMM eviction
+   的自动触发路径，并补 rate limit/failure backoff。
 ```
 
 ```text
@@ -1356,7 +1486,7 @@ make -C kernel-module/nvidia-module/kernel-open modules NV_KERNEL_MODULES=nvidia
 建议下一次更新目标：
 
 ```text
-完成 P1b Python ctypes region wrapper
-完成一个 Python self-test
-把 P1b 状态从 Pending 改为 Done
+完整重载模块后运行 phase-n-reclaim smoke
+把 P6 状态从 Soft Reclaim Control Plane Started 推进到 Soft Reclaim Smoke Done
+开始设计 make-resident/PMM eviction 自动触发点
 ```

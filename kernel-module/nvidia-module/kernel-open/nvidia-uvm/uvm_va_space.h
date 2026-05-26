@@ -75,6 +75,10 @@ typedef struct
     NvU64 last_access_epoch;
 } uvm_phase_f_region_t;
 
+#ifndef UVM_PHASE_N_TRACE_VICTIM_MAX
+#define UVM_PHASE_N_TRACE_VICTIM_MAX 8
+#endif
+
 #define UVM_PHASE_N_POOL_STATE_MAX 5
 
 typedef struct
@@ -85,9 +89,19 @@ typedef struct
     NvU64 reclaim_bytes;
     NvU64 protected_bytes;
     NvU64 evictable_bytes;
+    NvU64 over_budget_bytes;
+    NvU64 reclaim_target_bytes;
+    NvU64 victim_candidate_bytes;
+    NvU64 victim_candidate_regions;
+    NvU64 selected_victim_region_id;
+    NvU64 selected_victim_bytes;
+    NvU64 victim_region_ids[UVM_PHASE_N_TRACE_VICTIM_MAX];
+    NvU64 victim_bytes[UVM_PHASE_N_TRACE_VICTIM_MAX];
+    NvU32 victim_count;
     NvU64 over_budget_events;
     NvU64 reclaim_success_events;
     NvU64 reclaim_failed_events;
+    NvU64 accounting_corrections;
     NvU32 mode;
     NvU32 flags;
 } uvm_phase_n_pool_state_t;

@@ -137,7 +137,7 @@ def _parse_pool_budget_overrides(raw: str | None) -> dict[str, int]:
         if not item or "=" not in item:
             continue
         pool_name, value = item.split("=", 1)
-        pool = _normalize_pool(pool_name.strip())
+        pool = _normalize_driver_pool_name(pool_name.strip())
         if pool == "unknown":
             continue
         try:
@@ -165,6 +165,17 @@ def _read_mode_env() -> str:
 def _normalize_pool(pool: str) -> str:
     pool = (pool or "unknown").strip().lower()
     return pool if pool in VALID_POOLS else "unknown"
+
+
+def _normalize_driver_pool_name(pool: str) -> str:
+    pool = (pool or "unknown").strip().lower()
+    if pool in ("temp", "temporary", "buffer", "buffers", "workspace"):
+        return "scratch"
+    if pool == "weight":
+        return "weights"
+    if pool in ("kvcache", "kv_cache", "kv-cache"):
+        return "kv"
+    return _normalize_pool(pool)
 
 
 def _normalize_state(state: str) -> str:
@@ -490,6 +501,10 @@ class UvmPoolResidencyManager:
             "driver_region_state_update_success": 0,
             "driver_region_state_update_skips": 0,
             "driver_region_state_update_failures": 0,
+            "driver_pool_state_queries": 0,
+            "driver_pool_state_failures": 0,
+            "driver_pool_reclaim_attempts": 0,
+            "driver_pool_reclaim_failures": 0,
         }
 
     @property
@@ -501,6 +516,121 @@ class UvmPoolResidencyManager:
             self._record_config_locked()
             self._sync_driver_pool_budgets_locked(force=True)
             return dict(self._driver_pool_budget_status)
+
+    def driver_pool_state_snapshot(self, gpu_id: int = 0) -> dict[str, Any]:
+        with self._lock:
+            self._record_config_locked()
+            self._sync_driver_pool_budgets_locked()
+
+        try:
+            from vllm.device_allocator.uvm import driver_get_pool_state
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            with self._lock:
+                self._summary["driver_pool_state_failures"] += 1
+                self._write_locked(
+                    {
+                        "action": "residency_driver_pool_state",
+                        "reason": "import_failed",
+                        "error": repr(exc),
+                    }
+                )
+            return {}
+
+        states: dict[str, Any] = {}
+        failures = 0
+        for pool, pool_id in DRIVER_POOL_IDS.items():
+            if pool == "unknown":
+                continue
+            state = driver_get_pool_state(pool_id, gpu_id=gpu_id)
+            if state is None:
+                failures += 1
+                continue
+            victim_count = int(state.get("victim_count", 0))
+            state["victims"] = [
+                {
+                    "region_id": int(state.get(f"victim_region_id_{i}", 0)),
+                    "bytes": int(state.get(f"victim_bytes_{i}", 0)),
+                }
+                for i in range(min(max(victim_count, 0), 8))
+                if int(state.get(f"victim_region_id_{i}", 0)) != 0
+            ]
+            states[pool] = state
+
+        with self._lock:
+            self._summary["driver_pool_state_queries"] += 1
+            self._summary["driver_pool_state_failures"] += failures
+            self._write_locked(
+                {
+                    "action": "residency_driver_pool_state",
+                    "gpu_id": max(int(gpu_id or 0), 0),
+                    "states": states,
+                    "failures": failures,
+                }
+            )
+        return states
+
+    def driver_soft_reclaim_pool(
+        self,
+        pool: str,
+        *,
+        gpu_id: int = 0,
+        target_bytes: int = 0,
+        current_epoch: int = 0,
+        cooldown_epochs: int = 0,
+        max_victims: int = 8,
+        async_reclaim: bool = False,
+    ) -> dict[str, Any] | None:
+        pool_name = _normalize_driver_pool_name(pool)
+        pool_id = DRIVER_POOL_IDS.get(pool_name)
+        if pool_id is None or pool_name == "unknown":
+            return None
+
+        with self._lock:
+            self._record_config_locked()
+            self._sync_driver_pool_budgets_locked()
+
+        try:
+            from vllm.device_allocator.uvm import driver_reclaim_pool
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            with self._lock:
+                self._summary["driver_pool_reclaim_failures"] += 1
+                self._write_locked(
+                    {
+                        "action": "residency_driver_pool_reclaim",
+                        "pool": pool_name,
+                        "reason": "import_failed",
+                        "error": repr(exc),
+                    }
+                )
+            return None
+
+        result = driver_reclaim_pool(
+            pool_id,
+            gpu_id=gpu_id,
+            target_bytes=target_bytes,
+            current_epoch=current_epoch,
+            cooldown_epochs=cooldown_epochs,
+            max_victims=max_victims,
+            async_reclaim=async_reclaim,
+        )
+        with self._lock:
+            self._summary["driver_pool_reclaim_attempts"] += 1
+            if result is None:
+                self._summary["driver_pool_reclaim_failures"] += 1
+            self._write_locked(
+                {
+                    "action": "residency_driver_pool_reclaim",
+                    "pool": pool_name,
+                    "gpu_id": max(int(gpu_id or 0), 0),
+                    "target_bytes": max(int(target_bytes or 0), 0),
+                    "current_epoch": max(int(current_epoch or 0), 0),
+                    "cooldown_epochs": max(int(cooldown_epochs or 0), 0),
+                    "max_victims": max(int(max_victims or 0), 0),
+                    "async_reclaim": bool(async_reclaim),
+                    "result": result,
+                }
+            )
+        return result
 
     def register_region(
         self,
@@ -1810,6 +1940,33 @@ def get_uvm_residency_snapshot() -> dict[str, Any]:
 
 def sync_uvm_driver_pool_budgets() -> dict[str, int]:
     return get_uvm_pool_residency_manager().sync_driver_pool_budgets()
+
+
+def get_uvm_driver_pool_state_snapshot(gpu_id: int = 0) -> dict[str, Any]:
+    return get_uvm_pool_residency_manager().driver_pool_state_snapshot(
+        gpu_id=gpu_id
+    )
+
+
+def soft_reclaim_uvm_driver_pool(
+    pool: str,
+    *,
+    gpu_id: int = 0,
+    target_bytes: int = 0,
+    current_epoch: int = 0,
+    cooldown_epochs: int = 0,
+    max_victims: int = 8,
+    async_reclaim: bool = False,
+) -> dict[str, Any] | None:
+    return get_uvm_pool_residency_manager().driver_soft_reclaim_pool(
+        pool,
+        gpu_id=gpu_id,
+        target_bytes=target_bytes,
+        current_epoch=current_epoch,
+        cooldown_epochs=cooldown_epochs,
+        max_victims=max_victims,
+        async_reclaim=async_reclaim,
+    )
 
 
 def get_uvm_real_residency_snapshot(trigger: str = "manual") -> dict[str, Any]:

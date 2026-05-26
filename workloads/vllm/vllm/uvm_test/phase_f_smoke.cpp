@@ -96,6 +96,16 @@ int uvm_driver_phase_n_get_pool_state(uint32_t pool,
                                       uint32_t gpu_id,
                                       uint64_t* values_out,
                                       size_t values_count);
+int uvm_driver_phase_n_reclaim_pool(uint32_t pool,
+                                    uint32_t gpu_id,
+                                    uint64_t target_bytes,
+                                    uint64_t current_epoch,
+                                    uint64_t cooldown_epochs,
+                                    uint32_t max_victims,
+                                    uint32_t async,
+                                    uint32_t flags,
+                                    uint64_t* values_out,
+                                    size_t values_count);
 int uvm_driver_phase_n_update_region_state(uint64_t region_id,
                                            uint32_t state,
                                            uint32_t flags_set,
@@ -117,7 +127,7 @@ namespace {
 // shell 脚本 run_stage_m_phase_f_smoke.sh 会把同名 --step 继续传进来。
 void usage(const char* argv0) {
     std::fprintf(stderr,
-                 "Usage: %s [--step all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|register-region|query-region|phase-n-region|query|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu] "
+                 "Usage: %s [--step all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|register-region|query-region|phase-n-region|phase-n-reclaim|query|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu] "
                  "[--bytes N] [--device N] [--async 0|1]\n",
                  argv0);
 }
@@ -396,11 +406,11 @@ int main(int argc, char** argv) {
     // Step 8.3: Stage N 控制面闭环。
     // 注册 region tag，设置 KV pool budget，更新 region state，再按 id/VA 查询。
     if (want_step(step, "phase-n-region")) {
-        uint64_t values[11] = {};
+        uint64_t values[36] = {};
         trace("before_phase_n_region");
         int failed = run_step(
             "phase-n-set-pool-budget",
-            uvm_driver_phase_n_set_pool_budget(1, 0, 10ULL << 30, 0, 0));
+            uvm_driver_phase_n_set_pool_budget(1, 0, bytes / 2, 0, 0));
         if (!failed) {
             failed = run_step(
                 "phase-n-register-region",
@@ -446,19 +456,102 @@ int main(int argc, char** argv) {
             std::memset(values, 0, sizeof(values));
             failed = run_step(
                 "phase-n-get-pool-state",
-                uvm_driver_phase_n_get_pool_state(1, 0, values, 11));
-            std::printf("phase_n_pool_state budget=%llu resident_gpu=%llu resident_cpu=%llu protected=%llu evictable=%llu mode=%llu flags=0x%llx\n",
+                uvm_driver_phase_n_get_pool_state(1, 0, values, 36));
+            std::printf("phase_n_pool_state budget=%llu resident_gpu=%llu resident_cpu=%llu reclaim=%llu protected=%llu evictable=%llu over=%llu target=%llu candidate_bytes=%llu candidate_regions=%llu selected_id=%llu selected_bytes=%llu victim_count=%llu corrections=%llu mode=%llu flags=0x%llx\n",
                         static_cast<unsigned long long>(values[0]),
                         static_cast<unsigned long long>(values[1]),
                         static_cast<unsigned long long>(values[2]),
+                        static_cast<unsigned long long>(values[3]),
                         static_cast<unsigned long long>(values[4]),
                         static_cast<unsigned long long>(values[5]),
+                        static_cast<unsigned long long>(values[6]),
+                        static_cast<unsigned long long>(values[7]),
+                        static_cast<unsigned long long>(values[8]),
                         static_cast<unsigned long long>(values[9]),
-                        static_cast<unsigned long long>(values[10]));
+                        static_cast<unsigned long long>(values[10]),
+                        static_cast<unsigned long long>(values[11]),
+                        static_cast<unsigned long long>(values[12]),
+                        static_cast<unsigned long long>(values[33]),
+                        static_cast<unsigned long long>(values[34]),
+                        static_cast<unsigned long long>(values[35]));
+            std::printf("phase_n_victims:");
+            for (int i = 0; i < 8; ++i) {
+                std::printf(" [%d]=%llu:%llu",
+                            i,
+                            static_cast<unsigned long long>(values[14 + i]),
+                            static_cast<unsigned long long>(values[22 + i]));
+            }
+            std::printf("\n");
         }
         (void)uvm_driver_phase_f_unregister_region(region_id);
         trace("after_phase_n_region");
         if (failed || step == "phase-n-region") {
+            cudaFree(ptr);
+            return failed;
+        }
+    }
+
+    // Step 8.4: Stage N P6 soft reclaim 控制面。
+    // 先把 region 迁到 GPU，再设置 SOFT budget，最后让 driver 选择 victim 并迁回 CPU。
+    if (want_step(step, "phase-n-reclaim")) {
+        uint64_t values[45] = {};
+        trace("before_phase_n_reclaim");
+        int failed = run_step(
+            "phase-n-reclaim-register-region",
+            uvm_driver_phase_f_register_region(region_id, base, size, 1, 0, 0, 1, 1));
+        if (!failed) {
+            failed = run_step(
+                "phase-n-reclaim-update-region-state",
+                uvm_driver_phase_n_update_region_state(region_id, 5, 0x1, 0x6, 7, 1));
+        }
+        if (!failed) {
+            failed = run_step(
+                "phase-n-reclaim-prefetch-gpu",
+                uvm_driver_batch_prefetch_gpu(&base, &size, 1, device, 0));
+            cudaDeviceSynchronize();
+        }
+        if (!failed) {
+            failed = run_step(
+                "phase-n-reclaim-set-pool-budget",
+                uvm_driver_phase_n_set_pool_budget(1, 0, bytes / 2, 1, 0));
+        }
+        if (!failed) {
+            failed = run_step(
+                "phase-n-reclaim-pool",
+                uvm_driver_phase_n_reclaim_pool(1, 0, 0, 100, 0, 8, async, 0, values, 45));
+            std::printf("phase_n_reclaim attempted=%llu success=%llu failure=%llu victim_count=%llu budget=%llu resident_before=%llu over=%llu target=%llu attempted_bytes=%llu reclaimed=%llu failed_bytes=%llu candidate_bytes=%llu candidate_regions=%llu cooldown_bytes=%llu cooldown_regions=%llu success_events=%llu failed_events=%llu mode=%llu flags=0x%llx\n",
+                        static_cast<unsigned long long>(values[0]),
+                        static_cast<unsigned long long>(values[1]),
+                        static_cast<unsigned long long>(values[2]),
+                        static_cast<unsigned long long>(values[3]),
+                        static_cast<unsigned long long>(values[4]),
+                        static_cast<unsigned long long>(values[5]),
+                        static_cast<unsigned long long>(values[6]),
+                        static_cast<unsigned long long>(values[7]),
+                        static_cast<unsigned long long>(values[8]),
+                        static_cast<unsigned long long>(values[9]),
+                        static_cast<unsigned long long>(values[10]),
+                        static_cast<unsigned long long>(values[11]),
+                        static_cast<unsigned long long>(values[12]),
+                        static_cast<unsigned long long>(values[13]),
+                        static_cast<unsigned long long>(values[14]),
+                        static_cast<unsigned long long>(values[39]),
+                        static_cast<unsigned long long>(values[40]),
+                        static_cast<unsigned long long>(values[41]),
+                        static_cast<unsigned long long>(values[42]));
+            std::printf("phase_n_reclaim_victims:");
+            for (int i = 0; i < 8; ++i) {
+                std::printf(" [%d]=%llu:%llu:0x%llx",
+                            i,
+                            static_cast<unsigned long long>(values[15 + i]),
+                            static_cast<unsigned long long>(values[23 + i]),
+                            static_cast<unsigned long long>(values[31 + i]));
+            }
+            std::printf("\n");
+        }
+        (void)uvm_driver_phase_f_unregister_region(region_id);
+        trace("after_phase_n_reclaim");
+        if (failed || step == "phase-n-reclaim") {
             cudaFree(ptr);
             return failed;
         }

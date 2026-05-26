@@ -53,7 +53,9 @@ constexpr unsigned int UVM_PHASE_N_GET_POOL_STATE_IOCTL = 86;
 constexpr unsigned int UVM_PHASE_N_UPDATE_REGION_STATE_IOCTL = 87;
 constexpr unsigned int UVM_PHASE_N_QUERY_REGION_IOCTL = 88;
 constexpr unsigned int UVM_PHASE_N_QUERY_REGION_BY_VA_IOCTL = 89;
+constexpr unsigned int UVM_PHASE_N_RECLAIM_POOL_IOCTL = 90;
 constexpr size_t UVM_TEST_PHASE_F_MAX_RANGES = 64;
+constexpr size_t UVM_PHASE_N_TRACE_VICTIM_MAX = 8;
 constexpr uint32_t UVM_TEST_PHASE_F_PING_MAGIC = 0x50464e47;  // "PFNG"
 
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU = 1;
@@ -150,9 +152,20 @@ struct PhaseNGetPoolStateParams {
     uint64_t reclaim_bytes;
     uint64_t protected_bytes;
     uint64_t evictable_bytes;
+    uint64_t over_budget_bytes;
+    uint64_t reclaim_target_bytes;
+    uint64_t victim_candidate_bytes;
+    uint64_t victim_candidate_regions;
+    uint64_t selected_victim_region_id;
+    uint64_t selected_victim_bytes;
+    uint32_t victim_count;
+    uint32_t reserved;
+    uint64_t victim_region_ids[UVM_PHASE_N_TRACE_VICTIM_MAX];
+    uint64_t victim_bytes[UVM_PHASE_N_TRACE_VICTIM_MAX];
     uint64_t over_budget_events;
     uint64_t reclaim_success_events;
     uint64_t reclaim_failed_events;
+    uint64_t accounting_corrections;
     uint32_t mode;
     uint32_t flags;
     uint32_t rmStatus;
@@ -199,6 +212,40 @@ struct PhaseNQueryRegionByVaParams {
     uint32_t priority;
     uint32_t found_by_va;
     uint64_t last_access_epoch;
+    uint32_t rmStatus;
+};
+
+struct PhaseNReclaimPoolParams {
+    uint32_t pool;
+    uint32_t gpu_id;
+    uint64_t target_bytes;
+    uint64_t current_epoch;
+    uint64_t cooldown_epochs;
+    uint32_t max_victims;
+    uint8_t async;
+    uint32_t flags;
+    uint32_t attempted_regions;
+    uint32_t success_regions;
+    uint32_t failure_regions;
+    uint32_t victim_count;
+    uint64_t budget_bytes;
+    uint64_t resident_gpu_bytes_before;
+    uint64_t over_budget_bytes;
+    uint64_t reclaim_target_bytes;
+    uint64_t attempted_bytes;
+    uint64_t reclaimed_bytes;
+    uint64_t failed_bytes;
+    uint64_t victim_candidate_bytes;
+    uint64_t victim_candidate_regions;
+    uint64_t cooldown_skipped_bytes;
+    uint64_t cooldown_skipped_regions;
+    uint64_t victim_region_ids[UVM_PHASE_N_TRACE_VICTIM_MAX];
+    uint64_t victim_bytes[UVM_PHASE_N_TRACE_VICTIM_MAX];
+    uint32_t victim_status[UVM_PHASE_N_TRACE_VICTIM_MAX];
+    uint64_t reclaim_success_events;
+    uint64_t reclaim_failed_events;
+    uint32_t mode;
+    uint32_t pool_flags;
     uint32_t rmStatus;
 };
 
@@ -784,7 +831,7 @@ int uvm_driver_phase_n_get_pool_state_internal(uint32_t pool,
                                                uint32_t gpu_id,
                                                uint64_t* values_out,
                                                size_t values_count) {
-    if (values_out == nullptr || values_count < 11) return -2;
+    if (values_out == nullptr || values_count < 36) return -2;
     int fd = open_initialized_uvm_fd("driver_phase_n_get_pool_state", true);
     if (fd < 0) return -4;
 
@@ -799,15 +846,17 @@ int uvm_driver_phase_n_get_pool_state_internal(uint32_t pool,
     int ret = ioctl(fd, UVM_PHASE_N_GET_POOL_STATE_IOCTL, &params);
     int saved_errno = errno;
     close(fd);
-    phase_f_debug_log("driver_phase_n_get_pool_state cmd=%u pool=%u ioctl_done ret=%d errno=%d rmStatus=%u budget=%llu protected=%llu evictable=%llu",
+    phase_f_debug_log("driver_phase_n_get_pool_state cmd=%u pool=%u ioctl_done ret=%d errno=%d rmStatus=%u budget=%llu gpu=%llu over=%llu target=%llu candidate=%llu",
                       UVM_PHASE_N_GET_POOL_STATE_IOCTL,
                       pool,
                       ret,
                       saved_errno,
                       params.rmStatus,
                       static_cast<unsigned long long>(params.budget_bytes),
-                      static_cast<unsigned long long>(params.protected_bytes),
-                      static_cast<unsigned long long>(params.evictable_bytes));
+                      static_cast<unsigned long long>(params.resident_gpu_bytes),
+                      static_cast<unsigned long long>(params.over_budget_bytes),
+                      static_cast<unsigned long long>(params.reclaim_target_bytes),
+                      static_cast<unsigned long long>(params.victim_candidate_bytes));
 
     if (ret != 0) return -6;
     if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
@@ -818,11 +867,105 @@ int uvm_driver_phase_n_get_pool_state_internal(uint32_t pool,
     values_out[3] = params.reclaim_bytes;
     values_out[4] = params.protected_bytes;
     values_out[5] = params.evictable_bytes;
-    values_out[6] = params.over_budget_events;
-    values_out[7] = params.reclaim_success_events;
-    values_out[8] = params.reclaim_failed_events;
-    values_out[9] = params.mode;
-    values_out[10] = params.flags;
+    values_out[6] = params.over_budget_bytes;
+    values_out[7] = params.reclaim_target_bytes;
+    values_out[8] = params.victim_candidate_bytes;
+    values_out[9] = params.victim_candidate_regions;
+    values_out[10] = params.selected_victim_region_id;
+    values_out[11] = params.selected_victim_bytes;
+    values_out[12] = params.victim_count;
+    values_out[13] = params.reserved;
+    for (size_t i = 0; i < 8; ++i) {
+        values_out[14 + i] = params.victim_region_ids[i];
+        values_out[22 + i] = params.victim_bytes[i];
+    }
+    values_out[30] = params.over_budget_events;
+    values_out[31] = params.reclaim_success_events;
+    values_out[32] = params.reclaim_failed_events;
+    values_out[33] = params.accounting_corrections;
+    values_out[34] = params.mode;
+    values_out[35] = params.flags;
+    return 1;
+}
+
+int uvm_driver_phase_n_reclaim_pool_internal(uint32_t pool,
+                                             uint32_t gpu_id,
+                                             uint64_t target_bytes,
+                                             uint64_t current_epoch,
+                                             uint64_t cooldown_epochs,
+                                             uint32_t max_victims,
+                                             uint32_t async,
+                                             uint32_t flags,
+                                             uint64_t* values_out,
+                                             size_t values_count) {
+    if (values_out == nullptr || values_count < 45) return -2;
+    int fd = open_initialized_uvm_fd("driver_phase_n_reclaim_pool", true);
+    if (fd < 0) return -4;
+
+    PhaseNReclaimPoolParams params{};
+    params.pool = pool;
+    params.gpu_id = gpu_id;
+    params.target_bytes = target_bytes;
+    params.current_epoch = current_epoch;
+    params.cooldown_epochs = cooldown_epochs;
+    params.max_victims = max_victims;
+    params.async = async ? 1 : 0;
+    params.flags = flags;
+
+    phase_f_debug_log("driver_phase_n_reclaim_pool cmd=%u pool=%u gpu_id=%u target=%llu epoch=%llu cooldown=%llu max_victims=%u async=%u flags=0x%x ioctl_begin",
+                      UVM_PHASE_N_RECLAIM_POOL_IOCTL,
+                      pool,
+                      gpu_id,
+                      static_cast<unsigned long long>(target_bytes),
+                      static_cast<unsigned long long>(current_epoch),
+                      static_cast<unsigned long long>(cooldown_epochs),
+                      max_victims,
+                      async,
+                      flags);
+    int ret = ioctl(fd, UVM_PHASE_N_RECLAIM_POOL_IOCTL, &params);
+    int saved_errno = errno;
+    close(fd);
+    phase_f_debug_log("driver_phase_n_reclaim_pool cmd=%u pool=%u ioctl_done ret=%d errno=%d rmStatus=%u attempted=%u success=%u failure=%u reclaimed=%llu target=%llu",
+                      UVM_PHASE_N_RECLAIM_POOL_IOCTL,
+                      pool,
+                      ret,
+                      saved_errno,
+                      params.rmStatus,
+                      params.attempted_regions,
+                      params.success_regions,
+                      params.failure_regions,
+                      static_cast<unsigned long long>(params.reclaimed_bytes),
+                      static_cast<unsigned long long>(params.reclaim_target_bytes));
+
+    if (ret != 0) return -6;
+    if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+
+    values_out[0] = params.attempted_regions;
+    values_out[1] = params.success_regions;
+    values_out[2] = params.failure_regions;
+    values_out[3] = params.victim_count;
+    values_out[4] = params.budget_bytes;
+    values_out[5] = params.resident_gpu_bytes_before;
+    values_out[6] = params.over_budget_bytes;
+    values_out[7] = params.reclaim_target_bytes;
+    values_out[8] = params.attempted_bytes;
+    values_out[9] = params.reclaimed_bytes;
+    values_out[10] = params.failed_bytes;
+    values_out[11] = params.victim_candidate_bytes;
+    values_out[12] = params.victim_candidate_regions;
+    values_out[13] = params.cooldown_skipped_bytes;
+    values_out[14] = params.cooldown_skipped_regions;
+    for (size_t i = 0; i < UVM_PHASE_N_TRACE_VICTIM_MAX; ++i) {
+        values_out[15 + i] = params.victim_region_ids[i];
+        values_out[23 + i] = params.victim_bytes[i];
+        values_out[31 + i] = params.victim_status[i];
+    }
+    values_out[39] = params.reclaim_success_events;
+    values_out[40] = params.reclaim_failed_events;
+    values_out[41] = params.mode;
+    values_out[42] = params.pool_flags;
+    values_out[43] = params.rmStatus;
+    values_out[44] = params.flags;
     return 1;
 }
 
@@ -5992,6 +6135,29 @@ int uvm_driver_phase_n_get_pool_state(uint32_t pool,
     return uvm_driver_phase_n_get_pool_state_internal(
         pool,
         gpu_id,
+        values_out,
+        values_count);
+}
+
+int uvm_driver_phase_n_reclaim_pool(uint32_t pool,
+                                    uint32_t gpu_id,
+                                    uint64_t target_bytes,
+                                    uint64_t current_epoch,
+                                    uint64_t cooldown_epochs,
+                                    uint32_t max_victims,
+                                    uint32_t async,
+                                    uint32_t flags,
+                                    uint64_t* values_out,
+                                    size_t values_count) {
+    return uvm_driver_phase_n_reclaim_pool_internal(
+        pool,
+        gpu_id,
+        target_bytes,
+        current_epoch,
+        cooldown_epochs,
+        max_victims,
+        async,
+        flags,
         values_out,
         values_count);
 }

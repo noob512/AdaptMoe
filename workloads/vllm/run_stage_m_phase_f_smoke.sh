@@ -77,7 +77,7 @@ Options:
   --bytes <n>             managed allocation size, default 1048576
   --device <n>            CUDA device, default 0
   --async <0|1>           use async migrate flag for prefetch, default 0
-  --step <name>           run only one step: all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|query|register-region|query-region|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu
+  --step <name>           run only one step: all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|query|register-region|query-region|phase-n-region|phase-n-reclaim|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu
   --no-enable-tests       do not try to enable uvm_enable_builtin_tests
   --force-reload-uvm      last-resort: reload nvidia_uvm with builtin tests
   --reload-uvm            deprecated alias for --force-reload-uvm
@@ -368,7 +368,7 @@ case "$STEP" in
     run_step "all" "$SMOKE" --step all --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
     trace_marker "case_all_end"
     ;;
-  ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|query|register-region|query-region|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu)
+  ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|query|register-region|query-region|phase-n-region|phase-n-reclaim|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu)
     # 单步诊断模式。你给的命令 --step ping-ioctl 会进入这里，只执行一个子进程。
     trace_marker "case_single_begin selected=$STEP"
     run_step "$STEP" "$SMOKE" --step "$STEP" --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"

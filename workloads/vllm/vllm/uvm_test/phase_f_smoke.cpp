@@ -87,6 +87,27 @@ int uvm_driver_phase_f_register_query_region(uint64_t region_id,
                                              uintptr_t base,
                                              size_t length,
                                              int device);
+int uvm_driver_phase_n_set_pool_budget(uint32_t pool,
+                                       uint32_t gpu_id,
+                                       uint64_t budget_bytes,
+                                       uint32_t mode,
+                                       uint32_t flags);
+int uvm_driver_phase_n_get_pool_state(uint32_t pool,
+                                      uint32_t gpu_id,
+                                      uint64_t* values_out,
+                                      size_t values_count);
+int uvm_driver_phase_n_update_region_state(uint64_t region_id,
+                                           uint32_t state,
+                                           uint32_t flags_set,
+                                           uint32_t flags_clear,
+                                           uint32_t priority,
+                                           uint64_t last_access_epoch);
+int uvm_driver_phase_n_query_region(uint64_t region_id,
+                                    uint64_t* values_out,
+                                    size_t values_count);
+int uvm_driver_phase_n_query_region_by_va(uintptr_t address,
+                                          uint64_t* values_out,
+                                          size_t values_count);
 int uvm_driver_phase_f_probe_existing_uvm_fd();
 }
 
@@ -96,7 +117,7 @@ namespace {
 // shell 脚本 run_stage_m_phase_f_smoke.sh 会把同名 --step 继续传进来。
 void usage(const char* argv0) {
     std::fprintf(stderr,
-                 "Usage: %s [--step all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|register-region|query-region|query|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu] "
+                 "Usage: %s [--step all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|register-region|query-region|phase-n-region|query|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu] "
                  "[--bytes N] [--device N] [--async 0|1]\n",
                  argv0);
 }
@@ -367,6 +388,77 @@ int main(int argc, char** argv) {
             uvm_driver_phase_f_register_region(region_id, base, size, 1, 0, 0, 0, 0));
         trace("after_register_region");
         if (failed || step == "register-region") {
+            cudaFree(ptr);
+            return failed;
+        }
+    }
+
+    // Step 8.3: Stage N 控制面闭环。
+    // 注册 region tag，设置 KV pool budget，更新 region state，再按 id/VA 查询。
+    if (want_step(step, "phase-n-region")) {
+        uint64_t values[11] = {};
+        trace("before_phase_n_region");
+        int failed = run_step(
+            "phase-n-set-pool-budget",
+            uvm_driver_phase_n_set_pool_budget(1, 0, 10ULL << 30, 0, 0));
+        if (!failed) {
+            failed = run_step(
+                "phase-n-register-region",
+                uvm_driver_phase_f_register_region(region_id, base, size, 1, 0, 0, 1, 1));
+        }
+        if (!failed) {
+            failed = run_step(
+                "phase-n-update-region-state",
+                uvm_driver_phase_n_update_region_state(region_id, 4, 0x6, 0x1, 7, 42));
+        }
+        if (!failed) {
+            failed = run_step(
+                "phase-n-query-region",
+                uvm_driver_phase_n_query_region(region_id, values, 11));
+            std::printf("phase_n_region id=%llu base=0x%llx length=%llu pool=%llu role=%llu flags=0x%llx state=%llu priority=%llu epoch=%llu\n",
+                        static_cast<unsigned long long>(values[0]),
+                        static_cast<unsigned long long>(values[1]),
+                        static_cast<unsigned long long>(values[2]),
+                        static_cast<unsigned long long>(values[3]),
+                        static_cast<unsigned long long>(values[6]),
+                        static_cast<unsigned long long>(values[7]),
+                        static_cast<unsigned long long>(values[8]),
+                        static_cast<unsigned long long>(values[9]),
+                        static_cast<unsigned long long>(values[10]));
+        }
+        if (!failed) {
+            std::memset(values, 0, sizeof(values));
+            failed = run_step(
+                "phase-n-query-region-by-va",
+                uvm_driver_phase_n_query_region_by_va(base, values, 11));
+            std::printf("phase_n_region_by_va id=%llu base=0x%llx length=%llu pool=%llu role=%llu flags=0x%llx state=%llu priority=%llu epoch=%llu\n",
+                        static_cast<unsigned long long>(values[0]),
+                        static_cast<unsigned long long>(values[1]),
+                        static_cast<unsigned long long>(values[2]),
+                        static_cast<unsigned long long>(values[3]),
+                        static_cast<unsigned long long>(values[6]),
+                        static_cast<unsigned long long>(values[7]),
+                        static_cast<unsigned long long>(values[8]),
+                        static_cast<unsigned long long>(values[9]),
+                        static_cast<unsigned long long>(values[10]));
+        }
+        if (!failed) {
+            std::memset(values, 0, sizeof(values));
+            failed = run_step(
+                "phase-n-get-pool-state",
+                uvm_driver_phase_n_get_pool_state(1, 0, values, 11));
+            std::printf("phase_n_pool_state budget=%llu resident_gpu=%llu resident_cpu=%llu protected=%llu evictable=%llu mode=%llu flags=0x%llx\n",
+                        static_cast<unsigned long long>(values[0]),
+                        static_cast<unsigned long long>(values[1]),
+                        static_cast<unsigned long long>(values[2]),
+                        static_cast<unsigned long long>(values[4]),
+                        static_cast<unsigned long long>(values[5]),
+                        static_cast<unsigned long long>(values[9]),
+                        static_cast<unsigned long long>(values[10]));
+        }
+        (void)uvm_driver_phase_f_unregister_region(region_id);
+        trace("after_phase_n_region");
+        if (failed || step == "phase-n-region") {
             cudaFree(ptr);
             return failed;
         }

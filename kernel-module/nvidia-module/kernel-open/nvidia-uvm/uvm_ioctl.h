@@ -1091,6 +1091,113 @@ typedef struct
     NV_STATUS                rmStatus;                              // OUT
 } UVM_PHASE_F_BATCH_REGIONS_PARAMS;
 
+typedef enum
+{
+    UVM_PHASE_N_POOL_UNKNOWN = 0,
+    UVM_PHASE_N_POOL_KV = 1,
+    UVM_PHASE_N_POOL_WEIGHT = 2,
+    UVM_PHASE_N_POOL_SCRATCH = 3,
+    UVM_PHASE_N_POOL_ACTIVATION = 4,
+    UVM_PHASE_N_POOL_MAX = 5,
+} UVM_PHASE_N_POOL;
+
+typedef enum
+{
+    UVM_PHASE_N_MODE_TRACE_ONLY = 0,
+    UVM_PHASE_N_MODE_SOFT = 1,
+    UVM_PHASE_N_MODE_ENFORCE = 2,
+} UVM_PHASE_N_BUDGET_MODE;
+
+typedef enum
+{
+    UVM_PHASE_N_REGION_STATE_UNKNOWN = 0,
+    UVM_PHASE_N_REGION_STATE_COLD = 1,
+    UVM_PHASE_N_REGION_STATE_WARM = 2,
+    UVM_PHASE_N_REGION_STATE_HOT = 3,
+    UVM_PHASE_N_REGION_STATE_ACTIVE = 4,
+    UVM_PHASE_N_REGION_STATE_INACTIVE = 5,
+} UVM_PHASE_N_REGION_STATE;
+
+#define UVM_PHASE_N_SET_POOL_BUDGET                                  UVM_IOCTL_BASE(85)
+typedef struct
+{
+    NvU32     pool;                         // IN
+    NvU32     gpu_id;                       // IN, reserved for future multi-GPU accounting
+    NvU64     budget_bytes NV_ALIGN_BYTES(8); // IN
+    NvU32     mode;                         // IN
+    NvU32     flags;                        // IN
+    NV_STATUS rmStatus;                     // OUT
+} UVM_PHASE_N_SET_POOL_BUDGET_PARAMS;
+
+#define UVM_PHASE_N_GET_POOL_STATE                                   UVM_IOCTL_BASE(86)
+typedef struct
+{
+    NvU32     pool;                         // IN
+    NvU32     gpu_id;                       // IN, reserved for future multi-GPU accounting
+    NvU64     budget_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     resident_gpu_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     resident_cpu_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     reclaim_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     protected_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     evictable_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64     over_budget_events NV_ALIGN_BYTES(8); // OUT
+    NvU64     reclaim_success_events NV_ALIGN_BYTES(8); // OUT
+    NvU64     reclaim_failed_events NV_ALIGN_BYTES(8); // OUT
+    NvU32     mode;                         // OUT
+    NvU32     flags;                        // OUT
+    NV_STATUS rmStatus;                     // OUT
+} UVM_PHASE_N_GET_POOL_STATE_PARAMS;
+
+#define UVM_PHASE_N_UPDATE_REGION_STATE                              UVM_IOCTL_BASE(87)
+typedef struct
+{
+    NvU64     region_id NV_ALIGN_BYTES(8);  // IN
+    NvU32     state;                        // IN
+    NvU32     flags_set;                    // IN
+    NvU32     flags_clear;                  // IN
+    NvU32     priority;                     // IN
+    NvU32     reserved;                     // IN
+    NvU64     last_access_epoch NV_ALIGN_BYTES(8); // IN
+    NV_STATUS rmStatus;                     // OUT
+} UVM_PHASE_N_UPDATE_REGION_STATE_PARAMS;
+
+#define UVM_PHASE_N_QUERY_REGION                                     UVM_IOCTL_BASE(88)
+typedef struct
+{
+    NvU64     region_id NV_ALIGN_BYTES(8);  // IN
+    NvU64     base NV_ALIGN_BYTES(8);       // OUT
+    NvU64     length NV_ALIGN_BYTES(8);     // OUT
+    NvU32     pool;                         // OUT
+    NvU32     layer_id;                     // OUT
+    NvU32     expert_id;                    // OUT
+    NvU32     role;                         // OUT
+    NvU32     flags;                        // OUT
+    NvU32     state;                        // OUT
+    NvU32     priority;                     // OUT
+    NvU32     found_by_va;                  // OUT
+    NvU64     last_access_epoch NV_ALIGN_BYTES(8); // OUT
+    NV_STATUS rmStatus;                     // OUT
+} UVM_PHASE_N_QUERY_REGION_PARAMS;
+
+#define UVM_PHASE_N_QUERY_REGION_BY_VA                               UVM_IOCTL_BASE(89)
+typedef struct
+{
+    NvU64     address NV_ALIGN_BYTES(8);    // IN
+    NvU64     region_id NV_ALIGN_BYTES(8);  // OUT
+    NvU64     base NV_ALIGN_BYTES(8);       // OUT
+    NvU64     length NV_ALIGN_BYTES(8);     // OUT
+    NvU32     pool;                         // OUT
+    NvU32     layer_id;                     // OUT
+    NvU32     expert_id;                    // OUT
+    NvU32     role;                         // OUT
+    NvU32     flags;                        // OUT
+    NvU32     state;                        // OUT
+    NvU32     priority;                     // OUT
+    NvU32     found_by_va;                  // OUT
+    NvU64     last_access_epoch NV_ALIGN_BYTES(8); // OUT
+    NV_STATUS rmStatus;                     // OUT
+} UVM_PHASE_N_QUERY_REGION_BY_VA_PARAMS;
+
 //
 // UvmDiscard
 //

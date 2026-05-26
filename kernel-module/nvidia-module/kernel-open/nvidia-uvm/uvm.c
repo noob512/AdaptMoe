@@ -46,6 +46,54 @@ static dev_t g_uvm_base_dev;
 static struct cdev g_uvm_cdev;
 static const struct file_operations uvm_fops;
 
+static uvm_phase_f_region_t *uvm_phase_f_region_from_node(uvm_range_tree_node_t *node)
+{
+    if (!node)
+        return NULL;
+
+    return container_of(node, uvm_phase_f_region_t, va_node);
+}
+
+static bool uvm_phase_n_valid_pool(NvU32 pool)
+{
+    return pool < UVM_PHASE_N_POOL_STATE_MAX;
+}
+
+static void uvm_phase_n_copy_region_to_query(uvm_phase_f_region_t *region,
+                                             UVM_PHASE_N_QUERY_REGION_PARAMS *params,
+                                             NvU32 found_by_va)
+{
+    params->region_id = region->region_id;
+    params->base = region->base;
+    params->length = region->length;
+    params->pool = region->pool;
+    params->layer_id = region->layer_id;
+    params->expert_id = region->expert_id;
+    params->role = region->role;
+    params->flags = region->flags;
+    params->state = region->state;
+    params->priority = region->priority;
+    params->found_by_va = found_by_va;
+    params->last_access_epoch = region->last_access_epoch;
+}
+
+static void uvm_phase_n_copy_region_to_query_by_va(uvm_phase_f_region_t *region,
+                                                   UVM_PHASE_N_QUERY_REGION_BY_VA_PARAMS *params)
+{
+    params->region_id = region->region_id;
+    params->base = region->base;
+    params->length = region->length;
+    params->pool = region->pool;
+    params->layer_id = region->layer_id;
+    params->expert_id = region->expert_id;
+    params->role = region->role;
+    params->flags = region->flags;
+    params->state = region->state;
+    params->priority = region->priority;
+    params->found_by_va = 1;
+    params->last_access_epoch = region->last_access_epoch;
+}
+
 bool uvm_file_is_nvidia_uvm(struct file *filp)
 {
     return (filp != NULL) && (filp->f_op == &uvm_fops);
@@ -1389,7 +1437,10 @@ static NV_STATUS uvm_api_phase_f_register_region(UVM_PHASE_F_REGISTER_REGION_PAR
     NV_STATUS status;
     int ret;
 
-    if (params->region.region_id == 0 || params->region.base == 0 || params->region.length == 0)
+    if (params->region.region_id == 0 ||
+        params->region.base == 0 ||
+        params->region.length == 0 ||
+        params->region.base + params->region.length - 1 < params->region.base)
         return NV_ERR_INVALID_ARGUMENT;
 
     region = uvm_kvmalloc_zero(sizeof(*region));
@@ -1404,10 +1455,20 @@ static NV_STATUS uvm_api_phase_f_register_region(UVM_PHASE_F_REGISTER_REGION_PAR
     region->expert_id = params->region.expert_id;
     region->role = params->region.role;
     region->flags = params->region.flags;
+    region->state = UVM_PHASE_N_REGION_STATE_UNKNOWN;
+    region->priority = 0;
+    region->last_access_epoch = 0;
+    region->va_node.start = region->base;
+    region->va_node.end = region->base + region->length - 1;
 
     uvm_va_space_down_write(va_space);
-    ret = radix_tree_insert(&va_space->phase_f_regions, region->region_id, region);
-    status = errno_to_nv_status(ret);
+    status = uvm_range_tree_add(&va_space->phase_f_region_ranges, &region->va_node);
+    if (status == NV_OK) {
+        ret = radix_tree_insert(&va_space->phase_f_regions, region->region_id, region);
+        status = errno_to_nv_status(ret);
+        if (status != NV_OK)
+            uvm_range_tree_remove(&va_space->phase_f_region_ranges, &region->va_node);
+    }
     uvm_va_space_up_write(va_space);
 
     if (status != NV_OK) {
@@ -1438,6 +1499,8 @@ static NV_STATUS uvm_api_phase_f_unregister_region(UVM_PHASE_F_UNREGISTER_REGION
 
     uvm_va_space_down_write(va_space);
     region = radix_tree_delete(&va_space->phase_f_regions, params->region_id);
+    if (region)
+        uvm_range_tree_remove(&va_space->phase_f_region_ranges, &region->va_node);
     uvm_va_space_up_write(va_space);
 
     if (!region)
@@ -1531,6 +1594,175 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
     return first_error;
 }
 
+static NV_STATUS uvm_api_phase_n_set_pool_budget(UVM_PHASE_N_SET_POOL_BUDGET_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_phase_n_pool_state_t *pool_state;
+
+    if (!uvm_phase_n_valid_pool(params->pool))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    uvm_va_space_down_write(va_space);
+    pool_state = &va_space->phase_n_pools[params->pool];
+    pool_state->budget_bytes = params->budget_bytes;
+    pool_state->mode = params->mode;
+    pool_state->flags = params->flags;
+    uvm_va_space_up_write(va_space);
+
+    uvm_phase_f_route_log("phase_n_set_pool_budget pool=%u gpu_id=%u budget=%llu mode=%u flags=0x%x\n",
+                          params->pool,
+                          params->gpu_id,
+                          params->budget_bytes,
+                          params->mode,
+                          params->flags);
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_api_phase_n_get_pool_state(UVM_PHASE_N_GET_POOL_STATE_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_phase_n_pool_state_t pool_state;
+    uvm_phase_f_region_t *region = NULL;
+    struct radix_tree_root *root = &va_space->phase_f_regions;
+    NvU64 index = 1;
+
+    if (!uvm_phase_n_valid_pool(params->pool))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    params->resident_gpu_bytes = 0;
+    params->resident_cpu_bytes = 0;
+    params->reclaim_bytes = 0;
+    params->protected_bytes = 0;
+    params->evictable_bytes = 0;
+
+    uvm_va_space_down_read(va_space);
+    pool_state = va_space->phase_n_pools[params->pool];
+    while (radix_tree_gang_lookup(root, (void **)&region, index, 1)) {
+        UVM_ASSERT(region);
+        if (region->pool == params->pool) {
+            if (region->flags & (1U << 1))
+                params->protected_bytes += region->length;
+            if (region->flags & (1U << 0))
+                params->evictable_bytes += region->length;
+        }
+        index = region->region_id + 1;
+    }
+    uvm_va_space_up_read(va_space);
+
+    params->budget_bytes = pool_state.budget_bytes;
+    params->resident_gpu_bytes = pool_state.resident_gpu_bytes;
+    params->resident_cpu_bytes = pool_state.resident_cpu_bytes;
+    params->reclaim_bytes = pool_state.reclaim_bytes;
+    params->over_budget_events = pool_state.over_budget_events;
+    params->reclaim_success_events = pool_state.reclaim_success_events;
+    params->reclaim_failed_events = pool_state.reclaim_failed_events;
+    params->mode = pool_state.mode;
+    params->flags = pool_state.flags;
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_api_phase_n_update_region_state(UVM_PHASE_N_UPDATE_REGION_STATE_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_phase_f_region_t *region;
+
+    if (params->region_id == 0 || params->state > UVM_PHASE_N_REGION_STATE_INACTIVE)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    uvm_va_space_down_write(va_space);
+    region = radix_tree_lookup(&va_space->phase_f_regions, params->region_id);
+    if (region) {
+        region->state = params->state;
+        region->flags &= ~params->flags_clear;
+        region->flags |= params->flags_set;
+        region->priority = params->priority;
+        region->last_access_epoch = params->last_access_epoch;
+    }
+    uvm_va_space_up_write(va_space);
+
+    if (!region)
+        return NV_ERR_OBJECT_NOT_FOUND;
+
+    uvm_phase_f_route_log("phase_n_update_region_state id=%llu state=%u flags_set=0x%x flags_clear=0x%x priority=%u last_access_epoch=%llu\n",
+                          params->region_id,
+                          params->state,
+                          params->flags_set,
+                          params->flags_clear,
+                          params->priority,
+                          params->last_access_epoch);
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_api_phase_n_query_region(UVM_PHASE_N_QUERY_REGION_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_phase_f_region_t *region;
+
+    if (params->region_id == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    params->base = 0;
+    params->length = 0;
+    params->pool = 0;
+    params->layer_id = 0;
+    params->expert_id = 0;
+    params->role = 0;
+    params->flags = 0;
+    params->state = 0;
+    params->priority = 0;
+    params->found_by_va = 0;
+    params->last_access_epoch = 0;
+
+    uvm_va_space_down_read(va_space);
+    region = radix_tree_lookup(&va_space->phase_f_regions, params->region_id);
+    if (region)
+        uvm_phase_n_copy_region_to_query(region, params, 0);
+    uvm_va_space_up_read(va_space);
+
+    if (!region)
+        return NV_ERR_OBJECT_NOT_FOUND;
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_api_phase_n_query_region_by_va(UVM_PHASE_N_QUERY_REGION_BY_VA_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_phase_f_region_t *region = NULL;
+    uvm_range_tree_node_t *node;
+
+    if (params->address == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    params->region_id = 0;
+    params->base = 0;
+    params->length = 0;
+    params->pool = 0;
+    params->layer_id = 0;
+    params->expert_id = 0;
+    params->role = 0;
+    params->flags = 0;
+    params->state = 0;
+    params->priority = 0;
+    params->found_by_va = 0;
+    params->last_access_epoch = 0;
+
+    uvm_va_space_down_read(va_space);
+    node = uvm_range_tree_find(&va_space->phase_f_region_ranges, params->address);
+    region = uvm_phase_f_region_from_node(node);
+    if (region)
+        uvm_phase_n_copy_region_to_query_by_va(region, params);
+    uvm_va_space_up_read(va_space);
+
+    if (!region)
+        return NV_ERR_OBJECT_NOT_FOUND;
+
+    return NV_OK;
+}
+
 static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     switch (cmd)
@@ -1586,6 +1818,11 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_F_REGISTER_REGION,        uvm_api_phase_f_register_region);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_F_UNREGISTER_REGION,      uvm_api_phase_f_unregister_region);
         UVM_ROUTE_CMD_ALLOC_INIT_CHECK(UVM_PHASE_F_BATCH_REGIONS,          uvm_api_phase_f_batch_regions);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_N_SET_POOL_BUDGET,        uvm_api_phase_n_set_pool_budget);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_N_GET_POOL_STATE,         uvm_api_phase_n_get_pool_state);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_N_UPDATE_REGION_STATE,     uvm_api_phase_n_update_region_state);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_N_QUERY_REGION,            uvm_api_phase_n_query_region);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_N_QUERY_REGION_BY_VA,      uvm_api_phase_n_query_region_by_va);
     }
 
     // Try the test ioctls if none of the above matched

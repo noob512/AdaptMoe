@@ -53,6 +53,7 @@ static void uvm_phase_f_region_radix_tree_destroy(uvm_va_space_t *va_space)
 
     while (radix_tree_gang_lookup(root, (void **)&region, index, 1)) {
         UVM_ASSERT(region);
+        uvm_range_tree_remove(&va_space->phase_f_region_ranges, &region->va_node);
         radix_tree_delete(root, region->region_id);
         index = region->region_id + 1;
         uvm_kvfree(region);
@@ -223,6 +224,7 @@ NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va
     INIT_RADIX_TREE(&va_space->range_groups, NV_UVM_GFP_FLAGS);
     uvm_range_tree_init(&va_space->range_group_ranges);
     INIT_RADIX_TREE(&va_space->phase_f_regions, NV_UVM_GFP_FLAGS);
+    uvm_range_tree_init(&va_space->phase_f_region_ranges);
 
     bitmap_zero(va_space->enabled_peers, UVM_MAX_UNIQUE_GPU_PAIRS);
 

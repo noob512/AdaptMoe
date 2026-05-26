@@ -64,12 +64,33 @@ typedef struct
     NvU64 region_id;
     NvU64 base;
     NvU64 length;
+    uvm_range_tree_node_t va_node;
     NvU32 pool;
     NvU32 layer_id;
     NvU32 expert_id;
     NvU32 role;
     NvU32 flags;
+    NvU32 state;
+    NvU32 priority;
+    NvU64 last_access_epoch;
 } uvm_phase_f_region_t;
+
+#define UVM_PHASE_N_POOL_STATE_MAX 5
+
+typedef struct
+{
+    NvU64 budget_bytes;
+    NvU64 resident_gpu_bytes;
+    NvU64 resident_cpu_bytes;
+    NvU64 reclaim_bytes;
+    NvU64 protected_bytes;
+    NvU64 evictable_bytes;
+    NvU64 over_budget_events;
+    NvU64 reclaim_success_events;
+    NvU64 reclaim_failed_events;
+    NvU32 mode;
+    NvU32 flags;
+} uvm_phase_n_pool_state_t;
 
 typedef struct
 {
@@ -235,6 +256,8 @@ struct uvm_va_space_struct
 
     // Phase F policy regions, indexed by userspace-provided region IDs.
     struct radix_tree_root phase_f_regions;
+    uvm_range_tree_t phase_f_region_ranges;
+    uvm_phase_n_pool_state_t phase_n_pools[UVM_PHASE_N_POOL_STATE_MAX];
 
     // Peer to peer table
     // A bitmask of peer to peer pairs enabled in this va_space

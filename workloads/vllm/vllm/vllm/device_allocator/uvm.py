@@ -34,10 +34,11 @@ Warning:
     - Potential compatibility issues with CUDA graphs
 """
 
+import atexit
 import ctypes
 import os
-import atexit
 from contextlib import contextmanager
+from collections.abc import Sequence
 from typing import Optional
 
 import torch
@@ -51,6 +52,38 @@ _uvm_enabled = False
 _uvm_lib: Optional[ctypes.CDLL] = None
 _uvm_phase_stack: list[str] = []
 _UVM_DRIVER_BATCH_MAX_RANGES = 64
+
+UVM_REGION_POOL_UNKNOWN = 0
+UVM_REGION_POOL_KV = 1
+UVM_REGION_POOL_WEIGHT = 2
+UVM_REGION_POOL_SCRATCH = 3
+UVM_REGION_POOL_ACTIVATION = 4
+
+UVM_REGION_ROLE_UNKNOWN = 0
+UVM_REGION_ROLE_KV_BLOCK = 1
+UVM_REGION_ROLE_DENSE_WEIGHT = 2
+UVM_REGION_ROLE_MOE_EXPERT_W13 = 3
+UVM_REGION_ROLE_MOE_EXPERT_W2 = 4
+UVM_REGION_ROLE_SCRATCH = 5
+UVM_REGION_ROLE_WORKSPACE = 6
+
+UVM_REGION_FLAG_EVICTABLE = 1 << 0
+UVM_REGION_FLAG_PROTECTED = 1 << 1
+UVM_REGION_FLAG_ACTIVE = 1 << 2
+UVM_REGION_FLAG_PREFETCHABLE = 1 << 3
+UVM_REGION_FLAG_PINNED = 1 << 4
+UVM_REGION_FLAG_TRANSIENT = 1 << 5
+
+UVM_REGION_STATE_UNKNOWN = 0
+UVM_REGION_STATE_COLD = 1
+UVM_REGION_STATE_WARM = 2
+UVM_REGION_STATE_HOT = 3
+UVM_REGION_STATE_ACTIVE = 4
+UVM_REGION_STATE_INACTIVE = 5
+
+UVM_POOL_BUDGET_MODE_TRACE_ONLY = 0
+UVM_POOL_BUDGET_MODE_SOFT = 1
+UVM_POOL_BUDGET_MODE_ENFORCE = 2
 
 
 def find_uvm_allocator_library() -> Optional[str]:
@@ -234,6 +267,82 @@ def load_uvm_library() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_uint64),
     ]
+
+    lib.uvm_driver_phase_f_register_region.restype = ctypes.c_int
+    lib.uvm_driver_phase_f_register_region.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    ]
+
+    lib.uvm_driver_phase_f_unregister_region.restype = ctypes.c_int
+    lib.uvm_driver_phase_f_unregister_region.argtypes = [ctypes.c_uint64]
+
+    lib.uvm_driver_batch_query_residency_regions.restype = ctypes.c_int
+    lib.uvm_driver_batch_query_residency_regions.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.c_size_t,
+        ctypes.c_int,
+    ]
+
+    lib.uvm_driver_phase_f_register_query_region.restype = ctypes.c_int
+    lib.uvm_driver_phase_f_register_query_region.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    ]
+
+    if hasattr(lib, "uvm_driver_phase_n_set_pool_budget"):
+        lib.uvm_driver_phase_n_set_pool_budget.restype = ctypes.c_int
+        lib.uvm_driver_phase_n_set_pool_budget.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+
+    if hasattr(lib, "uvm_driver_phase_n_get_pool_state"):
+        lib.uvm_driver_phase_n_get_pool_state.restype = ctypes.c_int
+        lib.uvm_driver_phase_n_get_pool_state.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_size_t,
+        ]
+
+    if hasattr(lib, "uvm_driver_phase_n_update_region_state"):
+        lib.uvm_driver_phase_n_update_region_state.restype = ctypes.c_int
+        lib.uvm_driver_phase_n_update_region_state.argtypes = [
+            ctypes.c_uint64,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint64,
+        ]
+
+    if hasattr(lib, "uvm_driver_phase_n_query_region"):
+        lib.uvm_driver_phase_n_query_region.restype = ctypes.c_int
+        lib.uvm_driver_phase_n_query_region.argtypes = [
+            ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_size_t,
+        ]
+
+    if hasattr(lib, "uvm_driver_phase_n_query_region_by_va"):
+        lib.uvm_driver_phase_n_query_region_by_va.restype = ctypes.c_int
+        lib.uvm_driver_phase_n_query_region_by_va.argtypes = [
+            ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_size_t,
+        ]
 
     lib.uvm_is_managed_pointer.restype = ctypes.c_int
     lib.uvm_is_managed_pointer.argtypes = [
@@ -461,6 +570,8 @@ def prefetch_range_to_device(ptr: int, size: int, device: int = 0) -> bool:
     wrapper around the allocator .so so higher-level policies can prefetch
     logical tensor slices without constructing tensor views.
     """
+    if uvm_residency_tag_only_enabled():
+        return False
     if not _uvm_enabled or _uvm_lib is None:
         return False
     if ptr <= 0 or size <= 0:
@@ -528,6 +639,11 @@ def _prepare_uvm_range_arrays(
     return ptr_array, size_array, count
 
 
+def uvm_residency_tag_only_enabled() -> bool:
+    raw = os.environ.get("VLLM_UVM_RESIDENCY_TAG_ONLY")
+    return raw is not None and raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def batch_prefetch_ranges_to_device(
     ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
     device: int = 0,
@@ -536,6 +652,8 @@ def batch_prefetch_ranges_to_device(
 
     Returns the number of CUDA prefetch calls accepted by the allocator shim.
     """
+    if uvm_residency_tag_only_enabled():
+        return 0
     if not _uvm_enabled or _uvm_lib is None:
         return 0
     ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
@@ -568,6 +686,8 @@ def advise_range_preferred_location(ptr: int, size: int, device: int) -> bool:
     logs CUDA errors internally instead of returning them, so benchmark health
     and Stage I trace records are used for end-to-end validation.
     """
+    if uvm_residency_tag_only_enabled():
+        return False
     if not _uvm_enabled or _uvm_lib is None:
         return False
     if ptr <= 0 or size <= 0:
@@ -586,6 +706,8 @@ def batch_advise_ranges_preferred_location(
     device: int,
 ) -> int:
     """Batch set cudaMemAdviseSetPreferredLocation for raw UVM ranges."""
+    if uvm_residency_tag_only_enabled():
+        return 0
     if not _uvm_enabled or _uvm_lib is None:
         return 0
     ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
@@ -609,6 +731,8 @@ def driver_batch_prefetch_ranges_to_device(
     async_: bool = False,
 ) -> int:
     """Try Phase F driver batch prefetch. Negative return means unavailable."""
+    if uvm_residency_tag_only_enabled():
+        return 0
     if not _uvm_enabled or _uvm_lib is None:
         return -1
     range_list = list(ranges)
@@ -649,6 +773,8 @@ def driver_batch_advise_ranges_cpu(
     ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
 ) -> int:
     """Try Phase F driver batch CPU preferred-location advise."""
+    if uvm_residency_tag_only_enabled():
+        return 0
     if not _uvm_enabled or _uvm_lib is None:
         return -1
     range_list = list(ranges)
@@ -752,6 +878,301 @@ def driver_batch_query_ranges_residency_bytes(
         }
     )
     return result
+
+
+def driver_register_region(
+    *,
+    region_id: int,
+    ptr: int,
+    nbytes: int,
+    pool: int,
+    layer_id: int = 0,
+    expert_id: int = 0,
+    role: int = UVM_REGION_ROLE_UNKNOWN,
+    flags: int = 0,
+) -> int:
+    """Register a tagged managed range in the Phase F driver region table."""
+    if not _uvm_enabled or _uvm_lib is None:
+        return -1
+    if region_id <= 0 or ptr <= 0 or nbytes <= 0:
+        return -2
+    try:
+        return int(
+            _uvm_lib.uvm_driver_phase_f_register_region(
+                ctypes.c_uint64(region_id),
+                ctypes.c_uint64(ptr),
+                ctypes.c_size_t(nbytes),
+                ctypes.c_uint32(max(int(pool), 0)),
+                ctypes.c_uint32(max(int(layer_id), 0)),
+                ctypes.c_uint32(max(int(expert_id), 0)),
+                ctypes.c_uint32(max(int(role), 0)),
+                ctypes.c_uint32(max(int(flags), 0)),
+            )
+        )
+    except Exception:
+        logger.debug("Failed to register Phase F driver region", exc_info=True)
+        return -3
+
+
+def driver_unregister_region(region_id: int) -> int:
+    """Unregister a Phase F driver region by numeric region id."""
+    if not _uvm_enabled or _uvm_lib is None:
+        return -1
+    if region_id <= 0:
+        return -2
+    try:
+        return int(
+            _uvm_lib.uvm_driver_phase_f_unregister_region(
+                ctypes.c_uint64(region_id)
+            )
+        )
+    except Exception:
+        logger.debug("Failed to unregister Phase F driver region", exc_info=True)
+        return -3
+
+
+def driver_batch_query_regions_residency(
+    region_ids: Sequence[int],
+    device: int = 0,
+) -> int:
+    """Query residency by Phase F registered region ids."""
+    if not _uvm_enabled or _uvm_lib is None:
+        return -1
+    valid_ids = [int(region_id) for region_id in region_ids if int(region_id) > 0]
+    if not valid_ids:
+        return 0
+    total = 0
+    for start in range(0, len(valid_ids), _UVM_DRIVER_BATCH_MAX_RANGES):
+        chunk = valid_ids[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
+        id_array = (ctypes.c_uint64 * len(chunk))(*chunk)
+        try:
+            result = int(
+                _uvm_lib.uvm_driver_batch_query_residency_regions(
+                    id_array,
+                    ctypes.c_size_t(len(chunk)),
+                    ctypes.c_int(device),
+                )
+            )
+        except Exception:
+            logger.debug("Failed to query Phase F driver regions", exc_info=True)
+            return -3
+        if result < 0:
+            return result
+        total += result
+    return total
+
+
+def driver_register_query_region(
+    *,
+    region_id: int,
+    ptr: int,
+    nbytes: int,
+    device: int = 0,
+) -> int:
+    """Register, query, and unregister a region using the C++ smoke helper."""
+    if not _uvm_enabled or _uvm_lib is None:
+        return -1
+    if region_id <= 0 or ptr <= 0 or nbytes <= 0:
+        return -2
+    try:
+        return int(
+            _uvm_lib.uvm_driver_phase_f_register_query_region(
+                ctypes.c_uint64(region_id),
+                ctypes.c_uint64(ptr),
+                ctypes.c_size_t(nbytes),
+                ctypes.c_int(device),
+            )
+        )
+    except Exception:
+        logger.debug("Failed to register/query Phase F driver region",
+                     exc_info=True)
+        return -3
+
+
+def driver_set_pool_budget(
+    *,
+    pool: int,
+    budget_bytes: int,
+    gpu_id: int = 0,
+    mode: int = UVM_POOL_BUDGET_MODE_TRACE_ONLY,
+    flags: int = 0,
+) -> int:
+    """Set a Stage N per-pool GPU residency budget in the driver."""
+    if not has_pool_budget_ioctl():
+        return -1
+    if pool < 0 or budget_bytes < 0:
+        return -2
+    try:
+        return int(
+            _uvm_lib.uvm_driver_phase_n_set_pool_budget(
+                ctypes.c_uint32(int(pool)),
+                ctypes.c_uint32(max(int(gpu_id), 0)),
+                ctypes.c_uint64(int(budget_bytes)),
+                ctypes.c_uint32(max(int(mode), 0)),
+                ctypes.c_uint32(max(int(flags), 0)),
+            )
+        )
+    except Exception:
+        logger.debug("Failed to set Phase N driver pool budget", exc_info=True)
+        return -3
+
+
+def driver_get_pool_state(pool: int, gpu_id: int = 0) -> dict[str, int] | None:
+    """Return Stage N driver pool state, or None when unavailable/failing."""
+    if not has_pool_budget_ioctl() or pool < 0:
+        return None
+    values = (ctypes.c_uint64 * 11)()
+    try:
+        status = int(
+            _uvm_lib.uvm_driver_phase_n_get_pool_state(
+                ctypes.c_uint32(int(pool)),
+                ctypes.c_uint32(max(int(gpu_id), 0)),
+                values,
+                ctypes.c_size_t(len(values)),
+            )
+        )
+    except Exception:
+        logger.debug("Failed to query Phase N driver pool state", exc_info=True)
+        return None
+    if status < 0:
+        return None
+    keys = (
+        "budget_bytes",
+        "resident_gpu_bytes",
+        "resident_cpu_bytes",
+        "reclaim_bytes",
+        "protected_bytes",
+        "evictable_bytes",
+        "over_budget_events",
+        "reclaim_success_events",
+        "reclaim_failed_events",
+        "mode",
+        "flags",
+    )
+    return {key: int(values[i]) for i, key in enumerate(keys)}
+
+
+def driver_update_region_state(
+    *,
+    region_id: int,
+    state: int = UVM_REGION_STATE_UNKNOWN,
+    flags_set: int = 0,
+    flags_clear: int = 0,
+    priority: int = 0,
+    last_access_epoch: int = 0,
+) -> int:
+    """Update Stage N region state metadata in the driver."""
+    if not has_region_state_ioctl():
+        return -1
+    if region_id <= 0:
+        return -2
+    try:
+        return int(
+            _uvm_lib.uvm_driver_phase_n_update_region_state(
+                ctypes.c_uint64(int(region_id)),
+                ctypes.c_uint32(max(int(state), 0)),
+                ctypes.c_uint32(max(int(flags_set), 0)),
+                ctypes.c_uint32(max(int(flags_clear), 0)),
+                ctypes.c_uint32(max(int(priority), 0)),
+                ctypes.c_uint64(max(int(last_access_epoch), 0)),
+            )
+        )
+    except Exception:
+        logger.debug("Failed to update Phase N driver region state",
+                     exc_info=True)
+        return -3
+
+
+def _driver_region_values_to_dict(values: ctypes.Array) -> dict[str, int]:
+    keys = (
+        "region_id",
+        "base",
+        "length",
+        "pool",
+        "layer_id",
+        "expert_id",
+        "role",
+        "flags",
+        "state",
+        "priority",
+        "last_access_epoch",
+    )
+    return {key: int(values[i]) for i, key in enumerate(keys)}
+
+
+def driver_query_region(region_id: int) -> dict[str, int] | None:
+    """Query Stage N region metadata by region id."""
+    if not has_region_state_ioctl() or region_id <= 0:
+        return None
+    values = (ctypes.c_uint64 * 11)()
+    try:
+        status = int(
+            _uvm_lib.uvm_driver_phase_n_query_region(
+                ctypes.c_uint64(int(region_id)),
+                values,
+                ctypes.c_size_t(len(values)),
+            )
+        )
+    except Exception:
+        logger.debug("Failed to query Phase N driver region", exc_info=True)
+        return None
+    if status < 0:
+        return None
+    return _driver_region_values_to_dict(values)
+
+
+def driver_query_region_by_va(address: int) -> dict[str, int] | None:
+    """Query Stage N region metadata by a virtual address."""
+    if not has_region_state_ioctl() or address <= 0:
+        return None
+    values = (ctypes.c_uint64 * 11)()
+    try:
+        status = int(
+            _uvm_lib.uvm_driver_phase_n_query_region_by_va(
+                ctypes.c_uint64(int(address)),
+                values,
+                ctypes.c_size_t(len(values)),
+            )
+        )
+    except Exception:
+        logger.debug("Failed to query Phase N driver region by VA",
+                     exc_info=True)
+        return None
+    if status < 0:
+        return None
+    return _driver_region_values_to_dict(values)
+
+
+def has_driver_region_ioctl() -> bool:
+    return _uvm_enabled and _uvm_lib is not None and all(
+        hasattr(_uvm_lib, name)
+        for name in (
+            "uvm_driver_phase_f_register_region",
+            "uvm_driver_phase_f_unregister_region",
+            "uvm_driver_batch_query_residency_regions",
+        )
+    )
+
+
+def has_pool_budget_ioctl() -> bool:
+    return _uvm_enabled and _uvm_lib is not None and all(
+        hasattr(_uvm_lib, name)
+        for name in (
+            "uvm_driver_phase_n_set_pool_budget",
+            "uvm_driver_phase_n_get_pool_state",
+        )
+    )
+
+
+def has_region_state_ioctl() -> bool:
+    return _uvm_enabled and _uvm_lib is not None and all(
+        hasattr(_uvm_lib, name)
+        for name in (
+            "uvm_driver_phase_n_update_region_state",
+            "uvm_driver_phase_n_query_region",
+            "uvm_driver_phase_n_query_region_by_va",
+        )
+    )
 
 
 def batch_prefetch_ranges_to_device_with_executor(

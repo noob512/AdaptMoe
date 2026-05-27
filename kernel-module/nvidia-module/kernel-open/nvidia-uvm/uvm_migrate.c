@@ -718,6 +718,98 @@ static NV_STATUS uvm_migrate(uvm_va_space_t *va_space,
     return status;
 }
 
+NV_STATUS uvm_migrate_managed_range_to_cpu(uvm_va_space_t *va_space,
+                                           NvU64 base,
+                                           NvU64 length,
+                                           NvU32 migrate_flags)
+{
+    uvm_tracker_t tracker = UVM_TRACKER_INIT();
+    NvU32 effective_flags = migrate_flags;
+    uvm_tracker_t *tracker_ptr = NULL;
+    uvm_processor_mask_t *gpus_to_check_for_nvlink_errors = NULL;
+    struct mm_struct *mm;
+    NV_STATUS status;
+    bool retained_mm = false;
+
+    if (uvm_api_range_invalid(base, length))
+        return NV_ERR_INVALID_ADDRESS;
+
+    if (migrate_flags & ~(UVM_MIGRATE_FLAG_ASYNC | UVM_MIGRATE_FLAG_SKIP_CPU_MAP))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    gpus_to_check_for_nvlink_errors = uvm_processor_mask_cache_alloc();
+    if (!gpus_to_check_for_nvlink_errors)
+        return NV_ERR_NO_MEMORY;
+
+    uvm_processor_mask_zero(gpus_to_check_for_nvlink_errors);
+
+    if (uvm_va_space_mm_enabled(va_space)) {
+        mm = uvm_va_space_mm_retain(va_space);
+        retained_mm = mm != NULL;
+    }
+    else if (!(current->flags & PF_KTHREAD)) {
+        mm = current->mm;
+    }
+    else {
+        mm = NULL;
+    }
+
+    if (mm)
+        uvm_down_read_mmap_lock(mm);
+    else
+        effective_flags |= UVM_MIGRATE_FLAG_SKIP_CPU_MAP;
+
+    tracker_ptr = (effective_flags & UVM_MIGRATE_FLAG_ASYNC) ? NULL : &tracker;
+
+    uvm_va_space_down_read(va_space);
+
+    if (uvm_api_range_type_check(va_space, mm, base, length) != UVM_API_RANGE_TYPE_MANAGED) {
+        status = NV_ERR_INVALID_ADDRESS;
+        goto done;
+    }
+
+    status = uvm_migrate(va_space,
+                         mm,
+                         base,
+                         length,
+                         UVM_ID_CPU,
+                         NUMA_NO_NODE,
+                         effective_flags,
+                         uvm_va_space_iter_managed_first(va_space, base, base),
+                         tracker_ptr,
+                         gpus_to_check_for_nvlink_errors);
+
+done:
+    uvm_global_gpu_retain(gpus_to_check_for_nvlink_errors);
+
+    if (mm)
+        uvm_up_read_mmap_lock_out_of_order(mm);
+
+    if (tracker_ptr) {
+        NV_STATUS tracker_status = uvm_tracker_wait(tracker_ptr);
+
+        if (status == NV_OK)
+            status = tracker_status;
+
+        uvm_tracker_deinit(tracker_ptr);
+    }
+
+    uvm_va_space_up_read(va_space);
+    if (retained_mm)
+        uvm_va_space_mm_release(va_space);
+
+    if (status == NV_OK && !uvm_processor_mask_empty(gpus_to_check_for_nvlink_errors))
+        status = uvm_global_gpu_check_nvlink_error(gpus_to_check_for_nvlink_errors);
+
+    uvm_global_gpu_release(gpus_to_check_for_nvlink_errors);
+    uvm_processor_mask_cache_free(gpus_to_check_for_nvlink_errors);
+
+    if (!(effective_flags & UVM_MIGRATE_FLAG_ASYNC) || status != NV_OK)
+        uvm_tools_flush_events();
+
+    return status;
+}
+
 static NV_STATUS semaphore_release_from_gpu(uvm_gpu_t *gpu,
                                             uvm_va_range_semaphore_pool_t *semaphore_va_range,
                                             NvU64 semaphore_user_addr,

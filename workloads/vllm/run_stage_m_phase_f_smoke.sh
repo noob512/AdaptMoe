@@ -51,6 +51,7 @@ LOG_FILE=""
 BYTES="${BYTES:-1048576}"
 DEVICE="${DEVICE:-0}"
 ASYNC="${ASYNC:-0}"
+POOL="${POOL:-1}"
 STEP="all"
 
 # policy ioctl 是生产路径，不依赖 builtin test ioctl。默认/显式 test 模式仍然
@@ -77,6 +78,7 @@ Options:
   --bytes <n>             managed allocation size, default 1048576
   --device <n>            CUDA device, default 0
   --async <0|1>           use async migrate flag for prefetch, default 0
+  --pool <n>              Phase N pool for phase-n-reclaim: 1=kv, 2=weights, 3=scratch
   --step <name>           run only one step: all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|query|register-region|query-region|phase-n-region|phase-n-reclaim|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu
   --no-enable-tests       do not try to enable uvm_enable_builtin_tests
   --force-reload-uvm      last-resort: reload nvidia_uvm with builtin tests
@@ -111,6 +113,7 @@ while [ $# -gt 0 ]; do
     --bytes) BYTES="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --async) ASYNC="$2"; shift 2 ;;
+    --pool) POOL="$2"; shift 2 ;;
     --step) STEP="$2"; shift 2 ;;
     --no-enable-tests) ENABLE_BUILTIN_TESTS=0; shift ;;
     --force-reload-uvm) FORCE_RELOAD_UVM=1; shift ;;
@@ -243,6 +246,7 @@ echo "run_root: $RUN_ROOT"
 echo "bytes: $BYTES"
 echo "device: $DEVICE"
 echo "async: $ASYNC"
+echo "pool: $POOL"
 echo "step: $STEP"
 echo "phase_f_ioctl_mode: $PHASE_F_IOCTL_MODE"
 echo "enable_builtin_tests: $ENABLE_BUILTIN_TESTS"
@@ -351,27 +355,27 @@ case "$STEP" in
     #   ping        : ping-ioctl 的同类路径；
     #   query/query-region/prefetch/advise: 对真实 managed range 执行 Phase F 操作。
     trace_marker "case_all_begin"
-    run_step "ping-open" "$SMOKE" --step ping-open --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "ping-init" "$SMOKE" --step ping-init --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "ping-small" "$SMOKE" --step ping-small --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "batch-mini0" "$SMOKE" --step batch-mini0 --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "batch-mini1" "$SMOKE" --step batch-mini1 --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "ping-ioctl" "$SMOKE" --step ping-ioctl --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "ping" "$SMOKE" --step ping --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "probe-uvm-fd" "$SMOKE" --step probe-uvm-fd --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "query" "$SMOKE" --step query --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "query-region" "$SMOKE" --step query-region --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "prefetch-gpu" "$SMOKE" --step prefetch-gpu --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "prefetch-gpu-query" "$SMOKE" --step prefetch-gpu-query --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "advise-cpu" "$SMOKE" --step advise-cpu --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "prefetch-cpu" "$SMOKE" --step prefetch-cpu --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
-    run_step "all" "$SMOKE" --step all --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
+    run_step "ping-open" "$SMOKE" --step ping-open --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "ping-init" "$SMOKE" --step ping-init --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "ping-small" "$SMOKE" --step ping-small --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "batch-mini0" "$SMOKE" --step batch-mini0 --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "batch-mini1" "$SMOKE" --step batch-mini1 --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "ping-ioctl" "$SMOKE" --step ping-ioctl --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "ping" "$SMOKE" --step ping --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "probe-uvm-fd" "$SMOKE" --step probe-uvm-fd --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "query" "$SMOKE" --step query --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "query-region" "$SMOKE" --step query-region --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "prefetch-gpu" "$SMOKE" --step prefetch-gpu --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "prefetch-gpu-query" "$SMOKE" --step prefetch-gpu-query --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "advise-cpu" "$SMOKE" --step advise-cpu --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "prefetch-cpu" "$SMOKE" --step prefetch-cpu --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
+    run_step "all" "$SMOKE" --step all --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
     trace_marker "case_all_end"
     ;;
   ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|query|register-region|query-region|phase-n-region|phase-n-reclaim|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu)
     # 单步诊断模式。你给的命令 --step ping-ioctl 会进入这里，只执行一个子进程。
     trace_marker "case_single_begin selected=$STEP"
-    run_step "$STEP" "$SMOKE" --step "$STEP" --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC"
+    run_step "$STEP" "$SMOKE" --step "$STEP" --bytes "$BYTES" --device "$DEVICE" --async "$ASYNC" --pool "$POOL"
     trace_marker "case_single_end selected=$STEP"
     ;;
   *)

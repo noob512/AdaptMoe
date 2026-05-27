@@ -96,6 +96,10 @@ int uvm_driver_phase_n_get_pool_state(uint32_t pool,
                                       uint32_t gpu_id,
                                       uint64_t* values_out,
                                       size_t values_count);
+int uvm_driver_phase_n_metadata_state_smoke(uint32_t pool,
+                                            uint64_t budget_bytes,
+                                            uint64_t* values_out,
+                                            size_t values_count);
 int uvm_driver_phase_n_reclaim_pool(uint32_t pool,
                                     uint32_t gpu_id,
                                     uint64_t target_bytes,
@@ -127,8 +131,8 @@ namespace {
 // shell 脚本 run_stage_m_phase_f_smoke.sh 会把同名 --step 继续传进来。
 void usage(const char* argv0) {
     std::fprintf(stderr,
-                 "Usage: %s [--step all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|register-region|query-region|phase-n-region|phase-n-reclaim|query|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu] "
-                 "[--bytes N] [--device N] [--async 0|1]\n",
+                 "Usage: %s [--step all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|register-region|query-region|phase-n-region|phase-n-metadata-state|phase-n-reclaim|query|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu] "
+                 "[--bytes N] [--device N] [--async 0|1] [--pool N]\n",
                  argv0);
 }
 
@@ -173,6 +177,7 @@ int main(int argc, char** argv) {
     size_t bytes = 1 << 20;
     int device = 0;
     int async = 0;
+    uint32_t pool = 1;
 
     // 简单命令行解析。未知参数或缺少值时打印 usage 并返回 2。
     for (int i = 1; i < argc; ++i) {
@@ -188,6 +193,9 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--async") == 0 && i + 1 < argc) {
             async = std::atoi(argv[++i]);
         }
+        else if (std::strcmp(argv[i], "--pool") == 0 && i + 1 < argc) {
+            pool = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
+        }
         else if (std::strcmp(argv[i], "-h") == 0 ||
                  std::strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -201,8 +209,8 @@ int main(int argc, char** argv) {
 
     // 打印本次配置。若日志中看不到这一行，说明进程可能还没进入 main，
     // 或者动态链接/程序启动阶段已经失败。
-    std::printf("phase_f_smoke begin step=%s bytes=%zu device=%d async=%d\n",
-                step.c_str(), bytes, device, async);
+    std::printf("phase_f_smoke begin step=%s bytes=%zu device=%d async=%d pool=%u\n",
+                step.c_str(), bytes, device, async, pool);
     std::fflush(stdout);
     trace("main_after_parse");
 
@@ -270,6 +278,39 @@ int main(int argc, char** argv) {
         int failed = run_step("ping", uvm_driver_phase_f_ping());
         trace("after_ping");
         if (failed || step == "ping") return failed;
+    }
+
+    if (want_step(step, "phase-n-metadata-state")) {
+        uint64_t values[36] = {};
+        trace("before_phase_n_metadata_state");
+        int failed = run_step(
+            "phase-n-metadata-state",
+            uvm_driver_phase_n_metadata_state_smoke(
+                pool,
+                bytes / 2,
+                values,
+                36));
+        std::printf("phase_n_metadata_state pool=%u budget=%llu resident_gpu=%llu resident_cpu=%llu reclaim=%llu protected=%llu evictable=%llu over=%llu target=%llu candidate_bytes=%llu candidate_regions=%llu selected_id=%llu selected_bytes=%llu victim_count=%llu metadata_only=%llu corrections=%llu mode=%llu flags=0x%llx\n",
+                    pool,
+                    static_cast<unsigned long long>(values[0]),
+                    static_cast<unsigned long long>(values[1]),
+                    static_cast<unsigned long long>(values[2]),
+                    static_cast<unsigned long long>(values[3]),
+                    static_cast<unsigned long long>(values[4]),
+                    static_cast<unsigned long long>(values[5]),
+                    static_cast<unsigned long long>(values[6]),
+                    static_cast<unsigned long long>(values[7]),
+                    static_cast<unsigned long long>(values[8]),
+                    static_cast<unsigned long long>(values[9]),
+                    static_cast<unsigned long long>(values[10]),
+                    static_cast<unsigned long long>(values[11]),
+                    static_cast<unsigned long long>(values[12]),
+                    static_cast<unsigned long long>(values[13]),
+                    static_cast<unsigned long long>(values[33]),
+                    static_cast<unsigned long long>(values[34]),
+                    static_cast<unsigned long long>(values[35]));
+        trace("after_phase_n_metadata_state");
+        if (failed || step == "phase-n-metadata-state") return failed;
     }
 
     // 从这里开始，后续 step 都需要真实 managed allocation。
@@ -495,10 +536,22 @@ int main(int argc, char** argv) {
     // 先把 region 迁到 GPU，再设置 SOFT budget，最后让 driver 选择 victim 并迁回 CPU。
     if (want_step(step, "phase-n-reclaim")) {
         uint64_t values[45] = {};
+        uint64_t post_state[36] = {};
+        uint32_t role = pool == 3 ? 5 : (pool == 2 ? 2 : 1);
+        uint32_t flags = pool == 2 ? 0x2 : 0x1;
+        if (pool == 3)
+            flags |= 0x20;
         trace("before_phase_n_reclaim");
         int failed = run_step(
             "phase-n-reclaim-register-region",
-            uvm_driver_phase_f_register_region(region_id, base, size, 1, 0, 0, 1, 1));
+            uvm_driver_phase_f_register_region(region_id,
+                                               base,
+                                               size,
+                                               pool,
+                                               0,
+                                               0,
+                                               role,
+                                               flags));
         if (!failed) {
             failed = run_step(
                 "phase-n-reclaim-update-region-state",
@@ -513,13 +566,14 @@ int main(int argc, char** argv) {
         if (!failed) {
             failed = run_step(
                 "phase-n-reclaim-set-pool-budget",
-                uvm_driver_phase_n_set_pool_budget(1, 0, bytes / 2, 1, 0));
+                uvm_driver_phase_n_set_pool_budget(pool, 0, bytes / 2, 1, 0));
         }
         if (!failed) {
             failed = run_step(
                 "phase-n-reclaim-pool",
-                uvm_driver_phase_n_reclaim_pool(1, 0, 0, 100, 0, 8, async, 0, values, 45));
-            std::printf("phase_n_reclaim attempted=%llu success=%llu failure=%llu victim_count=%llu budget=%llu resident_before=%llu over=%llu target=%llu attempted_bytes=%llu reclaimed=%llu failed_bytes=%llu candidate_bytes=%llu candidate_regions=%llu cooldown_bytes=%llu cooldown_regions=%llu success_events=%llu failed_events=%llu mode=%llu flags=0x%llx\n",
+                uvm_driver_phase_n_reclaim_pool(pool, 0, 0, 100, 0, 8, async, 0, values, 45));
+            std::printf("phase_n_reclaim pool=%u attempted=%llu success=%llu failure=%llu victim_count=%llu budget=%llu resident_before=%llu over=%llu target=%llu attempted_bytes=%llu reclaimed=%llu failed_bytes=%llu candidate_bytes=%llu candidate_regions=%llu cooldown_bytes=%llu cooldown_regions=%llu success_events=%llu failed_events=%llu mode=%llu flags=0x%llx\n",
+                        pool,
                         static_cast<unsigned long long>(values[0]),
                         static_cast<unsigned long long>(values[1]),
                         static_cast<unsigned long long>(values[2]),
@@ -548,6 +602,27 @@ int main(int argc, char** argv) {
                             static_cast<unsigned long long>(values[31 + i]));
             }
             std::printf("\n");
+        }
+        if (!failed) {
+            failed = run_step(
+                "phase-n-reclaim-post-pool-state",
+                uvm_driver_phase_n_get_pool_state(pool, 0, post_state, 36));
+            std::printf("phase_n_reclaim_post_state pool=%u budget=%llu resident_gpu=%llu resident_cpu=%llu over=%llu target=%llu candidate_bytes=%llu candidate_regions=%llu selected_id=%llu selected_bytes=%llu victim_count=%llu success_events=%llu failed_events=%llu mode=%llu flags=0x%llx\n",
+                        pool,
+                        static_cast<unsigned long long>(post_state[0]),
+                        static_cast<unsigned long long>(post_state[1]),
+                        static_cast<unsigned long long>(post_state[2]),
+                        static_cast<unsigned long long>(post_state[6]),
+                        static_cast<unsigned long long>(post_state[7]),
+                        static_cast<unsigned long long>(post_state[8]),
+                        static_cast<unsigned long long>(post_state[9]),
+                        static_cast<unsigned long long>(post_state[10]),
+                        static_cast<unsigned long long>(post_state[11]),
+                        static_cast<unsigned long long>(post_state[12]),
+                        static_cast<unsigned long long>(post_state[31]),
+                        static_cast<unsigned long long>(post_state[32]),
+                        static_cast<unsigned long long>(post_state[34]),
+                        static_cast<unsigned long long>(post_state[35]));
         }
         (void)uvm_driver_phase_f_unregister_region(region_id);
         trace("after_phase_n_reclaim");

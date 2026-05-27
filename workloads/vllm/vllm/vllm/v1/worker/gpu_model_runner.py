@@ -59,6 +59,10 @@ from vllm.device_allocator.uvm import (
     uvm_allocation_phase,
     uvm_enabled_allocation_phase,
 )
+from vllm.device_allocator.uvm_pool_residency import (
+    get_uvm_pool_residency_manager,
+    register_uvm_residency_region,
+)
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -3749,6 +3753,66 @@ class GPUModelRunner(
         except OSError as exc:
             logger.warning("Failed to write UVM weight map %s: %s", log_path, exc)
 
+    @staticmethod
+    def _uvm_weight_region_id(record: dict[str, Any]) -> str:
+        name = str(record.get("name") or "unknown")
+        ptr = int(record.get("start_int") or 0)
+        return f"weight:{name}:{ptr:x}"
+
+    def _register_uvm_weight_residency_tags(
+        self, phase: str, records: list[dict[str, Any]]
+    ) -> None:
+        if not records:
+            return
+        manager = get_uvm_pool_residency_manager()
+        if not manager.active:
+            return
+        for record in records:
+            ptr = int(record.get("start_int") or 0)
+            size_bytes = int(record.get("size_bytes") or 0)
+            if ptr <= 0 or size_bytes <= 0:
+                continue
+            semantic = {
+                key: record.get(key)
+                for key in (
+                    "kind",
+                    "name",
+                    "layer_id",
+                    "expert_id",
+                    "role",
+                    "shard_id",
+                    "is_moe_expert",
+                    "dtype",
+                    "shape",
+                    "device",
+                )
+                if key in record
+            }
+            is_moe_expert = bool(record.get("is_moe_expert"))
+            driver_capable, driver_reason, driver_probe_result = (
+                probe_driver_capable_range(ptr, size_bytes)
+            )
+            register_uvm_residency_region(
+                pool="weights",
+                region_id=self._uvm_weight_region_id(record),
+                ptr=ptr,
+                bytes=size_bytes,
+                state="gpu",
+                evictable=is_moe_expert,
+                active=False,
+                metadata={
+                    **semantic,
+                    "stage": "stage_n",
+                    "source": "weight_address_map",
+                    "phase": phase,
+                    "protected": not is_moe_expert,
+                    "prefetchable": is_moe_expert,
+                    "driver_capable": driver_capable,
+                    "driver_capability_reason": driver_reason,
+                    "driver_probe_result": driver_probe_result,
+                },
+            )
+
     def _collect_weight_address_rows(
         self,
     ) -> tuple[list[tuple[str, str, int, int, int]], list[dict[str, Any]]]:
@@ -3966,6 +4030,7 @@ class GPUModelRunner(
         # 同时打上当前所属的 phase (阶段) 标签，方便后续按时间线进行内存变化追踪。
         self._append_uvm_address_log(phase, rows)
         self._append_uvm_weight_map_log(phase, semantic_records)
+        self._register_uvm_weight_residency_tags(phase, semantic_records)
 
     def _log_kv_cache_addresses(self, kv_caches: dict[str, Any], phase: str) -> None:
         """

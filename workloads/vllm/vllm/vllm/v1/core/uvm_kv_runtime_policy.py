@@ -76,6 +76,14 @@ def _read_action_mode_env(name: str, default: str, choices: set[str]) -> str:
     return mode
 
 
+def _read_choice_env(name: str, default: str, choices: set[str]) -> str:
+    value = os.environ.get(name, default).strip().lower()
+    if value not in choices:
+        logger.warning("Ignoring invalid %s=%r; using %s.", name, value, default)
+        return default
+    return value
+
+
 def _block_hash_to_text(block_hash: Any) -> str | None:
     if block_hash is None:
         return None
@@ -114,6 +122,19 @@ class UvmKvRuntimePolicy:
         self.stage_l6_prefetch_back_enable = _read_bool_env(
             "VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_ENABLE",
             os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l6",
+        )
+        self.stage_l6_pointer_tag_enable = _read_bool_env(
+            "VLLM_UVM_RESIDENCY_KV_POINTER_TAG_ENABLE",
+            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l6"
+            and (
+                _read_bool_env("VLLM_UVM_RESIDENCY_TAG_ONLY", False)
+                or _read_bool_env("VLLM_UVM_DRIVER_TAG_ENABLE", False)
+            ),
+        )
+        self.stage_l6_pointer_tag_granularity = _read_choice_env(
+            "VLLM_UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY",
+            "tensor",
+            {"tensor", "range"},
         )
         self.stage_l6_data_offload_mode = _read_action_mode_env(
             "VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE",
@@ -254,6 +275,10 @@ class UvmKvRuntimePolicy:
                 "stage_l5_metadata_enable": self.stage_l5_metadata_enable,
                 "stage_l6_data_offload_enable": self.stage_l6_data_offload_enable,
                 "stage_l6_prefetch_back_enable": self.stage_l6_prefetch_back_enable,
+                "stage_l6_pointer_tag_enable": self.stage_l6_pointer_tag_enable,
+                "stage_l6_pointer_tag_granularity": (
+                    self.stage_l6_pointer_tag_granularity
+                ),
                 "stage_l6_data_offload_mode": self.stage_l6_data_offload_mode,
                 "stage_l6_prefetch_back_mode": self.stage_l6_prefetch_back_mode,
                 "active_protect_enable": self.active_protect_enable,
@@ -322,15 +347,22 @@ class UvmKvRuntimePolicy:
                 "data_offload_issued": False,
             }
         )
+        self._maybe_load_stage_l6_pointer_map(reason="after_stage_l5_metadata")
 
     def register_stage_l6_kv_pointer_map(
-        self, kv_pointer_map: dict[tuple[int, int], tuple[int, int]]
+        self,
+        kv_pointer_map: dict[tuple[int, int], tuple[int, int]],
+        *,
+        source: str = "kv_pointer_map",
+        register_driver_regions: bool | None = None,
     ) -> None:
         """Upgrade registered KV regions with raw pointer ranges when available."""
-        if not self.active or not self.stage_l6_data_offload_enable:
+        if not self.active:
             return
         if not get_uvm_pool_residency_manager().active:
             return
+        if register_driver_regions is None:
+            register_driver_regions = self.stage_l6_data_offload_enable
         registered = 0
         for (group_id, block_id), (ptr, size_bytes) in kv_pointer_map.items():
             if ptr <= 0 or size_bytes <= 0:
@@ -338,6 +370,9 @@ class UvmKvRuntimePolicy:
             self._stage_l6_pointer_ranges[f"kv:{group_id}:{block_id}"] = [
                 (int(ptr), int(size_bytes))
             ]
+            if not register_driver_regions:
+                registered += 1
+                continue
             register_uvm_residency_region(
                 pool="kv",
                 region_id=f"kv:{group_id}:{block_id}",
@@ -348,7 +383,7 @@ class UvmKvRuntimePolicy:
                 active=False,
                 metadata={
                     "stage": "stage_l6",
-                    "source": "kv_pointer_map",
+                    "source": source,
                     "group_id": group_id,
                     "block_id": block_id,
                     "bytes_per_block": int(size_bytes),
@@ -362,18 +397,22 @@ class UvmKvRuntimePolicy:
             {
                 "action": "stage_l6_kv_pointer_map_registered",
                 "registered_regions": registered,
+                "driver_region_records": registered if register_driver_regions else 0,
                 "data_offload_capable": registered > 0,
+                "pointer_tag_enable": self.stage_l6_pointer_tag_enable,
+                "data_offload_enable": self.stage_l6_data_offload_enable,
             }
         )
 
-    def _maybe_load_stage_l6_pointer_map(self) -> None:
+    def _maybe_load_stage_l6_pointer_map(self, *, reason: str = "unspecified") -> None:
         if self._stage_l6_pointer_map_loaded:
             return
         self._stage_l6_pointer_map_loaded = True
         if (
             not self.enabled
             or not (
-                self.stage_l6_data_offload_enable
+                self.stage_l6_pointer_tag_enable
+                or self.stage_l6_data_offload_enable
                 or (
                     self.active_protect_enable
                     and self.active_protect_mode != "trace_only"
@@ -383,9 +422,22 @@ class UvmKvRuntimePolicy:
         ):
             return
         path = self.stage_l6_pointer_map_file
+        if not os.path.exists(path):
+            self._stage_l6_pointer_map_loaded = False
+            self._write(
+                {
+                    "action": "stage_l6_kv_pointer_map_load_deferred",
+                    "path": path,
+                    "reason": reason,
+                    "deferred_reason": "file_not_found",
+                }
+            )
+            return
         pointer_map: dict[tuple[int, int], tuple[int, int]] = {}
         range_map: dict[str, list[tuple[int, int]]] = {}
         bytes_map: dict[str, int] = {}
+        range_metadata_map: dict[str, list[dict[str, Any]]] = {}
+        tensor_spans: dict[str, dict[str, Any]] = {}
         records_seen = 0
         try:
             with open(path, "r", encoding="utf-8") as handle:
@@ -405,6 +457,7 @@ class UvmKvRuntimePolicy:
                         except (KeyError, TypeError, ValueError):
                             continue
                         ranges: list[tuple[int, int]] = []
+                        range_metadata: list[dict[str, Any]] = []
                         for raw_range in item.get("ranges") or []:
                             try:
                                 ptr = int(raw_range["ptr"])
@@ -413,6 +466,31 @@ class UvmKvRuntimePolicy:
                                 continue
                             if ptr > 0 and range_bytes > 0:
                                 ranges.append((ptr, range_bytes))
+                                tensor_name = raw_range.get("tensor_name")
+                                range_metadata.append(
+                                    {
+                                        "ptr": ptr,
+                                        "bytes": range_bytes,
+                                        "tensor_name": tensor_name,
+                                    }
+                                )
+                                if tensor_name:
+                                    span = tensor_spans.setdefault(
+                                        str(tensor_name),
+                                        {
+                                            "start": ptr,
+                                            "end": ptr + range_bytes,
+                                            "range_count": 0,
+                                            "bytes_sum": 0,
+                                        },
+                                    )
+                                    span["start"] = min(int(span["start"]), ptr)
+                                    span["end"] = max(
+                                        int(span["end"]),
+                                        ptr + range_bytes,
+                                    )
+                                    span["range_count"] = int(span["range_count"]) + 1
+                                    span["bytes_sum"] = int(span["bytes_sum"]) + range_bytes
                         if not ranges:
                             try:
                                 ptr = int(item["ptr"])
@@ -420,6 +498,13 @@ class UvmKvRuntimePolicy:
                                 ptr = 0
                             if ptr > 0 and size_bytes > 0:
                                 ranges.append((ptr, size_bytes))
+                                range_metadata.append(
+                                    {
+                                        "ptr": ptr,
+                                        "bytes": size_bytes,
+                                        "tensor_name": item.get("tensor_name"),
+                                    }
+                                )
                         if group_id >= 0 and block_id >= 0 and ranges:
                             region_id = f"kv:{group_id}:{block_id}"
                             first_ptr = ranges[0][0]
@@ -427,11 +512,14 @@ class UvmKvRuntimePolicy:
                             pointer_map[(group_id, block_id)] = (first_ptr, total_bytes)
                             range_map[region_id] = ranges
                             bytes_map[region_id] = total_bytes
+                            range_metadata_map[region_id] = range_metadata
         except OSError as exc:
+            self._stage_l6_pointer_map_loaded = False
             self._write(
                 {
                     "action": "stage_l6_kv_pointer_map_load_failed",
                     "path": path,
+                    "reason": reason,
                     "error": repr(exc),
                 }
             )
@@ -440,13 +528,27 @@ class UvmKvRuntimePolicy:
             {
                 "action": "stage_l6_kv_pointer_map_loaded",
                 "path": path,
+                "reason": reason,
                 "records_seen": records_seen,
                 "entries": len(pointer_map),
+                "range_entries": sum(len(ranges) for ranges in range_map.values()),
+                "tensor_span_entries": len(tensor_spans),
+                "pointer_tag_enable": self.stage_l6_pointer_tag_enable,
+                "pointer_tag_granularity": self.stage_l6_pointer_tag_granularity,
+                "data_offload_enable": self.stage_l6_data_offload_enable,
             }
         )
+        if not pointer_map:
+            self._stage_l6_pointer_map_loaded = False
+            return
         if pointer_map:
-            self.register_stage_l6_kv_pointer_map(pointer_map)
+            self.register_stage_l6_kv_pointer_map(
+                pointer_map,
+                source="kv_pointer_map_contiguous_block",
+                register_driver_regions=self.stage_l6_data_offload_enable,
+            )
             self._stage_l6_pointer_ranges.update(range_map)
+            driver_range_regions = 0
             for region_id, ranges in range_map.items():
                 try:
                     _, group_id_text, block_id_text = region_id.split(":", 2)
@@ -459,21 +561,104 @@ class UvmKvRuntimePolicy:
                 register_uvm_residency_region(
                     pool="kv",
                     region_id=region_id,
-                    ptr=first_ptr,
+                    ptr=first_ptr if self.stage_l6_data_offload_enable else None,
                     bytes=total_bytes,
                     state="gpu",
                     evictable=True,
                     active=False,
                     metadata={
                         "stage": "stage_l6",
-                        "source": "kv_pointer_map_ranges",
+                        "source": "kv_pointer_map_logical_block",
                         "group_id": group_id,
                         "block_id": block_id,
                         "bytes_per_block": total_bytes,
                         "offload_capable": True,
-                        "metadata_only": False,
+                        "metadata_only": not self.stage_l6_data_offload_enable,
+                        "driver_range_children": self.stage_l6_pointer_tag_enable,
                         "range_count": len(ranges),
                     },
+                )
+                if (
+                    not self.stage_l6_pointer_tag_enable
+                    or self.stage_l6_pointer_tag_granularity != "range"
+                ):
+                    continue
+                range_metadata = range_metadata_map.get(region_id) or []
+                for range_index, (ptr, range_bytes) in enumerate(ranges):
+                    if ptr <= 0 or range_bytes <= 0:
+                        continue
+                    range_meta = (
+                        range_metadata[range_index]
+                        if range_index < len(range_metadata)
+                        else {}
+                    )
+                    register_uvm_residency_region(
+                        pool="kv",
+                        region_id=f"{region_id}:range:{range_index}",
+                        ptr=int(ptr),
+                        bytes=int(range_bytes),
+                        state="gpu",
+                        evictable=True,
+                        active=False,
+                        metadata={
+                            "stage": "stage_l6",
+                            "source": "kv_pointer_map_range",
+                            "parent_region_id": region_id,
+                            "group_id": group_id,
+                            "block_id": block_id,
+                            "range_index": range_index,
+                            "tensor_name": range_meta.get("tensor_name"),
+                            "bytes_per_block": int(range_bytes),
+                            "logical_block_bytes": total_bytes,
+                            "offload_capable": False,
+                            "metadata_only": False,
+                            "driver_range_child": True,
+                        },
+                    )
+                    driver_range_regions += 1
+            driver_tensor_regions = 0
+            if (
+                self.stage_l6_pointer_tag_enable
+                and self.stage_l6_pointer_tag_granularity == "tensor"
+            ):
+                for tensor_index, (tensor_name, span) in enumerate(
+                    sorted(tensor_spans.items())
+                ):
+                    start = int(span.get("start") or 0)
+                    end = int(span.get("end") or 0)
+                    if start <= 0 or end <= start:
+                        continue
+                    register_uvm_residency_region(
+                        pool="kv",
+                        region_id=f"kv:tensor:{tensor_index}",
+                        ptr=start,
+                        bytes=end - start,
+                        state="gpu",
+                        evictable=True,
+                        active=False,
+                        metadata={
+                            "stage": "stage_l6",
+                            "source": "kv_pointer_map_tensor_span",
+                            "tensor_name": tensor_name,
+                            "tensor_index": tensor_index,
+                            "range_count": int(span.get("range_count") or 0),
+                            "bytes_sum": int(span.get("bytes_sum") or 0),
+                            "offload_capable": False,
+                            "metadata_only": False,
+                            "driver_tensor_span": True,
+                        },
+                    )
+                    driver_tensor_regions += 1
+            if self.stage_l6_pointer_tag_enable:
+                self._write(
+                    {
+                        "action": "stage_l6_kv_pointer_driver_tags_registered",
+                        "logical_regions": len(range_map),
+                        "granularity": self.stage_l6_pointer_tag_granularity,
+                        "driver_tensor_regions": driver_tensor_regions,
+                        "driver_range_regions": driver_range_regions,
+                        "data_offload_enable": self.stage_l6_data_offload_enable,
+                    }
                 )
 
     def should_allow_allocation(
@@ -487,6 +672,7 @@ class UvmKvRuntimePolicy:
         if not self.active or num_blocks_to_allocate <= 0:
             return True
         self.record_config()
+        self._maybe_load_stage_l6_pointer_map(reason="allocation_pressure")
         pressure = self._pressure_snapshot(block_pool, num_blocks_to_allocate)
         over_budget = bool(pressure["over_budget"])
         record_uvm_pool_pressure(

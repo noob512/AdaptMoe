@@ -25,6 +25,7 @@
 #include "linux/sort.h"
 #include "nv_uvm_interface.h"
 #include "uvm_common.h"
+#include "uvm_api.h"
 #include "uvm_linux.h"
 #include "uvm_global.h"
 #include "uvm_gpu_replayable_faults.h"
@@ -44,6 +45,8 @@
 // The documentation at the beginning of uvm_gpu_non_replayable_faults.c
 // provides some background for understanding replayable faults, non-replayable
 // faults, and how UVM services each fault type.
+
+#define UVM_PHASE_N_AUTO_RECLAIM_OUTER_MAX_PER_BATCH 8
 
 // The HW fault buffer flush mode instructs RM on how to flush the hardware
 // replayable fault buffer; it is only used in Confidential Computing.
@@ -3015,6 +3018,28 @@ static void enable_disable_prefetch_faults(uvm_parent_gpu_t *parent_gpu,
     }
 }
 
+static void phase_n_auto_reclaim_after_replayable_batch(uvm_fault_service_batch_context_t *batch_context)
+{
+    NvU32 i;
+    NvU32 attempts = 0;
+
+    for (i = 0;
+         i < batch_context->num_coalesced_faults && attempts < UVM_PHASE_N_AUTO_RECLAIM_OUTER_MAX_PER_BATCH;
+         ++i) {
+        uvm_fault_buffer_entry_t *entry = batch_context->ordered_fault_cache[i];
+
+        if (!entry || !entry->va_space || !entry->gpu || entry->is_fatal)
+            continue;
+
+        (void)uvm_phase_n_auto_reclaim_outer_hook(entry->va_space,
+                                                  entry->fault_address,
+                                                  PAGE_SIZE,
+                                                  uvm_id_value(entry->gpu->id),
+                                                  0);
+        ++attempts;
+    }
+}
+
 void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 {
     NvU32 num_replays = 0;
@@ -3069,6 +3094,9 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         // UVM_PERF_FAULT_REPLAY_POLICY_BLOCK is being used or the fault buffer
         // was flushed
         num_replays += batch_context->num_replays;
+
+        if (status == NV_OK)
+            phase_n_auto_reclaim_after_replayable_batch(batch_context);
 
         enable_disable_prefetch_faults(parent_gpu, batch_context);
 

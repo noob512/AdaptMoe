@@ -37,6 +37,7 @@
 #include "uvm_linux_ioctl.h"
 #include "uvm_hmm.h"
 #include "uvm_mem.h"
+#include "uvm_migrate.h"
 #include "uvm_kvmalloc.h"
 #include "uvm_test_file.h"
 
@@ -83,6 +84,46 @@ typedef struct
     NvU64 last_access_epoch;
     NV_STATUS status;
 } uvm_phase_n_reclaim_victim_t;
+
+static int uvm_phase_n_auto_reclaim_enable __read_mostly = 0;
+module_param(uvm_phase_n_auto_reclaim_enable, int, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_auto_reclaim_enable,
+                 "Enable Stage N make-resident automatic reclaim hook preflight. Default: 0.");
+
+static unsigned uvm_phase_n_auto_reclaim_execute __read_mostly = 0;
+module_param(uvm_phase_n_auto_reclaim_execute, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_auto_reclaim_execute,
+                 "Allow Stage N automatic reclaim hook to execute reclaim when a safe caller permits it. Default: 0.");
+
+static unsigned uvm_phase_n_auto_reclaim_every __read_mostly = 64;
+module_param(uvm_phase_n_auto_reclaim_every, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_auto_reclaim_every,
+                 "Run Stage N automatic reclaim hook once per N make-resident hits. Default: 64.");
+
+static unsigned uvm_phase_n_auto_reclaim_scan_every __read_mostly = 256;
+module_param(uvm_phase_n_auto_reclaim_scan_every, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_auto_reclaim_scan_every,
+                 "Force a full Stage N auto reclaim pool scan once per N hook epochs; 0 means every sampled hook. Default: 256.");
+
+static unsigned uvm_phase_n_auto_reclaim_max_victims __read_mostly = 2;
+module_param(uvm_phase_n_auto_reclaim_max_victims, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_auto_reclaim_max_victims,
+                 "Maximum victims for Stage N automatic reclaim hook execution. Default: 2.");
+
+static unsigned uvm_phase_n_auto_reclaim_cooldown_epochs __read_mostly = 0;
+module_param(uvm_phase_n_auto_reclaim_cooldown_epochs, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_auto_reclaim_cooldown_epochs,
+                 "Cooldown epochs passed to Stage N automatic reclaim hook. Default: 0.");
+
+static atomic64_t g_uvm_phase_n_auto_reclaim_epoch = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_phase_n_auto_reclaim_backoff_until = ATOMIC64_INIT(0);
+
+static unsigned uvm_phase_n_auto_reclaim_failure_backoff_epochs __read_mostly = 256;
+module_param(uvm_phase_n_auto_reclaim_failure_backoff_epochs, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_auto_reclaim_failure_backoff_epochs,
+                 "Backoff epochs after a failed Stage N automatic reclaim attempt. Default: 256.");
+
+#define UVM_PHASE_N_RECLAIM_FLAG_DRY_RUN_INTERNAL (1U << 31)
 
 static bool uvm_phase_n_valid_pool(NvU32 pool)
 {
@@ -157,6 +198,9 @@ static bool uvm_phase_n_victim_trace_is_better(const uvm_phase_n_victim_trace_t 
     if (candidate->last_access_epoch != existing->last_access_epoch)
         return candidate->last_access_epoch < existing->last_access_epoch;
 
+    if (candidate->bytes != existing->bytes)
+        return candidate->bytes < existing->bytes;
+
     return candidate->region_id < existing->region_id;
 }
 
@@ -202,6 +246,9 @@ static bool uvm_phase_n_reclaim_victim_is_better(const uvm_phase_n_reclaim_victi
 
     if (candidate->last_access_epoch != existing->last_access_epoch)
         return candidate->last_access_epoch < existing->last_access_epoch;
+
+    if (candidate->bytes != existing->bytes)
+        return candidate->bytes < existing->bytes;
 
     return candidate->region_id < existing->region_id;
 }
@@ -1301,14 +1348,14 @@ static NV_STATUS uvm_phase_f_query_resident_bytes(const NvProcessorUuid *gpu_uui
                                                   NvU64 base,
                                                   NvU64 length,
                                                   UVM_PHASE_F_RANGE_RESULT *result,
-                                                  struct file *filp)
+                                                  uvm_va_space_t *va_space)
 {
     NV_STATUS status = NV_OK;
-    uvm_va_space_t *va_space = uvm_va_space_get(filp);
     uvm_va_range_managed_t *managed_range = NULL;
     uvm_va_range_managed_t *managed_range_last = NULL;
     uvm_gpu_t *gpu = NULL;
     struct mm_struct *mm = NULL;
+    bool retained_mm = false;
     NvU64 query_start;
     NvU64 query_end;
     NvU64 last_address;
@@ -1326,7 +1373,17 @@ static NV_STATUS uvm_phase_f_query_resident_bytes(const NvProcessorUuid *gpu_uui
     query_end = base + length;
     last_address = query_end - 1;
 
-    mm = uvm_va_space_mm_or_current_retain_lock(va_space);
+    if (uvm_va_space_mm_enabled(va_space)) {
+        mm = uvm_va_space_mm_retain(va_space);
+        retained_mm = mm != NULL;
+    }
+    else if (!(current->flags & PF_KTHREAD)) {
+        mm = current->mm;
+    }
+
+    if (mm)
+        uvm_down_read_mmap_lock(mm);
+
     uvm_va_space_down_read(va_space);
 
     gpu = uvm_va_space_get_gpu_by_uuid(va_space, gpu_uuid);
@@ -1385,7 +1442,10 @@ static NV_STATUS uvm_phase_f_query_resident_bytes(const NvProcessorUuid *gpu_uui
 
 out:
     uvm_va_space_up_read(va_space);
-    uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+    if (mm)
+        uvm_up_read_mmap_lock(mm);
+    if (retained_mm)
+        uvm_va_space_mm_release(va_space);
 
     uvm_phase_f_route_log("phase_f_resident_bytes base=0x%llx length=%llu status=0x%x queried=%llu gpu=%llu cpu=%llu any=%llu unknown=%llu\n",
                           base,
@@ -1551,7 +1611,7 @@ static NV_STATUS uvm_phase_f_execute_range(NvU32 action,
                                                           base,
                                                           length,
                                                           result,
-                                                          filp);
+                                                          va_space);
             }
         }
     }
@@ -1845,6 +1905,7 @@ static NV_STATUS uvm_api_phase_n_get_pool_state(UVM_PHASE_N_GET_POOL_STATE_PARAM
     NvU64 selected_epoch = 0;
     NvU32 victim_count = 0;
     NV_STATUS scan_status = NV_OK;
+    bool metadata_only = false;
 
     if (!uvm_phase_n_valid_pool(params->pool))
         return NV_ERR_INVALID_ARGUMENT;
@@ -1867,11 +1928,10 @@ static NV_STATUS uvm_api_phase_n_get_pool_state(UVM_PHASE_N_GET_POOL_STATE_PARAM
 
     uvm_va_space_down_read(va_space);
     gpu = uvm_phase_n_gpu_from_id(va_space, params->gpu_id);
-    if (!gpu) {
-        uvm_va_space_up_read(va_space);
-        return NV_ERR_INVALID_DEVICE;
-    }
-    gpu_uuid = gpu->uuid;
+    if (gpu)
+        gpu_uuid = gpu->uuid;
+    else
+        metadata_only = true;
     uvm_va_space_up_read(va_space);
 
     uvm_va_space_down_read(va_space);
@@ -1910,6 +1970,8 @@ static NV_STATUS uvm_api_phase_n_get_pool_state(UVM_PHASE_N_GET_POOL_STATE_PARAM
 
     if (snapshot_index != region_count)
         ++pool_state.accounting_corrections;
+    if (metadata_only)
+        ++pool_state.accounting_corrections;
 
     for (i = 0; i < snapshot_index; ++i) {
         if (snapshots[i].flags & UVM_PHASE_N_REGION_FLAG_PROTECTED)
@@ -1917,15 +1979,35 @@ static NV_STATUS uvm_api_phase_n_get_pool_state(UVM_PHASE_N_GET_POOL_STATE_PARAM
         if (snapshots[i].flags & UVM_PHASE_N_REGION_FLAG_EVICTABLE)
             params->evictable_bytes += snapshots[i].length;
 
-        scan_status = uvm_phase_f_query_resident_bytes(&gpu_uuid,
-                                                       NV_FALSE,
-                                                       snapshots[i].base,
-                                                       snapshots[i].length,
-                                                       &residency,
-                                                       filp);
+        if (!metadata_only) {
+            scan_status = uvm_phase_f_query_resident_bytes(&gpu_uuid,
+                                                           NV_FALSE,
+                                                           snapshots[i].base,
+                                                           snapshots[i].length,
+                                                           &residency,
+                                                           va_space);
+        }
+        else {
+            memset(&residency, 0, sizeof(residency));
+            residency.queried_bytes = snapshots[i].length;
+            if (snapshots[i].state == UVM_PHASE_N_REGION_STATE_HOT ||
+                snapshots[i].state == UVM_PHASE_N_REGION_STATE_ACTIVE) {
+                residency.resident_gpu_bytes = snapshots[i].length;
+            }
+            else if (snapshots[i].state == UVM_PHASE_N_REGION_STATE_COLD ||
+                     snapshots[i].state == UVM_PHASE_N_REGION_STATE_INACTIVE) {
+                residency.resident_cpu_bytes = snapshots[i].length;
+            }
+            else {
+                residency.resident_unknown_bytes = snapshots[i].length;
+            }
+            scan_status = NV_OK;
+        }
         if (scan_status == NV_OK) {
             params->resident_gpu_bytes += residency.resident_gpu_bytes;
             params->resident_cpu_bytes += residency.resident_cpu_bytes;
+            if (residency.resident_unknown_bytes > 0)
+                params->reclaim_bytes += residency.resident_unknown_bytes;
 
             if (uvm_phase_n_region_is_victim_candidate(params->pool, &snapshots[i]) &&
                 residency.resident_gpu_bytes > 0) {
@@ -2013,12 +2095,14 @@ static NV_STATUS uvm_api_phase_n_get_pool_state(UVM_PHASE_N_GET_POOL_STATE_PARAM
     params->reclaim_success_events = pool_state.reclaim_success_events;
     params->reclaim_failed_events = pool_state.reclaim_failed_events;
     params->accounting_corrections = pool_state.accounting_corrections;
+    params->reserved = metadata_only ? 1 : 0;
     params->mode = pool_state.mode;
     params->flags = pool_state.flags;
 
-    uvm_phase_f_route_log("phase_n_get_pool_state pool=%u gpu_id=%u budget=%llu gpu=%llu cpu=%llu reclaim=%llu protected=%llu evictable=%llu over=%llu target=%llu candidate_bytes=%llu candidate_regions=%llu selected_id=%llu selected_bytes=%llu victim_count=%u mode=%u flags=0x%x\n",
+    uvm_phase_f_route_log("phase_n_get_pool_state pool=%u gpu_id=%u metadata_only=%u budget=%llu gpu=%llu cpu=%llu reclaim=%llu protected=%llu evictable=%llu over=%llu target=%llu candidate_bytes=%llu candidate_regions=%llu selected_id=%llu selected_bytes=%llu victim_count=%u mode=%u flags=0x%x\n",
                           params->pool,
                           params->gpu_id,
+                          metadata_only ? 1 : 0,
                           params->budget_bytes,
                           params->resident_gpu_bytes,
                           params->resident_cpu_bytes,
@@ -2139,9 +2223,9 @@ static NV_STATUS uvm_api_phase_n_query_region_by_va(UVM_PHASE_N_QUERY_REGION_BY_
     return NV_OK;
 }
 
-static NV_STATUS uvm_api_phase_n_reclaim_pool(UVM_PHASE_N_RECLAIM_POOL_PARAMS *params, struct file *filp)
+static NV_STATUS uvm_phase_n_reclaim_pool_execute(uvm_va_space_t *va_space,
+                                                  UVM_PHASE_N_RECLAIM_POOL_PARAMS *params)
 {
-    uvm_va_space_t *va_space = uvm_va_space_get(filp);
     uvm_phase_n_pool_state_t pool_state;
     uvm_phase_f_region_t *region = NULL;
     struct radix_tree_root *root = &va_space->phase_f_regions;
@@ -2240,7 +2324,7 @@ static NV_STATUS uvm_api_phase_n_reclaim_pool(UVM_PHASE_N_RECLAIM_POOL_PARAMS *p
                                                                  snapshots[i].base,
                                                                  snapshots[i].length,
                                                                  &residency,
-                                                                 filp);
+                                                                 va_space);
 
         if (scan_status != NV_OK) {
             params->failed_bytes += snapshots[i].length;
@@ -2293,6 +2377,7 @@ static NV_STATUS uvm_api_phase_n_reclaim_pool(UVM_PHASE_N_RECLAIM_POOL_PARAMS *p
     execute_reclaim = params->reclaim_target_bytes > 0 &&
                       (pool_state.mode == UVM_PHASE_N_MODE_SOFT ||
                        pool_state.mode == UVM_PHASE_N_MODE_ENFORCE) &&
+                      !(params->flags & UVM_PHASE_N_RECLAIM_FLAG_DRY_RUN_INTERNAL) &&
                       victim_count > 0;
 
     for (i = 0; i < victim_count && i < max_victims; ++i) {
@@ -2310,13 +2395,10 @@ static NV_STATUS uvm_api_phase_n_reclaim_pool(UVM_PHASE_N_RECLAIM_POOL_PARAMS *p
 
         ++params->attempted_regions;
         params->attempted_bytes += victims[i].bytes;
-        victims[i].status = uvm_phase_f_execute_range(UVM_PHASE_F_ACTION_PREFETCH_CPU,
-                                                      &gpu_uuid,
-                                                      params->async,
-                                                      victims[i].base,
-                                                      victims[i].length,
-                                                      &residency,
-                                                      filp);
+        victims[i].status = uvm_migrate_managed_range_to_cpu(va_space,
+                                                             victims[i].base,
+                                                             victims[i].length,
+                                                             params->async ? UVM_MIGRATE_FLAG_ASYNC : 0);
         params->victim_status[params->victim_count] = victims[i].status;
         if (uvm_phase_n_reclaim_status_success(victims[i].status)) {
             ++params->success_regions;
@@ -2334,6 +2416,27 @@ static NV_STATUS uvm_api_phase_n_reclaim_pool(UVM_PHASE_N_RECLAIM_POOL_PARAMS *p
     pool_state.over_budget_bytes = params->over_budget_bytes;
     pool_state.reclaim_target_bytes = params->reclaim_target_bytes;
     pool_state.victim_candidate_bytes = params->victim_candidate_bytes;
+    if (params->reclaimed_bytes > 0) {
+        NvU64 resident_after = params->resident_gpu_bytes_before > params->reclaimed_bytes ?
+                                   params->resident_gpu_bytes_before - params->reclaimed_bytes :
+                                   0;
+        NvU64 candidate_after = params->victim_candidate_bytes > params->reclaimed_bytes ?
+                                    params->victim_candidate_bytes - params->reclaimed_bytes :
+                                    0;
+
+        pool_state.resident_gpu_bytes = resident_after;
+        pool_state.victim_candidate_bytes = candidate_after;
+        pool_state.over_budget_bytes = pool_state.budget_bytes > 0 && resident_after > pool_state.budget_bytes ?
+                                           resident_after - pool_state.budget_bytes :
+                                           0;
+        pool_state.reclaim_target_bytes = pool_state.over_budget_bytes > 0 ?
+                                              pool_state.over_budget_bytes +
+                                                  uvm_phase_n_reclaim_margin_bytes(params->pool,
+                                                                                   pool_state.budget_bytes) :
+                                              0;
+        if (pool_state.reclaim_target_bytes < pool_state.over_budget_bytes)
+            pool_state.reclaim_target_bytes = ULLONG_MAX;
+    }
     pool_state.victim_candidate_regions = params->victim_candidate_regions;
     pool_state.victim_count = params->victim_count;
     pool_state.selected_victim_region_id = params->victim_count > 0 ? params->victim_region_ids[0] : 0;
@@ -2391,6 +2494,313 @@ static NV_STATUS uvm_api_phase_n_reclaim_pool(UVM_PHASE_N_RECLAIM_POOL_PARAMS *p
 
     uvm_kvfree(snapshots);
     return NV_OK;
+}
+
+static NV_STATUS uvm_api_phase_n_reclaim_pool(UVM_PHASE_N_RECLAIM_POOL_PARAMS *params, struct file *filp)
+{
+    return uvm_phase_n_reclaim_pool_execute(uvm_va_space_get(filp), params);
+}
+
+void uvm_phase_n_make_resident_reclaim_hook(uvm_va_space_t *va_space,
+                                            NvU64 address,
+                                            NvU64 length,
+                                            NvU32 gpu_id,
+                                            NvU32 cause,
+                                            NvBool execute_allowed)
+{
+    uvm_range_tree_node_t *node;
+    uvm_phase_f_region_t *region;
+    uvm_phase_n_pool_state_t pool_state = { 0 };
+    NvU64 epoch;
+    NvU64 epoch_mod;
+    NvU64 region_id = 0;
+    NvU32 every = uvm_phase_n_auto_reclaim_every;
+    NvU32 pool = UVM_PHASE_N_POOL_UNKNOWN;
+    bool would_reclaim = false;
+    bool execute_requested = false;
+
+    if (!uvm_phase_n_auto_reclaim_enable)
+        return;
+
+    epoch = (NvU64)atomic64_inc_return(&g_uvm_phase_n_auto_reclaim_epoch);
+    epoch_mod = epoch;
+    if (every > 1 && do_div(epoch_mod, every) != 0)
+        return;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    node = uvm_range_tree_find(&va_space->phase_f_region_ranges, address);
+    region = uvm_phase_f_region_from_node(node);
+    if (!region || !uvm_phase_n_valid_pool(region->pool)) {
+        uvm_phase_f_route_log("phase_n_auto_reclaim_hook epoch=%llu address=0x%llx length=%llu gpu_id=%u cause=%u skip=no_region\n",
+                              epoch,
+                              address,
+                              length,
+                              gpu_id,
+                              cause);
+        return;
+    }
+
+    pool = region->pool;
+    region_id = region->region_id;
+    pool_state = va_space->phase_n_pools[pool];
+
+    if (pool_state.mode == UVM_PHASE_N_MODE_TRACE_ONLY || pool_state.budget_bytes == 0) {
+        uvm_phase_f_route_log("phase_n_auto_reclaim_hook epoch=%llu address=0x%llx length=%llu gpu_id=%u cause=%u pool=%u region_id=%llu budget=%llu resident=%llu over=%llu mode=%u skip=%s\n",
+                              epoch,
+                              address,
+                              length,
+                              gpu_id,
+                              cause,
+                              pool,
+                              region_id,
+                              pool_state.budget_bytes,
+                              pool_state.resident_gpu_bytes,
+                              pool_state.over_budget_bytes,
+                              pool_state.mode,
+                              pool_state.budget_bytes == 0 ? "no_budget" : "trace_only");
+        return;
+    }
+
+    would_reclaim = pool_state.over_budget_bytes > 0 ||
+                    pool_state.resident_gpu_bytes > pool_state.budget_bytes;
+    execute_requested = would_reclaim &&
+                        execute_allowed &&
+                        uvm_phase_n_auto_reclaim_execute != 0;
+
+    uvm_phase_f_route_log("phase_n_auto_reclaim_hook epoch=%llu every=%u max_victims=%u cooldown_epochs=%u address=0x%llx length=%llu gpu_id=%u cause=%u pool=%u region_id=%llu budget=%llu resident=%llu over=%llu candidate_bytes=%llu victim_count=%u mode=%u would_reclaim=%u execute_allowed=%u execute_requested=%u execute=0 skip=locked_context\n",
+                          epoch,
+                          every,
+                          uvm_phase_n_auto_reclaim_max_victims,
+                          uvm_phase_n_auto_reclaim_cooldown_epochs,
+                          address,
+                          length,
+                          gpu_id,
+                          cause,
+                          pool,
+                          region_id,
+                          pool_state.budget_bytes,
+                          pool_state.resident_gpu_bytes,
+                          pool_state.over_budget_bytes,
+                          pool_state.victim_candidate_bytes,
+                          pool_state.victim_count,
+                          pool_state.mode,
+                          would_reclaim ? 1 : 0,
+                          execute_allowed ? 1 : 0,
+                          execute_requested ? 1 : 0);
+}
+
+NV_STATUS uvm_phase_n_auto_reclaim_outer_hook(uvm_va_space_t *va_space,
+                                              NvU64 address,
+                                              NvU64 length,
+                                              NvU32 gpu_id,
+                                              NvU32 cause)
+{
+    UVM_PHASE_N_RECLAIM_POOL_PARAMS params = { 0 };
+    uvm_range_tree_node_t *node;
+    uvm_phase_f_region_t *region;
+    uvm_phase_n_pool_state_t pool_state = { 0 };
+    NV_STATUS status;
+    NvU64 epoch;
+    NvU64 epoch_mod;
+    NvU64 scan_epoch_mod;
+    NvU64 backoff_until;
+    NvU32 every = uvm_phase_n_auto_reclaim_every;
+    NvU32 scan_every = uvm_phase_n_auto_reclaim_scan_every;
+    NvU32 pool;
+    NvU64 region_id;
+    bool cached_would_reclaim;
+    bool execute_requested;
+    bool force_scan;
+    bool would_reclaim;
+
+    if (!uvm_phase_n_auto_reclaim_enable)
+        return NV_OK;
+
+    epoch = (NvU64)atomic64_inc_return(&g_uvm_phase_n_auto_reclaim_epoch);
+    epoch_mod = epoch;
+    if (every > 1 && do_div(epoch_mod, every) != 0)
+        return NV_OK;
+
+    uvm_va_space_down_read(va_space);
+    node = uvm_range_tree_find(&va_space->phase_f_region_ranges, address);
+    region = uvm_phase_f_region_from_node(node);
+    if (!region || !uvm_phase_n_valid_pool(region->pool)) {
+        uvm_va_space_up_read(va_space);
+        uvm_phase_f_route_log("phase_n_auto_reclaim_hook phase=outer epoch=%llu address=0x%llx length=%llu gpu_id=%u cause=%u skip=no_region\n",
+                              epoch,
+                              address,
+                              length,
+                              gpu_id,
+                              cause);
+        return NV_OK;
+    }
+
+    pool = region->pool;
+    region_id = region->region_id;
+    pool_state = va_space->phase_n_pools[pool];
+    uvm_va_space_up_read(va_space);
+
+    if (pool_state.budget_bytes == 0) {
+        uvm_phase_f_route_log("phase_n_auto_reclaim_hook phase=outer epoch=%llu address=0x%llx length=%llu gpu_id=%u cause=%u pool=%u region_id=%llu budget=0 resident=%llu over=%llu mode=%u skip=no_budget\n",
+                              epoch,
+                              address,
+                              length,
+                              gpu_id,
+                              cause,
+                              pool,
+                              region_id,
+                              pool_state.resident_gpu_bytes,
+                              pool_state.over_budget_bytes,
+                              pool_state.mode);
+        return NV_OK;
+    }
+
+    if (pool_state.mode == UVM_PHASE_N_MODE_TRACE_ONLY) {
+        uvm_phase_f_route_log("phase_n_auto_reclaim_hook phase=outer epoch=%llu address=0x%llx length=%llu gpu_id=%u cause=%u pool=%u region_id=%llu budget=%llu resident=%llu over=%llu mode=%u skip=trace_only\n",
+                              epoch,
+                              address,
+                              length,
+                              gpu_id,
+                              cause,
+                              pool,
+                              region_id,
+                              pool_state.budget_bytes,
+                              pool_state.resident_gpu_bytes,
+                              pool_state.over_budget_bytes,
+                              pool_state.mode);
+        return NV_OK;
+    }
+
+    cached_would_reclaim = pool_state.over_budget_bytes > 0 ||
+                           pool_state.resident_gpu_bytes > pool_state.budget_bytes;
+    scan_epoch_mod = epoch;
+    force_scan = scan_every == 0 || do_div(scan_epoch_mod, scan_every) == 0;
+    if (!cached_would_reclaim && !force_scan) {
+        uvm_phase_f_route_log("phase_n_auto_reclaim_hook phase=outer epoch=%llu every=%u scan_every=%u max_victims=%u cooldown_epochs=%u address=0x%llx length=%llu gpu_id=%u cause=%u pool=%u region_id=%llu budget=%llu resident_before=%llu over=%llu target=%llu candidate_bytes=%llu victim_count=%u mode=%u would_reclaim=0 execute_requested=0 execute=0 status=0 attempted=0 success=0 failure=0 reclaimed=0 failed_bytes=0 async=1 skip=under_budget_cached\n",
+                              epoch,
+                              every,
+                              scan_every,
+                              uvm_phase_n_auto_reclaim_max_victims,
+                              uvm_phase_n_auto_reclaim_cooldown_epochs,
+                              address,
+                              length,
+                              gpu_id,
+                              cause,
+                              pool,
+                              region_id,
+                              pool_state.budget_bytes,
+                              pool_state.resident_gpu_bytes,
+                              pool_state.over_budget_bytes,
+                              pool_state.reclaim_target_bytes,
+                              pool_state.victim_candidate_bytes,
+                              pool_state.victim_count,
+                              pool_state.mode);
+        return NV_OK;
+    }
+
+    execute_requested = uvm_phase_n_auto_reclaim_execute != 0 &&
+                        (pool_state.mode == UVM_PHASE_N_MODE_SOFT ||
+                         pool_state.mode == UVM_PHASE_N_MODE_ENFORCE);
+    backoff_until = (NvU64)atomic64_read(&g_uvm_phase_n_auto_reclaim_backoff_until);
+    if (execute_requested && backoff_until != 0 && epoch < backoff_until) {
+        uvm_phase_f_route_log("phase_n_auto_reclaim_hook phase=outer epoch=%llu address=0x%llx length=%llu gpu_id=%u cause=%u pool=%u region_id=%llu budget=%llu resident=%llu over=%llu mode=%u skip=reclaim_backoff backoff_until=%llu\n",
+                              epoch,
+                              address,
+                              length,
+                              gpu_id,
+                              cause,
+                              pool,
+                              region_id,
+                              pool_state.budget_bytes,
+                              pool_state.resident_gpu_bytes,
+                              pool_state.over_budget_bytes,
+                              pool_state.mode,
+                              backoff_until);
+        return NV_OK;
+    }
+
+    params.pool = pool;
+    params.gpu_id = gpu_id;
+    params.current_epoch = epoch;
+    params.cooldown_epochs = uvm_phase_n_auto_reclaim_cooldown_epochs;
+    params.max_victims = uvm_phase_n_auto_reclaim_max_victims;
+    params.async = NV_TRUE;
+    if (!execute_requested)
+        params.flags |= UVM_PHASE_N_RECLAIM_FLAG_DRY_RUN_INTERNAL;
+
+    status = uvm_phase_n_reclaim_pool_execute(va_space, &params);
+    would_reclaim = params.reclaim_target_bytes > 0 && params.victim_count > 0;
+
+    if (execute_requested && params.success_regions > 0 &&
+        uvm_phase_n_auto_reclaim_cooldown_epochs > 0) {
+        NvU64 until = epoch + uvm_phase_n_auto_reclaim_cooldown_epochs;
+
+        if (until < epoch)
+            until = ULLONG_MAX;
+        atomic64_set(&g_uvm_phase_n_auto_reclaim_backoff_until, until);
+    }
+    else if (execute_requested &&
+             (status != NV_OK || params.failure_regions > 0 ||
+              (would_reclaim && params.success_regions == 0))) {
+        NvU64 until = epoch + uvm_phase_n_auto_reclaim_failure_backoff_epochs;
+
+        if (until < epoch)
+            until = ULLONG_MAX;
+        atomic64_set(&g_uvm_phase_n_auto_reclaim_backoff_until, until);
+    }
+
+    uvm_phase_f_route_log("phase_n_auto_reclaim_hook phase=outer epoch=%llu every=%u scan_every=%u max_victims=%u cooldown_epochs=%u address=0x%llx length=%llu gpu_id=%u cause=%u pool=%u region_id=%llu budget=%llu resident_before=%llu over=%llu target=%llu candidate_bytes=%llu victim_count=%u mode=%u would_reclaim=%u execute_requested=%u execute=%u status=%u attempted=%u success=%u failure=%u reclaimed=%llu failed_bytes=%llu async=%u\n",
+                          epoch,
+                          every,
+                          scan_every,
+                          uvm_phase_n_auto_reclaim_max_victims,
+                          uvm_phase_n_auto_reclaim_cooldown_epochs,
+                          address,
+                          length,
+                          gpu_id,
+                          cause,
+                          pool,
+                          region_id,
+                          params.budget_bytes,
+                          params.resident_gpu_bytes_before,
+                          params.over_budget_bytes,
+                          params.reclaim_target_bytes,
+                          params.victim_candidate_bytes,
+                          params.victim_count,
+                          params.mode,
+                          would_reclaim ? 1 : 0,
+                          execute_requested ? 1 : 0,
+                          (execute_requested && would_reclaim && status == NV_OK) ? 1 : 0,
+                          status,
+                          params.attempted_regions,
+                          params.success_regions,
+                          params.failure_regions,
+                          params.reclaimed_bytes,
+                          params.failed_bytes,
+                          params.async);
+
+    return status;
+}
+
+NV_STATUS uvm_phase_n_reclaim_pool_over_budget(uvm_va_space_t *va_space,
+                                               NvU32 pool,
+                                               NvU32 gpu_id,
+                                               NvU64 current_epoch,
+                                               NvU64 cooldown_epochs,
+                                               NvU32 max_victims,
+                                               NvBool async)
+{
+    UVM_PHASE_N_RECLAIM_POOL_PARAMS params = { 0 };
+
+    params.pool = pool;
+    params.gpu_id = gpu_id;
+    params.current_epoch = current_epoch;
+    params.cooldown_epochs = cooldown_epochs;
+    params.max_victims = max_victims;
+    params.async = async;
+
+    return uvm_phase_n_reclaim_pool_execute(va_space, &params);
 }
 
 static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)

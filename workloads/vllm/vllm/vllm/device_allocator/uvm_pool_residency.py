@@ -353,6 +353,14 @@ class UvmPoolResidencyManager:
             "VLLM_UVM_DRIVER_TEMP_BUFFER_BYTES",
             DEFAULT_DRIVER_TEMP_BUFFER_BYTES,
         )
+        self.driver_pool_state_snapshot_on_tag_only_every = _read_int_env(
+            "VLLM_UVM_DRIVER_POOL_STATE_SNAPSHOT_ON_TAG_ONLY_EVERY",
+            0,
+        )
+        self.driver_pool_state_snapshot_device = _read_int_env(
+            "VLLM_UVM_DRIVER_POOL_STATE_SNAPSHOT_DEVICE",
+            0,
+        )
         self._driver_pool_budget_status: dict[str, int] = {}
         self._driver_pool_budgets_applied = False
         self.safety_margin_bytes = _read_int_env(
@@ -742,6 +750,7 @@ class UvmPoolResidencyManager:
         metadata = metadata or {}
         active_region_ids = active_region_ids or set()
         if self.tag_only_mode:
+            snapshot_due = False
             with self._lock:
                 self._record_config_locked()
                 decision = UvmResidencyDecision(
@@ -767,6 +776,15 @@ class UvmPoolResidencyManager:
                     global_remaining_bytes=None,
                 )
                 self._record_request_locked(decision, metadata)
+                request_count = self._summary["requests"]
+                snapshot_every = self.driver_pool_state_snapshot_on_tag_only_every
+                snapshot_due = (
+                    snapshot_every > 0 and request_count % snapshot_every == 0
+                )
+            if snapshot_due:
+                self.driver_pool_state_snapshot(
+                    gpu_id=self.driver_pool_state_snapshot_device
+                )
             return decision
         if not self.active or bytes <= 0:
             return UvmResidencyDecision(
@@ -1611,6 +1629,12 @@ class UvmPoolResidencyManager:
                 "driver_pool_budget_mode": self.driver_pool_budget_mode,
                 "driver_pool_budget_overrides": self.driver_pool_budget_overrides,
                 "driver_temp_buffer_bytes": self.driver_temp_buffer_bytes,
+                "driver_pool_state_snapshot_on_tag_only_every": (
+                    self.driver_pool_state_snapshot_on_tag_only_every
+                ),
+                "driver_pool_state_snapshot_device": (
+                    self.driver_pool_state_snapshot_device
+                ),
                 "trace_file": self.trace_file,
                 "global_budget_bytes": self.global_budget_bytes,
                 "pool_budgets": self.pool_budgets,

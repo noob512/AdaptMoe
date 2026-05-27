@@ -25,3 +25,8 @@
 
 NV_STATUS uvm_migrate_init(void);
 void uvm_migrate_exit(void);
+
+NV_STATUS uvm_migrate_managed_range_to_cpu(uvm_va_space_t *va_space,
+                                           NvU64 base,
+                                           NvU64 length,
+                                           NvU32 migrate_flags);

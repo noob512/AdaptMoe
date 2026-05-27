@@ -1065,7 +1065,7 @@ def driver_get_pool_state(pool: int, gpu_id: int = 0) -> dict[str, int] | None:
         "selected_victim_region_id",
         "selected_victim_bytes",
         "victim_count",
-        "reserved",
+        "metadata_only",
         "victim_region_id_0",
         "victim_region_id_1",
         "victim_region_id_2",

@@ -26,6 +26,13 @@ SERVER_MAX_NUM_SEQS="${VLLM_SERVER_MAX_NUM_SEQS:-8}"
 SERVER_GPU_MEMORY_UTILIZATION="${VLLM_SERVER_GPU_MEMORY_UTILIZATION:-0.85}"
 SERVER_MAX_MODEL_LEN="${VLLM_SERVER_MAX_MODEL_LEN:-}"
 UVM_PHASE_F_ROUTE_LOG_DELAY_MS="${UVM_PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
+UVM_PHASE_N_AUTO_RECLAIM_ENABLE="${UVM_PHASE_N_AUTO_RECLAIM_ENABLE:-0}"
+UVM_PHASE_N_AUTO_RECLAIM_EXECUTE="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE:-0}"
+UVM_PHASE_N_AUTO_RECLAIM_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_EVERY:-64}"
+UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY:-256}"
+UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS="${UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS:-2}"
+UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS:-0}"
+UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS:-256}"
 
 DATASET_PATH="${DATASET_PATH:-$SCRIPT_DIR/datasets/ShareGPT_V3_unfiltered_cleaned_split.json}"
 ADDRESS_LOG="/tmp/vllm_uvm_address_regions.log"
@@ -173,7 +180,10 @@ UVM_RESIDENCY_KV_PREFETCH_BACK_MODE="${VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_MODE:
 UVM_RESIDENCY_KV_PREFETCH_DEVICE="${VLLM_UVM_RESIDENCY_KV_PREFETCH_DEVICE:-0}"
 UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP="${VLLM_UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP:-0}"
 UVM_RESIDENCY_KV_POINTER_MAP_FILE="${VLLM_UVM_RESIDENCY_KV_POINTER_MAP_FILE:-}"
+UVM_RESIDENCY_KV_POINTER_TAG_ENABLE="${VLLM_UVM_RESIDENCY_KV_POINTER_TAG_ENABLE:-0}"
+UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY="${VLLM_UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY:-tensor}"
 UVM_RESIDENCY_PRIORITY="${VLLM_UVM_RESIDENCY_PRIORITY:-kv,scratch,weights}"
+UVM_DRIVER_SCRATCH_TAG_ENABLE="${VLLM_UVM_DRIVER_SCRATCH_TAG_ENABLE:-0}"
 UVM_RESIDENCY_WEIGHT_INITIAL_STATE="${VLLM_UVM_RESIDENCY_WEIGHT_INITIAL_STATE:-cpu}"
 UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET="${VLLM_UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET:-0}"
 UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD="${VLLM_UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD:-1}"
@@ -496,6 +506,12 @@ Options:
                              event. 0 derives from runtime pressure.
   --uvm-residency-kv-pointer-map-file <path>
                              Stage L6 raw KV block pointer map sidecar.
+  --uvm-residency-kv-pointer-tag-enable <0|1>
+                             Stage N tag-only driver KV pointer registration.
+  --uvm-residency-kv-pointer-tag-granularity <tensor|range>
+                             Stage N KV driver tag granularity.
+  --uvm-driver-scratch-tag-enable <0|1>
+                             Stage N allocator-side scratch/temp driver tags.
   --uvm-residency-priority <csv>
                              Stage L priority label for reports
                              (default: kv,scratch,weights)
@@ -595,6 +611,20 @@ Options:
                              Required for Phase F test ioctl driver executor.
   --uvm-phase-f-route-log-delay-ms <n>
                              Set uvm_phase_f_route_log_delay_ms at insmod time (default: 0)
+  --uvm-phase-n-auto-reclaim-enable <0|1>
+                             Set uvm_phase_n_auto_reclaim_enable at insmod time
+  --uvm-phase-n-auto-reclaim-execute <0|1>
+                             Set uvm_phase_n_auto_reclaim_execute at insmod time
+  --uvm-phase-n-auto-reclaim-every <n>
+                             Set uvm_phase_n_auto_reclaim_every at insmod time
+  --uvm-phase-n-auto-reclaim-scan-every <n>
+                             Set uvm_phase_n_auto_reclaim_scan_every at insmod time
+  --uvm-phase-n-auto-reclaim-max-victims <n>
+                             Set uvm_phase_n_auto_reclaim_max_victims at insmod time
+  --uvm-phase-n-auto-reclaim-cooldown-epochs <n>
+                             Set uvm_phase_n_auto_reclaim_cooldown_epochs at insmod time
+  --uvm-phase-n-auto-reclaim-failure-backoff-epochs <n>
+                             Set uvm_phase_n_auto_reclaim_failure_backoff_epochs at insmod time
   --keep                     Keep UVM params on exit (no rollback)
   -h, --help                 Show help
 
@@ -877,7 +907,10 @@ start_server() {
                 VLLM_UVM_RESIDENCY_KV_PREFETCH_DEVICE='$UVM_RESIDENCY_KV_PREFETCH_DEVICE' \
                 VLLM_UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP='$UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP' \
                 VLLM_UVM_RESIDENCY_KV_POINTER_MAP_FILE='$UVM_RESIDENCY_KV_POINTER_MAP_FILE' \
+                VLLM_UVM_RESIDENCY_KV_POINTER_TAG_ENABLE='$UVM_RESIDENCY_KV_POINTER_TAG_ENABLE' \
+                VLLM_UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY='$UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY' \
                 VLLM_UVM_RESIDENCY_PRIORITY='$UVM_RESIDENCY_PRIORITY' \
+                VLLM_UVM_DRIVER_SCRATCH_TAG_ENABLE='$UVM_DRIVER_SCRATCH_TAG_ENABLE' \
                 VLLM_UVM_RESIDENCY_WEIGHT_INITIAL_STATE='$UVM_RESIDENCY_WEIGHT_INITIAL_STATE' \
                 VLLM_UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET='$UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET' \
                 VLLM_UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD='$UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD' \
@@ -1106,6 +1139,13 @@ reload_uvm_module_for_counter_reset() {
     uvm_enable_debug_procfs="$UVM_ENABLE_DEBUG_PROCFS" \
     uvm_enable_builtin_tests="$UVM_ENABLE_BUILTIN_TESTS" \
     uvm_phase_f_route_log_delay_ms="$UVM_PHASE_F_ROUTE_LOG_DELAY_MS" \
+    uvm_phase_n_auto_reclaim_enable="$UVM_PHASE_N_AUTO_RECLAIM_ENABLE" \
+    uvm_phase_n_auto_reclaim_execute="$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE" \
+    uvm_phase_n_auto_reclaim_every="$UVM_PHASE_N_AUTO_RECLAIM_EVERY" \
+    uvm_phase_n_auto_reclaim_scan_every="$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY" \
+    uvm_phase_n_auto_reclaim_max_victims="$UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS" \
+    uvm_phase_n_auto_reclaim_cooldown_epochs="$UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS" \
+    uvm_phase_n_auto_reclaim_failure_backoff_epochs="$UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS" \
     uvm_perf_fault_log_destination=0 \
     uvm_perf_fault_log_counters=0 \
     uvm_perf_fault_log_addresses=0 \
@@ -1129,6 +1169,24 @@ reload_uvm_module_for_counter_reset() {
     route_delay_val="$(cat "$PARAM_DIR/uvm_phase_f_route_log_delay_ms" 2>/dev/null || true)"
     [ "$route_delay_val" = "$UVM_PHASE_F_ROUTE_LOG_DELAY_MS" ] \
       || die "uvm_phase_f_route_log_delay_ms expected $UVM_PHASE_F_ROUTE_LOG_DELAY_MS, got $route_delay_val"
+  fi
+  if [ -r "$PARAM_DIR/uvm_phase_n_auto_reclaim_enable" ]; then
+    local auto_reclaim_enable_val
+    auto_reclaim_enable_val="$(cat "$PARAM_DIR/uvm_phase_n_auto_reclaim_enable" 2>/dev/null || true)"
+    [ "$auto_reclaim_enable_val" = "$UVM_PHASE_N_AUTO_RECLAIM_ENABLE" ] \
+      || die "uvm_phase_n_auto_reclaim_enable expected $UVM_PHASE_N_AUTO_RECLAIM_ENABLE, got $auto_reclaim_enable_val"
+  fi
+  if [ -r "$PARAM_DIR/uvm_phase_n_auto_reclaim_every" ]; then
+    local auto_reclaim_every_val
+    auto_reclaim_every_val="$(cat "$PARAM_DIR/uvm_phase_n_auto_reclaim_every" 2>/dev/null || true)"
+    [ "$auto_reclaim_every_val" = "$UVM_PHASE_N_AUTO_RECLAIM_EVERY" ] \
+      || die "uvm_phase_n_auto_reclaim_every expected $UVM_PHASE_N_AUTO_RECLAIM_EVERY, got $auto_reclaim_every_val"
+  fi
+  if [ -r "$PARAM_DIR/uvm_phase_n_auto_reclaim_scan_every" ]; then
+    local auto_reclaim_scan_every_val
+    auto_reclaim_scan_every_val="$(cat "$PARAM_DIR/uvm_phase_n_auto_reclaim_scan_every" 2>/dev/null || true)"
+    [ "$auto_reclaim_scan_every_val" = "$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY" ] \
+      || die "uvm_phase_n_auto_reclaim_scan_every expected $UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY, got $auto_reclaim_scan_every_val"
   fi
 
   # Optional: clear old kernel ring lines so dmesg mode only shows this run.
@@ -1401,6 +1459,9 @@ parse_args() {
       --uvm-residency-kv-prefetch-device) UVM_RESIDENCY_KV_PREFETCH_DEVICE="$2"; shift 2 ;; # Stage L6 prefetch-back target device
       --uvm-residency-kv-max-offload-blocks-per-step) UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP="$2"; shift 2 ;; # Stage L6 max safe offload blocks
       --uvm-residency-kv-pointer-map-file) UVM_RESIDENCY_KV_POINTER_MAP_FILE="$2"; shift 2 ;; # Stage L6 raw pointer map sidecar
+      --uvm-residency-kv-pointer-tag-enable) UVM_RESIDENCY_KV_POINTER_TAG_ENABLE="$2"; shift 2 ;; # Stage N tag-only driver KV pointer registration
+      --uvm-residency-kv-pointer-tag-granularity) UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY="$2"; shift 2 ;; # Stage N KV driver tag granularity
+      --uvm-driver-scratch-tag-enable) UVM_DRIVER_SCRATCH_TAG_ENABLE="$2"; shift 2 ;; # Stage N allocator-side scratch/temp driver tags
       --uvm-residency-priority) UVM_RESIDENCY_PRIORITY="$2"; shift 2 ;; # Stage L0 report priority label
       --uvm-residency-weight-initial-state) UVM_RESIDENCY_WEIGHT_INITIAL_STATE="$2"; shift 2 ;; # Stage L2 initial expert state
       --uvm-residency-weight-enforce-hot-set) UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET="$2"; shift 2 ;; # Stage L2 weights enforce gate
@@ -1448,6 +1509,13 @@ parse_args() {
       --uvm-enable-debug-procfs) UVM_ENABLE_DEBUG_PROCFS="$2"; shift 2 ;; # insmod 时的 debug procfs 开关
       --uvm-enable-builtin-tests) UVM_ENABLE_BUILTIN_TESTS="$2"; shift 2 ;; # insmod 时开启 builtin tests
       --uvm-phase-f-route-log-delay-ms) UVM_PHASE_F_ROUTE_LOG_DELAY_MS="$2"; shift 2 ;; # insmod 时的 Phase F route log 人工延迟
+      --uvm-phase-n-auto-reclaim-enable) UVM_PHASE_N_AUTO_RECLAIM_ENABLE="$2"; shift 2 ;; # insmod 时开启/关闭 Stage N auto hook
+      --uvm-phase-n-auto-reclaim-execute) UVM_PHASE_N_AUTO_RECLAIM_EXECUTE="$2"; shift 2 ;; # insmod 时允许 Stage N outer hook 执行 soft reclaim
+      --uvm-phase-n-auto-reclaim-every) UVM_PHASE_N_AUTO_RECLAIM_EVERY="$2"; shift 2 ;; # insmod 时配置 Stage N auto hook 采样频率
+      --uvm-phase-n-auto-reclaim-scan-every) UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY="$2"; shift 2 ;; # insmod 时配置 Stage N auto reclaim 全池扫描频率
+      --uvm-phase-n-auto-reclaim-max-victims) UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS="$2"; shift 2 ;; # insmod 时配置 Stage N auto reclaim batch victim 上限
+      --uvm-phase-n-auto-reclaim-cooldown-epochs) UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS="$2"; shift 2 ;; # insmod 时配置 Stage N auto reclaim cooldown
+      --uvm-phase-n-auto-reclaim-failure-backoff-epochs) UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="$2"; shift 2 ;; # insmod 时配置 Stage N auto reclaim failure backoff
       --keep) KEEP_ON_EXIT=1; shift ;;                         # 退出时不重置内核状态
 
       # ==========================================
@@ -1625,6 +1693,9 @@ validate_inputs() {
     [[ "$UVM_RESIDENCY_KV_PREFETCH_BACK_MODE" =~ ^(trace_only|prefetch)$ ]] || die "--uvm-residency-kv-prefetch-back-mode must be trace_only or prefetch"
     [[ "$UVM_RESIDENCY_KV_PREFETCH_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-residency-kv-prefetch-device must be an integer"
     [[ "$UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-residency-kv-max-offload-blocks-per-step must be a non-negative integer"
+    [[ "$UVM_RESIDENCY_KV_POINTER_TAG_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-kv-pointer-tag-enable must be 0 or 1"
+    [[ "$UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY" =~ ^(tensor|range)$ ]] || die "--uvm-residency-kv-pointer-tag-granularity must be tensor or range"
+    [[ "$UVM_DRIVER_SCRATCH_TAG_ENABLE" =~ ^[01]$ ]] || die "--uvm-driver-scratch-tag-enable must be 0 or 1"
     [ -n "$UVM_RESIDENCY_PRIORITY" ] || die "--uvm-residency-priority must not be empty"
     [[ "$UVM_RESIDENCY_WEIGHT_INITIAL_STATE" =~ ^(unknown|cpu|gpu)$ ]] || die "--uvm-residency-weight-initial-state must be unknown, cpu, or gpu"
     [[ "$UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET" =~ ^[01]$ ]] || die "--uvm-residency-weight-enforce-hot-set must be 0 or 1"
@@ -1636,6 +1707,13 @@ validate_inputs() {
     [[ "$UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-residency-weight-active-evict-max-experts-per-layer must be a non-negative integer"
     [[ "$UVM_RESIDENCY_WEIGHT_EVICT_PROTECT_RECENT_STEPS" =~ ^[0-9]+$ ]] || die "--uvm-residency-weight-evict-protect-recent-steps must be a non-negative integer"
     [[ "$UVM_POOL_REGISTRY_ENABLE" =~ ^[01]$ ]] || die "--uvm-pool-registry-enable must be 0 or 1"
+    [[ "$UVM_PHASE_N_AUTO_RECLAIM_ENABLE" =~ ^[01]$ ]] || die "--uvm-phase-n-auto-reclaim-enable must be 0 or 1"
+    [[ "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE" =~ ^[01]$ ]] || die "--uvm-phase-n-auto-reclaim-execute must be 0 or 1"
+    [[ "$UVM_PHASE_N_AUTO_RECLAIM_EVERY" =~ ^[0-9]+$ ]] || die "--uvm-phase-n-auto-reclaim-every must be a non-negative integer"
+    [[ "$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY" =~ ^[0-9]+$ ]] || die "--uvm-phase-n-auto-reclaim-scan-every must be a non-negative integer"
+    [[ "$UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS" =~ ^[0-9]+$ ]] || die "--uvm-phase-n-auto-reclaim-max-victims must be a non-negative integer"
+    [[ "$UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS" =~ ^[0-9]+$ ]] || die "--uvm-phase-n-auto-reclaim-cooldown-epochs must be a non-negative integer"
+    [[ "$UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS" =~ ^[0-9]+$ ]] || die "--uvm-phase-n-auto-reclaim-failure-backoff-epochs must be a non-negative integer"
     [[ "$UVM_SCRATCH_POOL_ENABLE" =~ ^[01]$ ]] || die "--uvm-scratch-pool-enable must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-scratch-pool-budget-bytes must be a non-negative integer"
     [[ "$UVM_SCRATCH_POOL_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-scratch-pool-mode must be trace_only or enforce"

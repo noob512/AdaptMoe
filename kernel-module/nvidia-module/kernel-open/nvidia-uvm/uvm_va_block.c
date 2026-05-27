@@ -4992,6 +4992,17 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
                                       region,
                                       page_mask);
 
+    if (UVM_ID_IS_GPU(dest_id)) {
+        uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
+
+        uvm_phase_n_make_resident_reclaim_hook(va_space,
+                                               uvm_va_block_region_start(va_block, region),
+                                               uvm_va_block_region_size(region),
+                                               uvm_id_value(dest_id),
+                                               cause,
+                                               NV_FALSE);
+    }
+
     return NV_OK;
 }
 
@@ -11935,6 +11946,7 @@ NV_STATUS uvm_va_block_service_finish(uvm_processor_id_t processor_id,
     uvm_prot_t new_prot;
     uvm_page_index_t page_index;
     NV_STATUS status = NV_OK;
+    bool finished_residency_update = false;
 
     // Update residency.
     if (service_context->read_duplicate_count == 0 || !uvm_page_mask_empty(caller_page_mask)) {
@@ -11942,6 +11954,18 @@ NV_STATUS uvm_va_block_service_finish(uvm_processor_id_t processor_id,
                                           service_context->block_context,
                                           service_context->region,
                                           caller_page_mask);
+        finished_residency_update = true;
+    }
+
+    if (finished_residency_update && UVM_ID_IS_GPU(new_residency)) {
+        uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
+
+        uvm_phase_n_make_resident_reclaim_hook(va_space,
+                                               uvm_va_block_region_start(va_block, service_context->region),
+                                               uvm_va_block_region_size(service_context->region),
+                                               uvm_id_value(new_residency),
+                                               service_context->block_context->make_resident.cause,
+                                               NV_FALSE);
     }
 
     uvm_page_mask_andnot(&service_context->did_not_migrate_mask, new_residency_mask, did_migrate_mask);

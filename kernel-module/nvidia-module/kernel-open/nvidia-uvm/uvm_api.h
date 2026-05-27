@@ -298,6 +298,24 @@ NV_STATUS uvm_api_unregister_channel(UVM_UNREGISTER_CHANNEL_PARAMS *params, stru
 NV_STATUS uvm_api_enable_read_duplication(const UVM_ENABLE_READ_DUPLICATION_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_disable_read_duplication(const UVM_DISABLE_READ_DUPLICATION_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp);
+NV_STATUS uvm_phase_n_reclaim_pool_over_budget(uvm_va_space_t *va_space,
+                                               NvU32 pool,
+                                               NvU32 gpu_id,
+                                               NvU64 current_epoch,
+                                               NvU64 cooldown_epochs,
+                                               NvU32 max_victims,
+                                               NvBool async);
+void uvm_phase_n_make_resident_reclaim_hook(uvm_va_space_t *va_space,
+                                            NvU64 address,
+                                            NvU64 length,
+                                            NvU32 gpu_id,
+                                            NvU32 cause,
+                                            NvBool execute_allowed);
+NV_STATUS uvm_phase_n_auto_reclaim_outer_hook(uvm_va_space_t *va_space,
+                                              NvU64 address,
+                                              NvU64 length,
+                                              NvU32 gpu_id,
+                                              NvU32 cause);
 NV_STATUS uvm_api_tools_init_event_tracker(UVM_TOOLS_INIT_EVENT_TRACKER_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_tools_init_event_tracker_v2(UVM_TOOLS_INIT_EVENT_TRACKER_V2_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_tools_set_notification_threshold(UVM_TOOLS_SET_NOTIFICATION_THRESHOLD_PARAMS *params, struct file *filp);

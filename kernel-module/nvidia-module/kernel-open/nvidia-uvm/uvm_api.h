@@ -154,6 +154,42 @@
 #define UVM_ROUTE_CMD_ALLOC_INIT_CHECK(cmd, function_name) \
     __UVM_ROUTE_CMD_ALLOC(cmd, cmd##_PARAMS, function_name, true)
 
+#define __UVM_ROUTE_CMD_HEAP(cmd, params_type, function_name, do_init_check)            \
+    case cmd:                                                                           \
+    {                                                                                   \
+        int ret = 0;                                                                    \
+        params_type *params = uvm_kvmalloc(sizeof(*params));                            \
+        if (!params)                                                                    \
+            return -ENOMEM;                                                             \
+                                                                                        \
+        if (copy_from_user(params, (void __user*)arg, sizeof(*params))) {               \
+            uvm_kvfree(params);                                                         \
+            return -EFAULT;                                                             \
+        }                                                                               \
+                                                                                        \
+        params->rmStatus = uvm_global_get_status();                                     \
+        if (params->rmStatus == NV_OK) {                                                \
+            if (do_init_check) {                                                        \
+                if (!uvm_fd_va_space(filp))                                             \
+                    params->rmStatus = NV_ERR_ILLEGAL_ACTION;                           \
+            }                                                                           \
+            if (likely(params->rmStatus == NV_OK))                                      \
+                params->rmStatus = function_name(params, filp);                         \
+        }                                                                               \
+                                                                                        \
+        if (copy_to_user((void __user*)arg, params, sizeof(*params)))                   \
+            ret = -EFAULT;                                                              \
+                                                                                        \
+        uvm_kvfree(params);                                                             \
+        return ret;                                                                     \
+    }
+
+#define UVM_ROUTE_CMD_HEAP_NO_INIT_CHECK(cmd, function_name) \
+    __UVM_ROUTE_CMD_HEAP(cmd, cmd##_PARAMS, function_name, false)
+
+#define UVM_ROUTE_CMD_HEAP_INIT_CHECK(cmd, function_name) \
+    __UVM_ROUTE_CMD_HEAP(cmd, cmd##_PARAMS, function_name, true)
+
 // Wrap an entry point into the UVM module.
 //
 // An entry function with signature

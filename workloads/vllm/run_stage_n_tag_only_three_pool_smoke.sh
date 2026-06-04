@@ -32,15 +32,34 @@ WITH_ADDRESS_LOG="${WITH_ADDRESS_LOG:-1}"
 UVM_PHASE_F_ROUTE_LOG_DELAY_MS="${UVM_PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
 REQUIRE_PHASE_N_AUTO_HOOK="${REQUIRE_PHASE_N_AUTO_HOOK:-0}"
 REQUIRE_PHASE_N_AUTO_RECLAIM="${REQUIRE_PHASE_N_AUTO_RECLAIM:-0}"
+REQUIRE_STAGE_N_HARD_PARTITION="${REQUIRE_STAGE_N_HARD_PARTITION:-0}"
+HARD_PARTITION_TOLERANCE_BYTES="${HARD_PARTITION_TOLERANCE_BYTES:-0}"
 DRIVER_POOL_BUDGET_MODE="${DRIVER_POOL_BUDGET_MODE:-trace_only}"
+VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE="${VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE:-0}"
+VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP="${VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP:-0}"
+UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY:-}"
+if [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ]; then
+  REQUIRE_PHASE_N_AUTO_RECLAIM=1
+  REQUIRE_PHASE_N_AUTO_HOOK=1
+  DRIVER_POOL_BUDGET_MODE=enforce
+  VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE=1
+  UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY:-1}"
+else
+  UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY:-0}"
+fi
 if [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" = "1" ]; then
   REQUIRE_PHASE_N_AUTO_HOOK=1
   DRIVER_POOL_BUDGET_MODE="${DRIVER_POOL_BUDGET_MODE:-soft}"
   [ "$DRIVER_POOL_BUDGET_MODE" = "trace_only" ] && DRIVER_POOL_BUDGET_MODE=soft
   UVM_PHASE_N_AUTO_RECLAIM_ENABLE="${UVM_PHASE_N_AUTO_RECLAIM_ENABLE:-1}"
   UVM_PHASE_N_AUTO_RECLAIM_EXECUTE="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE:-1}"
-  UVM_PHASE_N_AUTO_RECLAIM_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_EVERY:-64}"
-  UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY:-256}"
+  if [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ]; then
+    UVM_PHASE_N_AUTO_RECLAIM_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_EVERY:-1}"
+    UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY:-0}"
+  else
+    UVM_PHASE_N_AUTO_RECLAIM_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_EVERY:-64}"
+    UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY:-256}"
+  fi
 elif [ "$REQUIRE_PHASE_N_AUTO_HOOK" = "1" ]; then
   UVM_PHASE_N_AUTO_RECLAIM_ENABLE="${UVM_PHASE_N_AUTO_RECLAIM_ENABLE:-1}"
   UVM_PHASE_N_AUTO_RECLAIM_EXECUTE="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE:-0}"
@@ -70,13 +89,22 @@ if [ -z "$WEIGHT_BUDGET_BYTES" ]; then
   fi
 fi
 if [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" = "1" ]; then
-  UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS="${UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS:-1}"
-  UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS:-4096}"
+  if [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ]; then
+    UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS="${UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS:-128}"
+    UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS:-0}"
+  else
+    UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS="${UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS:-1}"
+    UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS:-4096}"
+  fi
 else
   UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS="${UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS:-2}"
   UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS:-256}"
 fi
-UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS:-256}"
+if [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ]; then
+  UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS:-0}"
+else
+  UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS:-256}"
+fi
 
 RUN_ROOT="${RUN_ROOT:-log/stage_n_tag_only_three_pool_smoke_$(date -u +%Y%m%d_%H%M%S)}"
 mkdir -p "$RUN_ROOT"
@@ -106,6 +134,8 @@ export VLLM_UVM_DRIVER_POOL_BUDGET_ENABLE=1
 export VLLM_UVM_DRIVER_POOL_BUDGET_MODE="$DRIVER_POOL_BUDGET_MODE"
 export VLLM_UVM_DRIVER_POOL_BUDGETS="kv=${KV_BUDGET_BYTES},weight=${WEIGHT_BUDGET_BYTES},temp=${SCRATCH_TEMP_BUDGET_BYTES}"
 export VLLM_UVM_DRIVER_TEMP_BUFFER_BYTES="$SCRATCH_TEMP_BUDGET_BYTES"
+export VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE
+export VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP
 export VLLM_UVM_DRIVER_POOL_STATE_SNAPSHOT_ON_TAG_ONLY_EVERY="$DRIVER_POOL_STATE_SNAPSHOT_ON_TAG_ONLY_EVERY"
 export VLLM_UVM_DRIVER_POOL_STATE_SNAPSHOT_DEVICE="$DRIVER_POOL_STATE_SNAPSHOT_DEVICE"
 export VLLM_UVM_DRIVER_POOL_STATE_SNAPSHOT_ON_SCRATCH_FREE=1
@@ -167,14 +197,19 @@ fi
   echo "DRIVER_POOL_STATE_SNAPSHOT_DEVICE=$DRIVER_POOL_STATE_SNAPSHOT_DEVICE"
   echo "REQUIRE_PHASE_N_AUTO_HOOK=$REQUIRE_PHASE_N_AUTO_HOOK"
   echo "REQUIRE_PHASE_N_AUTO_RECLAIM=$REQUIRE_PHASE_N_AUTO_RECLAIM"
+  echo "REQUIRE_STAGE_N_HARD_PARTITION=$REQUIRE_STAGE_N_HARD_PARTITION"
+  echo "HARD_PARTITION_TOLERANCE_BYTES=$HARD_PARTITION_TOLERANCE_BYTES"
   echo "DRIVER_POOL_BUDGET_MODE=$DRIVER_POOL_BUDGET_MODE"
   echo "UVM_PHASE_N_AUTO_RECLAIM_ENABLE=$UVM_PHASE_N_AUTO_RECLAIM_ENABLE"
   echo "UVM_PHASE_N_AUTO_RECLAIM_EXECUTE=$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE"
+  echo "UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY=$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY"
   echo "UVM_PHASE_N_AUTO_RECLAIM_EVERY=$UVM_PHASE_N_AUTO_RECLAIM_EVERY"
   echo "UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY=$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY"
   echo "UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS=$UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS"
   echo "UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS=$UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS"
   echo "UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS=$UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS"
+  echo "VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE=$VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE"
+  echo "VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP=$VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP"
   env | sort | grep -E '^VLLM_UVM_(PHASE_F_IOCTL_MODE|RESIDENCY|DRIVER)=' || true
   env | sort | grep -E '^VLLM_UVM_(RESIDENCY_|DRIVER_)' || true
 } > "$ENV_FILE"
@@ -234,11 +269,15 @@ cmd=(
   --uvm-residency-kv-prefetch-back-mode trace_only
   --uvm-residency-kv-pointer-map-file "$KV_POINTER_MAP"
   --uvm-residency-kv-pointer-tag-enable 1
-  --uvm-residency-kv-pointer-tag-granularity tensor
-  --uvm-driver-scratch-tag-enable 1
-  --uvm-phase-f-route-log-delay-ms "$UVM_PHASE_F_ROUTE_LOG_DELAY_MS"
+	  --uvm-residency-kv-pointer-tag-granularity tensor
+		  --uvm-driver-scratch-tag-enable 1
+		  --uvm-driver-temp-buffer-bytes "$SCRATCH_TEMP_BUDGET_BYTES"
+		  --uvm-driver-scratch-budget-enforce "$VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE"
+		  --uvm-driver-scratch-budget-enforce-warmup "$VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP"
+		  --uvm-phase-f-route-log-delay-ms "$UVM_PHASE_F_ROUTE_LOG_DELAY_MS"
   --uvm-phase-n-auto-reclaim-enable "$UVM_PHASE_N_AUTO_RECLAIM_ENABLE"
   --uvm-phase-n-auto-reclaim-execute "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE"
+  --uvm-phase-n-auto-reclaim-execute-on-ready "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY"
   --uvm-phase-n-auto-reclaim-every "$UVM_PHASE_N_AUTO_RECLAIM_EVERY"
   --uvm-phase-n-auto-reclaim-scan-every "$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY"
   --uvm-phase-n-auto-reclaim-max-victims "$UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS"
@@ -396,6 +435,7 @@ Scratch/Temp Driver Trace Summary
 ---------------------------------
 scratch_driver_tag_records=0
 scratch_driver_untag_records=0
+scratch_driver_reject_records=0
 scratch_driver_registered_records=0
 scratch_driver_live_peak_bytes=0
 scratch_driver_live_final_bytes=0
@@ -420,6 +460,7 @@ kv_pattern = re.compile(r"([A-Za-z0-9_]+)=([^ ]+)")
 live_by_region = {}
 tag_records = 0
 untag_records = 0
+reject_records = 0
 registered_records = 0
 live_bytes = 0
 live_peak_bytes = 0
@@ -471,11 +512,14 @@ with open(path, encoding="utf-8", errors="replace") as handle:
                 except ValueError:
                     size = 0
             live_bytes = max(live_bytes - size, 0)
+        elif "TRACE_DRIVER_SCRATCH_REJECT" in line:
+            reject_records += 1
 
 print("Scratch/Temp Driver Trace Summary")
 print("---------------------------------")
 print(f"scratch_driver_tag_records={tag_records}")
 print(f"scratch_driver_untag_records={untag_records}")
+print(f"scratch_driver_reject_records={reject_records}")
 print(f"scratch_driver_registered_records={registered_records}")
 print(f"scratch_driver_live_peak_bytes={live_peak_bytes}")
 print(f"scratch_driver_live_final_bytes={live_bytes}")
@@ -727,6 +771,7 @@ allocator_driver_pool_state_all_required_fields_present=0
 app_migration_records=0
 scratch_driver_tag_records=0
 scratch_driver_untag_records=0
+scratch_driver_reject_records=0
 scratch_driver_live_peak_bytes=0
 scratch_driver_max_alloc_bytes=0
 scratch_driver_over_budget_records=0
@@ -739,6 +784,17 @@ phase_n_auto_hook_no_region_records=0
 phase_n_auto_hook_execute_records=0
 phase_n_auto_hook_success_records=0
 phase_n_auto_hook_reclaimed_records=0
+hard_partition_pass=0
+hard_partition_all_driver_pools_under_budget=0
+hard_partition_all_transient_pools_under_budget=0
+hard_partition_sufficient_reclaim_to_budget=0
+hard_partition_sufficient_deny_or_block=0
+hard_partition_max_driver_over_budget_bytes=0
+hard_partition_auto_reclaimed_bytes=0
+hard_partition_scratch_over_budget_records=0
+hard_partition_scratch_budget_reject_records=0
+hard_partition_scratch_driver_reject_records=0
+hard_partition_failure_reasons=not_checked
 successful_requests=0
 failed_requests=0
 
@@ -782,8 +838,14 @@ fi
 if [ -s "$ALLOCATOR_LOG" ]; then
   scratch_driver_tag_records="$(count_matches 'TRACE_DRIVER_SCRATCH_TAG' "$ALLOCATOR_LOG")"
   scratch_driver_untag_records="$(count_matches 'TRACE_DRIVER_SCRATCH_UNTAG' "$ALLOCATOR_LOG")"
+  scratch_driver_reject_records="$(count_matches 'TRACE_DRIVER_SCRATCH_REJECT' "$ALLOCATOR_LOG")"
   allocator_driver_pool_state_records="$(count_matches 'TRACE_DRIVER_POOL_STATE_SNAPSHOT' "$ALLOCATOR_LOG")"
   scratch_parse="$(write_scratch_summary "$ALLOCATOR_LOG" "$SCRATCH_TEMP_BUDGET_BYTES")"
+  scratch_driver_reject_records="$(
+    printf '%s\n' "$scratch_parse" |
+      awk -F= '$1=="scratch_driver_reject_records"{print $2}' |
+      tail -n 1
+  )"
   scratch_driver_live_peak_bytes="$(
     printf '%s\n' "$scratch_parse" |
       awk -F= '$1=="scratch_driver_live_peak_bytes"{print $2}' |
@@ -848,6 +910,7 @@ elif [ -s "$ROUTE_LOG" ]; then
   phase_n_auto_hook_reclaimed_records="$(count_matches 'phase_n_auto_reclaim_hook.*reclaimed=[1-9]' "$ROUTE_LOG")"
 fi
 scratch_driver_live_peak_bytes="${scratch_driver_live_peak_bytes:-0}"
+scratch_driver_reject_records="${scratch_driver_reject_records:-0}"
 scratch_driver_max_alloc_bytes="${scratch_driver_max_alloc_bytes:-0}"
 scratch_driver_over_budget_records="${scratch_driver_over_budget_records:-0}"
 phase_n_auto_hook_records="${phase_n_auto_hook_records:-0}"
@@ -859,6 +922,77 @@ phase_n_auto_hook_no_region_records="${phase_n_auto_hook_no_region_records:-0}"
 phase_n_auto_hook_execute_records="${phase_n_auto_hook_execute_records:-0}"
 phase_n_auto_hook_success_records="${phase_n_auto_hook_success_records:-0}"
 phase_n_auto_hook_reclaimed_records="${phase_n_auto_hook_reclaimed_records:-0}"
+hard_partition_parse="$(
+  python3 "$SCRIPT_DIR/check_stage_n_hard_partition.py" \
+    "$RUN_ROOT" \
+    --tolerance-bytes "$HARD_PARTITION_TOLERANCE_BYTES" 2>/dev/null || true
+)"
+hard_partition_pass="$(
+  printf '%s\n' "$hard_partition_parse" |
+    awk -F= '$1=="hard_partition_pass"{print $2}' |
+    tail -n 1
+)"
+hard_partition_all_driver_pools_under_budget="$(
+  printf '%s\n' "$hard_partition_parse" |
+    awk -F= '$1=="hard_partition_all_driver_pools_under_budget"{print $2}' |
+    tail -n 1
+)"
+hard_partition_all_transient_pools_under_budget="$(
+  printf '%s\n' "$hard_partition_parse" |
+    awk -F= '$1=="hard_partition_all_transient_pools_under_budget"{print $2}' |
+    tail -n 1
+)"
+hard_partition_sufficient_reclaim_to_budget="$(
+  printf '%s\n' "$hard_partition_parse" |
+    awk -F= '$1=="hard_partition_sufficient_reclaim_to_budget"{print $2}' |
+    tail -n 1
+)"
+hard_partition_sufficient_deny_or_block="$(
+  printf '%s\n' "$hard_partition_parse" |
+    awk -F= '$1=="hard_partition_sufficient_deny_or_block"{print $2}' |
+    tail -n 1
+)"
+hard_partition_max_driver_over_budget_bytes="$(
+  printf '%s\n' "$hard_partition_parse" |
+    awk -F= '$1=="hard_partition_max_driver_over_budget_bytes"{print $2}' |
+    tail -n 1
+)"
+hard_partition_auto_reclaimed_bytes="$(
+  printf '%s\n' "$hard_partition_parse" |
+    awk -F= '$1=="hard_partition_auto_reclaimed_bytes"{print $2}' |
+    tail -n 1
+)"
+hard_partition_scratch_over_budget_records="$(
+  printf '%s\n' "$hard_partition_parse" |
+    awk -F= '$1=="hard_partition_scratch_over_budget_records"{print $2}' |
+    tail -n 1
+)"
+hard_partition_scratch_budget_reject_records="$(
+  printf '%s\n' "$hard_partition_parse" |
+    awk -F= '$1=="hard_partition_scratch_budget_reject_records"{print $2}' |
+    tail -n 1
+)"
+hard_partition_scratch_driver_reject_records="$(
+  printf '%s\n' "$hard_partition_parse" |
+    awk -F= '$1=="hard_partition_scratch_driver_reject_records"{print $2}' |
+    tail -n 1
+)"
+hard_partition_failure_reasons="$(
+  printf '%s\n' "$hard_partition_parse" |
+    awk -F= '$1=="hard_partition_failure_reasons"{print $2}' |
+    tail -n 1
+)"
+hard_partition_pass="${hard_partition_pass:-0}"
+hard_partition_all_driver_pools_under_budget="${hard_partition_all_driver_pools_under_budget:-0}"
+hard_partition_all_transient_pools_under_budget="${hard_partition_all_transient_pools_under_budget:-0}"
+hard_partition_sufficient_reclaim_to_budget="${hard_partition_sufficient_reclaim_to_budget:-0}"
+hard_partition_sufficient_deny_or_block="${hard_partition_sufficient_deny_or_block:-0}"
+hard_partition_max_driver_over_budget_bytes="${hard_partition_max_driver_over_budget_bytes:-0}"
+hard_partition_auto_reclaimed_bytes="${hard_partition_auto_reclaimed_bytes:-0}"
+hard_partition_scratch_over_budget_records="${hard_partition_scratch_over_budget_records:-0}"
+hard_partition_scratch_budget_reject_records="${hard_partition_scratch_budget_reject_records:-0}"
+hard_partition_scratch_driver_reject_records="${hard_partition_scratch_driver_reject_records:-0}"
+hard_partition_failure_reasons="${hard_partition_failure_reasons:-not_checked}"
 driver_pool_state_failures="${driver_pool_state_failures:-0}"
 driver_pool_state_success_records="${driver_pool_state_success_records:-0}"
 driver_pool_state_all_pools_present="${driver_pool_state_all_pools_present:-0}"
@@ -933,6 +1067,7 @@ failed_requests="${failed_requests:-0}"
   echo "allocator_driver_pool_state_all_required_fields_present=$allocator_driver_pool_state_all_required_fields_present"
   echo "scratch_driver_tag_records=$scratch_driver_tag_records"
   echo "scratch_driver_untag_records=$scratch_driver_untag_records"
+  echo "scratch_driver_reject_records=$scratch_driver_reject_records"
   echo "scratch_driver_live_peak_bytes=$scratch_driver_live_peak_bytes"
   echo "scratch_driver_max_alloc_bytes=$scratch_driver_max_alloc_bytes"
   echo "scratch_driver_over_budget_records=$scratch_driver_over_budget_records"
@@ -947,6 +1082,19 @@ failed_requests="${failed_requests:-0}"
   echo "phase_n_auto_hook_reclaimed_records=$phase_n_auto_hook_reclaimed_records"
   echo "require_phase_n_auto_hook=$REQUIRE_PHASE_N_AUTO_HOOK"
   echo "require_phase_n_auto_reclaim=$REQUIRE_PHASE_N_AUTO_RECLAIM"
+  echo "phase_n_auto_reclaim_execute_on_ready=$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY"
+  echo "require_stage_n_hard_partition=$REQUIRE_STAGE_N_HARD_PARTITION"
+  echo "hard_partition_tolerance_bytes=$HARD_PARTITION_TOLERANCE_BYTES"
+  echo "hard_partition_pass=$hard_partition_pass"
+  echo "hard_partition_all_driver_pools_under_budget=$hard_partition_all_driver_pools_under_budget"
+  echo "hard_partition_all_transient_pools_under_budget=$hard_partition_all_transient_pools_under_budget"
+  echo "hard_partition_sufficient_reclaim_to_budget=$hard_partition_sufficient_reclaim_to_budget"
+  echo "hard_partition_sufficient_deny_or_block=$hard_partition_sufficient_deny_or_block"
+  echo "hard_partition_max_driver_over_budget_bytes=$hard_partition_max_driver_over_budget_bytes"
+  echo "hard_partition_auto_reclaimed_bytes=$hard_partition_auto_reclaimed_bytes"
+  echo "hard_partition_scratch_over_budget_records=$hard_partition_scratch_over_budget_records"
+  echo "hard_partition_scratch_budget_reject_records=$hard_partition_scratch_budget_reject_records"
+  echo "hard_partition_scratch_driver_reject_records=$hard_partition_scratch_driver_reject_records"
   echo "driver_pool_budget_mode=$DRIVER_POOL_BUDGET_MODE"
   echo "uvm_phase_n_auto_reclaim_every=$UVM_PHASE_N_AUTO_RECLAIM_EVERY"
   echo "uvm_phase_n_auto_reclaim_scan_every=$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY"
@@ -963,13 +1111,15 @@ failed_requests="${failed_requests:-0}"
   echo
   write_allocator_pool_state_summary "$ALLOCATOR_LOG"
   echo
+  printf '%s\n' "$hard_partition_parse"
+  echo
   echo "Residency Driver Budget/Tag Evidence"
   echo "------------------------------------"
   grep_tail 'residency_driver_pool_budget_config|residency_driver_pool_state|residency_register_region|tag_only_no_application_residency_decision|driver_region|driver_tag|driver_state' "$RESIDENCY_TRACE"
   echo
   echo "Kernel Driver Evidence"
   echo "----------------------"
-  grep_tail 'phase_f_register_region|phase_n_update_region_state|phase_n_set_pool_budget|phase_n_get_pool_state|phase_n_reclaim_pool|phase_n_auto_reclaim_hook|TRACE_DRIVER_SCRATCH_TAG|TRACE_DRIVER_SCRATCH_UNTAG|TRACE_DRIVER_POOL_STATE_SNAPSHOT' "$RUN_ROOT" "$KERNEL_LOG" "$ROUTE_LOG" /var/log/kern.log
+  grep_tail 'phase_f_register_region|phase_n_update_region_state|phase_n_set_pool_budget|phase_n_get_pool_state|phase_n_reclaim_pool|phase_n_auto_reclaim_hook|TRACE_DRIVER_SCRATCH_TAG|TRACE_DRIVER_SCRATCH_UNTAG|TRACE_DRIVER_SCRATCH_REJECT|TRACE_DRIVER_POOL_STATE_SNAPSHOT' "$RUN_ROOT" "$KERNEL_LOG" "$ROUTE_LOG" /var/log/kern.log
   echo
   echo "Auto Hook Evidence"
   echo "------------------"
@@ -984,6 +1134,7 @@ failed_requests="${failed_requests:-0}"
   echo "phase_n_auto_hook_reclaimed_records=$phase_n_auto_hook_reclaimed_records"
   echo "require_phase_n_auto_hook=$REQUIRE_PHASE_N_AUTO_HOOK"
   echo "require_phase_n_auto_reclaim=$REQUIRE_PHASE_N_AUTO_RECLAIM"
+  echo "phase_n_auto_reclaim_execute_on_ready=$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY"
   echo "uvm_phase_n_auto_reclaim_every=$UVM_PHASE_N_AUTO_RECLAIM_EVERY"
   echo "uvm_phase_n_auto_reclaim_scan_every=$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY"
   echo "uvm_phase_n_auto_reclaim_cooldown_epochs=$UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS"
@@ -1000,7 +1151,7 @@ failed_requests="${failed_requests:-0}"
   echo
   echo "Verdict"
   echo "-------"
-  if [ "$status" -eq 0 ] &&
+  if { [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] || [ "$status" -eq 0 ]; } &&
      [ -s "$RESIDENCY_TRACE" ] &&
      [ "$driver_budget_records" -gt 0 ] &&
      [ "$driver_registered_true_records" -gt 0 ] &&
@@ -1016,20 +1167,25 @@ failed_requests="${failed_requests:-0}"
      [ "$allocator_driver_pool_state_all_status_ok" -eq 1 ] &&
      [ "$allocator_driver_pool_state_all_budgets_positive" -eq 1 ] &&
      [ "$allocator_driver_pool_state_all_required_fields_present" -eq 1 ] &&
-     [ "$scratch_driver_tag_records" -gt 0 ] &&
+     { [ "$scratch_driver_tag_records" -gt 0 ] || { [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] && [ "$scratch_driver_reject_records" -gt 0 ]; }; } &&
      [ "$tag_only_records" -gt 0 ] &&
-     [ "${failed_requests:-0}" = "0" ] &&
+     { [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] || [ "${failed_requests:-0}" = "0" ]; } &&
      { [ "$REQUIRE_PHASE_N_AUTO_HOOK" != "1" ] || [ "$phase_n_auto_hook_records" -gt 0 ]; } &&
      { [ "$REQUIRE_PHASE_N_AUTO_HOOK" != "1" ] || [ "$phase_n_auto_hook_pool_records" -gt 0 ]; } &&
-     { [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$phase_n_auto_hook_would_reclaim_records" -gt 0 ]; } &&
-     { [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$phase_n_auto_hook_execute_records" -gt 0 ]; } &&
-     { [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$phase_n_auto_hook_success_records" -gt 0 ]; } &&
-     { [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$phase_n_auto_hook_reclaimed_records" -gt 0 ]; } &&
+     { [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] || [ "$phase_n_auto_hook_would_reclaim_records" -gt 0 ]; } &&
+     { [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] || [ "$phase_n_auto_hook_execute_records" -gt 0 ]; } &&
+     { [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] || [ "$phase_n_auto_hook_success_records" -gt 0 ]; } &&
+     { [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] || [ "$phase_n_auto_hook_reclaimed_records" -gt 0 ]; } &&
+     { [ "$REQUIRE_STAGE_N_HARD_PARTITION" != "1" ] || [ "$hard_partition_pass" -eq 1 ]; } &&
      [ "$app_migration_records" -eq 0 ]; then
-    echo "PASS: Stage N tag-only smoke produced driver-backed KV/weight evidence, scratch driver tags, pool-state snapshots, auto hook pool evidence, tag-only decisions, and zero failed requests."
+    if [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ]; then
+      echo "PASS: Stage N hard partition proof produced per-pool budget evidence and either reclaim-to-budget or deny/block/reject evidence for any over-budget pool."
+    else
+      echo "PASS: Stage N tag-only smoke produced driver-backed KV/weight evidence, scratch driver tags, pool-state snapshots, auto hook pool evidence, tag-only decisions, and zero failed requests."
+    fi
   else
     echo "WARN: Stage N smoke did not satisfy all acceptance checks."
-    [ "$status" -eq 0 ] || echo "- run_kv_fault_ratio.sh exited with status $status"
+    [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] || [ "$status" -eq 0 ] || echo "- run_kv_fault_ratio.sh exited with status $status"
     [ -s "$RESIDENCY_TRACE" ] || echo "- missing or empty residency trace: $RESIDENCY_TRACE"
     [ "$driver_budget_records" -gt 0 ] || echo "- missing residency_driver_pool_budget_config records"
     [ "$driver_registered_true_records" -gt 0 ] || echo "- no region reached driver_registered=true"
@@ -1045,15 +1201,16 @@ failed_requests="${failed_requests:-0}"
     [ "$allocator_driver_pool_state_all_status_ok" -eq 1 ] || echo "- latest allocator pool-state snapshot did not return status=1 for kv, weights, and scratch"
     [ "$allocator_driver_pool_state_all_budgets_positive" -eq 1 ] || echo "- allocator pool-state snapshot did not report positive budgets for kv, weights, and scratch"
     [ "$allocator_driver_pool_state_all_required_fields_present" -eq 1 ] || echo "- allocator pool-state snapshot is missing required budget/resident/candidate/victim fields"
-    [ "$scratch_driver_tag_records" -gt 0 ] || echo "- missing TRACE_DRIVER_SCRATCH_TAG records"
+    [ "$scratch_driver_tag_records" -gt 0 ] || { [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] && [ "$scratch_driver_reject_records" -gt 0 ]; } || echo "- missing TRACE_DRIVER_SCRATCH_TAG records"
     [ "$tag_only_records" -gt 0 ] || echo "- missing tag_only_no_application_residency_decision records"
-	    [ "${failed_requests:-0}" = "0" ] || echo "- benchmark failed_requests=$failed_requests"
+	    [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] || [ "${failed_requests:-0}" = "0" ] || echo "- benchmark failed_requests=$failed_requests"
 	    [ "$REQUIRE_PHASE_N_AUTO_HOOK" != "1" ] || [ "$phase_n_auto_hook_records" -gt 0 ] || echo "- missing required phase_n_auto_reclaim_hook records"
 	    [ "$REQUIRE_PHASE_N_AUTO_HOOK" != "1" ] || [ "$phase_n_auto_hook_pool_records" -gt 0 ] || echo "- required phase_n_auto_reclaim_hook did not enter pool/budget branch"
-	    [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$phase_n_auto_hook_would_reclaim_records" -gt 0 ] || echo "- missing required phase_n_auto_reclaim_hook would_reclaim=1 records"
-	    [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$phase_n_auto_hook_execute_records" -gt 0 ] || echo "- missing required phase_n_auto_reclaim_hook execute=1 records"
-	    [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$phase_n_auto_hook_success_records" -gt 0 ] || echo "- missing successful automatic reclaim records"
-	    [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$phase_n_auto_hook_reclaimed_records" -gt 0 ] || echo "- automatic reclaim did not report reclaimed bytes"
+	    [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] || [ "$phase_n_auto_hook_would_reclaim_records" -gt 0 ] || echo "- missing required phase_n_auto_reclaim_hook would_reclaim=1 records"
+	    [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] || [ "$phase_n_auto_hook_execute_records" -gt 0 ] || echo "- missing required phase_n_auto_reclaim_hook execute=1 records"
+	    [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] || [ "$phase_n_auto_hook_success_records" -gt 0 ] || echo "- missing successful automatic reclaim records"
+	    [ "$REQUIRE_PHASE_N_AUTO_RECLAIM" != "1" ] || [ "$REQUIRE_STAGE_N_HARD_PARTITION" = "1" ] || [ "$phase_n_auto_hook_reclaimed_records" -gt 0 ] || echo "- automatic reclaim did not report reclaimed bytes"
+	    [ "$REQUIRE_STAGE_N_HARD_PARTITION" != "1" ] || [ "$hard_partition_pass" -eq 1 ] || echo "- hard partition proof failed: $hard_partition_failure_reasons"
 	    [ "$app_migration_records" -eq 0 ] || echo "- found application migration/offload records"
   fi
 } > "$SUMMARY"

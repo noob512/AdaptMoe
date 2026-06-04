@@ -917,68 +917,117 @@ int uvm_driver_phase_n_get_pool_state_internal(uint32_t pool,
                                                uint64_t* values_out,
                                                size_t values_count) {
     if (values_out == nullptr || values_count < 36) return -2;
-    int fd = open_initialized_uvm_fd("driver_phase_n_get_pool_state", true);
-    if (fd < 0) return -4;
+    PhaseNGetPoolStateParams best_params{};
+    bool have_best = false;
+    int best_score = -1;
+    int last_error = -4;
 
-    PhaseNGetPoolStateParams params{};
-    params.pool = pool;
-    params.gpu_id = gpu_id;
+    auto copy_state_values = [&]() {
+        values_out[0] = best_params.budget_bytes;
+        values_out[1] = best_params.resident_gpu_bytes;
+        values_out[2] = best_params.resident_cpu_bytes;
+        values_out[3] = best_params.reclaim_bytes;
+        values_out[4] = best_params.protected_bytes;
+        values_out[5] = best_params.evictable_bytes;
+        values_out[6] = best_params.over_budget_bytes;
+        values_out[7] = best_params.reclaim_target_bytes;
+        values_out[8] = best_params.victim_candidate_bytes;
+        values_out[9] = best_params.victim_candidate_regions;
+        values_out[10] = best_params.selected_victim_region_id;
+        values_out[11] = best_params.selected_victim_bytes;
+        values_out[12] = best_params.victim_count;
+        values_out[13] = best_params.reserved;
+        for (size_t i = 0; i < 8; ++i) {
+            values_out[14 + i] = best_params.victim_region_ids[i];
+            values_out[22 + i] = best_params.victim_bytes[i];
+        }
+        values_out[30] = best_params.over_budget_events;
+        values_out[31] = best_params.reclaim_success_events;
+        values_out[32] = best_params.reclaim_failed_events;
+        values_out[33] = best_params.accounting_corrections;
+        values_out[34] = best_params.mode;
+        values_out[35] = best_params.flags;
+    };
 
-    phase_f_debug_log("driver_phase_n_get_pool_state cmd=%u pool=%u gpu_id=%u ioctl_begin",
-                      UVM_PHASE_N_GET_POOL_STATE_IOCTL,
-                      pool,
-                      gpu_id);
-    int ret = ioctl(fd, UVM_PHASE_N_GET_POOL_STATE_IOCTL, &params);
-    int saved_errno = errno;
-    close(fd);
-    phase_f_debug_log("driver_phase_n_get_pool_state cmd=%u pool=%u ioctl_done ret=%d errno=%d rmStatus=%u budget=%llu gpu=%llu cpu=%llu reclaim=%llu evictable=%llu protected=%llu over=%llu target=%llu candidate=%llu candidate_regions=%llu selected_id=%llu selected_bytes=%llu victim_count=%u metadata_only=%u",
-                      UVM_PHASE_N_GET_POOL_STATE_IOCTL,
-                      pool,
-                      ret,
-                      saved_errno,
-                      params.rmStatus,
-                      static_cast<unsigned long long>(params.budget_bytes),
-                      static_cast<unsigned long long>(params.resident_gpu_bytes),
-                      static_cast<unsigned long long>(params.resident_cpu_bytes),
-                      static_cast<unsigned long long>(params.reclaim_bytes),
-                      static_cast<unsigned long long>(params.evictable_bytes),
-                      static_cast<unsigned long long>(params.protected_bytes),
-                      static_cast<unsigned long long>(params.over_budget_bytes),
-                      static_cast<unsigned long long>(params.reclaim_target_bytes),
-                      static_cast<unsigned long long>(params.victim_candidate_bytes),
-                      static_cast<unsigned long long>(params.victim_candidate_regions),
-                      static_cast<unsigned long long>(params.selected_victim_region_id),
-                      static_cast<unsigned long long>(params.selected_victim_bytes),
-                      params.victim_count,
-                      params.reserved);
+    auto query_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
+        PhaseNGetPoolStateParams params{};
+        params.pool = pool;
+        params.gpu_id = gpu_id;
 
-    if (ret != 0) return -6;
-    if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+        phase_f_debug_log("driver_phase_n_get_pool_state cmd=%u fd_source=%s source_fd=%d fd=%d path=%s pool=%u gpu_id=%u ioctl_begin",
+                          UVM_PHASE_N_GET_POOL_STATE_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          path ? path : "",
+                          pool,
+                          gpu_id);
+        int ret = ioctl(fd, UVM_PHASE_N_GET_POOL_STATE_IOCTL, &params);
+        int saved_errno = errno;
+        phase_f_debug_log("driver_phase_n_get_pool_state cmd=%u fd_source=%s source_fd=%d fd=%d pool=%u ioctl_done ret=%d errno=%d rmStatus=%u budget=%llu gpu=%llu cpu=%llu reclaim=%llu evictable=%llu protected=%llu over=%llu target=%llu candidate=%llu candidate_regions=%llu selected_id=%llu selected_bytes=%llu victim_count=%u metadata_only=%u",
+                          UVM_PHASE_N_GET_POOL_STATE_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          pool,
+                          ret,
+                          saved_errno,
+                          params.rmStatus,
+                          static_cast<unsigned long long>(params.budget_bytes),
+                          static_cast<unsigned long long>(params.resident_gpu_bytes),
+                          static_cast<unsigned long long>(params.resident_cpu_bytes),
+                          static_cast<unsigned long long>(params.reclaim_bytes),
+                          static_cast<unsigned long long>(params.evictable_bytes),
+                          static_cast<unsigned long long>(params.protected_bytes),
+                          static_cast<unsigned long long>(params.over_budget_bytes),
+                          static_cast<unsigned long long>(params.reclaim_target_bytes),
+                          static_cast<unsigned long long>(params.victim_candidate_bytes),
+                          static_cast<unsigned long long>(params.victim_candidate_regions),
+                          static_cast<unsigned long long>(params.selected_victim_region_id),
+                          static_cast<unsigned long long>(params.selected_victim_bytes),
+                          params.victim_count,
+                          params.reserved);
 
-    values_out[0] = params.budget_bytes;
-    values_out[1] = params.resident_gpu_bytes;
-    values_out[2] = params.resident_cpu_bytes;
-    values_out[3] = params.reclaim_bytes;
-    values_out[4] = params.protected_bytes;
-    values_out[5] = params.evictable_bytes;
-    values_out[6] = params.over_budget_bytes;
-    values_out[7] = params.reclaim_target_bytes;
-    values_out[8] = params.victim_candidate_bytes;
-    values_out[9] = params.victim_candidate_regions;
-    values_out[10] = params.selected_victim_region_id;
-    values_out[11] = params.selected_victim_bytes;
-    values_out[12] = params.victim_count;
-    values_out[13] = params.reserved;
-    for (size_t i = 0; i < 8; ++i) {
-        values_out[14 + i] = params.victim_region_ids[i];
-        values_out[22 + i] = params.victim_bytes[i];
+        if (ret != 0) return -6;
+        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+
+        int score = 0;
+        if (params.reserved == 0)
+            score += 100;
+        if (params.budget_bytes > 0)
+            score += 20;
+        if (params.resident_gpu_bytes > 0 ||
+            params.victim_candidate_bytes > 0 ||
+            params.victim_count > 0)
+            score += 10;
+        if (!have_best || score > best_score) {
+            best_params = params;
+            best_score = score;
+            have_best = true;
+        }
+        return 1;
+    };
+
+    int existing_result = apply_to_existing_uvm_fds(
+        "driver_phase_n_get_pool_state",
+        [&](int fd, int source_fd, const char* path) {
+            return query_on_fd(fd, "adopted", source_fd, path);
+        });
+    if (existing_result > 0 && have_best) {
+        copy_state_values();
+        return 1;
     }
-    values_out[30] = params.over_budget_events;
-    values_out[31] = params.reclaim_success_events;
-    values_out[32] = params.reclaim_failed_events;
-    values_out[33] = params.accounting_corrections;
-    values_out[34] = params.mode;
-    values_out[35] = params.flags;
+    if (existing_result < 0)
+        last_error = existing_result;
+
+    int fd = open_initialized_uvm_fd("driver_phase_n_get_pool_state", false);
+    if (fd < 0)
+        return last_error;
+    int result = query_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
+    close(fd);
+    if (result < 0)
+        return result;
+    copy_state_values();
     return 1;
 }
 
@@ -993,73 +1042,128 @@ int uvm_driver_phase_n_reclaim_pool_internal(uint32_t pool,
                                              uint64_t* values_out,
                                              size_t values_count) {
     if (values_out == nullptr || values_count < 45) return -2;
-    int fd = open_initialized_uvm_fd("driver_phase_n_reclaim_pool", true);
-    if (fd < 0) return -4;
+    PhaseNReclaimPoolParams best_params{};
+    bool have_best = false;
+    int last_error = -4;
 
-    PhaseNReclaimPoolParams params{};
-    params.pool = pool;
-    params.gpu_id = gpu_id;
-    params.target_bytes = target_bytes;
-    params.current_epoch = current_epoch;
-    params.cooldown_epochs = cooldown_epochs;
-    params.max_victims = max_victims;
-    params.async = async ? 1 : 0;
-    params.flags = flags;
+    auto copy_reclaim_values = [&]() {
+        values_out[0] = best_params.attempted_regions;
+        values_out[1] = best_params.success_regions;
+        values_out[2] = best_params.failure_regions;
+        values_out[3] = best_params.victim_count;
+        values_out[4] = best_params.budget_bytes;
+        values_out[5] = best_params.resident_gpu_bytes_before;
+        values_out[6] = best_params.over_budget_bytes;
+        values_out[7] = best_params.reclaim_target_bytes;
+        values_out[8] = best_params.attempted_bytes;
+        values_out[9] = best_params.reclaimed_bytes;
+        values_out[10] = best_params.failed_bytes;
+        values_out[11] = best_params.victim_candidate_bytes;
+        values_out[12] = best_params.victim_candidate_regions;
+        values_out[13] = best_params.cooldown_skipped_bytes;
+        values_out[14] = best_params.cooldown_skipped_regions;
+        for (size_t i = 0; i < UVM_PHASE_N_TRACE_VICTIM_MAX; ++i) {
+            values_out[15 + i] = best_params.victim_region_ids[i];
+            values_out[23 + i] = best_params.victim_bytes[i];
+            values_out[31 + i] = best_params.victim_status[i];
+        }
+        values_out[39] = best_params.reclaim_success_events;
+        values_out[40] = best_params.reclaim_failed_events;
+        values_out[41] = best_params.mode;
+        values_out[42] = best_params.pool_flags;
+        values_out[43] = best_params.rmStatus;
+        values_out[44] = best_params.flags;
+    };
 
-    phase_f_debug_log("driver_phase_n_reclaim_pool cmd=%u pool=%u gpu_id=%u target=%llu epoch=%llu cooldown=%llu max_victims=%u async=%u flags=0x%x ioctl_begin",
-                      UVM_PHASE_N_RECLAIM_POOL_IOCTL,
-                      pool,
-                      gpu_id,
-                      static_cast<unsigned long long>(target_bytes),
-                      static_cast<unsigned long long>(current_epoch),
-                      static_cast<unsigned long long>(cooldown_epochs),
-                      max_victims,
-                      async,
-                      flags);
-    int ret = ioctl(fd, UVM_PHASE_N_RECLAIM_POOL_IOCTL, &params);
-    int saved_errno = errno;
-    close(fd);
-    phase_f_debug_log("driver_phase_n_reclaim_pool cmd=%u pool=%u ioctl_done ret=%d errno=%d rmStatus=%u attempted=%u success=%u failure=%u reclaimed=%llu target=%llu",
-                      UVM_PHASE_N_RECLAIM_POOL_IOCTL,
-                      pool,
-                      ret,
-                      saved_errno,
-                      params.rmStatus,
-                      params.attempted_regions,
-                      params.success_regions,
-                      params.failure_regions,
-                      static_cast<unsigned long long>(params.reclaimed_bytes),
-                      static_cast<unsigned long long>(params.reclaim_target_bytes));
+    auto reclaim_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
+        PhaseNReclaimPoolParams params{};
+        params.pool = pool;
+        params.gpu_id = gpu_id;
+        params.target_bytes = target_bytes;
+        params.current_epoch = current_epoch;
+        params.cooldown_epochs = cooldown_epochs;
+        params.max_victims = max_victims;
+        params.async = async ? 1 : 0;
+        params.flags = flags;
 
-    if (ret != 0) return -6;
-    if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+        phase_f_debug_log("driver_phase_n_reclaim_pool cmd=%u fd_source=%s source_fd=%d fd=%d path=%s pool=%u gpu_id=%u target=%llu epoch=%llu cooldown=%llu max_victims=%u async=%u flags=0x%x ioctl_begin",
+                          UVM_PHASE_N_RECLAIM_POOL_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          path ? path : "",
+                          pool,
+                          gpu_id,
+                          static_cast<unsigned long long>(target_bytes),
+                          static_cast<unsigned long long>(current_epoch),
+                          static_cast<unsigned long long>(cooldown_epochs),
+                          max_victims,
+                          async,
+                          flags);
+        int ret = ioctl(fd, UVM_PHASE_N_RECLAIM_POOL_IOCTL, &params);
+        int saved_errno = errno;
+        phase_f_debug_log("driver_phase_n_reclaim_pool cmd=%u fd_source=%s source_fd=%d fd=%d pool=%u ioctl_done ret=%d errno=%d rmStatus=%u budget=%llu resident=%llu over=%llu attempted=%u success=%u failure=%u reclaimed=%llu target=%llu candidates=%llu",
+                          UVM_PHASE_N_RECLAIM_POOL_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          pool,
+                          ret,
+                          saved_errno,
+                          params.rmStatus,
+                          static_cast<unsigned long long>(params.budget_bytes),
+                          static_cast<unsigned long long>(params.resident_gpu_bytes_before),
+                          static_cast<unsigned long long>(params.over_budget_bytes),
+                          params.attempted_regions,
+                          params.success_regions,
+                          params.failure_regions,
+                          static_cast<unsigned long long>(params.reclaimed_bytes),
+                          static_cast<unsigned long long>(params.reclaim_target_bytes),
+                          static_cast<unsigned long long>(params.victim_candidate_bytes));
 
-    values_out[0] = params.attempted_regions;
-    values_out[1] = params.success_regions;
-    values_out[2] = params.failure_regions;
-    values_out[3] = params.victim_count;
-    values_out[4] = params.budget_bytes;
-    values_out[5] = params.resident_gpu_bytes_before;
-    values_out[6] = params.over_budget_bytes;
-    values_out[7] = params.reclaim_target_bytes;
-    values_out[8] = params.attempted_bytes;
-    values_out[9] = params.reclaimed_bytes;
-    values_out[10] = params.failed_bytes;
-    values_out[11] = params.victim_candidate_bytes;
-    values_out[12] = params.victim_candidate_regions;
-    values_out[13] = params.cooldown_skipped_bytes;
-    values_out[14] = params.cooldown_skipped_regions;
-    for (size_t i = 0; i < UVM_PHASE_N_TRACE_VICTIM_MAX; ++i) {
-        values_out[15 + i] = params.victim_region_ids[i];
-        values_out[23 + i] = params.victim_bytes[i];
-        values_out[31 + i] = params.victim_status[i];
+        if (ret != 0) return -6;
+        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+
+        best_params = params;
+        have_best = true;
+        return 1;
+    };
+
+    if (phase_f_adopt_cuda_uvm_fd_enabled()) {
+        std::vector<UvmFdCandidate> candidates =
+            collect_existing_uvm_fd_candidates("driver_phase_n_reclaim_pool");
+        for (const UvmFdCandidate& candidate : candidates) {
+            int fd = duplicate_uvm_fd_candidate("driver_phase_n_reclaim_pool", candidate);
+            if (fd < 0)
+                continue;
+            int result = reclaim_on_fd(fd, "adopted", candidate.source_fd, candidate.path.c_str());
+            close(fd);
+            if (result < 0) {
+                last_error = result;
+                continue;
+            }
+            if (best_params.budget_bytes > 0 ||
+                best_params.resident_gpu_bytes_before > 0 ||
+                best_params.victim_candidate_bytes > 0 ||
+                best_params.attempted_regions > 0) {
+                copy_reclaim_values();
+                return 1;
+            }
+        }
+        if (have_best) {
+            copy_reclaim_values();
+            return 1;
+        }
     }
-    values_out[39] = params.reclaim_success_events;
-    values_out[40] = params.reclaim_failed_events;
-    values_out[41] = params.mode;
-    values_out[42] = params.pool_flags;
-    values_out[43] = params.rmStatus;
-    values_out[44] = params.flags;
+
+    int fd = open_initialized_uvm_fd("driver_phase_n_reclaim_pool", false);
+    if (fd < 0)
+        return last_error;
+    int result = reclaim_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
+    close(fd);
+    if (result < 0)
+        return result;
+    copy_reclaim_values();
     return 1;
 }
 
@@ -1594,6 +1698,9 @@ static std::string weight_budget_mode = "trace_only";
 static int weight_budget_cpu_offload_enable = 0;
 static int pool_registry_enabled = 0;
 static int driver_scratch_tag_enable = 0;
+static int driver_scratch_budget_enforce = 0;
+static int driver_scratch_budget_enforce_warmup = 0;
+static size_t driver_scratch_budget_bytes = 0;
 static int driver_pool_state_snapshot_on_scratch_free = 0;
 static size_t driver_pool_state_snapshot_on_scratch_free_every = 1;
 static size_t driver_pool_state_snapshot_on_scratch_free_max = 4;
@@ -1800,6 +1907,21 @@ static std::atomic<size_t> pool_runtime_scratch_live_bytes{0};
 static std::atomic<size_t> pool_runtime_scratch_peak_live_bytes{0};
 static std::atomic<size_t> pool_runtime_scratch_free_success_allocs{0};
 
+/// @brief Stage N：driver scratch pool tag admission live bytes.
+static std::atomic<size_t> driver_scratch_live_bytes{0};
+
+/// @brief Stage N：driver scratch pool tag admission peak live bytes.
+static std::atomic<size_t> driver_scratch_peak_live_bytes{0};
+
+/// @brief Stage N：driver scratch tag admissions rejected by hard budget.
+static std::atomic<size_t> driver_scratch_budget_reject_allocs{0};
+
+/// @brief Stage N：driver scratch tag admissions that would exceed budget.
+static std::atomic<size_t> driver_scratch_budget_over_allocs{0};
+
+/// @brief Stage N：driver scratch tag budget reservations released on free.
+static std::atomic<size_t> driver_scratch_budget_release_allocs{0};
+
 /// @brief Stage G：runtime scratch pool 准入控制参与评估的分配次数。
 static std::atomic<size_t> scratch_pool_trace_allocs{0};
 
@@ -1931,6 +2053,7 @@ struct AllocationInfo {
     bool driver_scratch_region_registered; ///< Stage N：是否已向 UVM driver 注册 scratch tag。
     uint64_t driver_scratch_region_id; ///< Stage N：scratch driver region id。
     int driver_scratch_register_status; ///< Stage N：driver register 返回值。
+    bool driver_scratch_budget_reserved; ///< Stage N：是否占用了 driver scratch tag 预算。
     bool scratch_pool_tracked;       ///< Stage G：此分配是否参与 scratch pool admission。
     bool scratch_pool_eligible;      ///< Stage G：是否满足 scratch pool 独立准入。
     bool scratch_pool_device_direct; ///< Stage G：是否实际进入 scratch pool device-direct。
@@ -2499,6 +2622,76 @@ static size_t device_direct_budget_remaining_snapshot(size_t live) {
     return live >= device_direct_max_total_bytes
         ? 0
         : device_direct_max_total_bytes - live;
+}
+
+static void update_driver_scratch_peak_live(size_t current_live) {
+    size_t peak = driver_scratch_peak_live_bytes.load();
+    while (current_live > peak) {
+        if (driver_scratch_peak_live_bytes.compare_exchange_weak(
+                peak,
+                current_live
+            )) {
+            break;
+        }
+    }
+}
+
+static bool reserve_driver_scratch_budget(size_t size,
+                                          bool enforce_budget,
+                                          bool* over_budget_out,
+                                          size_t* live_before_out,
+                                          size_t* live_after_out) {
+    size_t live = driver_scratch_live_bytes.load();
+    while (true) {
+        if (live_before_out) {
+            *live_before_out = live;
+        }
+
+        size_t next_live = live + size;
+        if (next_live < live) {
+            if (over_budget_out) {
+                *over_budget_out = true;
+            }
+            if (live_after_out) {
+                *live_after_out = live;
+            }
+            return false;
+        }
+
+        bool over_budget =
+            driver_scratch_budget_bytes > 0 &&
+            next_live > driver_scratch_budget_bytes;
+        if (over_budget_out) {
+            *over_budget_out = over_budget;
+        }
+        if (live_after_out) {
+            *live_after_out = next_live;
+        }
+
+        if (over_budget) {
+            driver_scratch_budget_over_allocs.fetch_add(1);
+            if (enforce_budget) {
+                driver_scratch_budget_reject_allocs.fetch_add(1);
+                return false;
+            }
+        }
+
+        if (driver_scratch_live_bytes.compare_exchange_weak(live, next_live)) {
+            update_driver_scratch_peak_live(next_live);
+            return true;
+        }
+    }
+}
+
+static void release_driver_scratch_budget(size_t size) {
+    size_t live = driver_scratch_live_bytes.load();
+    while (true) {
+        size_t next_live = live >= size ? live - size : 0;
+        if (driver_scratch_live_bytes.compare_exchange_weak(live, next_live)) {
+            driver_scratch_budget_release_allocs.fetch_add(1);
+            return;
+        }
+    }
 }
 
 static void update_kv_peak_live(size_t current_live) {
@@ -3707,6 +3900,20 @@ static void init_log_file() {
                 "VLLM_UVM_DRIVER_SCRATCH_TAG_ENABLE",
                 read_bool_from_env("VLLM_UVM_DRIVER_TAG_ENABLE", false)
             ) ? 1 : 0;
+        driver_scratch_budget_bytes = read_size_from_env_allow_zero(
+            "VLLM_UVM_DRIVER_TEMP_BUFFER_BYTES",
+            driver_scratch_budget_bytes
+        );
+        driver_scratch_budget_enforce =
+            read_bool_from_env(
+                "VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE",
+                false
+            ) ? 1 : 0;
+        driver_scratch_budget_enforce_warmup =
+            read_bool_from_env(
+                "VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP",
+                false
+            ) ? 1 : 0;
         driver_pool_state_snapshot_on_scratch_free =
             read_bool_from_env(
                 "VLLM_UVM_DRIVER_POOL_STATE_SNAPSHOT_ON_SCRATCH_FREE",
@@ -3807,6 +4014,9 @@ static void init_log_file() {
                 "weight_budget_bytes=%zu weight_budget_mode=%s "
                 "weight_budget_cpu_offload_enable=%d "
                 "pool_registry_enabled=%d driver_scratch_tag_enable=%d "
+                "driver_scratch_budget_enforce=%d "
+                "driver_scratch_budget_enforce_warmup=%d "
+                "driver_scratch_budget_bytes=%zu "
                 "driver_pool_state_snapshot_on_scratch_free=%d "
                 "driver_pool_state_snapshot_on_scratch_free_every=%zu "
                 "driver_pool_state_snapshot_on_scratch_free_max=%zu "
@@ -3845,6 +4055,9 @@ static void init_log_file() {
                 weight_budget_cpu_offload_enable,
                 pool_registry_enabled,
                 driver_scratch_tag_enable,
+                driver_scratch_budget_enforce,
+                driver_scratch_budget_enforce_warmup,
+                driver_scratch_budget_bytes,
                 driver_pool_state_snapshot_on_scratch_free,
                 driver_pool_state_snapshot_on_scratch_free_every,
                 driver_pool_state_snapshot_on_scratch_free_max,
@@ -4884,43 +5097,134 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     bool driver_scratch_region_registered = false;
     uint64_t driver_scratch_region_id = 0;
     int driver_scratch_register_status = 0;
+    bool driver_scratch_budget_reserved = false;
+    bool driver_scratch_hard_reject = false;
     if (driver_scratch_tag_enable &&
             pool_registry_tracked &&
             pool_kind == PoolKind::RuntimeScratch &&
             strcmp(placement_backend, "managed") == 0 &&
             ptr != NULL &&
             static_cast<size_t>(size) > 0) {
+        bool driver_scratch_over_budget = false;
+        size_t driver_scratch_live_before = 0;
+        size_t driver_scratch_live_after = 0;
+        size_t driver_scratch_over_bytes = 0;
+        bool driver_scratch_enforce_this_alloc =
+            driver_scratch_budget_enforce != 0 &&
+            (alloc_class != AllocationClass::WarmupWorkspace ||
+             driver_scratch_budget_enforce_warmup != 0);
+
         driver_scratch_region_id = phase_n_allocator_region_id(ptr, alloc_count);
-        driver_scratch_register_status = uvm_driver_phase_f_register_region_internal(
-            driver_scratch_region_id,
-            reinterpret_cast<uintptr_t>(ptr),
+        driver_scratch_budget_reserved = reserve_driver_scratch_budget(
             static_cast<size_t>(size),
-            3,
-            0,
-            0,
-            alloc_class == AllocationClass::RuntimeWorkspace ||
-                    alloc_class == AllocationClass::WarmupWorkspace ? 6 : 5,
-            (1u << 0) | (1u << 5)
+            driver_scratch_enforce_this_alloc,
+            &driver_scratch_over_budget,
+            &driver_scratch_live_before,
+            &driver_scratch_live_after
         );
-        driver_scratch_region_registered = driver_scratch_register_status >= 0;
+        if (driver_scratch_budget_bytes > 0 &&
+                driver_scratch_live_after > driver_scratch_budget_bytes) {
+            driver_scratch_over_bytes =
+                driver_scratch_live_after - driver_scratch_budget_bytes;
+        }
+
+        if (driver_scratch_budget_reserved) {
+            driver_scratch_register_status = uvm_driver_phase_f_register_region_internal(
+                driver_scratch_region_id,
+                reinterpret_cast<uintptr_t>(ptr),
+                static_cast<size_t>(size),
+                3,
+                0,
+                0,
+                alloc_class == AllocationClass::RuntimeWorkspace ||
+                        alloc_class == AllocationClass::WarmupWorkspace ? 6 : 5,
+                (1u << 0) | (1u << 5)
+            );
+            driver_scratch_region_registered = driver_scratch_register_status >= 0;
+            if (!driver_scratch_region_registered) {
+                release_driver_scratch_budget(static_cast<size_t>(size));
+                driver_scratch_budget_reserved = false;
+                driver_scratch_live_after = driver_scratch_live_bytes.load();
+            }
+        } else {
+            driver_scratch_register_status = driver_scratch_over_budget ? -12 : -1;
+            driver_scratch_hard_reject = driver_scratch_enforce_this_alloc;
+        }
+
         if (log_file) {
             std::lock_guard<std::mutex> lock(log_mutex);
-            fprintf(log_file,
-                    "[%.3fs] TRACE_DRIVER_SCRATCH_TAG alloc_id=%zu ptr=0x%llx "
-                    "size_bytes=%zu region_id=%llu status=%d registered=%d "
-                    "phase=%s predicted_class=%s\n",
-                    get_elapsed_seconds(),
-                    alloc_count,
-                    static_cast<unsigned long long>(
-                        reinterpret_cast<uintptr_t>(ptr)),
-                    static_cast<size_t>(size),
-                    static_cast<unsigned long long>(driver_scratch_region_id),
-                    driver_scratch_register_status,
-                    driver_scratch_region_registered ? 1 : 0,
-                    phase_snapshot.c_str(),
-                    allocation_class_to_string(alloc_class));
+            if (driver_scratch_budget_reserved || driver_scratch_region_registered) {
+                fprintf(log_file,
+                        "[%.3fs] TRACE_DRIVER_SCRATCH_TAG alloc_id=%zu ptr=0x%llx "
+                        "size_bytes=%zu region_id=%llu status=%d registered=%d "
+                        "budget_reserved=%d budget_bytes=%zu live_before_bytes=%zu "
+                        "live_after_bytes=%zu over_budget=%d over_bytes=%zu "
+                        "enforce=%d enforce_warmup=%d phase=%s predicted_class=%s\n",
+                        get_elapsed_seconds(),
+                        alloc_count,
+                        static_cast<unsigned long long>(
+                            reinterpret_cast<uintptr_t>(ptr)),
+                        static_cast<size_t>(size),
+                        static_cast<unsigned long long>(driver_scratch_region_id),
+                        driver_scratch_register_status,
+                        driver_scratch_region_registered ? 1 : 0,
+                        driver_scratch_budget_reserved ? 1 : 0,
+                        driver_scratch_budget_bytes,
+                        driver_scratch_live_before,
+                        driver_scratch_live_after,
+                        driver_scratch_over_budget ? 1 : 0,
+                        driver_scratch_over_bytes,
+                        driver_scratch_enforce_this_alloc ? 1 : 0,
+                        driver_scratch_budget_enforce_warmup,
+                        phase_snapshot.c_str(),
+                        allocation_class_to_string(alloc_class));
+            } else {
+                fprintf(log_file,
+                        "[%.3fs] TRACE_DRIVER_SCRATCH_REJECT alloc_id=%zu ptr=0x%llx "
+                        "size_bytes=%zu region_id=%llu status=%d registered=0 "
+                        "budget_reserved=0 budget_bytes=%zu live_before_bytes=%zu "
+                        "live_after_bytes=%zu over_budget=%d over_bytes=%zu "
+                        "enforce=%d enforce_warmup=%d phase=%s predicted_class=%s "
+                        "reason=%s\n",
+                        get_elapsed_seconds(),
+                        alloc_count,
+                        static_cast<unsigned long long>(
+                            reinterpret_cast<uintptr_t>(ptr)),
+                        static_cast<size_t>(size),
+                        static_cast<unsigned long long>(driver_scratch_region_id),
+                        driver_scratch_register_status,
+                        driver_scratch_budget_bytes,
+                        driver_scratch_live_before,
+                        driver_scratch_live_after,
+                        driver_scratch_over_budget ? 1 : 0,
+                        driver_scratch_over_bytes,
+                        driver_scratch_enforce_this_alloc ? 1 : 0,
+                        driver_scratch_budget_enforce_warmup,
+                        phase_snapshot.c_str(),
+                        allocation_class_to_string(alloc_class),
+                        driver_scratch_over_budget ?
+                            "driver_scratch_budget_exceeded" :
+                            "driver_scratch_budget_reserve_failed");
+            }
             fflush(log_file);
         }
+    }
+
+    if (driver_scratch_hard_reject) {
+        if (pool_registry_tracked) {
+            release_pool_registry_allocation(pool_kind, static_cast<size_t>(size));
+        }
+
+        total_allocated.fetch_sub(static_cast<size_t>(size));
+        cudaError_t free_rejected_err = cudaFree(ptr);
+        if (free_rejected_err != cudaSuccess) {
+            fprintf(stderr,
+                    "[vLLM UVM] cudaFree failed after driver scratch hard reject "
+                    "for %zd bytes: %s\n",
+                    size,
+                    cudaGetErrorString(free_rejected_err));
+        }
+        return NULL;
     }
 
     bool scratch_pool_tracked =
@@ -5336,6 +5640,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             driver_scratch_region_registered,
             driver_scratch_region_id,
             driver_scratch_register_status,
+            driver_scratch_budget_reserved,
             scratch_pool_tracked,
             scratch_pool_eligible,
             scratch_pool_device_direct,
@@ -5474,6 +5779,13 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             it->second.pool_registry_tracked = pool_registry_tracked;
             it->second.pool_kind_name = pool_kind_to_string(pool_kind);
             it->second.pool_object_state = pool_object_state;
+            it->second.driver_scratch_region_registered =
+                driver_scratch_region_registered;
+            it->second.driver_scratch_region_id = driver_scratch_region_id;
+            it->second.driver_scratch_register_status =
+                driver_scratch_register_status;
+            it->second.driver_scratch_budget_reserved =
+                driver_scratch_budget_reserved;
             it->second.scratch_pool_tracked = scratch_pool_tracked;
             it->second.scratch_pool_eligible = scratch_pool_eligible;
             it->second.scratch_pool_device_direct = scratch_pool_device_direct;
@@ -5747,12 +6059,20 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
             int unregister_status = uvm_driver_phase_f_unregister_region_internal(
                 info.driver_scratch_region_id
             );
+            bool scratch_budget_released = false;
+            size_t scratch_live_after_release = driver_scratch_live_bytes.load();
+            if (info.driver_scratch_budget_reserved) {
+                release_driver_scratch_budget(info.size);
+                scratch_budget_released = true;
+                scratch_live_after_release = driver_scratch_live_bytes.load();
+            }
             if (log_file) {
                 std::lock_guard<std::mutex> lock(log_mutex);
                 fprintf(log_file,
                         "[%.3fs] TRACE_DRIVER_SCRATCH_UNTAG free_id=%zu "
                         "ptr=0x%llx size_bytes=%zu region_id=%llu status=%d "
-                        "alloc_id=%zu phase=%s\n",
+                        "alloc_id=%zu budget_reserved=%d budget_released=%d "
+                        "budget_bytes=%zu live_after_bytes=%zu phase=%s\n",
                         get_elapsed_seconds(),
                         free_count,
                         static_cast<unsigned long long>(
@@ -5762,6 +6082,10 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
                             info.driver_scratch_region_id),
                         unregister_status,
                         info.alloc_id,
+                        info.driver_scratch_budget_reserved ? 1 : 0,
+                        scratch_budget_released ? 1 : 0,
+                        driver_scratch_budget_bytes,
+                        scratch_live_after_release,
                         phase_snapshot.c_str());
                 fflush(log_file);
             }
@@ -5944,6 +6268,11 @@ void uvm_reset_all_stats(void) {
     pool_runtime_scratch_live_bytes.store(0);
     pool_runtime_scratch_peak_live_bytes.store(0);
     pool_runtime_scratch_free_success_allocs.store(0);
+    driver_scratch_live_bytes.store(0);
+    driver_scratch_peak_live_bytes.store(0);
+    driver_scratch_budget_reject_allocs.store(0);
+    driver_scratch_budget_over_allocs.store(0);
+    driver_scratch_budget_release_allocs.store(0);
     scratch_pool_trace_allocs.store(0);
     scratch_pool_eligible_allocs.store(0);
     scratch_pool_device_direct_allocs.store(0);
@@ -6064,6 +6393,22 @@ void uvm_close_log(void) {
             weight_budget_cpu_offload_failures.load());
     fprintf(log_file, "  Weight free success: %zu\n", weight_free_success_allocs.load());
     fprintf(log_file, "  Pool registry enabled: %d\n", pool_registry_enabled);
+    fprintf(log_file, "  Driver scratch budget enforce: %d\n",
+            driver_scratch_budget_enforce);
+    fprintf(log_file, "  Driver scratch budget enforce warmup: %d\n",
+            driver_scratch_budget_enforce_warmup);
+    fprintf(log_file, "  Driver scratch budget bytes: %zu\n",
+            driver_scratch_budget_bytes);
+    fprintf(log_file, "  Driver scratch live bytes: %zu\n",
+            driver_scratch_live_bytes.load());
+    fprintf(log_file, "  Driver scratch peak live bytes: %zu\n",
+            driver_scratch_peak_live_bytes.load());
+    fprintf(log_file, "  Driver scratch budget over allocations: %zu\n",
+            driver_scratch_budget_over_allocs.load());
+    fprintf(log_file, "  Driver scratch budget reject allocations: %zu\n",
+            driver_scratch_budget_reject_allocs.load());
+    fprintf(log_file, "  Driver scratch budget release allocations: %zu\n",
+            driver_scratch_budget_release_allocs.load());
     fprintf(log_file, "  Driver pool state snapshot on scratch free: %d\n",
             driver_pool_state_snapshot_on_scratch_free);
     fprintf(log_file, "  Driver pool state snapshot on scratch free every: %zu\n",

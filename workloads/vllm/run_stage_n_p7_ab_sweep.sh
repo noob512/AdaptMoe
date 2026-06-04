@@ -14,6 +14,7 @@ RUN_ROOT="${RUN_ROOT:-log/stage_n_p7_ab_sweep_$(date -u +%Y%m%d_%H%M%S)}"
 P7_VARIANTS="${P7_VARIANTS:-native_uvm,stage_n_trace,stage_n_soft}"
 REPEATS="${REPEATS:-1}"
 DRY_RUN="${DRY_RUN:-0}"
+FAIL_ON_WARN="${FAIL_ON_WARN:-0}"
 
 MODEL="${MODEL:-Qwen/Qwen3-30B-A3B-FP8}"
 PROMPTS="${PROMPTS:-4}"
@@ -26,18 +27,30 @@ STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-1800}"
 PORT_BASE="${PORT_BASE:-8100}"
 RESET_COUNTERS="${RESET_COUNTERS:-1}"
 UVM_PHASE_F_ROUTE_LOG_DELAY_MS="${UVM_PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
+REQUIRE_STAGE_N_HARD_PARTITION="${REQUIRE_STAGE_N_HARD_PARTITION:-0}"
+HARD_PARTITION_TOLERANCE_BYTES="${HARD_PARTITION_TOLERANCE_BYTES:-0}"
 
 KV_BUDGET_BYTES="${KV_BUDGET_BYTES:-10737418240}"
 TRACE_WEIGHT_BUDGET_BYTES="${TRACE_WEIGHT_BUDGET_BYTES:-10737418240}"
 SOFT_WEIGHT_BUDGET_BYTES="${SOFT_WEIGHT_BUDGET_BYTES:-21474836480}"
 TRACE_SCRATCH_BUDGET_BYTES="${TRACE_SCRATCH_BUDGET_BYTES:-104857600}"
 SOFT_SCRATCH_BUDGET_BYTES="${SOFT_SCRATCH_BUDGET_BYTES:-16777216}"
+ENFORCE_WEIGHT_BUDGET_BYTES="${ENFORCE_WEIGHT_BUDGET_BYTES:-$SOFT_WEIGHT_BUDGET_BYTES}"
+ENFORCE_SCRATCH_BUDGET_BYTES="${ENFORCE_SCRATCH_BUDGET_BYTES:-$SOFT_SCRATCH_BUDGET_BYTES}"
 
 UVM_PHASE_N_AUTO_RECLAIM_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_EVERY:-64}"
 UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY:-256}"
 UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS="${UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS:-1}"
 UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS:-4096}"
 UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS:-256}"
+UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY:-0}"
+UVM_PHASE_N_ENFORCE_RECLAIM_EVERY="${UVM_PHASE_N_ENFORCE_RECLAIM_EVERY:-1}"
+UVM_PHASE_N_ENFORCE_RECLAIM_SCAN_EVERY="${UVM_PHASE_N_ENFORCE_RECLAIM_SCAN_EVERY:-0}"
+UVM_PHASE_N_ENFORCE_RECLAIM_MAX_VICTIMS="${UVM_PHASE_N_ENFORCE_RECLAIM_MAX_VICTIMS:-128}"
+UVM_PHASE_N_ENFORCE_RECLAIM_COOLDOWN_EPOCHS="${UVM_PHASE_N_ENFORCE_RECLAIM_COOLDOWN_EPOCHS:-0}"
+UVM_PHASE_N_ENFORCE_RECLAIM_FAILURE_BACKOFF_EPOCHS="${UVM_PHASE_N_ENFORCE_RECLAIM_FAILURE_BACKOFF_EPOCHS:-0}"
+UVM_PHASE_N_ENFORCE_RECLAIM_EXECUTE_ON_READY="${UVM_PHASE_N_ENFORCE_RECLAIM_EXECUTE_ON_READY:-1}"
+VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP="${VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP:-0}"
 
 P7_SCRATCH_SWEEP_BYTES_CSV="${P7_SCRATCH_SWEEP_BYTES_CSV:-16777216,67108864,104857600}"
 P7_COOLDOWN_SWEEP_EPOCHS_CSV="${P7_COOLDOWN_SWEEP_EPOCHS_CSV:-0,1024,4096}"
@@ -65,9 +78,14 @@ csv_to_array() {
 write_command_file() {
   {
     printf 'cd %q\n' "$SCRIPT_DIR"
-    printf 'RUN_ROOT=%q P7_VARIANTS=%q REPEATS=%q PROMPTS=%q REQUEST_RATE=%q OUTPUT_LEN=%q SERVER_MAX_NUM_SEQS=%q PORT_BASE=%q RESET_COUNTERS=%q UVM_PHASE_F_ROUTE_LOG_DELAY_MS=%q ./run_stage_n_p7_ab_sweep.sh\n' \
+    printf 'RUN_ROOT=%q P7_VARIANTS=%q REPEATS=%q PROMPTS=%q REQUEST_RATE=%q OUTPUT_LEN=%q SERVER_MAX_NUM_SEQS=%q PORT_BASE=%q RESET_COUNTERS=%q UVM_PHASE_F_ROUTE_LOG_DELAY_MS=%q REQUIRE_STAGE_N_HARD_PARTITION=%q HARD_PARTITION_TOLERANCE_BYTES=%q UVM_PHASE_N_ENFORCE_RECLAIM_EVERY=%q UVM_PHASE_N_ENFORCE_RECLAIM_SCAN_EVERY=%q UVM_PHASE_N_ENFORCE_RECLAIM_MAX_VICTIMS=%q UVM_PHASE_N_ENFORCE_RECLAIM_COOLDOWN_EPOCHS=%q UVM_PHASE_N_ENFORCE_RECLAIM_FAILURE_BACKOFF_EPOCHS=%q UVM_PHASE_N_ENFORCE_RECLAIM_EXECUTE_ON_READY=%q VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP=%q ./run_stage_n_p7_ab_sweep.sh\n' \
       "$RUN_ROOT" "$P7_VARIANTS" "$REPEATS" "$PROMPTS" "$REQUEST_RATE" "$OUTPUT_LEN" \
-      "$SERVER_MAX_NUM_SEQS" "$PORT_BASE" "$RESET_COUNTERS" "$UVM_PHASE_F_ROUTE_LOG_DELAY_MS"
+      "$SERVER_MAX_NUM_SEQS" "$PORT_BASE" "$RESET_COUNTERS" "$UVM_PHASE_F_ROUTE_LOG_DELAY_MS" \
+      "$REQUIRE_STAGE_N_HARD_PARTITION" "$HARD_PARTITION_TOLERANCE_BYTES" \
+      "$UVM_PHASE_N_ENFORCE_RECLAIM_EVERY" "$UVM_PHASE_N_ENFORCE_RECLAIM_SCAN_EVERY" \
+      "$UVM_PHASE_N_ENFORCE_RECLAIM_MAX_VICTIMS" "$UVM_PHASE_N_ENFORCE_RECLAIM_COOLDOWN_EPOCHS" \
+      "$UVM_PHASE_N_ENFORCE_RECLAIM_FAILURE_BACKOFF_EPOCHS" "$UVM_PHASE_N_ENFORCE_RECLAIM_EXECUTE_ON_READY" \
+      "$VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP"
   } > "$COMMAND_FILE"
   chmod +x "$COMMAND_FILE"
 }
@@ -78,10 +96,12 @@ record_run() {
   local status="$3"
   local kind="$4"
   local require_auto_reclaim="$5"
-  local run_dir="$6"
+  local require_hard_partition="$6"
+  local run_dir="$7"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$variant" "$repeat" "$status" "$kind" "$require_auto_reclaim" "$run_dir" >> "$METADATA"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$variant" "$repeat" "$status" "$kind" "$require_auto_reclaim" \
+    "$require_hard_partition" "$run_dir" >> "$METADATA"
 }
 
 run_or_print() {
@@ -105,22 +125,34 @@ run_stage_n_variant() {
   local run_dir="$4"
   local budget_mode="$5"
   local require_auto_reclaim="$6"
-  local weight_budget="$7"
-  local scratch_budget="$8"
-  local max_victims="$9"
-  local cooldown_epochs="${10}"
+  local require_hard_partition="$7"
+  local weight_budget="$8"
+  local scratch_budget="$9"
+  local scan_every="${10}"
+  local max_victims="${11}"
+  local cooldown_epochs="${12}"
   local log_file="$run_dir/driver.log"
+  local auto_every="$UVM_PHASE_N_AUTO_RECLAIM_EVERY"
+  local failure_backoff="$UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS"
+  local execute_on_ready="$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY"
   local status=0
+
+  if [ "$require_hard_partition" = "1" ] || [ "$budget_mode" = "enforce" ]; then
+    auto_every="$UVM_PHASE_N_ENFORCE_RECLAIM_EVERY"
+    failure_backoff="$UVM_PHASE_N_ENFORCE_RECLAIM_FAILURE_BACKOFF_EPOCHS"
+    execute_on_ready="$UVM_PHASE_N_ENFORCE_RECLAIM_EXECUTE_ON_READY"
+  fi
 
   mkdir -p "$run_dir"
   {
     printf 'cd %q\n' "$SCRIPT_DIR"
-    printf 'env MODEL=%q PROMPTS=%q REQUEST_RATE=%q OUTPUT_LEN=%q MAX_MODEL_LEN=%q SERVER_MAX_NUM_SEQS=%q SERVER_GPU_MEMORY_UTILIZATION=%q STARTUP_TIMEOUT=%q PORT=%q RESET_COUNTERS=%q UVM_PHASE_F_ROUTE_LOG_DELAY_MS=%q KV_BUDGET_BYTES=%q WEIGHT_BUDGET_BYTES=%q SCRATCH_TEMP_BUDGET_BYTES=%q DRIVER_POOL_BUDGET_MODE=%q REQUIRE_PHASE_N_AUTO_HOOK=%q REQUIRE_PHASE_N_AUTO_RECLAIM=%q UVM_PHASE_N_AUTO_RECLAIM_EVERY=%q UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY=%q UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS=%q UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS=%q UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS=%q RUN_ROOT=%q ./run_stage_n_tag_only_three_pool_smoke.sh\n' \
+    printf 'env MODEL=%q PROMPTS=%q REQUEST_RATE=%q OUTPUT_LEN=%q MAX_MODEL_LEN=%q SERVER_MAX_NUM_SEQS=%q SERVER_GPU_MEMORY_UTILIZATION=%q STARTUP_TIMEOUT=%q PORT=%q RESET_COUNTERS=%q UVM_PHASE_F_ROUTE_LOG_DELAY_MS=%q KV_BUDGET_BYTES=%q WEIGHT_BUDGET_BYTES=%q SCRATCH_TEMP_BUDGET_BYTES=%q DRIVER_POOL_BUDGET_MODE=%q REQUIRE_PHASE_N_AUTO_HOOK=%q REQUIRE_PHASE_N_AUTO_RECLAIM=%q REQUIRE_STAGE_N_HARD_PARTITION=%q HARD_PARTITION_TOLERANCE_BYTES=%q UVM_PHASE_N_AUTO_RECLAIM_EVERY=%q UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY=%q UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS=%q UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS=%q UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS=%q UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY=%q VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP=%q RUN_ROOT=%q ./run_stage_n_tag_only_three_pool_smoke.sh\n' \
       "$MODEL" "$PROMPTS" "$REQUEST_RATE" "$OUTPUT_LEN" "$MAX_MODEL_LEN" "$SERVER_MAX_NUM_SEQS" \
       "$SERVER_GPU_MEMORY_UTILIZATION" "$STARTUP_TIMEOUT" "$port" "$RESET_COUNTERS" "$UVM_PHASE_F_ROUTE_LOG_DELAY_MS" \
       "$KV_BUDGET_BYTES" "$weight_budget" "$scratch_budget" "$budget_mode" "$require_auto_reclaim" "$require_auto_reclaim" \
-      "$UVM_PHASE_N_AUTO_RECLAIM_EVERY" "$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY" "$max_victims" "$cooldown_epochs" \
-      "$UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS" "$run_dir"
+      "$require_hard_partition" "$HARD_PARTITION_TOLERANCE_BYTES" \
+      "$auto_every" "$scan_every" "$max_victims" "$cooldown_epochs" \
+      "$failure_backoff" "$execute_on_ready" "$VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP" "$run_dir"
   } > "$run_dir/command.sh"
   chmod +x "$run_dir/command.sh"
 
@@ -144,17 +176,22 @@ run_stage_n_variant() {
       DRIVER_POOL_BUDGET_MODE="$budget_mode" \
       REQUIRE_PHASE_N_AUTO_HOOK="$require_auto_reclaim" \
       REQUIRE_PHASE_N_AUTO_RECLAIM="$require_auto_reclaim" \
-      UVM_PHASE_N_AUTO_RECLAIM_EVERY="$UVM_PHASE_N_AUTO_RECLAIM_EVERY" \
-      UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY="$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY" \
+      REQUIRE_STAGE_N_HARD_PARTITION="$require_hard_partition" \
+      HARD_PARTITION_TOLERANCE_BYTES="$HARD_PARTITION_TOLERANCE_BYTES" \
+      UVM_PHASE_N_AUTO_RECLAIM_EVERY="$auto_every" \
+      UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY="$scan_every" \
       UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS="$max_victims" \
       UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS="$cooldown_epochs" \
-      UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="$UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS" \
+      UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="$failure_backoff" \
+      UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY="$execute_on_ready" \
+      VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP="$VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP" \
       RUN_ROOT="$run_dir" \
       ./run_stage_n_tag_only_three_pool_smoke.sh
   status=$?
   set -e
 
-  record_run "$variant" "$repeat" "$status" "stage_n" "$require_auto_reclaim" "$run_dir"
+  record_run "$variant" "$repeat" "$status" "stage_n" "$require_auto_reclaim" \
+    "$require_hard_partition" "$run_dir"
 }
 
 run_native_uvm_variant() {
@@ -207,7 +244,7 @@ run_native_uvm_variant() {
   status=$?
   set -e
 
-  record_run "$variant" "$repeat" "$status" "native_uvm" "0" "$run_dir"
+  record_run "$variant" "$repeat" "$status" "native_uvm" "0" "0" "$run_dir"
 }
 
 write_p7_summary() {
@@ -245,6 +282,33 @@ summary_keys = (
     "driver_pool_state_all_required_fields_present",
     "allocator_driver_pool_state_all_status_ok",
     "scratch_driver_over_budget_records",
+    "require_stage_n_hard_partition",
+    "hard_partition_pass",
+    "hard_partition_all_driver_pools_under_budget",
+    "hard_partition_all_transient_pools_under_budget",
+    "hard_partition_sufficient_reclaim_to_budget",
+    "hard_partition_sufficient_deny_or_block",
+    "hard_partition_max_driver_over_budget_bytes",
+    "hard_partition_auto_reclaimed_bytes",
+    "hard_partition_auto_block_records",
+    "hard_partition_auto_deny_records",
+    "hard_partition_auto_deny_or_block_records",
+    "hard_partition_pool_kv_over_budget_bytes",
+    "hard_partition_pool_kv_auto_reclaimed_bytes",
+    "hard_partition_pool_kv_auto_reclaim_to_budget_records",
+    "hard_partition_pool_kv_auto_deny_or_block_records",
+    "hard_partition_pool_weights_over_budget_bytes",
+    "hard_partition_pool_weights_auto_reclaimed_bytes",
+    "hard_partition_pool_weights_auto_reclaim_to_budget_records",
+    "hard_partition_pool_weights_auto_deny_or_block_records",
+    "hard_partition_pool_scratch_over_budget_bytes",
+    "hard_partition_pool_scratch_auto_reclaimed_bytes",
+    "hard_partition_pool_scratch_auto_reclaim_to_budget_records",
+    "hard_partition_pool_scratch_auto_deny_or_block_records",
+    "hard_partition_scratch_over_budget_records",
+    "hard_partition_scratch_budget_reject_records",
+    "hard_partition_scratch_driver_reject_records",
+    "hard_partition_failure_reasons",
 )
 
 def read_text(path: str) -> str:
@@ -276,7 +340,12 @@ rows = []
 with open(metadata_path, encoding="utf-8") as handle:
     header = next(handle, "")
     for raw in handle:
-        variant, repeat, status, kind, require_auto, run_dir = raw.rstrip("\n").split("\t")
+        fields = raw.rstrip("\n").split("\t")
+        if len(fields) == 6:
+            variant, repeat, status, kind, require_auto, run_dir = fields
+            require_hard = "0"
+        else:
+            variant, repeat, status, kind, require_auto, require_hard, run_dir = fields
         stage_summary = os.path.join(run_dir, "stage_n_acceptance_summary.txt")
         bench_log = os.path.join(run_dir, "vllm_bench.log")
         text = read_text(stage_summary)
@@ -288,6 +357,7 @@ with open(metadata_path, encoding="utf-8") as handle:
             "status": status,
             "kind": kind,
             "require_auto_reclaim": require_auto,
+            "require_hard_partition": require_hard,
             "run_root": run_dir,
             **bench,
         }
@@ -316,11 +386,16 @@ for row in rows:
     if baseline_tpot and tpot is not None:
         row["tpot_delta_pct"] = f"{((tpot - baseline_tpot) / baseline_tpot) * 100:.2f}"
 
+    hard_required = row["require_hard_partition"] == "1"
     failed = as_float(row.get("failed_requests"))
     ttft_delta = as_float(row["ttft_delta_pct"])
     tpot_delta = as_float(row["tpot_delta_pct"])
-    ok = row["status"] == "0" and (failed is None or failed == 0)
-    if row["require_auto_reclaim"] == "1":
+    if hard_required:
+        ok = int(row["hard_partition_pass"] or 0) == 1
+    else:
+        ok = row["status"] == "0" and (failed is None or failed == 0)
+
+    if row["require_auto_reclaim"] == "1" and not hard_required:
         ok = ok and int(row["phase_n_auto_hook_would_reclaim_records"] or 0) > 0
         ok = ok and int(row["phase_n_auto_hook_execute_records"] or 0) > 0
         ok = ok and int(row["phase_n_auto_hook_success_records"] or 0) > 0
@@ -337,7 +412,27 @@ fields = [
     "tpot_delta_pct", "phase_n_auto_hook_records", "phase_n_auto_hook_would_reclaim_records",
     "phase_n_auto_hook_execute_records", "phase_n_auto_hook_success_records",
     "phase_n_auto_hook_reclaimed_records", "driver_pool_state_failures",
-    "allocator_driver_pool_state_all_status_ok", "scratch_driver_over_budget_records", "run_root",
+    "allocator_driver_pool_state_all_status_ok", "scratch_driver_over_budget_records",
+    "require_hard_partition", "hard_partition_pass",
+    "hard_partition_max_driver_over_budget_bytes",
+    "hard_partition_auto_reclaimed_bytes",
+    "hard_partition_auto_deny_or_block_records",
+    "hard_partition_pool_kv_over_budget_bytes",
+    "hard_partition_pool_kv_auto_reclaimed_bytes",
+    "hard_partition_pool_kv_auto_reclaim_to_budget_records",
+    "hard_partition_pool_kv_auto_deny_or_block_records",
+    "hard_partition_pool_weights_over_budget_bytes",
+    "hard_partition_pool_weights_auto_reclaimed_bytes",
+    "hard_partition_pool_weights_auto_reclaim_to_budget_records",
+    "hard_partition_pool_weights_auto_deny_or_block_records",
+    "hard_partition_pool_scratch_over_budget_bytes",
+    "hard_partition_pool_scratch_auto_reclaimed_bytes",
+    "hard_partition_pool_scratch_auto_reclaim_to_budget_records",
+    "hard_partition_pool_scratch_auto_deny_or_block_records",
+    "hard_partition_scratch_over_budget_records",
+    "hard_partition_scratch_budget_reject_records",
+    "hard_partition_scratch_driver_reject_records",
+    "hard_partition_failure_reasons", "run_root",
 ]
 
 with open(tsv_path, "w", encoding="utf-8") as out:
@@ -357,24 +452,33 @@ def mean_for(items, field):
 with open(md_path, "w", encoding="utf-8") as out:
     out.write("# Stage N P7 A/B Summary\n\n")
     out.write(f"Baseline: {baseline['variant'] if baseline else 'missing'}\n\n")
-    out.write("| Variant | Runs | Verdicts | Mean TTFT ms | Mean TPOT ms | Mean output tok/s | Auto exec | Auto reclaimed | Failed req |\n")
-    out.write("|---|---:|---|---:|---:|---:|---:|---:|---:|\n")
+    out.write("| Variant | Runs | Verdicts | Mean TTFT ms | Mean TPOT ms | Mean output tok/s | Auto exec | Hard pass | Max over bytes | Hard reclaimed bytes | Hard block | Scratch reject | Failed req |\n")
+    out.write("|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
     for variant, items in variant_groups.items():
         verdicts = ",".join(sorted(set(item["p7_verdict"] for item in items)))
         auto_exec = sum(int(item.get("phase_n_auto_hook_execute_records") or 0) for item in items)
-        auto_reclaimed = sum(int(item.get("phase_n_auto_hook_reclaimed_records") or 0) for item in items)
+        hard_pass = sum(int(item.get("hard_partition_pass") or 0) for item in items)
+        max_over = max(int(item.get("hard_partition_max_driver_over_budget_bytes") or 0) for item in items)
+        hard_reclaimed = sum(int(item.get("hard_partition_auto_reclaimed_bytes") or 0) for item in items)
+        hard_block = sum(int(item.get("hard_partition_auto_deny_or_block_records") or 0) for item in items)
+        scratch_reject = sum(
+            int(item.get("hard_partition_scratch_budget_reject_records") or 0) +
+            int(item.get("hard_partition_scratch_driver_reject_records") or 0)
+            for item in items
+        )
         failed = sum(int(float(item.get("failed_requests") or 0)) for item in items if item.get("failed_requests"))
         out.write(
             f"| {variant} | {len(items)} | {verdicts} | {mean_for(items, 'mean_ttft_ms')} | "
             f"{mean_for(items, 'mean_tpot_ms')} | {mean_for(items, 'output_tok_s')} | "
-            f"{auto_exec} | {auto_reclaimed} | {failed} |\n"
+            f"{auto_exec} | {hard_pass}/{len(items)} | {max_over} | {hard_reclaimed} | "
+            f"{hard_block} | {scratch_reject} | {failed} |\n"
         )
     out.write("\nDetailed TSV: `p7_ab_summary.tsv`\n")
 PY
 }
 
 write_command_file
-printf 'variant\trepeat\tstatus\tkind\trequire_auto_reclaim\trun_root\n' > "$METADATA"
+printf 'variant\trepeat\tstatus\tkind\trequire_auto_reclaim\trequire_hard_partition\trun_root\n' > "$METADATA"
 
 declare -a variants
 csv_to_array "$P7_VARIANTS" variants
@@ -393,21 +497,26 @@ for repeat in $(seq 1 "$REPEATS"); do
       stage_n_trace)
         run_dir="$RUN_ROOT/${repeat}_${variant}"
         run_stage_n_variant "$variant" "$repeat" "$((PORT_BASE + run_index))" "$run_dir" \
-          trace_only 0 "$TRACE_WEIGHT_BUDGET_BYTES" "$TRACE_SCRATCH_BUDGET_BYTES" 2 256
+          trace_only 0 0 "$TRACE_WEIGHT_BUDGET_BYTES" "$TRACE_SCRATCH_BUDGET_BYTES" \
+          "$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY" 2 256
         run_index=$((run_index + 1))
         ;;
       stage_n_soft)
         run_dir="$RUN_ROOT/${repeat}_${variant}"
         run_stage_n_variant "$variant" "$repeat" "$((PORT_BASE + run_index))" "$run_dir" \
-          soft 1 "$SOFT_WEIGHT_BUDGET_BYTES" "$SOFT_SCRATCH_BUDGET_BYTES" \
+          soft 1 "$REQUIRE_STAGE_N_HARD_PARTITION" \
+          "$SOFT_WEIGHT_BUDGET_BYTES" "$SOFT_SCRATCH_BUDGET_BYTES" \
+          "$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY" \
           "$UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS" "$UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS"
         run_index=$((run_index + 1))
         ;;
       stage_n_enforce_probe)
         run_dir="$RUN_ROOT/${repeat}_${variant}"
         run_stage_n_variant "$variant" "$repeat" "$((PORT_BASE + run_index))" "$run_dir" \
-          enforce 1 "$SOFT_WEIGHT_BUDGET_BYTES" "$SOFT_SCRATCH_BUDGET_BYTES" \
-          "$UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS" "$UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS"
+          enforce 1 1 "$ENFORCE_WEIGHT_BUDGET_BYTES" "$ENFORCE_SCRATCH_BUDGET_BYTES" \
+          "$UVM_PHASE_N_ENFORCE_RECLAIM_SCAN_EVERY" \
+          "$UVM_PHASE_N_ENFORCE_RECLAIM_MAX_VICTIMS" \
+          "$UVM_PHASE_N_ENFORCE_RECLAIM_COOLDOWN_EPOCHS"
         run_index=$((run_index + 1))
         ;;
       stage_n_soft_sweep)
@@ -421,7 +530,8 @@ for repeat in $(seq 1 "$REPEATS"); do
               sweep_variant="stage_n_soft_s${scratch_budget}_c${cooldown_epochs}_v${max_victims}"
               run_dir="$RUN_ROOT/${repeat}_${sweep_variant}"
               run_stage_n_variant "$sweep_variant" "$repeat" "$((PORT_BASE + run_index))" "$run_dir" \
-                soft 1 "$SOFT_WEIGHT_BUDGET_BYTES" "$scratch_budget" "$max_victims" "$cooldown_epochs"
+                soft 1 0 "$SOFT_WEIGHT_BUDGET_BYTES" "$scratch_budget" \
+                "$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY" "$max_victims" "$cooldown_epochs"
               run_index=$((run_index + 1))
             done
           done
@@ -444,3 +554,9 @@ echo "summary_tsv=$SUMMARY_TSV"
 echo "summary_md=$SUMMARY_MD"
 echo "command_file=$COMMAND_FILE"
 cat "$SUMMARY_MD"
+
+if [ "$FAIL_ON_WARN" = "1" ] &&
+   awk -F'\t' 'NR > 1 && $3 == "WARN" { found = 1 } END { exit found ? 0 : 1 }' "$SUMMARY_TSV"; then
+  echo "FAIL_ON_WARN=1 and at least one P7 run produced WARN." >&2
+  exit 1
+fi

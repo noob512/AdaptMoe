@@ -28,6 +28,7 @@ SERVER_MAX_MODEL_LEN="${VLLM_SERVER_MAX_MODEL_LEN:-}"
 UVM_PHASE_F_ROUTE_LOG_DELAY_MS="${UVM_PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
 UVM_PHASE_N_AUTO_RECLAIM_ENABLE="${UVM_PHASE_N_AUTO_RECLAIM_ENABLE:-0}"
 UVM_PHASE_N_AUTO_RECLAIM_EXECUTE="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE:-0}"
+UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY:-0}"
 UVM_PHASE_N_AUTO_RECLAIM_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_EVERY:-64}"
 UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY:-256}"
 UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS="${UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS:-2}"
@@ -184,6 +185,9 @@ UVM_RESIDENCY_KV_POINTER_TAG_ENABLE="${VLLM_UVM_RESIDENCY_KV_POINTER_TAG_ENABLE:
 UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY="${VLLM_UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY:-tensor}"
 UVM_RESIDENCY_PRIORITY="${VLLM_UVM_RESIDENCY_PRIORITY:-kv,scratch,weights}"
 UVM_DRIVER_SCRATCH_TAG_ENABLE="${VLLM_UVM_DRIVER_SCRATCH_TAG_ENABLE:-0}"
+UVM_DRIVER_TEMP_BUFFER_BYTES="${VLLM_UVM_DRIVER_TEMP_BUFFER_BYTES:-0}"
+UVM_DRIVER_SCRATCH_BUDGET_ENFORCE="${VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE:-0}"
+UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP="${VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP:-0}"
 UVM_RESIDENCY_WEIGHT_INITIAL_STATE="${VLLM_UVM_RESIDENCY_WEIGHT_INITIAL_STATE:-cpu}"
 UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET="${VLLM_UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET:-0}"
 UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD="${VLLM_UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD:-1}"
@@ -551,6 +555,10 @@ Options:
                              Stage F unified pool registry telemetry.
                              Records kv_cache/weights/runtime_scratch objects
                              without changing allocation policy (default: 0)
+  --uvm-driver-scratch-budget-enforce-warmup <0|1>
+                             If 1, apply allocator-side scratch hard reject to
+                             warmup/autotune workspaces too. Default 0 keeps
+                             hard partition enforcement startup-safe.
   --uvm-scratch-pool-enable <0|1>
                              Stage G runtime scratch pool admission control.
                              Budgeted device-direct fast path with managed
@@ -615,6 +623,8 @@ Options:
                              Set uvm_phase_n_auto_reclaim_enable at insmod time
   --uvm-phase-n-auto-reclaim-execute <0|1>
                              Set uvm_phase_n_auto_reclaim_execute at insmod time
+  --uvm-phase-n-auto-reclaim-execute-on-ready <0|1>
+                             Load with execute=0, then set requested execute after server ready
   --uvm-phase-n-auto-reclaim-every <n>
                              Set uvm_phase_n_auto_reclaim_every at insmod time
   --uvm-phase-n-auto-reclaim-scan-every <n>
@@ -697,6 +707,38 @@ write_param() {
   local key="$1"
   local value="$2"
   echo "$value" | sudo tee "$PARAM_DIR/$key" >/dev/null
+}
+
+read_param() {
+  local key="$1"
+  cat "$PARAM_DIR/$key" 2>/dev/null || true
+}
+
+phase_n_auto_reclaim_execute_load_value() {
+  if [ "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY" = "1" ]; then
+    echo 0
+  else
+    echo "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE"
+  fi
+}
+
+stage_phase_n_auto_reclaim_execute_for_startup() {
+  [ "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY" = "1" ] || return 0
+  need_writable_param uvm_phase_n_auto_reclaim_execute
+  write_param uvm_phase_n_auto_reclaim_execute 0
+  echo "Stage N auto reclaim execute staged off for server startup."
+}
+
+enable_phase_n_auto_reclaim_execute_after_ready() {
+  local loaded_value
+
+  [ "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY" = "1" ] || return 0
+  need_writable_param uvm_phase_n_auto_reclaim_execute
+  write_param uvm_phase_n_auto_reclaim_execute "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE"
+  loaded_value="$(read_param uvm_phase_n_auto_reclaim_execute)"
+  [ "$loaded_value" = "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE" ] \
+    || die "uvm_phase_n_auto_reclaim_execute expected $UVM_PHASE_N_AUTO_RECLAIM_EXECUTE after ready, got $loaded_value"
+  echo "Stage N auto reclaim execute enabled after server readiness: $loaded_value"
 }
 
 is_hex_u64() {
@@ -911,6 +953,9 @@ start_server() {
                 VLLM_UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY='$UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY' \
                 VLLM_UVM_RESIDENCY_PRIORITY='$UVM_RESIDENCY_PRIORITY' \
                 VLLM_UVM_DRIVER_SCRATCH_TAG_ENABLE='$UVM_DRIVER_SCRATCH_TAG_ENABLE' \
+                VLLM_UVM_DRIVER_TEMP_BUFFER_BYTES='$UVM_DRIVER_TEMP_BUFFER_BYTES' \
+                VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE='$UVM_DRIVER_SCRATCH_BUDGET_ENFORCE' \
+                VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP='$UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP' \
                 VLLM_UVM_RESIDENCY_WEIGHT_INITIAL_STATE='$UVM_RESIDENCY_WEIGHT_INITIAL_STATE' \
                 VLLM_UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET='$UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET' \
                 VLLM_UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD='$UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD' \
@@ -1123,11 +1168,14 @@ start_dmesg_capture_if_needed() {
 }
 
 reload_uvm_module_for_counter_reset() {
+  local load_auto_reclaim_execute
+
   need_file "$UVM_KO_PATH"
   [ "$UVM_ENABLE_DEBUG_PROCFS" = "0" ] || [ "$UVM_ENABLE_DEBUG_PROCFS" = "1" ] \
     || die "--uvm-enable-debug-procfs must be 0 or 1"
   [ "$UVM_ENABLE_BUILTIN_TESTS" = "0" ] || [ "$UVM_ENABLE_BUILTIN_TESTS" = "1" ] \
     || die "--uvm-enable-builtin-tests must be 0 or 1"
+  load_auto_reclaim_execute="$(phase_n_auto_reclaim_execute_load_value)"
 
   echo "Resetting UVM total counters by reloading nvidia_uvm..."
 
@@ -1140,7 +1188,7 @@ reload_uvm_module_for_counter_reset() {
     uvm_enable_builtin_tests="$UVM_ENABLE_BUILTIN_TESTS" \
     uvm_phase_f_route_log_delay_ms="$UVM_PHASE_F_ROUTE_LOG_DELAY_MS" \
     uvm_phase_n_auto_reclaim_enable="$UVM_PHASE_N_AUTO_RECLAIM_ENABLE" \
-    uvm_phase_n_auto_reclaim_execute="$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE" \
+    uvm_phase_n_auto_reclaim_execute="$load_auto_reclaim_execute" \
     uvm_phase_n_auto_reclaim_every="$UVM_PHASE_N_AUTO_RECLAIM_EVERY" \
     uvm_phase_n_auto_reclaim_scan_every="$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY" \
     uvm_phase_n_auto_reclaim_max_victims="$UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS" \
@@ -1175,6 +1223,12 @@ reload_uvm_module_for_counter_reset() {
     auto_reclaim_enable_val="$(cat "$PARAM_DIR/uvm_phase_n_auto_reclaim_enable" 2>/dev/null || true)"
     [ "$auto_reclaim_enable_val" = "$UVM_PHASE_N_AUTO_RECLAIM_ENABLE" ] \
       || die "uvm_phase_n_auto_reclaim_enable expected $UVM_PHASE_N_AUTO_RECLAIM_ENABLE, got $auto_reclaim_enable_val"
+  fi
+  if [ -r "$PARAM_DIR/uvm_phase_n_auto_reclaim_execute" ]; then
+    local auto_reclaim_execute_val
+    auto_reclaim_execute_val="$(cat "$PARAM_DIR/uvm_phase_n_auto_reclaim_execute" 2>/dev/null || true)"
+    [ "$auto_reclaim_execute_val" = "$load_auto_reclaim_execute" ] \
+      || die "uvm_phase_n_auto_reclaim_execute expected $load_auto_reclaim_execute at load, got $auto_reclaim_execute_val"
   fi
   if [ -r "$PARAM_DIR/uvm_phase_n_auto_reclaim_every" ]; then
     local auto_reclaim_every_val
@@ -1287,6 +1341,9 @@ cleanup() {
   stop_trace_capture_if_needed || true
 
   if [ "$KEEP_ON_EXIT" -eq 0 ]; then
+    if [ "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY" = "1" ]; then
+      write_param uvm_phase_n_auto_reclaim_execute 0 || true
+    fi
     write_param uvm_perf_fault_log_counters 0 || true
     write_param uvm_perf_fault_kv_range_enable 0 || true
     write_param uvm_perf_fault_log_addresses 0 || true
@@ -1462,6 +1519,9 @@ parse_args() {
       --uvm-residency-kv-pointer-tag-enable) UVM_RESIDENCY_KV_POINTER_TAG_ENABLE="$2"; shift 2 ;; # Stage N tag-only driver KV pointer registration
       --uvm-residency-kv-pointer-tag-granularity) UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY="$2"; shift 2 ;; # Stage N KV driver tag granularity
       --uvm-driver-scratch-tag-enable) UVM_DRIVER_SCRATCH_TAG_ENABLE="$2"; shift 2 ;; # Stage N allocator-side scratch/temp driver tags
+      --uvm-driver-temp-buffer-bytes) UVM_DRIVER_TEMP_BUFFER_BYTES="$2"; shift 2 ;; # Stage N driver scratch/temp budget bytes
+      --uvm-driver-scratch-budget-enforce) UVM_DRIVER_SCRATCH_BUDGET_ENFORCE="$2"; shift 2 ;; # Stage N allocator-side scratch budget hard gate
+      --uvm-driver-scratch-budget-enforce-warmup) UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP="$2"; shift 2 ;; # Stage N hard gate also applies to warmup/autotune scratch
       --uvm-residency-priority) UVM_RESIDENCY_PRIORITY="$2"; shift 2 ;; # Stage L0 report priority label
       --uvm-residency-weight-initial-state) UVM_RESIDENCY_WEIGHT_INITIAL_STATE="$2"; shift 2 ;; # Stage L2 initial expert state
       --uvm-residency-weight-enforce-hot-set) UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET="$2"; shift 2 ;; # Stage L2 weights enforce gate
@@ -1511,6 +1571,7 @@ parse_args() {
       --uvm-phase-f-route-log-delay-ms) UVM_PHASE_F_ROUTE_LOG_DELAY_MS="$2"; shift 2 ;; # insmod 时的 Phase F route log 人工延迟
       --uvm-phase-n-auto-reclaim-enable) UVM_PHASE_N_AUTO_RECLAIM_ENABLE="$2"; shift 2 ;; # insmod 时开启/关闭 Stage N auto hook
       --uvm-phase-n-auto-reclaim-execute) UVM_PHASE_N_AUTO_RECLAIM_EXECUTE="$2"; shift 2 ;; # insmod 时允许 Stage N outer hook 执行 soft reclaim
+      --uvm-phase-n-auto-reclaim-execute-on-ready) UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY="$2"; shift 2 ;; # ready 后再开启 Stage N outer hook 执行
       --uvm-phase-n-auto-reclaim-every) UVM_PHASE_N_AUTO_RECLAIM_EVERY="$2"; shift 2 ;; # insmod 时配置 Stage N auto hook 采样频率
       --uvm-phase-n-auto-reclaim-scan-every) UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY="$2"; shift 2 ;; # insmod 时配置 Stage N auto reclaim 全池扫描频率
       --uvm-phase-n-auto-reclaim-max-victims) UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS="$2"; shift 2 ;; # insmod 时配置 Stage N auto reclaim batch victim 上限
@@ -1696,6 +1757,9 @@ validate_inputs() {
     [[ "$UVM_RESIDENCY_KV_POINTER_TAG_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-kv-pointer-tag-enable must be 0 or 1"
     [[ "$UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY" =~ ^(tensor|range)$ ]] || die "--uvm-residency-kv-pointer-tag-granularity must be tensor or range"
     [[ "$UVM_DRIVER_SCRATCH_TAG_ENABLE" =~ ^[01]$ ]] || die "--uvm-driver-scratch-tag-enable must be 0 or 1"
+    [[ "$UVM_DRIVER_TEMP_BUFFER_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-driver-temp-buffer-bytes must be a non-negative integer"
+    [[ "$UVM_DRIVER_SCRATCH_BUDGET_ENFORCE" =~ ^[01]$ ]] || die "--uvm-driver-scratch-budget-enforce must be 0 or 1"
+    [[ "$UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP" =~ ^[01]$ ]] || die "--uvm-driver-scratch-budget-enforce-warmup must be 0 or 1"
     [ -n "$UVM_RESIDENCY_PRIORITY" ] || die "--uvm-residency-priority must not be empty"
     [[ "$UVM_RESIDENCY_WEIGHT_INITIAL_STATE" =~ ^(unknown|cpu|gpu)$ ]] || die "--uvm-residency-weight-initial-state must be unknown, cpu, or gpu"
     [[ "$UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET" =~ ^[01]$ ]] || die "--uvm-residency-weight-enforce-hot-set must be 0 or 1"
@@ -1709,6 +1773,7 @@ validate_inputs() {
     [[ "$UVM_POOL_REGISTRY_ENABLE" =~ ^[01]$ ]] || die "--uvm-pool-registry-enable must be 0 or 1"
     [[ "$UVM_PHASE_N_AUTO_RECLAIM_ENABLE" =~ ^[01]$ ]] || die "--uvm-phase-n-auto-reclaim-enable must be 0 or 1"
     [[ "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE" =~ ^[01]$ ]] || die "--uvm-phase-n-auto-reclaim-execute must be 0 or 1"
+    [[ "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY" =~ ^[01]$ ]] || die "--uvm-phase-n-auto-reclaim-execute-on-ready must be 0 or 1"
     [[ "$UVM_PHASE_N_AUTO_RECLAIM_EVERY" =~ ^[0-9]+$ ]] || die "--uvm-phase-n-auto-reclaim-every must be a non-negative integer"
     [[ "$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY" =~ ^[0-9]+$ ]] || die "--uvm-phase-n-auto-reclaim-scan-every must be a non-negative integer"
     [[ "$UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS" =~ ^[0-9]+$ ]] || die "--uvm-phase-n-auto-reclaim-max-victims must be a non-negative integer"
@@ -2185,6 +2250,7 @@ main() {
 
   validate_inputs
   : > "$BENCH_LOG"
+  stage_phase_n_auto_reclaim_execute_for_startup
 
   if [ "$AUTO_GAP_WATCH_ENABLE" -eq 1 ]; then
     write_gap_watch_control_file \
@@ -2207,6 +2273,7 @@ main() {
 
   echo "KV range (same server process): start=$KV_START end=$KV_END"
   configure_uvm_params
+  enable_phase_n_auto_reclaim_execute_after_ready
 
   echo "UVM params configured."
   echo "Stats log: $TRACE_LOG"

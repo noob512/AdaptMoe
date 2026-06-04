@@ -50,8 +50,8 @@ Temp scratch pool:
 因此当前阶段定义为：
 
 ```text
-当前阶段: P7 稳定性/性能 A/B harness 已落地，等待长实验数据
-下一检查点: 运行多请求 A/B 与预算 sweep，按结果收敛 accounting、限速和 enforce 前策略
+当前阶段: P7 hard partition enforce 闭环已落地，等待重编译/重载后的证明实验
+下一检查点: 运行 hard partition proof，确认超预算池要么 reclaim-to-budget，要么产生 deny/block/reject 证据
 ```
 
 ## 1. 实时计划表
@@ -69,8 +69,8 @@ Temp scratch pool:
 | P3: Pool budget/state ioctl | Control Plane Done | 三池预算和 region state 下沉到 driver | 已新增 `SET_POOL_BUDGET`、`GET_POOL_STATE`、`UPDATE_REGION_STATE`、`QUERY_REGION`、`QUERY_REGION_BY_VA`；Python/C++ helper 已封装；scratch 默认可配置约 100MiB temp budget | 运行 phase-n-region smoke；接入 vLLM 启动配置 | driver 内部保存并查询 KV/weight/temp-scratch budget/state |
 | P4: Real residency accounting | Scan Calibration Done | driver 维护真实 resident bytes | `GET_POOL_STATE` 已对已注册 region 做 scan/query 汇总并写回 per-pool resident_gpu/resident_cpu/reclaim bytes | 接 migrate/make-resident/evict/free 增量更新 | `pool_resident_gpu_bytes` 与 query 误差可控 |
 | P5: Driver victim selection | Batch Trace Done | driver 自主选择 victim | `GET_POOL_STATE` 已计算 over_budget/reclaim_target/victim_candidate/selected_victim trace 字段，并返回最多 8 个 batch victim 候选；scratch 只把 `TRANSIENT|EVICTABLE` 且非 active/protected 的 region 作为候选 | 用 vLLM 三池 smoke 验证候选质量 | 超 budget 时 driver 选出同 pool 可驱逐页面/region |
-| P6: 接入 UVM eviction/migration | Auto Soft Reclaim Smoke Passed | 使用 UVM 原生路径执行 reclaim | `phase-n-reclaim` 三池 smoke 已通过；`RECLAIM_POOL` 已抽成 `uvm_phase_n_reclaim_pool_execute()` 并调用 `uvm_migrate_managed_range_to_cpu()`；replayable fault batch 外层安全点已接入执行型 `phase_n_auto_reclaim_hook`；`REQUIRE_PHASE_N_AUTO_RECLAIM=1` validation 已 PASS，最新 `would_reclaim=20`、`execute=1`、`success=1`、`reclaimed=1`、`failed_requests=0` | 收敛 P7 稳定性和性能策略；补长期增量 accounting；扩大多请求 A/B | 应用不再发起 CPU/GPU prefetch，driver 能在安全点自动 soft reclaim 并保持请求成功 |
-| P7: 稳定性和性能优化 | Harness Ready | 降低抖动、带宽竞争和锁开销 | P6 smoke 已加入 `every/scan_every/max_victims/cooldown/failure_backoff`，并优先小 victim 降低权重回收扰动；新增 `run_stage_n_p7_ab_sweep.sh`，可跑 native UVM / Stage N trace / Stage N soft / soft sweep / enforce probe，并生成 TSV/Markdown 摘要 | 运行多请求 A/B、scratch/cooldown/max-victim sweep；根据结果补长期 accounting 或调整 per-pool 策略 | TPOT/TTFT 不明显恶化，failed_requests=0，auto reclaim 成功，fault 更稳定 |
+| P6: 接入 UVM eviction/migration | Hard Enforce Implemented | 使用 UVM 原生路径执行 reclaim，并形成硬限制闭环 | `phase-n-reclaim` 三池 smoke 已通过；`RECLAIM_POOL` 已抽成 `uvm_phase_n_reclaim_pool_execute()` 并调用 `uvm_migrate_managed_range_to_cpu()`；replayable fault batch 外层安全点已接入执行型 `phase_n_auto_reclaim_hook`；enforce 模式现在会三池 sweep、优先大 victim、同步多轮 reclaim，最终仍超预算则返回 `NV_ERR_INSUFFICIENT_RESOURCES` 并记录 `deny_or_block=1` | 重编译/重载 UVM 后运行 hard partition proof；再根据结果调预算和性能 | 任一池 final resident 不得无证据超预算；超预算时必须有 pool-specific `reclaim_to_budget=1` 或 `deny/block/reject` |
+| P7: 稳定性和性能优化 | Hard Proof Harness Ready | 降低抖动、带宽竞争和锁开销，并验证硬分区正确性 | `run_stage_n_p7_ab_sweep.sh` 支持 native UVM / Stage N trace / Stage N soft / soft sweep / enforce probe；新增 hard proof wrapper 和 `check_stage_n_hard_partition.py`，汇总 `Hard pass`、`Max over bytes`、`Hard block`、`Scratch reject` | 先跑 hard partition proof；随后运行多请求 A/B、scratch/cooldown/max-victim sweep | hard proof PASS；性能 A/B 中 TTFT/TPOT 不明显恶化；soft 模式 failed_requests=0 |
 | P8: BPF 可选插件 | Pending | 快速实验 victim scoring | 当前不需要 BPF 承载正确性 | 暴露只读 kfunc/struct_ops score hook | 不加载 BPF 时 C 策略完整可用 |
 | P9: 通用化 | Pending | 支持非 vLLM workload | vLLM 内已有较多专用接入 | 提供 C/Python tag SDK，适配 llama.cpp/SGLang | 新应用只需少量 tag 接入 |
 
@@ -1742,29 +1742,34 @@ make -C kernel-module/nvidia-module/kernel-open modules NV_KERNEL_MODULES=nvidia
 ```
 
 ```text
-更新日期: 2026-05-27
-当前阶段: P7 稳定性/性能 A/B harness 已落地，等待长实验数据
+更新日期: 2026-06-04
+当前阶段: P7 hard partition enforce 闭环已落地，等待重编译/重载后的证明实验
 完成项:
   - driver-backed KV/weights/scratch tag-only smoke
   - GET_POOL_STATE 三池强验收
   - manual phase-n-reclaim 三池 victim/reclaim/post-state 验收
   - replayable fault batch 外层 automatic soft reclaim
-  - rate limit / scan throttle / cooldown / failure backoff / small-victim preference
+  - rate limit / scan throttle / cooldown / failure backoff
+  - enforce 模式三池同步 sweep、多轮 reclaim、超预算后 deny/block
+  - hard proof checker 要求 final under-budget，或 pool-specific reclaim-to-budget/deny-block/reject
+  - weight victim selection 改为大块优先，避免候选很多但只回收小碎块
+  - scratch hard gate 在 enforce 下会释放 rejected managed allocation 并返回 NULL
   - P7 A/B/sweep 脚本 `run_stage_n_p7_ab_sweep.sh`
+  - hard partition proof wrapper `run_stage_n_hard_partition_proof.sh`
 新增证据:
-  - log/stage_n_three_pool_validation_20260527_110849
-  - DRY_RUN=1 的 P7 harness 语法/命令生成验证
+  - 旧 soft 证据: log/stage_n_three_pool_validation_20260527_110849
+  - hard proof checker/script 已补强，待重新加载新 UVM 后实跑
 回归指标:
-  - failed_requests=0
-  - Mean TTFT=744.21ms
-  - Mean TPOT=187.69ms
+  - hard proof 优先验证正确性：超预算池必须 reclaim-to-budget 或 deny/block/reject
+  - soft/P7 A/B 继续用 failed_requests=0、TTFT/TPOT 回归作为性能验收
 阻塞项:
-  - 暂无 P6 阻塞；P7 长实验结果尚未采集
+  - 需要重编译并重载 nvidia_uvm，随后运行 hard partition proof
 下一检查点:
-  - 多请求 A/B：native UVM / Stage M / Stage N trace / Stage N soft
+  - hard partition proof：Stage N enforce probe
+  - 多请求 A/B：native UVM / Stage M / Stage N trace / Stage N soft / Stage N enforce
   - 长期增量 accounting：migrate/evict/free/make-resident 后持续更新 pool state
   - hysteresis、per-pool cooldown、failure backoff 策略调参
-  - enforce mode 前的预算贴近度和性能回归验收
+  - enforce 预算贴近度和性能回归验收
 ```
 
 ### 14.5 P7 A/B 与调参脚本
@@ -1844,23 +1849,66 @@ UVM_PHASE_F_ROUTE_LOG_DELAY_MS=0 \
 ./run_stage_n_p7_ab_sweep.sh
 ```
 
-enforce 前探测：
+hard partition enforce 证明实验：
 
 ```bash
 cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
-RUN_ROOT=log/stage_n_p7_enforce_probe_$(date -u +%Y%m%d_%H%M%S) \
-P7_VARIANTS=stage_n_enforce_probe \
-REPEATS=2 \
-PROMPTS=8 \
-REQUEST_RATE=2 \
+RUN_ROOT=log/stage_n_hard_partition_proof_$(date -u +%Y%m%d_%H%M%S) \
 RESET_COUNTERS=1 \
 UVM_PHASE_F_ROUTE_LOG_DELAY_MS=0 \
-./run_stage_n_p7_ab_sweep.sh
+./run_stage_n_hard_partition_proof.sh
 ```
 
 建议下一次更新目标：
 
 ```text
-运行 P7 A/B/sweep 后，把 `p7_ab_summary.md` 中的最佳参数写回默认配置；
-若出现 TPOT/TTFT 回退或 reclaim 抖动，再补 per-pool cooldown/accounting 修正。
+先用 `run_stage_n_hard_partition_proof.sh` 证明硬分区正确性；
+随后运行 P7 A/B/sweep，把 `p7_ab_summary.md` 中的最佳参数写回默认配置。
+若出现 TTFT/TPOT 回退或 reclaim 抖动，再补 per-pool cooldown/accounting 修正。
+```
+
+### 14.6 hard partition proof 启动安全修复
+
+2026-06-04 更新：`log/stage_n_hard_partition_proof_20260604_122852` 的 WARN 不是一次完整 hard proof 失败，而是实验没有真正进入 benchmark。证据是 `vllm_bench.log` 为空、TTFT/TPOT 为空，server log 停在 FlashInfer autotune / EngineCore 初始化附近，`run.log` 报等待 server readiness 和 KV range 超时。根因是 enforce proof 把 `uvm_phase_n_auto_reclaim_execute=1`、`scan_every=0`、`max_victims=128` 过早作用到 server startup/warmup 阶段，导致初始化期被 hard reclaim 扫描和 scratch hard gate 干扰。
+
+本轮修复：
+
+```text
+run_kv_fault_ratio.sh:
+  新增 UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY
+  当该开关为 1 时，模块加载和 server startup 阶段强制 execute=0
+  等 /v1/models ready 且 KV range 出现后，再写回目标 execute 值
+  cleanup 时把 execute 置回 0，避免影响下一次实验
+
+run_stage_n_tag_only_three_pool_smoke.sh:
+  hard partition 模式默认 UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY=1
+  summary/env/command 都记录该开关
+
+run_stage_n_p7_ab_sweep.sh 和 run_stage_n_hard_partition_proof.sh:
+  enforce/hard variants 默认启用 ready-gated execute
+
+uvm_allocator.cpp:
+  新增 VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP，默认 0
+  scratch hard gate 仍约束 runtime_scratch/runtime_workspace
+  warmup_workspace 默认只记录 over-budget telemetry，不做 hard reject
+  若要做反向压力实验，可显式设置 VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP=1
+```
+
+这不是降低 hard partition 验收标准。`check_stage_n_hard_partition.py` 仍要求：任一池如果 `resident_gpu_bytes > budget_bytes`，必须看到足够的 reclaim-to-budget 或 deny/block/reject 证据，否则 `hard_partition_pass=0`。ready gate 只避免在服务尚未 ready、KV/weight/scratch region 还没形成稳定可观测状态之前执行 hard reclaim。默认 `VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP=0` 时，hard pass 的 scratch 峰值只统计 runtime scratch；all/warmup scratch 峰值仍单独输出为 telemetry，用来确认启动保护是否生效。
+
+新的 hard proof 期望证据：
+
+```text
+run.log:
+  Stage N auto reclaim execute staged off for server startup.
+  Stage N auto reclaim execute enabled after server readiness: 1
+
+stage_n_acceptance_summary.txt:
+  phase_n_auto_reclaim_execute_on_ready=1
+  VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP=0
+  hard_partition_pass=1
+  hard_partition_all_driver_pools_under_budget=1
+  或 hard_partition_sufficient_reclaim_to_budget=1
+  或 hard_partition_sufficient_deny_or_block=1
+  failed_requests=0
 ```

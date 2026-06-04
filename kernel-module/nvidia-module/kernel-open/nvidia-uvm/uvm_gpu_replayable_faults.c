@@ -3018,26 +3018,32 @@ static void enable_disable_prefetch_faults(uvm_parent_gpu_t *parent_gpu,
     }
 }
 
-static void phase_n_auto_reclaim_after_replayable_batch(uvm_fault_service_batch_context_t *batch_context)
+static NV_STATUS phase_n_auto_reclaim_after_replayable_batch(uvm_fault_service_batch_context_t *batch_context)
 {
     NvU32 i;
     NvU32 attempts = 0;
+    NV_STATUS first_error = NV_OK;
 
     for (i = 0;
          i < batch_context->num_coalesced_faults && attempts < UVM_PHASE_N_AUTO_RECLAIM_OUTER_MAX_PER_BATCH;
          ++i) {
         uvm_fault_buffer_entry_t *entry = batch_context->ordered_fault_cache[i];
+        NV_STATUS status;
 
         if (!entry || !entry->va_space || !entry->gpu || entry->is_fatal)
             continue;
 
-        (void)uvm_phase_n_auto_reclaim_outer_hook(entry->va_space,
-                                                  entry->fault_address,
-                                                  PAGE_SIZE,
-                                                  uvm_id_value(entry->gpu->id),
-                                                  0);
+        status = uvm_phase_n_auto_reclaim_outer_hook(entry->va_space,
+                                                     entry->fault_address,
+                                                     PAGE_SIZE,
+                                                     uvm_id_value(entry->gpu->id),
+                                                     0);
+        if (status != NV_OK && first_error == NV_OK)
+            first_error = status;
         ++attempts;
     }
+
+    return first_error;
 }
 
 void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
@@ -3096,7 +3102,7 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         num_replays += batch_context->num_replays;
 
         if (status == NV_OK)
-            phase_n_auto_reclaim_after_replayable_batch(batch_context);
+            status = phase_n_auto_reclaim_after_replayable_batch(batch_context);
 
         enable_disable_prefetch_faults(parent_gpu, batch_context);
 

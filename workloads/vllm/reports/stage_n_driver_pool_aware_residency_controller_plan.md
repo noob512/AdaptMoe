@@ -898,10 +898,10 @@ victim:
 验证侧:
   重新运行 `phase-n-reclaim` 时当前加载模块仍是旧版，log 显示
   `ioctl 82/83 not found`，因此这次失败是模块未重载，不是 reclaim 逻辑失败。
-  `make -C kernel-module/nvidia-module/kernel-open modules NV_KERNEL_MODULES=nvidia-uvm`
-  已编译 `uvm.c`、`uvm_migrate.c` 并链接到 `nvidia-uvm.o`；最终仍在单独构建
-  `nvidia-uvm` 的 modpost 阶段因缺少 core `nvidia` 模块符号失败，这是既有
-  构建方式限制。
+  单独 `NV_KERNEL_MODULES=nvidia-uvm` 会在 modpost 阶段缺少 core `nvidia`
+  模块导出的 `nvUvmInterface*` 符号；后续构建必须使用
+  `workloads/vllm/build_stage_n_modules.sh`，或显式
+  `NV_KERNEL_MODULES="nvidia nvidia-uvm"`。
 ```
 
 2026-05-27 make-resident hook preflight 更新：
@@ -1649,10 +1649,9 @@ VLLM_UVM_PHASE_F_IOCTL_MODE=policy ./run_stage_m_phase_f_smoke.sh --no-enable-te
   PASS
   attempted=1 success=1 failure=0 reclaimed=1048576 victim_status=0x0
 
-make -C kernel-module/nvidia-module/kernel-open modules NV_KERNEL_MODULES=nvidia-uvm
-  uvm.c / uvm_migrate.c / uvm_va_space.c 编译通过，nvidia-uvm.o 链接通过
-  最终 modpost 因只构建 nvidia-uvm、缺少 nvidia 核心模块符号失败
-  这不是 Stage N 代码编译错误
+./workloads/vllm/build_stage_n_modules.sh
+  使用 `NV_KERNEL_MODULES="nvidia nvidia-uvm"` 同轮构建，避免
+  nvidia-uvm modpost 缺少 `nvUvmInterface*` 符号
   当前仍有既有 warning: uvm_ioctl frame size 1152 > 1024
 
 2026-05-27 本轮 smoke:

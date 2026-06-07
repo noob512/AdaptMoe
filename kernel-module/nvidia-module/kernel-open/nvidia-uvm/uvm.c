@@ -85,6 +85,21 @@ typedef struct
     NV_STATUS status;
 } uvm_phase_n_reclaim_victim_t;
 
+typedef struct
+{
+    uvm_phase_n_block_t *block;
+    NvU64 tagged_region_id;
+    NvU64 radix_key;
+    NvU64 native_block_index;
+    NvU64 block_start;
+    NvU64 block_end;
+    NvU64 migrate_base;
+    NvU64 migrate_length;
+    NvU64 account_bytes;
+    NvU32 pool;
+    NV_STATUS status;
+} uvm_phase_n_block_reclaim_victim_t;
+
 static int uvm_phase_n_auto_reclaim_enable __read_mostly = 0;
 module_param(uvm_phase_n_auto_reclaim_enable, int, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_phase_n_auto_reclaim_enable,
@@ -123,13 +138,549 @@ module_param(uvm_phase_n_auto_reclaim_failure_backoff_epochs, uint, S_IRUGO | S_
 MODULE_PARM_DESC(uvm_phase_n_auto_reclaim_failure_backoff_epochs,
                  "Backoff epochs after a failed Stage N automatic reclaim attempt. Default: 256.");
 
+static int uvm_phase_n_block_quota_enable __read_mostly = 0;
+module_param(uvm_phase_n_block_quota_enable, int, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_block_quota_enable,
+                 "Enable Stage N native-UVM-block quota accounting. Default: 0.");
+
+static unsigned uvm_phase_n_block_quota_trace_only __read_mostly = 1;
+module_param(uvm_phase_n_block_quota_trace_only, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_block_quota_trace_only,
+                 "Keep Stage N block quota in trace/accounting-only mode. Default: 1.");
+
 #define UVM_PHASE_N_RECLAIM_FLAG_DRY_RUN_INTERNAL (1U << 31)
 #define UVM_PHASE_N_RECLAIM_VICTIM_SCAN_MAX 128
 #define UVM_PHASE_N_ENFORCE_RECLAIM_MAX_ROUNDS 16
+#define UVM_PHASE_N_BLOCK_KEY_MAX_PROBES 4096
 
 static bool uvm_phase_n_valid_pool(NvU32 pool)
 {
     return pool < UVM_PHASE_N_POOL_STATE_MAX;
+}
+
+static bool uvm_phase_n_valid_tagged_pool(NvU32 pool)
+{
+    return pool > UVM_PHASE_N_POOL_UNKNOWN && pool < UVM_PHASE_N_POOL_STATE_MAX;
+}
+
+static NvU64 uvm_phase_n_range_end(NvU64 base, NvU64 length)
+{
+    if (length == 0)
+        return base;
+
+    if (base + length - 1 < base)
+        return ULLONG_MAX;
+
+    return base + length - 1;
+}
+
+static NvU64 uvm_phase_n_budget_blocks(NvU64 budget_bytes)
+{
+    if (budget_bytes == 0)
+        return 0;
+
+    return (budget_bytes + UVM_VA_BLOCK_SIZE - 1) / UVM_VA_BLOCK_SIZE;
+}
+
+static unsigned long uvm_phase_n_block_base_key(uvm_va_range_managed_t *managed_range, NvU64 native_block_index)
+{
+    NvU64 key = (NvU64)(uintptr_t)managed_range;
+
+    key >>= 4;
+    key ^= native_block_index + 0x9e3779b97f4a7c15ULL + (key << 6) + (key >> 2);
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+
+    return (unsigned long)key;
+}
+
+static uvm_phase_f_region_t *uvm_phase_n_find_tagged_region(uvm_va_space_t *va_space, NvU64 address)
+{
+    uvm_range_tree_node_t *node;
+    uvm_phase_f_region_t *region;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    node = uvm_range_tree_find(&va_space->phase_f_region_ranges, address);
+    region = uvm_phase_f_region_from_node(node);
+    if (!region || !uvm_phase_n_valid_tagged_pool(region->pool))
+        return NULL;
+
+    return region;
+}
+
+static NV_STATUS uvm_phase_n_native_block_identity(uvm_va_space_t *va_space,
+                                                   NvU64 address,
+                                                   uvm_va_range_managed_t **out_managed_range,
+                                                   NvU64 *out_native_block_index,
+                                                   uvm_va_block_t **out_native_block)
+{
+    uvm_va_range_t *va_range;
+    uvm_va_range_managed_t *managed_range;
+    uvm_va_block_t *native_block = NULL;
+    size_t native_block_index;
+    NV_STATUS status;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    va_range = uvm_va_range_find(va_space, address);
+    managed_range = uvm_va_range_to_managed_or_null(va_range);
+    if (!managed_range)
+        return NV_ERR_INVALID_ADDRESS;
+
+    native_block_index = uvm_va_range_block_index(managed_range, address);
+    status = uvm_va_range_block_create(managed_range, native_block_index, &native_block);
+    if (status != NV_OK)
+        return status;
+
+    *out_managed_range = managed_range;
+    *out_native_block_index = (NvU64)native_block_index;
+    *out_native_block = native_block;
+    return NV_OK;
+}
+
+static uvm_phase_n_block_t *uvm_phase_n_find_block(uvm_va_space_t *va_space,
+                                                   uvm_va_range_managed_t *managed_range,
+                                                   NvU64 native_block_index,
+                                                   unsigned long *out_key)
+{
+    struct radix_tree_root *root = &va_space->phase_n_blocks;
+    unsigned long key = uvm_phase_n_block_base_key(managed_range, native_block_index);
+    unsigned probe;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    for (probe = 0; probe < UVM_PHASE_N_BLOCK_KEY_MAX_PROBES; ++probe, ++key) {
+        uvm_phase_n_block_t *block = radix_tree_lookup(root, key);
+
+        if (!block) {
+            if (out_key)
+                *out_key = key;
+            return NULL;
+        }
+
+        if (block->managed_range == managed_range &&
+            block->native_block_index == native_block_index) {
+            if (out_key)
+                *out_key = key;
+            return block;
+        }
+    }
+
+    if (out_key)
+        *out_key = 0;
+    return NULL;
+}
+
+static NvBool uvm_phase_n_detect_mixed_pool(uvm_va_space_t *va_space,
+                                            const uvm_phase_f_region_t *tagged_region,
+                                            NvU64 block_start,
+                                            NvU64 block_end)
+{
+    uvm_range_tree_node_t *node;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    uvm_range_tree_for_each_in(node, &va_space->phase_f_region_ranges, block_start, block_end) {
+        uvm_phase_f_region_t *region = uvm_phase_f_region_from_node(node);
+
+        if (!region || !uvm_phase_n_valid_tagged_pool(region->pool))
+            continue;
+
+        if (region->pool != tagged_region->pool)
+            return NV_TRUE;
+    }
+
+    return NV_FALSE;
+}
+
+static NV_STATUS uvm_phase_n_create_block(uvm_va_space_t *va_space,
+                                          const uvm_phase_f_region_t *tagged_region,
+                                          uvm_va_range_managed_t *managed_range,
+                                          NvU64 native_block_index,
+                                          uvm_va_block_t *native_block,
+                                          unsigned long key,
+                                          uvm_phase_n_block_t **out_block)
+{
+    uvm_phase_n_block_pool_t *block_pool;
+    uvm_phase_n_block_t *block;
+    NvU64 region_end;
+    int ret;
+
+    block = uvm_kvmalloc_zero(sizeof(*block));
+    if (!block)
+        return NV_ERR_NO_MEMORY;
+
+    block_pool = &va_space->phase_n_block_pools[tagged_region->pool];
+    region_end = uvm_phase_n_range_end(tagged_region->base, tagged_region->length);
+
+    block->managed_range = managed_range;
+    block->tagged_region_id = tagged_region->region_id;
+    block->native_block_index = native_block_index;
+    block->radix_key = key;
+    block->block_start = native_block->start;
+    block->block_end = native_block->end;
+    block->covered_start = max(tagged_region->base, native_block->start);
+    block->covered_end = min(region_end, native_block->end);
+    block->pool = tagged_region->pool;
+    block->flags = tagged_region->flags;
+    block->mixed_pool = uvm_phase_n_detect_mixed_pool(va_space,
+                                                      tagged_region,
+                                                      native_block->start,
+                                                      native_block->end);
+    INIT_LIST_HEAD(&block->queue_node);
+
+    ret = radix_tree_insert(&va_space->phase_n_blocks, key, block);
+    if (ret != 0) {
+        uvm_kvfree(block);
+        return errno_to_nv_status(ret);
+    }
+
+    ++block_pool->materialized_blocks;
+    if (block->mixed_pool)
+        ++block_pool->mixed_blocks;
+
+    uvm_phase_f_route_log("phase_n_block_materialize region_id=%llu pool=%u key=%lu managed_range=0x%llx native_block_index=%llu block_start=0x%llx block_end=0x%llx covered_start=0x%llx covered_end=0x%llx mixed_pool=%u materialized_blocks=%llu mixed_blocks=%llu\n",
+                          block->tagged_region_id,
+                          block->pool,
+                          key,
+                          (NvU64)(uintptr_t)managed_range,
+                          block->native_block_index,
+                          block->block_start,
+                          block->block_end,
+                          block->covered_start,
+                          block->covered_end,
+                          block->mixed_pool ? 1 : 0,
+                          block_pool->materialized_blocks,
+                          block_pool->mixed_blocks);
+
+    if (block->mixed_pool) {
+        uvm_phase_f_route_log("phase_n_block_mixed_pool region_id=%llu pool=%u key=%lu managed_range=0x%llx native_block_index=%llu block_start=0x%llx block_end=0x%llx mixed_blocks=%llu\n",
+                              block->tagged_region_id,
+                              block->pool,
+                              key,
+                              (NvU64)(uintptr_t)managed_range,
+                              block->native_block_index,
+                              block->block_start,
+                              block->block_end,
+                              block_pool->mixed_blocks);
+    }
+
+    *out_block = block;
+    return NV_OK;
+}
+
+static NV_STATUS uvm_phase_n_find_or_create_block(uvm_va_space_t *va_space,
+                                                  NvU64 address,
+                                                  uvm_phase_f_region_t **out_region,
+                                                  uvm_phase_n_block_t **out_block)
+{
+    uvm_phase_f_region_t *region;
+    uvm_va_range_managed_t *managed_range = NULL;
+    uvm_va_block_t *native_block = NULL;
+    uvm_phase_n_block_t *block;
+    unsigned long key = 0;
+    NvU64 native_block_index = 0;
+    NV_STATUS status;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    region = uvm_phase_n_find_tagged_region(va_space, address);
+    if (!region)
+        return NV_ERR_OBJECT_NOT_FOUND;
+
+    status = uvm_phase_n_native_block_identity(va_space,
+                                               address,
+                                               &managed_range,
+                                               &native_block_index,
+                                               &native_block);
+    if (status != NV_OK)
+        return status;
+
+    block = uvm_phase_n_find_block(va_space, managed_range, native_block_index, &key);
+    if (!block) {
+        status = uvm_phase_n_create_block(va_space,
+                                          region,
+                                          managed_range,
+                                          native_block_index,
+                                          native_block,
+                                          key,
+                                          &block);
+        if (status != NV_OK)
+            return status;
+    }
+    else if (block->pool != region->pool && !block->mixed_pool) {
+        block->mixed_pool = NV_TRUE;
+        ++va_space->phase_n_block_pools[block->pool].mixed_blocks;
+        uvm_phase_f_route_log("phase_n_block_mixed_pool region_id=%llu pool=%u existing_pool=%u key=%lu managed_range=0x%llx native_block_index=%llu block_start=0x%llx block_end=0x%llx mixed_blocks=%llu reason=late_tagged_pool_overlap\n",
+                              region->region_id,
+                              region->pool,
+                              block->pool,
+                              block->radix_key,
+                              (NvU64)(uintptr_t)managed_range,
+                              block->native_block_index,
+                              block->block_start,
+                              block->block_end,
+                              va_space->phase_n_block_pools[block->pool].mixed_blocks);
+    }
+
+    *out_region = region;
+    *out_block = block;
+    return NV_OK;
+}
+
+static void uvm_phase_n_update_block_pressure(uvm_va_space_t *va_space,
+                                              NvU32 pool,
+                                              uvm_phase_n_block_pool_t *block_pool)
+{
+    NvU64 over_blocks = 0;
+
+    if (block_pool->budget_blocks > 0 && block_pool->resident_blocks > block_pool->budget_blocks) {
+        over_blocks = block_pool->resident_blocks - block_pool->budget_blocks;
+        ++block_pool->quota_over_events;
+        block_pool->max_over_blocks = max(block_pool->max_over_blocks, over_blocks);
+    }
+
+    va_space->phase_n_pools[pool].resident_gpu_bytes = block_pool->resident_blocks * UVM_VA_BLOCK_SIZE;
+    va_space->phase_n_pools[pool].over_budget_bytes = over_blocks * UVM_VA_BLOCK_SIZE;
+    va_space->phase_n_pools[pool].victim_candidate_bytes = block_pool->resident_blocks * UVM_VA_BLOCK_SIZE;
+    va_space->phase_n_pools[pool].victim_candidate_regions = block_pool->materialized_blocks;
+    va_space->phase_n_pools[pool].selected_victim_region_id = 0;
+    va_space->phase_n_pools[pool].selected_victim_bytes = 0;
+    va_space->phase_n_pools[pool].victim_count = 0;
+    va_space->phase_n_pools[pool].over_budget_events = block_pool->quota_over_events;
+    va_space->phase_n_pools[pool].reclaim_success_events = block_pool->reclaim_success;
+    va_space->phase_n_pools[pool].reclaim_failed_events = block_pool->reclaim_failures + block_pool->cross_pool_victim_errors;
+    va_space->phase_n_pools[pool].accounting_corrections = block_pool->mixed_blocks;
+}
+
+static void uvm_phase_n_mark_block_resident(uvm_va_space_t *va_space,
+                                            uvm_phase_n_block_t *block,
+                                            NvU64 epoch)
+{
+    uvm_phase_n_block_pool_t *block_pool = &va_space->phase_n_block_pools[block->pool];
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    block->last_access_epoch = epoch;
+    if (!block->gpu_resident) {
+        block->gpu_resident = NV_TRUE;
+        block->resident_epoch = epoch;
+        ++block_pool->resident_blocks;
+    }
+
+    if (!block->queued) {
+        list_add_tail(&block->queue_node, &block_pool->resident_queue);
+        block->queued = NV_TRUE;
+    }
+
+    uvm_phase_n_update_block_pressure(va_space, block->pool, block_pool);
+}
+
+static NV_STATUS uvm_phase_n_materialize_access(uvm_va_space_t *va_space,
+                                                NvU64 address,
+                                                NvU64 length,
+                                                NvU32 gpu_id,
+                                                NvU32 cause,
+                                                NvU64 epoch,
+                                                const char *phase)
+{
+    uvm_phase_f_region_t *region = NULL;
+    uvm_phase_n_block_t *block = NULL;
+    uvm_phase_n_block_pool_t *block_pool;
+    NV_STATUS status;
+
+    uvm_va_space_down_write(va_space);
+    status = uvm_phase_n_find_or_create_block(va_space, address, &region, &block);
+    if (status == NV_OK) {
+        uvm_phase_n_mark_block_resident(va_space, block, epoch);
+        block_pool = &va_space->phase_n_block_pools[block->pool];
+        uvm_phase_f_route_log("phase_n_block_summary phase=%s epoch=%llu address=0x%llx length=%llu gpu_id=%u cause=%u pool=%u region_id=%llu key=%lu native_block_index=%llu resident_blocks=%llu budget_blocks=%llu materialized_blocks=%llu mixed_blocks=%llu over_blocks=%llu trace_only=%u\n",
+                              phase,
+                              epoch,
+                              address,
+                              length,
+                              gpu_id,
+                              cause,
+                              block->pool,
+                              region ? region->region_id : 0,
+                              block->radix_key,
+                              block->native_block_index,
+                              block_pool->resident_blocks,
+                              block_pool->budget_blocks,
+                              block_pool->materialized_blocks,
+                              block_pool->mixed_blocks,
+                              block_pool->budget_blocks > 0 && block_pool->resident_blocks > block_pool->budget_blocks ?
+                                  block_pool->resident_blocks - block_pool->budget_blocks : 0,
+                              uvm_phase_n_block_quota_trace_only ? 1 : 0);
+    }
+    uvm_va_space_up_write(va_space);
+
+    if (status == NV_ERR_OBJECT_NOT_FOUND) {
+        uvm_phase_f_route_log("phase_n_block_summary phase=%s epoch=%llu address=0x%llx length=%llu gpu_id=%u cause=%u skip=no_tagged_region\n",
+                              phase,
+                              epoch,
+                              address,
+                              length,
+                              gpu_id,
+                              cause);
+        return NV_OK;
+    }
+
+    if (status != NV_OK) {
+        uvm_phase_f_route_log("phase_n_block_summary phase=%s epoch=%llu address=0x%llx length=%llu gpu_id=%u cause=%u status=%u skip=materialize_failed\n",
+                              phase,
+                              epoch,
+                              address,
+                              length,
+                              gpu_id,
+                              cause,
+                              status);
+        if (uvm_phase_n_block_quota_trace_only)
+            return NV_OK;
+    }
+
+    return status;
+}
+
+static NV_STATUS uvm_phase_n_get_pool_state_blocks(uvm_va_space_t *va_space,
+                                                   UVM_PHASE_N_GET_POOL_STATE_PARAMS *params)
+{
+    uvm_phase_n_pool_state_t pool_state;
+    NvU64 budget_blocks;
+    NvU64 resident_blocks;
+    NvU64 materialized_blocks;
+    NvU64 mixed_blocks;
+    NvU64 quota_over_events;
+    NvU64 max_over_blocks;
+    NvU64 reclaim_success;
+    NvU64 reclaim_failures;
+    NvU64 over_blocks = 0;
+
+    memset(params->victim_region_ids, 0, sizeof(params->victim_region_ids));
+    memset(params->victim_bytes, 0, sizeof(params->victim_bytes));
+
+    uvm_va_space_down_read(va_space);
+    pool_state = va_space->phase_n_pools[params->pool];
+    budget_blocks = va_space->phase_n_block_pools[params->pool].budget_blocks;
+    resident_blocks = va_space->phase_n_block_pools[params->pool].resident_blocks;
+    materialized_blocks = va_space->phase_n_block_pools[params->pool].materialized_blocks;
+    mixed_blocks = va_space->phase_n_block_pools[params->pool].mixed_blocks;
+    quota_over_events = va_space->phase_n_block_pools[params->pool].quota_over_events;
+    max_over_blocks = va_space->phase_n_block_pools[params->pool].max_over_blocks;
+    reclaim_success = va_space->phase_n_block_pools[params->pool].reclaim_success;
+    reclaim_failures = va_space->phase_n_block_pools[params->pool].reclaim_failures +
+                       va_space->phase_n_block_pools[params->pool].cross_pool_victim_errors;
+    uvm_va_space_up_read(va_space);
+
+    if (budget_blocks > 0 && resident_blocks > budget_blocks)
+        over_blocks = resident_blocks - budget_blocks;
+
+    params->budget_bytes = pool_state.budget_bytes;
+    params->resident_gpu_bytes = resident_blocks * UVM_VA_BLOCK_SIZE;
+    params->resident_cpu_bytes = 0;
+    params->reclaim_bytes = materialized_blocks * UVM_VA_BLOCK_SIZE;
+    params->protected_bytes = 0;
+    params->evictable_bytes = resident_blocks * UVM_VA_BLOCK_SIZE;
+    params->over_budget_bytes = over_blocks * UVM_VA_BLOCK_SIZE;
+    params->reclaim_target_bytes = params->over_budget_bytes;
+    params->victim_candidate_bytes = resident_blocks * UVM_VA_BLOCK_SIZE;
+    params->victim_candidate_regions = materialized_blocks;
+    params->selected_victim_region_id = 0;
+    params->selected_victim_bytes = max_over_blocks * UVM_VA_BLOCK_SIZE;
+    params->victim_count = resident_blocks > UVM_PHASE_N_TRACE_VICTIM_MAX ?
+                               UVM_PHASE_N_TRACE_VICTIM_MAX :
+                               (NvU32)resident_blocks;
+    params->reserved = 0;
+    params->over_budget_events = quota_over_events;
+    params->reclaim_success_events = reclaim_success;
+    params->reclaim_failed_events = reclaim_failures;
+    params->accounting_corrections = mixed_blocks;
+    params->mode = pool_state.mode;
+    params->flags = pool_state.flags;
+
+    uvm_phase_f_route_log("phase_n_get_pool_state block_quota=1 pool=%u gpu_id=%u budget=%llu budget_blocks=%llu resident_blocks=%llu resident_bytes=%llu materialized_blocks=%llu mixed_blocks=%llu over_blocks=%llu max_over_blocks=%llu reclaim_success=%llu reclaim_failures=%llu mode=%u flags=0x%x trace_only=%u\n",
+                          params->pool,
+                          params->gpu_id,
+                          params->budget_bytes,
+                          budget_blocks,
+                          resident_blocks,
+                          params->resident_gpu_bytes,
+                          materialized_blocks,
+                          mixed_blocks,
+                          over_blocks,
+                          max_over_blocks,
+                          reclaim_success,
+                          reclaim_failures,
+                          params->mode,
+                          params->flags,
+                          uvm_phase_n_block_quota_trace_only ? 1 : 0);
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_phase_n_reclaim_pool_blocks_trace(uvm_va_space_t *va_space,
+                                                       UVM_PHASE_N_RECLAIM_POOL_PARAMS *params)
+{
+    uvm_phase_n_pool_state_t pool_state;
+    uvm_phase_n_block_pool_t block_pool;
+    NvU64 over_blocks = 0;
+
+    params->attempted_regions = 0;
+    params->success_regions = 0;
+    params->failure_regions = 0;
+    params->victim_count = 0;
+    params->budget_bytes = 0;
+    params->resident_gpu_bytes_before = 0;
+    params->over_budget_bytes = 0;
+    params->reclaim_target_bytes = 0;
+    params->attempted_bytes = 0;
+    params->reclaimed_bytes = 0;
+    params->failed_bytes = 0;
+    params->victim_candidate_bytes = 0;
+    params->victim_candidate_regions = 0;
+    params->cooldown_skipped_bytes = 0;
+    params->cooldown_skipped_regions = 0;
+    memset(params->victim_region_ids, 0, sizeof(params->victim_region_ids));
+    memset(params->victim_bytes, 0, sizeof(params->victim_bytes));
+    memset(params->victim_status, 0, sizeof(params->victim_status));
+
+    uvm_va_space_down_read(va_space);
+    pool_state = va_space->phase_n_pools[params->pool];
+    block_pool = va_space->phase_n_block_pools[params->pool];
+    uvm_va_space_up_read(va_space);
+
+    if (block_pool.budget_blocks > 0 && block_pool.resident_blocks > block_pool.budget_blocks)
+        over_blocks = block_pool.resident_blocks - block_pool.budget_blocks;
+
+    params->budget_bytes = pool_state.budget_bytes;
+    params->resident_gpu_bytes_before = block_pool.resident_blocks * UVM_VA_BLOCK_SIZE;
+    params->over_budget_bytes = over_blocks * UVM_VA_BLOCK_SIZE;
+    params->reclaim_target_bytes = params->target_bytes != 0 ? params->target_bytes : params->over_budget_bytes;
+    params->victim_candidate_bytes = block_pool.resident_blocks * UVM_VA_BLOCK_SIZE;
+    params->victim_candidate_regions = block_pool.materialized_blocks;
+    params->victim_count = block_pool.resident_blocks > UVM_PHASE_N_TRACE_VICTIM_MAX ?
+                               UVM_PHASE_N_TRACE_VICTIM_MAX :
+                               (NvU32)block_pool.resident_blocks;
+    params->reclaim_success_events = block_pool.reclaim_success;
+    params->reclaim_failed_events = block_pool.reclaim_failures + block_pool.cross_pool_victim_errors;
+    params->mode = pool_state.mode;
+    params->pool_flags = pool_state.flags;
+
+    uvm_phase_f_route_log("phase_n_reclaim_pool block_quota=1 pool=%u gpu_id=%u mode=%u budget=%llu budget_blocks=%llu resident_blocks=%llu over_blocks=%llu target=%llu candidates=%llu trace_only=%u attempted=0 success=0 failure=0 skip=trace_only\n",
+                          params->pool,
+                          params->gpu_id,
+                          params->mode,
+                          params->budget_bytes,
+                          block_pool.budget_blocks,
+                          block_pool.resident_blocks,
+                          over_blocks,
+                          params->reclaim_target_bytes,
+                          params->victim_candidate_regions,
+                          uvm_phase_n_block_quota_trace_only ? 1 : 0);
+
+    return NV_OK;
 }
 
 static uvm_gpu_t *uvm_phase_n_gpu_from_id(uvm_va_space_t *va_space, NvU32 gpu_id)
@@ -314,6 +865,397 @@ static bool uvm_phase_n_region_in_cooldown(const uvm_phase_n_region_snapshot_t *
 static bool uvm_phase_n_reclaim_status_success(NV_STATUS status)
 {
     return status == NV_OK || status == NV_WARN_NOTHING_TO_DO;
+}
+
+static NvU64 uvm_phase_n_block_account_bytes(const uvm_phase_n_block_t *block)
+{
+    if (block->block_end >= block->block_start) {
+        NvU64 block_bytes = block->block_end - block->block_start + 1;
+
+        if (block_bytes > 0 && block_bytes < UVM_VA_BLOCK_SIZE)
+            return block_bytes;
+    }
+
+    return UVM_VA_BLOCK_SIZE;
+}
+
+static NV_STATUS uvm_phase_n_block_reclaim_range(const uvm_phase_n_block_t *block,
+                                                 NvU64 *out_base,
+                                                 NvU64 *out_length)
+{
+    NvU64 start;
+    NvU64 end;
+
+    if (block->covered_start <= block->covered_end) {
+        start = block->covered_start;
+        end = block->covered_end;
+    }
+    else {
+        start = block->block_start;
+        end = block->block_end;
+    }
+
+    if (start > end || end == ULLONG_MAX)
+        return NV_ERR_INVALID_ADDRESS;
+
+    start = UVM_PAGE_ALIGN_DOWN(start);
+    end = UVM_PAGE_ALIGN_UP(end + 1) - 1;
+    start = max(start, block->block_start);
+    end = min(end, block->block_end);
+
+    if (start > end)
+        return NV_ERR_INVALID_ADDRESS;
+
+    *out_base = start;
+    *out_length = end - start + 1;
+    return NV_OK;
+}
+
+static NvBool uvm_phase_n_block_reclaim_candidate(NvU32 pool, const uvm_phase_n_block_t *block)
+{
+    NvU32 skip_flags = UVM_PHASE_N_REGION_FLAG_PROTECTED |
+                       UVM_PHASE_N_REGION_FLAG_ACTIVE |
+                       UVM_PHASE_N_REGION_FLAG_PINNED;
+
+    if (!block)
+        return NV_FALSE;
+
+    if (block->pool != pool)
+        return NV_FALSE;
+
+    if (!block->gpu_resident || !block->queued || block->in_reclaim || block->stale)
+        return NV_FALSE;
+
+    if (block->mixed_pool)
+        return NV_FALSE;
+
+    if (!(block->flags & UVM_PHASE_N_REGION_FLAG_EVICTABLE))
+        return NV_FALSE;
+
+    if (block->flags & skip_flags)
+        return NV_FALSE;
+
+    if (pool == UVM_PHASE_N_POOL_SCRATCH &&
+        !(block->flags & UVM_PHASE_N_REGION_FLAG_TRANSIENT)) {
+        return NV_FALSE;
+    }
+
+    return NV_TRUE;
+}
+
+static NvBool uvm_phase_n_select_block_reclaim_victim(uvm_va_space_t *va_space,
+                                                      NvU32 pool,
+                                                      uvm_phase_n_block_reclaim_victim_t *victim)
+{
+    uvm_phase_n_block_pool_t *block_pool = &va_space->phase_n_block_pools[pool];
+    uvm_phase_n_block_t *block;
+    uvm_phase_n_block_t *next;
+
+    uvm_assert_rwsem_locked_write(&va_space->lock);
+    memset(victim, 0, sizeof(*victim));
+
+    list_for_each_entry_safe(block, next, &block_pool->resident_queue, queue_node) {
+        NV_STATUS range_status;
+
+        if (!uvm_phase_n_block_reclaim_candidate(pool, block)) {
+            if (block->pool != pool) {
+                ++block_pool->cross_pool_victim_errors;
+                list_del_init(&block->queue_node);
+                block->queued = NV_FALSE;
+                uvm_phase_f_route_log("phase_n_block_reclaim_skip pool=%u block_pool=%u key=%lu region_id=%llu reason=wrong_pool cross_pool_errors=%llu\n",
+                                      pool,
+                                      block->pool,
+                                      block->radix_key,
+                                      block->tagged_region_id,
+                                      block_pool->cross_pool_victim_errors);
+            }
+            else if (block->stale || !block->gpu_resident) {
+                list_del_init(&block->queue_node);
+                block->queued = NV_FALSE;
+                uvm_phase_f_route_log("phase_n_block_reclaim_skip pool=%u key=%lu region_id=%llu stale=%u gpu_resident=%u reason=dead_or_nonresident\n",
+                                      pool,
+                                      block->radix_key,
+                                      block->tagged_region_id,
+                                      block->stale ? 1 : 0,
+                                      block->gpu_resident ? 1 : 0);
+            }
+
+            continue;
+        }
+
+        range_status = uvm_phase_n_block_reclaim_range(block,
+                                                       &victim->migrate_base,
+                                                       &victim->migrate_length);
+        if (range_status != NV_OK) {
+            ++block_pool->reclaim_failures;
+            list_del_init(&block->queue_node);
+            block->queued = NV_FALSE;
+            block->stale = NV_TRUE;
+            uvm_phase_f_route_log("phase_n_block_reclaim_skip pool=%u key=%lu region_id=%llu status=%u reason=invalid_reclaim_range\n",
+                                  pool,
+                                  block->radix_key,
+                                  block->tagged_region_id,
+                                  range_status);
+            continue;
+        }
+
+        list_del_init(&block->queue_node);
+        block->queued = NV_FALSE;
+        block->in_reclaim = NV_TRUE;
+
+        victim->block = block;
+        victim->tagged_region_id = block->tagged_region_id;
+        victim->radix_key = block->radix_key;
+        victim->native_block_index = block->native_block_index;
+        victim->block_start = block->block_start;
+        victim->block_end = block->block_end;
+        victim->account_bytes = uvm_phase_n_block_account_bytes(block);
+        victim->pool = block->pool;
+        return NV_TRUE;
+    }
+
+    return NV_FALSE;
+}
+
+static void uvm_phase_n_finish_block_reclaim(uvm_va_space_t *va_space,
+                                             uvm_phase_n_block_reclaim_victim_t *victim)
+{
+    uvm_phase_n_block_t *block = victim->block;
+    uvm_phase_n_block_pool_t *block_pool;
+
+    uvm_assert_rwsem_locked_write(&va_space->lock);
+
+    if (!block || !uvm_phase_n_valid_tagged_pool(block->pool))
+        return;
+
+    block_pool = &va_space->phase_n_block_pools[block->pool];
+    block->in_reclaim = NV_FALSE;
+
+    if (uvm_phase_n_reclaim_status_success(victim->status)) {
+        if (block->gpu_resident) {
+            block->gpu_resident = NV_FALSE;
+            block->resident_epoch = 0;
+            if (block_pool->resident_blocks > 0)
+                --block_pool->resident_blocks;
+            else
+                ++block_pool->reclaim_failures;
+        }
+
+        ++block_pool->reclaim_success;
+        ++block_pool->same_pool_victims;
+    }
+    else {
+        ++block_pool->reclaim_failures;
+        if (block->gpu_resident && !block->queued && !block->stale) {
+            list_add_tail(&block->queue_node, &block_pool->resident_queue);
+            block->queued = NV_TRUE;
+        }
+    }
+
+    uvm_phase_n_update_block_pressure(va_space, block->pool, block_pool);
+}
+
+static NV_STATUS uvm_phase_n_reclaim_pool_blocks(uvm_va_space_t *va_space,
+                                                 UVM_PHASE_N_RECLAIM_POOL_PARAMS *params)
+{
+    uvm_phase_n_pool_state_t pool_state;
+    uvm_phase_n_block_pool_t block_pool_snapshot;
+    NvU64 over_blocks = 0;
+    NvU64 resident_after;
+    NvU64 selected_count = 0;
+    NvU32 max_victims;
+    NvU32 i;
+    NvBool execute_reclaim;
+    const char *skip_reason = NULL;
+
+    if (uvm_phase_n_block_quota_trace_only)
+        return uvm_phase_n_reclaim_pool_blocks_trace(va_space, params);
+
+    max_victims = params->max_victims;
+    if (max_victims == 0 || max_victims > UVM_PHASE_N_RECLAIM_VICTIM_SCAN_MAX)
+        max_victims = UVM_PHASE_N_RECLAIM_VICTIM_SCAN_MAX;
+
+    uvm_va_space_down_read(va_space);
+    pool_state = va_space->phase_n_pools[params->pool];
+    block_pool_snapshot = va_space->phase_n_block_pools[params->pool];
+    uvm_va_space_up_read(va_space);
+
+    if (block_pool_snapshot.budget_blocks > 0 &&
+        block_pool_snapshot.resident_blocks > block_pool_snapshot.budget_blocks) {
+        over_blocks = block_pool_snapshot.resident_blocks - block_pool_snapshot.budget_blocks;
+    }
+
+    params->budget_bytes = pool_state.budget_bytes;
+    params->resident_gpu_bytes_before = block_pool_snapshot.resident_blocks * UVM_VA_BLOCK_SIZE;
+    params->over_budget_bytes = over_blocks * UVM_VA_BLOCK_SIZE;
+    if (params->target_bytes != 0) {
+        params->reclaim_target_bytes = params->target_bytes;
+    }
+    else if (params->over_budget_bytes > 0) {
+        NvU64 reclaim_margin = uvm_phase_n_reclaim_margin_bytes(params->pool, pool_state.budget_bytes);
+
+        params->reclaim_target_bytes = params->over_budget_bytes + reclaim_margin;
+        if (params->reclaim_target_bytes < params->over_budget_bytes)
+            params->reclaim_target_bytes = ULLONG_MAX;
+    }
+    params->victim_candidate_bytes = block_pool_snapshot.resident_blocks * UVM_VA_BLOCK_SIZE;
+    params->victim_candidate_regions = block_pool_snapshot.resident_blocks;
+    params->reclaim_success_events = block_pool_snapshot.reclaim_success;
+    params->reclaim_failed_events = block_pool_snapshot.reclaim_failures +
+                                    block_pool_snapshot.cross_pool_victim_errors;
+    params->mode = pool_state.mode;
+    params->pool_flags = pool_state.flags;
+
+    execute_reclaim = params->reclaim_target_bytes > 0 &&
+                      (pool_state.mode == UVM_PHASE_N_MODE_SOFT ||
+                       pool_state.mode == UVM_PHASE_N_MODE_ENFORCE) &&
+                      !(params->flags & UVM_PHASE_N_RECLAIM_FLAG_DRY_RUN_INTERNAL) &&
+                      max_victims > 0;
+
+    if (!execute_reclaim) {
+        if (params->reclaim_target_bytes == 0)
+            skip_reason = "under_budget";
+        else if (pool_state.mode == UVM_PHASE_N_MODE_TRACE_ONLY)
+            skip_reason = "mode_trace_only";
+        else if (params->flags & UVM_PHASE_N_RECLAIM_FLAG_DRY_RUN_INTERNAL)
+            skip_reason = "dry_run";
+        else
+            skip_reason = "no_victims_allowed";
+
+        uvm_phase_f_route_log("phase_n_reclaim_pool block_quota=1 pool=%u gpu_id=%u mode=%u budget=%llu budget_blocks=%llu resident_blocks=%llu over_blocks=%llu target=%llu candidates=%llu trace_only=0 attempted=0 success=0 failure=0 skip=%s\n",
+                              params->pool,
+                              params->gpu_id,
+                              params->mode,
+                              params->budget_bytes,
+                              block_pool_snapshot.budget_blocks,
+                              block_pool_snapshot.resident_blocks,
+                              over_blocks,
+                              params->reclaim_target_bytes,
+                              params->victim_candidate_regions,
+                              skip_reason);
+        return NV_OK;
+    }
+
+    while (selected_count < max_victims && params->attempted_bytes < params->reclaim_target_bytes) {
+        uvm_phase_n_block_reclaim_victim_t victim;
+        NvU32 trace_index = params->victim_count;
+        NvBool trace_victim = trace_index < UVM_PHASE_N_TRACE_VICTIM_MAX;
+        NvBool found;
+
+        uvm_va_space_down_write(va_space);
+        found = uvm_phase_n_select_block_reclaim_victim(va_space, params->pool, &victim);
+        uvm_va_space_up_write(va_space);
+
+        if (!found)
+            break;
+
+        if (trace_victim) {
+            params->victim_region_ids[trace_index] = victim.tagged_region_id;
+            params->victim_bytes[trace_index] = victim.account_bytes;
+        }
+
+        ++selected_count;
+        ++params->attempted_regions;
+        params->attempted_bytes += victim.account_bytes;
+
+        victim.status = uvm_migrate_managed_range_to_cpu(va_space,
+                                                         victim.migrate_base,
+                                                         victim.migrate_length,
+                                                         params->async ? UVM_MIGRATE_FLAG_ASYNC : 0);
+        if (trace_victim)
+            params->victim_status[trace_index] = victim.status;
+
+        if (uvm_phase_n_reclaim_status_success(victim.status)) {
+            ++params->success_regions;
+            params->reclaimed_bytes += victim.account_bytes;
+        }
+        else {
+            ++params->failure_regions;
+            params->failed_bytes += victim.account_bytes;
+        }
+
+        uvm_va_space_down_write(va_space);
+        uvm_phase_n_finish_block_reclaim(va_space, &victim);
+        uvm_va_space_up_write(va_space);
+
+        if (trace_victim)
+            ++params->victim_count;
+
+        uvm_phase_f_route_log("phase_n_block_reclaim pool=%u region_id=%llu key=%lu native_block_index=%llu block_start=0x%llx block_end=0x%llx migrate_base=0x%llx migrate_length=%llu account_bytes=%llu status=%u success=%u async=%u\n",
+                              victim.pool,
+                              victim.tagged_region_id,
+                              victim.radix_key,
+                              victim.native_block_index,
+                              victim.block_start,
+                              victim.block_end,
+                              victim.migrate_base,
+                              victim.migrate_length,
+                              victim.account_bytes,
+                              victim.status,
+                              uvm_phase_n_reclaim_status_success(victim.status) ? 1 : 0,
+                              params->async ? 1 : 0);
+    }
+
+    uvm_va_space_down_write(va_space);
+    uvm_phase_n_update_block_pressure(va_space,
+                                      params->pool,
+                                      &va_space->phase_n_block_pools[params->pool]);
+    block_pool_snapshot = va_space->phase_n_block_pools[params->pool];
+    pool_state = va_space->phase_n_pools[params->pool];
+    resident_after = block_pool_snapshot.resident_blocks * UVM_VA_BLOCK_SIZE;
+    va_space->phase_n_pools[params->pool].reclaim_target_bytes =
+        pool_state.budget_bytes > 0 && resident_after > pool_state.budget_bytes ?
+            resident_after - pool_state.budget_bytes :
+            0;
+    va_space->phase_n_pools[params->pool].victim_candidate_bytes =
+        block_pool_snapshot.resident_blocks * UVM_VA_BLOCK_SIZE;
+    va_space->phase_n_pools[params->pool].victim_candidate_regions =
+        block_pool_snapshot.resident_blocks;
+    va_space->phase_n_pools[params->pool].selected_victim_region_id =
+        params->victim_count > 0 ? params->victim_region_ids[0] : 0;
+    va_space->phase_n_pools[params->pool].selected_victim_bytes =
+        params->victim_count > 0 ? params->victim_bytes[0] : 0;
+    va_space->phase_n_pools[params->pool].victim_count = params->victim_count;
+    memset(va_space->phase_n_pools[params->pool].victim_region_ids, 0,
+           sizeof(va_space->phase_n_pools[params->pool].victim_region_ids));
+    memset(va_space->phase_n_pools[params->pool].victim_bytes, 0,
+           sizeof(va_space->phase_n_pools[params->pool].victim_bytes));
+    for (i = 0; i < params->victim_count; ++i) {
+        va_space->phase_n_pools[params->pool].victim_region_ids[i] = params->victim_region_ids[i];
+        va_space->phase_n_pools[params->pool].victim_bytes[i] = params->victim_bytes[i];
+    }
+    va_space->phase_n_pools[params->pool].reclaim_success_events = block_pool_snapshot.reclaim_success;
+    va_space->phase_n_pools[params->pool].reclaim_failed_events =
+        block_pool_snapshot.reclaim_failures + block_pool_snapshot.cross_pool_victim_errors;
+    va_space->phase_n_pools[params->pool].accounting_corrections = block_pool_snapshot.mixed_blocks;
+    pool_state = va_space->phase_n_pools[params->pool];
+    uvm_va_space_up_write(va_space);
+
+    params->reclaim_success_events = pool_state.reclaim_success_events;
+    params->reclaim_failed_events = pool_state.reclaim_failed_events;
+
+    uvm_phase_f_route_log("phase_n_reclaim_pool block_quota=1 pool=%u gpu_id=%u mode=%u budget=%llu resident_before=%llu resident_after=%llu over=%llu target=%llu candidates=%llu attempted=%u attempted_bytes=%llu success=%u failure=%u reclaimed=%llu failed_bytes=%llu victim_count=%u same_pool_victims=%llu cross_pool_errors=%llu async=%u trace_only=0\n",
+                          params->pool,
+                          params->gpu_id,
+                          params->mode,
+                          params->budget_bytes,
+                          params->resident_gpu_bytes_before,
+                          resident_after,
+                          params->over_budget_bytes,
+                          params->reclaim_target_bytes,
+                          params->victim_candidate_regions,
+                          params->attempted_regions,
+                          params->attempted_bytes,
+                          params->success_regions,
+                          params->failure_regions,
+                          params->reclaimed_bytes,
+                          params->failed_bytes,
+                          params->victim_count,
+                          block_pool_snapshot.same_pool_victims,
+                          block_pool_snapshot.cross_pool_victim_errors,
+                          params->async ? 1 : 0);
+
+    return NV_OK;
 }
 
 static NvU64 uvm_phase_n_resident_after_reclaim(const UVM_PHASE_N_RECLAIM_POOL_PARAMS *params)
@@ -1826,6 +2768,17 @@ static NV_STATUS uvm_api_phase_f_register_region(UVM_PHASE_F_REGISTER_REGION_PAR
                           region->expert_id,
                           region->role,
                           region->flags);
+    if (uvm_phase_n_block_quota_enable) {
+        uvm_phase_f_route_log("phase_n_tagged_range_register region_id=%llu base=0x%llx length=%llu pool=%u role=%u flags=0x%x aligned_2mb_base=%u aligned_2mb_length=%u\n",
+                              region->region_id,
+                              region->base,
+                              region->length,
+                              region->pool,
+                              region->role,
+                              region->flags,
+                              IS_ALIGNED(region->base, UVM_VA_BLOCK_SIZE) ? 1 : 0,
+                              IS_ALIGNED(region->length, UVM_VA_BLOCK_SIZE) ? 1 : 0);
+    }
 
     return NV_OK;
 }
@@ -1951,14 +2904,19 @@ static NV_STATUS uvm_api_phase_n_set_pool_budget(UVM_PHASE_N_SET_POOL_BUDGET_PAR
     pool_state->budget_bytes = params->budget_bytes;
     pool_state->mode = params->mode;
     pool_state->flags = params->flags;
+    va_space->phase_n_block_pools[params->pool].budget_bytes = params->budget_bytes;
+    va_space->phase_n_block_pools[params->pool].budget_blocks =
+        uvm_phase_n_budget_blocks(params->budget_bytes);
     uvm_va_space_up_write(va_space);
 
-    uvm_phase_f_route_log("phase_n_set_pool_budget pool=%u gpu_id=%u budget=%llu mode=%u flags=0x%x\n",
+    uvm_phase_f_route_log("phase_n_set_pool_budget pool=%u gpu_id=%u budget=%llu budget_blocks=%llu mode=%u flags=0x%x block_quota_enable=%u\n",
                           params->pool,
                           params->gpu_id,
                           params->budget_bytes,
+                          uvm_phase_n_budget_blocks(params->budget_bytes),
                           params->mode,
-                          params->flags);
+                          params->flags,
+                          uvm_phase_n_block_quota_enable ? 1 : 0);
 
     return NV_OK;
 }
@@ -1986,6 +2944,9 @@ static NV_STATUS uvm_api_phase_n_get_pool_state(UVM_PHASE_N_GET_POOL_STATE_PARAM
 
     if (!uvm_phase_n_valid_pool(params->pool))
         return NV_ERR_INVALID_ARGUMENT;
+
+    if (uvm_phase_n_block_quota_enable)
+        return uvm_phase_n_get_pool_state_blocks(va_space, params);
 
     params->resident_gpu_bytes = 0;
     params->resident_cpu_bytes = 0;
@@ -2353,6 +3314,9 @@ static NV_STATUS uvm_phase_n_reclaim_pool_execute(uvm_va_space_t *va_space,
     memset(params->victim_bytes, 0, sizeof(params->victim_bytes));
     memset(params->victim_status, 0, sizeof(params->victim_status));
 
+    if (uvm_phase_n_block_quota_enable)
+        return uvm_phase_n_reclaim_pool_blocks(va_space, params);
+
     uvm_va_space_down_read(va_space);
     gpu = uvm_phase_n_gpu_from_id(va_space, params->gpu_id);
     if (!gpu) {
@@ -2635,7 +3599,7 @@ void uvm_phase_n_make_resident_reclaim_hook(uvm_va_space_t *va_space,
     bool would_reclaim = false;
     bool execute_requested = false;
 
-    if (!uvm_phase_n_auto_reclaim_enable)
+    if (!uvm_phase_n_auto_reclaim_enable && !uvm_phase_n_block_quota_enable)
         return;
 
     epoch = (NvU64)atomic64_inc_return(&g_uvm_phase_n_auto_reclaim_epoch);
@@ -2900,10 +3864,31 @@ NV_STATUS uvm_phase_n_auto_reclaim_outer_hook(uvm_va_space_t *va_space,
     bool would_reclaim;
     NvU64 resident_after = 0;
 
-    if (!uvm_phase_n_auto_reclaim_enable)
+    if (!uvm_phase_n_auto_reclaim_enable && !uvm_phase_n_block_quota_enable)
         return NV_OK;
 
     epoch = (NvU64)atomic64_inc_return(&g_uvm_phase_n_auto_reclaim_epoch);
+    if (uvm_phase_n_block_quota_enable) {
+        status = uvm_phase_n_materialize_access(va_space,
+                                                address,
+                                                length,
+                                                gpu_id,
+                                                cause,
+                                                epoch,
+                                                "outer");
+        if (status != NV_OK)
+            return status;
+
+        uvm_phase_f_route_log("phase_n_auto_reclaim_hook phase=outer_block_quota epoch=%llu address=0x%llx length=%llu gpu_id=%u cause=%u trace_only=%u skip=p8a_no_reclaim\n",
+                              epoch,
+                              address,
+                              length,
+                              gpu_id,
+                              cause,
+                              uvm_phase_n_block_quota_trace_only ? 1 : 0);
+        return NV_OK;
+    }
+
     epoch_mod = epoch;
     if (every > 1 && do_div(epoch_mod, every) != 0)
         return NV_OK;

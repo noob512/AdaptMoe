@@ -106,6 +106,45 @@ typedef struct
     NvU32 flags;
 } uvm_phase_n_pool_state_t;
 
+typedef struct uvm_phase_n_block
+{
+    uvm_va_range_managed_t *managed_range;
+    NvU64 tagged_region_id;
+    NvU64 native_block_index;
+    NvU64 radix_key;
+    NvU64 block_start;
+    NvU64 block_end;
+    NvU64 covered_start;
+    NvU64 covered_end;
+    NvU32 pool;
+    NvU32 flags;
+    NvBool mixed_pool;
+    NvBool gpu_resident;
+    NvBool queued;
+    NvBool in_reclaim;
+    NvBool stale;
+    NvU64 resident_epoch;
+    NvU64 last_access_epoch;
+    struct list_head queue_node;
+} uvm_phase_n_block_t;
+
+typedef struct
+{
+    NvU64 budget_bytes;
+    NvU64 budget_blocks;
+    NvU64 resident_blocks;
+    NvU64 materialized_blocks;
+    NvU64 mixed_blocks;
+    NvU64 reclaim_attempts;
+    NvU64 reclaim_success;
+    NvU64 reclaim_failures;
+    NvU64 same_pool_victims;
+    NvU64 cross_pool_victim_errors;
+    NvU64 quota_over_events;
+    NvU64 max_over_blocks;
+    struct list_head resident_queue;
+} uvm_phase_n_block_pool_t;
+
 typedef struct
 {
     uvm_deferred_free_object_type_t type;
@@ -272,6 +311,8 @@ struct uvm_va_space_struct
     struct radix_tree_root phase_f_regions;
     uvm_range_tree_t phase_f_region_ranges;
     uvm_phase_n_pool_state_t phase_n_pools[UVM_PHASE_N_POOL_STATE_MAX];
+    struct radix_tree_root phase_n_blocks;
+    uvm_phase_n_block_pool_t phase_n_block_pools[UVM_PHASE_N_POOL_STATE_MAX];
 
     // Peer to peer table
     // A bitmask of peer to peer pairs enabled in this va_space

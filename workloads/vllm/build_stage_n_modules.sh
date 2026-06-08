@@ -45,9 +45,12 @@ if [ "$FORCE_REBUILD" = "1" ]; then
   make -C "$SCRIPT_DIR/vllm/uvm_test" clean || true
 fi
 make -C "$SCRIPT_DIR/vllm/uvm_test" uvm
+cp "$SCRIPT_DIR/vllm/uvm_test/uvm_allocator.so" \
+  "$SCRIPT_DIR/vllm/vllm/uvm_allocator.abi3.so"
 
 echo "Build complete:"
 stat -c '  %y %s %n' \
   "$KERNEL_OPEN_DIR/nvidia.ko" \
   "$KERNEL_OPEN_DIR/nvidia-uvm.ko" \
-  "$SCRIPT_DIR/vllm/uvm_test/uvm_allocator.so"
+  "$SCRIPT_DIR/vllm/uvm_test/uvm_allocator.so" \
+  "$SCRIPT_DIR/vllm/vllm/uvm_allocator.abi3.so"

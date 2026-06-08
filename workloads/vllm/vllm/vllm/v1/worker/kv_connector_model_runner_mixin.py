@@ -23,6 +23,10 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.device_allocator.uvm_kv_init_probe import (
+    record_kv_init_probe_event,
+    synchronize_kv_init_probe_tensor,
+)
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
@@ -287,11 +291,49 @@ class KVConnectorModelRunnerMixin:
 
         logger.info("Allocating a cross layer KV cache of shape %s", kv_cache_shape)
 
+        record_kv_init_probe_event(
+            "kv_zeros_begin",
+            path="cross_layer",
+            index=0,
+            size_bytes=int(total_size),
+            device=device,
+            shape=(int(total_size),),
+            extra={
+                "num_layers": int(num_layers),
+                "tensor_size": int(tensor_size),
+                "kv_cache_shape": list(kv_cache_shape),
+            },
+        )
         # allocate one contiguous buffer for all layers
+        cross_layers_kv_cache_raw = torch.zeros(
+            total_size, dtype=torch.int8, device=device
+        )
+        record_kv_init_probe_event(
+            "kv_zeros_return",
+            path="cross_layer",
+            index=0,
+            tensor=cross_layers_kv_cache_raw,
+            size_bytes=int(total_size),
+            device=device,
+        )
+        synchronize_kv_init_probe_tensor(
+            path="cross_layer",
+            index=0,
+            tensor=cross_layers_kv_cache_raw,
+        )
         cross_layers_kv_cache = (
-            torch.zeros(total_size, dtype=torch.int8, device=device)
-            .view(kv_cache_spec.dtype)
-            .view(kv_cache_shape)
+            cross_layers_kv_cache_raw.view(kv_cache_spec.dtype).view(kv_cache_shape)
+        )
+        record_kv_init_probe_event(
+            "kv_tensor_ready",
+            path="cross_layer",
+            index=0,
+            tensor=cross_layers_kv_cache,
+            extra={
+                "num_layers": int(num_layers),
+                "tensor_size": int(tensor_size),
+                "kv_cache_shape": list(kv_cache_shape),
+            },
         )
 
         # Maintain original KV shape view.

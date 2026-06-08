@@ -59,6 +59,10 @@ from vllm.device_allocator.uvm import (
     uvm_allocation_phase,
     uvm_enabled_allocation_phase,
 )
+from vllm.device_allocator.uvm_kv_init_probe import (
+    record_kv_init_probe_event,
+    synchronize_kv_init_probe_tensor,
+)
 from vllm.device_allocator.uvm_pool_residency import (
     get_uvm_pool_residency_manager,
     register_uvm_residency_region,
@@ -6010,9 +6014,42 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+        for index, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
+            record_kv_init_probe_event(
+                "kv_zeros_begin",
+                path="general",
+                index=index,
+                size_bytes=int(kv_cache_tensor.size),
+                device=self.device,
+                shape=(int(kv_cache_tensor.size),),
+                extra={
+                    "shared_by": list(kv_cache_tensor.shared_by),
+                },
+            )
             tensor = torch.zeros(
                 kv_cache_tensor.size, dtype=torch.int8, device=self.device
+            )
+            record_kv_init_probe_event(
+                "kv_zeros_return",
+                path="general",
+                index=index,
+                tensor=tensor,
+                size_bytes=int(kv_cache_tensor.size),
+                device=self.device,
+            )
+            synchronize_kv_init_probe_tensor(
+                path="general",
+                index=index,
+                tensor=tensor,
+            )
+            record_kv_init_probe_event(
+                "kv_tensor_ready",
+                path="general",
+                index=index,
+                tensor=tensor,
+                extra={
+                    "shared_by": list(kv_cache_tensor.shared_by),
+                },
             )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor

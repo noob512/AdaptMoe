@@ -100,6 +100,18 @@ typedef struct
     NV_STATUS status;
 } uvm_phase_n_block_reclaim_victim_t;
 
+typedef struct
+{
+    NvU32 pool;
+    NvU32 mode;
+    NvU64 region_id;
+    NvU64 budget_bytes;
+    NvU64 budget_blocks;
+    NvU64 resident_blocks;
+    NvU64 materialized_blocks;
+    NvU64 over_blocks;
+} uvm_phase_n_block_pool_snapshot_t;
+
 static int uvm_phase_n_auto_reclaim_enable __read_mostly = 0;
 module_param(uvm_phase_n_auto_reclaim_enable, int, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_phase_n_auto_reclaim_enable,
@@ -470,6 +482,8 @@ static void uvm_phase_n_mark_block_resident(uvm_va_space_t *va_space,
         ++block_pool->resident_blocks;
     }
 
+    // FIFO policy: first resident insertion defines queue order. Later accesses
+    // update epochs but don't move an already queued block to the tail.
     if (!block->queued) {
         list_add_tail(&block->queue_node, &block_pool->resident_queue);
         block->queued = NV_TRUE;
@@ -542,6 +556,37 @@ static NV_STATUS uvm_phase_n_materialize_access(uvm_va_space_t *va_space,
     }
 
     return status;
+}
+
+static NvBool uvm_phase_n_block_pool_snapshot_for_address(uvm_va_space_t *va_space,
+                                                          NvU64 address,
+                                                          uvm_phase_n_block_pool_snapshot_t *snapshot)
+{
+    uvm_phase_f_region_t *region;
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->pool = UVM_PHASE_N_POOL_UNKNOWN;
+
+    uvm_va_space_down_read(va_space);
+    region = uvm_phase_n_find_tagged_region(va_space, address);
+    if (!region) {
+        uvm_va_space_up_read(va_space);
+        return NV_FALSE;
+    }
+
+    snapshot->pool = region->pool;
+    snapshot->region_id = region->region_id;
+    snapshot->mode = va_space->phase_n_pools[snapshot->pool].mode;
+    snapshot->budget_bytes = va_space->phase_n_pools[snapshot->pool].budget_bytes;
+    snapshot->budget_blocks = va_space->phase_n_block_pools[snapshot->pool].budget_blocks;
+    snapshot->resident_blocks = va_space->phase_n_block_pools[snapshot->pool].resident_blocks;
+    snapshot->materialized_blocks = va_space->phase_n_block_pools[snapshot->pool].materialized_blocks;
+    if (snapshot->budget_blocks > 0 && snapshot->resident_blocks > snapshot->budget_blocks) {
+        snapshot->over_blocks = snapshot->resident_blocks - snapshot->budget_blocks;
+    }
+    uvm_va_space_up_read(va_space);
+
+    return NV_TRUE;
 }
 
 static NV_STATUS uvm_phase_n_get_pool_state_blocks(uvm_va_space_t *va_space,
@@ -1055,8 +1100,8 @@ static void uvm_phase_n_finish_block_reclaim(uvm_va_space_t *va_space,
     uvm_phase_n_update_block_pressure(va_space, block->pool, block_pool);
 }
 
-static NV_STATUS uvm_phase_n_reclaim_pool_blocks(uvm_va_space_t *va_space,
-                                                 UVM_PHASE_N_RECLAIM_POOL_PARAMS *params)
+static NV_STATUS uvm_phase_n_reclaim_pool_blocks_internal(uvm_va_space_t *va_space,
+                                                          UVM_PHASE_N_RECLAIM_POOL_PARAMS *params)
 {
     uvm_phase_n_pool_state_t pool_state;
     uvm_phase_n_block_pool_t block_pool_snapshot;
@@ -1256,6 +1301,12 @@ static NV_STATUS uvm_phase_n_reclaim_pool_blocks(uvm_va_space_t *va_space,
                           params->async ? 1 : 0);
 
     return NV_OK;
+}
+
+static NV_STATUS uvm_phase_n_reclaim_pool_blocks(uvm_va_space_t *va_space,
+                                                 UVM_PHASE_N_RECLAIM_POOL_PARAMS *params)
+{
+    return uvm_phase_n_reclaim_pool_blocks_internal(va_space, params);
 }
 
 static NvU64 uvm_phase_n_resident_after_reclaim(const UVM_PHASE_N_RECLAIM_POOL_PARAMS *params)
@@ -3838,6 +3889,199 @@ static NV_STATUS uvm_phase_n_auto_reclaim_enforce_sweep(uvm_va_space_t *va_space
     return first_error;
 }
 
+static NV_STATUS uvm_phase_n_auto_reclaim_block_quota(uvm_va_space_t *va_space,
+                                                      NvU64 epoch,
+                                                      NvU64 address,
+                                                      NvU64 length,
+                                                      NvU32 gpu_id,
+                                                      NvU32 cause,
+                                                      NvU32 every)
+{
+    UVM_PHASE_N_RECLAIM_POOL_PARAMS params = { 0 };
+    uvm_phase_n_block_pool_snapshot_t snapshot = { 0 };
+    uvm_phase_n_block_pool_snapshot_t after_snapshot = { 0 };
+    NV_STATUS status;
+    NvU64 backoff_until;
+    NvU64 resident_before;
+    NvU64 resident_after;
+    NvU64 over_bytes;
+    NvBool has_after_snapshot;
+    NvBool would_reclaim;
+    NvBool execute_requested = NV_FALSE;
+    NvBool reclaim_to_budget = NV_FALSE;
+    const char *skip_reason = NULL;
+
+    status = uvm_phase_n_materialize_access(va_space,
+                                            address,
+                                            length,
+                                            gpu_id,
+                                            cause,
+                                            epoch,
+                                            "outer");
+    if (status != NV_OK)
+        return status;
+
+    if (!uvm_phase_n_block_pool_snapshot_for_address(va_space, address, &snapshot)) {
+        uvm_phase_f_route_log("phase_n_block_auto_hook phase=outer epoch=%llu every=%u max_victims=%u cooldown_epochs=%u address=0x%llx length=%llu gpu_id=%u cause=%u trace_only=%u skip=no_tagged_region\n",
+                              epoch,
+                              every,
+                              uvm_phase_n_auto_reclaim_max_victims,
+                              uvm_phase_n_auto_reclaim_cooldown_epochs,
+                              address,
+                              length,
+                              gpu_id,
+                              cause,
+                              uvm_phase_n_block_quota_trace_only ? 1 : 0);
+        return NV_OK;
+    }
+
+    resident_before = snapshot.resident_blocks * UVM_VA_BLOCK_SIZE;
+    over_bytes = snapshot.over_blocks * UVM_VA_BLOCK_SIZE;
+    would_reclaim = snapshot.over_blocks > 0;
+
+    if (snapshot.budget_blocks == 0 || snapshot.budget_bytes == 0)
+        skip_reason = "no_budget";
+    else if (snapshot.mode == UVM_PHASE_N_MODE_TRACE_ONLY)
+        skip_reason = "mode_trace_only";
+    else if (uvm_phase_n_block_quota_trace_only)
+        skip_reason = "trace_only";
+    else if (!would_reclaim)
+        skip_reason = "under_budget";
+    else if (snapshot.mode != UVM_PHASE_N_MODE_SOFT &&
+             snapshot.mode != UVM_PHASE_N_MODE_ENFORCE)
+        skip_reason = "mode_not_reclaimable";
+    else if (uvm_phase_n_auto_reclaim_execute == 0)
+        skip_reason = "execute_disabled";
+
+    if (would_reclaim) {
+        uvm_phase_f_route_log("phase_n_block_over_budget phase=outer epoch=%llu address=0x%llx length=%llu gpu_id=%u cause=%u pool=%u region_id=%llu budget_blocks=%llu resident_blocks=%llu over_blocks=%llu budget=%llu resident=%llu over=%llu mode=%u trace_only=%u skip=%s\n",
+                              epoch,
+                              address,
+                              length,
+                              gpu_id,
+                              cause,
+                              snapshot.pool,
+                              snapshot.region_id,
+                              snapshot.budget_blocks,
+                              snapshot.resident_blocks,
+                              snapshot.over_blocks,
+                              snapshot.budget_bytes,
+                              resident_before,
+                              over_bytes,
+                              snapshot.mode,
+                              uvm_phase_n_block_quota_trace_only ? 1 : 0,
+                              skip_reason ? skip_reason : "none");
+    }
+
+    if (!skip_reason) {
+        backoff_until = (NvU64)atomic64_read(&g_uvm_phase_n_auto_reclaim_backoff_until);
+        if (backoff_until != 0 && epoch < backoff_until)
+            skip_reason = "reclaim_backoff";
+        else
+            execute_requested = NV_TRUE;
+    }
+
+    if (!execute_requested) {
+        uvm_phase_f_route_log("phase_n_block_auto_hook phase=outer epoch=%llu every=%u max_victims=%u cooldown_epochs=%u address=0x%llx length=%llu gpu_id=%u cause=%u pool=%u region_id=%llu budget=%llu budget_blocks=%llu resident_blocks=%llu over_blocks=%llu target=%llu candidate_blocks=%llu mode=%u would_reclaim=%u execute_requested=0 execute=0 status=0 attempted=0 success=0 failure=0 reclaimed=0 failed_bytes=0 reclaim_to_budget=0 async=0 trace_only=%u skip=%s\n",
+                              epoch,
+                              every,
+                              uvm_phase_n_auto_reclaim_max_victims,
+                              uvm_phase_n_auto_reclaim_cooldown_epochs,
+                              address,
+                              length,
+                              gpu_id,
+                              cause,
+                              snapshot.pool,
+                              snapshot.region_id,
+                              snapshot.budget_bytes,
+                              snapshot.budget_blocks,
+                              snapshot.resident_blocks,
+                              snapshot.over_blocks,
+                              over_bytes,
+                              snapshot.resident_blocks,
+                              snapshot.mode,
+                              would_reclaim ? 1 : 0,
+                              uvm_phase_n_block_quota_trace_only ? 1 : 0,
+                              skip_reason ? skip_reason : "none");
+        return NV_OK;
+    }
+
+    params.pool = snapshot.pool;
+    params.gpu_id = gpu_id;
+    params.target_bytes = over_bytes;
+    params.current_epoch = epoch;
+    params.cooldown_epochs = uvm_phase_n_auto_reclaim_cooldown_epochs;
+    params.max_victims = uvm_phase_n_auto_reclaim_max_victims;
+    params.async = NV_FALSE;
+
+    status = uvm_phase_n_reclaim_pool_blocks_internal(va_space, &params);
+
+    has_after_snapshot = uvm_phase_n_block_pool_snapshot_for_address(va_space, address, &after_snapshot);
+    if (has_after_snapshot) {
+        resident_after = after_snapshot.resident_blocks * UVM_VA_BLOCK_SIZE;
+        reclaim_to_budget = after_snapshot.budget_blocks == 0 ||
+                            after_snapshot.resident_blocks <= after_snapshot.budget_blocks;
+    }
+    else {
+        resident_after = uvm_phase_n_resident_after_reclaim(&params);
+        reclaim_to_budget = uvm_phase_n_reclaim_to_budget(&params);
+    }
+
+    if (params.success_regions > 0 &&
+        uvm_phase_n_auto_reclaim_cooldown_epochs > 0 &&
+        (params.mode != UVM_PHASE_N_MODE_ENFORCE || reclaim_to_budget)) {
+        NvU64 until = epoch + uvm_phase_n_auto_reclaim_cooldown_epochs;
+
+        if (until < epoch)
+            until = ULLONG_MAX;
+        atomic64_set(&g_uvm_phase_n_auto_reclaim_backoff_until, until);
+    }
+    else if (status != NV_OK ||
+             params.failure_regions > 0 ||
+             (would_reclaim && params.success_regions == 0)) {
+        NvU64 until = epoch + uvm_phase_n_auto_reclaim_failure_backoff_epochs;
+
+        if (until < epoch)
+            until = ULLONG_MAX;
+        atomic64_set(&g_uvm_phase_n_auto_reclaim_backoff_until, until);
+    }
+
+    uvm_phase_f_route_log("phase_n_block_auto_hook phase=outer epoch=%llu every=%u max_victims=%u cooldown_epochs=%u address=0x%llx length=%llu gpu_id=%u cause=%u pool=%u region_id=%llu budget=%llu budget_blocks=%llu resident_before=%llu resident_after=%llu resident_before_blocks=%llu resident_after_blocks=%llu over_blocks=%llu target=%llu candidate_blocks=%llu mode=%u would_reclaim=%u execute_requested=1 execute=%u status=%u attempted=%u attempted_bytes=%llu success=%u failure=%u reclaimed=%llu failed_bytes=%llu reclaim_to_budget=%u async=%u trace_only=0\n",
+                          epoch,
+                          every,
+                          uvm_phase_n_auto_reclaim_max_victims,
+                          uvm_phase_n_auto_reclaim_cooldown_epochs,
+                          address,
+                          length,
+                          gpu_id,
+                          cause,
+                          snapshot.pool,
+                          snapshot.region_id,
+                          params.budget_bytes,
+                          snapshot.budget_blocks,
+                          params.resident_gpu_bytes_before,
+                          resident_after,
+                          snapshot.resident_blocks,
+                          has_after_snapshot ? after_snapshot.resident_blocks : 0,
+                          snapshot.over_blocks,
+                          params.reclaim_target_bytes,
+                          snapshot.resident_blocks,
+                          params.mode,
+                          would_reclaim ? 1 : 0,
+                          (status == NV_OK && params.attempted_regions > 0) ? 1 : 0,
+                          status,
+                          params.attempted_regions,
+                          params.attempted_bytes,
+                          params.success_regions,
+                          params.failure_regions,
+                          params.reclaimed_bytes,
+                          params.failed_bytes,
+                          reclaim_to_budget ? 1 : 0,
+                          params.async ? 1 : 0);
+
+    return status;
+}
+
 NV_STATUS uvm_phase_n_auto_reclaim_outer_hook(uvm_va_space_t *va_space,
                                               NvU64 address,
                                               NvU64 length,
@@ -3868,26 +4112,14 @@ NV_STATUS uvm_phase_n_auto_reclaim_outer_hook(uvm_va_space_t *va_space,
         return NV_OK;
 
     epoch = (NvU64)atomic64_inc_return(&g_uvm_phase_n_auto_reclaim_epoch);
-    if (uvm_phase_n_block_quota_enable) {
-        status = uvm_phase_n_materialize_access(va_space,
-                                                address,
-                                                length,
-                                                gpu_id,
-                                                cause,
-                                                epoch,
-                                                "outer");
-        if (status != NV_OK)
-            return status;
-
-        uvm_phase_f_route_log("phase_n_auto_reclaim_hook phase=outer_block_quota epoch=%llu address=0x%llx length=%llu gpu_id=%u cause=%u trace_only=%u skip=p8a_no_reclaim\n",
-                              epoch,
-                              address,
-                              length,
-                              gpu_id,
-                              cause,
-                              uvm_phase_n_block_quota_trace_only ? 1 : 0);
-        return NV_OK;
-    }
+    if (uvm_phase_n_block_quota_enable)
+        return uvm_phase_n_auto_reclaim_block_quota(va_space,
+                                                    epoch,
+                                                    address,
+                                                    length,
+                                                    gpu_id,
+                                                    cause,
+                                                    every);
 
     epoch_mod = epoch;
     if (every > 1 && do_div(epoch_mod, every) != 0)

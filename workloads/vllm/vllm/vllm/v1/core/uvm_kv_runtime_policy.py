@@ -131,6 +131,10 @@ class UvmKvRuntimePolicy:
                 or _read_bool_env("VLLM_UVM_DRIVER_TAG_ENABLE", False)
             ),
         )
+        self.stage_n_allocator_kv_driver_tag_enable = _read_bool_env(
+            "VLLM_UVM_DRIVER_KV_TAG_ENABLE",
+            False,
+        )
         self.stage_l6_pointer_tag_granularity = _read_choice_env(
             "VLLM_UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY",
             "tensor",
@@ -276,6 +280,9 @@ class UvmKvRuntimePolicy:
                 "stage_l6_data_offload_enable": self.stage_l6_data_offload_enable,
                 "stage_l6_prefetch_back_enable": self.stage_l6_prefetch_back_enable,
                 "stage_l6_pointer_tag_enable": self.stage_l6_pointer_tag_enable,
+                "stage_n_allocator_kv_driver_tag_enable": (
+                    self.stage_n_allocator_kv_driver_tag_enable
+                ),
                 "stage_l6_pointer_tag_granularity": (
                     self.stage_l6_pointer_tag_granularity
                 ),
@@ -363,7 +370,14 @@ class UvmKvRuntimePolicy:
             return
         if register_driver_regions is None:
             register_driver_regions = self.stage_l6_data_offload_enable
+        allocator_driver_tag_skip = (
+            self.stage_n_allocator_kv_driver_tag_enable
+            and bool(register_driver_regions)
+        )
+        if allocator_driver_tag_skip:
+            register_driver_regions = False
         registered = 0
+        driver_regions_skipped = 0
         for (group_id, block_id), (ptr, size_bytes) in kv_pointer_map.items():
             if ptr <= 0 or size_bytes <= 0:
                 continue
@@ -371,6 +385,8 @@ class UvmKvRuntimePolicy:
                 (int(ptr), int(size_bytes))
             ]
             if not register_driver_regions:
+                if allocator_driver_tag_skip:
+                    driver_regions_skipped += 1
                 registered += 1
                 continue
             register_uvm_residency_region(
@@ -398,6 +414,15 @@ class UvmKvRuntimePolicy:
                 "action": "stage_l6_kv_pointer_map_registered",
                 "registered_regions": registered,
                 "driver_region_records": registered if register_driver_regions else 0,
+                "driver_pointer_tags_skipped": driver_regions_skipped,
+                "driver_pointer_tag_skip_reason": (
+                    "allocator_kv_driver_tag_enable"
+                    if allocator_driver_tag_skip
+                    else None
+                ),
+                "allocator_kv_driver_tag_enable": (
+                    self.stage_n_allocator_kv_driver_tag_enable
+                ),
                 "data_offload_capable": registered > 0,
                 "pointer_tag_enable": self.stage_l6_pointer_tag_enable,
                 "data_offload_enable": self.stage_l6_data_offload_enable,
@@ -534,6 +559,9 @@ class UvmKvRuntimePolicy:
                 "range_entries": sum(len(ranges) for ranges in range_map.values()),
                 "tensor_span_entries": len(tensor_spans),
                 "pointer_tag_enable": self.stage_l6_pointer_tag_enable,
+                "allocator_kv_driver_tag_enable": (
+                    self.stage_n_allocator_kv_driver_tag_enable
+                ),
                 "pointer_tag_granularity": self.stage_l6_pointer_tag_granularity,
                 "data_offload_enable": self.stage_l6_data_offload_enable,
             }
@@ -542,13 +570,18 @@ class UvmKvRuntimePolicy:
             self._stage_l6_pointer_map_loaded = False
             return
         if pointer_map:
+            allocator_driver_tags = self.stage_n_allocator_kv_driver_tag_enable
             self.register_stage_l6_kv_pointer_map(
                 pointer_map,
                 source="kv_pointer_map_contiguous_block",
-                register_driver_regions=self.stage_l6_data_offload_enable,
+                register_driver_regions=(
+                    self.stage_l6_data_offload_enable
+                    and not allocator_driver_tags
+                ),
             )
             self._stage_l6_pointer_ranges.update(range_map)
             driver_range_regions = 0
+            skipped_driver_pointer_regions = 0
             for region_id, ranges in range_map.items():
                 try:
                     _, group_id_text, block_id_text = region_id.split(":", 2)
@@ -561,7 +594,14 @@ class UvmKvRuntimePolicy:
                 register_uvm_residency_region(
                     pool="kv",
                     region_id=region_id,
-                    ptr=first_ptr if self.stage_l6_data_offload_enable else None,
+                    ptr=(
+                        first_ptr
+                        if (
+                            self.stage_l6_data_offload_enable
+                            and not allocator_driver_tags
+                        )
+                        else None
+                    ),
                     bytes=total_bytes,
                     state="gpu",
                     evictable=True,
@@ -573,15 +613,31 @@ class UvmKvRuntimePolicy:
                         "block_id": block_id,
                         "bytes_per_block": total_bytes,
                         "offload_capable": True,
-                        "metadata_only": not self.stage_l6_data_offload_enable,
+                        "metadata_only": (
+                            not self.stage_l6_data_offload_enable
+                            or allocator_driver_tags
+                        ),
                         "driver_range_children": self.stage_l6_pointer_tag_enable,
+                        "allocator_kv_driver_tag": allocator_driver_tags,
+                        "driver_tag_skipped": (
+                            "allocator_kv_driver_tag_enable"
+                            if allocator_driver_tags
+                            else None
+                        ),
                         "range_count": len(ranges),
                     },
                 )
                 if (
                     not self.stage_l6_pointer_tag_enable
                     or self.stage_l6_pointer_tag_granularity != "range"
+                    or allocator_driver_tags
                 ):
+                    if (
+                        allocator_driver_tags
+                        and self.stage_l6_pointer_tag_enable
+                        and self.stage_l6_pointer_tag_granularity == "range"
+                    ):
+                        skipped_driver_pointer_regions += len(ranges)
                     continue
                 range_metadata = range_metadata_map.get(region_id) or []
                 for range_index, (ptr, range_bytes) in enumerate(ranges):
@@ -620,6 +676,7 @@ class UvmKvRuntimePolicy:
             if (
                 self.stage_l6_pointer_tag_enable
                 and self.stage_l6_pointer_tag_granularity == "tensor"
+                and not allocator_driver_tags
             ):
                 for tensor_index, (tensor_name, span) in enumerate(
                     sorted(tensor_spans.items())
@@ -649,6 +706,12 @@ class UvmKvRuntimePolicy:
                         },
                     )
                     driver_tensor_regions += 1
+            elif (
+                allocator_driver_tags
+                and self.stage_l6_pointer_tag_enable
+                and self.stage_l6_pointer_tag_granularity == "tensor"
+            ):
+                skipped_driver_pointer_regions += len(tensor_spans)
             if self.stage_l6_pointer_tag_enable:
                 self._write(
                     {
@@ -657,6 +720,15 @@ class UvmKvRuntimePolicy:
                         "granularity": self.stage_l6_pointer_tag_granularity,
                         "driver_tensor_regions": driver_tensor_regions,
                         "driver_range_regions": driver_range_regions,
+                        "driver_pointer_tags_skipped": (
+                            skipped_driver_pointer_regions
+                        ),
+                        "driver_pointer_tag_skip_reason": (
+                            "allocator_kv_driver_tag_enable"
+                            if allocator_driver_tags
+                            else None
+                        ),
+                        "allocator_kv_driver_tag_enable": allocator_driver_tags,
                         "data_offload_enable": self.stage_l6_data_offload_enable,
                     }
                 )

@@ -1697,6 +1697,7 @@ static size_t weight_budget_bytes = 0;
 static std::string weight_budget_mode = "trace_only";
 static int weight_budget_cpu_offload_enable = 0;
 static int pool_registry_enabled = 0;
+static int driver_kv_tag_enable = 0;
 static int driver_scratch_tag_enable = 0;
 static int driver_scratch_budget_enforce = 0;
 static int driver_scratch_budget_enforce_warmup = 0;
@@ -1922,6 +1923,15 @@ static std::atomic<size_t> driver_scratch_budget_over_allocs{0};
 /// @brief Stage N：driver scratch tag budget reservations released on free.
 static std::atomic<size_t> driver_scratch_budget_release_allocs{0};
 
+/// @brief Stage N P8e-a：allocator-side KV driver tag registrations.
+static std::atomic<size_t> driver_kv_tag_allocs{0};
+
+/// @brief Stage N P8e-a：allocator-side KV driver tag registration failures.
+static std::atomic<size_t> driver_kv_tag_failures{0};
+
+/// @brief Stage N P8e-a：allocator-side KV driver tag unregister calls.
+static std::atomic<size_t> driver_kv_untag_allocs{0};
+
 /// @brief Stage G：runtime scratch pool 准入控制参与评估的分配次数。
 static std::atomic<size_t> scratch_pool_trace_allocs{0};
 
@@ -2050,6 +2060,9 @@ struct AllocationInfo {
     bool pool_registry_tracked;      ///< Stage F：此分配是否纳入统一 pool registry。
     std::string pool_kind_name;      ///< Stage F：统一 pool 名称，如 kv_cache/weights/runtime_scratch。
     std::string pool_object_state;   ///< Stage F：对象状态，当前仅 telemetry active/freed。
+    bool driver_kv_region_registered; ///< Stage N P8e-a：是否已向 UVM driver 早注册 KV tag。
+    uint64_t driver_kv_region_id;     ///< Stage N P8e-a：allocator-side KV driver region id。
+    int driver_kv_register_status;    ///< Stage N P8e-a：KV driver register 返回值。
     bool driver_scratch_region_registered; ///< Stage N：是否已向 UVM driver 注册 scratch tag。
     uint64_t driver_scratch_region_id; ///< Stage N：scratch driver region id。
     int driver_scratch_register_status; ///< Stage N：driver register 返回值。
@@ -3895,6 +3908,11 @@ static void init_log_file() {
             ) ? 1 : 0;
         pool_registry_enabled =
             read_bool_from_env("VLLM_UVM_POOL_REGISTRY_ENABLE", false) ? 1 : 0;
+        driver_kv_tag_enable =
+            read_bool_from_env(
+                "VLLM_UVM_DRIVER_KV_TAG_ENABLE",
+                false
+            ) ? 1 : 0;
         driver_scratch_tag_enable =
             read_bool_from_env(
                 "VLLM_UVM_DRIVER_SCRATCH_TAG_ENABLE",
@@ -4013,7 +4031,8 @@ static void init_log_file() {
                 "kv_budget_bytes=%zu kv_budget_mode=%s "
                 "weight_budget_bytes=%zu weight_budget_mode=%s "
                 "weight_budget_cpu_offload_enable=%d "
-                "pool_registry_enabled=%d driver_scratch_tag_enable=%d "
+                "pool_registry_enabled=%d driver_kv_tag_enable=%d "
+                "driver_scratch_tag_enable=%d "
                 "driver_scratch_budget_enforce=%d "
                 "driver_scratch_budget_enforce_warmup=%d "
                 "driver_scratch_budget_bytes=%zu "
@@ -4054,6 +4073,7 @@ static void init_log_file() {
                 weight_budget_mode.c_str(),
                 weight_budget_cpu_offload_enable,
                 pool_registry_enabled,
+                driver_kv_tag_enable,
                 driver_scratch_tag_enable,
                 driver_scratch_budget_enforce,
                 driver_scratch_budget_enforce_warmup,
@@ -5099,6 +5119,9 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     int driver_scratch_register_status = 0;
     bool driver_scratch_budget_reserved = false;
     bool driver_scratch_hard_reject = false;
+    bool driver_kv_region_registered = false;
+    uint64_t driver_kv_region_id = 0;
+    int driver_kv_register_status = 0;
     if (driver_scratch_tag_enable &&
             pool_registry_tracked &&
             pool_kind == PoolKind::RuntimeScratch &&
@@ -5552,6 +5575,53 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         }
     }
 
+    if (driver_kv_tag_enable &&
+            pool_kind == PoolKind::KvCache &&
+            strcmp(placement_backend, "managed") == 0 &&
+            ptr != NULL &&
+            static_cast<size_t>(size) > 0) {
+        driver_kv_region_id = phase_n_allocator_region_id(ptr, alloc_count);
+        driver_kv_register_status = uvm_driver_phase_f_register_region_internal(
+            driver_kv_region_id,
+            reinterpret_cast<uintptr_t>(ptr),
+            static_cast<size_t>(size),
+            1,
+            0,
+            0,
+            1,
+            (1u << 0)
+        );
+        driver_kv_region_registered = driver_kv_register_status >= 0;
+        if (driver_kv_region_registered) {
+            driver_kv_tag_allocs.fetch_add(1);
+        } else {
+            driver_kv_tag_failures.fetch_add(1);
+        }
+
+        if (log_file) {
+            std::lock_guard<std::mutex> lock(log_mutex);
+            fprintf(log_file,
+                    "[%.3fs] TRACE_DRIVER_KV_TAG alloc_id=%zu ptr=0x%llx "
+                    "size_bytes=%zu region_id=%llu status=%d registered=%d "
+                    "phase=%s predicted_class=%s pool_kind=%s placement_backend=%s "
+                    "role=kv_block flags=0x%x\n",
+                    get_elapsed_seconds(),
+                    alloc_count,
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(ptr)),
+                    static_cast<size_t>(size),
+                    static_cast<unsigned long long>(driver_kv_region_id),
+                    driver_kv_register_status,
+                    driver_kv_region_registered ? 1 : 0,
+                    phase_snapshot.c_str(),
+                    allocation_class_to_string(alloc_class),
+                    pool_kind_to_string(pool_kind),
+                    placement_backend,
+                    (1u << 0));
+            fflush(log_file);
+        }
+    }
+
     if (weight_budget_tracked &&
             weight_budget_over_budget &&
             weight_budget_mode == "enforce" &&
@@ -5595,7 +5665,8 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         strcmp(placement_backend, "device_direct") == 0 ||
         kv_budget_tracked ||
         weight_budget_tracked ||
-        pool_registry_tracked;
+        pool_registry_tracked ||
+        driver_kv_region_registered;
 
     // 7.1 记录活跃分配元数据，供 free / gap watch / unknown detail 使用
     if (store_active_info) {
@@ -5637,6 +5708,9 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             pool_registry_tracked,
             pool_kind_to_string(pool_kind),
             pool_object_state,
+            driver_kv_region_registered,
+            driver_kv_region_id,
+            driver_kv_register_status,
             driver_scratch_region_registered,
             driver_scratch_region_id,
             driver_scratch_register_status,
@@ -5779,6 +5853,11 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             it->second.pool_registry_tracked = pool_registry_tracked;
             it->second.pool_kind_name = pool_kind_to_string(pool_kind);
             it->second.pool_object_state = pool_object_state;
+            it->second.driver_kv_region_registered =
+                driver_kv_region_registered;
+            it->second.driver_kv_region_id = driver_kv_region_id;
+            it->second.driver_kv_register_status =
+                driver_kv_register_status;
             it->second.driver_scratch_region_registered =
                 driver_scratch_region_registered;
             it->second.driver_scratch_region_id = driver_scratch_region_id;
@@ -6035,6 +6114,33 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
         }
 
         if (has_info &&
+                info.driver_kv_region_registered &&
+                info.driver_kv_region_id != 0) {
+            int unregister_status = uvm_driver_phase_f_unregister_region_internal(
+                info.driver_kv_region_id
+            );
+            driver_kv_untag_allocs.fetch_add(1);
+            if (log_file) {
+                std::lock_guard<std::mutex> lock(log_mutex);
+                fprintf(log_file,
+                        "[%.3fs] TRACE_DRIVER_KV_UNTAG free_id=%zu "
+                        "ptr=0x%llx size_bytes=%zu region_id=%llu status=%d "
+                        "alloc_id=%zu phase=%s\n",
+                        get_elapsed_seconds(),
+                        free_count,
+                        static_cast<unsigned long long>(
+                            reinterpret_cast<uintptr_t>(ptr)),
+                        info.size,
+                        static_cast<unsigned long long>(
+                            info.driver_kv_region_id),
+                        unregister_status,
+                        info.alloc_id,
+                        phase_snapshot.c_str());
+                fflush(log_file);
+            }
+        }
+
+        if (has_info &&
                 info.driver_scratch_region_registered &&
                 info.driver_scratch_region_id != 0) {
             if (driver_pool_state_snapshot_on_scratch_free) {
@@ -6273,6 +6379,9 @@ void uvm_reset_all_stats(void) {
     driver_scratch_budget_reject_allocs.store(0);
     driver_scratch_budget_over_allocs.store(0);
     driver_scratch_budget_release_allocs.store(0);
+    driver_kv_tag_allocs.store(0);
+    driver_kv_tag_failures.store(0);
+    driver_kv_untag_allocs.store(0);
     scratch_pool_trace_allocs.store(0);
     scratch_pool_eligible_allocs.store(0);
     scratch_pool_device_direct_allocs.store(0);
@@ -6393,6 +6502,14 @@ void uvm_close_log(void) {
             weight_budget_cpu_offload_failures.load());
     fprintf(log_file, "  Weight free success: %zu\n", weight_free_success_allocs.load());
     fprintf(log_file, "  Pool registry enabled: %d\n", pool_registry_enabled);
+    fprintf(log_file, "  Driver KV tag enabled: %d\n",
+            driver_kv_tag_enable);
+    fprintf(log_file, "  Driver KV tag allocations: %zu\n",
+            driver_kv_tag_allocs.load());
+    fprintf(log_file, "  Driver KV tag failures: %zu\n",
+            driver_kv_tag_failures.load());
+    fprintf(log_file, "  Driver KV untag allocations: %zu\n",
+            driver_kv_untag_allocs.load());
     fprintf(log_file, "  Driver scratch budget enforce: %d\n",
             driver_scratch_budget_enforce);
     fprintf(log_file, "  Driver scratch budget enforce warmup: %d\n",

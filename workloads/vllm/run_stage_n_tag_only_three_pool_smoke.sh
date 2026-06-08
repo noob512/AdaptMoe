@@ -30,11 +30,14 @@ RESET_COUNTERS="${RESET_COUNTERS:-0}"
 MODE="${MODE:-trace}"
 WITH_ADDRESS_LOG="${WITH_ADDRESS_LOG:-1}"
 UVM_PHASE_F_ROUTE_LOG_DELAY_MS="${UVM_PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
+UVM_PHASE_N_BLOCK_QUOTA_ENABLE="${UVM_PHASE_N_BLOCK_QUOTA_ENABLE:-0}"
+UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY="${UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY:-1}"
 REQUIRE_PHASE_N_AUTO_HOOK="${REQUIRE_PHASE_N_AUTO_HOOK:-0}"
 REQUIRE_PHASE_N_AUTO_RECLAIM="${REQUIRE_PHASE_N_AUTO_RECLAIM:-0}"
 REQUIRE_STAGE_N_HARD_PARTITION="${REQUIRE_STAGE_N_HARD_PARTITION:-0}"
 HARD_PARTITION_TOLERANCE_BYTES="${HARD_PARTITION_TOLERANCE_BYTES:-0}"
 DRIVER_POOL_BUDGET_MODE="${DRIVER_POOL_BUDGET_MODE:-trace_only}"
+VLLM_UVM_DRIVER_KV_TAG_ENABLE="${VLLM_UVM_DRIVER_KV_TAG_ENABLE:-0}"
 VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE="${VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE:-0}"
 VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP="${VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP:-0}"
 UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY:-}"
@@ -128,6 +131,7 @@ COMMAND_FILE="$RUN_ROOT/command_stage_n_tag_only.sh"
 export VLLM_UVM_PHASE_F_IOCTL_MODE=policy
 export VLLM_UVM_RESIDENCY_TAG_ONLY=1
 export VLLM_UVM_DRIVER_TAG_ENABLE=1
+export VLLM_UVM_DRIVER_KV_TAG_ENABLE
 export VLLM_UVM_DRIVER_SCRATCH_TAG_ENABLE=1
 export VLLM_UVM_DRIVER_TAG_REQUIRE_MANAGED=1
 export VLLM_UVM_DRIVER_POOL_BUDGET_ENABLE=1
@@ -200,6 +204,8 @@ fi
   echo "REQUIRE_STAGE_N_HARD_PARTITION=$REQUIRE_STAGE_N_HARD_PARTITION"
   echo "HARD_PARTITION_TOLERANCE_BYTES=$HARD_PARTITION_TOLERANCE_BYTES"
   echo "DRIVER_POOL_BUDGET_MODE=$DRIVER_POOL_BUDGET_MODE"
+  echo "UVM_PHASE_N_BLOCK_QUOTA_ENABLE=$UVM_PHASE_N_BLOCK_QUOTA_ENABLE"
+  echo "UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY=$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY"
   echo "UVM_PHASE_N_AUTO_RECLAIM_ENABLE=$UVM_PHASE_N_AUTO_RECLAIM_ENABLE"
   echo "UVM_PHASE_N_AUTO_RECLAIM_EXECUTE=$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE"
   echo "UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY=$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY"
@@ -269,12 +275,15 @@ cmd=(
   --uvm-residency-kv-prefetch-back-mode trace_only
   --uvm-residency-kv-pointer-map-file "$KV_POINTER_MAP"
   --uvm-residency-kv-pointer-tag-enable 1
-	  --uvm-residency-kv-pointer-tag-granularity tensor
-		  --uvm-driver-scratch-tag-enable 1
-		  --uvm-driver-temp-buffer-bytes "$SCRATCH_TEMP_BUDGET_BYTES"
-		  --uvm-driver-scratch-budget-enforce "$VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE"
-		  --uvm-driver-scratch-budget-enforce-warmup "$VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP"
-		  --uvm-phase-f-route-log-delay-ms "$UVM_PHASE_F_ROUTE_LOG_DELAY_MS"
+  --uvm-residency-kv-pointer-tag-granularity tensor
+  --uvm-driver-kv-tag-enable "$VLLM_UVM_DRIVER_KV_TAG_ENABLE"
+  --uvm-driver-scratch-tag-enable 1
+  --uvm-driver-temp-buffer-bytes "$SCRATCH_TEMP_BUDGET_BYTES"
+  --uvm-driver-scratch-budget-enforce "$VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE"
+  --uvm-driver-scratch-budget-enforce-warmup "$VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP"
+  --uvm-phase-f-route-log-delay-ms "$UVM_PHASE_F_ROUTE_LOG_DELAY_MS"
+  --uvm-phase-n-block-quota-enable "$UVM_PHASE_N_BLOCK_QUOTA_ENABLE"
+  --uvm-phase-n-block-quota-trace-only "$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY"
   --uvm-phase-n-auto-reclaim-enable "$UVM_PHASE_N_AUTO_RECLAIM_ENABLE"
   --uvm-phase-n-auto-reclaim-execute "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE"
   --uvm-phase-n-auto-reclaim-execute-on-ready "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY"
@@ -836,6 +845,8 @@ if [ -s "$RESIDENCY_TRACE" ]; then
 fi
 
 if [ -s "$ALLOCATOR_LOG" ]; then
+  kv_driver_tag_records="$(count_matches 'TRACE_DRIVER_KV_TAG' "$ALLOCATOR_LOG")"
+  kv_driver_untag_records="$(count_matches 'TRACE_DRIVER_KV_UNTAG' "$ALLOCATOR_LOG")"
   scratch_driver_tag_records="$(count_matches 'TRACE_DRIVER_SCRATCH_TAG' "$ALLOCATOR_LOG")"
   scratch_driver_untag_records="$(count_matches 'TRACE_DRIVER_SCRATCH_UNTAG' "$ALLOCATOR_LOG")"
   scratch_driver_reject_records="$(count_matches 'TRACE_DRIVER_SCRATCH_REJECT' "$ALLOCATOR_LOG")"
@@ -911,6 +922,8 @@ elif [ -s "$ROUTE_LOG" ]; then
 fi
 scratch_driver_live_peak_bytes="${scratch_driver_live_peak_bytes:-0}"
 scratch_driver_reject_records="${scratch_driver_reject_records:-0}"
+kv_driver_tag_records="${kv_driver_tag_records:-0}"
+kv_driver_untag_records="${kv_driver_untag_records:-0}"
 scratch_driver_max_alloc_bytes="${scratch_driver_max_alloc_bytes:-0}"
 scratch_driver_over_budget_records="${scratch_driver_over_budget_records:-0}"
 phase_n_auto_hook_records="${phase_n_auto_hook_records:-0}"
@@ -1068,6 +1081,8 @@ failed_requests="${failed_requests:-0}"
   echo "scratch_driver_tag_records=$scratch_driver_tag_records"
   echo "scratch_driver_untag_records=$scratch_driver_untag_records"
   echo "scratch_driver_reject_records=$scratch_driver_reject_records"
+  echo "kv_driver_tag_records=$kv_driver_tag_records"
+  echo "kv_driver_untag_records=$kv_driver_untag_records"
   echo "scratch_driver_live_peak_bytes=$scratch_driver_live_peak_bytes"
   echo "scratch_driver_max_alloc_bytes=$scratch_driver_max_alloc_bytes"
   echo "scratch_driver_over_budget_records=$scratch_driver_over_budget_records"
@@ -1096,9 +1111,12 @@ failed_requests="${failed_requests:-0}"
   echo "hard_partition_scratch_budget_reject_records=$hard_partition_scratch_budget_reject_records"
   echo "hard_partition_scratch_driver_reject_records=$hard_partition_scratch_driver_reject_records"
   echo "driver_pool_budget_mode=$DRIVER_POOL_BUDGET_MODE"
+  echo "driver_kv_tag_enable=$VLLM_UVM_DRIVER_KV_TAG_ENABLE"
   echo "uvm_phase_n_auto_reclaim_every=$UVM_PHASE_N_AUTO_RECLAIM_EVERY"
   echo "uvm_phase_n_auto_reclaim_scan_every=$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY"
   echo "uvm_phase_n_auto_reclaim_cooldown_epochs=$UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS"
+  echo "uvm_phase_n_block_quota_enable=$UVM_PHASE_N_BLOCK_QUOTA_ENABLE"
+  echo "uvm_phase_n_block_quota_trace_only=$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY"
   echo "app_migration_records=$app_migration_records"
   echo "successful_requests=$successful_requests"
   echo "failed_requests=$failed_requests"
@@ -1119,7 +1137,7 @@ failed_requests="${failed_requests:-0}"
   echo
   echo "Kernel Driver Evidence"
   echo "----------------------"
-  grep_tail 'phase_f_register_region|phase_n_update_region_state|phase_n_set_pool_budget|phase_n_get_pool_state|phase_n_reclaim_pool|phase_n_auto_reclaim_hook|TRACE_DRIVER_SCRATCH_TAG|TRACE_DRIVER_SCRATCH_UNTAG|TRACE_DRIVER_SCRATCH_REJECT|TRACE_DRIVER_POOL_STATE_SNAPSHOT' "$RUN_ROOT" "$KERNEL_LOG" "$ROUTE_LOG" /var/log/kern.log
+  grep_tail 'phase_f_register_region|phase_n_update_region_state|phase_n_set_pool_budget|phase_n_get_pool_state|phase_n_reclaim_pool|phase_n_auto_reclaim_hook|phase_n_block_|TRACE_DRIVER_KV_TAG|TRACE_DRIVER_KV_UNTAG|TRACE_DRIVER_SCRATCH_TAG|TRACE_DRIVER_SCRATCH_UNTAG|TRACE_DRIVER_SCRATCH_REJECT|TRACE_DRIVER_POOL_STATE_SNAPSHOT' "$RUN_ROOT" "$KERNEL_LOG" "$ROUTE_LOG" /var/log/kern.log
   echo
   echo "Auto Hook Evidence"
   echo "------------------"
@@ -1138,8 +1156,10 @@ failed_requests="${failed_requests:-0}"
   echo "uvm_phase_n_auto_reclaim_every=$UVM_PHASE_N_AUTO_RECLAIM_EVERY"
   echo "uvm_phase_n_auto_reclaim_scan_every=$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY"
   echo "uvm_phase_n_auto_reclaim_cooldown_epochs=$UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS"
+  echo "uvm_phase_n_block_quota_enable=$UVM_PHASE_N_BLOCK_QUOTA_ENABLE"
+  echo "uvm_phase_n_block_quota_trace_only=$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY"
   echo "phase_f_route_log_snapshot=$ROUTE_LOG"
-  grep_tail 'phase_n_auto_reclaim_hook' "$ROUTE_LOG" "$KERNEL_LOG" "$RUN_ROOT"
+  grep_tail 'phase_n_auto_reclaim_hook|phase_n_block_' "$ROUTE_LOG" "$KERNEL_LOG" "$RUN_ROOT"
   echo
   echo "Application Migration Evidence"
   echo "------------------------------"

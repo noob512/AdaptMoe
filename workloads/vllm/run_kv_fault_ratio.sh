@@ -34,6 +34,9 @@ UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY:-256}
 UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS="${UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS:-2}"
 UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS:-0}"
 UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS:-256}"
+UVM_PHASE_N_BLOCK_QUOTA_ENABLE="${UVM_PHASE_N_BLOCK_QUOTA_ENABLE:-0}"
+UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY="${UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY:-1}"
+UVM_CAPTURE_STARTUP_FAULTS="${VLLM_UVM_CAPTURE_STARTUP_FAULTS:-0}"
 
 DATASET_PATH="${DATASET_PATH:-$SCRIPT_DIR/datasets/ShareGPT_V3_unfiltered_cleaned_split.json}"
 ADDRESS_LOG="/tmp/vllm_uvm_address_regions.log"
@@ -184,6 +187,10 @@ UVM_RESIDENCY_KV_POINTER_MAP_FILE="${VLLM_UVM_RESIDENCY_KV_POINTER_MAP_FILE:-}"
 UVM_RESIDENCY_KV_POINTER_TAG_ENABLE="${VLLM_UVM_RESIDENCY_KV_POINTER_TAG_ENABLE:-0}"
 UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY="${VLLM_UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY:-tensor}"
 UVM_RESIDENCY_PRIORITY="${VLLM_UVM_RESIDENCY_PRIORITY:-kv,scratch,weights}"
+UVM_DRIVER_KV_TAG_ENABLE="${VLLM_UVM_DRIVER_KV_TAG_ENABLE:-0}"
+UVM_KV_INIT_FAULT_PROBE="${VLLM_UVM_KV_INIT_FAULT_PROBE:-0}"
+UVM_KV_INIT_FAULT_PROBE_FILE="${VLLM_UVM_KV_INIT_FAULT_PROBE_FILE:-}"
+UVM_KV_INIT_FAULT_PROBE_SYNC="${VLLM_UVM_KV_INIT_FAULT_PROBE_SYNC:-0}"
 UVM_DRIVER_SCRATCH_TAG_ENABLE="${VLLM_UVM_DRIVER_SCRATCH_TAG_ENABLE:-0}"
 UVM_DRIVER_TEMP_BUFFER_BYTES="${VLLM_UVM_DRIVER_TEMP_BUFFER_BYTES:-0}"
 UVM_DRIVER_SCRATCH_BUDGET_ENFORCE="${VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE:-0}"
@@ -514,6 +521,14 @@ Options:
                              Stage N tag-only driver KV pointer registration.
   --uvm-residency-kv-pointer-tag-granularity <tensor|range>
                              Stage N KV driver tag granularity.
+  --uvm-driver-kv-tag-enable <0|1>
+                             Stage N P8e-a allocator-side early KV driver tags.
+  --uvm-kv-init-fault-probe <0|1>
+                             Emit KV torch.zeros begin/return/sync markers.
+  --uvm-kv-init-fault-probe-file <path>
+                             JSONL sidecar for KV init probe tensor metadata.
+  --uvm-kv-init-fault-probe-sync <0|1>
+                             Synchronize after KV torch.zeros while probing.
   --uvm-driver-scratch-tag-enable <0|1>
                              Stage N allocator-side scratch/temp driver tags.
   --uvm-residency-priority <csv>
@@ -635,6 +650,12 @@ Options:
                              Set uvm_phase_n_auto_reclaim_cooldown_epochs at insmod time
   --uvm-phase-n-auto-reclaim-failure-backoff-epochs <n>
                              Set uvm_phase_n_auto_reclaim_failure_backoff_epochs at insmod time
+  --uvm-phase-n-block-quota-enable <0|1>
+                             Set uvm_phase_n_block_quota_enable at insmod time
+  --uvm-phase-n-block-quota-trace-only <0|1>
+                             Set uvm_phase_n_block_quota_trace_only at insmod time
+  --capture-startup-faults <0|1>
+                             Start fault trace before vLLM server/KV initialization.
   --keep                     Keep UVM params on exit (no rollback)
   -h, --help                 Show help
 
@@ -813,6 +834,9 @@ start_server() {
     if [ -z "$UVM_RESIDENCY_TRACE_FILE" ]; then
       UVM_RESIDENCY_TRACE_FILE="$uvm_stage_e_log_dir/vllm_uvm_pool_residency_stage_l.jsonl"
     fi
+    if [ -z "$UVM_KV_INIT_FAULT_PROBE_FILE" ]; then
+      UVM_KV_INIT_FAULT_PROBE_FILE="$uvm_stage_e_log_dir/vllm_uvm_kv_init_fault_probe.jsonl"
+    fi
     policy_env="VLLM_UVM_POLICY_ENABLE='$UVM_POLICY_ENABLE' \
                 VLLM_UVM_POLICY_MODE='$UVM_POLICY_MODE' \
                 VLLM_UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES='$UVM_POLICY_WARMUP_PREFETCH_MIN_BYTES' \
@@ -952,6 +976,10 @@ start_server() {
                 VLLM_UVM_RESIDENCY_KV_POINTER_TAG_ENABLE='$UVM_RESIDENCY_KV_POINTER_TAG_ENABLE' \
                 VLLM_UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY='$UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY' \
                 VLLM_UVM_RESIDENCY_PRIORITY='$UVM_RESIDENCY_PRIORITY' \
+                VLLM_UVM_DRIVER_KV_TAG_ENABLE='$UVM_DRIVER_KV_TAG_ENABLE' \
+                VLLM_UVM_KV_INIT_FAULT_PROBE='$UVM_KV_INIT_FAULT_PROBE' \
+                VLLM_UVM_KV_INIT_FAULT_PROBE_FILE='$UVM_KV_INIT_FAULT_PROBE_FILE' \
+                VLLM_UVM_KV_INIT_FAULT_PROBE_SYNC='$UVM_KV_INIT_FAULT_PROBE_SYNC' \
                 VLLM_UVM_DRIVER_SCRATCH_TAG_ENABLE='$UVM_DRIVER_SCRATCH_TAG_ENABLE' \
                 VLLM_UVM_DRIVER_TEMP_BUFFER_BYTES='$UVM_DRIVER_TEMP_BUFFER_BYTES' \
                 VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE='$UVM_DRIVER_SCRATCH_BUDGET_ENFORCE' \
@@ -1077,6 +1105,9 @@ start_trace_capture_if_needed() {
 
   resolve_trace_dir
   need_file "$TRACE_DIR/trace_pipe"
+  if [ "$UVM_KV_INIT_FAULT_PROBE" = "1" ] && [ -e "$TRACE_DIR/trace_marker" ]; then
+    sudo chmod a+w "$TRACE_DIR/trace_marker" >/dev/null 2>&1 || true
+  fi
 
   mkdir -p "$(dirname "$TRACE_LOG")"
   RUN_STATS_LOG="$TRACE_LOG"
@@ -1108,7 +1139,7 @@ start_trace_capture_if_needed() {
       err="$4"
       sudo cat "$trace_dir/trace_pipe" 2>"$err" | awk -v stats="$stats" -v addrs="$addrs" '"'"'
         /Replayable fault stats GPU|batch_faults=|本批次总缺页实例数=/ { print >> stats; fflush(stats); next }
-        /Replayable fault GPU|精确原始地址=/ { print >> addrs; fflush(addrs); next }
+        /Replayable fault GPU|精确原始地址=|VLLM_KV_INIT_PROBE/ { print >> addrs; fflush(addrs); next }
       '"'"'
     ' _ "$TRACE_DIR" "$RUN_STATS_LOG" "$RUN_ADDRESS_LOG" "$TRACE_READER_ERROR_LOG" &
   else
@@ -1156,7 +1187,7 @@ start_dmesg_capture_if_needed() {
   if [ "$ENABLE_FAULT_ADDRESS_LOG" -eq 1 ]; then
     sudo dmesg "$dmesg_follow_arg" --time-format iso | awk -v stats="$RUN_STATS_LOG" -v addrs="$RUN_ADDRESS_LOG" '
       /Replayable fault stats GPU|batch_faults=|本批次总缺页实例数=/ { print >> stats; fflush(stats); next }
-      /Replayable fault GPU|精确原始地址=/ { print >> addrs; fflush(addrs); next }
+      /Replayable fault GPU|精确原始地址=|VLLM_KV_INIT_PROBE/ { print >> addrs; fflush(addrs); next }
     ' &
   else
     sudo dmesg "$dmesg_follow_arg" --time-format iso | grep -E --line-buffered "$STATS_LINE_PATTERN" > "$RUN_STATS_LOG" &
@@ -1194,6 +1225,8 @@ reload_uvm_module_for_counter_reset() {
     uvm_phase_n_auto_reclaim_max_victims="$UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS" \
     uvm_phase_n_auto_reclaim_cooldown_epochs="$UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS" \
     uvm_phase_n_auto_reclaim_failure_backoff_epochs="$UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS" \
+    uvm_phase_n_block_quota_enable="$UVM_PHASE_N_BLOCK_QUOTA_ENABLE" \
+    uvm_phase_n_block_quota_trace_only="$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY" \
     uvm_perf_fault_log_destination=0 \
     uvm_perf_fault_log_counters=0 \
     uvm_perf_fault_log_addresses=0 \
@@ -1241,6 +1274,18 @@ reload_uvm_module_for_counter_reset() {
     auto_reclaim_scan_every_val="$(cat "$PARAM_DIR/uvm_phase_n_auto_reclaim_scan_every" 2>/dev/null || true)"
     [ "$auto_reclaim_scan_every_val" = "$UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY" ] \
       || die "uvm_phase_n_auto_reclaim_scan_every expected $UVM_PHASE_N_AUTO_RECLAIM_SCAN_EVERY, got $auto_reclaim_scan_every_val"
+  fi
+  if [ -r "$PARAM_DIR/uvm_phase_n_block_quota_enable" ]; then
+    local block_quota_enable_val
+    block_quota_enable_val="$(cat "$PARAM_DIR/uvm_phase_n_block_quota_enable" 2>/dev/null || true)"
+    [ "$block_quota_enable_val" = "$UVM_PHASE_N_BLOCK_QUOTA_ENABLE" ] \
+      || die "uvm_phase_n_block_quota_enable expected $UVM_PHASE_N_BLOCK_QUOTA_ENABLE, got $block_quota_enable_val"
+  fi
+  if [ -r "$PARAM_DIR/uvm_phase_n_block_quota_trace_only" ]; then
+    local block_quota_trace_only_val
+    block_quota_trace_only_val="$(cat "$PARAM_DIR/uvm_phase_n_block_quota_trace_only" 2>/dev/null || true)"
+    [ "$block_quota_trace_only_val" = "$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY" ] \
+      || die "uvm_phase_n_block_quota_trace_only expected $UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY, got $block_quota_trace_only_val"
   fi
 
   # Optional: clear old kernel ring lines so dmesg mode only shows this run.
@@ -1331,6 +1376,16 @@ configure_uvm_params() {
   write_param uvm_perf_fault_kv_start "$KV_START"
   write_param uvm_perf_fault_kv_end "$KV_END"
   write_param uvm_perf_fault_kv_range_enable 1
+  write_param uvm_perf_fault_log_destination "$destination"
+  write_param uvm_perf_fault_log_counters 1
+  write_param uvm_perf_fault_log_addresses "$ENABLE_FAULT_ADDRESS_LOG"
+}
+
+configure_uvm_params_for_startup_capture() {
+  local destination=0
+  [ "$MODE" = "trace" ] && destination=1
+
+  write_param uvm_perf_fault_kv_range_enable 0
   write_param uvm_perf_fault_log_destination "$destination"
   write_param uvm_perf_fault_log_counters 1
   write_param uvm_perf_fault_log_addresses "$ENABLE_FAULT_ADDRESS_LOG"
@@ -1518,6 +1573,10 @@ parse_args() {
       --uvm-residency-kv-pointer-map-file) UVM_RESIDENCY_KV_POINTER_MAP_FILE="$2"; shift 2 ;; # Stage L6 raw pointer map sidecar
       --uvm-residency-kv-pointer-tag-enable) UVM_RESIDENCY_KV_POINTER_TAG_ENABLE="$2"; shift 2 ;; # Stage N tag-only driver KV pointer registration
       --uvm-residency-kv-pointer-tag-granularity) UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY="$2"; shift 2 ;; # Stage N KV driver tag granularity
+      --uvm-driver-kv-tag-enable) UVM_DRIVER_KV_TAG_ENABLE="$2"; shift 2 ;; # Stage N P8e-a allocator-side early KV driver tags
+      --uvm-kv-init-fault-probe) UVM_KV_INIT_FAULT_PROBE="$2"; shift 2 ;; # Probe KV torch.zeros fault timing
+      --uvm-kv-init-fault-probe-file) UVM_KV_INIT_FAULT_PROBE_FILE="$2"; shift 2 ;; # KV init probe JSONL sidecar
+      --uvm-kv-init-fault-probe-sync) UVM_KV_INIT_FAULT_PROBE_SYNC="$2"; shift 2 ;; # Synchronize after KV torch.zeros while probing
       --uvm-driver-scratch-tag-enable) UVM_DRIVER_SCRATCH_TAG_ENABLE="$2"; shift 2 ;; # Stage N allocator-side scratch/temp driver tags
       --uvm-driver-temp-buffer-bytes) UVM_DRIVER_TEMP_BUFFER_BYTES="$2"; shift 2 ;; # Stage N driver scratch/temp budget bytes
       --uvm-driver-scratch-budget-enforce) UVM_DRIVER_SCRATCH_BUDGET_ENFORCE="$2"; shift 2 ;; # Stage N allocator-side scratch budget hard gate
@@ -1577,6 +1636,9 @@ parse_args() {
       --uvm-phase-n-auto-reclaim-max-victims) UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS="$2"; shift 2 ;; # insmod 时配置 Stage N auto reclaim batch victim 上限
       --uvm-phase-n-auto-reclaim-cooldown-epochs) UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS="$2"; shift 2 ;; # insmod 时配置 Stage N auto reclaim cooldown
       --uvm-phase-n-auto-reclaim-failure-backoff-epochs) UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="$2"; shift 2 ;; # insmod 时配置 Stage N auto reclaim failure backoff
+      --uvm-phase-n-block-quota-enable) UVM_PHASE_N_BLOCK_QUOTA_ENABLE="$2"; shift 2 ;; # insmod 时开启 Stage N block quota path
+      --uvm-phase-n-block-quota-trace-only) UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY="$2"; shift 2 ;; # insmod 时控制 block quota 是否只 trace
+      --capture-startup-faults) UVM_CAPTURE_STARTUP_FAULTS="$2"; shift 2 ;; # 在 vLLM server/KV 初始化前启动 fault trace
       --keep) KEEP_ON_EXIT=1; shift ;;                         # 退出时不重置内核状态
 
       # ==========================================
@@ -1756,6 +1818,9 @@ validate_inputs() {
     [[ "$UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-residency-kv-max-offload-blocks-per-step must be a non-negative integer"
     [[ "$UVM_RESIDENCY_KV_POINTER_TAG_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-kv-pointer-tag-enable must be 0 or 1"
     [[ "$UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY" =~ ^(tensor|range)$ ]] || die "--uvm-residency-kv-pointer-tag-granularity must be tensor or range"
+    [[ "$UVM_DRIVER_KV_TAG_ENABLE" =~ ^[01]$ ]] || die "--uvm-driver-kv-tag-enable must be 0 or 1"
+    [[ "$UVM_KV_INIT_FAULT_PROBE" =~ ^[01]$ ]] || die "--uvm-kv-init-fault-probe must be 0 or 1"
+    [[ "$UVM_KV_INIT_FAULT_PROBE_SYNC" =~ ^[01]$ ]] || die "--uvm-kv-init-fault-probe-sync must be 0 or 1"
     [[ "$UVM_DRIVER_SCRATCH_TAG_ENABLE" =~ ^[01]$ ]] || die "--uvm-driver-scratch-tag-enable must be 0 or 1"
     [[ "$UVM_DRIVER_TEMP_BUFFER_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-driver-temp-buffer-bytes must be a non-negative integer"
     [[ "$UVM_DRIVER_SCRATCH_BUDGET_ENFORCE" =~ ^[01]$ ]] || die "--uvm-driver-scratch-budget-enforce must be 0 or 1"
@@ -1779,6 +1844,9 @@ validate_inputs() {
     [[ "$UVM_PHASE_N_AUTO_RECLAIM_MAX_VICTIMS" =~ ^[0-9]+$ ]] || die "--uvm-phase-n-auto-reclaim-max-victims must be a non-negative integer"
     [[ "$UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS" =~ ^[0-9]+$ ]] || die "--uvm-phase-n-auto-reclaim-cooldown-epochs must be a non-negative integer"
     [[ "$UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS" =~ ^[0-9]+$ ]] || die "--uvm-phase-n-auto-reclaim-failure-backoff-epochs must be a non-negative integer"
+    [[ "$UVM_PHASE_N_BLOCK_QUOTA_ENABLE" =~ ^[01]$ ]] || die "--uvm-phase-n-block-quota-enable must be 0 or 1"
+    [[ "$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY" =~ ^[01]$ ]] || die "--uvm-phase-n-block-quota-trace-only must be 0 or 1"
+    [[ "$UVM_CAPTURE_STARTUP_FAULTS" =~ ^[01]$ ]] || die "--capture-startup-faults must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_ENABLE" =~ ^[01]$ ]] || die "--uvm-scratch-pool-enable must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-scratch-pool-budget-bytes must be a non-negative integer"
     [[ "$UVM_SCRATCH_POOL_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-scratch-pool-mode must be trace_only or enforce"
@@ -2265,6 +2333,16 @@ main() {
     echo "Auto gap-watch control file initialized: $UVM_GAP_WATCH_CONTROL_FILE"
   fi
 
+  if [ "$UVM_CAPTURE_STARTUP_FAULTS" -eq 1 ]; then
+    echo "Configuring startup UVM fault logging before vLLM server start..."
+    configure_uvm_params_for_startup_capture
+    echo "Startup UVM fault logging configured."
+    echo "Stats log: $TRACE_LOG"
+    [ "$ENABLE_FAULT_ADDRESS_LOG" -eq 1 ] && echo "Address log: $ADDRESS_TRACE_LOG"
+    start_trace_capture_if_needed
+    start_dmesg_capture_if_needed
+  fi
+
   echo "Starting single-process vLLM server..."
   start_server
 
@@ -2279,8 +2357,12 @@ main() {
   echo "Stats log: $TRACE_LOG"
   [ "$ENABLE_FAULT_ADDRESS_LOG" -eq 1 ] && echo "Address log: $ADDRESS_TRACE_LOG"
 
-  start_trace_capture_if_needed
-  start_dmesg_capture_if_needed
+  if [ "$UVM_CAPTURE_STARTUP_FAULTS" -eq 0 ]; then
+    start_trace_capture_if_needed
+    start_dmesg_capture_if_needed
+  else
+    echo "Trace capture was already started before server initialization."
+  fi
 
   if [ "$NO_BENCH" -eq 0 ]; then
     echo "Bench log: $BENCH_LOG"

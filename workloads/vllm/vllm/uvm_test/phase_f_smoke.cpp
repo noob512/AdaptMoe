@@ -131,8 +131,8 @@ namespace {
 // shell 脚本 run_stage_m_phase_f_smoke.sh 会把同名 --step 继续传进来。
 void usage(const char* argv0) {
     std::fprintf(stderr,
-                 "Usage: %s [--step all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|register-region|query-region|phase-n-region|phase-n-metadata-state|phase-n-reclaim|query|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu] "
-                 "[--bytes N] [--device N] [--async 0|1] [--pool N]\n",
+                 "Usage: %s [--step all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|register-region|query-region|phase-n-region|phase-n-metadata-state|phase-n-reclaim|phase-n-block-quota|query|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu] "
+                 "[--bytes N] [--device N] [--async 0|1] [--pool N] [--blocks N] [--budget-blocks N]\n",
                  argv0);
 }
 
@@ -178,6 +178,8 @@ int main(int argc, char** argv) {
     int device = 0;
     int async = 0;
     uint32_t pool = 1;
+    size_t blocks = 4;
+    size_t budget_blocks = 2;
 
     // 简单命令行解析。未知参数或缺少值时打印 usage 并返回 2。
     for (int i = 1; i < argc; ++i) {
@@ -196,6 +198,12 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--pool") == 0 && i + 1 < argc) {
             pool = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
         }
+        else if (std::strcmp(argv[i], "--blocks") == 0 && i + 1 < argc) {
+            blocks = std::strtoull(argv[++i], nullptr, 0);
+        }
+        else if (std::strcmp(argv[i], "--budget-blocks") == 0 && i + 1 < argc) {
+            budget_blocks = std::strtoull(argv[++i], nullptr, 0);
+        }
         else if (std::strcmp(argv[i], "-h") == 0 ||
                  std::strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -209,8 +217,8 @@ int main(int argc, char** argv) {
 
     // 打印本次配置。若日志中看不到这一行，说明进程可能还没进入 main，
     // 或者动态链接/程序启动阶段已经失败。
-    std::printf("phase_f_smoke begin step=%s bytes=%zu device=%d async=%d pool=%u\n",
-                step.c_str(), bytes, device, async, pool);
+    std::printf("phase_f_smoke begin step=%s bytes=%zu device=%d async=%d pool=%u blocks=%zu budget_blocks=%zu\n",
+                step.c_str(), bytes, device, async, pool, blocks, budget_blocks);
     std::fflush(stdout);
     trace("main_after_parse");
 
@@ -317,6 +325,18 @@ int main(int argc, char** argv) {
     // 因此只有 requested == all 或 requested 属于后续 range step 时才会走到这里。
     // 对 ping-ioctl 单步来说，前面已经 return，不会执行以下 CUDA 代码。
     void* ptr = nullptr;
+    size_t allocation_bytes = bytes;
+    if (want_step(step, "phase-n-block-quota")) {
+        if (blocks == 0 || budget_blocks == 0 || bytes == 0) {
+            std::fprintf(stderr, "phase-n-block-quota requires positive --bytes, --blocks, and --budget-blocks\n");
+            return 2;
+        }
+        if (blocks > static_cast<size_t>(-1) / bytes) {
+            std::fprintf(stderr, "phase-n-block-quota allocation size overflow\n");
+            return 2;
+        }
+        allocation_bytes = bytes * blocks;
+    }
 
     // 选择 CUDA device。失败时返回 3。
     trace("before_cuda_set_device");
@@ -329,7 +349,7 @@ int main(int argc, char** argv) {
     // 分配一个 managed memory buffer。后续 Phase F range 操作会使用它的地址。
     // 失败时返回 4。
     trace("before_cuda_malloc_managed");
-    err = cudaMallocManaged(&ptr, bytes);
+    err = cudaMallocManaged(&ptr, allocation_bytes);
     if (err != cudaSuccess) {
         std::fprintf(stderr, "cudaMallocManaged failed: %s\n", cudaGetErrorString(err));
         return 4;
@@ -338,7 +358,7 @@ int main(int argc, char** argv) {
     // 触摸 buffer 前 4KB，让这个 allocation 有实际访问痕迹。
     // 这能帮助后续 residency/query/prefetch 测试更接近真实 UVM 使用场景。
     trace("before_memset");
-    std::memset(ptr, 0x5a, bytes < 4096 ? bytes : 4096);
+    std::memset(ptr, 0x5a, allocation_bytes < 4096 ? allocation_bytes : 4096);
 
     // 等待 CUDA 侧状态稳定。失败时释放 buffer 并返回 5。
     trace("before_cuda_device_synchronize_after_memset");
@@ -352,7 +372,7 @@ int main(int argc, char** argv) {
 
     // 把 managed pointer 转成整数地址，传给 uvm_allocator.cpp 的 ioctl helper。
     uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
-    size_t size = bytes;
+    size_t size = allocation_bytes;
     std::printf("phase_f_smoke managed_ptr=0x%llx bytes=%zu\n",
                 static_cast<unsigned long long>(base), size);
     std::fflush(stdout);
@@ -627,6 +647,110 @@ int main(int argc, char** argv) {
         (void)uvm_driver_phase_f_unregister_region(region_id);
         trace("after_phase_n_reclaim");
         if (failed || step == "phase-n-reclaim") {
+            cudaFree(ptr);
+            return failed;
+        }
+    }
+
+    // Step 8.5: Stage N P8c block-quota synthetic proof.
+    // The region is registered before GPU touches. Each cudaMemset hits the
+    // first page of one native-size block so the replayable-fault outer hook can
+    // materialize the Stage N block wrapper and optionally auto-reclaim.
+    if (want_step(step, "phase-n-block-quota")) {
+        uint64_t state[36] = {};
+        const uint64_t block_region_id = 1000 + pool;
+        const uint32_t role = pool == 2 ? 2 : (pool == 3 ? 5 : 1);
+        uint32_t flags = 0x1;
+        if (pool == 3)
+            flags |= 0x20;
+        size_t touch_bytes = bytes < 4096 ? bytes : 4096;
+        uint64_t budget_bytes = static_cast<uint64_t>(budget_blocks) * static_cast<uint64_t>(bytes);
+
+        trace("before_phase_n_block_quota");
+        int failed = run_step(
+            "phase-n-block-quota-set-pool-budget",
+            uvm_driver_phase_n_set_pool_budget(pool, 0, budget_bytes, 1, 0));
+        if (!failed) {
+            failed = run_step(
+                "phase-n-block-quota-register-region",
+                uvm_driver_phase_f_register_region(block_region_id,
+                                                   base,
+                                                   size,
+                                                   pool,
+                                                   0,
+                                                   0,
+                                                   role,
+                                                   flags));
+        }
+        if (!failed) {
+            failed = run_step(
+                "phase-n-block-quota-initial-pool-state",
+                uvm_driver_phase_n_get_pool_state(pool, 0, state, 36));
+            std::printf("phase_n_block_quota_initial pool=%u budget=%llu resident_gpu=%llu over=%llu mode=%llu flags=0x%llx\n",
+                        pool,
+                        static_cast<unsigned long long>(state[0]),
+                        static_cast<unsigned long long>(state[1]),
+                        static_cast<unsigned long long>(state[6]),
+                        static_cast<unsigned long long>(state[34]),
+                        static_cast<unsigned long long>(state[35]));
+        }
+
+        for (size_t i = 0; !failed && i < blocks; ++i) {
+            char* block_ptr = static_cast<char*>(ptr) + i * bytes;
+            err = cudaMemset(block_ptr, static_cast<int>(0x30 + (i & 0x3f)), touch_bytes);
+            if (err != cudaSuccess) {
+                std::fprintf(stderr, "cudaMemset block=%zu failed: %s\n",
+                             i, cudaGetErrorString(err));
+                failed = 6;
+                break;
+            }
+            err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                std::fprintf(stderr, "cudaDeviceSynchronize block=%zu failed: %s\n",
+                             i, cudaGetErrorString(err));
+                failed = 7;
+                break;
+            }
+
+            std::memset(state, 0, sizeof(state));
+            failed = run_step(
+                "phase-n-block-quota-touch-pool-state",
+                uvm_driver_phase_n_get_pool_state(pool, 0, state, 36));
+            std::printf("phase_n_block_quota_touch pool=%u block=%zu offset=%zu touch_bytes=%zu budget=%llu resident_gpu=%llu over=%llu victim_count=%llu success_events=%llu failed_events=%llu mode=%llu flags=0x%llx\n",
+                        pool,
+                        i,
+                        i * bytes,
+                        touch_bytes,
+                        static_cast<unsigned long long>(state[0]),
+                        static_cast<unsigned long long>(state[1]),
+                        static_cast<unsigned long long>(state[6]),
+                        static_cast<unsigned long long>(state[12]),
+                        static_cast<unsigned long long>(state[31]),
+                        static_cast<unsigned long long>(state[32]),
+                        static_cast<unsigned long long>(state[34]),
+                        static_cast<unsigned long long>(state[35]));
+        }
+
+        if (!failed) {
+            std::memset(state, 0, sizeof(state));
+            failed = run_step(
+                "phase-n-block-quota-final-pool-state",
+                uvm_driver_phase_n_get_pool_state(pool, 0, state, 36));
+            std::printf("phase_n_block_quota_final pool=%u budget=%llu resident_gpu=%llu over=%llu victim_count=%llu success_events=%llu failed_events=%llu mode=%llu flags=0x%llx\n",
+                        pool,
+                        static_cast<unsigned long long>(state[0]),
+                        static_cast<unsigned long long>(state[1]),
+                        static_cast<unsigned long long>(state[6]),
+                        static_cast<unsigned long long>(state[12]),
+                        static_cast<unsigned long long>(state[31]),
+                        static_cast<unsigned long long>(state[32]),
+                        static_cast<unsigned long long>(state[34]),
+                        static_cast<unsigned long long>(state[35]));
+        }
+
+        (void)uvm_driver_phase_f_unregister_region(block_region_id);
+        trace("after_phase_n_block_quota");
+        if (failed || step == "phase-n-block-quota") {
             cudaFree(ptr);
             return failed;
         }

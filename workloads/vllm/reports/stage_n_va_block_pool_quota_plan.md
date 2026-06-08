@@ -440,7 +440,6 @@ uvm_phase_n_block_queue_policy=fifo|lru
 victim 选择只允许从当前 pool queue 中取：
 
 ```text
-skip current triggering block
 skip in_reclaim block
 skip mixed_pool block
 skip stale/dead block

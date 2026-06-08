@@ -20,10 +20,10 @@ workloads/vllm/reports/stage_n_va_block_pool_quota_plan.md
 
 ## 当前实现阶段标注
 
-更新时间：2026-06-07
+更新时间：2026-06-08
 
 ```text
-当前已实现到：P8b - Manual Same-Pool Block Reclaim
+当前已实现到：P8e-a - Allocator-side Early KV Tag
 ```
 
 - P8a `Tagged Range + Lazy Block Trace`：已实现并通过模块编译。
@@ -34,9 +34,40 @@ workloads/vllm/reports/stage_n_va_block_pool_quota_plan.md
   - victim 跳过 `mixed_pool`、`in_reclaim`、`stale/nonresident`、wrong-pool、未标记 evictable、protected/active/pinned block。
   - 实际迁移通过已有 `uvm_migrate_managed_range_to_cpu()`，迁移范围使用 tagged range 与 native block 的 page-aligned 覆盖交集。
   - 成功后更新 `gpu_resident=false`、出队、`resident_blocks--`、`reclaim_success/same_pool_victims++`；失败则重新入队并累计 failure。
-- P8c `Auto Post-Fault Block Quota`：未实现。
-- P8d `Capacity Stability Proof`：未实现。
-- P8e `Pre-Fault Hard Quota`：未实现。
+- P8c `Auto Post-Fault Block Quota`：已实现 driver outer hook block-quota post-fault correction。
+  - replayable fault batch 外层 hook 在 `uvm_phase_n_block_quota_enable=1` 时先 lazy materialize block wrapper 并更新 resident queue/counter。
+  - materialize 后通过 tagged address 读取 block pool snapshot，不扫 region。
+  - 当 pool `resident_blocks > budget_blocks` 时输出 `phase_n_block_over_budget`。
+  - 默认仍保守：`uvm_phase_n_block_quota_trace_only=1` 只记录，不迁移。
+  - 真正自动迁移需要 `uvm_phase_n_block_quota_trace_only=0`、`uvm_phase_n_auto_reclaim_execute=1`，且 pool mode 为 `SOFT` 或 `ENFORCE`。
+  - 执行时复用 P8b `uvm_phase_n_reclaim_pool_blocks()`，从 same-pool `resident_queue` 取 victim，不进入旧 region full scan。
+  - 当前 queue policy 明确为 FIFO：block 第一次变为 resident 时入队尾，后续访问只更新 epoch，不移动队列位置。
+  - 已删除 auto path 的 trigger-block skip；P8c 按 FIFO 顺序选择第一个 same-pool eligible victim。
+  - auto path 的 target 使用当前 `over_blocks * UVM_VA_BLOCK_SIZE`，做 post-fault correction，不额外加 region reclaim margin。
+  - 新增 `phase_n_block_auto_hook` trace，记录 skip/execute、attempted/success/failure、reclaim_to_budget 等证据。
+- P8d `Capacity Stability Proof`：实验脚本与 checker 已实现，等待目标 GPU 上执行并归档结果。
+  - 新增 `workloads/vllm/check_stage_n_block_quota.py`：解析 synthetic/vLLM run root 中的 `phase_n_block_*`、`GET_POOL_STATE block_quota=1`、`RECLAIM_POOL block_quota=1` 证据。
+  - 新增 `workloads/vllm/run_stage_n_p8d_synthetic_block_quota.sh`：不启动 vLLM，直接用 `phase_f_smoke --step phase-n-block-quota` 验证 KV/WEIGHT 分池、FIFO resident queue、post-fault over-budget、same-pool block reclaim。
+  - 新增 `workloads/vllm/run_stage_n_p8d_vllm_block_quota_probe.sh`：复用 vLLM tag-only three-pool smoke，开启 P8c block quota 参数，并用新 checker 验证真实 vLLM 日志。
+  - 新增 `workloads/vllm/run_stage_n_p8d_block_quota_all.sh`：一键串联 synthetic 与 vLLM probe。
+  - `workloads/vllm/vllm/uvm_test/phase_f_smoke.cpp` 新增 `phase-n-block-quota` step，通过 `cudaMemset` 触发 managed-memory GPU fault。
+  - `workloads/vllm/run_kv_fault_ratio.sh` 与 `run_stage_n_tag_only_three_pool_smoke.sh` 已接入 `uvm_phase_n_block_quota_enable` / `uvm_phase_n_block_quota_trace_only` module 参数。
+- P8e-a `Allocator-side Early KV Tag`：已实现，默认关闭，通过 `VLLM_UVM_DRIVER_KV_TAG_ENABLE=1` 开启。
+  - `workloads/vllm/vllm/uvm_test/uvm_allocator.cpp` 在 KV allocation 最终确认仍为 `managed` 后，立即调用 `uvm_driver_phase_f_register_region_internal()` 注册整段 KV managed VA。
+  - allocator 注册参数：`pool=1(KV)`、`role=1(kv_block)`、`flags=0x1(EVICTABLE)`；日志输出 `TRACE_DRIVER_KV_TAG` / `TRACE_DRIVER_KV_UNTAG`。
+  - `AllocationInfo` 保存 allocator-side KV driver region id，`uvm_free()` 对称 unregister，避免 `phase_f_region_ranges` 残留旧 KV range。
+  - `uvm_kv_runtime_policy.py` 在 `VLLM_UVM_DRIVER_KV_TAG_ENABLE=1` 时保留 KV metadata / pointer map，但跳过 Python pointer child driver tags，避免和 allocator 整段 KV range 重叠注册。
+  - `run_kv_fault_ratio.sh` 新增 `--uvm-driver-kv-tag-enable <0|1>`；`run_stage_n_tag_only_three_pool_smoke.sh` 与 P8d probe 已透传并记录该 flag。
+  - `build_stage_n_modules.sh` 已在构建 `uvm_allocator.so` 后同步复制到运行时 `vllm/uvm_allocator.abi3.so`。
+- P8e-a 当前验证结论：allocator-side early KV tag 已经生效，但尚未完全修复真实 vLLM KV block 漏账。
+  - 快速验证 run：`log/stage_n_p8e_allocator_kv_tag_quick2_20260608_135153`。
+  - `allocator_kv_driver_tag_records=48`，`allocator_kv_driver_tag_success_records=48`，说明 allocator 确实在 KV allocation 路径向 driver 注册了 KV tag。
+  - `pool_kv_materialize_records=0`，`pool_kv_max_resident_blocks=0`，说明 Stage N block quota 的 KV `phase_n_block_t` / resident queue 仍未被填充。
+  - 同次 acceptance summary 里旧 region-scan 路径显示 `pool_state_kv.resident_gpu_bytes=6329204736`、`candidate_regions=3018`，说明 KV range/tag/residency 并非完全缺失；缺的是把已有 native UVM residency 补进 Stage N block queue。
+  - 同一 run 中 weights 有 `phase_n_block_materialize pool=2`，说明 block quota hook 本身仍在工作；问题集中在真实 vLLM KV 路径没有产生可见的 tagged KV post-fault materialize。
+  - 因此 P8e-a 是必要补强，但不是完整修复；如果目标是让真实 vLLM KV resident block accounting 非 0，下一步应进入 P8e-b。
+- P8e-b `Register-time Backfill`：未实现。P8e-a 验证后仍出现 KV 漏账，因此下一阶段建议实现 register-time/allocator-register-time backfill。
+- P8e `Pre-Fault Hard Quota`：尚未实现 admission-control/hard quota，只完成早打 tag 的 P8e-a 子阶段。
 
 ## 1. 历史背景与当前结论
 
@@ -359,7 +390,7 @@ uvm_phase_n_create_block(va_space, tagged_region, managed_range, native_index, n
 uvm_phase_n_find_or_create_block(va_space, address, &block)
 uvm_phase_n_detect_mixed_pool(va_space, block)
 uvm_phase_n_mark_block_resident(va_space, block, epoch)
-uvm_phase_n_pop_same_pool_victim(va_space, pool, trigger_block)
+uvm_phase_n_pop_same_pool_victim(va_space, pool)
 uvm_phase_n_reclaim_block_to_cpu(va_space, block, gpu_id)
 uvm_phase_n_reclaim_pool_from_queue(va_space, pool, gpu_id, max_victims)
 ```
@@ -467,7 +498,6 @@ RECLAIM_POOL 在 block quota enable 时不扫 region；
 3. victim skip 条件：
 
    ```text
-   skip trigger block
    skip mixed_pool
    skip in_reclaim
    skip stale/dead

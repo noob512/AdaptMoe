@@ -88,7 +88,30 @@ MODULE_PARM_DESC(uvm_exp_gpu_cache_sysmem,
                  "Force caching for mappings to system memory. "
                  "This is an experimental parameter that may cause correctness issues if used.");
 
+static unsigned uvm_latency_remote_first_enable __read_mostly = 0;
+module_param(uvm_latency_remote_first_enable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_latency_remote_first_enable,
+                 "Enable experimental read-only remote-first GPU fault service. Default: 0.");
+
+static unsigned uvm_latency_bg_promote_enable __read_mostly = 0;
+module_param(uvm_latency_bg_promote_enable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_latency_bg_promote_enable,
+                 "Enable experimental read-only background promotion after remote-first service. Default: 0.");
+
+static unsigned uvm_latency_bg_promote_max_pages __read_mostly = 512;
+module_param(uvm_latency_bg_promote_max_pages, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_latency_bg_promote_max_pages,
+                 "Maximum pages copied by one read-only background promotion worker pass. Default: 512.");
+
+static atomic64_t g_uvm_latency_remote_first_faults = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_latency_remote_first_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_latency_bg_promote_enqueued_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_latency_bg_promote_copied_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_latency_bg_promote_committed_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_latency_bg_promote_cancelled_pages = ATOMIC64_INIT(0);
+
 static void block_add_eviction_mappings_entry(void *args);
+static void block_bg_promote_entry(void *args);
 static void block_unmap_cpu(uvm_va_block_t *block,
                             uvm_va_block_context_t *block_context,
                             uvm_va_block_region_t region,
@@ -1302,6 +1325,7 @@ NV_STATUS uvm_va_block_create(uvm_va_range_managed_t *managed_range,
     block->prefetch_info.last_migration_proc_id = UVM_ID_INVALID;
 
     nv_kthread_q_item_init(&block->eviction_mappings_q_item, block_add_eviction_mappings_entry, block);
+    nv_kthread_q_item_init(&block->bg_promote_q_item, block_bg_promote_entry, block);
 
     *out_block = block;
     return NV_OK;
@@ -8519,6 +8543,421 @@ NV_STATUS uvm_va_block_map(uvm_va_block_t *va_block,
     return status;
 }
 
+static NvU32 block_page_mask_copy_limited(uvm_page_mask_t *dst,
+                                          const uvm_page_mask_t *src,
+                                          uvm_va_block_region_t region,
+                                          NvU32 max_pages)
+{
+    uvm_page_index_t page_index;
+    NvU32 count = 0;
+
+    uvm_page_mask_zero(dst);
+
+    if (max_pages == 0)
+        return 0;
+
+    for_each_va_block_page_in_region_mask(page_index, src, region) {
+        uvm_page_mask_set(dst, page_index);
+        if (++count == max_pages)
+            break;
+    }
+
+    return count;
+}
+
+static void block_bg_promote_schedule_locked(uvm_va_block_t *va_block)
+{
+    uvm_va_block_retain(va_block);
+
+    if (!nv_kthread_q_schedule_q_item(&g_uvm_global.global_q, &va_block->bg_promote_q_item))
+        uvm_va_block_release_no_destroy(va_block);
+}
+
+static bool block_bg_promote_pages_pending(uvm_va_block_t *va_block)
+{
+    uvm_gpu_id_t gpu_id;
+
+    for_each_gpu_id_in_mask(gpu_id, &va_block->bg_promote_gpus) {
+        uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu_id);
+
+        if (!gpu_state)
+            continue;
+
+        if (!uvm_page_mask_empty(&gpu_state->bg_promote_pending))
+            return true;
+    }
+
+    return false;
+}
+
+static NV_STATUS block_force_remote_map_cpu_read_locked(uvm_va_block_t *va_block,
+                                                        uvm_va_block_context_t *block_context,
+                                                        uvm_gpu_id_t gpu_id,
+                                                        uvm_va_block_region_t region,
+                                                        const uvm_page_mask_t *page_mask)
+{
+    uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
+    uvm_gpu_t *gpu = uvm_gpu_get(gpu_id);
+    uvm_va_block_gpu_state_t *gpu_state;
+    uvm_page_mask_t *running_page_mask = &block_context->mapping.map_running_page_mask;
+    uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
+    NV_STATUS status = NV_OK;
+    int nid;
+
+    UVM_ASSERT(!uvm_va_block_is_hmm(va_block));
+    UVM_ASSERT(UVM_ID_IS_GPU(gpu_id));
+    UVM_ASSERT(uvm_processor_mask_test(&va_space->accessible_from[uvm_id_value(UVM_ID_CPU)], gpu_id));
+
+    gpu_state = uvm_va_block_gpu_state_get_alloc(va_block, gpu);
+    if (!gpu_state)
+        return NV_ERR_NO_MEMORY;
+
+    uvm_page_mask_init_from_region(running_page_mask, region, page_mask);
+    uvm_page_mask_andnot(running_page_mask, running_page_mask, &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ]);
+    if (uvm_page_mask_region_empty(running_page_mask, region))
+        return NV_OK;
+
+    block_context->mapping.cause = UvmEventMapRemoteCausePolicy;
+
+    for_each_possible_uvm_node(nid) {
+        NV_STATUS tracker_status;
+
+        status = block_map_gpu_to(va_block,
+                                  block_context,
+                                  gpu,
+                                  UVM_ID_CPU,
+                                  nid,
+                                  running_page_mask,
+                                  UVM_PROT_READ_ONLY,
+                                  &local_tracker);
+
+        tracker_status = uvm_tracker_add_tracker_safe(&va_block->tracker, &local_tracker);
+        uvm_tracker_deinit(&local_tracker);
+        uvm_tracker_init(&local_tracker);
+
+        if (status == NV_OK)
+            status = tracker_status;
+
+        if (status != NV_OK)
+            break;
+
+        if (uvm_page_mask_region_empty(running_page_mask, region))
+            break;
+    }
+
+    uvm_tracker_deinit(&local_tracker);
+
+    if (status == NV_OK && !uvm_page_mask_region_empty(running_page_mask, region))
+        status = NV_ERR_INVALID_STATE;
+
+    return status;
+}
+
+static NV_STATUS block_bg_promote_enqueue_locked(uvm_va_block_t *va_block,
+                                                 uvm_va_block_context_t *block_context,
+                                                 uvm_gpu_id_t gpu_id,
+                                                 uvm_va_block_region_t region,
+                                                 const uvm_page_mask_t *page_mask)
+{
+    uvm_gpu_t *gpu = uvm_gpu_get(gpu_id);
+    uvm_va_block_gpu_state_t *gpu_state;
+    uvm_page_mask_t *enqueue_mask = &block_context->scratch_page_mask;
+    NvU32 pages;
+
+    if (!uvm_latency_bg_promote_enable)
+        return NV_OK;
+
+    gpu_state = uvm_va_block_gpu_state_get_alloc(va_block, gpu);
+    if (!gpu_state)
+        return NV_ERR_NO_MEMORY;
+
+    uvm_page_mask_init_from_region(enqueue_mask, region, page_mask);
+    uvm_page_mask_andnot(enqueue_mask, enqueue_mask, &gpu_state->resident);
+    uvm_page_mask_andnot(enqueue_mask, enqueue_mask, &gpu_state->bg_promote_pending);
+    uvm_page_mask_andnot(enqueue_mask, enqueue_mask, &gpu_state->bg_promote_inflight);
+
+    if (uvm_page_mask_region_empty(enqueue_mask, region)) {
+        if (!uvm_page_mask_empty(&gpu_state->bg_promote_pending))
+            block_bg_promote_schedule_locked(va_block);
+        return NV_OK;
+    }
+
+    pages = uvm_page_mask_region_weight(enqueue_mask, region);
+    uvm_page_mask_or(&gpu_state->bg_promote_pending, &gpu_state->bg_promote_pending, enqueue_mask);
+    uvm_processor_mask_set(&va_block->bg_promote_gpus, gpu_id);
+    atomic64_add(pages, &g_uvm_latency_bg_promote_enqueued_pages);
+
+    block_bg_promote_schedule_locked(va_block);
+
+    return NV_OK;
+}
+
+static NV_STATUS block_bg_promote_unmap_gpu_locked(uvm_va_block_t *va_block,
+                                                   uvm_va_block_context_t *block_context,
+                                                   uvm_gpu_id_t gpu_id,
+                                                   uvm_va_block_region_t region,
+                                                   const uvm_page_mask_t *page_mask)
+{
+    uvm_tracker_t unmap_tracker = UVM_TRACKER_INIT();
+    NV_STATUS status;
+    NV_STATUS tracker_status;
+
+    status = uvm_va_block_unmap(va_block, block_context, gpu_id, region, page_mask, &unmap_tracker);
+    tracker_status = uvm_tracker_add_tracker_safe(&va_block->tracker, &unmap_tracker);
+    uvm_tracker_deinit(&unmap_tracker);
+    if (status == NV_OK)
+        status = tracker_status;
+
+    return status;
+}
+
+static NV_STATUS block_bg_promote_map_local_locked(uvm_va_block_t *va_block,
+                                                   uvm_va_block_context_t *block_context,
+                                                   uvm_gpu_id_t gpu_id,
+                                                   uvm_va_block_region_t region,
+                                                   const uvm_page_mask_t *page_mask)
+{
+    uvm_tracker_t map_tracker = UVM_TRACKER_INIT();
+    NV_STATUS status;
+    NV_STATUS tracker_status;
+
+    status = uvm_va_block_map(va_block,
+                              block_context,
+                              gpu_id,
+                              region,
+                              page_mask,
+                              UVM_PROT_READ_ONLY,
+                              UvmEventMapRemoteCausePolicy,
+                              &map_tracker);
+    tracker_status = uvm_tracker_add_tracker_safe(&va_block->tracker, &map_tracker);
+    uvm_tracker_deinit(&map_tracker);
+    if (status == NV_OK)
+        status = tracker_status;
+
+    return status;
+}
+
+static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
+                                                  uvm_va_block_retry_t *retry,
+                                                  uvm_va_block_context_t *block_context,
+                                                  uvm_gpu_id_t gpu_id,
+                                                  const uvm_page_mask_t *page_mask,
+                                                  NvU32 *committed_pages_out)
+{
+    NV_STATUS status = NV_OK;
+    uvm_page_mask_t *eligible_mask;
+    uvm_page_mask_t *migrated_pages;
+    uvm_page_mask_t *staged_pages;
+    uvm_page_mask_t *dst_resident_mask;
+    uvm_va_block_region_t region;
+    bool gpu_state_updated = false;
+
+    *committed_pages_out = 0;
+
+    eligible_mask = kmem_cache_alloc(g_uvm_page_mask_cache, NV_UVM_GFP_FLAGS);
+    if (!eligible_mask)
+        return NV_ERR_NO_MEMORY;
+
+    uvm_page_mask_andnot(eligible_mask,
+                         page_mask,
+                         uvm_va_block_resident_mask_get(va_block, gpu_id, NUMA_NO_NODE));
+    uvm_page_mask_and(eligible_mask, eligible_mask, &va_block->cpu.resident);
+
+    if (uvm_page_mask_empty(eligible_mask))
+        goto out;
+
+    region = uvm_va_block_region_from_mask(va_block, eligible_mask);
+
+    block_context->make_resident.dest_id = gpu_id;
+    block_context->make_resident.dest_nid = NUMA_NO_NODE;
+    block_context->make_resident.cause = UVM_MAKE_RESIDENT_CAUSE_PREFETCH;
+    nodes_clear(block_context->make_resident.cpu_pages_used.nodes);
+    uvm_page_mask_zero(&block_context->make_resident.pages_changed_residency);
+    uvm_processor_mask_zero(&block_context->make_resident.all_involved_processors);
+
+    uvm_page_mask_init_from_region(&block_context->discard.scratch_page_mask, region, eligible_mask);
+    uvm_page_mask_and(&block_context->discard.discarded_pages,
+                      &block_context->discard.scratch_page_mask,
+                      &va_block->discarded_pages);
+
+    status = block_populate_pages(va_block, retry, block_context, gpu_id, region, eligible_mask);
+    if (status != NV_OK)
+        goto out;
+
+    status = block_copy_resident_pages(va_block,
+                                       block_context,
+                                       gpu_id,
+                                       region,
+                                       eligible_mask,
+                                       NULL,
+                                       UVM_VA_BLOCK_TRANSFER_MODE_COPY);
+    if (status != NV_OK)
+        goto out_cleanup;
+
+    staged_pages = &block_context->make_resident.pages_staged;
+    if (!uvm_page_mask_empty(staged_pages)) {
+        uvm_va_block_cpu_set_resident_all_chunks(va_block, block_context, staged_pages);
+        block_set_resident_processor(va_block, UVM_ID_CPU);
+        uvm_page_mask_or(&va_block->read_duplicated_pages, &va_block->read_duplicated_pages, staged_pages);
+        uvm_tools_record_read_duplicate(va_block, UVM_ID_CPU, region, staged_pages);
+    }
+
+    migrated_pages = &block_context->make_resident.pages_migrated;
+    uvm_page_mask_and(migrated_pages, migrated_pages, eligible_mask);
+    if (uvm_page_mask_empty(migrated_pages))
+        goto out;
+
+    status = block_bg_promote_unmap_gpu_locked(va_block, block_context, gpu_id, region, migrated_pages);
+    if (status != NV_OK)
+        goto out_cleanup;
+
+    dst_resident_mask = uvm_va_block_resident_mask_get(va_block, gpu_id, NUMA_NO_NODE);
+    uvm_page_mask_or(dst_resident_mask, dst_resident_mask, migrated_pages);
+    block_set_resident_processor(va_block, gpu_id);
+    uvm_page_mask_or(&va_block->read_duplicated_pages, &va_block->read_duplicated_pages, migrated_pages);
+    uvm_tools_record_read_duplicate(va_block, gpu_id, region, migrated_pages);
+    gpu_state_updated = true;
+
+    if (uvm_processor_mask_test(&va_block->evicted_gpus, gpu_id))
+        block_make_resident_clear_evicted(va_block, gpu_id, migrated_pages);
+
+    if (uvm_page_mask_full(dst_resident_mask))
+        uvm_processor_mask_set(&va_block->ever_fully_resident, gpu_id);
+
+    status = block_bg_promote_map_local_locked(va_block, block_context, gpu_id, region, migrated_pages);
+    if (status != NV_OK)
+        goto out_cleanup;
+
+    *committed_pages_out = uvm_page_mask_region_weight(migrated_pages, region);
+    atomic64_add(*committed_pages_out, &g_uvm_latency_bg_promote_copied_pages);
+    atomic64_add(*committed_pages_out, &g_uvm_latency_bg_promote_committed_pages);
+    block_mark_memory_used(va_block, gpu_id);
+    UVM_ASSERT(block_check_cpu_chunks(va_block));
+
+out_cleanup:
+    if (status != NV_OK && status != NV_ERR_MORE_PROCESSING_REQUIRED && !gpu_state_updated)
+        block_cleanup_temp_pinned_gpu_chunks(va_block, gpu_id);
+out:
+    kmem_cache_free(g_uvm_page_mask_cache, eligible_mask);
+    return status;
+}
+
+static NV_STATUS block_bg_promote_locked(uvm_va_block_t *va_block,
+                                         uvm_va_block_retry_t *retry,
+                                         uvm_va_block_context_t *block_context)
+{
+    uvm_gpu_id_t gpu_id;
+    NvU32 max_pages = uvm_latency_bg_promote_max_pages;
+
+    if (max_pages == 0)
+        max_pages = PAGES_PER_UVM_VA_BLOCK;
+
+    for_each_gpu_id_in_mask(gpu_id, &va_block->bg_promote_gpus) {
+        uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu_id);
+        uvm_page_mask_t *work_mask = &block_context->caller_page_mask;
+        NvU32 work_pages;
+        NvU32 committed_pages = 0;
+        NV_STATUS status;
+
+        if (!gpu_state) {
+            uvm_processor_mask_clear(&va_block->bg_promote_gpus, gpu_id);
+            continue;
+        }
+
+        work_pages = block_page_mask_copy_limited(work_mask,
+                                                  &gpu_state->bg_promote_pending,
+                                                  uvm_va_block_region_from_block(va_block),
+                                                  max_pages);
+        if (work_pages == 0) {
+            if (uvm_page_mask_empty(&gpu_state->bg_promote_inflight))
+                uvm_processor_mask_clear(&va_block->bg_promote_gpus, gpu_id);
+            continue;
+        }
+
+        uvm_page_mask_andnot(&gpu_state->bg_promote_pending, &gpu_state->bg_promote_pending, work_mask);
+        uvm_page_mask_or(&gpu_state->bg_promote_inflight, &gpu_state->bg_promote_inflight, work_mask);
+
+        status = block_bg_promote_readonly_locked(va_block, retry, block_context, gpu_id, work_mask, &committed_pages);
+
+        uvm_page_mask_andnot(&gpu_state->bg_promote_inflight, &gpu_state->bg_promote_inflight, work_mask);
+
+        if (status == NV_ERR_MORE_PROCESSING_REQUIRED) {
+            uvm_page_mask_or(&gpu_state->bg_promote_pending, &gpu_state->bg_promote_pending, work_mask);
+            return status;
+        }
+
+        if (status != NV_OK) {
+            atomic64_add(work_pages, &g_uvm_latency_bg_promote_cancelled_pages);
+            return status;
+        }
+
+        if (committed_pages < work_pages)
+            atomic64_add(work_pages - committed_pages, &g_uvm_latency_bg_promote_cancelled_pages);
+
+        if (uvm_page_mask_empty(&gpu_state->bg_promote_pending) &&
+            uvm_page_mask_empty(&gpu_state->bg_promote_inflight)) {
+            uvm_processor_mask_clear(&va_block->bg_promote_gpus, gpu_id);
+        }
+    }
+
+    if (block_bg_promote_pages_pending(va_block))
+        block_bg_promote_schedule_locked(va_block);
+
+    return NV_OK;
+}
+
+static void block_bg_promote(void *args)
+{
+    uvm_va_block_t *va_block = (uvm_va_block_t *)args;
+    uvm_va_space_t *va_space;
+    uvm_va_block_context_t *block_context = NULL;
+    uvm_va_block_retry_t block_retry;
+    struct mm_struct *mm = NULL;
+    NV_STATUS status = NV_OK;
+
+    uvm_mutex_lock(&va_block->lock);
+    va_space = uvm_va_block_get_va_space_maybe_dead(va_block);
+    uvm_mutex_unlock(&va_block->lock);
+
+    if (!va_space)
+        goto done;
+
+    mm = uvm_va_space_mm_retain_lock(va_space);
+
+    block_context = uvm_va_block_context_alloc(mm);
+    if (!block_context)
+        goto done;
+
+    uvm_va_space_down_read(va_space);
+
+    if (uvm_va_block_is_dead(va_block))
+        goto unlock;
+
+    status = UVM_VA_BLOCK_LOCK_RETRY(va_block,
+                                     &block_retry,
+                                     block_bg_promote_locked(va_block, &block_retry, block_context));
+
+    if (status != NV_OK) {
+        UVM_ERR_PRINT("Background read-only promotion for block [0x%llx, 0x%llx] failed %s\n",
+                      va_block->start,
+                      va_block->end,
+                      nvstatusToString(status));
+    }
+
+unlock:
+    uvm_va_space_up_read(va_space);
+    uvm_va_block_context_free(block_context);
+
+done:
+    uvm_va_space_mm_release_unlock(va_space, mm);
+    uvm_va_block_release(va_block);
+}
+
+static void block_bg_promote_entry(void *args)
+{
+    UVM_ENTRY_VOID(block_bg_promote(args));
+}
+
 NV_STATUS uvm_va_block_migrate_map_mapped_pages(uvm_va_block_t *va_block,
                                                 uvm_va_block_retry_t *va_block_retry,
                                                 uvm_va_block_context_t *va_block_context,
@@ -10547,6 +10986,24 @@ static void block_split_gpu(uvm_va_block_t *existing, uvm_va_block_t *new, uvm_g
     }
 
     block_split_page_mask(&existing_gpu_state->evicted, existing_pages, &new_gpu_state->evicted, new_pages);
+    block_split_page_mask(&existing_gpu_state->bg_promote_pending,
+                          existing_pages,
+                          &new_gpu_state->bg_promote_pending,
+                          new_pages);
+    block_split_page_mask(&existing_gpu_state->bg_promote_inflight,
+                          existing_pages,
+                          &new_gpu_state->bg_promote_inflight,
+                          new_pages);
+
+    if (!uvm_page_mask_empty(&new_gpu_state->bg_promote_pending) ||
+        !uvm_page_mask_empty(&new_gpu_state->bg_promote_inflight)) {
+        uvm_processor_mask_set(&new->bg_promote_gpus, gpu_id);
+    }
+
+    if (uvm_page_mask_empty(&existing_gpu_state->bg_promote_pending) &&
+        uvm_page_mask_empty(&existing_gpu_state->bg_promote_inflight)) {
+        uvm_processor_mask_clear(&existing->bg_promote_gpus, gpu_id);
+    }
 }
 
 NV_STATUS uvm_va_block_split(uvm_va_block_t *existing_va_block,
@@ -11575,6 +12032,133 @@ static void uvm_va_block_get_prefetch_hint(uvm_va_block_t *va_block,
     }
 }
 
+static bool block_remote_first_all_pages_read(const uvm_service_block_context_t *service_context,
+                                              const uvm_page_mask_t *demand_mask,
+                                              uvm_va_block_region_t region)
+{
+    uvm_page_index_t page_index;
+
+    for_each_va_block_page_in_region_mask(page_index, demand_mask, region) {
+        if (service_context->access_type[page_index] > UVM_FAULT_ACCESS_TYPE_READ)
+            return false;
+    }
+
+    return true;
+}
+
+static bool block_remote_first_allowed(uvm_processor_id_t processor_id,
+                                       uvm_processor_id_t new_residency,
+                                       uvm_va_block_t *va_block,
+                                       const uvm_va_policy_t *policy,
+                                       uvm_service_block_context_t *service_context,
+                                       const uvm_page_mask_t *demand_mask)
+{
+    uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
+    uvm_va_block_region_t demand_region;
+    uvm_va_block_gpu_state_t *gpu_state;
+    uvm_gpu_t *gpu;
+
+    if (!uvm_latency_remote_first_enable)
+        return false;
+
+    if (service_context->operation != UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS)
+        return false;
+
+    if (!UVM_ID_IS_GPU(processor_id) || !uvm_id_equal(processor_id, new_residency))
+        return false;
+
+    if (uvm_va_block_is_hmm(va_block))
+        return false;
+
+    // First version is deliberately restricted to explicit ReadMostly/read-dup
+    // policy. That keeps CPU and GPU copies coherent for read-only data.
+    if (!uvm_va_policy_is_read_duplicate(policy))
+        return false;
+
+    if (uvm_page_mask_empty(demand_mask))
+        return false;
+
+    demand_region = uvm_va_block_region_from_mask(va_block, demand_mask);
+    if (!block_remote_first_all_pages_read(service_context, demand_mask, demand_region))
+        return false;
+
+    if (!uvm_page_mask_subset(demand_mask, &va_block->cpu.resident))
+        return false;
+
+    gpu_state = uvm_va_block_gpu_state_get(va_block, processor_id);
+    if (gpu_state && uvm_page_mask_intersects(demand_mask, &gpu_state->resident))
+        return false;
+
+    if (!uvm_processor_mask_test(&va_space->accessible_from[uvm_id_value(UVM_ID_CPU)], processor_id))
+        return false;
+
+    gpu = uvm_gpu_get(processor_id);
+    if (!uvm_gpu_va_space_get(va_space, gpu))
+        return false;
+
+    return true;
+}
+
+static NV_STATUS block_try_remote_first_bg_promote(uvm_processor_id_t processor_id,
+                                                   uvm_processor_id_t new_residency,
+                                                   uvm_va_block_t *va_block,
+                                                   const uvm_va_policy_t *policy,
+                                                   uvm_service_block_context_t *service_context,
+                                                   const uvm_page_mask_t *demand_mask,
+                                                   bool *handled)
+{
+    NV_STATUS status;
+    uvm_page_mask_t *bg_mask = &service_context->block_context->scratch_page_mask;
+    uvm_va_block_region_t demand_region;
+    uvm_va_block_region_t bg_region;
+    NvU32 demand_pages;
+
+    *handled = false;
+
+    if (!block_remote_first_allowed(processor_id,
+                                    new_residency,
+                                    va_block,
+                                    policy,
+                                    service_context,
+                                    demand_mask)) {
+        return NV_OK;
+    }
+
+    demand_region = uvm_va_block_region_from_mask(va_block, demand_mask);
+
+    status = block_force_remote_map_cpu_read_locked(va_block,
+                                                    service_context->block_context,
+                                                    processor_id,
+                                                    demand_region,
+                                                    demand_mask);
+    if (status != NV_OK)
+        return status;
+
+    demand_pages = uvm_page_mask_region_weight(demand_mask, demand_region);
+    atomic64_inc(&g_uvm_latency_remote_first_faults);
+    atomic64_add(demand_pages, &g_uvm_latency_remote_first_pages);
+
+    if (uvm_latency_bg_promote_enable) {
+        uvm_page_mask_copy(bg_mask, demand_mask);
+        uvm_page_mask_or(bg_mask, bg_mask, &service_context->prefetch_hint.prefetch_pages_mask);
+        uvm_page_mask_and(bg_mask, bg_mask, &va_block->cpu.resident);
+
+        if (!uvm_page_mask_empty(bg_mask)) {
+            bg_region = uvm_va_block_region_from_mask(va_block, bg_mask);
+            status = block_bg_promote_enqueue_locked(va_block,
+                                                     service_context->block_context,
+                                                     processor_id,
+                                                     bg_region,
+                                                     bg_mask);
+            if (status != NV_OK)
+                return status;
+        }
+    }
+
+    *handled = true;
+    return NV_OK;
+}
+
 NV_STATUS uvm_va_block_service_copy(uvm_processor_id_t processor_id,
                                     uvm_processor_id_t new_residency,
                                     uvm_va_block_t *va_block,
@@ -12081,6 +12665,10 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
 {
     uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
     uvm_processor_id_t new_residency;
+    uvm_processor_id_t remote_first_residency = UVM_ID_INVALID;
+    const uvm_va_policy_t *policy;
+    uvm_page_mask_t *remote_first_demand_mask = &service_context->block_context->caller_page_mask;
+    bool remote_first_candidate = false;
     NV_STATUS status = NV_OK;
 
     uvm_assert_mutex_locked(&va_block->lock);
@@ -12099,9 +12687,35 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
     else
         uvm_assert_rwsem_locked_read(&va_space->lock);
 
-    uvm_va_block_get_prefetch_hint(va_block,
-                                   uvm_va_policy_get_region(va_block, service_context->region),
-                                   service_context);
+    policy = uvm_va_policy_get_region(va_block, service_context->region);
+
+    if (uvm_processor_mask_get_count(&service_context->resident_processors) == 1) {
+        uvm_page_mask_t *new_residency_mask;
+
+        remote_first_residency = uvm_processor_mask_find_first_id(&service_context->resident_processors);
+        new_residency_mask = &service_context->per_processor_masks[uvm_id_value(remote_first_residency)].new_residency;
+        uvm_page_mask_copy(remote_first_demand_mask, new_residency_mask);
+        remote_first_candidate = true;
+    }
+
+    uvm_va_block_get_prefetch_hint(va_block, policy, service_context);
+
+    if (remote_first_candidate) {
+        bool remote_first_handled = false;
+
+        status = block_try_remote_first_bg_promote(processor_id,
+                                                   remote_first_residency,
+                                                   va_block,
+                                                   policy,
+                                                   service_context,
+                                                   remote_first_demand_mask,
+                                                   &remote_first_handled);
+        if (status != NV_OK)
+            return status;
+
+        if (remote_first_handled)
+            return NV_OK;
+    }
 
     for_each_id_in_mask(new_residency, &service_context->resident_processors) {
         if (uvm_va_block_is_hmm(va_block)) {

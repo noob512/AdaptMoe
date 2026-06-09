@@ -240,6 +240,14 @@ typedef struct
 
     // Set of pages using EGM mappings.
     uvm_page_mask_t egm_pages;
+
+    // Pages waiting for read-only background promotion to this GPU. These pages
+    // are expected to keep their current remote READ mapping until the deferred
+    // copy completes and the GPU mapping is switched to the local copy.
+    uvm_page_mask_t bg_promote_pending;
+
+    // Pages currently being copied by the read-only background promotion worker.
+    uvm_page_mask_t bg_promote_inflight;
 } uvm_va_block_gpu_state_t;
 
 typedef struct
@@ -503,6 +511,10 @@ struct uvm_va_block_struct
 
     // A queue item for establishing eviction mappings in a deferred way
     nv_kthread_q_item_t eviction_mappings_q_item;
+
+    // Queue item and GPU mask for deferred read-only background promotion.
+    nv_kthread_q_item_t bg_promote_q_item;
+    uvm_processor_mask_t bg_promote_gpus;
 
     uvm_perf_module_data_desc_t perf_modules_data[UVM_PERF_MODULE_TYPE_COUNT];
 

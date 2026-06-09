@@ -28,7 +28,7 @@ PORT="${PORT:-8000}"
 
 SCRATCH_TEMP_BUDGET_BYTES="${SCRATCH_TEMP_BUDGET_BYTES:-16777216}"
 DRIVER_POOL_BUDGET_MODE="${DRIVER_POOL_BUDGET_MODE:-soft}"
-VLLM_UVM_DRIVER_KV_TAG_ENABLE="${VLLM_UVM_DRIVER_KV_TAG_ENABLE:-0}"
+VLLM_UVM_DRIVER_KV_TAG_ENABLE="${VLLM_UVM_DRIVER_KV_TAG_ENABLE:-1}"
 
 case "$PROFILE" in
   kv)
@@ -58,6 +58,7 @@ esac
 UVM_PHASE_F_ROUTE_LOG_DELAY_MS="${UVM_PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
 UVM_PHASE_N_BLOCK_QUOTA_ENABLE="${UVM_PHASE_N_BLOCK_QUOTA_ENABLE:-1}"
 UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY="${UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY:-0}"
+UVM_PHASE_N_NATIVE_BLOCK_ENABLE="${UVM_PHASE_N_NATIVE_BLOCK_ENABLE:-1}"
 UVM_PHASE_N_AUTO_RECLAIM_ENABLE="${UVM_PHASE_N_AUTO_RECLAIM_ENABLE:-1}"
 UVM_PHASE_N_AUTO_RECLAIM_EXECUTE="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE:-1}"
 UVM_PHASE_N_AUTO_RECLAIM_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_EVERY:-1}"
@@ -95,7 +96,7 @@ mkdir -p "$RUN_ROOT"
   echo "REQUIRE_RECLAIM=$REQUIRE_RECLAIM"
   echo "REQUIRE_BLOCK_FASTPATH=$REQUIRE_BLOCK_FASTPATH"
   echo "ALLOWED_POST_FAULT_SLACK_BLOCKS=$ALLOWED_POST_FAULT_SLACK_BLOCKS"
-  env | sort | grep -E '^UVM_PHASE_(F_ROUTE|N_BLOCK|N_AUTO)' || true
+  env | sort | grep -E '^UVM_PHASE_(F_ROUTE|N_BLOCK|N_NATIVE|N_AUTO)' || true
 } > "$ENV_FILE"
 
 cmd=(
@@ -119,6 +120,7 @@ cmd=(
   "UVM_PHASE_F_ROUTE_LOG_DELAY_MS=$UVM_PHASE_F_ROUTE_LOG_DELAY_MS"
   "UVM_PHASE_N_BLOCK_QUOTA_ENABLE=$UVM_PHASE_N_BLOCK_QUOTA_ENABLE"
   "UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY=$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY"
+  "UVM_PHASE_N_NATIVE_BLOCK_ENABLE=$UVM_PHASE_N_NATIVE_BLOCK_ENABLE"
   "UVM_PHASE_N_AUTO_RECLAIM_ENABLE=$UVM_PHASE_N_AUTO_RECLAIM_ENABLE"
   "UVM_PHASE_N_AUTO_RECLAIM_EXECUTE=$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE"
   "UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY=$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY"
@@ -197,13 +199,13 @@ set -e
   echo "Smoke Summary"
   echo "-------------"
   if [ -f "$SMOKE_ROOT/stage_n_acceptance_summary.txt" ]; then
-    grep -E 'run_status=|successful_requests=|failed_requests=|driver_pool_budget_mode=|driver_kv_tag_enable=|kv_driver_tag_records=|kv_driver_untag_records=|uvm_phase_n_block_quota|phase_f_route_log_snapshot=' \
+    grep -E 'run_status=|successful_requests=|failed_requests=|driver_pool_budget_mode=|driver_kv_tag_enable=|kv_driver_tag_records=|kv_driver_untag_records=|uvm_phase_n_block_quota|uvm_phase_n_native_block|phase_f_route_log_snapshot=' \
       "$SMOKE_ROOT/stage_n_acceptance_summary.txt" || true
   fi
   echo
   echo "Recent Block Evidence"
   echo "---------------------"
-  grep -R -E 'phase_n_block_|phase_n_get_pool_state block_quota=1|phase_n_reclaim_pool block_quota=1' \
+  grep -R -E 'phase_n_block_|phase_n_native_block_|phase_n_native_range_|phase_n_get_pool_state block_quota=1|phase_n_reclaim_pool (block_quota|native_block)=1' \
     "$SMOKE_ROOT" 2>/dev/null | tail -n 180 || true
 } > "$SUMMARY"
 

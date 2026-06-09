@@ -347,6 +347,13 @@ void uvm_phase_n_make_resident_reclaim_hook(uvm_va_space_t *va_space,
                                             NvU32 gpu_id,
                                             NvU32 cause,
                                             NvBool execute_allowed);
+void uvm_phase_n_va_block_make_resident_hook(uvm_va_space_t *va_space,
+                                             uvm_va_block_t *va_block,
+                                             uvm_va_block_region_t region,
+                                             uvm_processor_id_t dest_id,
+                                             NvU32 cause,
+                                             NvBool execute_allowed);
+void uvm_phase_n_va_block_destroy_hook(uvm_va_block_t *va_block);
 NV_STATUS uvm_phase_n_auto_reclaim_outer_hook(uvm_va_space_t *va_space,
                                               NvU64 address,
                                               NvU64 length,

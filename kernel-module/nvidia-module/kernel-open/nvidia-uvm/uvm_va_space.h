@@ -313,6 +313,7 @@ struct uvm_va_space_struct
     uvm_phase_n_pool_state_t phase_n_pools[UVM_PHASE_N_POOL_STATE_MAX];
     struct radix_tree_root phase_n_blocks;
     uvm_phase_n_block_pool_t phase_n_block_pools[UVM_PHASE_N_POOL_STATE_MAX];
+    spinlock_t phase_n_native_block_pool_locks[UVM_PHASE_N_POOL_STATE_MAX];
 
     // Peer to peer table
     // A bitmask of peer to peer pairs enabled in this va_space

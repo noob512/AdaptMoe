@@ -4995,6 +4995,12 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
     if (UVM_ID_IS_GPU(dest_id)) {
         uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
 
+        uvm_phase_n_va_block_make_resident_hook(va_space,
+                                                va_block,
+                                                region,
+                                                dest_id,
+                                                cause,
+                                                NV_FALSE);
         uvm_phase_n_make_resident_reclaim_hook(va_space,
                                                uvm_va_block_region_start(va_block, region),
                                                uvm_va_block_region_size(region),
@@ -9466,6 +9472,8 @@ void uvm_va_block_destroy(nv_kref_t *nv_kref)
     // Nobody else should have a reference when freeing
     uvm_assert_mutex_unlocked(&block->lock);
 
+    uvm_phase_n_va_block_destroy_hook(block);
+
     uvm_mutex_lock(&block->lock);
     block_kill(block);
     uvm_mutex_unlock(&block->lock);
@@ -9474,6 +9482,8 @@ void uvm_va_block_destroy(nv_kref_t *nv_kref)
 
 void uvm_va_block_kill(uvm_va_block_t *va_block)
 {
+    uvm_phase_n_va_block_destroy_hook(va_block);
+
     uvm_mutex_lock(&va_block->lock);
     block_kill(va_block);
     uvm_mutex_unlock(&va_block->lock);
@@ -10577,8 +10587,24 @@ NV_STATUS uvm_va_block_split(uvm_va_block_t *existing_va_block,
 
     if (status != NV_OK)
         uvm_va_block_release(new_block);
-    else if (new_va_block)
-        *new_va_block = new_block;
+    else {
+        NvBool tag_valid = existing_va_block->phase_n.tag_valid;
+
+        memset(&new_block->phase_n, 0, sizeof(new_block->phase_n));
+        INIT_LIST_HEAD(&new_block->phase_n.queue_node);
+        if (tag_valid) {
+            new_block->phase_n.region_id = existing_va_block->phase_n.region_id;
+            new_block->phase_n.allocation_id = existing_va_block->phase_n.allocation_id;
+            new_block->phase_n.pool = existing_va_block->phase_n.pool;
+            new_block->phase_n.role = existing_va_block->phase_n.role;
+            new_block->phase_n.flags = existing_va_block->phase_n.flags;
+            new_block->phase_n.tag_valid = existing_va_block->phase_n.tag_valid;
+            new_block->phase_n.mixed_pool = existing_va_block->phase_n.mixed_pool;
+        }
+
+        if (new_va_block)
+            *new_va_block = new_block;
+    }
 
     return status;
 }
@@ -11960,6 +11986,12 @@ NV_STATUS uvm_va_block_service_finish(uvm_processor_id_t processor_id,
     if (finished_residency_update && UVM_ID_IS_GPU(new_residency)) {
         uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
 
+        uvm_phase_n_va_block_make_resident_hook(va_space,
+                                                va_block,
+                                                service_context->region,
+                                                new_residency,
+                                                service_context->block_context->make_resident.cause,
+                                                NV_FALSE);
         uvm_phase_n_make_resident_reclaim_hook(va_space,
                                                uvm_va_block_region_start(va_block, service_context->region),
                                                uvm_va_block_region_size(service_context->region),

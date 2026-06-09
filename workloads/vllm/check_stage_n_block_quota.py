@@ -150,6 +150,25 @@ def parse_logs(paths: list[Path]) -> dict[str, object]:
                         totals["mixed_pool_records"] += 1
                         pools[pool]["mixed_pool_records"] += 1
 
+                if "phase_n_native_block_resident" in line:
+                    totals["native_block_resident_records"] += 1
+                    pools[pool]["native_block_resident_records"] += 1
+                    totals["block_summary_records"] += 1
+                    pools[pool]["block_summary_records"] += 1
+                    if _int(fields.get("materialized")):
+                        totals["native_block_materialize_records"] += 1
+                        pools[pool]["native_block_materialize_records"] += 1
+                        totals["block_materialize_records"] += 1
+                        pools[pool]["block_materialize_records"] += 1
+                        if pool == "kv" and first_kv_materialize is None:
+                            first_kv_materialize = (path.name, line_no, line[:220])
+                    for key in ("budget_blocks", "resident_blocks", "materialized_blocks", "over_blocks"):
+                        max_by_pool[pool][key] = max(max_by_pool[pool][key], _int(fields.get(key)))
+
+                if "phase_n_native_range_tag_attach" in line:
+                    totals["native_range_tag_attach_records"] += 1
+                    pools[pool]["native_range_tag_attach_records"] += 1
+
                 if "phase_n_block_summary" in line:
                     totals["block_summary_records"] += 1
                     pools[pool]["block_summary_records"] += 1
@@ -193,6 +212,18 @@ def parse_logs(paths: list[Path]) -> dict[str, object]:
                         totals["block_reclaim_failure_records"] += 1
                         pools[pool]["block_reclaim_failure_records"] += 1
 
+                if "phase_n_native_block_reclaim pool=" in line:
+                    totals["native_block_reclaim_records"] += 1
+                    pools[pool]["native_block_reclaim_records"] += 1
+                    totals["block_reclaim_records"] += 1
+                    pools[pool]["block_reclaim_records"] += 1
+                    if _int(fields.get("success")):
+                        totals["block_reclaim_success_records"] += 1
+                        pools[pool]["block_reclaim_success_records"] += 1
+                    else:
+                        totals["block_reclaim_failure_records"] += 1
+                        pools[pool]["block_reclaim_failure_records"] += 1
+
                 if "phase_n_block_reclaim_skip" in line:
                     totals["block_reclaim_skip_records"] += 1
                     pools[pool]["block_reclaim_skip_records"] += 1
@@ -212,6 +243,14 @@ def parse_logs(paths: list[Path]) -> dict[str, object]:
                 if "phase_n_reclaim_pool block_quota=1" in line:
                     totals["reclaim_pool_block_quota_records"] += 1
                     pools[pool]["reclaim_pool_block_quota_records"] += 1
+                    for key in ("budget_blocks", "resident_blocks", "over_blocks"):
+                        max_by_pool[pool][key] = max(max_by_pool[pool][key], _int(fields.get(key)))
+
+                if "phase_n_reclaim_pool native_block=1" in line:
+                    totals["reclaim_pool_block_quota_records"] += 1
+                    totals["reclaim_pool_native_block_records"] += 1
+                    pools[pool]["reclaim_pool_block_quota_records"] += 1
+                    pools[pool]["reclaim_pool_native_block_records"] += 1
                     for key in ("budget_blocks", "resident_blocks", "over_blocks"):
                         max_by_pool[pool][key] = max(max_by_pool[pool][key], _int(fields.get(key)))
 
@@ -313,14 +352,18 @@ def main() -> int:
         print(
             f"pool_{pool}="
             f"materialize:{counters.get('block_materialize_records', 0)},"
+            f"native_materialize:{counters.get('native_block_materialize_records', 0)},"
             f"summary:{counters.get('block_summary_records', 0)},"
+            f"native_resident:{counters.get('native_block_resident_records', 0)},"
             f"over_budget:{counters.get('block_over_budget_records', 0)},"
             f"auto_hook:{counters.get('block_auto_hook_records', 0)},"
             f"auto_execute:{counters.get('block_auto_hook_execute_records', 0)},"
             f"auto_success:{counters.get('block_auto_hook_success_records', 0)},"
             f"reclaim:{counters.get('block_reclaim_records', 0)},"
+            f"native_reclaim:{counters.get('native_block_reclaim_records', 0)},"
             f"reclaim_success:{counters.get('block_reclaim_success_records', 0)},"
             f"get_state_fastpath:{counters.get('get_pool_state_block_quota_records', 0)},"
+            f"native_range_tag:{counters.get('native_range_tag_attach_records', 0)},"
             f"allocator_kv_tag:{counters.get('allocator_kv_driver_tag_records', 0)},"
             f"allocator_kv_tag_success:{counters.get('allocator_kv_driver_tag_success_records', 0)},"
             f"no_tagged_region:{counters.get('no_tagged_region_records', 0)},"

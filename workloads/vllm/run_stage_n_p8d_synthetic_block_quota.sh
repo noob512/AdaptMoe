@@ -27,6 +27,7 @@ REQUIRE_RECLAIM="${REQUIRE_RECLAIM:-1}"
 UVM_PHASE_F_ROUTE_LOG_DELAY_MS="${UVM_PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
 UVM_PHASE_N_BLOCK_QUOTA_ENABLE="${UVM_PHASE_N_BLOCK_QUOTA_ENABLE:-1}"
 UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY="${UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY:-0}"
+UVM_PHASE_N_NATIVE_BLOCK_ENABLE="${UVM_PHASE_N_NATIVE_BLOCK_ENABLE:-0}"
 UVM_PHASE_N_AUTO_RECLAIM_ENABLE="${UVM_PHASE_N_AUTO_RECLAIM_ENABLE:-1}"
 UVM_PHASE_N_AUTO_RECLAIM_EXECUTE="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE:-1}"
 UVM_PHASE_N_AUTO_RECLAIM_EVERY="${UVM_PHASE_N_AUTO_RECLAIM_EVERY:-1}"
@@ -94,6 +95,7 @@ reload_uvm_if_requested() {
     uvm_phase_f_route_log_delay_ms="$UVM_PHASE_F_ROUTE_LOG_DELAY_MS" \
     uvm_phase_n_block_quota_enable="$UVM_PHASE_N_BLOCK_QUOTA_ENABLE" \
     uvm_phase_n_block_quota_trace_only="$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY" \
+    uvm_phase_n_native_block_enable="$UVM_PHASE_N_NATIVE_BLOCK_ENABLE" \
     uvm_phase_n_auto_reclaim_enable="$UVM_PHASE_N_AUTO_RECLAIM_ENABLE" \
     uvm_phase_n_auto_reclaim_execute="$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE" \
     uvm_phase_n_auto_reclaim_every="$UVM_PHASE_N_AUTO_RECLAIM_EVERY" \
@@ -112,6 +114,7 @@ configure_uvm_params() {
   set_param uvm_phase_f_route_log_delay_ms "$UVM_PHASE_F_ROUTE_LOG_DELAY_MS"
   set_param uvm_phase_n_block_quota_enable "$UVM_PHASE_N_BLOCK_QUOTA_ENABLE"
   set_param uvm_phase_n_block_quota_trace_only "$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY"
+  set_param uvm_phase_n_native_block_enable "$UVM_PHASE_N_NATIVE_BLOCK_ENABLE"
   set_param uvm_phase_n_auto_reclaim_enable "$UVM_PHASE_N_AUTO_RECLAIM_ENABLE"
   set_param uvm_phase_n_auto_reclaim_execute "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE"
   set_param uvm_phase_n_auto_reclaim_every "$UVM_PHASE_N_AUTO_RECLAIM_EVERY"

@@ -13,17 +13,18 @@ workloads/vllm/reports/stage_n_va_block_pool_quota_plan.md
 ```text
 不要继续优化 region full scan；
 不要把 phase_n_block 做成裸全局 2MB bucket；
-继承原生 UVM managed_range/block_index；
-用 Stage N block wrapper 维护 per-pool resident queue；
+把语义 tag attach 到原生 UVM managed_range；
+把 FIFO/resident/reclaim 状态推进原生 uvm_va_block_t；
+保留 phase_n_block wrapper 作为 fallback/debug path；
 先 post-fault correction，后 pre-fault hard quota。
 ```
 
 ## 当前实现阶段标注
 
-更新时间：2026-06-08
+更新时间：2026-06-09
 
 ```text
-当前已实现到：P8e-a - Allocator-side Early KV Tag
+当前已实现到：P8f - Native VA Range / VA Block Pool Quota Fast Path
 ```
 
 - P8a `Tagged Range + Lazy Block Trace`：已实现并通过模块编译。
@@ -66,7 +67,17 @@ workloads/vllm/reports/stage_n_va_block_pool_quota_plan.md
   - 同次 acceptance summary 里旧 region-scan 路径显示 `pool_state_kv.resident_gpu_bytes=6329204736`、`candidate_regions=3018`，说明 KV range/tag/residency 并非完全缺失；缺的是把已有 native UVM residency 补进 Stage N block queue。
   - 同一 run 中 weights 有 `phase_n_block_materialize pool=2`，说明 block quota hook 本身仍在工作；问题集中在真实 vLLM KV 路径没有产生可见的 tagged KV post-fault materialize。
   - 因此 P8e-a 是必要补强，但不是完整修复；如果目标是让真实 vLLM KV resident block accounting 非 0，下一步应进入 P8e-b。
-- P8e-b `Register-time Backfill`：未实现。P8e-a 验证后仍出现 KV 漏账，因此下一阶段建议实现 register-time/allocator-register-time backfill。
+- P8f `Native VA Range / VA Block Pool Quota Fast Path`：已实现并通过模块编译，默认关闭，通过 `uvm_phase_n_native_block_enable=1` 开启。
+  - `uvm_va_range_managed_t` 新增 `phase_n_tag`，用于直接保存 KV/WEIGHT pool tag。
+  - `uvm_va_block_t` 新增 `phase_n` 状态，包含 FIFO queue node、pool/role/flags、resident/materialized/queued/in_reclaim/stale 等字段。
+  - `REGISTER_REGION` 在 native enable 时执行 register-time split，对齐 region base/end 边界，并把 tag attach 到覆盖的 managed range。
+  - register-time backfill 已合入 P8f：已有 native block 会继承 tag；如果已经 GPU resident，会直接进入 per-pool FIFO 并更新 `resident_blocks`。
+  - `uvm_va_range_block_create()` 会让新 block 从 parent managed range 继承 tag。
+  - make-resident 完成后调用 `uvm_phase_n_va_block_make_resident_hook()`，直接更新 native block accounting，不再依赖 replayable fault outer hook 采样创建 wrapper。
+  - `RECLAIM_POOL` 在 `uvm_phase_n_native_block_enable=1` 时从 native `uvm_va_block_t.phase_n.queue_node` FIFO 选择 same-pool victim，并用 `uvm_va_block_retain/release` pin 生命周期。
+  - `UNREGISTER_REGION`、`uvm_va_block_kill/destroy` 会清理 native FIFO 和 counters。
+  - 现有 wrapper path 保留：`uvm_phase_n_native_block_enable=0` 时继续使用 P8a-P8e-a 的 `phase_n_block_t` 路线。
+- P8e-b `Register-time Backfill`：已被 P8f native path 吸收，不再作为单独主线。
 - P8e `Pre-Fault Hard Quota`：尚未实现 admission-control/hard quota，只完成早打 tag 的 P8e-a 子阶段。
 
 ## 1. 历史背景与当前结论

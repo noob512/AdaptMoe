@@ -249,8 +249,10 @@ NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va
     INIT_RADIX_TREE(&va_space->phase_f_regions, NV_UVM_GFP_FLAGS);
     uvm_range_tree_init(&va_space->phase_f_region_ranges);
     INIT_RADIX_TREE(&va_space->phase_n_blocks, NV_UVM_GFP_FLAGS);
-    for (pool = 0; pool < UVM_PHASE_N_POOL_STATE_MAX; ++pool)
+    for (pool = 0; pool < UVM_PHASE_N_POOL_STATE_MAX; ++pool) {
         INIT_LIST_HEAD(&va_space->phase_n_block_pools[pool].resident_queue);
+        spin_lock_init(&va_space->phase_n_native_block_pool_locks[pool]);
+    }
 
     bitmap_zero(va_space->enabled_peers, UVM_MAX_UNIQUE_GPU_PAIRS);
 

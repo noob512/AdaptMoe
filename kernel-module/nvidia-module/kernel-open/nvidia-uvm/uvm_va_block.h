@@ -71,6 +71,25 @@
 // Note that this means user space will get best allocation efficiency if it
 // allocates memory in 2^UVM_VA_BLOCK_BITS naturally-aligned chunks.
 
+typedef struct
+{
+    struct list_head queue_node;
+    NvU64 region_id;
+    NvU64 allocation_id;
+    NvU64 resident_epoch;
+    NvU64 last_access_epoch;
+    NvU32 pool;
+    NvU32 role;
+    NvU32 flags;
+    NvBool tag_valid;
+    NvBool materialized;
+    NvBool gpu_resident;
+    NvBool queued;
+    NvBool in_reclaim;
+    NvBool mixed_pool;
+    NvBool stale;
+} uvm_phase_n_va_block_state_t;
+
 // enums used for indexing into the array of pte_bits bitmaps in the VA block
 // which hold the current state of each PTE. For a given {processor, PTE}, the
 // bits represented here must be enough to re-create the non-address portion of
@@ -295,6 +314,10 @@ struct uvm_va_block_struct
     // write mode.
     NvU64 start;
     NvU64 end;
+
+    // Stage N native fast-path state. This is active only when
+    // uvm_phase_n_native_block_enable is set, and is otherwise inert.
+    uvm_phase_n_va_block_state_t phase_n;
 
     // Per-processor residency bit vector, used for fast lookup of which
     // processors are active in this block.

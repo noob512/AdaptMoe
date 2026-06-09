@@ -36,6 +36,7 @@ UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_COOLDOWN_EP
 UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS:-256}"
 UVM_PHASE_N_BLOCK_QUOTA_ENABLE="${UVM_PHASE_N_BLOCK_QUOTA_ENABLE:-0}"
 UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY="${UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY:-1}"
+UVM_PHASE_N_NATIVE_BLOCK_ENABLE="${UVM_PHASE_N_NATIVE_BLOCK_ENABLE:-0}"
 UVM_CAPTURE_STARTUP_FAULTS="${VLLM_UVM_CAPTURE_STARTUP_FAULTS:-0}"
 
 DATASET_PATH="${DATASET_PATH:-$SCRIPT_DIR/datasets/ShareGPT_V3_unfiltered_cleaned_split.json}"
@@ -654,6 +655,8 @@ Options:
                              Set uvm_phase_n_block_quota_enable at insmod time
   --uvm-phase-n-block-quota-trace-only <0|1>
                              Set uvm_phase_n_block_quota_trace_only at insmod time
+  --uvm-phase-n-native-block-enable <0|1>
+                             Set uvm_phase_n_native_block_enable at insmod time
   --capture-startup-faults <0|1>
                              Start fault trace before vLLM server/KV initialization.
   --keep                     Keep UVM params on exit (no rollback)
@@ -1227,6 +1230,7 @@ reload_uvm_module_for_counter_reset() {
     uvm_phase_n_auto_reclaim_failure_backoff_epochs="$UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS" \
     uvm_phase_n_block_quota_enable="$UVM_PHASE_N_BLOCK_QUOTA_ENABLE" \
     uvm_phase_n_block_quota_trace_only="$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY" \
+    uvm_phase_n_native_block_enable="$UVM_PHASE_N_NATIVE_BLOCK_ENABLE" \
     uvm_perf_fault_log_destination=0 \
     uvm_perf_fault_log_counters=0 \
     uvm_perf_fault_log_addresses=0 \
@@ -1286,6 +1290,12 @@ reload_uvm_module_for_counter_reset() {
     block_quota_trace_only_val="$(cat "$PARAM_DIR/uvm_phase_n_block_quota_trace_only" 2>/dev/null || true)"
     [ "$block_quota_trace_only_val" = "$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY" ] \
       || die "uvm_phase_n_block_quota_trace_only expected $UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY, got $block_quota_trace_only_val"
+  fi
+  if [ -r "$PARAM_DIR/uvm_phase_n_native_block_enable" ]; then
+    local native_block_enable_val
+    native_block_enable_val="$(cat "$PARAM_DIR/uvm_phase_n_native_block_enable" 2>/dev/null || true)"
+    [ "$native_block_enable_val" = "$UVM_PHASE_N_NATIVE_BLOCK_ENABLE" ] \
+      || die "uvm_phase_n_native_block_enable expected $UVM_PHASE_N_NATIVE_BLOCK_ENABLE, got $native_block_enable_val"
   fi
 
   # Optional: clear old kernel ring lines so dmesg mode only shows this run.
@@ -1638,6 +1648,7 @@ parse_args() {
       --uvm-phase-n-auto-reclaim-failure-backoff-epochs) UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="$2"; shift 2 ;; # insmod 时配置 Stage N auto reclaim failure backoff
       --uvm-phase-n-block-quota-enable) UVM_PHASE_N_BLOCK_QUOTA_ENABLE="$2"; shift 2 ;; # insmod 时开启 Stage N block quota path
       --uvm-phase-n-block-quota-trace-only) UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY="$2"; shift 2 ;; # insmod 时控制 block quota 是否只 trace
+      --uvm-phase-n-native-block-enable) UVM_PHASE_N_NATIVE_BLOCK_ENABLE="$2"; shift 2 ;; # insmod 时开启 native va_range/va_block fast path
       --capture-startup-faults) UVM_CAPTURE_STARTUP_FAULTS="$2"; shift 2 ;; # 在 vLLM server/KV 初始化前启动 fault trace
       --keep) KEEP_ON_EXIT=1; shift ;;                         # 退出时不重置内核状态
 
@@ -1846,6 +1857,7 @@ validate_inputs() {
     [[ "$UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS" =~ ^[0-9]+$ ]] || die "--uvm-phase-n-auto-reclaim-failure-backoff-epochs must be a non-negative integer"
     [[ "$UVM_PHASE_N_BLOCK_QUOTA_ENABLE" =~ ^[01]$ ]] || die "--uvm-phase-n-block-quota-enable must be 0 or 1"
     [[ "$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY" =~ ^[01]$ ]] || die "--uvm-phase-n-block-quota-trace-only must be 0 or 1"
+    [[ "$UVM_PHASE_N_NATIVE_BLOCK_ENABLE" =~ ^[01]$ ]] || die "--uvm-phase-n-native-block-enable must be 0 or 1"
     [[ "$UVM_CAPTURE_STARTUP_FAULTS" =~ ^[01]$ ]] || die "--capture-startup-faults must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_ENABLE" =~ ^[01]$ ]] || die "--uvm-scratch-pool-enable must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-scratch-pool-budget-bytes must be a non-negative integer"

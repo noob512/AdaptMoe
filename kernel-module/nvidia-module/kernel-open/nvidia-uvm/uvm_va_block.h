@@ -45,6 +45,8 @@
 #include <linux/wait.h>
 #include <linux/nodemask.h>
 
+struct seq_file;
+
 // VA blocks are the leaf nodes in the uvm_va_space tree for managed allocations
 // (VA ranges of type uvm_va_range_managed_t):
 //
@@ -246,8 +248,17 @@ typedef struct
     // copy completes and the GPU mapping is switched to the local copy.
     uvm_page_mask_t bg_promote_pending;
 
+    // Source classification for bg_promote_pending. Demand pages came from the
+    // faulting access itself; prefetch pages came from the UVM prefetch hint.
+    uvm_page_mask_t bg_promote_pending_demand;
+    uvm_page_mask_t bg_promote_pending_prefetch;
+
     // Pages currently being copied by the read-only background promotion worker.
     uvm_page_mask_t bg_promote_inflight;
+
+    // Source classification for bg_promote_inflight.
+    uvm_page_mask_t bg_promote_inflight_demand;
+    uvm_page_mask_t bg_promote_inflight_prefetch;
 } uvm_va_block_gpu_state_t;
 
 typedef struct
@@ -923,6 +934,33 @@ NV_STATUS uvm_va_block_map(uvm_va_block_t *va_block,
                            uvm_prot_t new_prot,
                            UvmEventMapRemoteCause cause,
                            uvm_tracker_t *out_tracker);
+
+// Pre-establish GPU READ-only mappings to CPU/system memory for ReadMostly
+// managed pages. This is an experimental latency path: it does not migrate or
+// copy data, and it only maps pages which are CPU-resident, not discarded, not
+// already GPU-resident, and not already mapped with GPU READ permissions.
+//
+// LOCKING: The caller must hold the va block lock. If va_block_context->mm !=
+//          NULL, va_block_context->mm->mmap_lock must be held in at least read
+//          mode.
+NV_STATUS uvm_va_block_premap_readmostly_remote_read(uvm_va_block_t *va_block,
+                                                     uvm_va_block_context_t *va_block_context,
+                                                     uvm_gpu_id_t gpu_id,
+                                                     uvm_va_block_region_t region,
+                                                     bool wait_for_mappings,
+                                                     NvU32 *mapped_pages_out);
+
+// Enqueue a background read-dup promotion for ReadMostly managed pages. This is
+// intended to be paired with uvm_va_block_premap_readmostly_remote_read(): the
+// foreground path keeps GPU reads remote, while the worker copies CPU-resident
+// pages into a GPU read duplicate and switches future reads to local memory.
+//
+// LOCKING: The caller must hold the va block lock.
+NV_STATUS uvm_va_block_enqueue_readmostly_bg_promote(uvm_va_block_t *va_block,
+                                                     uvm_va_block_context_t *va_block_context,
+                                                     uvm_gpu_id_t gpu_id,
+                                                     uvm_va_block_region_t region,
+                                                     NvU32 *enqueued_pages_out);
 
 // Like uvm_va_block_map, except it maps all processors in the input mask. The
 // VA block tracker contains all map operations on return.
@@ -2260,6 +2298,14 @@ NV_STATUS uvm_va_block_populate_pages_gpu(uvm_va_block_t *block,
                                           uvm_gpu_id_t gpu_id,
                                           uvm_va_block_region_t region,
                                           const uvm_page_mask_t *populate_mask);
+
+// Print global counters for the experimental latency-aware remote-first
+// background promotion path.
+void uvm_va_block_print_latency_stats(struct seq_file *s);
+
+// Reset global counters for the experimental latency-aware remote-first
+// background promotion path.
+void uvm_va_block_reset_latency_stats(void);
 
 // A helper macro for handling allocation-retry
 //

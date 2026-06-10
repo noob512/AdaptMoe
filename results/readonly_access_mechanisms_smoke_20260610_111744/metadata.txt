@@ -1,0 +1,25 @@
+run_root=/home/ubuntu/nvidia-uvm-gpu/results/readonly_access_mechanisms_smoke_20260610_111744
+date_utc=2026-06-10T11:17:44Z
+root_dir=/home/ubuntu/nvidia-uvm-gpu
+nvcc=/usr/local/cuda-12.8/bin/nvcc
+nvcc_arch=-arch=native
+pages=256
+passes=2
+ops_per_page=4
+counter_ops_per_page=16
+repeats=1
+device=0
+mechanisms=uvm_pure_remote uva_pinned_remote readonly_dup direct_migrate counter_migrate
+disable_remote_first=1
+restore_params=1
+
+nvidia-smi:
+NVIDIA GeForce RTX 5090, 595.71.05, 12.0, 32607 MiB, 32111 MiB
+
+UVM module parameters:
+  uvm_latency_remote_first_enable                  0
+  uvm_latency_bg_promote_enable                    0
+  uvm_perf_prefetch_enable                         1
+  uvm_perf_access_counter_migration_enable         -1
+  uvm_perf_access_counter_threshold                256
+  uvm_ats_mode                                     1

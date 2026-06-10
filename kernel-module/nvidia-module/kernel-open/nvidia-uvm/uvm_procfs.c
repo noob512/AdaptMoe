@@ -24,6 +24,7 @@
 #include "uvm_global.h"
 #include "uvm_procfs.h"
 #include "uvm_gpu.h"
+#include "uvm_va_block.h"
 
 #include "nv-procfs.h"
 #include "uvm_linux.h"
@@ -49,9 +50,9 @@
 
 // Optional debug-only delay after each Phase F route log write. This gives a
 // userspace watcher more time to copy /proc/driver/nvidia-uvm/phase_f_route_log
-// into a real file before a suspected hard crash. The Phase F crash diagnostic
-// run uses 500ms by default to make each route step visible before continuing.
-static unsigned int uvm_phase_f_route_log_delay_ms = 500;
+// into a real file before a suspected hard crash. Keep this disabled by default:
+// enabling it can add hundreds of milliseconds to every logged UVM ioctl step.
+static unsigned int uvm_phase_f_route_log_delay_ms = 0;
 module_param(uvm_phase_f_route_log_delay_ms, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_phase_f_route_log_delay_ms,
                  "Delay after each Phase F route log write, in milliseconds");
@@ -60,6 +61,8 @@ static struct proc_dir_entry *uvm_proc_dir;
 static struct proc_dir_entry *uvm_proc_gpus;
 static struct proc_dir_entry *uvm_proc_cpu;
 static struct proc_dir_entry *uvm_proc_phase_f_route_log;
+static struct proc_dir_entry *uvm_proc_latency_stats;
+static struct proc_dir_entry *uvm_proc_latency_stats_reset;
 
 static DEFINE_MUTEX(g_phase_f_route_log_lock);
 static char g_phase_f_route_log[UVM_PHASE_F_ROUTE_LOG_SIZE];
@@ -139,6 +142,28 @@ static int nv_procfs_read_phase_f_route_log(struct seq_file *s, void *v)
 
 UVM_DEFINE_SINGLE_PROCFS_FILE(phase_f_route_log);
 
+static int nv_procfs_read_latency_stats(struct seq_file *s, void *v)
+{
+    uvm_va_block_print_latency_stats(s);
+    return 0;
+}
+
+UVM_DEFINE_SINGLE_PROCFS_FILE(latency_stats);
+
+static ssize_t nv_procfs_write_latency_stats_reset(struct file *file,
+                                                   const char __user *buf,
+                                                   size_t count,
+                                                   loff_t *ppos)
+{
+    uvm_va_block_reset_latency_stats();
+    return count;
+}
+
+static const nv_proc_ops_t nv_procfs_latency_stats_reset_fops = {
+    NV_PROC_OPS_SET_OWNER()
+    .NV_PROC_OPS_WRITE = nv_procfs_write_latency_stats_reset,
+};
+
 NV_STATUS uvm_procfs_init(void)
 {
     if (!uvm_procfs_is_enabled())
@@ -161,6 +186,20 @@ NV_STATUS uvm_procfs_init(void)
                                                      phase_f_route_log,
                                                      NULL);
     if (uvm_proc_phase_f_route_log == NULL)
+        return NV_ERR_OPERATING_SYSTEM;
+
+    uvm_proc_latency_stats = NV_CREATE_PROC_FILE("latency_stats",
+                                                uvm_proc_dir,
+                                                latency_stats,
+                                                NULL);
+    if (uvm_proc_latency_stats == NULL)
+        return NV_ERR_OPERATING_SYSTEM;
+
+    uvm_proc_latency_stats_reset = NV_CREATE_PROC_FILE("latency_stats_reset",
+                                                       uvm_proc_dir,
+                                                       latency_stats_reset,
+                                                       NULL);
+    if (uvm_proc_latency_stats_reset == NULL)
         return NV_ERR_OPERATING_SYSTEM;
 
     return NV_OK;

@@ -199,6 +199,91 @@ CPU/system memory 可被该 GPU 访问
 
 这些是第二阶段或第三阶段工作。
 
+### 3.3 为什么后台 promotion 应使用只读复制而不是普通迁移
+
+对只读/ReadMostly 数据，后台 promotion 不应该做普通迁移 `MOVE`，而应该做只读复制 `read-dup COPY`。这是本方案能成立的关键之一。
+
+普通迁移的语义更接近“搬走所有权”：
+
+```text
+CPU copy/GPU old mapping 会被撤销
+目标 GPU 成为新的主要 resident
+过程中容易产生 unmap、replay、同步等待
+后续 CPU 再访问可能重新 fault 或触发迁回
+```
+
+只读复制的语义更接近“增加一个 GPU 本地只读副本”：
+
+```text
+CPU copy 保留
+GPU 增加一个只读 local copy
+CPU/GPU 可以同时拥有 resident copy
+只需要撤销写权限，保证不会有人修改
+后续 GPU 读走本地，CPU 读仍走 CPU copy
+```
+
+当前驱动中已有这两类基础路径：
+
+```text
+uvm_va_block_make_resident_copy()
+    普通迁移路径，内部使用 UVM_VA_BLOCK_TRANSFER_MODE_MOVE。
+
+uvm_va_block_make_resident_read_duplicate()
+    只读复制路径，内部使用 UVM_VA_BLOCK_TRANSFER_MODE_COPY。
+```
+
+本方案的后台 promotion 应继承 read-dup 的核心语义：`COPY` 数据到 GPU，并把目标页加入 `read_duplicated_pages`，但不能直接复用完整的 `uvm_va_block_make_resident_read_duplicate()` 前台路径。原因是现有 read-dup helper 会在 copy 前撤销远程映射并 revoke write，这会破坏“copy 期间继续 remote read”的目标。
+
+因此第一版实现应使用一个新的后台 helper：
+
+```text
+第一次 GPU 读:
+    建 CPU remote READ mapping
+    尽快 replay，让 GPU 先远程读
+
+后台 worker:
+    分配 GPU page/chunk
+    使用 UVM_VA_BLOCK_TRANSFER_MODE_COPY 做 CPU -> GPU copy
+    保留 CPU resident copy
+    标记 GPU resident
+    标记 read_duplicated_pages
+    copy 完成后短暂切 GPU PTE 到 local READ
+
+之后:
+    GPU 本地读
+    CPU 仍保留 CPU resident copy
+```
+
+这个选择能减少的不是所有单次搬运成本，而是减少迁移语义带来的额外破坏，并让搬运可以安全地从 foreground fault path 中移出去。
+
+仍然存在的成本：
+
+```text
+GPU page/chunk 分配，也就是 populate 的一部分
+CPU -> GPU DMA copy
+GPU PTE 从 remote mapping 切到 local mapping
+必要的锁、tracker、TLB/replay 协调
+```
+
+可能减少或规避的成本：
+
+```text
+不需要删除 CPU copy
+不需要完整 break residency
+后续 CPU 读不会把数据迁回 CPU
+后台 copy 不阻塞首次 GPU 读
+只读数据不需要 dirty tracking、写回或版本冲突处理
+```
+
+所以更准确的判断是：
+
+```text
+只读复制本身不一定让单次 copy 更快；
+它真正的价值是让 copy 可以安全地后台化。
+```
+
+这也是本方案优先选择只读/ReadMostly 数据的根本原因。对于 LLM 推理中的只读权重、已经写满并进入只读阶段的 KV cache block、读多写少且可证明无写冲突的数据，read-dup background promotion 比普通迁移更符合低首延迟目标。
+
 ## 4. 实施总览
 
 实施可以分为十个阶段：
@@ -264,6 +349,29 @@ atomic64_t bg_promote_throttled_rounds;
 ```
 
 第一版可以先用 `UVM_INFO_PRINT` 或 debug procfs 暴露。后续再接入正式 telemetry。
+
+当前实现已经增加只读 procfs 节点：
+
+```text
+/proc/driver/nvidia-uvm/latency_stats
+```
+
+读取示例：
+
+```bash
+cat /proc/driver/nvidia-uvm/latency_stats
+```
+
+输出格式是简单的 `name value`，便于实验脚本解析：
+
+```text
+remote_first_faults             0
+remote_first_pages              0
+bg_promote_enqueued_pages       0
+bg_promote_copied_pages         0
+bg_promote_committed_pages      0
+bg_promote_cancelled_pages      0
+```
 
 ### 5.3 扩展 `uvm_va_block_gpu_state_t`
 
@@ -615,6 +723,8 @@ static NV_STATUS block_bg_promote_locked(uvm_va_block_t *block,
 
 ## 10. 后台只读 copy helper
 
+后台 copy helper 的核心语义是 read-dup promotion，而不是普通 migration。也就是说，它应该保留 CPU resident copy，使用 `UVM_VA_BLOCK_TRANSFER_MODE_COPY` 建立 GPU 只读副本，并在成功后更新 `read_duplicated_pages`。
+
 不能直接调用：
 
 ```text
@@ -864,6 +974,54 @@ pte_switch_pages
 fallback_sync_pages
 ```
 
+当前项目中提供了专用 counter probe：
+
+```bash
+cd /home/ubuntu/nvidia-uvm-gpu
+
+RELOAD_UVM=1 \
+PAGES=16384 \
+PASSES=6 \
+OPS_PER_PAGE=128 \
+COUNTER_OPS_PER_PAGE=512 \
+REPEATS=2 \
+BG_MAX_PAGES=512 \
+PHASE_F_ROUTE_LOG_DELAY_MS=0 \
+CASES='remote_first_bg remote_first_only readonly_dup_sync counter_migrate local_prefetch default_uvm' \
+./scripts/test_remote_first_bg_promotion_counters.sh
+```
+
+如果已经手动加载了新的 `nvidia-uvm.ko`，可以省略 `RELOAD_UVM=1`。脚本会读取：
+
+```text
+/proc/driver/nvidia-uvm/latency_stats
+```
+
+并输出 before/after/delta，用于确认 remote-first 和 background promotion 是否真实触发。
+
+默认 case 含义：
+
+```text
+remote_first_bg:
+    打开 remote-first 和后台 promotion，测试目标机制。
+
+remote_first_only:
+    打开 remote-first，关闭后台 promotion，隔离纯 remote-first 首延迟。
+
+readonly_dup_sync:
+    关闭 remote-first，使用原生 ReadMostly/read-dup 同步路径。
+
+counter_migrate:
+    使用 CPU Preferred + AccessedBy，增加 ops/page 到 COUNTER_OPS_PER_PAGE，
+    对比 access-counter 迁移机制。
+
+local_prefetch:
+    显式 GPU prefetch 后再计时，作为 GPU local 上限。
+
+default_uvm:
+    不加 ReadMostly/AccessedBy，作为默认 UVM on-demand baseline。
+```
+
 ### 14.2 性能实验
 
 最小对照组：
@@ -914,6 +1072,114 @@ request_ready_ms 仍然明显高于 remote_only
 ```
 
 则说明后台 copy 仍在争用关键资源，需要进一步降低 `uvm_latency_bg_promote_max_pages` 或引入真正低优先级 copy channel。
+
+### 14.4 当前新增实现：prepare + background read-dup promotion
+
+在 `PREPARE_REMOTE_READ` 已经证明可行之后，当前实现新增了一个显式实验动作：
+
+```text
+UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG
+```
+
+它对应用户态 benchmark 中的新机制：
+
+```text
+readmostly_prepare_remote_bg
+```
+
+该机制和 `readmostly_prepare_remote` 的区别是：
+
+```text
+readmostly_prepare_remote:
+    Phase F prepare 只提前建立 GPU -> CPU READ-only remote mapping。
+    后续访问仍然一直走 remote read。
+
+readmostly_prepare_remote_bg:
+    Phase F prepare 先提前建立 GPU -> CPU READ-only remote mapping；
+    然后立即 enqueue background read-dup promotion；
+    background worker 分配 GPU page/chunk，CPU -> GPU copy；
+    copy 完成后 unmap remote READ PTE，并切换到 GPU local READ PTE。
+```
+
+内核侧关键路径：
+
+```text
+UVM_PHASE_F_BATCH_EXECUTOR
+  -> uvm_phase_f_execute_range()
+  -> uvm_phase_f_prepare_remote_read(enqueue_bg=true)
+  -> uvm_va_block_premap_readmostly_remote_read()
+  -> uvm_va_block_enqueue_readmostly_bg_promote()
+  -> block_bg_promote_enqueue_locked(force=true)
+  -> block_bg_promote_schedule_locked()
+  -> block_bg_promote_entry()
+  -> block_bg_promote_readonly_locked()
+```
+
+其中 `force=true` 的意义是：该显式 prepare-bg 动作不依赖全局
+`uvm_latency_bg_promote_enable` 参数。这样实验脚本可以关闭 fault-path
+remote-first 机制，只测试手动 prepare 阶段触发的后台 read-dup promotion。
+
+用户态 benchmark 也调整了时序：
+
+```text
+1. 分配和初始化数据
+2. 先完成 device warmup
+3. 再调用 PREPARE_REMOTE_READ 或 PREPARE_REMOTE_READ_BG
+4. prepare 返回后立即启动 pass0
+```
+
+这样可以尽量避免 benchmark 自己在 prepare 和 pass0 之间留下额外等待时间。
+
+2026-06-10 的 64 MiB 只读实验显示：
+
+```text
+uvm_pure_remote:
+    pass0 ~= 2.96 ms
+    pass1 ~= 2.92 ms
+
+readmostly_prepare_remote:
+    prepare ~= 0.30 ms
+    pass0 ~= 2.96 ms
+    pass1 ~= 2.92 ms
+
+readmostly_prepare_remote_bg:
+    prepare ~= 1.45 ms
+    pass0 ~= 2.62 ms
+    pass1 ~= 0.032 ms
+
+hybrid_remote_first_bg:
+    pass0 ~= 12.87 ms
+    pass1 ~= 0.034 ms
+
+readonly_dup:
+    pass0 ~= 14.29 ms
+    pass1 ~= 0.045 ms
+```
+
+计数器也对上了：
+
+```text
+remote_prepare_pages        98304
+remote_prepare_mapped_pages 98304
+bg_promote_enqueued_pages   98304
+bg_promote_copied_pages     98304
+bg_promote_committed_pages  98304
+pte_switch_pages            98304
+```
+
+这个结果说明：
+
+```text
+prepare-only 可以把 ReadMostly 数据的首轮访问降到 pure remote 级别；
+prepare-bg 可以保留接近 remote 的首轮访问，同时让第二轮进入 GPU local/read-dup 级别；
+相比 fault-path hybrid_remote_first_bg，提前 prepare 避免了在 replayable fault path 中临时建 remote PTE 的巨大开销。
+```
+
+但仍需注意：`readmostly_prepare_remote_bg` 的 pass0 不是严格固定为纯 remote。
+如果后台 worker 在 pass0 开始前或 pass0 执行过程中已经完成部分 promotion，
+pass0 会出现 remote 和 local 混合访问。因此后续如果要精确测量
+"迁移中仍远程访问" 的窗口，需要增加更细的 timeline counter 或人为放慢
+background promotion。
 
 ## 15. 风险与陷阱
 

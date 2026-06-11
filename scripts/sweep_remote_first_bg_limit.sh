@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 BG_MAX_VALUES="${BG_MAX_VALUES:-64 128 256 512 1024 0}"
+BG_DELAY_MS="${BG_DELAY_MS:-0}"
+BG_RESCHEDULE_DELAY_MS="${BG_RESCHEDULE_DELAY_MS:-0}"
 PAGES="${PAGES:-16384}"
 PASSES="${PASSES:-6}"
 OPS_PER_PAGE="${OPS_PER_PAGE:-128}"
@@ -24,6 +26,8 @@ mkdir -p "${RUN_ROOT}"
   echo "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "root_dir=${ROOT_DIR}"
   echo "bg_max_values=${BG_MAX_VALUES}"
+  echo "bg_delay_ms=${BG_DELAY_MS}"
+  echo "bg_reschedule_delay_ms=${BG_RESCHEDULE_DELAY_MS}"
   echo "pages=${PAGES}"
   echo "passes=${PASSES}"
   echo "ops_per_page=${OPS_PER_PAGE}"
@@ -46,6 +50,8 @@ for bg_max in ${BG_MAX_VALUES}; do
   REPEATS="${REPEATS}" \
   DEVICE="${DEVICE}" \
   BG_MAX_PAGES="${bg_max}" \
+  BG_DELAY_MS="${BG_DELAY_MS}" \
+  BG_RESCHEDULE_DELAY_MS="${BG_RESCHEDULE_DELAY_MS}" \
   PHASE_F_ROUTE_LOG_DELAY_MS="${PHASE_F_ROUTE_LOG_DELAY_MS}" \
   CASES="remote_first_bg" \
   RESET_COUNTERS="${RESET_COUNTERS}" \
@@ -113,6 +119,11 @@ for value in values:
         "bg_promote_committed_pages",
         "pte_switch_pages",
         "bg_promote_worker_rounds",
+        "bg_promote_delayed_schedules",
+        "bg_promote_immediate_schedules",
+        "bg_promote_timer_fires",
+        "bg_promote_deferred_pages",
+        "bg_promote_start_pages",
         "bg_promote_retry_count",
         "bg_promote_cancelled_pages",
         "sync_fallback_pages",
@@ -129,8 +140,8 @@ lines.append(f"- Metadata: `{meta_path}`")
 lines.append("")
 lines.append("## Performance And Counters")
 lines.append("")
-lines.append("| BG_MAX_PAGES | Pass0 ms | Last-pass ms | Median ms | Last GiB/s | RF pages | Remote map | BG enq | Demand promoted | Prefetch promoted | BG committed | PTE switch | Worker rounds | Retries | Cancelled | Fallback |")
-lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+lines.append("| BG_MAX_PAGES | Pass0 ms | Last-pass ms | Median ms | Last GiB/s | RF pages | Remote map | BG enq | Demand promoted | Prefetch promoted | BG committed | PTE switch | Worker rounds | Delayed schedules | Immediate schedules | Timer fires | Retries | Cancelled | Fallback |")
+lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 for row in rows:
     if row.get("missing"):
         lines.append(f"| {row['bg_max']} | MISSING | MISSING | MISSING | MISSING | | | | | | | | | | | |")
@@ -140,7 +151,9 @@ for row in rows:
         f"{row['last_gib_s']:.3f} | {row['remote_first_pages']} | {row['remote_map_pages']} | "
         f"{row['bg_promote_enqueued_pages']} | {row['bg_promote_demand_pages_promoted']} | "
         f"{row['bg_promote_prefetch_pages_promoted']} | {row['bg_promote_committed_pages']} | "
-        f"{row['pte_switch_pages']} | {row['bg_promote_worker_rounds']} | {row['bg_promote_retry_count']} | "
+        f"{row['pte_switch_pages']} | {row['bg_promote_worker_rounds']} | "
+        f"{row['bg_promote_delayed_schedules']} | {row['bg_promote_immediate_schedules']} | "
+        f"{row['bg_promote_timer_fires']} | {row['bg_promote_retry_count']} | "
         f"{row['bg_promote_cancelled_pages']} | {row['sync_fallback_pages']} |"
     )
 
@@ -150,6 +163,7 @@ lines.append("")
 lines.append("- If `BG_MAX_PAGES` is too large, pass0 may rise because background copy competes with urgent remote reads.")
 lines.append("- If `BG_MAX_PAGES` is too small, worker rounds rise and later passes may remain remote for longer.")
 lines.append("- A useful setting keeps pass0 low while making `BG committed` and `PTE switch` reach the working set quickly.")
+lines.append("- Non-zero delay parameters should move activity from immediate schedules to delayed schedules/timer fires.")
 
 summary_path.write_text("\n".join(lines) + "\n")
 print(summary_path)

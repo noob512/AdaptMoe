@@ -1,6 +1,0 @@
-remote_first_faults             6719
-remote_first_pages              35894
-bg_promote_enqueued_pages       33088
-bg_promote_copied_pages         33088
-bg_promote_committed_pages      33088
-bg_promote_cancelled_pages      0

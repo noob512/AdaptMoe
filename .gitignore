@@ -65,3 +65,6 @@ workloads/vllm/results/uvm_kv_bench_single_process.log
 /workloads/vllm/**/*_metrics.json
 /workloads/vllm/**/*_trace.jsonl
 /workloads/vllm/**/*_stats.json
+
+# UVM experiment outputs
+/results/

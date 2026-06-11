@@ -78,6 +78,7 @@ static void usage(const char *argv0)
                  "  uva_pinned_remote  vLLM-style pinned CPU memory + UVA CUDA view\n"
                  "  readmostly_prepare_remote Managed, ReadMostly; manual driver remote READ prepare\n"
                  "  readmostly_prepare_remote_bg Managed, ReadMostly; manual remote READ prepare + bg read-dup promotion\n"
+                 "  readmostly_prepare_remote_bg_after_first Managed, ReadMostly; prepare remote + defer bg promotion until pass0 completes\n"
                  "  hybrid_remote_first_bg Managed, ReadMostly; driver remote-first + bg promotion\n"
                  "  hybrid_remote_first_only Managed, ReadMostly; driver remote-first only\n"
                  "  readonly_dup       Managed, CPU resident, ReadMostly read-dup\n"
@@ -92,6 +93,7 @@ static bool valid_mechanism(const std::string &mechanism)
            mechanism == "uva_pinned_remote" ||
            mechanism == "readmostly_prepare_remote" ||
            mechanism == "readmostly_prepare_remote_bg" ||
+           mechanism == "readmostly_prepare_remote_bg_after_first" ||
            mechanism == "hybrid_remote_first_bg" ||
            mechanism == "hybrid_remote_first_only" ||
            mechanism == "readonly_dup" ||
@@ -223,20 +225,20 @@ static bool is_nvidia_uvm_fd_target(const char *target)
     return std::strncmp(name, "nvidia-uvm", len) == 0 && (name[len] == '\0' || name[len] == ' ');
 }
 
-static bool try_prepare_remote_read_ioctl(int fd,
-                                          void *ptr,
-                                          size_t bytes,
-                                          int device,
-                                          bool enqueue_bg,
-                                          PrepareRemoteResult *result,
-                                          int *saved_errno,
-                                          uint32_t *rm_status,
-                                          uint32_t *range_status);
+static bool try_phase_f_ioctl(int fd,
+                              void *ptr,
+                              size_t bytes,
+                              int device,
+                              uint32_t action,
+                              PrepareRemoteResult *result,
+                              int *saved_errno,
+                              uint32_t *rm_status,
+                              uint32_t *range_status);
 
 static bool try_existing_uvm_fds(void *ptr,
                                  size_t bytes,
                                  int device,
-                                 bool enqueue_bg,
+                                 uint32_t action,
                                  PrepareRemoteResult *result,
                                  int *saved_errno,
                                  uint32_t *rm_status,
@@ -276,15 +278,15 @@ static bool try_existing_uvm_fds(void *ptr,
         if (dup_fd < 0)
             continue;
 
-        if (try_prepare_remote_read_ioctl(dup_fd,
-                                          ptr,
-                                          bytes,
-                                          device,
-                                          enqueue_bg,
-                                          result,
-                                          saved_errno,
-                                          rm_status,
-                                          range_status)) {
+        if (try_phase_f_ioctl(dup_fd,
+                              ptr,
+                              bytes,
+                              device,
+                              action,
+                              result,
+                              saved_errno,
+                              rm_status,
+                              range_status)) {
             close(dup_fd);
             closedir(dir);
             return true;
@@ -313,20 +315,19 @@ static int open_initialized_uvm_fd()
     return fd;
 }
 
-static bool try_prepare_remote_read_ioctl(int fd,
-                                          void *ptr,
-                                          size_t bytes,
-                                          int device,
-                                          bool enqueue_bg,
-                                          PrepareRemoteResult *result,
-                                          int *saved_errno,
-                                          uint32_t *rm_status,
-                                          uint32_t *range_status)
+static bool try_phase_f_ioctl(int fd,
+                              void *ptr,
+                              size_t bytes,
+                              int device,
+                              uint32_t action,
+                              PrepareRemoteResult *result,
+                              int *saved_errno,
+                              uint32_t *rm_status,
+                              uint32_t *range_status)
 {
     UVM_PHASE_F_BATCH_EXECUTOR_PARAMS params{};
 
-    params.action = enqueue_bg ? UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG :
-                                 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ;
+    params.action = action;
     params.count = 1;
     params.async = NV_FALSE;
     params.ranges[0].base = reinterpret_cast<uint64_t>(ptr);
@@ -358,7 +359,11 @@ static bool try_prepare_remote_read_ioctl(int fd,
     return true;
 }
 
-static PrepareRemoteResult prepare_remote_read_or_die(void *ptr, size_t bytes, int device, bool enqueue_bg)
+static PrepareRemoteResult phase_f_action_or_die(void *ptr,
+                                                 size_t bytes,
+                                                 int device,
+                                                 uint32_t action,
+                                                 const char *action_name)
 {
     PrepareRemoteResult result{};
     int saved_errno = 0;
@@ -368,7 +373,7 @@ static PrepareRemoteResult prepare_remote_read_or_die(void *ptr, size_t bytes, i
     if (try_existing_uvm_fds(ptr,
                              bytes,
                              device,
-                             enqueue_bg,
+                             action,
                              &result,
                              &saved_errno,
                              &rm_status,
@@ -377,15 +382,15 @@ static PrepareRemoteResult prepare_remote_read_or_die(void *ptr, size_t bytes, i
 
     int fd = open_initialized_uvm_fd();
     if (fd >= 0) {
-        if (try_prepare_remote_read_ioctl(fd,
-                                          ptr,
-                                          bytes,
-                                          device,
-                                          enqueue_bg,
-                                          &result,
-                                          &saved_errno,
-                                          &rm_status,
-                                          &range_status)) {
+        if (try_phase_f_ioctl(fd,
+                              ptr,
+                              bytes,
+                              device,
+                              action,
+                              &result,
+                              &saved_errno,
+                              &rm_status,
+                              &range_status)) {
             close(fd);
             return result;
         }
@@ -393,7 +398,8 @@ static PrepareRemoteResult prepare_remote_read_or_die(void *ptr, size_t bytes, i
     }
 
     std::fprintf(stderr,
-                 "PREPARE_REMOTE_READ failed: errno=%d rmStatus=%u rangeStatus=%u\n",
+                 "%s failed: errno=%d rmStatus=%u rangeStatus=%u\n",
+                 action_name,
                  saved_errno,
                  rm_status,
                  range_status);
@@ -438,7 +444,10 @@ int main(int argc, char **argv)
     PrepareRemoteResult prepare_remote{};
     const bool should_prepare_remote =
         opt.mechanism == "readmostly_prepare_remote" ||
-        opt.mechanism == "readmostly_prepare_remote_bg";
+        opt.mechanism == "readmostly_prepare_remote_bg" ||
+        opt.mechanism == "readmostly_prepare_remote_bg_after_first";
+    const bool should_start_bg_after_first =
+        opt.mechanism == "readmostly_prepare_remote_bg_after_first";
 
     const double setup_start = now_ms();
 
@@ -461,6 +470,7 @@ int main(int argc, char **argv)
         if (opt.mechanism == "readonly_dup" ||
             opt.mechanism == "readmostly_prepare_remote" ||
             opt.mechanism == "readmostly_prepare_remote_bg" ||
+            opt.mechanism == "readmostly_prepare_remote_bg_after_first" ||
             opt.mechanism == "hybrid_remote_first_bg" ||
             opt.mechanism == "hybrid_remote_first_only")
             CHECK_CUDA(cudaMemAdvise(data, bytes, cudaMemAdviseSetReadMostly, opt.device));
@@ -473,10 +483,19 @@ int main(int argc, char **argv)
     CHECK_CUDA(cudaDeviceSynchronize());
 
     if (should_prepare_remote) {
-        prepare_remote = prepare_remote_read_or_die(data,
-                                                    bytes,
-                                                    opt.device,
-                                                    opt.mechanism == "readmostly_prepare_remote_bg");
+        uint32_t action = UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ;
+        const char *action_name = "PREPARE_REMOTE_READ";
+
+        if (opt.mechanism == "readmostly_prepare_remote_bg") {
+            action = UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG;
+            action_name = "PREPARE_REMOTE_READ_BG";
+        }
+        else if (opt.mechanism == "readmostly_prepare_remote_bg_after_first") {
+            action = UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED;
+            action_name = "PREPARE_REMOTE_READ_BG_DEFERRED";
+        }
+
+        prepare_remote = phase_f_action_or_die(data, bytes, opt.device, action, action_name);
     }
 
     const double setup_ms = now_ms() - setup_start;
@@ -514,6 +533,14 @@ int main(int argc, char **argv)
         CHECK_CUDA(cudaEventElapsedTime(&event_ms_f, ev_start, ev_stop));
         CHECK_CUDA(cudaEventDestroy(ev_start));
         CHECK_CUDA(cudaEventDestroy(ev_stop));
+
+        if (pass == 0 && should_start_bg_after_first) {
+            phase_f_action_or_die(data,
+                                  bytes,
+                                  opt.device,
+                                  UVM_PHASE_F_ACTION_START_BG_PROMOTION,
+                                  "START_BG_PROMOTION");
+        }
 
         const double mloads_s =
             wall_ms > 0.0 ? static_cast<double>(logical_loads) / (wall_ms * 1000.0) : 0.0;

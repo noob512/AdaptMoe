@@ -3333,6 +3333,7 @@ static NV_STATUS uvm_phase_f_prepare_remote_read(const NvProcessorUuid *gpu_uuid
                                                  NvU64 base,
                                                  NvU64 length,
                                                  bool enqueue_bg,
+                                                 bool schedule_bg,
                                                  UVM_PHASE_F_RANGE_RESULT *result,
                                                  uvm_va_space_t *va_space)
 {
@@ -3430,11 +3431,17 @@ static NV_STATUS uvm_phase_f_prepare_remote_read(const NvProcessorUuid *gpu_uuid
             if (enqueue_bg) {
                 status = UVM_VA_BLOCK_LOCK_RETRY(block,
                                                  NULL,
-                                                 uvm_va_block_enqueue_readmostly_bg_promote(block,
-                                                                                            block_context,
-                                                                                            gpu->id,
-                                                                                            block_region,
-                                                                                            &block_bg_enqueued_pages));
+                                                 schedule_bg ?
+                                                    uvm_va_block_enqueue_readmostly_bg_promote(block,
+                                                                                               block_context,
+                                                                                               gpu->id,
+                                                                                               block_region,
+                                                                                               &block_bg_enqueued_pages) :
+                                                    uvm_va_block_enqueue_readmostly_bg_promote_deferred(block,
+                                                                                                        block_context,
+                                                                                                        gpu->id,
+                                                                                                        block_region,
+                                                                                                        &block_bg_enqueued_pages));
                 if (status != NV_OK)
                     goto out;
 
@@ -3455,17 +3462,140 @@ out:
     result->resident_any_bytes = covered_bytes;
     result->resident_unknown_bytes = length > covered_bytes ? length - covered_bytes : 0;
 
-    uvm_phase_f_route_log("phase_f_prepare_remote_read base=0x%llx length=%llu status=0x%x gpu=%s async=%u enqueue_bg=%u covered=%llu candidate_pages=%llu mapped_pages=%llu bg_enqueued_pages=%llu\n",
+    uvm_phase_f_route_log("phase_f_prepare_remote_read base=0x%llx length=%llu status=0x%x gpu=%s async=%u enqueue_bg=%u schedule_bg=%u covered=%llu candidate_pages=%llu mapped_pages=%llu bg_enqueued_pages=%llu\n",
                           base,
                           length,
                           status,
                           gpu ? gpu->name : "none",
                           async,
                           enqueue_bg,
+                          schedule_bg,
                           covered_bytes,
                           candidate_pages,
                           mapped_pages,
                           bg_enqueued_pages);
+
+    return status;
+}
+
+static NV_STATUS uvm_phase_f_start_bg_promotion(const NvProcessorUuid *gpu_uuid,
+                                                NvBool async,
+                                                NvU64 base,
+                                                NvU64 length,
+                                                UVM_PHASE_F_RANGE_RESULT *result,
+                                                uvm_va_space_t *va_space)
+{
+    NV_STATUS status = NV_OK;
+    uvm_va_range_managed_t *managed_range = NULL;
+    uvm_va_range_managed_t *managed_range_last = NULL;
+    uvm_va_block_context_t *block_context;
+    uvm_gpu_t *gpu = NULL;
+    struct mm_struct *mm = NULL;
+    NvU64 query_start;
+    NvU64 query_end;
+    NvU64 last_address;
+    NvU64 covered_bytes = 0;
+    NvU64 candidate_pages = 0;
+    NvU64 started_pages = 0;
+
+    result->queried_bytes = length;
+    result->resident_gpu_bytes = 0;
+    result->resident_cpu_bytes = 0;
+    result->resident_any_bytes = 0;
+    result->resident_unknown_bytes = 0;
+
+    if (uvm_api_range_invalid(base, length))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    query_start = base;
+    query_end = base + length;
+    last_address = query_end - 1;
+
+    mm = uvm_va_space_mm_or_current_retain_lock(va_space);
+    uvm_va_space_down_read(va_space);
+
+    gpu = uvm_va_space_get_gpu_by_uuid(va_space, gpu_uuid);
+    if (!gpu) {
+        status = NV_ERR_INVALID_DEVICE;
+        goto out;
+    }
+
+    if (uvm_api_range_type_check(va_space, mm, base, length) != UVM_API_RANGE_TYPE_MANAGED) {
+        status = NV_ERR_INVALID_ADDRESS;
+        goto out;
+    }
+
+    block_context = uvm_va_space_block_context(va_space, mm);
+
+    uvm_for_each_va_range_managed_in_contig(managed_range, va_space, base, last_address) {
+        const NvU64 range_start = max(query_start, managed_range->va_range.node.start);
+        const NvU64 range_end = min(last_address, managed_range->va_range.node.end);
+        const size_t first_block_index = uvm_va_range_block_index(managed_range, range_start);
+        const size_t last_block_index = uvm_va_range_block_index(managed_range, range_end);
+        size_t block_index;
+
+        managed_range_last = managed_range;
+
+        if (!uvm_va_policy_is_read_duplicate(&managed_range->policy)) {
+            status = NV_ERR_INVALID_STATE;
+            goto out;
+        }
+
+        for (block_index = first_block_index; block_index <= last_block_index; ++block_index) {
+            uvm_va_block_t *block;
+            NvU64 block_start;
+            NvU64 block_end;
+            uvm_va_block_region_t block_region;
+            NvU32 block_started_pages = 0;
+
+            status = uvm_va_range_block_create(managed_range, block_index, &block);
+            if (status != NV_OK)
+                goto out;
+
+            block_start = max(query_start, block->start);
+            block_end = min(last_address, block->end);
+            if (block_start > block_end)
+                continue;
+
+            block_region = uvm_va_block_region_from_start_end(block, block_start, block_end);
+            covered_bytes += block_end - block_start + 1;
+            candidate_pages += uvm_va_block_region_size(block_region) / PAGE_SIZE;
+
+            status = UVM_VA_BLOCK_LOCK_RETRY(block,
+                                             NULL,
+                                             uvm_va_block_start_readmostly_bg_promote(block,
+                                                                                      block_context,
+                                                                                      gpu->id,
+                                                                                      block_region,
+                                                                                      &block_started_pages));
+            if (status != NV_OK)
+                goto out;
+
+            started_pages += block_started_pages;
+        }
+    }
+
+    if (!managed_range_last || managed_range_last->va_range.node.end < last_address)
+        status = NV_ERR_INVALID_ADDRESS;
+
+out:
+    uvm_va_space_up_read(va_space);
+    uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+
+    result->resident_gpu_bytes = started_pages * PAGE_SIZE;
+    result->resident_cpu_bytes = candidate_pages * PAGE_SIZE;
+    result->resident_any_bytes = covered_bytes;
+    result->resident_unknown_bytes = length > covered_bytes ? length - covered_bytes : 0;
+
+    uvm_phase_f_route_log("phase_f_start_bg_promotion base=0x%llx length=%llu status=0x%x gpu=%s async=%u covered=%llu candidate_pages=%llu started_pages=%llu\n",
+                          base,
+                          length,
+                          status,
+                          gpu ? gpu->name : "none",
+                          async,
+                          covered_bytes,
+                          candidate_pages,
+                          started_pages);
 
     return status;
 }
@@ -3627,14 +3757,24 @@ static NV_STATUS uvm_phase_f_execute_range(NvU32 action,
         }
     }
     else if (action == UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ ||
-             action == UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG) {
+             action == UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG ||
+             action == UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED) {
         status = uvm_phase_f_prepare_remote_read(gpu_uuid,
                                                  async,
                                                  base,
                                                  length,
+                                                 action != UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ,
                                                  action == UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG,
                                                  result,
                                                  va_space);
+    }
+    else if (action == UVM_PHASE_F_ACTION_START_BG_PROMOTION) {
+        status = uvm_phase_f_start_bg_promotion(gpu_uuid,
+                                                async,
+                                                base,
+                                                length,
+                                                result,
+                                                va_space);
     }
     else {
         status = NV_ERR_INVALID_ARGUMENT;

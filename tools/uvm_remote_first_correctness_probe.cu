@@ -6,9 +6,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <string>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <vector>
+
+#include "uvm_linux_ioctl.h"
 
 #define CHECK_CUDA(call)                                                     \
     do {                                                                     \
@@ -32,6 +39,8 @@ struct Options {
     int device = 0;
     int threads = 256;
     int blocks_per_sm = 4;
+    bool prepare_remote = false;
+    bool prepare_remote_bg = false;
 };
 
 static double now_ms()
@@ -56,7 +65,8 @@ static void usage(const char *argv0)
     std::fprintf(stderr,
                  "Usage: %s [--pages N] [--write-pages N] [--passes N]\n"
                  "          [--ops-per-page N] [--streams N] [--device N]\n"
-                 "          [--threads N] [--blocks-per-sm N]\n",
+                 "          [--threads N] [--blocks-per-sm N]\n"
+                 "          [--prepare-remote | --prepare-remote-bg]\n",
                  argv0);
 }
 
@@ -89,6 +99,10 @@ static Options parse_args(int argc, char **argv)
             opt.threads = static_cast<int>(parse_size(need_value(argv[i])));
         else if (std::strcmp(argv[i], "--blocks-per-sm") == 0)
             opt.blocks_per_sm = static_cast<int>(parse_size(need_value(argv[i])));
+        else if (std::strcmp(argv[i], "--prepare-remote") == 0)
+            opt.prepare_remote = true;
+        else if (std::strcmp(argv[i], "--prepare-remote-bg") == 0)
+            opt.prepare_remote_bg = true;
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             std::exit(EXIT_SUCCESS);
@@ -105,8 +119,193 @@ static Options parse_args(int argc, char **argv)
         std::exit(EXIT_FAILURE);
     }
 
+    if (opt.prepare_remote && opt.prepare_remote_bg) {
+        std::fprintf(stderr, "--prepare-remote and --prepare-remote-bg are mutually exclusive\n");
+        std::exit(EXIT_FAILURE);
+    }
+
     opt.write_pages = std::min(opt.write_pages, opt.pages);
     return opt;
+}
+
+static bool get_device_uuid(int device, NvProcessorUuid *uuid)
+{
+    cudaDeviceProp prop{};
+    cudaError_t err;
+
+    if (!uuid)
+        return false;
+
+    err = cudaGetDeviceProperties(&prop, device);
+    if (err != cudaSuccess)
+        return false;
+
+    static_assert(sizeof(prop.uuid.bytes) == sizeof(uuid->uuid), "Unexpected CUDA UUID size");
+    std::memcpy(uuid->uuid, prop.uuid.bytes, sizeof(uuid->uuid));
+    return true;
+}
+
+static bool is_nvidia_uvm_fd_target(const char *target)
+{
+    const char *name;
+    size_t len;
+
+    if (!target)
+        return false;
+
+    name = std::strrchr(target, '/');
+    name = name ? name + 1 : target;
+    len = std::strlen("nvidia-uvm");
+
+    return std::strncmp(name, "nvidia-uvm", len) == 0 && (name[len] == '\0' || name[len] == ' ');
+}
+
+static bool try_prepare_remote_ioctl(int fd,
+                                     void *ptr,
+                                     size_t bytes,
+                                     int device,
+                                     bool enqueue_bg,
+                                     int *saved_errno,
+                                     uint32_t *rm_status,
+                                     uint32_t *range_status)
+{
+    UVM_PHASE_F_BATCH_EXECUTOR_PARAMS params{};
+
+    params.action = enqueue_bg ? UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG :
+                                 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ;
+    params.count = 1;
+    params.async = NV_FALSE;
+    params.ranges[0].base = reinterpret_cast<uint64_t>(ptr);
+    params.ranges[0].length = static_cast<uint64_t>(bytes);
+
+    if (!get_device_uuid(device, &params.gpu_uuid)) {
+        if (range_status)
+            *range_status = 0xffffffffu;
+        return false;
+    }
+
+    const int ret = ioctl(fd, UVM_PHASE_F_BATCH_EXECUTOR, &params);
+    if (saved_errno)
+        *saved_errno = errno;
+    if (rm_status)
+        *rm_status = params.rmStatus;
+    if (range_status)
+        *range_status = params.results[0].status;
+
+    return ret == 0 && params.rmStatus == 0 && params.failure_count == 0 && params.results[0].status == 0;
+}
+
+static bool try_existing_uvm_fds(void *ptr,
+                                 size_t bytes,
+                                 int device,
+                                 bool enqueue_bg,
+                                 int *saved_errno,
+                                 uint32_t *rm_status,
+                                 uint32_t *range_status)
+{
+    DIR *dir = opendir("/proc/self/fd");
+    struct dirent *entry;
+
+    if (!dir)
+        return false;
+
+    while ((entry = readdir(dir)) != nullptr) {
+        char *end = nullptr;
+        long fd_long = std::strtol(entry->d_name, &end, 10);
+        char link_path[64];
+        char target[PATH_MAX];
+        ssize_t len;
+        int dup_fd;
+
+        if (end == entry->d_name || *end != '\0')
+            continue;
+
+        std::snprintf(link_path, sizeof(link_path), "/proc/self/fd/%ld", fd_long);
+        len = readlink(link_path, target, sizeof(target) - 1);
+        if (len < 0)
+            continue;
+
+        target[len] = '\0';
+        if (!is_nvidia_uvm_fd_target(target))
+            continue;
+
+        dup_fd = fcntl(static_cast<int>(fd_long), F_DUPFD_CLOEXEC, 3);
+        if (dup_fd < 0)
+            continue;
+
+        if (try_prepare_remote_ioctl(dup_fd,
+                                     ptr,
+                                     bytes,
+                                     device,
+                                     enqueue_bg,
+                                     saved_errno,
+                                     rm_status,
+                                     range_status)) {
+            close(dup_fd);
+            closedir(dir);
+            return true;
+        }
+
+        close(dup_fd);
+    }
+
+    closedir(dir);
+    return false;
+}
+
+static int open_initialized_uvm_fd()
+{
+    int fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
+
+    if (fd < 0)
+        return -1;
+
+    UVM_INITIALIZE_PARAMS init{};
+    if (ioctl(fd, UVM_INITIALIZE, &init) != 0 || init.rmStatus != 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+static void prepare_remote_or_die(void *ptr, size_t bytes, int device, bool enqueue_bg)
+{
+    int saved_errno = 0;
+    uint32_t rm_status = 0;
+    uint32_t range_status = 0;
+
+    if (try_existing_uvm_fds(ptr,
+                             bytes,
+                             device,
+                             enqueue_bg,
+                             &saved_errno,
+                             &rm_status,
+                             &range_status))
+        return;
+
+    int fd = open_initialized_uvm_fd();
+    if (fd >= 0) {
+        const bool ok = try_prepare_remote_ioctl(fd,
+                                                 ptr,
+                                                 bytes,
+                                                 device,
+                                                 enqueue_bg,
+                                                 &saved_errno,
+                                                 &rm_status,
+                                                 &range_status);
+        close(fd);
+        if (ok)
+            return;
+    }
+
+    std::fprintf(stderr,
+                 "%s failed: errno=%d rmStatus=%u rangeStatus=%u\n",
+                 enqueue_bg ? "PREPARE_REMOTE_READ_BG" : "PREPARE_REMOTE_READ",
+                 saved_errno,
+                 rm_status,
+                 range_status);
+    std::exit(EXIT_FAILURE);
 }
 
 static __host__ __device__ uint64_t initial_value(size_t page)
@@ -275,6 +474,8 @@ int main(int argc, char **argv)
     CHECK_CUDA(cudaDeviceSynchronize());
 
     CHECK_CUDA(cudaMemAdvise(data, bytes, cudaMemAdviseSetReadMostly, opt.device));
+    if (opt.prepare_remote || opt.prepare_remote_bg)
+        prepare_remote_or_die(data, bytes, opt.device, opt.prepare_remote_bg);
 
     std::printf("test,status,observed,expected,wall_ms\n");
 

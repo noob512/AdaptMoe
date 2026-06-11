@@ -21,8 +21,12 @@ OPS_PER_PAGE="${OPS_PER_PAGE:-16}"
 STREAMS="${STREAMS:-4}"
 DEVICE="${DEVICE:-0}"
 BG_MAX_PAGES="${BG_MAX_PAGES:-512}"
+BG_DELAY_MS="${BG_DELAY_MS:-0}"
+BG_RESCHEDULE_DELAY_MS="${BG_RESCHEDULE_DELAY_MS:-0}"
 REMOTE_FIRST="${REMOTE_FIRST:-1}"
 BG_PROMOTE="${BG_PROMOTE:-1}"
+PREPARE_REMOTE="${PREPARE_REMOTE:-0}"
+PREPARE_REMOTE_BG="${PREPARE_REMOTE_BG:-0}"
 RESET_COUNTERS="${RESET_COUNTERS:-1}"
 RUN_ROOT="${RUN_ROOT:-${ROOT_DIR}/results/remote_first_correctness_$(date -u +%Y%m%d_%H%M%S)}"
 
@@ -58,6 +62,14 @@ COUNTER_KEYS=(
   bg_promote_failed_map
   bg_promote_failed_block_dead
   sync_fallback_pages
+  remote_prepare_calls
+  remote_prepare_pages
+  remote_prepare_mapped_pages
+  bg_promote_delayed_schedules
+  bg_promote_immediate_schedules
+  bg_promote_timer_fires
+  bg_promote_deferred_pages
+  bg_promote_start_pages
 )
 
 mkdir -p "${RUN_ROOT}"
@@ -121,8 +133,12 @@ write_metadata() {
     echo "streams=${STREAMS}"
     echo "device=${DEVICE}"
     echo "bg_max_pages=${BG_MAX_PAGES}"
+    echo "bg_delay_ms=${BG_DELAY_MS}"
+    echo "bg_reschedule_delay_ms=${BG_RESCHEDULE_DELAY_MS}"
     echo "remote_first=${REMOTE_FIRST}"
     echo "bg_promote=${BG_PROMOTE}"
+    echo "prepare_remote=${PREPARE_REMOTE}"
+    echo "prepare_remote_bg=${PREPARE_REMOTE_BG}"
     echo "reset_counters=${RESET_COUNTERS}"
     echo
     echo "nvidia-smi:"
@@ -133,6 +149,8 @@ write_metadata() {
       "${PARAM_ROOT}/uvm_latency_remote_first_enable" \
       "${PARAM_ROOT}/uvm_latency_bg_promote_enable" \
       "${PARAM_ROOT}/uvm_latency_bg_promote_max_pages" \
+      "${PARAM_ROOT}/uvm_latency_bg_promote_delay_ms" \
+      "${PARAM_ROOT}/uvm_latency_bg_promote_reschedule_delay_ms" \
       "${PARAM_ROOT}/uvm_perf_prefetch_enable" \
       "${PARAM_ROOT}/uvm_perf_access_counter_migration_enable" \
       "${PARAM_ROOT}/uvm_perf_access_counter_threshold" \
@@ -232,22 +250,40 @@ echo "run_root=${RUN_ROOT}"
 write_param uvm_latency_remote_first_enable "${REMOTE_FIRST}"
 write_param uvm_latency_bg_promote_enable "${BG_PROMOTE}"
 write_param uvm_latency_bg_promote_max_pages "${BG_MAX_PAGES}"
+write_param uvm_latency_bg_promote_delay_ms "${BG_DELAY_MS}"
+write_param uvm_latency_bg_promote_reschedule_delay_ms "${BG_RESCHEDULE_DELAY_MS}"
 
 reset_counters_if_requested
 write_metadata
 
 echo "Building ${BIN}"
-"${NVCC}" -O3 -std=c++17 ${NVCC_ARCH} "${SRC}" -o "${BIN}"
+"${NVCC}" -O3 -std=c++17 ${NVCC_ARCH} \
+  -I"${ROOT_DIR}/kernel-module/nvidia-module/kernel-open/nvidia-uvm" \
+  -I"${ROOT_DIR}/kernel-module/nvidia-module/kernel-open/common/inc" \
+  "${SRC}" -o "${BIN}"
 
 capture_stats_quiet "${STATS_BEFORE}"
 
+probe_args=(
+  --pages "${PAGES}"
+  --write-pages "${WRITE_PAGES}"
+  --passes "${PASSES}"
+  --ops-per-page "${OPS_PER_PAGE}"
+  --streams "${STREAMS}"
+  --device "${DEVICE}"
+)
+
+if [[ "${PREPARE_REMOTE}" == "1" && "${PREPARE_REMOTE_BG}" == "1" ]]; then
+  echo "ERROR: PREPARE_REMOTE and PREPARE_REMOTE_BG are mutually exclusive." >&2
+  exit 1
+elif [[ "${PREPARE_REMOTE}" == "1" ]]; then
+  probe_args+=(--prepare-remote)
+elif [[ "${PREPARE_REMOTE_BG}" == "1" ]]; then
+  probe_args+=(--prepare-remote-bg)
+fi
+
 "${BIN}" \
-  --pages "${PAGES}" \
-  --write-pages "${WRITE_PAGES}" \
-  --passes "${PASSES}" \
-  --ops-per-page "${OPS_PER_PAGE}" \
-  --streams "${STREAMS}" \
-  --device "${DEVICE}" | tee "${CSV}"
+  "${probe_args[@]}" | tee "${CSV}"
 
 capture_stats_quiet "${STATS_AFTER}"
 summarize

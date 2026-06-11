@@ -18,8 +18,10 @@ COUNTER_OPS_PER_PAGE="${COUNTER_OPS_PER_PAGE:-512}"
 REPEATS="${REPEATS:-3}"
 DEVICE="${DEVICE:-0}"
 BG_MAX_PAGES="${BG_MAX_PAGES:-512}"
+BG_DELAY_MS="${BG_DELAY_MS:-0}"
+BG_RESCHEDULE_DELAY_MS="${BG_RESCHEDULE_DELAY_MS:-0}"
 PHASE_F_ROUTE_LOG_DELAY_MS="${PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
-MECHANISMS="${MECHANISMS:-uvm_pure_remote uva_pinned_remote readmostly_prepare_remote readmostly_prepare_remote_bg hybrid_remote_first_only hybrid_remote_first_bg readonly_dup direct_migrate counter_migrate}"
+MECHANISMS="${MECHANISMS:-uvm_pure_remote uva_pinned_remote readmostly_prepare_remote readmostly_prepare_remote_bg readmostly_prepare_remote_bg_after_first hybrid_remote_first_only hybrid_remote_first_bg readonly_dup direct_migrate counter_migrate}"
 RUN_ROOT="${RUN_ROOT:-${ROOT_DIR}/results/readonly_access_mechanisms_$(date -u +%Y%m%d_%H%M%S)}"
 
 # Isolate the new remote-first/background promotion path: enabled only for
@@ -129,6 +131,8 @@ set_remote_first_for_mechanism() {
     uvm_latency_remote_first_enable \
     uvm_latency_bg_promote_enable \
     uvm_latency_bg_promote_max_pages \
+    uvm_latency_bg_promote_delay_ms \
+    uvm_latency_bg_promote_reschedule_delay_ms \
     uvm_phase_f_route_log_delay_ms; do
     save_param "${name}"
   done
@@ -138,17 +142,24 @@ set_remote_first_for_mechanism() {
       write_param uvm_latency_remote_first_enable 1
       write_param uvm_latency_bg_promote_enable 0
       write_param uvm_latency_bg_promote_max_pages "${BG_MAX_PAGES}"
+      write_param uvm_latency_bg_promote_delay_ms "${BG_DELAY_MS}"
+      write_param uvm_latency_bg_promote_reschedule_delay_ms "${BG_RESCHEDULE_DELAY_MS}"
       write_param uvm_phase_f_route_log_delay_ms "${PHASE_F_ROUTE_LOG_DELAY_MS}"
       ;;
     hybrid_remote_first_bg)
       write_param uvm_latency_remote_first_enable 1
       write_param uvm_latency_bg_promote_enable 1
       write_param uvm_latency_bg_promote_max_pages "${BG_MAX_PAGES}"
+      write_param uvm_latency_bg_promote_delay_ms "${BG_DELAY_MS}"
+      write_param uvm_latency_bg_promote_reschedule_delay_ms "${BG_RESCHEDULE_DELAY_MS}"
       write_param uvm_phase_f_route_log_delay_ms "${PHASE_F_ROUTE_LOG_DELAY_MS}"
       ;;
     *)
       write_param uvm_latency_remote_first_enable 0
       write_param uvm_latency_bg_promote_enable 0
+      write_param uvm_latency_bg_promote_max_pages "${BG_MAX_PAGES}"
+      write_param uvm_latency_bg_promote_delay_ms "${BG_DELAY_MS}"
+      write_param uvm_latency_bg_promote_reschedule_delay_ms "${BG_RESCHEDULE_DELAY_MS}"
       ;;
   esac
 }
@@ -210,6 +221,8 @@ write_metadata() {
     echo "repeats=${REPEATS}"
     echo "device=${DEVICE}"
     echo "bg_max_pages=${BG_MAX_PAGES}"
+    echo "bg_delay_ms=${BG_DELAY_MS}"
+    echo "bg_reschedule_delay_ms=${BG_RESCHEDULE_DELAY_MS}"
     echo "phase_f_route_log_delay_ms=${PHASE_F_ROUTE_LOG_DELAY_MS}"
     echo "mechanisms=${MECHANISMS}"
     echo "disable_remote_first=${DISABLE_REMOTE_FIRST}"
@@ -223,6 +236,8 @@ write_metadata() {
       "${PARAM_ROOT}/uvm_latency_remote_first_enable" \
       "${PARAM_ROOT}/uvm_latency_bg_promote_enable" \
       "${PARAM_ROOT}/uvm_latency_bg_promote_max_pages" \
+      "${PARAM_ROOT}/uvm_latency_bg_promote_delay_ms" \
+      "${PARAM_ROOT}/uvm_latency_bg_promote_reschedule_delay_ms" \
       "${PARAM_ROOT}/uvm_phase_f_route_log_delay_ms" \
       "${PARAM_ROOT}/uvm_perf_prefetch_enable" \
       "${PARAM_ROOT}/uvm_perf_access_counter_migration_enable" \
@@ -337,6 +352,7 @@ lines.append("| `uvm_pure_remote` | Managed memory, CPU preferred + GPU Accessed
 lines.append("| `uva_pinned_remote` | vLLM-style pinned CPU tensor exposed to GPU with UVA / `cudaHostGetDevicePointer`. No UVM managed page migration. |")
 lines.append("| `readmostly_prepare_remote` | Managed memory initially CPU-resident, `ReadMostly`; before the first read the benchmark manually calls Phase F `PREPARE_REMOTE_READ` to pre-build GPU->CPU READ mappings outside the fault path. |")
 lines.append("| `readmostly_prepare_remote_bg` | Managed memory initially CPU-resident, `ReadMostly`; before the first read the benchmark manually calls Phase F `PREPARE_REMOTE_READ_BG`, which pre-builds GPU->CPU READ mappings and enqueues background read-dup promotion. |")
+lines.append("| `readmostly_prepare_remote_bg_after_first` | Managed memory initially CPU-resident, `ReadMostly`; before the first read the benchmark calls Phase F `PREPARE_REMOTE_READ_BG_DEFERRED`, which pre-builds GPU->CPU READ mappings and only marks promotion pending. After pass0 completes it calls `START_BG_PROMOTION` to launch the worker. |")
 lines.append("| `hybrid_remote_first_only` | Managed memory initially CPU-resident, `ReadMostly`; script enables modified driver remote-first READ mapping and disables background promotion. |")
 lines.append("| `hybrid_remote_first_bg` | Managed memory initially CPU-resident, `ReadMostly`; script enables the modified driver remote-first READ mapping plus background read-dup promotion for this case only. |")
 lines.append("| `readonly_dup` | Managed memory initially CPU-resident, `cudaMemAdviseSetReadMostly`; first GPU read may build a GPU read duplicate. |")
@@ -366,7 +382,9 @@ lines.append("")
 lines.append("- Compare `uvm_pure_remote` and `uva_pinned_remote` to separate UVM remote mapping overhead from vLLM-style pinned UVA remote reads.")
 lines.append("- Compare `readmostly_prepare_remote` with `uvm_pure_remote` and `hybrid_remote_first_only` to test whether pre-building ReadMostly remote READ mappings outside the fault path removes the expensive first-touch mapping cost.")
 lines.append("- Compare `readmostly_prepare_remote_bg` with `readmostly_prepare_remote` to isolate the extra prepare-time enqueue and background read-dup promotion effect.")
+lines.append("- Compare `readmostly_prepare_remote_bg_after_first` with `readmostly_prepare_remote_bg` to test whether deferring worker start until after pass0 protects first-pass remote-read latency from background copy interference.")
 lines.append("- The target result for `readmostly_prepare_remote_bg` is first-pass latency close to `uvm_pure_remote`, then second/last-pass latency close to `readonly_dup` after the background promotion commits.")
+lines.append("- The stricter target for `readmostly_prepare_remote_bg_after_first` is pass0 close to `uvm_pure_remote`; promotion should begin only after pass0 and later passes should converge toward `readonly_dup` as the worker commits pages.")
 lines.append("- Compare `hybrid_remote_first_only` and `hybrid_remote_first_bg` to isolate the cost of background promotion.")
 lines.append("- Compare `hybrid_remote_first_bg` with `uvm_pure_remote` for first-pass latency and with `readonly_dup` for second-pass local-read convergence.")
 lines.append("- Compare first pass and second/last pass of `readonly_dup` and `direct_migrate` to see whether the expensive first touch turns into fast GPU-local reuse.")

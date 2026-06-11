@@ -22,6 +22,8 @@ COUNTER_OPS_PER_PAGE="${COUNTER_OPS_PER_PAGE:-512}"
 REPEATS="${REPEATS:-2}"
 DEVICE="${DEVICE:-0}"
 BG_MAX_PAGES="${BG_MAX_PAGES:-512}"
+BG_DELAY_MS="${BG_DELAY_MS:-0}"
+BG_RESCHEDULE_DELAY_MS="${BG_RESCHEDULE_DELAY_MS:-0}"
 PHASE_F_ROUTE_LOG_DELAY_MS="${PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
 CASES="${CASES:-remote_first_bg remote_first_only readonly_dup_sync counter_migrate local_prefetch default_uvm}"
 RELOAD_UVM="${RELOAD_UVM:-0}"
@@ -61,6 +63,11 @@ COUNTER_KEYS=(
   bg_promote_failed_map
   bg_promote_failed_block_dead
   sync_fallback_pages
+  bg_promote_delayed_schedules
+  bg_promote_immediate_schedules
+  bg_promote_timer_fires
+  bg_promote_deferred_pages
+  bg_promote_start_pages
 )
 
 mkdir -p "${RUN_ROOT}"
@@ -101,6 +108,8 @@ reload_uvm_if_requested() {
     uvm_latency_remote_first_enable=1 \
     uvm_latency_bg_promote_enable=1 \
     uvm_latency_bg_promote_max_pages="${BG_MAX_PAGES}" \
+    uvm_latency_bg_promote_delay_ms="${BG_DELAY_MS}" \
+    uvm_latency_bg_promote_reschedule_delay_ms="${BG_RESCHEDULE_DELAY_MS}" \
     uvm_phase_f_route_log_delay_ms="${PHASE_F_ROUTE_LOG_DELAY_MS}"
 }
 
@@ -109,6 +118,8 @@ check_runtime_params() {
     uvm_latency_remote_first_enable
     uvm_latency_bg_promote_enable
     uvm_latency_bg_promote_max_pages
+    uvm_latency_bg_promote_delay_ms
+    uvm_latency_bg_promote_reschedule_delay_ms
   )
 
   for name in "${required[@]}"; do
@@ -121,6 +132,8 @@ check_runtime_params() {
   done
 
   write_param uvm_latency_bg_promote_max_pages "${BG_MAX_PAGES}"
+  write_param uvm_latency_bg_promote_delay_ms "${BG_DELAY_MS}"
+  write_param uvm_latency_bg_promote_reschedule_delay_ms "${BG_RESCHEDULE_DELAY_MS}"
 }
 
 set_driver_case_params() {
@@ -130,6 +143,8 @@ set_driver_case_params() {
   write_param uvm_latency_remote_first_enable "${remote_first}"
   write_param uvm_latency_bg_promote_enable "${bg_promote}"
   write_param uvm_latency_bg_promote_max_pages "${BG_MAX_PAGES}"
+  write_param uvm_latency_bg_promote_delay_ms "${BG_DELAY_MS}"
+  write_param uvm_latency_bg_promote_reschedule_delay_ms "${BG_RESCHEDULE_DELAY_MS}"
 }
 
 capture_stats() {
@@ -309,6 +324,8 @@ write_metadata() {
     echo "repeats=${REPEATS}"
     echo "device=${DEVICE}"
     echo "bg_max_pages=${BG_MAX_PAGES}"
+    echo "bg_delay_ms=${BG_DELAY_MS}"
+    echo "bg_reschedule_delay_ms=${BG_RESCHEDULE_DELAY_MS}"
     echo "phase_f_route_log_delay_ms=${PHASE_F_ROUTE_LOG_DELAY_MS}"
     echo "cases=${CASES}"
     echo "reload_uvm=${RELOAD_UVM}"
@@ -322,6 +339,8 @@ write_metadata() {
       "${PARAM_ROOT}/uvm_latency_remote_first_enable" \
       "${PARAM_ROOT}/uvm_latency_bg_promote_enable" \
       "${PARAM_ROOT}/uvm_latency_bg_promote_max_pages" \
+      "${PARAM_ROOT}/uvm_latency_bg_promote_delay_ms" \
+      "${PARAM_ROOT}/uvm_latency_bg_promote_reschedule_delay_ms" \
       "${PARAM_ROOT}/uvm_phase_f_route_log_delay_ms" \
       "${PARAM_ROOT}/uvm_perf_prefetch_enable" \
       "${PARAM_ROOT}/uvm_perf_access_counter_migration_enable" \
@@ -371,6 +390,9 @@ keys = [
     "bg_promote_failed_map",
     "bg_promote_failed_block_dead",
     "sync_fallback_pages",
+    "bg_promote_delayed_schedules",
+    "bg_promote_immediate_schedules",
+    "bg_promote_timer_fires",
 ]
 
 def read_stats(path):
@@ -476,13 +498,15 @@ for case in case_order:
 lines.append("")
 lines.append("## Per-Case Worker And Failure Detail")
 lines.append("")
-lines.append("| Case | Demand promoted | Prefetch promoted | Worker rounds | Retries | Not CPU resident | Already GPU resident | Alloc fail | Copy fail | Unmap fail | Map fail | Dead block | Sync fallback pages |")
-lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+lines.append("| Case | Demand promoted | Prefetch promoted | Worker rounds | Delayed schedules | Immediate schedules | Timer fires | Retries | Not CPU resident | Already GPU resident | Alloc fail | Copy fail | Unmap fail | Map fail | Dead block | Sync fallback pages |")
+lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 for case in case_order:
     s = case_totals[case]
     lines.append(
         f"| `{case}` | {s['bg_promote_demand_pages_promoted']} | {s['bg_promote_prefetch_pages_promoted']} | "
-        f"{s['bg_promote_worker_rounds']} | {s['bg_promote_retry_count']} | "
+        f"{s['bg_promote_worker_rounds']} | {s['bg_promote_delayed_schedules']} | "
+        f"{s['bg_promote_immediate_schedules']} | {s['bg_promote_timer_fires']} | "
+        f"{s['bg_promote_retry_count']} | "
         f"{s['bg_promote_failed_not_cpu_resident']} | {s['bg_promote_failed_already_gpu_resident']} | "
         f"{s['bg_promote_failed_allocation']} | {s['bg_promote_failed_copy']} | "
         f"{s['bg_promote_failed_unmap']} | {s['bg_promote_failed_map']} | "
@@ -520,6 +544,8 @@ if rf_bg:
         lines.append("  Observed: both remote-first and committed background promotion counters increased.")
     else:
         lines.append("  Warning: expected remote-first/background counters did not both increase.")
+    if rf_bg["bg_promote_delayed_schedules"] > 0:
+        lines.append("  Observed: delayed background promotion scheduling was used.")
 
 if rf_only:
     lines.append("- `remote_first_only` disables background promotion to isolate foreground remote-first latency.")

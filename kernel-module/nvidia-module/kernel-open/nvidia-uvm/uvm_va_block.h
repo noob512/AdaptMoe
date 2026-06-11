@@ -44,6 +44,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/wait.h>
 #include <linux/nodemask.h>
+#include <linux/workqueue.h>
 
 struct seq_file;
 
@@ -526,6 +527,8 @@ struct uvm_va_block_struct
     // Queue item and GPU mask for deferred read-only background promotion.
     nv_kthread_q_item_t bg_promote_q_item;
     uvm_processor_mask_t bg_promote_gpus;
+    struct delayed_work bg_promote_delayed_work;
+    bool bg_promote_delayed_work_active;
 
     uvm_perf_module_data_desc_t perf_modules_data[UVM_PERF_MODULE_TYPE_COUNT];
 
@@ -961,6 +964,28 @@ NV_STATUS uvm_va_block_enqueue_readmostly_bg_promote(uvm_va_block_t *va_block,
                                                      uvm_gpu_id_t gpu_id,
                                                      uvm_va_block_region_t region,
                                                      NvU32 *enqueued_pages_out);
+
+// Same as uvm_va_block_enqueue_readmostly_bg_promote(), but it only marks the
+// pages as pending. It intentionally does not schedule the worker. This is used
+// to keep the first GPU remote read free from background copy interference.
+//
+// LOCKING: The caller must hold the va block lock.
+NV_STATUS uvm_va_block_enqueue_readmostly_bg_promote_deferred(uvm_va_block_t *va_block,
+                                                              uvm_va_block_context_t *va_block_context,
+                                                              uvm_gpu_id_t gpu_id,
+                                                              uvm_va_block_region_t region,
+                                                              NvU32 *enqueued_pages_out);
+
+// Start background promotion for pages which were previously enqueued by the
+// deferred helper. This schedules the worker immediately; later rounds still
+// obey the module's reschedule delay.
+//
+// LOCKING: The caller must hold the va block lock.
+NV_STATUS uvm_va_block_start_readmostly_bg_promote(uvm_va_block_t *va_block,
+                                                   uvm_va_block_context_t *va_block_context,
+                                                   uvm_gpu_id_t gpu_id,
+                                                   uvm_va_block_region_t region,
+                                                   NvU32 *pending_pages_out);
 
 // Like uvm_va_block_map, except it maps all processors in the input mask. The
 // VA block tracker contains all map operations on return.

@@ -114,6 +114,16 @@ module_param(uvm_latency_bg_promote_reschedule_delay_ms, uint, S_IRUGO | S_IWUSR
 MODULE_PARM_DESC(uvm_latency_bg_promote_reschedule_delay_ms,
                  "Delay between read-only background promotion worker passes when pending work remains. Default: 0.");
 
+static unsigned uvm_stage_a_cpu_fault_observe_enable __read_mostly = 0;
+module_param(uvm_stage_a_cpu_fault_observe_enable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_stage_a_cpu_fault_observe_enable,
+                 "Enable Stage A trace-only CPU fault observation for registered Phase F regions. Default: 0.");
+
+static unsigned uvm_stage_a_cpu_fault_log_enable __read_mostly = 1;
+module_param(uvm_stage_a_cpu_fault_log_enable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_stage_a_cpu_fault_log_enable,
+                 "Log each Stage A observed CPU fault to phase_f_route_log when observation is enabled. Default: 1.");
+
 static atomic64_t g_uvm_latency_remote_first_faults = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_latency_remote_first_pages = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_latency_bg_promote_enqueued_pages = ATOMIC64_INIT(0);
@@ -144,6 +154,39 @@ static atomic64_t g_uvm_latency_bg_promote_immediate_schedules = ATOMIC64_INIT(0
 static atomic64_t g_uvm_latency_bg_promote_timer_fires = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_latency_bg_promote_deferred_pages = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_latency_bg_promote_start_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_cpu_faults_total = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_cpu_faults_registered = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_cpu_faults_candidate = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_cpu_read_faults = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_cpu_write_faults = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_cpu_faults_weight = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_cpu_faults_kv = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_cpu_faults_scratch = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_cpu_faults_other = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_cpu_fault_fallbacks = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_last_region_id = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_last_pool = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_last_fault_addr = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_stage_a_last_is_write = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_apply_calls = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_apply_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_cpu_unmap_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_gpu_map_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_readdup_apply_calls = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_readdup_apply_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_cpu_preserved_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_clear_calls = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_clear_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_cpu_faults = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_cpu_read_faults = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_cpu_write_faults = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_soft_breaks = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_soft_break_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_failed_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_last_region_id = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_last_pool = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_last_fault_addr = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_gpu_only_last_is_write = ATOMIC64_INIT(0);
 
 void uvm_va_block_print_latency_stats(struct seq_file *s)
 {
@@ -207,6 +250,72 @@ void uvm_va_block_print_latency_stats(struct seq_file *s)
                          (NvU64)atomic64_read(&g_uvm_latency_bg_promote_deferred_pages));
     UVM_SEQ_OR_DBG_PRINT(s, "bg_promote_start_pages          %llu\n",
                          (NvU64)atomic64_read(&g_uvm_latency_bg_promote_start_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_total        %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_cpu_faults_total));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_registered   %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_cpu_faults_registered));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_candidate    %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_cpu_faults_candidate));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_read_faults         %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_cpu_read_faults));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_write_faults        %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_cpu_write_faults));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_weight       %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_cpu_faults_weight));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_kv           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_cpu_faults_kv));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_scratch      %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_cpu_faults_scratch));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_other        %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_cpu_faults_other));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_fault_fallbacks     %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_cpu_fault_fallbacks));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_last_region_id          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_last_region_id));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_last_pool               %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_last_pool));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_last_fault_addr         0x%llx\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_last_fault_addr));
+    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_last_is_write           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_stage_a_last_is_write));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_apply_calls            %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_apply_calls));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_apply_pages            %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_apply_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_cpu_unmap_pages        %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_cpu_unmap_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_gpu_map_pages          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_gpu_map_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_readdup_apply_calls    %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_readdup_apply_calls));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_readdup_apply_pages    %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_readdup_apply_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_cpu_preserved_pages    %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_cpu_preserved_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_clear_calls            %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_clear_calls));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_clear_pages            %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_clear_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_cpu_faults             %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_cpu_faults));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_cpu_read_faults        %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_cpu_read_faults));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_cpu_write_faults       %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_cpu_write_faults));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_soft_breaks            %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_soft_breaks));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_soft_break_pages       %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_soft_break_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_failed_pages           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_failed_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_last_region_id         %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_last_region_id));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_last_pool              %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_last_pool));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_last_fault_addr        0x%llx\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_last_fault_addr));
+    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_last_is_write          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_gpu_only_last_is_write));
 }
 
 void uvm_va_block_reset_latency_stats(void)
@@ -241,6 +350,39 @@ void uvm_va_block_reset_latency_stats(void)
     atomic64_set(&g_uvm_latency_bg_promote_timer_fires, 0);
     atomic64_set(&g_uvm_latency_bg_promote_deferred_pages, 0);
     atomic64_set(&g_uvm_latency_bg_promote_start_pages, 0);
+    atomic64_set(&g_uvm_stage_a_cpu_faults_total, 0);
+    atomic64_set(&g_uvm_stage_a_cpu_faults_registered, 0);
+    atomic64_set(&g_uvm_stage_a_cpu_faults_candidate, 0);
+    atomic64_set(&g_uvm_stage_a_cpu_read_faults, 0);
+    atomic64_set(&g_uvm_stage_a_cpu_write_faults, 0);
+    atomic64_set(&g_uvm_stage_a_cpu_faults_weight, 0);
+    atomic64_set(&g_uvm_stage_a_cpu_faults_kv, 0);
+    atomic64_set(&g_uvm_stage_a_cpu_faults_scratch, 0);
+    atomic64_set(&g_uvm_stage_a_cpu_faults_other, 0);
+    atomic64_set(&g_uvm_stage_a_cpu_fault_fallbacks, 0);
+    atomic64_set(&g_uvm_stage_a_last_region_id, 0);
+    atomic64_set(&g_uvm_stage_a_last_pool, 0);
+    atomic64_set(&g_uvm_stage_a_last_fault_addr, 0);
+    atomic64_set(&g_uvm_stage_a_last_is_write, 0);
+    atomic64_set(&g_uvm_gpu_only_apply_calls, 0);
+    atomic64_set(&g_uvm_gpu_only_apply_pages, 0);
+    atomic64_set(&g_uvm_gpu_only_cpu_unmap_pages, 0);
+    atomic64_set(&g_uvm_gpu_only_gpu_map_pages, 0);
+    atomic64_set(&g_uvm_gpu_only_readdup_apply_calls, 0);
+    atomic64_set(&g_uvm_gpu_only_readdup_apply_pages, 0);
+    atomic64_set(&g_uvm_gpu_only_cpu_preserved_pages, 0);
+    atomic64_set(&g_uvm_gpu_only_clear_calls, 0);
+    atomic64_set(&g_uvm_gpu_only_clear_pages, 0);
+    atomic64_set(&g_uvm_gpu_only_cpu_faults, 0);
+    atomic64_set(&g_uvm_gpu_only_cpu_read_faults, 0);
+    atomic64_set(&g_uvm_gpu_only_cpu_write_faults, 0);
+    atomic64_set(&g_uvm_gpu_only_soft_breaks, 0);
+    atomic64_set(&g_uvm_gpu_only_soft_break_pages, 0);
+    atomic64_set(&g_uvm_gpu_only_failed_pages, 0);
+    atomic64_set(&g_uvm_gpu_only_last_region_id, 0);
+    atomic64_set(&g_uvm_gpu_only_last_pool, 0);
+    atomic64_set(&g_uvm_gpu_only_last_fault_addr, 0);
+    atomic64_set(&g_uvm_gpu_only_last_is_write, 0);
 }
 
 static void block_add_eviction_mappings_entry(void *args);
@@ -9170,6 +9312,205 @@ NV_STATUS uvm_va_block_start_readmostly_bg_promote(uvm_va_block_t *va_block,
     return NV_OK;
 }
 
+NV_STATUS uvm_va_block_apply_gpu_only_soft(uvm_va_block_t *va_block,
+                                           uvm_va_block_retry_t *va_block_retry,
+                                           uvm_va_block_context_t *va_block_context,
+                                           uvm_gpu_id_t gpu_id,
+                                           uvm_va_block_region_t region,
+                                           bool read_only,
+                                           bool preserve_cpu_backing,
+                                           bool wait_for_gpu_mapping,
+                                           NvU32 *applied_pages_out,
+                                           NvU32 *cpu_unmapped_pages_out,
+                                           NvU32 *gpu_mapped_pages_out,
+                                           NvU32 *cpu_preserved_pages_out)
+{
+    uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
+    uvm_gpu_t *gpu;
+    uvm_va_block_gpu_state_t *gpu_state;
+    uvm_page_mask_t *policy_mask = &va_block_context->caller_page_mask;
+    uvm_page_mask_t *cpu_mapped_before = &va_block_context->mapping.filtered_page_mask;
+    uvm_page_mask_t *gpu_mapped_before = &va_block_context->mapping.migratable_mask;
+    uvm_page_mask_t *cpu_resident_before = &va_block_context->scratch_page_mask;
+    NvU32 applied_pages;
+    NvU32 cpu_unmapped_pages = 0;
+    NvU32 gpu_mapped_pages = 0;
+    NvU32 cpu_preserved_pages = 0;
+    uvm_prot_t gpu_prot = read_only ? UVM_PROT_READ_ONLY : UVM_PROT_READ_WRITE;
+    uvm_pte_bits_gpu_t gpu_prot_bit = get_gpu_pte_bit_index(gpu_prot);
+    NV_STATUS status;
+
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (applied_pages_out)
+        *applied_pages_out = 0;
+    if (cpu_unmapped_pages_out)
+        *cpu_unmapped_pages_out = 0;
+    if (gpu_mapped_pages_out)
+        *gpu_mapped_pages_out = 0;
+    if (cpu_preserved_pages_out)
+        *cpu_preserved_pages_out = 0;
+
+    if (!UVM_ID_IS_GPU(gpu_id) || uvm_va_block_is_hmm(va_block))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    // A writable GPU mapping cannot coexist with another valid resident copy in
+    // UVM's current invariants. Preserve backing only for read-only ranges.
+    if (preserve_cpu_backing && !read_only)
+        return NV_ERR_NOT_SUPPORTED;
+
+    if (!uvm_processor_mask_test(&va_space->accessible_from[uvm_id_value(UVM_ID_CPU)], gpu_id))
+        return NV_ERR_INVALID_DEVICE;
+
+    gpu = uvm_gpu_get(gpu_id);
+    if (!uvm_gpu_va_space_get(va_space, gpu))
+        return NV_ERR_INVALID_DEVICE;
+
+    gpu_state = uvm_va_block_gpu_state_get_alloc(va_block, gpu);
+    if (!gpu_state)
+        return NV_ERR_NO_MEMORY;
+
+    uvm_page_mask_init_from_region(policy_mask, region, NULL);
+    uvm_page_mask_andnot(policy_mask, policy_mask, &va_block->discarded_pages);
+    applied_pages = uvm_page_mask_region_weight(policy_mask, region);
+    if (applied_pages == 0)
+        return NV_OK;
+
+    uvm_page_mask_and(cpu_mapped_before, policy_mask, &va_block->cpu.pte_bits[UVM_PTE_BITS_CPU_READ]);
+    cpu_unmapped_pages = uvm_page_mask_region_weight(cpu_mapped_before, region);
+
+    uvm_page_mask_and(gpu_mapped_before, policy_mask, &gpu_state->pte_bits[gpu_prot_bit]);
+    gpu_mapped_pages = applied_pages - uvm_page_mask_region_weight(gpu_mapped_before, region);
+
+    va_block_context->make_resident.dest_nid = NUMA_NO_NODE;
+    if (preserve_cpu_backing) {
+        uvm_page_mask_and(cpu_resident_before,
+                          policy_mask,
+                          uvm_va_block_resident_mask_get(va_block, UVM_ID_CPU, NUMA_NO_NODE));
+        cpu_preserved_pages = uvm_page_mask_region_weight(cpu_resident_before, region);
+        if (!uvm_page_mask_subset(policy_mask, cpu_resident_before)) {
+            atomic64_add(applied_pages, &g_uvm_gpu_only_failed_pages);
+            return NV_ERR_INVALID_STATE;
+        }
+
+        status = uvm_va_block_make_resident_read_duplicate(va_block,
+                                                           va_block_retry,
+                                                           va_block_context,
+                                                           gpu_id,
+                                                           region,
+                                                           policy_mask,
+                                                           NULL,
+                                                           UVM_MAKE_RESIDENT_CAUSE_API_HINT);
+    }
+    else {
+        status = uvm_va_block_make_resident(va_block,
+                                            va_block_retry,
+                                            va_block_context,
+                                            gpu_id,
+                                            region,
+                                            policy_mask,
+                                            NULL,
+                                            UVM_MAKE_RESIDENT_CAUSE_API_HINT);
+    }
+    if (status != NV_OK) {
+        if (status != NV_ERR_MORE_PROCESSING_REQUIRED)
+            atomic64_add(applied_pages, &g_uvm_gpu_only_failed_pages);
+        return status;
+    }
+
+    // make_resident() usually removes CPU mappings when it migrates to GPU,
+    // but call unmap explicitly so already-GPU-resident pages lose CPU access.
+    status = uvm_va_block_unmap(va_block, va_block_context, UVM_ID_CPU, region, policy_mask, NULL);
+    if (status != NV_OK) {
+        atomic64_add(applied_pages, &g_uvm_gpu_only_failed_pages);
+        return status;
+    }
+
+    status = uvm_va_block_map(va_block,
+                              va_block_context,
+                              gpu_id,
+                              region,
+                              policy_mask,
+                              gpu_prot,
+                              UvmEventMapRemoteCausePolicy,
+                              &va_block->tracker);
+    if (status != NV_OK) {
+        if (status != NV_ERR_MORE_PROCESSING_REQUIRED)
+            atomic64_add(applied_pages, &g_uvm_gpu_only_failed_pages);
+        return status;
+    }
+
+    if (wait_for_gpu_mapping) {
+        status = uvm_tracker_wait(&va_block->tracker);
+        if (status != NV_OK) {
+            atomic64_add(applied_pages, &g_uvm_gpu_only_failed_pages);
+            return status;
+        }
+    }
+
+    uvm_page_mask_or(&va_block->gpu_only_soft_pages, &va_block->gpu_only_soft_pages, policy_mask);
+    uvm_page_mask_or(&va_block->gpu_only_read_pages, &va_block->gpu_only_read_pages, policy_mask);
+    if (read_only)
+        uvm_page_mask_andnot(&va_block->gpu_only_write_pages, &va_block->gpu_only_write_pages, policy_mask);
+    else
+        uvm_page_mask_or(&va_block->gpu_only_write_pages, &va_block->gpu_only_write_pages, policy_mask);
+
+    atomic64_inc(&g_uvm_gpu_only_apply_calls);
+    atomic64_add(applied_pages, &g_uvm_gpu_only_apply_pages);
+    atomic64_add(cpu_unmapped_pages, &g_uvm_gpu_only_cpu_unmap_pages);
+    atomic64_add(gpu_mapped_pages, &g_uvm_gpu_only_gpu_map_pages);
+    if (preserve_cpu_backing) {
+        atomic64_inc(&g_uvm_gpu_only_readdup_apply_calls);
+        atomic64_add(applied_pages, &g_uvm_gpu_only_readdup_apply_pages);
+        atomic64_add(cpu_preserved_pages, &g_uvm_gpu_only_cpu_preserved_pages);
+    }
+
+    if (applied_pages_out)
+        *applied_pages_out = applied_pages;
+    if (cpu_unmapped_pages_out)
+        *cpu_unmapped_pages_out = cpu_unmapped_pages;
+    if (gpu_mapped_pages_out)
+        *gpu_mapped_pages_out = gpu_mapped_pages;
+    if (cpu_preserved_pages_out)
+        *cpu_preserved_pages_out = cpu_preserved_pages;
+
+    return NV_OK;
+}
+
+NV_STATUS uvm_va_block_clear_gpu_only_soft(uvm_va_block_t *va_block,
+                                           uvm_va_block_context_t *va_block_context,
+                                           uvm_va_block_region_t region,
+                                           NvU32 *cleared_pages_out)
+{
+    uvm_page_mask_t *clear_mask = &va_block_context->caller_page_mask;
+    NvU32 cleared_pages;
+
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (cleared_pages_out)
+        *cleared_pages_out = 0;
+
+    if (uvm_va_block_is_hmm(va_block))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    uvm_page_mask_init_from_region(clear_mask, region, &va_block->gpu_only_soft_pages);
+    cleared_pages = uvm_page_mask_region_weight(clear_mask, region);
+    if (cleared_pages == 0)
+        return NV_OK;
+
+    uvm_page_mask_andnot(&va_block->gpu_only_soft_pages, &va_block->gpu_only_soft_pages, clear_mask);
+    uvm_page_mask_andnot(&va_block->gpu_only_read_pages, &va_block->gpu_only_read_pages, clear_mask);
+    uvm_page_mask_andnot(&va_block->gpu_only_write_pages, &va_block->gpu_only_write_pages, clear_mask);
+
+    atomic64_inc(&g_uvm_gpu_only_clear_calls);
+    atomic64_add(cleared_pages, &g_uvm_gpu_only_clear_pages);
+
+    if (cleared_pages_out)
+        *cleared_pages_out = cleared_pages;
+
+    return NV_OK;
+}
+
 static NV_STATUS block_bg_promote_unmap_gpu_locked(uvm_va_block_t *va_block,
                                                    uvm_va_block_context_t *block_context,
                                                    uvm_gpu_id_t gpu_id,
@@ -11750,6 +12091,18 @@ NV_STATUS uvm_va_block_split_locked(uvm_va_block_t *existing_va_block,
                           uvm_va_block_num_cpu_pages(existing_va_block),
                           &new_block->read_duplicated_pages,
                           uvm_va_block_num_cpu_pages(new_block));
+    block_split_page_mask(&existing_va_block->gpu_only_soft_pages,
+                          uvm_va_block_num_cpu_pages(existing_va_block),
+                          &new_block->gpu_only_soft_pages,
+                          uvm_va_block_num_cpu_pages(new_block));
+    block_split_page_mask(&existing_va_block->gpu_only_read_pages,
+                          uvm_va_block_num_cpu_pages(existing_va_block),
+                          &new_block->gpu_only_read_pages,
+                          uvm_va_block_num_cpu_pages(new_block));
+    block_split_page_mask(&existing_va_block->gpu_only_write_pages,
+                          uvm_va_block_num_cpu_pages(existing_va_block),
+                          &new_block->gpu_only_write_pages,
+                          uvm_va_block_num_cpu_pages(new_block));
     block_split_page_mask(&existing_va_block->discarded_pages,
                           uvm_va_block_num_cpu_pages(existing_va_block),
                           &new_block->discarded_pages,
@@ -13647,6 +14000,180 @@ static bool skip_cpu_fault_with_valid_permissions(uvm_va_block_t *va_block,
     return false;
 }
 
+static uvm_phase_f_region_t *block_stage_a_region_from_address(uvm_va_space_t *va_space, NvU64 fault_addr)
+{
+    uvm_range_tree_node_t *node;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    node = uvm_range_tree_find(&va_space->phase_f_region_ranges, fault_addr);
+    if (!node)
+        return NULL;
+
+    return container_of(node, uvm_phase_f_region_t, va_node);
+}
+
+static const char *block_stage_a_pool_name(NvU32 pool)
+{
+    switch (pool) {
+        case UVM_PHASE_N_POOL_KV:
+            return "kv";
+        case UVM_PHASE_N_POOL_WEIGHT:
+            return "weight";
+        case UVM_PHASE_N_POOL_SCRATCH:
+            return "scratch";
+        case UVM_PHASE_N_POOL_ACTIVATION:
+            return "activation";
+        default:
+            return "other";
+    }
+}
+
+static bool block_stage_a_region_is_gpu_only_candidate(const uvm_phase_f_region_t *region)
+{
+    const NvU32 gpu_only_flags = UVM_PHASE_N_REGION_FLAG_GPU_ONLY_SOFT |
+                                 UVM_PHASE_N_REGION_FLAG_GPU_ONLY_HARD |
+                                 UVM_PHASE_N_REGION_FLAG_CPU_NO_USER_MAPPING |
+                                 UVM_PHASE_N_REGION_FLAG_GPU_READ_ONLY |
+                                 UVM_PHASE_N_REGION_FLAG_GPU_READ_WRITE;
+
+    if (region->flags & gpu_only_flags)
+        return true;
+
+    return region->pool == UVM_PHASE_N_POOL_WEIGHT || region->pool == UVM_PHASE_N_POOL_KV;
+}
+
+static void block_stage_a_observe_cpu_fault(uvm_va_block_t *va_block,
+                                            uvm_va_space_t *va_space,
+                                            NvU64 fault_addr,
+                                            uvm_fault_access_type_t fault_access_type,
+                                            uvm_service_block_context_t *service_context)
+{
+    uvm_phase_f_region_t *region;
+    bool is_write;
+    bool is_candidate;
+
+    if (!uvm_stage_a_cpu_fault_observe_enable)
+        return;
+
+    if (service_context->num_retries != 0)
+        return;
+
+    atomic64_inc(&g_uvm_stage_a_cpu_faults_total);
+
+    region = block_stage_a_region_from_address(va_space, fault_addr);
+    if (!region)
+        return;
+
+    is_write = fault_access_type > UVM_FAULT_ACCESS_TYPE_READ;
+    is_candidate = block_stage_a_region_is_gpu_only_candidate(region);
+
+    atomic64_inc(&g_uvm_stage_a_cpu_faults_registered);
+    atomic64_inc(is_write ? &g_uvm_stage_a_cpu_write_faults : &g_uvm_stage_a_cpu_read_faults);
+    if (is_candidate) {
+        atomic64_inc(&g_uvm_stage_a_cpu_faults_candidate);
+        atomic64_inc(&g_uvm_stage_a_cpu_fault_fallbacks);
+    }
+
+    switch (region->pool) {
+        case UVM_PHASE_N_POOL_WEIGHT:
+            atomic64_inc(&g_uvm_stage_a_cpu_faults_weight);
+            break;
+        case UVM_PHASE_N_POOL_KV:
+            atomic64_inc(&g_uvm_stage_a_cpu_faults_kv);
+            break;
+        case UVM_PHASE_N_POOL_SCRATCH:
+            atomic64_inc(&g_uvm_stage_a_cpu_faults_scratch);
+            break;
+        default:
+            atomic64_inc(&g_uvm_stage_a_cpu_faults_other);
+            break;
+    }
+
+    atomic64_set(&g_uvm_stage_a_last_region_id, region->region_id);
+    atomic64_set(&g_uvm_stage_a_last_pool, region->pool);
+    atomic64_set(&g_uvm_stage_a_last_fault_addr, fault_addr);
+    atomic64_set(&g_uvm_stage_a_last_is_write, is_write ? 1 : 0);
+
+    if (uvm_stage_a_cpu_fault_log_enable) {
+        uvm_phase_f_route_log("stage_a_cpu_fault region_id=%llu pool=%u pool_name=%s fault_addr=0x%llx access=%s is_candidate=%u fallback=normal flags=0x%x role=%u layer=%u expert=%u block_start=0x%llx block_end=0x%llx pid=%d\n",
+                              region->region_id,
+                              region->pool,
+                              block_stage_a_pool_name(region->pool),
+                              fault_addr,
+                              is_write ? "write" : "read",
+                              is_candidate ? 1 : 0,
+                              region->flags,
+                              region->role,
+                              region->layer_id,
+                              region->expert_id,
+                              va_block->start,
+                              va_block->end,
+                              current->pid);
+    }
+}
+
+static void block_gpu_only_soft_break_cpu_fault(uvm_va_block_t *va_block,
+                                                uvm_va_space_t *va_space,
+                                                NvU64 fault_addr,
+                                                uvm_fault_access_type_t fault_access_type)
+{
+    uvm_phase_f_region_t *region;
+    uvm_page_index_t page_index = uvm_va_block_cpu_page_index(va_block, fault_addr);
+    uvm_va_block_region_t clear_region = uvm_va_block_region_for_page(page_index);
+    NvU32 cleared_pages;
+    bool is_write;
+    bool had_read_policy;
+    bool had_write_policy;
+
+    if (!uvm_page_mask_test(&va_block->gpu_only_soft_pages, page_index))
+        return;
+
+    region = block_stage_a_region_from_address(va_space, fault_addr);
+    if (region) {
+        NvU64 region_last = region->base + region->length - 1;
+        NvU64 clear_start = max(region->base, va_block->start);
+        NvU64 clear_end = min(region_last, va_block->end);
+
+        if (clear_start <= clear_end)
+            clear_region = uvm_va_block_region_from_start_end(va_block, clear_start, clear_end);
+    }
+
+    cleared_pages = uvm_page_mask_region_weight(&va_block->gpu_only_soft_pages, clear_region);
+    if (cleared_pages == 0)
+        return;
+
+    is_write = fault_access_type > UVM_FAULT_ACCESS_TYPE_READ;
+    had_read_policy = uvm_page_mask_test(&va_block->gpu_only_read_pages, page_index);
+    had_write_policy = uvm_page_mask_test(&va_block->gpu_only_write_pages, page_index);
+
+    uvm_page_mask_region_clear(&va_block->gpu_only_soft_pages, clear_region);
+    uvm_page_mask_region_clear(&va_block->gpu_only_read_pages, clear_region);
+    uvm_page_mask_region_clear(&va_block->gpu_only_write_pages, clear_region);
+
+    atomic64_inc(&g_uvm_gpu_only_cpu_faults);
+    atomic64_inc(is_write ? &g_uvm_gpu_only_cpu_write_faults : &g_uvm_gpu_only_cpu_read_faults);
+    atomic64_inc(&g_uvm_gpu_only_soft_breaks);
+    atomic64_add(cleared_pages, &g_uvm_gpu_only_soft_break_pages);
+    atomic64_set(&g_uvm_gpu_only_last_region_id, region ? region->region_id : 0);
+    atomic64_set(&g_uvm_gpu_only_last_pool, region ? region->pool : UVM_PHASE_N_POOL_UNKNOWN);
+    atomic64_set(&g_uvm_gpu_only_last_fault_addr, fault_addr);
+    atomic64_set(&g_uvm_gpu_only_last_is_write, is_write ? 1 : 0);
+
+    uvm_phase_f_route_log("gpu_only_soft_break region_id=%llu pool=%u pool_name=%s fault_addr=0x%llx access=%s had_read=%u had_write=%u cleared_pages=%u fallback=normal block_start=0x%llx block_end=0x%llx pid=%d\n",
+                          region ? region->region_id : 0,
+                          region ? region->pool : UVM_PHASE_N_POOL_UNKNOWN,
+                          region ? block_stage_a_pool_name(region->pool) : "unknown",
+                          fault_addr,
+                          is_write ? "write" : "read",
+                          had_read_policy ? 1 : 0,
+                          had_write_policy ? 1 : 0,
+                          cleared_pages,
+                          va_block->start,
+                          va_block->end,
+                          current->pid);
+}
+
 static NV_STATUS block_cpu_fault_locked(uvm_va_block_t *va_block,
                                         uvm_va_block_retry_t *va_block_retry,
                                         NvU64 fault_addr,
@@ -13699,6 +14226,9 @@ static NV_STATUS block_cpu_fault_locked(uvm_va_block_t *va_block,
                                                     fault_access_type);
     if (status != NV_OK)
         return status;
+
+    block_stage_a_observe_cpu_fault(va_block, va_space, fault_addr, fault_access_type, service_context);
+    block_gpu_only_soft_break_cpu_fault(va_block, va_space, fault_addr, fault_access_type);
 
     uvm_processor_mask_zero(&service_context->cpu_fault.gpus_to_check_for_ecc);
     uvm_processor_mask_zero(&service_context->gpus_to_check_for_nvlink_errors);

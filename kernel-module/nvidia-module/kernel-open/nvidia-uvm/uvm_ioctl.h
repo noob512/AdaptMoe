@@ -1020,6 +1020,11 @@ typedef enum
     UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG = 6,
     UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED = 7,
     UVM_PHASE_F_ACTION_START_BG_PROMOTION = 8,
+    UVM_PHASE_F_ACTION_GPU_ONLY_READ_SOFT = 9,
+    UVM_PHASE_F_ACTION_GPU_ONLY_RW_SOFT = 10,
+    UVM_PHASE_F_ACTION_CLEAR_GPU_ONLY = 13,
+    UVM_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT = 14,
+    UVM_PHASE_F_ACTION_PREFETCH_CPU_NO_MAP = 15,
 } UVM_PHASE_F_ACTION;
 
 typedef struct
@@ -1128,6 +1133,11 @@ typedef enum
 #define UVM_PHASE_N_REGION_FLAG_PREFETCHABLE                         (1U << 3)
 #define UVM_PHASE_N_REGION_FLAG_PINNED                               (1U << 4)
 #define UVM_PHASE_N_REGION_FLAG_TRANSIENT                            (1U << 5)
+#define UVM_PHASE_N_REGION_FLAG_GPU_ONLY_SOFT                        (1U << 6)
+#define UVM_PHASE_N_REGION_FLAG_GPU_ONLY_HARD                        (1U << 7)
+#define UVM_PHASE_N_REGION_FLAG_CPU_NO_USER_MAPPING                  (1U << 8)
+#define UVM_PHASE_N_REGION_FLAG_GPU_READ_ONLY                        (1U << 9)
+#define UVM_PHASE_N_REGION_FLAG_GPU_READ_WRITE                       (1U << 10)
 
 #define UVM_PHASE_N_TRACE_VICTIM_MAX                                 8
 

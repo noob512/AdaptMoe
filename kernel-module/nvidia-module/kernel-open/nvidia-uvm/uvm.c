@@ -80,6 +80,7 @@ typedef struct
     NvU64 bytes;
     NvU64 base;
     NvU64 length;
+    NvU32 flags;
     NvU32 priority;
     NvU64 last_access_epoch;
     NV_STATUS status;
@@ -97,6 +98,7 @@ typedef struct
     NvU64 migrate_length;
     NvU64 account_bytes;
     NvU32 pool;
+    NvU32 flags;
     NV_STATUS status;
 } uvm_phase_n_block_reclaim_victim_t;
 
@@ -110,6 +112,7 @@ typedef struct
     NvU64 migrate_length;
     NvU64 account_bytes;
     NvU32 pool;
+    NvU32 flags;
     NV_STATUS status;
 } uvm_phase_n_native_block_reclaim_victim_t;
 
@@ -185,6 +188,16 @@ MODULE_PARM_DESC(uvm_phase_n_native_block_enable,
 
 static NvBool uvm_phase_n_native_fast_path_enabled(void);
 static NvBool uvm_phase_n_native_pool_supported(NvU32 pool);
+
+static NvU32 uvm_phase_n_cpu_reclaim_migrate_flags(NvBool async, NvU32 region_flags)
+{
+    NvU32 migrate_flags = async ? UVM_MIGRATE_FLAG_ASYNC : 0;
+
+    if (region_flags & UVM_PHASE_N_REGION_FLAG_CPU_NO_USER_MAPPING)
+        migrate_flags |= UVM_MIGRATE_FLAG_SKIP_CPU_MAP;
+
+    return migrate_flags;
+}
 
 static bool uvm_phase_n_valid_pool(NvU32 pool)
 {
@@ -908,6 +921,7 @@ static void uvm_phase_n_reclaim_victim_insert(uvm_phase_n_reclaim_victim_t *vict
                                               NvU64 base,
                                               NvU64 length,
                                               NvU64 bytes,
+                                              NvU32 flags,
                                               NvU32 priority,
                                               NvU64 last_access_epoch)
 {
@@ -916,6 +930,7 @@ static void uvm_phase_n_reclaim_victim_insert(uvm_phase_n_reclaim_victim_t *vict
         .bytes = bytes,
         .base = base,
         .length = length,
+        .flags = flags,
         .priority = priority,
         .last_access_epoch = last_access_epoch,
         .status = NV_OK,
@@ -1526,6 +1541,7 @@ static NvBool uvm_phase_n_select_block_reclaim_victim(uvm_va_space_t *va_space,
         victim->block_end = block->block_end;
         victim->account_bytes = uvm_phase_n_block_account_bytes(block);
         victim->pool = block->pool;
+        victim->flags = block->flags;
         return NV_TRUE;
     }
 
@@ -1676,7 +1692,8 @@ static NV_STATUS uvm_phase_n_reclaim_pool_blocks_internal(uvm_va_space_t *va_spa
         victim.status = uvm_migrate_managed_range_to_cpu(va_space,
                                                          victim.migrate_base,
                                                          victim.migrate_length,
-                                                         params->async ? UVM_MIGRATE_FLAG_ASYNC : 0);
+                                                         uvm_phase_n_cpu_reclaim_migrate_flags(params->async,
+                                                                                               victim.flags));
         if (trace_victim)
             params->victim_status[trace_index] = victim.status;
 
@@ -1696,7 +1713,7 @@ static NV_STATUS uvm_phase_n_reclaim_pool_blocks_internal(uvm_va_space_t *va_spa
         if (trace_victim)
             ++params->victim_count;
 
-        uvm_phase_f_route_log("phase_n_block_reclaim pool=%u region_id=%llu key=%lu native_block_index=%llu block_start=0x%llx block_end=0x%llx migrate_base=0x%llx migrate_length=%llu account_bytes=%llu status=%u success=%u async=%u\n",
+        uvm_phase_f_route_log("phase_n_block_reclaim pool=%u region_id=%llu key=%lu native_block_index=%llu block_start=0x%llx block_end=0x%llx migrate_base=0x%llx migrate_length=%llu account_bytes=%llu status=%u success=%u async=%u cpu_no_user_mapping=%u\n",
                               victim.pool,
                               victim.tagged_region_id,
                               victim.radix_key,
@@ -1708,7 +1725,8 @@ static NV_STATUS uvm_phase_n_reclaim_pool_blocks_internal(uvm_va_space_t *va_spa
                               victim.account_bytes,
                               victim.status,
                               uvm_phase_n_reclaim_status_success(victim.status) ? 1 : 0,
-                              params->async ? 1 : 0);
+                              params->async ? 1 : 0,
+                              (victim.flags & UVM_PHASE_N_REGION_FLAG_CPU_NO_USER_MAPPING) ? 1 : 0);
     }
 
     uvm_va_space_down_write(va_space);
@@ -1848,6 +1866,7 @@ static NvBool uvm_phase_n_select_native_block_reclaim_victim(uvm_va_space_t *va_
         victim->migrate_length = block->end - block->start + 1;
         victim->account_bytes = uvm_phase_n_va_block_account_bytes(block);
         victim->pool = block->phase_n.pool;
+        victim->flags = block->phase_n.flags;
 
         spin_unlock_irqrestore(&va_space->phase_n_native_block_pool_locks[pool], irq_flags);
         return NV_TRUE;
@@ -2002,7 +2021,8 @@ static NV_STATUS uvm_phase_n_reclaim_pool_native_blocks_internal(uvm_va_space_t 
         victim.status = uvm_migrate_managed_range_to_cpu(va_space,
                                                          victim.migrate_base,
                                                          victim.migrate_length,
-                                                         params->async ? UVM_MIGRATE_FLAG_ASYNC : 0);
+                                                         uvm_phase_n_cpu_reclaim_migrate_flags(params->async,
+                                                                                               victim.flags));
         if (trace_victim)
             params->victim_status[trace_index] = victim.status;
 
@@ -2023,7 +2043,7 @@ static NV_STATUS uvm_phase_n_reclaim_pool_native_blocks_internal(uvm_va_space_t 
         if (trace_victim)
             ++params->victim_count;
 
-        uvm_phase_f_route_log("phase_n_native_block_reclaim pool=%u region_id=%llu block=0x%llx block_start=0x%llx block_end=0x%llx migrate_base=0x%llx migrate_length=%llu account_bytes=%llu status=%u success=%u async=%u\n",
+        uvm_phase_f_route_log("phase_n_native_block_reclaim pool=%u region_id=%llu block=0x%llx block_start=0x%llx block_end=0x%llx migrate_base=0x%llx migrate_length=%llu account_bytes=%llu status=%u success=%u async=%u cpu_no_user_mapping=%u\n",
                               victim.pool,
                               victim.region_id,
                               (NvU64)(uintptr_t)victim.block,
@@ -2034,7 +2054,8 @@ static NV_STATUS uvm_phase_n_reclaim_pool_native_blocks_internal(uvm_va_space_t 
                               victim.account_bytes,
                               victim.status,
                               uvm_phase_n_reclaim_status_success(victim.status) ? 1 : 0,
-                              params->async ? 1 : 0);
+                              params->async ? 1 : 0,
+                              (victim.flags & UVM_PHASE_N_REGION_FLAG_CPU_NO_USER_MAPPING) ? 1 : 0);
     }
 
     uvm_va_space_down_write(va_space);
@@ -3600,6 +3621,167 @@ out:
     return status;
 }
 
+static NV_STATUS uvm_phase_f_gpu_only_soft(const NvProcessorUuid *gpu_uuid,
+                                           NvBool async,
+                                           NvU64 base,
+                                           NvU64 length,
+                                           bool read_only,
+                                           bool clear,
+                                           bool preserve_cpu_backing,
+                                           UVM_PHASE_F_RANGE_RESULT *result,
+                                           uvm_va_space_t *va_space)
+{
+    NV_STATUS status = NV_OK;
+    uvm_va_range_managed_t *managed_range = NULL;
+    uvm_va_range_managed_t *managed_range_last = NULL;
+    uvm_va_block_context_t *block_context;
+    uvm_gpu_t *gpu = NULL;
+    struct mm_struct *mm = NULL;
+    NvU64 query_start;
+    NvU64 query_end;
+    NvU64 last_address;
+    NvU64 covered_bytes = 0;
+    NvU64 candidate_pages = 0;
+    NvU64 applied_pages = 0;
+    NvU64 cpu_unmapped_pages = 0;
+    NvU64 gpu_mapped_pages = 0;
+    NvU64 cpu_preserved_pages = 0;
+    NvU64 cleared_pages = 0;
+
+    result->queried_bytes = length;
+    result->resident_gpu_bytes = 0;
+    result->resident_cpu_bytes = 0;
+    result->resident_any_bytes = 0;
+    result->resident_unknown_bytes = 0;
+
+    if (uvm_api_range_invalid(base, length))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    query_start = base;
+    query_end = base + length;
+    last_address = query_end - 1;
+
+    mm = uvm_va_space_mm_or_current_retain_lock(va_space);
+    uvm_va_space_down_read(va_space);
+
+    if (!clear) {
+        gpu = uvm_va_space_get_gpu_by_uuid(va_space, gpu_uuid);
+        if (!gpu) {
+            status = NV_ERR_INVALID_DEVICE;
+            goto out;
+        }
+    }
+
+    if (uvm_api_range_type_check(va_space, mm, base, length) != UVM_API_RANGE_TYPE_MANAGED) {
+        status = NV_ERR_INVALID_ADDRESS;
+        goto out;
+    }
+
+    block_context = uvm_va_space_block_context(va_space, mm);
+
+    uvm_for_each_va_range_managed_in_contig(managed_range, va_space, base, last_address) {
+        const NvU64 range_start = max(query_start, managed_range->va_range.node.start);
+        const NvU64 range_end = min(last_address, managed_range->va_range.node.end);
+        const size_t first_block_index = uvm_va_range_block_index(managed_range, range_start);
+        const size_t last_block_index = uvm_va_range_block_index(managed_range, range_end);
+        size_t block_index;
+
+        managed_range_last = managed_range;
+
+        for (block_index = first_block_index; block_index <= last_block_index; ++block_index) {
+            uvm_va_block_t *block;
+            NvU64 block_start;
+            NvU64 block_end;
+            uvm_va_block_region_t block_region;
+            NvU32 block_applied_pages = 0;
+            NvU32 block_cpu_unmapped_pages = 0;
+            NvU32 block_gpu_mapped_pages = 0;
+            NvU32 block_cpu_preserved_pages = 0;
+            NvU32 block_cleared_pages = 0;
+
+            status = uvm_va_range_block_create(managed_range, block_index, &block);
+            if (status != NV_OK)
+                goto out;
+
+            block_start = max(query_start, block->start);
+            block_end = min(last_address, block->end);
+            if (block_start > block_end)
+                continue;
+
+            block_region = uvm_va_block_region_from_start_end(block, block_start, block_end);
+            covered_bytes += block_end - block_start + 1;
+            candidate_pages += uvm_va_block_region_size(block_region) / PAGE_SIZE;
+
+            if (clear) {
+                status = UVM_VA_BLOCK_LOCK_RETRY(block,
+                                                 NULL,
+                                                 uvm_va_block_clear_gpu_only_soft(block,
+                                                                                  block_context,
+                                                                                  block_region,
+                                                                                  &block_cleared_pages));
+            }
+            else {
+                uvm_va_block_retry_t block_retry;
+
+                status = UVM_VA_BLOCK_LOCK_RETRY(block,
+                                                 &block_retry,
+                                                 uvm_va_block_apply_gpu_only_soft(block,
+                                                                                  &block_retry,
+                                                                                  block_context,
+                                                                                  gpu->id,
+                                                                                  block_region,
+                                                                                  read_only,
+                                                                                  preserve_cpu_backing,
+                                                                                  !async,
+                                                                                  &block_applied_pages,
+                                                                                  &block_cpu_unmapped_pages,
+                                                                                  &block_gpu_mapped_pages,
+                                                                                  &block_cpu_preserved_pages));
+            }
+
+            if (status != NV_OK)
+                goto out;
+
+            applied_pages += block_applied_pages;
+            cpu_unmapped_pages += block_cpu_unmapped_pages;
+            gpu_mapped_pages += block_gpu_mapped_pages;
+            cpu_preserved_pages += block_cpu_preserved_pages;
+            cleared_pages += block_cleared_pages;
+        }
+    }
+
+    if (!managed_range_last || managed_range_last->va_range.node.end < last_address)
+        status = NV_ERR_INVALID_ADDRESS;
+
+out:
+    uvm_va_space_up_read(va_space);
+    uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+
+    result->resident_gpu_bytes = (clear ? cleared_pages : applied_pages) * PAGE_SIZE;
+    result->resident_cpu_bytes = (preserve_cpu_backing ? cpu_preserved_pages : cpu_unmapped_pages) * PAGE_SIZE;
+    result->resident_any_bytes = covered_bytes;
+    result->resident_unknown_bytes = length > covered_bytes ? length - covered_bytes : 0;
+
+    uvm_phase_f_route_log("phase_f_gpu_only_soft base=0x%llx length=%llu status=0x%x gpu=%s async=%u read_only=%u clear=%u preserve_cpu_backing=%u covered=%llu candidate_pages=%llu applied_pages=%llu cpu_unmapped_pages=%llu gpu_mapped_pages=%llu cpu_preserved_pages=%llu cleared_pages=%llu\n",
+                          base,
+                          length,
+                          status,
+                          gpu ? gpu->name : "none",
+                          async,
+                          read_only ? 1 : 0,
+                          clear ? 1 : 0,
+                          preserve_cpu_backing ? 1 : 0,
+                          covered_bytes,
+                          candidate_pages,
+                          applied_pages,
+                          cpu_unmapped_pages,
+                          gpu_mapped_pages,
+                          cpu_preserved_pages,
+                          cleared_pages);
+
+    return status;
+}
+
 static NV_STATUS uvm_phase_f_execute_range(NvU32 action,
                                            const NvProcessorUuid *gpu_uuid,
                                            NvBool async,
@@ -3692,12 +3874,21 @@ static NV_STATUS uvm_phase_f_execute_range(NvU32 action,
         }
     }
     else if (action == UVM_PHASE_F_ACTION_PREFETCH_CPU ||
+             action == UVM_PHASE_F_ACTION_PREFETCH_CPU_NO_MAP ||
              action == UVM_PHASE_F_ACTION_PREFETCH_GPU) {
         UVM_MIGRATE_PARAMS *migrate_params =
             uvm_kvmalloc_zero(sizeof(*migrate_params));
 
         if (!migrate_params) {
             status = NV_ERR_NO_MEMORY;
+        }
+        else if (action == UVM_PHASE_F_ACTION_PREFETCH_CPU_NO_MAP) {
+            status = uvm_migrate_managed_range_to_cpu(va_space,
+                                                      base,
+                                                      length,
+                                                      (async ? UVM_MIGRATE_FLAG_ASYNC : 0) |
+                                                      UVM_MIGRATE_FLAG_SKIP_CPU_MAP);
+            uvm_kvfree(migrate_params);
         }
         else {
             migrate_params->base = base;
@@ -3775,6 +3966,21 @@ static NV_STATUS uvm_phase_f_execute_range(NvU32 action,
                                                 length,
                                                 result,
                                                 va_space);
+    }
+    else if (action == UVM_PHASE_F_ACTION_GPU_ONLY_READ_SOFT ||
+             action == UVM_PHASE_F_ACTION_GPU_ONLY_RW_SOFT ||
+             action == UVM_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT ||
+             action == UVM_PHASE_F_ACTION_CLEAR_GPU_ONLY) {
+        status = uvm_phase_f_gpu_only_soft(gpu_uuid,
+                                           async,
+                                           base,
+                                           length,
+                                           action == UVM_PHASE_F_ACTION_GPU_ONLY_READ_SOFT ||
+                                           action == UVM_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT,
+                                           action == UVM_PHASE_F_ACTION_CLEAR_GPU_ONLY,
+                                           action == UVM_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT,
+                                           result,
+                                           va_space);
     }
     else {
         status = NV_ERR_INVALID_ARGUMENT;
@@ -4566,6 +4772,7 @@ static NV_STATUS uvm_phase_n_reclaim_pool_execute(uvm_va_space_t *va_space,
                                               snapshots[i].base,
                                               snapshots[i].length,
                                               residency.resident_gpu_bytes,
+                                              snapshots[i].flags,
                                               snapshots[i].priority,
                                               snapshots[i].last_access_epoch);
         }
@@ -4617,7 +4824,8 @@ static NV_STATUS uvm_phase_n_reclaim_pool_execute(uvm_va_space_t *va_space,
         victims[i].status = uvm_migrate_managed_range_to_cpu(va_space,
                                                              victims[i].base,
                                                              victims[i].length,
-                                                             params->async ? UVM_MIGRATE_FLAG_ASYNC : 0);
+                                                             uvm_phase_n_cpu_reclaim_migrate_flags(params->async,
+                                                                                                   victims[i].flags));
         if (trace_victim)
             params->victim_status[trace_index] = victims[i].status;
         if (uvm_phase_n_reclaim_status_success(victims[i].status)) {

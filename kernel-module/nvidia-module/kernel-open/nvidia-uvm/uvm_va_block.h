@@ -492,6 +492,14 @@ struct uvm_va_block_struct
     // Mask to keep track of the pages that are read-duplicate
     uvm_page_mask_t read_duplicated_pages;
 
+    // Experimental Stage B soft GPU-only policy. Pages in gpu_only_soft_pages
+    // have had CPU user mappings revoked by an explicit Phase F policy action.
+    // A later CPU fault clears the corresponding policy page and falls back to
+    // normal UVM servicing.
+    uvm_page_mask_t gpu_only_soft_pages;
+    uvm_page_mask_t gpu_only_read_pages;
+    uvm_page_mask_t gpu_only_write_pages;
+
     // Mask to keep track of the pages that are not mapped on any non-UVM-Lite
     // processor. This mask is not used for HMM because the CPU can map pages
     // at any time without notifying the driver.
@@ -986,6 +994,24 @@ NV_STATUS uvm_va_block_start_readmostly_bg_promote(uvm_va_block_t *va_block,
                                                    uvm_gpu_id_t gpu_id,
                                                    uvm_va_block_region_t region,
                                                    NvU32 *pending_pages_out);
+
+NV_STATUS uvm_va_block_apply_gpu_only_soft(uvm_va_block_t *va_block,
+                                           uvm_va_block_retry_t *va_block_retry,
+                                           uvm_va_block_context_t *va_block_context,
+                                           uvm_gpu_id_t gpu_id,
+                                           uvm_va_block_region_t region,
+                                           bool read_only,
+                                           bool preserve_cpu_backing,
+                                           bool wait_for_gpu_mapping,
+                                           NvU32 *applied_pages_out,
+                                           NvU32 *cpu_unmapped_pages_out,
+                                           NvU32 *gpu_mapped_pages_out,
+                                           NvU32 *cpu_preserved_pages_out);
+
+NV_STATUS uvm_va_block_clear_gpu_only_soft(uvm_va_block_t *va_block,
+                                           uvm_va_block_context_t *va_block_context,
+                                           uvm_va_block_region_t region,
+                                           NvU32 *cleared_pages_out);
 
 // Like uvm_va_block_map, except it maps all processors in the input mask. The
 // VA block tracker contains all map operations on return.

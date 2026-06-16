@@ -54,6 +54,8 @@ from vllm.distributed.parallel_state import (
 from vllm.device_allocator.uvm import (
     batch_advise_ranges_cpu_with_executor,
     batch_offload_ranges_to_cpu_with_executor,
+    batch_prepare_ranges_for_native_remote_access_with_executor,
+    batch_prepare_ranges_for_remote_read_with_executor,
     batch_prefetch_ranges_to_device,
     probe_driver_capable_range,
     uvm_allocation_phase,
@@ -5262,6 +5264,10 @@ class GPUModelRunner(
             "advise_cpu",
             "prefetch_cpu",
             "offload_cpu",
+            "remote_read",
+            "remote_read_bg",
+            "remote_read_accessed_by",
+            "native_remote_access",
             "prefetch_gpu",
         }:
             logger.warning(
@@ -5392,6 +5398,75 @@ class GPUModelRunner(
                     sync=sync,
                     executor=executor,
                 )
+            )
+        elif mode == "native_remote_access":
+            (
+                successes,
+                executor_used,
+                accessed_by_result,
+                prefetch_cpu_successes,
+                preferred_cpu_result,
+            ) = batch_prepare_ranges_for_native_remote_access_with_executor(
+                ranges,
+                sync=sync,
+                executor=executor,
+                device=torch.cuda.current_device(),
+            )
+            driver_advise_result = 0
+            driver_prefetch_result = 0
+            self._append_uvm_matched_cpu_offload_trace(
+                {
+                    "event": "matched_cpu_offload_native_remote_prepare",
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "mode": mode,
+                    "matched_parameter_count": len(items),
+                    "attempted_bytes": attempted_bytes,
+                    "successes": successes,
+                    "executor": executor_used,
+                    "requested_executor": executor,
+                    "accessed_by_result": accessed_by_result,
+                    "prefetch_cpu_successes": prefetch_cpu_successes,
+                    "preferred_cpu_result": preferred_cpu_result,
+                    "driver_advise_result": driver_advise_result,
+                    "driver_prefetch_result": driver_prefetch_result,
+                    "sync": sync,
+                    "preferred_location_cpu": True,
+                    "readmostly": False,
+                }
+            )
+        elif mode in {"remote_read", "remote_read_bg", "remote_read_accessed_by"}:
+            (
+                successes,
+                executor_used,
+                readmostly_result,
+                accessed_by_result,
+                driver_advise_result,
+                driver_prefetch_result,
+            ) = batch_prepare_ranges_for_remote_read_with_executor(
+                ranges,
+                sync=sync,
+                executor=executor,
+                device=torch.cuda.current_device(),
+                accessed_by=mode == "remote_read_accessed_by",
+            )
+            self._append_uvm_matched_cpu_offload_trace(
+                {
+                    "event": "matched_cpu_offload_remote_read_prepare",
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "mode": mode,
+                    "matched_parameter_count": len(items),
+                    "attempted_bytes": attempted_bytes,
+                    "successes": successes,
+                    "executor": executor_used,
+                    "requested_executor": executor,
+                    "readmostly_result": readmostly_result,
+                    "accessed_by_result": accessed_by_result,
+                    "driver_advise_result": driver_advise_result,
+                    "driver_prefetch_result": driver_prefetch_result,
+                    "sync": sync,
+                }
             )
         else:
             successes = batch_prefetch_ranges_to_device(ranges, device=0)

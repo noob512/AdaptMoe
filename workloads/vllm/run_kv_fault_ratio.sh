@@ -560,7 +560,9 @@ Options:
   --uvm-matched-cpu-offload-trace-file <path>
                              JSONL trace for matched UVM CPU placement.
   --uvm-matched-cpu-offload-mode <mode>
-                             trace_only|advise_cpu|prefetch_cpu|offload_cpu|prefetch_gpu.
+                             trace_only|advise_cpu|prefetch_cpu|offload_cpu|
+                             remote_read|remote_read_bg|remote_read_accessed_by|
+                             native_remote_access|prefetch_gpu.
   --uvm-matched-cpu-offload-executor <mode>
                              cpp_batch|driver_batch|auto.
   --uvm-matched-cpu-offload-sync <0|1>
@@ -1795,7 +1797,7 @@ validate_inputs() {
     [[ "$UVM_HOT_RESIDENCY_STAGE_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-hot-residency-stage-device must be an integer"
     [[ "$UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN" =~ ^[01]$ ]] || die "--uvm-init-weight-require-routing-plan must be 0 or 1"
     [[ "$UVM_MATCHED_CPU_OFFLOAD_ENABLE" =~ ^[01]$ ]] || die "--uvm-matched-cpu-offload-enable must be 0 or 1"
-    [[ "$UVM_MATCHED_CPU_OFFLOAD_MODE" =~ ^(trace_only|advise_cpu|prefetch_cpu|offload_cpu|prefetch_gpu)$ ]] || die "--uvm-matched-cpu-offload-mode must be trace_only, advise_cpu, prefetch_cpu, offload_cpu, or prefetch_gpu"
+    [[ "$UVM_MATCHED_CPU_OFFLOAD_MODE" =~ ^(trace_only|advise_cpu|prefetch_cpu|offload_cpu|remote_read|remote_read_bg|remote_read_accessed_by|native_remote_access|prefetch_gpu)$ ]] || die "--uvm-matched-cpu-offload-mode must be trace_only, advise_cpu, prefetch_cpu, offload_cpu, remote_read, remote_read_bg, remote_read_accessed_by, native_remote_access, or prefetch_gpu"
     [[ "$UVM_MATCHED_CPU_OFFLOAD_EXECUTOR" =~ ^(cpp_batch|driver_batch|auto)$ ]] || die "--uvm-matched-cpu-offload-executor must be cpp_batch, driver_batch, or auto"
     [[ "$UVM_MATCHED_CPU_OFFLOAD_SYNC" =~ ^[01]$ ]] || die "--uvm-matched-cpu-offload-sync must be 0 or 1"
     [[ "$UVM_MATCHED_CPU_OFFLOAD_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-matched-cpu-offload-max-bytes must be a non-negative integer"

@@ -618,6 +618,25 @@ def set_cpu_offload_max_bytes(max_bytes: int) -> None:
             )
 
 
+def _cpu_offload_backend() -> str:
+    return os.environ.get("VLLM_CPU_OFFLOAD_BACKEND", "uva").strip().lower()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_uvm_cpu_offload_backend(backend: str) -> bool:
+    return backend in (
+        "isolated_uvm_remote",
+        "uvm_remote",
+        "uvm_pure_remote",
+    )
+
+
 def maybe_offload_to_cpu(
     module: torch.nn.Module,
     module_prefix: str | None = None,
@@ -639,6 +658,17 @@ def maybe_offload_to_cpu(
 
     assert uva_available, "V1 CPU offloading requires uva (pin memory) support"
     uva_offloading = True
+    direct_cuda_parameter = True
+    offload_backend = _cpu_offload_backend()
+    if offload_backend in ("", "native", "native_uva", "pinned_uva"):
+        offload_backend = "uva"
+    if offload_backend != "uva" and not _is_uvm_cpu_offload_backend(
+        offload_backend
+    ):
+        raise ValueError(
+            "Unknown VLLM_CPU_OFFLOAD_BACKEND="
+            f"{offload_backend!r}; use 'uva' or 'isolated_uvm_remote'"
+        )
 
     # offload parameters to CPU
     # use pin_memory if possible, which helps cudagraph capture speed
@@ -655,54 +685,123 @@ def maybe_offload_to_cpu(
             else (module_prefix or param_name)
         )
 
-        # `torch.empty_like` does not support `pin_memory` argument
-        cpu_data = torch.empty_strided(
-            size=p.data.size(),
-            stride=p.data.stride(),
-            dtype=p.data.dtype,
-            layout=p.data.layout,
-            device="cpu",
-            pin_memory=pin_memory,
-        )
-        cpu_data.copy_(p.data)
-        if not uva_offloading:
-            p.data = cpu_data
+        manifest_extra: dict[str, Any] = {"offload_backend": offload_backend}
+
+        if _is_uvm_cpu_offload_backend(offload_backend):
+            from vllm.device_allocator.uvm import (
+                batch_advise_ranges_accessed_by,
+                batch_advise_ranges_preferred_location,
+                batch_prefetch_ranges_to_device,
+                ensure_uvm_runtime_library,
+                probe_driver_capable_range,
+                uvm_local_memory_pool,
+            )
+
+            ensure_uvm_runtime_library()
+            with torch.cuda.device(device), uvm_local_memory_pool():
+                uvm_data = torch.empty_strided(
+                    size=p.data.size(),
+                    stride=p.data.stride(),
+                    dtype=p.data.dtype,
+                    layout=p.data.layout,
+                    device=device,
+                )
+            uvm_data.copy_(p.data)
+
+            ptr = int(uvm_data.data_ptr())
+            ranges = [(ptr, int(bytes_before))]
+            device_index = (
+                device.index
+                if device.index is not None
+                else torch.cuda.current_device()
+            )
+            prefetch_cpu_result = batch_prefetch_ranges_to_device(ranges, -1)
+            preferred_cpu_result = batch_advise_ranges_preferred_location(
+                ranges, -1
+            )
+            accessed_by_result = batch_advise_ranges_accessed_by(
+                ranges, int(device_index)
+            )
+            if _env_flag("VLLM_CPU_OFFLOAD_UVM_SYNC", True):
+                torch.cuda.synchronize()
+            managed, managed_reason, managed_code = probe_driver_capable_range(
+                ptr, int(bytes_before)
+            )
+
+            p._vllm_offloaded_uvm_data = uvm_data
+            p.data = uvm_data
+            manifest_extra.update(
+                {
+                    "uvm_managed": bool(managed),
+                    "uvm_managed_reason": managed_reason,
+                    "uvm_managed_probe_code": int(managed_code),
+                    "uvm_data_ptr": ptr,
+                    "uvm_prefetch_cpu_result": int(prefetch_cpu_result),
+                    "uvm_preferred_cpu_result": int(preferred_cpu_result),
+                    "uvm_accessed_by_result": int(accessed_by_result),
+                    "uvm_accessed_by_device": int(device_index),
+                    "uvm_sync": _env_flag("VLLM_CPU_OFFLOAD_UVM_SYNC", True),
+                    "cpu_data_pinned": False,
+                }
+            )
         else:
-            # keep the cpu data alive
-            p._vllm_offloaded_cpu_data = cpu_data
-            p.data = get_cuda_view_from_cpu_tensor(cpu_data)
+            # `torch.empty_like` does not support `pin_memory` argument
+            cpu_data = torch.empty_strided(
+                size=p.data.size(),
+                stride=p.data.stride(),
+                dtype=p.data.dtype,
+                layout=p.data.layout,
+                device="cpu",
+                pin_memory=pin_memory,
+            )
+            cpu_data.copy_(p.data)
+            if not uva_offloading:
+                p.data = cpu_data
+                direct_cuda_parameter = False
+            else:
+                # keep the cpu data alive
+                p._vllm_offloaded_cpu_data = cpu_data
+                p.data = get_cuda_view_from_cpu_tensor(cpu_data)
+            manifest_extra.update(
+                {
+                    "cpu_data_pinned": bool(
+                        cpu_data.is_pinned()
+                        if hasattr(cpu_data, "is_pinned")
+                        else False
+                    )
+                }
+            )
+
         _CPU_OFFLOAD_BYTES += bytes_before
         offloaded_parameters = True
         _CPU_OFFLOAD_ORDER += 1
-        _append_cpu_offload_manifest(
-            {
-                "event": "cpu_offload_parameter",
-                "timestamp": time.time(),
-                "pid": os.getpid(),
-                "module_prefix": module_prefix,
-                "module_class": module.__class__.__name__,
-                "parameter_name": param_name,
-                "full_parameter_name": full_parameter_name,
-                "param_index_in_module": param_index,
-                "offload_order": _CPU_OFFLOAD_ORDER,
-                "shape": list(p.data.size()),
-                "stride": list(p.data.stride()),
-                "dtype": str(p.data.dtype),
-                "bytes": int(bytes_before),
-                "cumulative_offload_bytes": int(_CPU_OFFLOAD_BYTES),
-                "max_offload_bytes": int(_CPU_OFFLOAD_MAX_BYTES),
-                "pin_memory": bool(pin_memory),
-                "uva_available": bool(uva_available),
-                "uva_offloading": bool(uva_offloading),
-                "device_before": str(device),
-                "device_after": str(p.data.device),
-                "cpu_data_pinned": bool(
-                    cpu_data.is_pinned() if hasattr(cpu_data, "is_pinned") else False
-                ),
-            }
-        )
+        record = {
+            "event": "cpu_offload_parameter",
+            "timestamp": time.time(),
+            "pid": os.getpid(),
+            "module_prefix": module_prefix,
+            "module_class": module.__class__.__name__,
+            "parameter_name": param_name,
+            "full_parameter_name": full_parameter_name,
+            "param_index_in_module": param_index,
+            "offload_order": _CPU_OFFLOAD_ORDER,
+            "shape": list(p.data.size()),
+            "stride": list(p.data.stride()),
+            "dtype": str(p.data.dtype),
+            "bytes": int(bytes_before),
+            "cumulative_offload_bytes": int(_CPU_OFFLOAD_BYTES),
+            "max_offload_bytes": int(_CPU_OFFLOAD_MAX_BYTES),
+            "pin_memory": bool(pin_memory),
+            "uva_available": bool(uva_available),
+            "uva_offloading": bool(offload_backend == "uva" and uva_offloading),
+            "uvm_offloading": bool(_is_uvm_cpu_offload_backend(offload_backend)),
+            "device_before": str(device),
+            "device_after": str(p.data.device),
+        }
+        record.update(manifest_extra)
+        _append_cpu_offload_manifest(record)
 
-    if offloaded_parameters and not uva_offloading:
+    if offloaded_parameters and not direct_cuda_parameter:
         original_forward = module.forward
 
         def forward(*args, **kwargs):

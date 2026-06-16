@@ -1,0 +1,26 @@
+case=uvm_pure_remote
+matched_mode=native_remote_access
+uvm_remote_mechanism=uvm_pure_remote
+uvm_prefetch_cpu=1
+uvm_preferred_location_cpu=1
+uvm_accessed_by_gpu=1
+uvm_readmostly=0
+uvm_remote_first_enable=0
+uvm_bg_promote_enable=0
+uvm_matched_manifest_enable=1
+date_utc=2026-06-16T11:03:40Z
+model=Qwen/Qwen3-30B-A3B-FP8
+prompts=2
+output_len=16
+request_rate=1
+server_max_num_seqs=1
+max_model_len=4096
+uvm_executor=auto
+uvm_sync=1
+disable_access_counter_migration=1
+
+NVIDIA GeForce RTX 5090, 595.71.05, 12.0, 32607 MiB, 32111 MiB
+
+uvm_perf_access_counter_migration_enable=-1
+uvm_perf_access_counter_threshold=256
+uvm_ats_mode=1

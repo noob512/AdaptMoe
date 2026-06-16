@@ -1,0 +1,51 @@
+{
+  "rows": [
+    {
+      "backend_counts": {
+        "uva": 233
+      },
+      "case": "native_cpu_offload",
+      "exit_code": 0,
+      "failed_requests": 0.0,
+      "manifest_bytes": 8728868976,
+      "manifest_parameters": 233,
+      "mean_itl_ms": 49.16,
+      "mean_tpot_ms": 49.16,
+      "mean_tpot_ratio_vs_native": 1.0,
+      "mean_ttft_ms": 144732.15,
+      "output_tok_s": 19.79,
+      "output_tok_s_ratio_vs_native": 1.0,
+      "same_offload_names_as_native": true,
+      "successful_requests": 50.0,
+      "total_tok_s": 64.06,
+      "uvm_accessed_by_success": 0,
+      "uvm_managed": 0,
+      "uvm_preferred_cpu_success": 0,
+      "uvm_prefetch_cpu_success": 0
+    },
+    {
+      "backend_counts": {
+        "isolated_uvm_remote": 233
+      },
+      "case": "isolated_uvm_remote_offload",
+      "exit_code": 0,
+      "failed_requests": 0.0,
+      "manifest_bytes": 8728868976,
+      "manifest_parameters": 233,
+      "mean_itl_ms": 50.03,
+      "mean_tpot_ms": 50.03,
+      "mean_tpot_ratio_vs_native": 1.0176973148901547,
+      "mean_ttft_ms": 147410.06,
+      "output_tok_s": 19.55,
+      "output_tok_s_ratio_vs_native": 0.9878726629610916,
+      "same_offload_names_as_native": true,
+      "successful_requests": 50.0,
+      "total_tok_s": 63.29,
+      "uvm_accessed_by_success": 233,
+      "uvm_managed": 233,
+      "uvm_preferred_cpu_success": 233,
+      "uvm_prefetch_cpu_success": 233
+    }
+  ],
+  "run_root": "/home/ubuntu/nvidia-uvm-gpu/log/stage_m_isolated_uvm_offload_remote_20260616_144331"
+}

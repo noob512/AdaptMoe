@@ -50,6 +50,9 @@ logger = init_logger(__name__)
 # Global state
 _uvm_enabled = False
 _uvm_lib: Optional[ctypes.CDLL] = None
+_uvm_log_close_registered = False
+_uvm_local_allocator = None
+_uvm_local_mem_pool = None
 _uvm_phase_stack: list[str] = []
 _UVM_DRIVER_BATCH_MAX_RANGES = 64
 
@@ -380,6 +383,47 @@ def _close_uvm_log_at_exit() -> None:
         logger.debug("Failed to close UVM allocator log", exc_info=True)
 
 
+def ensure_uvm_runtime_library() -> ctypes.CDLL:
+    """Load the UVM helper library without enabling the global CUDA allocator.
+
+    This is used by isolated experiments that allocate only selected tensors
+    through a local PyTorch MemPool while the rest of vLLM keeps the ordinary
+    CUDA allocator.
+    """
+    global _uvm_lib
+    if _uvm_lib is None:
+        _uvm_lib = load_uvm_library()
+        _uvm_lib.uvm_set_prefetch(0)
+        _uvm_lib.uvm_set_verbose(0)
+    return _uvm_lib
+
+
+@contextmanager
+def uvm_local_memory_pool():
+    """Temporarily allocate CUDA tensors from cudaMallocManaged.
+
+    Unlike ``enable_uvm_allocator()``, this does not call
+    ``change_current_allocator``. Only allocations inside this context use the
+    UVM pluggable allocator, which lets CPU-offload experiments replace just
+    the offloaded weight tensors.
+    """
+    global _uvm_local_allocator, _uvm_local_mem_pool
+    ensure_uvm_runtime_library()
+    lib_path = find_uvm_allocator_library()
+    if lib_path is None:
+        raise RuntimeError("UVM allocator library not found")
+
+    if _uvm_local_allocator is None or _uvm_local_mem_pool is None:
+        allocator = torch.cuda.memory.CUDAPluggableAllocator(
+            lib_path, "uvm_malloc", "uvm_free"
+        )
+        _uvm_local_allocator = allocator
+        _uvm_local_mem_pool = torch.cuda.memory.MemPool(allocator._allocator)
+
+    with torch.cuda.memory.use_mem_pool(_uvm_local_mem_pool):
+        yield
+
+
 def enable_uvm_allocator(
     enable_prefetch: bool = False,
     verbose: bool = False,
@@ -400,7 +444,7 @@ def enable_uvm_allocator(
     Raises:
         RuntimeError: If UVM allocator library is not available.
     """
-    global _uvm_enabled, _uvm_lib
+    global _uvm_enabled, _uvm_lib, _uvm_log_close_registered
 
     if _uvm_enabled:
         logger.warning("UVM allocator is already enabled")
@@ -430,7 +474,9 @@ def enable_uvm_allocator(
         )
         torch.cuda.memory.change_current_allocator(allocator)
         _uvm_enabled = True
-        atexit.register(_close_uvm_log_at_exit)
+        if not _uvm_log_close_registered:
+            atexit.register(_close_uvm_log_at_exit)
+            _uvm_log_close_registered = True
         logger.info("UVM allocator enabled successfully")
         _set_uvm_phase("enabled")
         mark_uvm_phase_event("allocator_enabled", "enabled")
@@ -587,7 +633,7 @@ def prefetch_range_to_device(ptr: int, size: int, device: int = 0) -> bool:
     """
     if uvm_residency_tag_only_enabled():
         return False
-    if not _uvm_enabled or _uvm_lib is None:
+    if _uvm_lib is None:
         return False
     if ptr <= 0 or size <= 0:
         return False
@@ -613,8 +659,6 @@ def probe_driver_capable_range(ptr: int, size: int) -> tuple[bool, str, int]:
     VA blocks. This probe records the CUDA runtime's pointer classification so
     weight traces can distinguish non-managed tensors from driver plumbing bugs.
     """
-    if not _uvm_enabled:
-        return False, "uvm_disabled", -1
     if _uvm_lib is None:
         return False, "uvm_library_unavailable", -2
     if ptr <= 0 or size <= 0:
@@ -669,7 +713,7 @@ def batch_prefetch_ranges_to_device(
     """
     if uvm_residency_tag_only_enabled():
         return 0
-    if not _uvm_enabled or _uvm_lib is None:
+    if _uvm_lib is None:
         return 0
     ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
     if count <= 0:
@@ -703,7 +747,7 @@ def advise_range_preferred_location(ptr: int, size: int, device: int) -> bool:
     """
     if uvm_residency_tag_only_enabled():
         return False
-    if not _uvm_enabled or _uvm_lib is None:
+    if _uvm_lib is None:
         return False
     if ptr <= 0 or size <= 0:
         return False
@@ -723,7 +767,7 @@ def batch_advise_ranges_preferred_location(
     """Batch set cudaMemAdviseSetPreferredLocation for raw UVM ranges."""
     if uvm_residency_tag_only_enabled():
         return 0
-    if not _uvm_enabled or _uvm_lib is None:
+    if _uvm_lib is None:
         return 0
     ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
     if count <= 0:
@@ -734,6 +778,52 @@ def batch_advise_ranges_preferred_location(
             size_array,
             ctypes.c_size_t(count),
             ctypes.c_int(2),  # cudaMemAdviseSetPreferredLocation
+            ctypes.c_int(device),
+        )
+    )
+
+
+def batch_advise_ranges_read_mostly(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    device: int = 0,
+) -> int:
+    """Batch set cudaMemAdviseSetReadMostly for raw UVM ranges."""
+    if uvm_residency_tag_only_enabled():
+        return 0
+    if _uvm_lib is None:
+        return 0
+    ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
+    if count <= 0:
+        return 0
+    return int(
+        _uvm_lib.uvm_batch_advise(
+            ptr_array,
+            size_array,
+            ctypes.c_size_t(count),
+            ctypes.c_int(1),  # uvm_allocator shim: ReadMostly
+            ctypes.c_int(device),
+        )
+    )
+
+
+def batch_advise_ranges_accessed_by(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    device: int = 0,
+) -> int:
+    """Batch set cudaMemAdviseSetAccessedBy for raw UVM ranges."""
+    if uvm_residency_tag_only_enabled():
+        return 0
+    if _uvm_lib is None:
+        return 0
+    ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
+    if count <= 0:
+        return 0
+    return int(
+        _uvm_lib.uvm_batch_advise(
+            ptr_array,
+            size_array,
+            ctypes.c_size_t(count),
+            ctypes.c_int(3),  # uvm_allocator shim: AccessedBy
             ctypes.c_int(device),
         )
     )
@@ -1406,6 +1496,112 @@ def batch_advise_ranges_cpu_with_executor(
             driver_result,
         )
     return batch_advise_ranges_preferred_location(ranges, -1), "cpp_batch", 0
+
+
+def batch_prepare_ranges_for_remote_read_with_executor(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    sync: bool = False,
+    executor: str = "cpp_batch",
+    device: int = 0,
+    accessed_by: bool = False,
+) -> tuple[int, str, int, int, int, int]:
+    """Prepare UVM ranges for CPU-resident GPU remote reads.
+
+    The range is marked ReadMostly, moved to CPU/preferred CPU, and optionally
+    tagged AccessedBy for the GPU. With the modified driver remote-first path
+    enabled, the ReadMostly + CPU-resident state lets first GPU reads install
+    remote CPU mappings instead of migrating the page to GPU.
+
+    Returns (successes, executor_used, readmostly_result, accessed_by_result,
+    driver_advise_result, driver_prefetch_result).
+    """
+    if not ranges:
+        return 0, executor, 0, 0, 0, 0
+
+    readmostly_result = batch_advise_ranges_read_mostly(ranges, device=device)
+    (
+        offload_successes,
+        executor_used,
+        driver_advise_result,
+        driver_prefetch_result,
+    ) = batch_offload_ranges_to_cpu_with_executor(
+        ranges,
+        sync=sync,
+        executor=executor,
+    )
+    accessed_by_result = 0
+    if accessed_by:
+        accessed_by_result = batch_advise_ranges_accessed_by(
+            ranges,
+            device=device,
+        )
+
+    successes = min(readmostly_result, offload_successes)
+    if accessed_by:
+        successes = min(successes, accessed_by_result)
+    return (
+        successes,
+        executor_used,
+        readmostly_result,
+        accessed_by_result,
+        driver_advise_result,
+        driver_prefetch_result,
+    )
+
+
+def batch_prepare_ranges_for_native_remote_access_with_executor(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    sync: bool = False,
+    executor: str = "cpp_batch",
+    device: int = 0,
+) -> tuple[int, str, int, int, int]:
+    """Prepare UVM ranges for native pure GPU remote access.
+
+    This path matches the microbenchmark's ``uvm_pure_remote`` mechanism:
+    place managed ranges on CPU, set PreferredLocation(CPU), then set
+    AccessedBy(GPU) so native UVM can pre-map GPU->CPU remote READ mappings.
+    It deliberately does not use ReadMostly, modified-driver remote-first, or
+    repository-specific driver-batch ioctls.
+
+    Returns (successes, executor_used, accessed_by_result,
+    prefetch_cpu_successes, preferred_cpu_result).
+    """
+    if not ranges:
+        return 0, executor, 0, 0, 0
+
+    # Keep this experiment on native CUDA UVM APIs. The driver-batch executor
+    # can use repository-specific Phase F ioctls, which would change the test.
+    prefetch_cpu_successes = batch_prefetch_ranges_to_device(ranges, -1)
+    executor_used = "cpp_batch_native_cuda"
+    if prefetch_cpu_successes > 0 and sync:
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            logger.debug("Failed to synchronize after native remote CPU prefetch",
+                         exc_info=True)
+
+    preferred_cpu_result = batch_advise_ranges_preferred_location(
+        ranges,
+        device=-1,
+    )
+    accessed_by_result = batch_advise_ranges_accessed_by(
+        ranges,
+        device=device,
+    )
+    successes = min(
+        prefetch_cpu_successes,
+        preferred_cpu_result,
+        accessed_by_result,
+    )
+    return (
+        successes,
+        executor_used,
+        accessed_by_result,
+        prefetch_cpu_successes,
+        preferred_cpu_result,
+    )
 
 
 def offload_range_to_cpu(

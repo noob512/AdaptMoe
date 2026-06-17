@@ -3621,6 +3621,115 @@ out:
     return status;
 }
 
+static NV_STATUS uvm_phase_f_set_bg_promotion_paused(NvU64 base,
+                                                     NvU64 length,
+                                                     bool pause,
+                                                     UVM_PHASE_F_RANGE_RESULT *result,
+                                                     uvm_va_space_t *va_space)
+{
+    NV_STATUS status = NV_OK;
+    uvm_va_range_managed_t *managed_range = NULL;
+    uvm_va_range_managed_t *managed_range_last = NULL;
+    struct mm_struct *mm = NULL;
+    NvU64 query_start;
+    NvU64 query_end;
+    NvU64 last_address;
+    NvU64 covered_bytes = 0;
+    NvU64 candidate_blocks = 0;
+    NvU64 touched_blocks = 0;
+
+    result->queried_bytes = length;
+    result->resident_gpu_bytes = 0;
+    result->resident_cpu_bytes = 0;
+    result->resident_any_bytes = 0;
+    result->resident_unknown_bytes = 0;
+
+    if (uvm_api_range_invalid(base, length))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    query_start = base;
+    query_end = base + length;
+    last_address = query_end - 1;
+
+    mm = uvm_va_space_mm_or_current_retain_lock(va_space);
+    uvm_va_space_down_read(va_space);
+
+    if (uvm_api_range_type_check(va_space, mm, base, length) != UVM_API_RANGE_TYPE_MANAGED) {
+        status = NV_ERR_INVALID_ADDRESS;
+        goto out;
+    }
+
+    uvm_for_each_va_range_managed_in_contig(managed_range, va_space, base, last_address) {
+        const NvU64 range_start = max(query_start, managed_range->va_range.node.start);
+        const NvU64 range_end = min(last_address, managed_range->va_range.node.end);
+        const size_t first_block_index = uvm_va_range_block_index(managed_range, range_start);
+        const size_t last_block_index = uvm_va_range_block_index(managed_range, range_end);
+        size_t block_index;
+
+        managed_range_last = managed_range;
+
+        for (block_index = first_block_index; block_index <= last_block_index; ++block_index) {
+            uvm_va_block_t *block;
+            NvU64 block_start;
+            NvU64 block_end;
+            NvU32 block_touched = 0;
+
+            status = uvm_va_range_block_create(managed_range, block_index, &block);
+            if (status != NV_OK)
+                goto out;
+
+            block_start = max(query_start, block->start);
+            block_end = min(last_address, block->end);
+            if (block_start > block_end)
+                continue;
+
+            covered_bytes += block_end - block_start + 1;
+            candidate_blocks++;
+
+            status = UVM_VA_BLOCK_LOCK_RETRY(block,
+                                             NULL,
+                                             uvm_va_block_set_bg_promote_paused(block,
+                                                                                pause,
+                                                                                &block_touched));
+            if (status != NV_OK)
+                goto out;
+
+            touched_blocks += block_touched;
+        }
+    }
+
+    if (!managed_range_last || managed_range_last->va_range.node.end < last_address)
+        status = NV_ERR_INVALID_ADDRESS;
+
+out:
+    uvm_va_space_up_read(va_space);
+    uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+
+    result->resident_gpu_bytes = touched_blocks;
+    result->resident_cpu_bytes = candidate_blocks;
+    result->resident_any_bytes = covered_bytes;
+    result->resident_unknown_bytes = length > covered_bytes ? length - covered_bytes : 0;
+
+    if (pause)
+        uvm_phase_f_route_log("phase_f_pause_bg_promotion base=0x%llx length=%llu status=0x%x covered=%llu blocks=%llu touched=%llu\n",
+                              base,
+                              length,
+                              status,
+                              covered_bytes,
+                              candidate_blocks,
+                              touched_blocks);
+    else
+        uvm_phase_f_route_log("phase_f_resume_bg_promotion base=0x%llx length=%llu status=0x%x covered=%llu blocks=%llu touched=%llu\n",
+                              base,
+                              length,
+                              status,
+                              covered_bytes,
+                              candidate_blocks,
+                              touched_blocks);
+
+    return status;
+}
+
 static NV_STATUS uvm_phase_f_gpu_only_soft(const NvProcessorUuid *gpu_uuid,
                                            NvBool async,
                                            NvU64 base,
@@ -3966,6 +4075,17 @@ static NV_STATUS uvm_phase_f_execute_range(NvU32 action,
                                                 length,
                                                 result,
                                                 va_space);
+    }
+    else if (action == UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION ||
+             action == UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION) {
+        bool pause = action == UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION;
+
+        uvm_va_block_note_bg_promote_gate_action(pause);
+        status = uvm_phase_f_set_bg_promotion_paused(base,
+                                                     length,
+                                                     pause,
+                                                     result,
+                                                     va_space);
     }
     else if (action == UVM_PHASE_F_ACTION_GPU_ONLY_READ_SOFT ||
              action == UVM_PHASE_F_ACTION_GPU_ONLY_RW_SOFT ||

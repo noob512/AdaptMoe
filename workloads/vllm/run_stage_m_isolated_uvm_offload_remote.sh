@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# Compare native vLLM CPU offload with an isolated UVM replacement for only
+# Compare native vLLM CPU offload with isolated UVM replacements for only
 # the parameters selected by --cpu-offload-gb.
+# Cases:
+# - native_cpu_offload: pinned CPU tensor + UVA view
+# - isolated_uvm_migration_offload: managed UVM + CPU prefetch only,
+#   leaving later GPU reads to UVM's default demand migration/fault path
+# - isolated_uvm_remote_offload: managed UVM + CPU prefetch/preferred +
+#   AccessedBy(GPU), matching the remote-read path
+# - isolated_uvm_hybrid_remote_offload: remote path plus ReadMostly and
+#   deferred bg-promotion prepare/gate
 #
 # This script does not enable VLLM_USE_UVM and does not LD_PRELOAD CUDA
 # allocators. All non-offloaded allocations keep the ordinary vLLM CUDA path.
@@ -180,7 +188,7 @@ run_case() {
 
   echo "$status" > "$case_root/status.txt"
   if kill -0 "$server_pid" 2>/dev/null; then
-    if [[ "$backend" == "isolated_uvm_remote" ]]; then
+    if [[ "$backend" == "isolated_uvm_migration" || "$backend" == "isolated_uvm_remote" || "$backend" == "isolated_uvm_hybrid_remote" ]]; then
       # The current local MemPool + uvm_allocator.so path can crash during
       # Python interpreter teardown. The benchmark and manifest are already
       # written, so avoid the teardown path for this isolated smoke experiment.
@@ -204,7 +212,12 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-cases = ["native_cpu_offload", "isolated_uvm_remote_offload"]
+cases = [
+    "native_cpu_offload",
+    "isolated_uvm_migration_offload",
+    "isolated_uvm_remote_offload",
+    "isolated_uvm_hybrid_remote_offload",
+]
 patterns = {
     "successful_requests": r"Successful requests:\s+([0-9.]+)",
     "failed_requests": r"Failed requests:\s+([0-9.]+)",
@@ -239,12 +252,32 @@ def manifest_stats(path: Path):
         "uvm_prefetch_cpu_success": 0,
         "uvm_preferred_cpu_success": 0,
         "uvm_accessed_by_success": 0,
+        "uvm_readmostly_success": 0,
+        "uvm_remote_read_bg_success": 0,
+        "uvm_remote_read_bg_failure": 0,
+        "uvm_remote_read_bg_ioctl_ok": 0,
+        "uvm_bg_start_success": 0,
+        "uvm_bg_start_failure": 0,
+        "uvm_bg_start_ioctl_ok": 0,
+        "uvm_gate_events": 0,
+        "uvm_gate_pause_success": 0,
+        "uvm_gate_resume_success": 0,
+        "uvm_gate_start_success": 0,
         "names": [],
     }
     for line in text(path).splitlines():
         try:
             rec = json.loads(line)
         except Exception:
+            continue
+        if rec.get("event") == "cpu_offload_hybrid_remote_gate":
+            out["uvm_gate_events"] += 1
+            if int(rec.get("pause_success") or 0) > 0:
+                out["uvm_gate_pause_success"] += 1
+            if int(rec.get("resume_success") or 0) > 0:
+                out["uvm_gate_resume_success"] += 1
+            if int(rec.get("start_success") or 0) > 0:
+                out["uvm_gate_start_success"] += 1
             continue
         if rec.get("event") != "cpu_offload_parameter":
             continue
@@ -260,6 +293,26 @@ def manifest_stats(path: Path):
             out["uvm_preferred_cpu_success"] += 1
         if int(rec.get("uvm_accessed_by_result") or 0) > 0:
             out["uvm_accessed_by_success"] += 1
+        if int(rec.get("uvm_readmostly_result") or 0) > 0:
+            out["uvm_readmostly_success"] += 1
+        if int(rec.get("uvm_remote_read_bg_success") or 0) > 0:
+            out["uvm_remote_read_bg_success"] += 1
+        out["uvm_remote_read_bg_failure"] += int(
+            rec.get("uvm_remote_read_bg_failure") or 0
+        )
+        if int(rec.get("uvm_remote_read_bg_ioctl_ret") or 0) == 0 and int(
+            rec.get("uvm_remote_read_bg_success") or 0
+        ) > 0:
+            out["uvm_remote_read_bg_ioctl_ok"] += 1
+        if int(rec.get("uvm_bg_start_success") or 0) > 0:
+            out["uvm_bg_start_success"] += 1
+        out["uvm_bg_start_failure"] += int(
+            rec.get("uvm_bg_start_failure") or 0
+        )
+        if int(rec.get("uvm_bg_start_ioctl_ret") or 0) == 0 and int(
+            rec.get("uvm_bg_start_success") or 0
+        ) > 0:
+            out["uvm_bg_start_ioctl_ok"] += 1
         name = rec.get("full_parameter_name")
         if isinstance(name, str):
             out["names"].append(name)
@@ -282,7 +335,6 @@ for case in cases:
     rows.append(row)
 
 native = rows[0] if rows else None
-uvm = rows[1] if len(rows) > 1 else None
 if native:
     for row in rows:
         row["output_tok_s_ratio_vs_native"] = ratio(
@@ -291,8 +343,9 @@ if native:
         row["mean_tpot_ratio_vs_native"] = ratio(
             row.get("mean_tpot_ms"), native.get("mean_tpot_ms")
         )
-if native and uvm:
-    uvm["same_offload_names_as_native"] = native["_names"] == uvm["_names"]
+if native:
+    for row in rows:
+        row["same_offload_names_as_native"] = native["_names"] == row["_names"]
     native["same_offload_names_as_native"] = True
 
 for row in rows:
@@ -305,6 +358,12 @@ fields = [
     "manifest_parameters", "manifest_bytes", "backend_counts",
     "uvm_managed", "uvm_prefetch_cpu_success",
     "uvm_preferred_cpu_success", "uvm_accessed_by_success",
+    "uvm_readmostly_success",
+    "uvm_remote_read_bg_success",
+    "uvm_remote_read_bg_failure", "uvm_remote_read_bg_ioctl_ok",
+    "uvm_bg_start_success", "uvm_bg_start_failure", "uvm_bg_start_ioctl_ok",
+    "uvm_gate_events", "uvm_gate_pause_success", "uvm_gate_resume_success",
+    "uvm_gate_start_success",
     "same_offload_names_as_native",
 ]
 with (root / "isolated_uvm_offload_summary.csv").open(
@@ -334,8 +393,8 @@ lines = [
     "- global UVM allocator: not enabled (`VLLM_USE_UVM` is unset)",
     "- LD_PRELOAD CUDA allocator interception: not used",
     "",
-    "| case | ok/fail | tok/s | TPOT ms | TTFT ms | tok/s/native | TPOT/native | params | bytes | backend | managed | prefetch CPU | preferred CPU | AccessedBy | same names |",
-    "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---|",
+    "| case | ok/fail | tok/s | TPOT ms | TTFT ms | tok/s/native | TPOT/native | params | bytes | backend | managed | prefetch CPU | preferred CPU | AccessedBy | ReadMostly | remote-bg prepare | gate events | gate start | same names |",
+    "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
 ]
 for row in rows:
     ok = row.get("successful_requests")
@@ -343,7 +402,8 @@ for row in rows:
     lines.append(
         "| {case} | {ok}/{fail} | {tok} | {tpot} | {ttft} | {tok_ratio} | "
         "{tpot_ratio} | {params} | {bytes} | {backend} | {managed} | "
-        "{prefetch} | {preferred} | {accessed} | {same} |".format(
+        "{prefetch} | {preferred} | {accessed} | {readmostly} | "
+        "{remote_bg} | {gate_events} | {gate_start} | {same} |".format(
             case=row.get("case"),
             ok=fmt(ok, 0),
             fail=fmt(fail, 0),
@@ -359,6 +419,10 @@ for row in rows:
             prefetch=row.get("uvm_prefetch_cpu_success"),
             preferred=row.get("uvm_preferred_cpu_success"),
             accessed=row.get("uvm_accessed_by_success"),
+            readmostly=row.get("uvm_readmostly_success"),
+            remote_bg=row.get("uvm_remote_read_bg_success"),
+            gate_events=row.get("uvm_gate_events"),
+            gate_start=row.get("uvm_gate_start_success"),
             same=row.get("same_offload_names_as_native"),
         )
     )
@@ -367,8 +431,10 @@ lines.extend([
     "## Interpretation",
     "",
     "- `native_cpu_offload` is the vLLM pinned CPU tensor + UVA CUDA view baseline.",
-    "- `isolated_uvm_remote_offload` uses the same `--cpu-offload-gb` selection, but those selected weights are allocated from a local UVM MemPool and prepared with CPU prefetch, PreferredLocation(CPU), and AccessedBy(GPU).",
-    "- The key validity checks are: same offload names, same manifest bytes, UVM managed count equals parameter count, and no failed requests.",
+    "- `isolated_uvm_migration_offload` uses the same `--cpu-offload-gb` selection, but those selected weights are allocated from a local UVM MemPool and only prefetched to CPU, leaving later GPU reads to the default UVM demand migration/fault path.",
+    "- `isolated_uvm_remote_offload` uses the same selected weights, additionally sets PreferredLocation(CPU) and tags AccessedBy(GPU), so it exercises the native UVM remote-read path.",
+    "- `isolated_uvm_hybrid_remote_offload` uses the same selected weights, additionally sets ReadMostly, calls the modified UVM remote-read/background-promotion prepare path, and gates background promotion around module forward calls.",
+    "- The key validity checks are: same offload names, same manifest bytes, UVM managed count equals parameter count, remote-bg prepare count equals parameter count for the hybrid case, and no failed requests.",
 ])
 (root / "isolated_uvm_offload_summary.md").write_text(
     "\n".join(lines) + "\n", encoding="utf-8"
@@ -385,7 +451,9 @@ echo "vllm_cmd=${VLLM_CMD[*]}"
 echo "==========================================================="
 
 run_case native_cpu_offload uva "$PORT_BASE"
-run_case isolated_uvm_remote_offload isolated_uvm_remote "$((PORT_BASE + 1))"
+run_case isolated_uvm_migration_offload isolated_uvm_migration "$((PORT_BASE + 1))"
+run_case isolated_uvm_remote_offload isolated_uvm_remote "$((PORT_BASE + 2))"
+run_case isolated_uvm_hybrid_remote_offload isolated_uvm_hybrid_remote "$((PORT_BASE + 3))"
 summarize
 
 echo "summary_md=$RUN_ROOT/isolated_uvm_offload_summary.md"

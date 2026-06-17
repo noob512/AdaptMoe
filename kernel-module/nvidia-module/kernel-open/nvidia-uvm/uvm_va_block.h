@@ -537,6 +537,7 @@ struct uvm_va_block_struct
     uvm_processor_mask_t bg_promote_gpus;
     struct delayed_work bg_promote_delayed_work;
     bool bg_promote_delayed_work_active;
+    NvU32 bg_promote_pause_count;
 
     uvm_perf_module_data_desc_t perf_modules_data[UVM_PERF_MODULE_TYPE_COUNT];
 
@@ -2357,6 +2358,18 @@ void uvm_va_block_print_latency_stats(struct seq_file *s);
 // Reset global counters for the experimental latency-aware remote-first
 // background promotion path.
 void uvm_va_block_reset_latency_stats(void);
+
+// Pause or resume deferred read-only background promotion for the block. This
+// is an experimental runtime gate used by Phase F to keep background promotion
+// out of known remote-read critical sections.
+// Locking: the va_block lock must be held.
+NV_STATUS uvm_va_block_set_bg_promote_paused(uvm_va_block_t *va_block,
+                                             bool pause,
+                                             NvU32 *touched_blocks_out);
+
+// Count Phase F pause/resume action calls for the experimental background
+// promotion gate.
+void uvm_va_block_note_bg_promote_gate_action(bool pause);
 
 // A helper macro for handling allocation-retry
 //

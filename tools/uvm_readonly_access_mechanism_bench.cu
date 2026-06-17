@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <string>
+#include <thread>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -37,6 +38,8 @@ struct Options {
     int device = 0;
     int threads = 256;
     int blocks_per_sm = 4;
+    int start_bg_after_pass = 0;
+    int bg_idle_window_ms = 0;
     bool print_header = true;
 };
 
@@ -71,14 +74,17 @@ static void usage(const char *argv0)
     std::fprintf(stderr,
                  "Usage: %s --mechanism NAME [--pages N] [--passes N]\n"
                  "          [--ops-per-page N] [--repeat N] [--device N]\n"
-                 "          [--threads N] [--blocks-per-sm N] [--no-header]\n"
+                 "          [--threads N] [--blocks-per-sm N]\n"
+                 "          [--start-bg-after-pass N] [--bg-idle-window-ms N]\n"
+                 "          [--no-header]\n"
                  "\n"
                  "Mechanisms:\n"
                  "  uvm_pure_remote    Managed, CPU preferred, GPU AccessedBy\n"
                  "  uva_pinned_remote  vLLM-style pinned CPU memory + UVA CUDA view\n"
                  "  readmostly_prepare_remote Managed, ReadMostly; manual driver remote READ prepare\n"
                  "  readmostly_prepare_remote_bg Managed, ReadMostly; manual remote READ prepare + bg read-dup promotion\n"
-                 "  readmostly_prepare_remote_bg_after_first Managed, ReadMostly; prepare remote + defer bg promotion until pass0 completes\n"
+                 "  readmostly_prepare_remote_bg_after_first Managed, ReadMostly; prepare remote + defer bg promotion until the configured pass completes\n"
+                 "  readmostly_prepare_remote_bg_runtime_gate Managed, ReadMostly; prepare remote + defer bg promotion; pause promotion during each measured pass and resume in the pass gap\n"
                  "  hybrid_remote_first_bg Managed, ReadMostly; driver remote-first + bg promotion\n"
                  "  hybrid_remote_first_only Managed, ReadMostly; driver remote-first only\n"
                  "  readonly_dup       Managed, CPU resident, ReadMostly read-dup\n"
@@ -94,6 +100,7 @@ static bool valid_mechanism(const std::string &mechanism)
            mechanism == "readmostly_prepare_remote" ||
            mechanism == "readmostly_prepare_remote_bg" ||
            mechanism == "readmostly_prepare_remote_bg_after_first" ||
+           mechanism == "readmostly_prepare_remote_bg_runtime_gate" ||
            mechanism == "hybrid_remote_first_bg" ||
            mechanism == "hybrid_remote_first_only" ||
            mechanism == "readonly_dup" ||
@@ -130,6 +137,10 @@ static Options parse_args(int argc, char **argv)
             opt.threads = static_cast<int>(parse_size(need_value(argv[i])));
         else if (std::strcmp(argv[i], "--blocks-per-sm") == 0)
             opt.blocks_per_sm = static_cast<int>(parse_size(need_value(argv[i])));
+        else if (std::strcmp(argv[i], "--start-bg-after-pass") == 0)
+            opt.start_bg_after_pass = static_cast<int>(parse_size(need_value(argv[i])));
+        else if (std::strcmp(argv[i], "--bg-idle-window-ms") == 0)
+            opt.bg_idle_window_ms = static_cast<int>(parse_size(need_value(argv[i])));
         else if (std::strcmp(argv[i], "--no-header") == 0)
             opt.print_header = false;
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
@@ -151,6 +162,16 @@ static Options parse_args(int argc, char **argv)
 
     if (opt.pages == 0 || opt.passes <= 0 || opt.ops_per_page <= 0) {
         std::fprintf(stderr, "pages, passes, and ops_per_page must be positive\n");
+        std::exit(EXIT_FAILURE);
+    }
+
+    if (opt.start_bg_after_pass < 0 || opt.start_bg_after_pass >= opt.passes) {
+        std::fprintf(stderr, "start_bg_after_pass must be in [0, passes - 1]\n");
+        std::exit(EXIT_FAILURE);
+    }
+
+    if (opt.bg_idle_window_ms < 0) {
+        std::fprintf(stderr, "bg_idle_window_ms must be non-negative\n");
         std::exit(EXIT_FAILURE);
     }
 
@@ -445,9 +466,12 @@ int main(int argc, char **argv)
     const bool should_prepare_remote =
         opt.mechanism == "readmostly_prepare_remote" ||
         opt.mechanism == "readmostly_prepare_remote_bg" ||
-        opt.mechanism == "readmostly_prepare_remote_bg_after_first";
+        opt.mechanism == "readmostly_prepare_remote_bg_after_first" ||
+        opt.mechanism == "readmostly_prepare_remote_bg_runtime_gate";
     const bool should_start_bg_after_first =
         opt.mechanism == "readmostly_prepare_remote_bg_after_first";
+    const bool should_gate_bg_runtime =
+        opt.mechanism == "readmostly_prepare_remote_bg_runtime_gate";
 
     const double setup_start = now_ms();
 
@@ -471,6 +495,7 @@ int main(int argc, char **argv)
             opt.mechanism == "readmostly_prepare_remote" ||
             opt.mechanism == "readmostly_prepare_remote_bg" ||
             opt.mechanism == "readmostly_prepare_remote_bg_after_first" ||
+            opt.mechanism == "readmostly_prepare_remote_bg_runtime_gate" ||
             opt.mechanism == "hybrid_remote_first_bg" ||
             opt.mechanism == "hybrid_remote_first_only")
             CHECK_CUDA(cudaMemAdvise(data, bytes, cudaMemAdviseSetReadMostly, opt.device));
@@ -494,6 +519,10 @@ int main(int argc, char **argv)
             action = UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED;
             action_name = "PREPARE_REMOTE_READ_BG_DEFERRED";
         }
+        else if (opt.mechanism == "readmostly_prepare_remote_bg_runtime_gate") {
+            action = UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED;
+            action_name = "PREPARE_REMOTE_READ_BG_DEFERRED";
+        }
 
         prepare_remote = phase_f_action_or_die(data, bytes, opt.device, action, action_name);
     }
@@ -508,12 +537,22 @@ int main(int argc, char **argv)
         static_cast<uint64_t>(opt.pages) * static_cast<uint64_t>(opt.ops_per_page);
     const double logical_gib =
         (static_cast<double>(logical_loads) * sizeof(uint64_t)) / (1024.0 * 1024.0 * 1024.0);
+    bool bg_gate_paused = false;
 
     for (int pass = 0; pass < opt.passes; ++pass) {
         cudaEvent_t ev_start = nullptr;
         cudaEvent_t ev_stop = nullptr;
         CHECK_CUDA(cudaEventCreate(&ev_start));
         CHECK_CUDA(cudaEventCreate(&ev_stop));
+
+        if (should_gate_bg_runtime && !bg_gate_paused) {
+            phase_f_action_or_die(data,
+                                  bytes,
+                                  opt.device,
+                                  UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION,
+                                  "PAUSE_BG_PROMOTION");
+            bg_gate_paused = true;
+        }
 
         const double wall_start = now_ms();
         CHECK_CUDA(cudaEventRecord(ev_start));
@@ -534,12 +573,38 @@ int main(int argc, char **argv)
         CHECK_CUDA(cudaEventDestroy(ev_start));
         CHECK_CUDA(cudaEventDestroy(ev_stop));
 
-        if (pass == 0 && should_start_bg_after_first) {
+        if (pass == opt.start_bg_after_pass && should_start_bg_after_first) {
             phase_f_action_or_die(data,
                                   bytes,
                                   opt.device,
                                   UVM_PHASE_F_ACTION_START_BG_PROMOTION,
                                   "START_BG_PROMOTION");
+        }
+
+        if (should_gate_bg_runtime) {
+            phase_f_action_or_die(data,
+                                  bytes,
+                                  opt.device,
+                                  UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION,
+                                  "RESUME_BG_PROMOTION");
+            bg_gate_paused = false;
+            if (pass == 0) {
+                phase_f_action_or_die(data,
+                                      bytes,
+                                      opt.device,
+                                      UVM_PHASE_F_ACTION_START_BG_PROMOTION,
+                                      "START_BG_PROMOTION");
+            }
+            if (opt.bg_idle_window_ms > 0 && pass + 1 < opt.passes)
+                std::this_thread::sleep_for(std::chrono::milliseconds(opt.bg_idle_window_ms));
+            if (pass + 1 < opt.passes) {
+                phase_f_action_or_die(data,
+                                      bytes,
+                                      opt.device,
+                                      UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION,
+                                      "PAUSE_BG_PROMOTION");
+                bg_gate_paused = true;
+            }
         }
 
         const double mloads_s =

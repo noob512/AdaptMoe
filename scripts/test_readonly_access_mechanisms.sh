@@ -21,7 +21,9 @@ BG_MAX_PAGES="${BG_MAX_PAGES:-512}"
 BG_DELAY_MS="${BG_DELAY_MS:-0}"
 BG_RESCHEDULE_DELAY_MS="${BG_RESCHEDULE_DELAY_MS:-0}"
 PHASE_F_ROUTE_LOG_DELAY_MS="${PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
-MECHANISMS="${MECHANISMS:-uvm_pure_remote uva_pinned_remote readmostly_prepare_remote readmostly_prepare_remote_bg readmostly_prepare_remote_bg_after_first hybrid_remote_first_only hybrid_remote_first_bg readonly_dup direct_migrate counter_migrate}"
+START_BG_AFTER_PASS="${START_BG_AFTER_PASS:-0}"
+BG_IDLE_WINDOW_MS="${BG_IDLE_WINDOW_MS:-0}"
+MECHANISMS="${MECHANISMS:-uvm_pure_remote uva_pinned_remote readmostly_prepare_remote readmostly_prepare_remote_bg readmostly_prepare_remote_bg_after_first readmostly_prepare_remote_bg_runtime_gate hybrid_remote_first_only hybrid_remote_first_bg readonly_dup direct_migrate counter_migrate}"
 RUN_ROOT="${RUN_ROOT:-${ROOT_DIR}/results/readonly_access_mechanisms_$(date -u +%Y%m%d_%H%M%S)}"
 
 # Isolate the new remote-first/background promotion path: enabled only for
@@ -224,6 +226,8 @@ write_metadata() {
     echo "bg_delay_ms=${BG_DELAY_MS}"
     echo "bg_reschedule_delay_ms=${BG_RESCHEDULE_DELAY_MS}"
     echo "phase_f_route_log_delay_ms=${PHASE_F_ROUTE_LOG_DELAY_MS}"
+    echo "start_bg_after_pass=${START_BG_AFTER_PASS}"
+    echo "bg_idle_window_ms=${BG_IDLE_WINDOW_MS}"
     echo "mechanisms=${MECHANISMS}"
     echo "disable_remote_first=${DISABLE_REMOTE_FIRST}"
     echo "restore_params=${RESTORE_PARAMS}"
@@ -268,6 +272,14 @@ run_matrix() {
         --repeat "${repeat}"
         --device "${DEVICE}"
       )
+
+      if [[ "${mechanism}" == "readmostly_prepare_remote_bg_after_first" ]]; then
+        args+=(--start-bg-after-pass "${START_BG_AFTER_PASS}")
+      fi
+
+      if [[ "${mechanism}" == "readmostly_prepare_remote_bg_runtime_gate" ]]; then
+        args+=(--bg-idle-window-ms "${BG_IDLE_WINDOW_MS}")
+      fi
 
       if [[ "${first}" == "1" ]]; then
         "${BIN}" "${args[@]}" >> "${CSV}"

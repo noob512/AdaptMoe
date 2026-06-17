@@ -37,6 +37,7 @@ Warning:
 import atexit
 import ctypes
 import os
+import uuid as uuidlib
 from contextlib import contextmanager
 from collections.abc import Sequence
 from typing import Optional
@@ -55,6 +56,16 @@ _uvm_local_allocator = None
 _uvm_local_mem_pool = None
 _uvm_phase_stack: list[str] = []
 _UVM_DRIVER_BATCH_MAX_RANGES = 64
+_UVM_INITIALIZE_IOCTL = 0x30000001
+_UVM_PHASE_F_BATCH_EXECUTOR_IOCTL = 81
+_UVM_PHASE_F_MAX_RANGES = 64
+
+UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ = 5
+UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG = 6
+UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED = 7
+UVM_PHASE_F_ACTION_START_BG_PROMOTION = 8
+UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16
+UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17
 
 UVM_REGION_POOL_UNKNOWN = 0
 UVM_REGION_POOL_KV = 1
@@ -87,6 +98,96 @@ UVM_REGION_STATE_INACTIVE = 5
 UVM_POOL_BUDGET_MODE_TRACE_ONLY = 0
 UVM_POOL_BUDGET_MODE_SOFT = 1
 UVM_POOL_BUDGET_MODE_ENFORCE = 2
+
+
+class _UvmInitializeParams(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint64),
+        ("rmStatus", ctypes.c_uint32),
+    ]
+
+
+class _PhaseFUuid(ctypes.Structure):
+    _fields_ = [("uuid", ctypes.c_uint8 * 16)]
+
+
+class _PhaseFRange(ctypes.Structure):
+    _fields_ = [
+        ("base", ctypes.c_uint64),
+        ("length", ctypes.c_uint64),
+    ]
+
+
+class _PhaseFRangeResult(ctypes.Structure):
+    _fields_ = [
+        ("status", ctypes.c_uint32),
+        ("resident_on_count", ctypes.c_uint32),
+        ("resident_on_cpu", ctypes.c_uint8),
+        ("resident_on_gpu", ctypes.c_uint8),
+        ("queried_bytes", ctypes.c_uint64),
+        ("resident_gpu_bytes", ctypes.c_uint64),
+        ("resident_cpu_bytes", ctypes.c_uint64),
+        ("resident_any_bytes", ctypes.c_uint64),
+        ("resident_unknown_bytes", ctypes.c_uint64),
+    ]
+
+
+class _PhaseFBatchExecutorParams(ctypes.Structure):
+    _fields_ = [
+        ("action", ctypes.c_uint32),
+        ("count", ctypes.c_uint32),
+        ("gpu_uuid", _PhaseFUuid),
+        ("async_", ctypes.c_uint8),
+        ("success_count", ctypes.c_uint32),
+        ("failure_count", ctypes.c_uint32),
+        ("ranges", _PhaseFRange * _UVM_PHASE_F_MAX_RANGES),
+        ("results", _PhaseFRangeResult * _UVM_PHASE_F_MAX_RANGES),
+        ("rmStatus", ctypes.c_uint32),
+    ]
+
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_LIBC.ioctl.restype = ctypes.c_int
+
+
+def _libc_ioctl(fd: int, request: int, params: ctypes.Structure) -> int:
+    return int(_LIBC.ioctl(
+        ctypes.c_int(fd),
+        ctypes.c_ulong(request),
+        ctypes.byref(params),
+    ))
+
+
+def _phase_f_gpu_uuid(device: int) -> _PhaseFUuid:
+    if device < 0:
+        device = torch.cuda.current_device()
+    raw_uuid = getattr(torch.cuda.get_device_properties(device), "uuid", None)
+    if raw_uuid is None:
+        raise RuntimeError("torch.cuda device properties do not expose UUID")
+    if isinstance(raw_uuid, bytes):
+        uuid_bytes = raw_uuid
+    else:
+        uuid_text = str(raw_uuid)
+        if uuid_text.startswith("GPU-"):
+            uuid_text = uuid_text[4:]
+        uuid_bytes = uuidlib.UUID(uuid_text).bytes
+    if len(uuid_bytes) != 16:
+        raise RuntimeError(f"Unexpected CUDA UUID size: {len(uuid_bytes)}")
+    return _PhaseFUuid((ctypes.c_uint8 * 16).from_buffer_copy(uuid_bytes))
+
+
+def _open_initialized_uvm_fd() -> int:
+    fd = os.open("/dev/nvidia-uvm", os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+    params = _UvmInitializeParams()
+    ret = _libc_ioctl(fd, _UVM_INITIALIZE_IOCTL, params)
+    if ret != 0 or int(params.rmStatus) != 0:
+        saved_errno = ctypes.get_errno()
+        os.close(fd)
+        raise RuntimeError(
+            "UVM_INITIALIZE failed: "
+            f"ret={ret} errno={saved_errno} rmStatus={int(params.rmStatus)}"
+        )
+    return fd
 
 
 def find_uvm_allocator_library() -> Optional[str]:
@@ -696,6 +797,142 @@ def _prepare_uvm_range_arrays(
         *(size for _, size in valid_ranges)
     )
     return ptr_array, size_array, count
+
+
+def driver_phase_f_batch_execute_ranges(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    action: int,
+    *,
+    device: int = 0,
+    async_: bool = False,
+) -> tuple[int, int, int, int]:
+    """Submit raw VA ranges to the modified UVM Phase-F executor.
+
+    This pure-Python ioctl path is intentionally independent from the
+    pluggable allocator .so exports, so isolated vLLM experiments can exercise
+    newly added kernel actions without rebuilding vLLM or the allocator helper.
+
+    Returns (success_count, failure_count, rm_status, ioctl_ret). Negative
+    ``ioctl_ret`` values are local wrapper failures.
+    """
+    if uvm_residency_tag_only_enabled():
+        return 0, 0, 0, 0
+
+    range_list = [
+        (int(ptr), int(size))
+        for ptr, size in ranges
+        if int(ptr) > 0 and int(size) > 0
+    ]
+    if not range_list:
+        return 0, 0, 0, 0
+
+    try:
+        gpu_uuid = _phase_f_gpu_uuid(device)
+    except Exception:
+        logger.debug("Failed to resolve CUDA UUID for Phase-F ioctl",
+                     exc_info=True)
+        return 0, len(range_list), 0, -3
+
+    fd = -1
+    try:
+        fd = _open_initialized_uvm_fd()
+        total_success = 0
+        total_failure = 0
+        last_rm_status = 0
+
+        for start in range(0, len(range_list), _UVM_PHASE_F_MAX_RANGES):
+            chunk = range_list[start:start + _UVM_PHASE_F_MAX_RANGES]
+            params = _PhaseFBatchExecutorParams()
+            params.action = int(action)
+            params.count = len(chunk)
+            params.gpu_uuid = gpu_uuid
+            params.async_ = 1 if async_ else 0
+            for index, (ptr, size) in enumerate(chunk):
+                params.ranges[index].base = int(ptr)
+                params.ranges[index].length = int(size)
+
+            ret = _libc_ioctl(fd, _UVM_PHASE_F_BATCH_EXECUTOR_IOCTL, params)
+            if ret != 0:
+                saved_errno = ctypes.get_errno()
+                logger.warning(
+                    "Phase-F ioctl action=%s failed: ret=%s errno=%s "
+                    "rmStatus=%s success=%s failure=%s",
+                    action,
+                    ret,
+                    saved_errno,
+                    int(params.rmStatus),
+                    int(params.success_count),
+                    int(params.failure_count),
+                )
+                total_success += int(params.success_count)
+                total_failure += int(params.failure_count)
+                return total_success, total_failure, int(params.rmStatus), -6
+
+            total_success += int(params.success_count)
+            total_failure += int(params.failure_count)
+            last_rm_status = int(params.rmStatus)
+            if int(params.rmStatus) != 0 and int(params.success_count) == 0:
+                return total_success, total_failure, last_rm_status, -last_rm_status
+
+        return total_success, total_failure, last_rm_status, 0
+    except Exception:
+        logger.debug("Phase-F direct ioctl failed", exc_info=True)
+        return 0, len(range_list), 0, -4
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def driver_prepare_ranges_remote_read_bg_deferred(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    device: int = 0,
+) -> tuple[int, int, int, int]:
+    """Prepare remote READ PTEs and mark background promotion pending."""
+    return driver_phase_f_batch_execute_ranges(
+        ranges,
+        UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED,
+        device=device,
+    )
+
+
+def driver_start_ranges_bg_promotion(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    device: int = 0,
+) -> tuple[int, int, int, int]:
+    return driver_phase_f_batch_execute_ranges(
+        ranges,
+        UVM_PHASE_F_ACTION_START_BG_PROMOTION,
+        device=device,
+    )
+
+
+def driver_pause_ranges_bg_promotion(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    device: int = 0,
+) -> tuple[int, int, int, int]:
+    return driver_phase_f_batch_execute_ranges(
+        ranges,
+        UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION,
+        device=device,
+    )
+
+
+def driver_resume_ranges_bg_promotion(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    device: int = 0,
+) -> tuple[int, int, int, int]:
+    return driver_phase_f_batch_execute_ranges(
+        ranges,
+        UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION,
+        device=device,
+    )
 
 
 def uvm_residency_tag_only_enabled() -> bool:

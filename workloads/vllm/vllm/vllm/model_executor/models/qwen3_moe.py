@@ -24,7 +24,12 @@
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
 import typing
+import json
+import os
+import threading
+import time
 from collections.abc import Callable, Iterable
+from collections import Counter
 from itertools import islice
 from typing import Any
 
@@ -77,6 +82,69 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+_QWEN3_MOE_TRACE_LOCK = threading.Lock()
+_QWEN3_MOE_TRACE_STEP = 0
+
+
+def _qwen3_moe_trace_enabled() -> bool:
+    return os.environ.get("VLLM_QWEN3_MOE_EXPERT_TRACE_ENABLE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _qwen3_moe_trace_file() -> str:
+    return os.environ.get("VLLM_QWEN3_MOE_EXPERT_TRACE_FILE", "")
+
+
+def _qwen3_moe_trace_active_experts(
+    *,
+    layer_name: str,
+    layer_id: int | None,
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    topk_ids: torch.Tensor,
+) -> None:
+    trace_file = _qwen3_moe_trace_file()
+    if not trace_file:
+        return
+
+    global _QWEN3_MOE_TRACE_STEP
+    flat_ids = topk_ids.detach().reshape(-1).to("cpu").tolist()
+    valid_ids = [int(expert_id) for expert_id in flat_ids if int(expert_id) >= 0]
+    counts = Counter(valid_ids)
+    active_experts = sorted(counts)
+    with _QWEN3_MOE_TRACE_LOCK:
+        _QWEN3_MOE_TRACE_STEP += 1
+        step = _QWEN3_MOE_TRACE_STEP
+        record = {
+            "event": "qwen3_moe_expert_trace",
+            "timestamp": time.time(),
+            "pid": os.getpid(),
+            "step": step,
+            "layer_name": layer_name,
+            "layer_id": layer_id,
+            "num_tokens": int(num_tokens),
+            "top_k": int(top_k),
+            "num_experts": int(num_experts),
+            "expert_assignments": int(len(valid_ids)),
+            "active_expert_count": int(len(active_experts)),
+            "active_expert_fraction": (
+                float(len(active_experts) / num_experts) if num_experts else None
+            ),
+            "active_experts": active_experts,
+            "expert_token_counts": {
+                str(expert_id): int(counts[expert_id])
+                for expert_id in active_experts
+            },
+        }
+        os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
+        with open(trace_file, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -182,6 +250,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate",
         )
+        self.layer_name = prefix
+        try:
+            self.layer_id: int | None = extract_layer_index(prefix)
+        except Exception:
+            self.layer_id = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert hidden_states.dim() <= 2, (
@@ -196,6 +269,19 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        if _qwen3_moe_trace_enabled():
+            _, topk_ids, _ = self.experts.select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+            _qwen3_moe_trace_active_experts(
+                layer_name=self.layer_name,
+                layer_id=self.layer_id,
+                num_tokens=hidden_states.shape[0],
+                top_k=self.experts.top_k,
+                num_experts=self.n_routed_experts,
+                topk_ids=topk_ids,
+            )
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )

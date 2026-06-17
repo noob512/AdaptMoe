@@ -631,7 +631,9 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 def _is_uvm_cpu_offload_backend(backend: str) -> bool:
     return backend in (
+        "isolated_uvm_migration",
         "isolated_uvm_remote",
+        "isolated_uvm_hybrid_remote",
         "uvm_remote",
         "uvm_pure_remote",
     )
@@ -667,12 +669,19 @@ def maybe_offload_to_cpu(
     ):
         raise ValueError(
             "Unknown VLLM_CPU_OFFLOAD_BACKEND="
-            f"{offload_backend!r}; use 'uva' or 'isolated_uvm_remote'"
+            f"{offload_backend!r}; use 'uva', 'isolated_uvm_migration', "
+            "'isolated_uvm_remote', or 'isolated_uvm_hybrid_remote'"
         )
 
     # offload parameters to CPU
     # use pin_memory if possible, which helps cudagraph capture speed
     offloaded_parameters = False
+    hybrid_remote_ranges: list[tuple[int, int]] = []
+    hybrid_remote_device_index = (
+        device.index
+        if device.index is not None
+        else torch.cuda.current_device()
+    )
     for param_index, (param_name, p) in enumerate(module.named_parameters()):
         if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
             # we use per-parameter offloading
@@ -691,7 +700,9 @@ def maybe_offload_to_cpu(
             from vllm.device_allocator.uvm import (
                 batch_advise_ranges_accessed_by,
                 batch_advise_ranges_preferred_location,
+                batch_advise_ranges_read_mostly,
                 batch_prefetch_ranges_to_device,
+                driver_prepare_ranges_remote_read_bg_deferred,
                 ensure_uvm_runtime_library,
                 probe_driver_capable_range,
                 uvm_local_memory_pool,
@@ -716,12 +727,35 @@ def maybe_offload_to_cpu(
                 else torch.cuda.current_device()
             )
             prefetch_cpu_result = batch_prefetch_ranges_to_device(ranges, -1)
-            preferred_cpu_result = batch_advise_ranges_preferred_location(
-                ranges, -1
+            remote_like_backend = offload_backend in (
+                "isolated_uvm_remote",
+                "isolated_uvm_hybrid_remote",
+                "uvm_remote",
+                "uvm_pure_remote",
             )
-            accessed_by_result = batch_advise_ranges_accessed_by(
-                ranges, int(device_index)
-            )
+            preferred_cpu_result = 0
+            if remote_like_backend:
+                preferred_cpu_result = batch_advise_ranges_preferred_location(
+                    ranges, -1
+                )
+            readmostly_result = 0
+            if offload_backend == "isolated_uvm_hybrid_remote":
+                readmostly_result = batch_advise_ranges_read_mostly(
+                    ranges,
+                    device=int(device_index),
+                )
+            accessed_by_result = 0
+            if remote_like_backend:
+                accessed_by_result = batch_advise_ranges_accessed_by(
+                    ranges, int(device_index)
+                )
+            remote_read_bg_result = (0, 0, 0, 0)
+            if offload_backend == "isolated_uvm_hybrid_remote":
+                remote_read_bg_result = driver_prepare_ranges_remote_read_bg_deferred(
+                    ranges,
+                    device=int(device_index),
+                )
+                hybrid_remote_ranges.extend(ranges)
             if _env_flag("VLLM_CPU_OFFLOAD_UVM_SYNC", True):
                 torch.cuda.synchronize()
             managed, managed_reason, managed_code = probe_driver_capable_range(
@@ -738,8 +772,16 @@ def maybe_offload_to_cpu(
                     "uvm_data_ptr": ptr,
                     "uvm_prefetch_cpu_result": int(prefetch_cpu_result),
                     "uvm_preferred_cpu_result": int(preferred_cpu_result),
+                    "uvm_readmostly_result": int(readmostly_result),
                     "uvm_accessed_by_result": int(accessed_by_result),
                     "uvm_accessed_by_device": int(device_index),
+                    "uvm_remote_read_bg_success": int(remote_read_bg_result[0]),
+                    "uvm_remote_read_bg_failure": int(remote_read_bg_result[1]),
+                    "uvm_remote_read_bg_rm_status": int(remote_read_bg_result[2]),
+                    "uvm_remote_read_bg_ioctl_ret": int(remote_read_bg_result[3]),
+                    "uvm_bg_start_deferred": bool(
+                        offload_backend == "isolated_uvm_hybrid_remote"
+                    ),
                     "uvm_sync": _env_flag("VLLM_CPU_OFFLOAD_UVM_SYNC", True),
                     "cpu_data_pinned": False,
                 }
@@ -817,6 +859,66 @@ def maybe_offload_to_cpu(
             return output
 
         module.forward = forward
+
+    if offloaded_parameters and offload_backend == "isolated_uvm_hybrid_remote":
+        from vllm.device_allocator.uvm import (
+            driver_pause_ranges_bg_promotion,
+            driver_resume_ranges_bg_promotion,
+            driver_start_ranges_bg_promotion,
+        )
+
+        original_forward = module.forward
+        bg_started = False
+
+        def hybrid_forward(*args, **kwargs):
+            nonlocal bg_started
+            pause_result = driver_pause_ranges_bg_promotion(
+                hybrid_remote_ranges,
+                device=int(hybrid_remote_device_index),
+            )
+            ok = False
+            try:
+                output = original_forward(*args, **kwargs)
+                ok = True
+                return output
+            finally:
+                resume_result = driver_resume_ranges_bg_promotion(
+                    hybrid_remote_ranges,
+                    device=int(hybrid_remote_device_index),
+                )
+                start_result = (0, 0, 0, 0)
+                if ok and not bg_started:
+                    start_result = driver_start_ranges_bg_promotion(
+                        hybrid_remote_ranges,
+                        device=int(hybrid_remote_device_index),
+                    )
+                    bg_started = True
+                _append_cpu_offload_manifest(
+                    {
+                        "event": "cpu_offload_hybrid_remote_gate",
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "module_prefix": module_prefix,
+                        "module_class": module.__class__.__name__,
+                        "range_count": len(hybrid_remote_ranges),
+                        "bytes": int(sum(size for _, size in hybrid_remote_ranges)),
+                        "pause_success": int(pause_result[0]),
+                        "pause_failure": int(pause_result[1]),
+                        "pause_rm_status": int(pause_result[2]),
+                        "pause_ioctl_ret": int(pause_result[3]),
+                        "resume_success": int(resume_result[0]),
+                        "resume_failure": int(resume_result[1]),
+                        "resume_rm_status": int(resume_result[2]),
+                        "resume_ioctl_ret": int(resume_result[3]),
+                        "start_success": int(start_result[0]),
+                        "start_failure": int(start_result[1]),
+                        "start_rm_status": int(start_result[2]),
+                        "start_ioctl_ret": int(start_result[3]),
+                        "bg_started": bool(bg_started),
+                    }
+                )
+
+        module.forward = hybrid_forward
 
     return module
 

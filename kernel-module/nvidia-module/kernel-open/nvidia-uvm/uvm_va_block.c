@@ -154,6 +154,11 @@ static atomic64_t g_uvm_latency_bg_promote_immediate_schedules = ATOMIC64_INIT(0
 static atomic64_t g_uvm_latency_bg_promote_timer_fires = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_latency_bg_promote_deferred_pages = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_latency_bg_promote_start_pages = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_latency_bg_promote_pause_calls = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_latency_bg_promote_resume_calls = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_latency_bg_promote_paused_blocks = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_latency_bg_promote_resumed_blocks = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_latency_bg_promote_gate_skips = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_cpu_faults_total = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_cpu_faults_registered = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_cpu_faults_candidate = ATOMIC64_INIT(0);
@@ -250,6 +255,16 @@ void uvm_va_block_print_latency_stats(struct seq_file *s)
                          (NvU64)atomic64_read(&g_uvm_latency_bg_promote_deferred_pages));
     UVM_SEQ_OR_DBG_PRINT(s, "bg_promote_start_pages          %llu\n",
                          (NvU64)atomic64_read(&g_uvm_latency_bg_promote_start_pages));
+    UVM_SEQ_OR_DBG_PRINT(s, "bg_promote_pause_calls          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_latency_bg_promote_pause_calls));
+    UVM_SEQ_OR_DBG_PRINT(s, "bg_promote_resume_calls         %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_latency_bg_promote_resume_calls));
+    UVM_SEQ_OR_DBG_PRINT(s, "bg_promote_paused_blocks        %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_latency_bg_promote_paused_blocks));
+    UVM_SEQ_OR_DBG_PRINT(s, "bg_promote_resumed_blocks       %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_latency_bg_promote_resumed_blocks));
+    UVM_SEQ_OR_DBG_PRINT(s, "bg_promote_gate_skips           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_latency_bg_promote_gate_skips));
     UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_total        %llu\n",
                          (NvU64)atomic64_read(&g_uvm_stage_a_cpu_faults_total));
     UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_registered   %llu\n",
@@ -350,6 +365,11 @@ void uvm_va_block_reset_latency_stats(void)
     atomic64_set(&g_uvm_latency_bg_promote_timer_fires, 0);
     atomic64_set(&g_uvm_latency_bg_promote_deferred_pages, 0);
     atomic64_set(&g_uvm_latency_bg_promote_start_pages, 0);
+    atomic64_set(&g_uvm_latency_bg_promote_pause_calls, 0);
+    atomic64_set(&g_uvm_latency_bg_promote_resume_calls, 0);
+    atomic64_set(&g_uvm_latency_bg_promote_paused_blocks, 0);
+    atomic64_set(&g_uvm_latency_bg_promote_resumed_blocks, 0);
+    atomic64_set(&g_uvm_latency_bg_promote_gate_skips, 0);
     atomic64_set(&g_uvm_stage_a_cpu_faults_total, 0);
     atomic64_set(&g_uvm_stage_a_cpu_faults_registered, 0);
     atomic64_set(&g_uvm_stage_a_cpu_faults_candidate, 0);
@@ -383,6 +403,14 @@ void uvm_va_block_reset_latency_stats(void)
     atomic64_set(&g_uvm_gpu_only_last_pool, 0);
     atomic64_set(&g_uvm_gpu_only_last_fault_addr, 0);
     atomic64_set(&g_uvm_gpu_only_last_is_write, 0);
+}
+
+void uvm_va_block_note_bg_promote_gate_action(bool pause)
+{
+    if (pause)
+        atomic64_inc(&g_uvm_latency_bg_promote_pause_calls);
+    else
+        atomic64_inc(&g_uvm_latency_bg_promote_resume_calls);
 }
 
 static void block_add_eviction_mappings_entry(void *args);
@@ -8845,6 +8873,13 @@ static NvU32 block_page_mask_copy_limited(uvm_page_mask_t *dst,
 
 static bool block_bg_promote_pages_pending(uvm_va_block_t *va_block);
 
+static bool block_bg_promote_paused_locked(uvm_va_block_t *va_block)
+{
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    return va_block->bg_promote_pause_count > 0;
+}
+
 static void block_bg_promote_schedule_now(uvm_va_block_t *va_block)
 {
     uvm_va_block_retain(va_block);
@@ -8878,7 +8913,13 @@ static void block_bg_promote_delayed_work(struct work_struct *work)
 
     uvm_mutex_lock(&va_block->lock);
     va_block->bg_promote_delayed_work_active = false;
-    should_schedule = !uvm_va_block_is_dead(va_block) && block_bg_promote_pages_pending(va_block);
+    should_schedule = !uvm_va_block_is_dead(va_block) &&
+                      !block_bg_promote_paused_locked(va_block) &&
+                      block_bg_promote_pages_pending(va_block);
+    if (!uvm_va_block_is_dead(va_block) &&
+        block_bg_promote_paused_locked(va_block) &&
+        block_bg_promote_pages_pending(va_block))
+        atomic64_inc(&g_uvm_latency_bg_promote_gate_skips);
     uvm_mutex_unlock(&va_block->lock);
 
     if (!should_schedule) {
@@ -8892,6 +8933,13 @@ static void block_bg_promote_delayed_work(struct work_struct *work)
 
 static void block_bg_promote_schedule_delayed_locked(uvm_va_block_t *va_block, unsigned delay_ms)
 {
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (block_bg_promote_paused_locked(va_block)) {
+        atomic64_inc(&g_uvm_latency_bg_promote_gate_skips);
+        return;
+    }
+
     if (delay_ms == 0) {
         block_bg_promote_schedule_now(va_block);
         return;
@@ -8914,6 +8962,55 @@ static void block_bg_promote_schedule_locked(uvm_va_block_t *va_block)
 static void block_bg_promote_reschedule_locked(uvm_va_block_t *va_block)
 {
     block_bg_promote_schedule_delayed_locked(va_block, uvm_latency_bg_promote_reschedule_delay_ms);
+}
+
+static void block_bg_promote_schedule_on_resume_locked(uvm_va_block_t *va_block)
+{
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (!block_bg_promote_pages_pending(va_block))
+        return;
+
+    block_bg_promote_schedule_now(va_block);
+}
+
+NV_STATUS uvm_va_block_set_bg_promote_paused(uvm_va_block_t *va_block,
+                                             bool pause,
+                                             NvU32 *touched_blocks_out)
+{
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (touched_blocks_out)
+        *touched_blocks_out = 0;
+
+    if (uvm_va_block_is_hmm(va_block))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    if (pause) {
+        if (va_block->bg_promote_pause_count == NV_U32_MAX)
+            return NV_ERR_INVALID_STATE;
+
+        va_block->bg_promote_pause_count++;
+        if (va_block->bg_promote_pause_count == 1) {
+            atomic64_inc(&g_uvm_latency_bg_promote_paused_blocks);
+            if (touched_blocks_out)
+                *touched_blocks_out = 1;
+        }
+    }
+    else {
+        if (va_block->bg_promote_pause_count == 0)
+            return NV_OK;
+
+        va_block->bg_promote_pause_count--;
+        if (va_block->bg_promote_pause_count == 0) {
+            atomic64_inc(&g_uvm_latency_bg_promote_resumed_blocks);
+            if (touched_blocks_out)
+                *touched_blocks_out = 1;
+            block_bg_promote_schedule_on_resume_locked(va_block);
+        }
+    }
+
+    return NV_OK;
 }
 
 static bool block_bg_promote_cancel_delayed_work_locked(uvm_va_block_t *va_block)
@@ -9307,7 +9404,10 @@ NV_STATUS uvm_va_block_start_readmostly_bg_promote(uvm_va_block_t *va_block,
 
     uvm_processor_mask_set(&va_block->bg_promote_gpus, gpu_id);
     atomic64_add(pending_pages, &g_uvm_latency_bg_promote_start_pages);
-    block_bg_promote_schedule_now(va_block);
+    if (block_bg_promote_paused_locked(va_block))
+        atomic64_inc(&g_uvm_latency_bg_promote_gate_skips);
+    else
+        block_bg_promote_schedule_now(va_block);
 
     return NV_OK;
 }
@@ -9721,6 +9821,12 @@ static NV_STATUS block_bg_promote_locked(uvm_va_block_t *va_block,
 {
     uvm_gpu_id_t gpu_id;
     NvU32 max_pages = uvm_latency_bg_promote_max_pages;
+
+    if (block_bg_promote_paused_locked(va_block)) {
+        if (block_bg_promote_pages_pending(va_block))
+            atomic64_inc(&g_uvm_latency_bg_promote_gate_skips);
+        return NV_OK;
+    }
 
     if (max_pages == 0)
         max_pages = PAGES_PER_UVM_VA_BLOCK;
@@ -12009,6 +12115,8 @@ NV_STATUS uvm_va_block_split(uvm_va_block_t *existing_va_block,
             new_block->phase_n.tag_valid = existing_va_block->phase_n.tag_valid;
             new_block->phase_n.mixed_pool = existing_va_block->phase_n.mixed_pool;
         }
+
+        new_block->bg_promote_pause_count = existing_va_block->bg_promote_pause_count;
 
         if (new_va_block)
             *new_va_block = new_block;

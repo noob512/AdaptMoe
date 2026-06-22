@@ -59,6 +59,7 @@ _UVM_DRIVER_BATCH_MAX_RANGES = 64
 _UVM_INITIALIZE_IOCTL = 0x30000001
 _UVM_PHASE_F_BATCH_EXECUTOR_IOCTL = 81
 _UVM_PHASE_F_MAX_RANGES = 64
+_UVM_PAGE_SIZE = 0
 
 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ = 5
 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG = 6
@@ -358,6 +359,24 @@ def load_uvm_library() -> ctypes.CDLL:
         ctypes.c_size_t,
         ctypes.c_int,
     ]
+
+    for helper_name in (
+        "uvm_driver_batch_prepare_remote_read",
+        "uvm_driver_batch_prepare_remote_read_bg_deferred",
+        "uvm_driver_batch_start_bg_promotion",
+        "uvm_driver_batch_pause_bg_promotion",
+        "uvm_driver_batch_resume_bg_promotion",
+    ):
+        if hasattr(lib, helper_name):
+            helper = getattr(lib, helper_name)
+            helper.restype = ctypes.c_int
+            helper.argtypes = [
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.c_size_t,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
 
     lib.uvm_driver_batch_query_residency_bytes.restype = ctypes.c_int
     lib.uvm_driver_batch_query_residency_bytes.argtypes = [
@@ -799,6 +818,150 @@ def _prepare_uvm_range_arrays(
     return ptr_array, size_array, count
 
 
+def get_uvm_page_size() -> int:
+    global _UVM_PAGE_SIZE
+    if _UVM_PAGE_SIZE > 0:
+        return _UVM_PAGE_SIZE
+
+    raw = os.environ.get("VLLM_UVM_HYBRID_PAGE_SIZE", "").strip()
+    if raw:
+        try:
+            value = int(raw, 0)
+            if value > 0:
+                _UVM_PAGE_SIZE = value
+                return _UVM_PAGE_SIZE
+        except ValueError:
+            logger.warning("Invalid VLLM_UVM_HYBRID_PAGE_SIZE=%r", raw)
+
+    try:
+        _UVM_PAGE_SIZE = int(os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError):
+        _UVM_PAGE_SIZE = 4096
+    if _UVM_PAGE_SIZE <= 0:
+        _UVM_PAGE_SIZE = 4096
+    return _UVM_PAGE_SIZE
+
+
+def round_ranges_to_pages(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    page_size: int | None = None,
+) -> list[tuple[int, int]]:
+    """Round raw byte ranges to page ranges and merge overlaps.
+
+    This is the intentionally aggressive experimental normalization used by
+    the hybrid Phase-F ioctl path. It assumes the rounded pages are safe to
+    treat as readonly managed weight pages.
+    """
+    page = int(page_size or get_uvm_page_size())
+    if page <= 0:
+        page = 4096
+
+    rounded: list[tuple[int, int]] = []
+    for ptr, size in ranges:
+        start = int(ptr)
+        length = int(size)
+        if start <= 0 or length <= 0:
+            continue
+        end = start + length
+        rounded_start = start - (start % page)
+        rounded_end = ((end + page - 1) // page) * page
+        if rounded_end <= rounded_start:
+            continue
+        rounded.append((rounded_start, rounded_end - rounded_start))
+
+    if not rounded:
+        return []
+
+    rounded.sort()
+    merged: list[tuple[int, int]] = []
+    cur_start, cur_size = rounded[0]
+    cur_end = cur_start + cur_size
+    for start, size in rounded[1:]:
+        end = start + size
+        if start <= cur_end:
+            cur_end = max(cur_end, end)
+            continue
+        merged.append((cur_start, cur_end - cur_start))
+        cur_start, cur_end = start, end
+    merged.append((cur_start, cur_end - cur_start))
+    return merged
+
+
+def _phase_f_cpp_helper_name(action: int) -> str | None:
+    if action == UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ:
+        return "uvm_driver_batch_prepare_remote_read"
+    if action == UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED:
+        return "uvm_driver_batch_prepare_remote_read_bg_deferred"
+    if action == UVM_PHASE_F_ACTION_START_BG_PROMOTION:
+        return "uvm_driver_batch_start_bg_promotion"
+    if action == UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION:
+        return "uvm_driver_batch_pause_bg_promotion"
+    if action == UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION:
+        return "uvm_driver_batch_resume_bg_promotion"
+    return None
+
+
+def _phase_f_cpp_helper_enabled() -> bool:
+    raw = os.environ.get("VLLM_UVM_PHASE_F_CPP_HELPER")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _driver_phase_f_batch_execute_ranges_cpp_helper(
+    ranges: list[tuple[int, int]],
+    action: int,
+    *,
+    device: int = 0,
+    async_: bool = False,
+) -> tuple[int, int, int, int] | None:
+    if not _phase_f_cpp_helper_enabled() or _uvm_lib is None:
+        return None
+
+    helper_name = _phase_f_cpp_helper_name(action)
+    if helper_name is None or not hasattr(_uvm_lib, helper_name):
+        return None
+
+    helper = getattr(_uvm_lib, helper_name)
+    total_success = 0
+    total_failure = 0
+    last_rm_status = 0
+    for start in range(0, len(ranges), _UVM_DRIVER_BATCH_MAX_RANGES):
+        chunk = ranges[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
+        ptr_array, size_array, count = _prepare_uvm_range_arrays(chunk)
+        if count <= 0:
+            continue
+        result = int(
+            helper(
+                ptr_array,
+                size_array,
+                ctypes.c_size_t(count),
+                ctypes.c_int(device),
+                ctypes.c_int(1 if async_ else 0),
+            )
+        )
+        if result < 0:
+            if result < -6:
+                last_rm_status = -result
+            total_failure += count
+            logger.warning(
+                "Phase-F C++ helper %s failed: result=%s rmStatus=%s "
+                "success=%s failure=%s",
+                helper_name,
+                result,
+                last_rm_status,
+                total_success,
+                total_failure,
+            )
+            return total_success, total_failure, last_rm_status, result
+        total_success += result
+        if result < count:
+            total_failure += count - result
+
+    return total_success, total_failure, last_rm_status, 0
+
+
 def driver_phase_f_batch_execute_ranges(
     ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
     action: int,
@@ -825,6 +988,15 @@ def driver_phase_f_batch_execute_ranges(
     ]
     if not range_list:
         return 0, 0, 0, 0
+
+    helper_result = _driver_phase_f_batch_execute_ranges_cpp_helper(
+        range_list,
+        action,
+        device=device,
+        async_=async_,
+    )
+    if helper_result is not None:
+        return helper_result
 
     try:
         gpu_uuid = _phase_f_gpu_uuid(device)
@@ -895,6 +1067,19 @@ def driver_prepare_ranges_remote_read_bg_deferred(
     return driver_phase_f_batch_execute_ranges(
         ranges,
         UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED,
+        device=device,
+    )
+
+
+def driver_prepare_ranges_remote_read(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    device: int = 0,
+) -> tuple[int, int, int, int]:
+    """Prepare remote READ PTEs without marking background promotion pending."""
+    return driver_phase_f_batch_execute_ranges(
+        ranges,
+        UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ,
         device=device,
     )
 

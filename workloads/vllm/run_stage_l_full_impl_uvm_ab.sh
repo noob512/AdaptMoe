@@ -32,6 +32,7 @@ SCRATCH_MAX_TOTAL_BYTES=""
 SCRATCH_MAX_BYTES=""
 
 SERVER_MAX_NUM_SEQS="${SERVER_MAX_NUM_SEQS:-4}"
+SERVER_MAX_NUM_BATCHED_TOKENS="${SERVER_MAX_NUM_BATCHED_TOKENS:-}"
 SERVER_GPU_MEMORY_UTILIZATION="${SERVER_GPU_MEMORY_UTILIZATION:-0.75}"
 
 GLOBAL_GPU_BYTES="${GLOBAL_GPU_BYTES:-25769803776}"       # 24 GiB
@@ -139,6 +140,7 @@ Common options:
 
 Server pressure controls:
   --server-max-num-seqs <n>              default: 4
+  --server-max-num-batched-tokens <n>    optional vLLM server limit
   --server-gpu-memory-utilization <f>    default: 0.75
 
 Scratch direct controls:
@@ -222,6 +224,7 @@ while [ $# -gt 0 ]; do
     --fail-fast) FAIL_FAST=1; shift ;;
     --skip-trace-control) RUN_TRACE_CONTROL=0; shift ;;
     --server-max-num-seqs) SERVER_MAX_NUM_SEQS="$2"; shift 2 ;;
+    --server-max-num-batched-tokens) SERVER_MAX_NUM_BATCHED_TOKENS="$2"; shift 2 ;;
     --server-gpu-memory-utilization) SERVER_GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
     --scratch-profile) SCRATCH_PROFILE="$2"; shift 2 ;;
     --scratch-total-bytes) SCRATCH_MAX_TOTAL_BYTES="$2"; SCRATCH_PROFILE="custom"; shift 2 ;;
@@ -421,6 +424,7 @@ echo " scratch_total_bytes: $SCRATCH_MAX_TOTAL_BYTES"
 echo " scratch_max_bytes: $SCRATCH_MAX_BYTES"
 echo " scratch_backend: $SCRATCH_BACKEND"
 echo " server_max_num_seqs: $SERVER_MAX_NUM_SEQS"
+echo " server_max_num_batched_tokens: ${SERVER_MAX_NUM_BATCHED_TOKENS:-<unset>}"
 echo " server_gpu_memory_utilization: $SERVER_GPU_MEMORY_UTILIZATION"
 echo " global_gpu_bytes: $GLOBAL_GPU_BYTES"
 echo " weight_gpu_bytes: $WEIGHT_GPU_BYTES"
@@ -530,6 +534,9 @@ base_args() {
     --prompts "$PROMPTS" \
     --request-rate "$REQUEST_RATE" \
     --output-len "$OUTPUT_LEN"
+  if [ -n "$SERVER_MAX_NUM_BATCHED_TOKENS" ]; then
+    printf '%s\0' --server-max-num-batched-tokens "$SERVER_MAX_NUM_BATCHED_TOKENS"
+  fi
   if [ "$FAULT_ADDRESS_LOG_ENABLE" = "1" ]; then
     printf '%s\0' \
       --with-address-log \

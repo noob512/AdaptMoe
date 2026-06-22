@@ -22,6 +22,7 @@ WEIGHT_PLAN_FILE="${WEIGHT_PLAN_FILE:-}"
 WEIGHT_GPU_BYTES="${WEIGHT_GPU_BYTES:-10737418240}"
 KV_GPU_BYTES="${KV_GPU_BYTES:-2147483648}"
 SERVER_MAX_NUM_SEQS="${SERVER_MAX_NUM_SEQS:-1}"
+SERVER_MAX_NUM_BATCHED_TOKENS="${SERVER_MAX_NUM_BATCHED_TOKENS:-}"
 SERVER_GPU_MEMORY_UTILIZATION="${SERVER_GPU_MEMORY_UTILIZATION:-0.70}"
 WEIGHT_EXECUTOR="${WEIGHT_EXECUTOR:-auto}"
 REQUIRE_DRIVER=0
@@ -92,6 +93,7 @@ Options:
   --weight-gpu-bytes <n>                 default: 10GiB
   --kv-gpu-bytes <n>                     default: 2GiB
   --server-max-num-seqs <n>              default: 1
+  --server-max-num-batched-tokens <n>    optional vLLM server limit
   --server-gpu-memory-utilization <f>    default: 0.70
   --weight-executor <mode>               auto|driver_batch|cpp_batch (default: auto)
   --require-driver                       fail unless executor=driver_batch is observed
@@ -158,6 +160,7 @@ while [ $# -gt 0 ]; do
     --weight-gpu-bytes) WEIGHT_GPU_BYTES="$2"; shift 2 ;;
     --kv-gpu-bytes) KV_GPU_BYTES="$2"; shift 2 ;;
     --server-max-num-seqs) SERVER_MAX_NUM_SEQS="$2"; shift 2 ;;
+    --server-max-num-batched-tokens) SERVER_MAX_NUM_BATCHED_TOKENS="$2"; shift 2 ;;
     --server-gpu-memory-utilization) SERVER_GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
     --weight-executor) WEIGHT_EXECUTOR="$2"; shift 2 ;;
     --require-driver) REQUIRE_DRIVER=1; shift ;;
@@ -251,6 +254,11 @@ if ! [[ "$WEIGHT_ROUTER_TOPK_EVERY_N_STEPS" =~ ^[0-9]+$ ]]; then
   echo "WEIGHT_ROUTER_TOPK_EVERY_N_STEPS must be a non-negative integer" >&2
   exit 2
 fi
+if [ -n "$SERVER_MAX_NUM_BATCHED_TOKENS" ] \
+  && ! [[ "$SERVER_MAX_NUM_BATCHED_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SERVER_MAX_NUM_BATCHED_TOKENS must be a positive integer" >&2
+  exit 2
+fi
 if ! [[ "$WEIGHT_PREFETCH_MAX_BYTES_PER_STEP" =~ ^[0-9]+$ ]]; then
   echo "WEIGHT_PREFETCH_MAX_BYTES_PER_STEP must be a non-negative integer" >&2
   exit 2
@@ -325,6 +333,12 @@ CHECK_MD="$RUN_ROOT/phase_f_check.md"
 PHASE_F_DEBUG_LOG="$RUN_ROOT/phase_f_user_debug.log"
 mkdir -p "$PROFILE_DIR" "$CHECK_DIR"
 export VLLM_UVM_PHASE_F_DEBUG_LOG="$PHASE_F_DEBUG_LOG"
+SERVER_BATCH_TOKEN_ARGS=()
+if [ -n "$SERVER_MAX_NUM_BATCHED_TOKENS" ]; then
+  SERVER_BATCH_TOKEN_ARGS=(
+    --server-max-num-batched-tokens "$SERVER_MAX_NUM_BATCHED_TOKENS"
+  )
+fi
 
 echo "==========================================================="
 echo " Stage M Phase F Check"
@@ -333,6 +347,8 @@ echo " model: $MODEL"
 echo " prompts: $PROMPTS"
 echo " output_len: $OUTPUT_LEN"
 echo " request_rate: $REQUEST_RATE"
+echo " server_max_num_seqs: $SERVER_MAX_NUM_SEQS"
+echo " server_max_num_batched_tokens: ${SERVER_MAX_NUM_BATCHED_TOKENS:-<unset>}"
 echo " routing_trace: ${ROUTING_TRACE:-<generate>}"
 echo " weight_plan_file: ${WEIGHT_PLAN_FILE:-<generate>}"
 echo " weight_executor: $WEIGHT_EXECUTOR"
@@ -435,6 +451,7 @@ if [ -z "$ROUTING_TRACE" ]; then
     --uvm-moe-routing-trace-enable 1 \
     --uvm-moe-routing-trace-file "$PROFILE_DIR/vllm_uvm_moe_routing_trace.jsonl" \
     --server-max-num-seqs "$SERVER_MAX_NUM_SEQS" \
+    "${SERVER_BATCH_TOKEN_ARGS[@]}" \
     --server-gpu-memory-utilization "$SERVER_GPU_MEMORY_UTILIZATION" \
     --prompts "$PROMPTS" \
     --request-rate "$REQUEST_RATE" \
@@ -479,6 +496,7 @@ WEIGHT_BATCH_EXECUTOR_ENABLE=1 \
   --repeat 1 \
   --skip-trace-control \
   --server-max-num-seqs "$SERVER_MAX_NUM_SEQS" \
+  "${SERVER_BATCH_TOKEN_ARGS[@]}" \
   --server-gpu-memory-utilization "$SERVER_GPU_MEMORY_UTILIZATION" \
   --weight-gpu-bytes "$WEIGHT_GPU_BYTES" \
   --kv-gpu-bytes "$KV_GPU_BYTES" \

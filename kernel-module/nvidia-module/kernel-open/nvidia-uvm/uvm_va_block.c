@@ -9122,7 +9122,6 @@ NV_STATUS uvm_va_block_premap_readmostly_remote_read(uvm_va_block_t *va_block,
     uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
     uvm_gpu_t *gpu;
     uvm_va_block_gpu_state_t *gpu_state;
-    const uvm_va_policy_t *policy;
     uvm_page_mask_t *map_mask = &block_context->scratch_page_mask;
     NvU32 candidate_pages = 0;
     NvU32 mapped_pages = 0;
@@ -9142,10 +9141,6 @@ NV_STATUS uvm_va_block_premap_readmostly_remote_read(uvm_va_block_t *va_block,
     gpu = uvm_gpu_get(gpu_id);
     if (!uvm_gpu_va_space_get(va_space, gpu))
         return NV_ERR_INVALID_DEVICE;
-
-    policy = uvm_va_policy_get_region(va_block, region);
-    if (!uvm_va_policy_is_read_duplicate(policy))
-        return NV_ERR_INVALID_STATE;
 
     gpu_state = uvm_va_block_gpu_state_get_alloc(va_block, gpu);
     if (!gpu_state)
@@ -9280,7 +9275,6 @@ NV_STATUS uvm_va_block_enqueue_readmostly_bg_promote(uvm_va_block_t *va_block,
 {
     uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
     uvm_gpu_t *gpu;
-    const uvm_va_policy_t *policy;
     uvm_page_mask_t *promote_mask = &block_context->caller_page_mask;
 
     uvm_assert_mutex_locked(&va_block->lock);
@@ -9297,10 +9291,6 @@ NV_STATUS uvm_va_block_enqueue_readmostly_bg_promote(uvm_va_block_t *va_block,
     gpu = uvm_gpu_get(gpu_id);
     if (!uvm_gpu_va_space_get(va_space, gpu))
         return NV_ERR_INVALID_DEVICE;
-
-    policy = uvm_va_policy_get_region(va_block, region);
-    if (!uvm_va_policy_is_read_duplicate(policy))
-        return NV_ERR_INVALID_STATE;
 
     uvm_page_mask_init_from_region(promote_mask, region, NULL);
 
@@ -9323,7 +9313,6 @@ NV_STATUS uvm_va_block_enqueue_readmostly_bg_promote_deferred(uvm_va_block_t *va
 {
     uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
     uvm_gpu_t *gpu;
-    const uvm_va_policy_t *policy;
     uvm_page_mask_t *promote_mask = &block_context->caller_page_mask;
 
     uvm_assert_mutex_locked(&va_block->lock);
@@ -9340,10 +9329,6 @@ NV_STATUS uvm_va_block_enqueue_readmostly_bg_promote_deferred(uvm_va_block_t *va
     gpu = uvm_gpu_get(gpu_id);
     if (!uvm_gpu_va_space_get(va_space, gpu))
         return NV_ERR_INVALID_DEVICE;
-
-    policy = uvm_va_policy_get_region(va_block, region);
-    if (!uvm_va_policy_is_read_duplicate(policy))
-        return NV_ERR_INVALID_STATE;
 
     uvm_page_mask_init_from_region(promote_mask, region, NULL);
 
@@ -9367,7 +9352,6 @@ NV_STATUS uvm_va_block_start_readmostly_bg_promote(uvm_va_block_t *va_block,
     uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
     uvm_gpu_t *gpu;
     uvm_va_block_gpu_state_t *gpu_state;
-    const uvm_va_policy_t *policy;
     uvm_page_mask_t *pending_mask = &block_context->scratch_page_mask;
     NvU32 pending_pages;
 
@@ -9385,10 +9369,6 @@ NV_STATUS uvm_va_block_start_readmostly_bg_promote(uvm_va_block_t *va_block,
     gpu = uvm_gpu_get(gpu_id);
     if (!uvm_gpu_va_space_get(va_space, gpu))
         return NV_ERR_INVALID_DEVICE;
-
-    policy = uvm_va_policy_get_region(va_block, region);
-    if (!uvm_va_policy_is_read_duplicate(policy))
-        return NV_ERR_INVALID_STATE;
 
     gpu_state = uvm_va_block_gpu_state_get(va_block, gpu_id);
     if (!gpu_state)

@@ -3410,11 +3410,6 @@ static NV_STATUS uvm_phase_f_prepare_remote_read(const NvProcessorUuid *gpu_uuid
 
         managed_range_last = managed_range;
 
-        if (!uvm_va_policy_is_read_duplicate(&managed_range->policy)) {
-            status = NV_ERR_INVALID_STATE;
-            goto out;
-        }
-
         for (block_index = first_block_index; block_index <= last_block_index; ++block_index) {
             uvm_va_block_t *block;
             NvU64 block_start;
@@ -3556,11 +3551,6 @@ static NV_STATUS uvm_phase_f_start_bg_promotion(const NvProcessorUuid *gpu_uuid,
         size_t block_index;
 
         managed_range_last = managed_range;
-
-        if (!uvm_va_policy_is_read_duplicate(&managed_range->policy)) {
-            status = NV_ERR_INVALID_STATE;
-            goto out;
-        }
 
         for (block_index = first_block_index; block_index <= last_block_index; ++block_index) {
             uvm_va_block_t *block;

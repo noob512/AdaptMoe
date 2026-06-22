@@ -23,8 +23,12 @@ SEED=42
 STARTUP_TIMEOUT=600
 CHECK_INTERVAL=2
 SERVER_MAX_NUM_SEQS="${VLLM_SERVER_MAX_NUM_SEQS:-8}"
+SERVER_MAX_NUM_BATCHED_TOKENS="${VLLM_SERVER_MAX_NUM_BATCHED_TOKENS:-}"
 SERVER_GPU_MEMORY_UTILIZATION="${VLLM_SERVER_GPU_MEMORY_UTILIZATION:-0.85}"
 SERVER_MAX_MODEL_LEN="${VLLM_SERVER_MAX_MODEL_LEN:-}"
+SERVER_CPU_OFFLOAD_GB="${VLLM_SERVER_CPU_OFFLOAD_GB:-}"
+SERVER_KV_CACHE_MEMORY_BYTES="${VLLM_SERVER_KV_CACHE_MEMORY_BYTES:-}"
+SERVER_EXTRA_ENV="${VLLM_SERVER_EXTRA_ENV:-}"
 UVM_PHASE_F_ROUTE_LOG_DELAY_MS="${UVM_PHASE_F_ROUTE_LOG_DELAY_MS:-0}"
 UVM_PHASE_N_AUTO_RECLAIM_ENABLE="${UVM_PHASE_N_AUTO_RECLAIM_ENABLE:-0}"
 UVM_PHASE_N_AUTO_RECLAIM_EXECUTE="${UVM_PHASE_N_AUTO_RECLAIM_EXECUTE:-0}"
@@ -622,9 +626,18 @@ Options:
   --startup-timeout <sec>    Server/KV wait timeout (default: 600)
   --check-interval <sec>     Poll interval (default: 2)
   --server-max-num-seqs <n>  vLLM server --max-num-seqs (default: 8)
+  --server-max-num-batched-tokens <n>
+                             vLLM server --max-num-batched-tokens
   --server-gpu-memory-utilization <f>
                              vLLM server --gpu-memory-utilization (default: 0.85)
   --max-model-len <n>        vLLM server --max-model-len
+  --server-cpu-offload-gb <f>
+                             Optional vLLM server --cpu-offload-gb.
+  --server-kv-cache-memory-bytes <n>
+                             Optional vLLM server --kv-cache-memory-bytes.
+  --server-extra-env <string>
+                             Extra KEY=VALUE assignments prepended to vLLM
+                             server launch. Quote as one shell string.
   --with-address-log         Also enable per-fault address logs
   --no-cleanup               Skip workloads/cleanup_gpu.py before run
   --no-bench                 Configure params only, do not run benchmark
@@ -769,6 +782,30 @@ enable_phase_n_auto_reclaim_execute_after_ready() {
 
 is_hex_u64() {
   [[ "$1" =~ ^0x[0-9a-fA-F]+$ ]]
+}
+
+abs_path_from_cwd() {
+  local path="$1"
+  if [ -z "$path" ] || [[ "$path" = /* ]]; then
+    printf '%s\n' "$path"
+  else
+    printf '%s/%s\n' "$PWD" "$path"
+  fi
+}
+
+normalize_output_paths() {
+  ADDRESS_LOG="$(abs_path_from_cwd "$ADDRESS_LOG")"
+  SERVER_LOG="$(abs_path_from_cwd "$SERVER_LOG")"
+  BENCH_LOG="$(abs_path_from_cwd "$BENCH_LOG")"
+  if [ -n "$TRACE_LOG" ]; then
+    TRACE_LOG="$(abs_path_from_cwd "$TRACE_LOG")"
+  fi
+  if [ -n "$ADDRESS_TRACE_LOG" ]; then
+    ADDRESS_TRACE_LOG="$(abs_path_from_cwd "$ADDRESS_TRACE_LOG")"
+  fi
+  if [ -n "$ALLOCATOR_TRACE_LOG" ]; then
+    ALLOCATOR_TRACE_LOG="$(abs_path_from_cwd "$ALLOCATOR_TRACE_LOG")"
+  fi
 }
 
 extract_kv_range_from_log() {
@@ -1016,8 +1053,20 @@ start_server() {
 
     # 3. 构造服务器启动指令
     local max_model_len_arg=""
+    local max_num_batched_tokens_arg=""
+    local cpu_offload_arg=""
+    local kv_cache_memory_bytes_arg=""
     if [ -n "$SERVER_MAX_MODEL_LEN" ]; then
       max_model_len_arg="--max-model-len '$SERVER_MAX_MODEL_LEN'"
+    fi
+    if [ -n "$SERVER_MAX_NUM_BATCHED_TOKENS" ]; then
+      max_num_batched_tokens_arg="--max-num-batched-tokens '$SERVER_MAX_NUM_BATCHED_TOKENS'"
+    fi
+    if [ -n "$SERVER_CPU_OFFLOAD_GB" ]; then
+      cpu_offload_arg="--cpu-offload-gb '$SERVER_CPU_OFFLOAD_GB'"
+    fi
+    if [ -n "$SERVER_KV_CACHE_MEMORY_BYTES" ]; then
+      kv_cache_memory_bytes_arg="--kv-cache-memory-bytes '$SERVER_KV_CACHE_MEMORY_BYTES'"
     fi
     local server_cmd
     # 指令解析：
@@ -1034,13 +1083,17 @@ start_server() {
                 VLLM_USE_UVM=1 \
                 VLLM_UVM_ADDRESS_LOG_ENABLE=1 \
                 VLLM_UVM_ADDRESS_LOG_FILE='$ADDRESS_LOG' \
+                $SERVER_EXTRA_ENV \
                 $allocator_env \
                 $policy_env \
                 uv run vllm serve '$MODEL' \
                 --enforce-eager \
                 --max-num-seqs '$SERVER_MAX_NUM_SEQS' \
+                $max_num_batched_tokens_arg \
                 $max_model_len_arg \
                 --gpu-memory-utilization '$SERVER_GPU_MEMORY_UTILIZATION' \
+                $cpu_offload_arg \
+                $kv_cache_memory_bytes_arg \
                 --port '$PORT' > '$SERVER_LOG' 2>&1"
 
     # 4. 后台执行并脱离终端控制
@@ -1623,8 +1676,12 @@ parse_args() {
       --startup-timeout) STARTUP_TIMEOUT="$2"; shift 2 ;;   # 设置等待服务器启动的超时时间
       --check-interval) CHECK_INTERVAL="$2"; shift 2 ;;     # 设置轮询检查的间隔时间
       --server-max-num-seqs) SERVER_MAX_NUM_SEQS="$2"; shift 2 ;; # 设置 vLLM server 最大并发序列数
+      --server-max-num-batched-tokens) SERVER_MAX_NUM_BATCHED_TOKENS="$2"; shift 2 ;; # 设置 vLLM server 每轮最大 batched tokens
       --server-gpu-memory-utilization) SERVER_GPU_MEMORY_UTILIZATION="$2"; shift 2 ;; # 设置 vLLM server 显存利用率
       --max-model-len) SERVER_MAX_MODEL_LEN="$2"; shift 2 ;; # 设置 vLLM server max model len
+      --server-cpu-offload-gb) SERVER_CPU_OFFLOAD_GB="$2"; shift 2 ;; # 设置 vLLM server CPU offload GB
+      --server-kv-cache-memory-bytes) SERVER_KV_CACHE_MEMORY_BYTES="$2"; shift 2 ;; # 设置 vLLM server KV cache bytes
+      --server-extra-env) SERVER_EXTRA_ENV="$2"; shift 2 ;; # 设置 vLLM server 额外环境变量
 
       # ==========================================
       # 布尔开关类型参数 (Boolean Flags): 只需要出现该选项即可，不需要值
@@ -1870,6 +1927,15 @@ validate_inputs() {
     [[ "$UVM_SCRATCH_POOL_REUSE_CACHE_MAX_ENTRIES_PER_BUCKET" =~ ^[0-9]+$ ]] || die "--uvm-scratch-pool-reuse-cache-max-entries-per-bucket must be a non-negative integer"
     [[ "$UVM_MOE_ROUTING_TRACE_ENABLE" =~ ^[01]$ ]] || die "--uvm-moe-routing-trace-enable must be 0 or 1"
     [[ "$SERVER_MAX_NUM_SEQS" =~ ^[1-9][0-9]*$ ]] || die "--server-max-num-seqs must be a positive integer"
+    if [ -n "$SERVER_MAX_NUM_BATCHED_TOKENS" ]; then
+      [[ "$SERVER_MAX_NUM_BATCHED_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "--server-max-num-batched-tokens must be a positive integer"
+    fi
+    if [ -n "$SERVER_CPU_OFFLOAD_GB" ]; then
+      [[ "$SERVER_CPU_OFFLOAD_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--server-cpu-offload-gb must be a non-negative number"
+    fi
+    if [ -n "$SERVER_KV_CACHE_MEMORY_BYTES" ]; then
+      [[ "$SERVER_KV_CACHE_MEMORY_BYTES" =~ ^[1-9][0-9]*$ ]] || die "--server-kv-cache-memory-bytes must be a positive integer"
+    fi
     [[ "$SERVER_GPU_MEMORY_UTILIZATION" =~ ^(0\.[0-9]+|1(\.0+)?)$ ]] || die "--server-gpu-memory-utilization must be in (0, 1]"
     [[ "$AUTO_GAP_WATCH_ENABLE" =~ ^[01]$ ]] || die "--auto-gap-watch-enable must be 0 or 1"
     [[ "$AUTO_GAP_WATCH_PROBE_PROMPTS" =~ ^[0-9]+$ ]] || die "--auto-gap-watch-probe-prompts must be a non-negative integer"
@@ -2318,6 +2384,7 @@ print_delta_stats() {
 
 main() {
   parse_args "$@"
+  normalize_output_paths
 
   trap cleanup EXIT INT TERM
 

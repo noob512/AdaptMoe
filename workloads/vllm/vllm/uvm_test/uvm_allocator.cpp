@@ -62,6 +62,12 @@ constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU = 1;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU = 2;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_ADVISE_CPU = 3;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY = 4;
+constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ = 5;
+constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG = 6;
+constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED = 7;
+constexpr uint32_t UVM_TEST_PHASE_F_ACTION_START_BG_PROMOTION = 8;
+constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16;
+constexpr uint32_t UVM_TEST_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17;
 
 struct PhaseFUuid {
     uint8_t uuid[16];
@@ -462,8 +468,34 @@ const char* phase_f_action_name(uint32_t action) {
             return "ADVISE_CPU";
         case UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY:
             return "QUERY_RESIDENCY";
+        case UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ:
+            return "PREPARE_REMOTE_READ";
+        case UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG:
+            return "PREPARE_REMOTE_READ_BG";
+        case UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED:
+            return "PREPARE_REMOTE_READ_BG_DEFERRED";
+        case UVM_TEST_PHASE_F_ACTION_START_BG_PROMOTION:
+            return "START_BG_PROMOTION";
+        case UVM_TEST_PHASE_F_ACTION_PAUSE_BG_PROMOTION:
+            return "PAUSE_BG_PROMOTION";
+        case UVM_TEST_PHASE_F_ACTION_RESUME_BG_PROMOTION:
+            return "RESUME_BG_PROMOTION";
         default:
             return "UNKNOWN";
+    }
+}
+
+bool phase_f_action_needs_gpu_uuid(uint32_t action) {
+    switch (action) {
+        case UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU:
+        case UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY:
+        case UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ:
+        case UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG:
+        case UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED:
+        case UVM_TEST_PHASE_F_ACTION_START_BG_PROMOTION:
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -536,8 +568,7 @@ int uvm_driver_batch_execute_internal(const uintptr_t* ptrs,
     params.count = static_cast<uint32_t>(count);
     params.async = async ? 1 : 0;
     params.gpu_uuid = CPU_UUID;
-    if ((action == UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU ||
-         action == UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY) &&
+    if (phase_f_action_needs_gpu_uuid(action) &&
         !get_cuda_device_uuid(device, &params.gpu_uuid)) {
         phase_f_debug_log("driver_batch action=%s count=%zu device=%d uuid_lookup_failed",
                           phase_f_action_name(action), count, device);
@@ -761,8 +792,7 @@ int uvm_driver_phase_f_batch_regions_fd(int fd,
     params.count = static_cast<uint32_t>(count);
     params.async = async ? 1 : 0;
     params.gpu_uuid = CPU_UUID;
-    if ((action == UVM_TEST_PHASE_F_ACTION_PREFETCH_GPU ||
-         action == UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY) &&
+    if (phase_f_action_needs_gpu_uuid(action) &&
         !get_cuda_device_uuid(device, &params.gpu_uuid)) {
         phase_f_debug_log("driver_batch_regions action=%s count=%zu device=%d uuid_lookup_failed",
                           phase_f_action_name(action), count, device);
@@ -6875,6 +6905,81 @@ int uvm_driver_batch_query_residency(const uintptr_t* ptrs,
         UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY,
         device,
         0,
+        nullptr);
+}
+
+int uvm_driver_batch_prepare_remote_read_bg_deferred(const uintptr_t* ptrs,
+                                                     const size_t* sizes,
+                                                     size_t count,
+                                                     int device,
+                                                     int async) {
+    return uvm_driver_batch_execute_internal(
+        ptrs,
+        sizes,
+        count,
+        UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED,
+        device,
+        async,
+        nullptr);
+}
+
+int uvm_driver_batch_prepare_remote_read(const uintptr_t* ptrs,
+                                         const size_t* sizes,
+                                         size_t count,
+                                         int device,
+                                         int async) {
+    return uvm_driver_batch_execute_internal(
+        ptrs,
+        sizes,
+        count,
+        UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ,
+        device,
+        async,
+        nullptr);
+}
+
+int uvm_driver_batch_start_bg_promotion(const uintptr_t* ptrs,
+                                        const size_t* sizes,
+                                        size_t count,
+                                        int device,
+                                        int async) {
+    return uvm_driver_batch_execute_internal(
+        ptrs,
+        sizes,
+        count,
+        UVM_TEST_PHASE_F_ACTION_START_BG_PROMOTION,
+        device,
+        async,
+        nullptr);
+}
+
+int uvm_driver_batch_pause_bg_promotion(const uintptr_t* ptrs,
+                                        const size_t* sizes,
+                                        size_t count,
+                                        int device,
+                                        int async) {
+    return uvm_driver_batch_execute_internal(
+        ptrs,
+        sizes,
+        count,
+        UVM_TEST_PHASE_F_ACTION_PAUSE_BG_PROMOTION,
+        device,
+        async,
+        nullptr);
+}
+
+int uvm_driver_batch_resume_bg_promotion(const uintptr_t* ptrs,
+                                         const size_t* sizes,
+                                         size_t count,
+                                         int device,
+                                         int async) {
+    return uvm_driver_batch_execute_internal(
+        ptrs,
+        sizes,
+        count,
+        UVM_TEST_PHASE_F_ACTION_RESUME_BG_PROMOTION,
+        device,
+        async,
         nullptr);
 }
 

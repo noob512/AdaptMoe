@@ -1,3 +1,0 @@
-case,exit_code,successful_requests,failed_requests,output_tok_s,mean_tpot_ms,mean_ttft_ms,mean_itl_ms,output_tok_s_ratio_vs_native,mean_tpot_ratio_vs_native,manifest_parameters,manifest_bytes,backend_counts,uvm_managed,uvm_prefetch_cpu_success,uvm_preferred_cpu_success,uvm_accessed_by_success,same_offload_names_as_native
-native_cpu_offload,0,5.0,0.0,12.13,48.55,310.64,48.55,1.0,1.0,233,8728868976,{'uva': 233},0,0,0,0,True
-isolated_uvm_remote_offload,0,5.0,0.0,12.07,49.1,309.13,49.11,0.9950535861500411,1.0113285272914523,233,8728868976,{'isolated_uvm_remote': 233},233,233,233,233,True

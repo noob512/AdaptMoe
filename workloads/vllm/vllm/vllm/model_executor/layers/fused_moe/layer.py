@@ -2128,6 +2128,32 @@ class FusedMoE(CustomOp):
                 valid_ids.flatten(),
                 minlength=max(int(self.global_num_experts), 0),
             ).cpu()
+            weight_sums: dict[str, float] = {}
+            try:
+                weights = topk_weights.detach()
+                if weights.shape == ids.shape:
+                    valid_weights = weights[ids >= 0].to(dtype=torch.float32)
+                    weighted_counts = torch.bincount(
+                        valid_ids.flatten(),
+                        weights=valid_weights.flatten(),
+                        minlength=max(int(self.global_num_experts), 0),
+                    ).cpu()
+                    weight_sums = {
+                        str(int(expert_id)): float(
+                            weighted_counts[expert_id].item()
+                        )
+                        for expert_id in torch.nonzero(
+                            weighted_counts, as_tuple=False
+                        )
+                        .flatten()
+                        .tolist()
+                        if weighted_counts[expert_id].item() > 0
+                    }
+            except Exception:
+                logger.debug(
+                    "Failed to compute weighted UVM MoE routing trace",
+                    exc_info=True,
+                )
             active = torch.nonzero(counts, as_tuple=False).flatten().tolist()
             active_counts = {
                 str(int(expert_id)): int(counts[expert_id].item())
@@ -2147,6 +2173,7 @@ class FusedMoE(CustomOp):
                 "topk_shape": list(topk_ids.shape),
                 "router_logits_shape": list(router_logits.shape),
                 "expert_token_counts": active_counts,
+                "expert_weight_sums": weight_sums,
                 "active_experts": [int(expert_id) for expert_id in active],
                 "topk_weight_sum": float(topk_weights.detach().sum().cpu().item()),
                 "enable_eplb": bool(self.enable_eplb),

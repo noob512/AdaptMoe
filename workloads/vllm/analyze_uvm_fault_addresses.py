@@ -31,6 +31,7 @@ SECTION_RE = re.compile(
 )
 RAW_ADDR_RE = re.compile(r"(?:\braw|精确原始地址)=(0x[0-9a-fA-F]+)")
 PAGE_ADDR_RE = re.compile(r"(?:\bpage|对齐到页地址)=(0x[0-9a-fA-F]+)")
+STAT_INT_RE = re.compile(r"\b([A-Za-z_]+)=([0-9]+)")
 
 
 @dataclass(frozen=True)
@@ -137,6 +138,26 @@ def parse_args() -> argparse.Namespace:
         "--summary-json",
         default=None,
         help="Optional output JSON summary file.",
+    )
+    parser.add_argument(
+        "--stats-log",
+        default=None,
+        help=(
+            "Optional UVM replayable fault stats log. When provided, the report "
+            "includes delta_after_dedup using the same baseline formula as "
+            "run_kv_fault_ratio.sh."
+        ),
+    )
+    parser.add_argument(
+        "--dedup-mode",
+        choices=("none", "global-page"),
+        default="none",
+        help=(
+            "Deduplicate parsed fault records before classification. "
+            "'global-page' keeps the first occurrence of each selected page address. "
+            "This is an approximation of after-dedup attribution; exact after-dedup "
+            "classification needs kernel-side logging after UVM duplicate removal."
+        ),
     )
     parser.add_argument(
         "--max-faults",
@@ -345,6 +366,75 @@ def parse_fault_record(line: str, line_no: int) -> FaultRecord | None:
     return FaultRecord(line_no=line_no, raw_address=raw_address, page_address=page_address)
 
 
+def extract_stat_ints(line: str) -> dict[str, int]:
+    return {key: int(value) for key, value in STAT_INT_RE.findall(line)}
+
+
+def safe_delta(last: int | None, baseline: int | None) -> int | None:
+    if last is None or baseline is None:
+        return None
+    return max(0, last - baseline)
+
+
+def ratio_percent(numerator: int | None, denominator: int | None) -> float | None:
+    if numerator is None or denominator in (None, 0):
+        return None
+    return numerator * 100.0 / denominator
+
+
+def parse_stats_delta(path: Path) -> dict[str, object]:
+    stat_lines: list[dict[str, int]] = []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if "uvm_parent_gpu_service_replayable_faults" not in line:
+                continue
+            values = extract_stat_ints(line)
+            if "total_faults" in values and "batch_faults" in values:
+                stat_lines.append(values)
+
+    if not stat_lines:
+        return {
+            "stats_log": str(path),
+            "parsed_stat_records": 0,
+            "error": "no_replayable_fault_stats_found",
+        }
+
+    first = stat_lines[0]
+    last = stat_lines[-1]
+    base_faults = first.get("total_faults", 0) - first.get("batch_faults", 0)
+    base_duplicates = first.get("total_duplicates", 0) - first.get("batch_duplicates", 0)
+    base_after_dedup = first.get("total_after_dedup", 0) - first.get("batch_after_dedup", 0)
+    base_kv_faults = first.get("total_kv_faults", 0) - first.get("batch_kv_faults", 0)
+    base_kv_duplicates = first.get("total_kv_duplicates", 0) - first.get("batch_kv_duplicates", 0)
+    base_kv_after_dedup = first.get("total_kv_after_dedup", 0) - first.get(
+        "batch_kv_after_dedup", 0
+    )
+
+    delta_faults = safe_delta(last.get("total_faults"), base_faults)
+    delta_duplicates = safe_delta(last.get("total_duplicates"), base_duplicates)
+    delta_after_dedup = safe_delta(last.get("total_after_dedup"), base_after_dedup)
+    delta_kv_faults = safe_delta(last.get("total_kv_faults"), base_kv_faults)
+    delta_kv_duplicates = safe_delta(last.get("total_kv_duplicates"), base_kv_duplicates)
+    delta_kv_after_dedup = safe_delta(
+        last.get("total_kv_after_dedup"), base_kv_after_dedup
+    )
+
+    return {
+        "stats_log": str(path),
+        "parsed_stat_records": len(stat_lines),
+        "delta_faults": delta_faults,
+        "delta_duplicates": delta_duplicates,
+        "delta_after_dedup": delta_after_dedup,
+        "delta_kv_faults": delta_kv_faults,
+        "delta_kv_duplicates": delta_kv_duplicates,
+        "delta_kv_after_dedup": delta_kv_after_dedup,
+        "delta_kv_ratio_pct": ratio_percent(delta_kv_faults, delta_faults),
+        "delta_kv_after_dedup_ratio_pct": ratio_percent(
+            delta_kv_after_dedup, delta_after_dedup
+        ),
+    }
+
+
 def write_regions_csv(path: Path, regions: list[Region]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
@@ -390,11 +480,14 @@ def classify_faults(
     concrete_lookup: RegionLookup,
     kv_summary_lookup: RegionLookup,
     use_raw_address: bool,
+    dedup_mode: str,
     top_n: int,
     faults_csv_path: Path | None,
     max_faults: int | None,
 ) -> dict[str, object]:
     parsed_lines = 0
+    classified_records = 0
+    duplicate_records_skipped = 0
     total_lines = 0
     ignored_lines = 0
     address_min: int | None = None
@@ -404,6 +497,7 @@ def classify_faults(
     matched_name_counts: Counter[str] = Counter()
     matched_phase_counts: Counter[str] = Counter()
     unknown_examples: list[dict[str, object]] = []
+    seen_selected_addresses: set[int] = set()
     csv_handle = None
     csv_writer = None
 
@@ -439,6 +533,14 @@ def classify_faults(
                     classification_counts["unknown"] += 1
                     continue
 
+                if dedup_mode == "global-page":
+                    if selected_address in seen_selected_addresses:
+                        duplicate_records_skipped += 1
+                        if max_faults is not None and parsed_lines >= max_faults:
+                            break
+                        continue
+                    seen_selected_addresses.add(selected_address)
+
                 if address_min is None or selected_address < address_min:
                     address_min = selected_address
                 if address_max is None or selected_address > address_max:
@@ -446,6 +548,7 @@ def classify_faults(
 
                 matched_region = concrete_lookup.find(selected_address)
                 in_kv_summary_span = kv_summary_lookup.contains(selected_address)
+                classified_records += 1
 
                 if matched_region is None:
                     classification = (
@@ -505,7 +608,7 @@ def classify_faults(
                             ]
                         )
 
-                if max_faults is not None and parsed_lines >= max_faults:
+                if max_faults is not None and classified_records >= max_faults:
                     break
     finally:
         if csv_handle is not None:
@@ -514,6 +617,12 @@ def classify_faults(
     return {
         "total_lines": total_lines,
         "parsed_fault_records": parsed_lines,
+        "classified_fault_records": classified_records,
+        "dedup_mode": dedup_mode,
+        "duplicate_records_skipped": duplicate_records_skipped,
+        "unique_selected_addresses": len(seen_selected_addresses)
+        if dedup_mode == "global-page"
+        else None,
         "ignored_lines": ignored_lines,
         "selected_address_min": f"0x{address_min:x}" if address_min is not None else None,
         "selected_address_max": f"0x{address_max:x}" if address_max is not None else None,
@@ -646,6 +755,9 @@ def print_report(report: dict[str, object]) -> None:
     fault_summary = report["fault_summary"]
     print(
         f"- parsed_fault_records={fault_summary['parsed_fault_records']} "
+        f"classified_fault_records={fault_summary.get('classified_fault_records')} "
+        f"dedup_mode={fault_summary.get('dedup_mode')} "
+        f"duplicate_records_skipped={fault_summary.get('duplicate_records_skipped')} "
         f"ignored_lines={fault_summary['ignored_lines']} total_lines_seen={fault_summary['total_lines']}"
     )
     print(
@@ -653,6 +765,20 @@ def print_report(report: dict[str, object]) -> None:
     )
     for name, count in sorted(fault_summary["classification_counts"].items()):
         print(f"- {name}: {count}")
+
+    stats_summary = report.get("stats_summary")
+    if stats_summary:
+        print("\nReplayable Fault Delta")
+        print(f"- stats_log: {stats_summary.get('stats_log')}")
+        print(f"- parsed_stat_records: {stats_summary.get('parsed_stat_records')}")
+        print(
+            f"- delta_after_dedup: {stats_summary.get('delta_after_dedup')} "
+            f"delta_kv_after_dedup: {stats_summary.get('delta_kv_after_dedup')}"
+        )
+        print(
+            f"- delta_kv_ratio_pct: {stats_summary.get('delta_kv_ratio_pct')} "
+            f"delta_kv_after_dedup_ratio_pct: {stats_summary.get('delta_kv_after_dedup_ratio_pct')}"
+        )
 
     print("\nAddress Space Assessment")
     assessment = report["address_space_assessment"]
@@ -681,6 +807,7 @@ def main() -> int:
     args = parse_args()
     address_log_path = Path(args.address_log)
     fault_log_path = Path(args.fault_log)
+    stats_log_path = Path(args.stats_log) if args.stats_log else None
 
     # 2. 前置检查：确保输入的 vLLM 地址日志和 UVM 缺页日志确实存在
     if not address_log_path.is_file():
@@ -724,10 +851,13 @@ def main() -> int:
         concrete_lookup=RegionLookup(concrete_regions),     # 权重和 KV 的精确查找表 (内部用二分查找优化)
         kv_summary_lookup=RegionLookup(kv_summary_regions), # KV 宏观跨度的辅助查找表
         use_raw_address=args.use_raw_address,               # 是用原始地址还是按页对齐后的地址进行匹配
+        dedup_mode=args.dedup_mode,
         top_n=args.top_n,                                   # 统计报错最频繁的 Top N 张量
         faults_csv_path=Path(args.faults_csv) if args.faults_csv else None,
         max_faults=args.max_faults,                         # 用于测试或限制处理规模，提前截断
     )
+
+    stats_summary = parse_stats_delta(stats_log_path) if stats_log_path else None
 
     # 7. 交叉验证 (Validation)：评估两份日志的虚拟地址空间是否匹配
     # 如果 UVM fault 发生的区间跟 vLLM 张量分配的区间完全没有交集，说明日志抓串了或者环境脏了
@@ -742,6 +872,7 @@ def main() -> int:
         "warnings": warnings,
         "region_summary": region_summary,
         "fault_summary": fault_summary,
+        "stats_summary": stats_summary,
         "address_space_assessment": assessment,
     }
 

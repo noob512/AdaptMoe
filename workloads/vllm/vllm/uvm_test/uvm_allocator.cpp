@@ -37,6 +37,26 @@
 
 namespace {
 
+__global__ void uvm_smoke_copy_bytes_kernel(const unsigned char* src,
+                                            unsigned char* dst,
+                                            size_t bytes) {
+    size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = blockDim.x * gridDim.x;
+
+    for (; index < bytes; index += stride)
+        dst[index] = src[index];
+}
+
+__global__ void uvm_smoke_fill_bytes_kernel(unsigned char* dst,
+                                            unsigned char value,
+                                            size_t bytes) {
+    size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = blockDim.x * gridDim.x;
+
+    for (; index < bytes; index += stride)
+        dst[index] = value;
+}
+
 constexpr unsigned int UVM_INITIALIZE_IOCTL = 0x30000001;
 constexpr unsigned int UVM_TEST_PHASE_F_PING_IOCTL =
     200 + 115;
@@ -54,7 +74,9 @@ constexpr unsigned int UVM_PHASE_N_UPDATE_REGION_STATE_IOCTL = 87;
 constexpr unsigned int UVM_PHASE_N_QUERY_REGION_IOCTL = 88;
 constexpr unsigned int UVM_PHASE_N_QUERY_REGION_BY_VA_IOCTL = 89;
 constexpr unsigned int UVM_PHASE_N_RECLAIM_POOL_IOCTL = 90;
+constexpr unsigned int UVM_MOE_SLOT_REMAP_BATCH_IOCTL = 91;
 constexpr size_t UVM_TEST_PHASE_F_MAX_RANGES = 64;
+constexpr size_t UVM_MOE_SLOT_REMAP_MAX_ENTRIES = 128;
 constexpr size_t UVM_PHASE_N_TRACE_VICTIM_MAX = 8;
 constexpr uint32_t UVM_TEST_PHASE_F_PING_MAGIC = 0x50464e47;  // "PFNG"
 
@@ -68,6 +90,14 @@ constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED = 7;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_START_BG_PROMOTION = 8;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17;
+
+constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_DRY_RUN = 0;
+constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_VALIDATE = 1;
+constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_REMAP = 2;
+constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY = 3;
+constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY = 4;
+constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP = 5;
+constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP = 6;
 
 struct PhaseFUuid {
     uint8_t uuid[16];
@@ -255,6 +285,35 @@ struct PhaseNReclaimPoolParams {
     uint32_t rmStatus;
 };
 
+struct MoeSlotRemapEntry {
+    uint32_t layer_id;
+    uint32_t expert_id;
+    uint32_t slot_id;
+    uint32_t role;
+    uint64_t va_base;
+    uint64_t bytes;
+    uint64_t slot_offset;
+    uint32_t flags;
+    uint32_t status;
+};
+
+struct MoeSlotRemapBatchParams {
+    uint32_t mode;
+    uint32_t count;
+    PhaseFUuid gpu_uuid;
+    uint32_t validate_managed;
+    uint32_t success_count;
+    uint32_t failure_count;
+    uint32_t conflict_count;
+    uint32_t remap_count;
+    uint32_t tlb_invalidate_count;
+    uint32_t reserved;
+    uint64_t requested_bytes;
+    uint64_t accepted_bytes;
+    MoeSlotRemapEntry entries[UVM_MOE_SLOT_REMAP_MAX_ENTRIES];
+    uint32_t rmStatus;
+};
+
 struct PhaseFPingParams {
     uint32_t magic;
     uint32_t rmStatus;
@@ -283,6 +342,9 @@ struct UvmFdCandidate {
     int source_fd;
     std::string path;
 };
+
+std::mutex g_phase_n_persistent_fd_mutex;
+int g_phase_n_persistent_fd = -1;
 
 bool phase_f_use_test_ioctl() {
     const char* mode = std::getenv("VLLM_UVM_PHASE_F_IOCTL_MODE");
@@ -380,19 +442,43 @@ int duplicate_uvm_fd_candidate(const char* op_name, const UvmFdCandidate& candid
     return dup_fd;
 }
 
+bool initialize_duplicated_uvm_fd(const char* op_name, int fd, const UvmFdCandidate& candidate) {
+    UvmInitializeParams init_params{};
+    if (ioctl(fd, UVM_INITIALIZE_IOCTL, &init_params) == 0 &&
+        init_params.rmStatus == 0)
+        return true;
+
+    int saved_errno = errno;
+    phase_f_debug_log("%s adopt_fd init_rejected candidate_fd=%d dup_fd=%d path=%s errno=%d rmStatus=%u",
+                      op_name,
+                      candidate.source_fd,
+                      fd,
+                      candidate.path.c_str(),
+                      saved_errno,
+                      init_params.rmStatus);
+    return false;
+}
+
 int adopt_existing_uvm_fd(const char* op_name) {
     std::vector<UvmFdCandidate> candidates = collect_existing_uvm_fd_candidates(op_name);
     if (candidates.empty())
         return -1;
 
-    const UvmFdCandidate& selected = candidates.front();
-    int dup_fd = duplicate_uvm_fd_candidate(op_name, selected);
-    if (dup_fd < 0)
-        return -1;
+    for (const UvmFdCandidate& candidate : candidates) {
+        int dup_fd = duplicate_uvm_fd_candidate(op_name, candidate);
+        if (dup_fd < 0)
+            continue;
 
-    phase_f_debug_log("%s adopt_fd adopted candidate_fd=%d dup_fd=%d path=%s",
-                      op_name, selected.source_fd, dup_fd, selected.path.c_str());
-    return dup_fd;
+        if (initialize_duplicated_uvm_fd(op_name, dup_fd, candidate)) {
+            phase_f_debug_log("%s adopt_fd adopted candidate_fd=%d dup_fd=%d path=%s",
+                              op_name, candidate.source_fd, dup_fd, candidate.path.c_str());
+            return dup_fd;
+        }
+
+        close(dup_fd);
+    }
+
+    return -1;
 }
 
 int open_initialized_uvm_fd(const char* op_name, bool prefer_existing = false) {
@@ -422,6 +508,20 @@ int open_initialized_uvm_fd(const char* op_name, bool prefer_existing = false) {
     return fd;
 }
 
+int get_phase_n_persistent_fd(const char* op_name) {
+    std::lock_guard<std::mutex> lock(g_phase_n_persistent_fd_mutex);
+    if (g_phase_n_persistent_fd >= 0)
+        return g_phase_n_persistent_fd;
+
+    g_phase_n_persistent_fd = open_initialized_uvm_fd(op_name, false);
+    if (g_phase_n_persistent_fd >= 0) {
+        phase_f_debug_log("%s persistent_fd_opened fd=%d",
+                          op_name,
+                          g_phase_n_persistent_fd);
+    }
+    return g_phase_n_persistent_fd;
+}
+
 template <typename Fn>
 int apply_to_existing_uvm_fds(const char* op_name, Fn fn) {
     if (!phase_f_adopt_cuda_uvm_fd_enabled())
@@ -437,6 +537,11 @@ int apply_to_existing_uvm_fds(const char* op_name, Fn fn) {
 
         if (fd < 0)
             continue;
+
+        if (!initialize_duplicated_uvm_fd(op_name, fd, candidate)) {
+            close(fd);
+            continue;
+        }
 
         result = fn(fd, candidate.source_fd, candidate.path.c_str());
         close(fd);
@@ -719,17 +824,25 @@ int uvm_driver_phase_f_register_region_internal(uint64_t region_id,
             return uvm_driver_phase_f_register_region_fd(
                 fd, region_id, base, length, pool, layer_id, expert_id, role, flags);
         });
-    if (existing_result > 0)
-        return existing_result;
 
-    int fd = open_initialized_uvm_fd("driver_register_region", false);
-    int result;
+    int fd = get_phase_n_persistent_fd("driver_register_region_persistent");
+    int persistent_result = -4;
 
-    if (fd < 0) return -4;
-    result = uvm_driver_phase_f_register_region_fd(
-        fd, region_id, base, length, pool, layer_id, expert_id, role, flags);
-    close(fd);
-    return result;
+    if (fd >= 0) {
+        phase_f_debug_log("driver_register_region fd_source=persistent fd=%d id=%llu base=0x%llx length=%zu",
+                          fd,
+                          static_cast<unsigned long long>(region_id),
+                          static_cast<unsigned long long>(base),
+                          length);
+        persistent_result = uvm_driver_phase_f_register_region_fd(
+            fd, region_id, base, length, pool, layer_id, expert_id, role, flags);
+    }
+
+    if (existing_result > 0 || persistent_result > 0)
+        return 1;
+    if (persistent_result < 0)
+        return persistent_result;
+    return existing_result;
 }
 
 int uvm_driver_phase_f_unregister_region_fd(int fd, uint64_t region_id) {
@@ -883,6 +996,220 @@ int uvm_driver_phase_f_register_query_region_internal(uint64_t region_id,
         return unregister_result;
 
     return query_result;
+}
+
+int uvm_driver_moe_slot_remap_batch_fd(int fd,
+                                       const uint32_t* layer_ids,
+                                       const uint32_t* expert_ids,
+                                       const uint32_t* slot_ids,
+                                       const uint32_t* roles,
+                                       const uintptr_t* ptrs,
+                                       const size_t* sizes,
+                                       size_t count,
+                                       uint32_t mode,
+                                       int device,
+                                       uint32_t validate_managed,
+                                       uint64_t* stats_out,
+                                       size_t stats_count) {
+    if (stats_out != nullptr) {
+        for (size_t i = 0; i < stats_count; ++i)
+            stats_out[i] = 0;
+    }
+    if (count == 0) return 0;
+    if (layer_ids == nullptr || expert_ids == nullptr || slot_ids == nullptr ||
+        roles == nullptr || ptrs == nullptr || sizes == nullptr)
+        return -1;
+    if (count > UVM_MOE_SLOT_REMAP_MAX_ENTRIES)
+        return -2;
+    if (mode > UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP)
+        return -1;
+
+    MoeSlotRemapBatchParams params{};
+    params.mode = mode;
+    params.count = static_cast<uint32_t>(count);
+    params.validate_managed = validate_managed ? 1 : 0;
+    params.gpu_uuid = CPU_UUID;
+    if (device >= 0 && !get_cuda_device_uuid(device, &params.gpu_uuid)) {
+        phase_f_debug_log("driver_moe_slot_remap count=%zu mode=%u device=%d uuid_lookup_failed",
+                          count, mode, device);
+        return -3;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        params.entries[i].layer_id = layer_ids[i];
+        params.entries[i].expert_id = expert_ids[i];
+        params.entries[i].slot_id = slot_ids[i];
+        params.entries[i].role = roles[i];
+        params.entries[i].va_base = static_cast<uint64_t>(ptrs[i]);
+        params.entries[i].bytes = static_cast<uint64_t>(sizes[i]);
+        params.entries[i].slot_offset = 0;
+        params.entries[i].flags = 0;
+    }
+
+    phase_f_debug_log("driver_moe_slot_remap cmd=%u count=%zu mode=%u device=%d validate_managed=%u ioctl_begin first_layer=%u first_expert=%u first_slot=%u first_va=0x%llx first_bytes=%llu",
+                      UVM_MOE_SLOT_REMAP_BATCH_IOCTL,
+                      count,
+                      mode,
+                      device,
+                      validate_managed,
+                      count > 0 ? params.entries[0].layer_id : 0,
+                      count > 0 ? params.entries[0].expert_id : 0,
+                      count > 0 ? params.entries[0].slot_id : 0,
+                      count > 0 ? static_cast<unsigned long long>(params.entries[0].va_base) : 0ULL,
+                      count > 0 ? static_cast<unsigned long long>(params.entries[0].bytes) : 0ULL);
+    int ret = ioctl(fd, UVM_MOE_SLOT_REMAP_BATCH_IOCTL, &params);
+    int saved_errno = errno;
+    phase_f_debug_log("driver_moe_slot_remap cmd=%u count=%zu mode=%u ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u conflicts=%u requested=%llu accepted=%llu remap=%u tlb=%u first_status=%u",
+                      UVM_MOE_SLOT_REMAP_BATCH_IOCTL,
+                      count,
+                      mode,
+                      ret,
+                      saved_errno,
+                      params.rmStatus,
+                      params.success_count,
+                      params.failure_count,
+                      params.conflict_count,
+                      static_cast<unsigned long long>(params.requested_bytes),
+                      static_cast<unsigned long long>(params.accepted_bytes),
+                      params.remap_count,
+                      params.tlb_invalidate_count,
+                      count > 0 ? params.entries[0].status : 0);
+
+    if (stats_out != nullptr && stats_count > 0) {
+        if (stats_count > 0) stats_out[0] = params.rmStatus;
+        if (stats_count > 1) stats_out[1] = params.success_count;
+        if (stats_count > 2) stats_out[2] = params.failure_count;
+        if (stats_count > 3) stats_out[3] = params.conflict_count;
+        if (stats_count > 4) stats_out[4] = params.requested_bytes;
+        if (stats_count > 5) stats_out[5] = params.accepted_bytes;
+        if (stats_count > 6) stats_out[6] = params.remap_count;
+        if (stats_count > 7) stats_out[7] = params.tlb_invalidate_count;
+    }
+
+    if (ret != 0) return -6;
+    if (params.rmStatus != 0 && params.success_count == 0)
+        return -static_cast<int>(params.rmStatus);
+    return static_cast<int>(params.success_count);
+}
+
+bool uvm_driver_moe_slot_remap_fd_validates_targets(int fd,
+                                                    const uint32_t* layer_ids,
+                                                    const uint32_t* expert_ids,
+                                                    const uint32_t* slot_ids,
+                                                    const uint32_t* roles,
+                                                    const uintptr_t* ptrs,
+                                                    const size_t* sizes,
+                                                    size_t count,
+                                                    int device) {
+    uint64_t stats[8] = {};
+    int result = uvm_driver_moe_slot_remap_batch_fd(fd,
+                                                   layer_ids,
+                                                   expert_ids,
+                                                   slot_ids,
+                                                   roles,
+                                                   ptrs,
+                                                   sizes,
+                                                   count,
+                                                   UVM_MOE_SLOT_REMAP_MODE_DRY_RUN,
+                                                   device,
+                                                   1,
+                                                   stats,
+                                                   8);
+
+    return result == static_cast<int>(count) &&
+           stats[0] == 0 &&
+           stats[1] == count &&
+           stats[2] == 0;
+}
+
+int uvm_driver_moe_slot_remap_batch_internal(const uint32_t* layer_ids,
+                                             const uint32_t* expert_ids,
+                                             const uint32_t* slot_ids,
+                                             const uint32_t* roles,
+                                             const uintptr_t* ptrs,
+                                             const size_t* sizes,
+                                             size_t count,
+                                             uint32_t mode,
+                                             int device,
+                                             uint32_t validate_managed,
+                                             uint64_t* stats_out,
+                                             size_t stats_count) {
+    if (phase_f_adopt_cuda_uvm_fd_enabled()) {
+        std::vector<UvmFdCandidate> candidates =
+            collect_existing_uvm_fd_candidates("driver_moe_slot_remap");
+
+        for (const UvmFdCandidate& candidate : candidates) {
+            int candidate_fd = duplicate_uvm_fd_candidate("driver_moe_slot_remap", candidate);
+            int result;
+
+            if (candidate_fd < 0)
+                continue;
+
+            if (!initialize_duplicated_uvm_fd("driver_moe_slot_remap", candidate_fd, candidate)) {
+                close(candidate_fd);
+                continue;
+            }
+
+            if (!uvm_driver_moe_slot_remap_fd_validates_targets(candidate_fd,
+                                                                layer_ids,
+                                                                expert_ids,
+                                                                slot_ids,
+                                                                roles,
+                                                                ptrs,
+                                                                sizes,
+                                                                count,
+                                                                device)) {
+                phase_f_debug_log("driver_moe_slot_remap adopt_fd target_validation_failed source_fd=%d fd=%d path=%s",
+                                  candidate.source_fd,
+                                  candidate_fd,
+                                  candidate.path.c_str());
+                close(candidate_fd);
+                continue;
+            }
+
+            phase_f_debug_log("driver_moe_slot_remap adopt_fd target_validated source_fd=%d fd=%d path=%s",
+                              candidate.source_fd,
+                              candidate_fd,
+                              candidate.path.c_str());
+            result = uvm_driver_moe_slot_remap_batch_fd(
+                candidate_fd,
+                layer_ids,
+                expert_ids,
+                slot_ids,
+                roles,
+                ptrs,
+                sizes,
+                count,
+                mode,
+                device,
+                validate_managed,
+                stats_out,
+                stats_count);
+            close(candidate_fd);
+            return result;
+        }
+    }
+
+    int fd = open_initialized_uvm_fd("driver_moe_slot_remap", false);
+    int result;
+
+    if (fd < 0) return -4;
+    result = uvm_driver_moe_slot_remap_batch_fd(
+        fd,
+        layer_ids,
+        expert_ids,
+        slot_ids,
+        roles,
+        ptrs,
+        sizes,
+        count,
+        mode,
+        device,
+        validate_managed,
+        stats_out,
+        stats_count);
+    close(fd);
+    return result;
 }
 
 int uvm_driver_phase_n_set_pool_budget_internal(uint32_t pool,
@@ -1246,15 +1573,17 @@ int uvm_driver_phase_n_update_region_state_internal(uint64_t region_id,
         [&](int fd, int source_fd, const char* path) {
             return update_state_on_fd(fd, "adopted", source_fd, path);
         });
-    if (existing_result > 0)
-        return existing_result;
 
-    int fd = open_initialized_uvm_fd("driver_phase_n_update_region_state", false);
-    int result;
-    if (fd < 0) return -4;
-    result = update_state_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
-    close(fd);
-    return result;
+    int fd = get_phase_n_persistent_fd("driver_phase_n_update_region_state_persistent");
+    int persistent_result = -4;
+    if (fd >= 0)
+        persistent_result = update_state_on_fd(fd, "persistent", -1, "/dev/nvidia-uvm:persistent");
+
+    if (existing_result > 0 || persistent_result > 0)
+        return 1;
+    if (persistent_result < 0)
+        return persistent_result;
+    return existing_result;
 }
 
 int uvm_driver_phase_n_metadata_state_smoke_internal(uint32_t pool,
@@ -1355,23 +1684,68 @@ int uvm_driver_phase_n_query_region_internal(uint64_t region_id,
                                              uint64_t* values_out,
                                              size_t values_count) {
     if (values_out == nullptr || values_count < 11) return -2;
-    int fd = open_initialized_uvm_fd("driver_phase_n_query_region", true);
-    if (fd < 0) return -4;
 
     PhaseNQueryRegionParams params{};
     params.region_id = region_id;
+    int final_ret = -1;
+    int final_errno = 0;
 
-    phase_f_debug_log("driver_phase_n_query_region cmd=%u id=%llu ioctl_begin",
-                      UVM_PHASE_N_QUERY_REGION_IOCTL,
-                      static_cast<unsigned long long>(region_id));
-    int ret = ioctl(fd, UVM_PHASE_N_QUERY_REGION_IOCTL, &params);
-    int saved_errno = errno;
-    close(fd);
+    auto query_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
+        PhaseNQueryRegionParams attempt{};
+        attempt.region_id = region_id;
+
+        phase_f_debug_log("driver_phase_n_query_region cmd=%u fd_source=%s source_fd=%d fd=%d path=%s id=%llu ioctl_begin",
+                          UVM_PHASE_N_QUERY_REGION_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          path ? path : "",
+                          static_cast<unsigned long long>(region_id));
+        int ret = ioctl(fd, UVM_PHASE_N_QUERY_REGION_IOCTL, &attempt);
+        int saved_errno = errno;
+        phase_f_debug_log("driver_phase_n_query_region cmd=%u fd_source=%s source_fd=%d fd=%d id=%llu ioctl_done ret=%d errno=%d rmStatus=%u base=0x%llx length=%llu pool=%u flags=0x%x state=%u",
+                          UVM_PHASE_N_QUERY_REGION_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          static_cast<unsigned long long>(region_id),
+                          ret,
+                          saved_errno,
+                          attempt.rmStatus,
+                          static_cast<unsigned long long>(attempt.base),
+                          static_cast<unsigned long long>(attempt.length),
+                          attempt.pool,
+                          attempt.flags,
+                          attempt.state);
+        final_ret = ret;
+        final_errno = saved_errno;
+        if (ret == 0 && attempt.rmStatus == 0) {
+            params = attempt;
+            return 1;
+        }
+        if (ret != 0)
+            return -6;
+        return -static_cast<int>(attempt.rmStatus);
+    };
+
+    int existing_result = apply_to_existing_uvm_fds(
+        "driver_phase_n_query_region",
+        [&](int fd, int source_fd, const char* path) {
+            return query_on_fd(fd, "adopted", source_fd, path);
+        });
+
+    int persistent_result = -4;
+    if (existing_result <= 0) {
+        int fd = get_phase_n_persistent_fd("driver_phase_n_query_region_persistent");
+        if (fd >= 0)
+            persistent_result = query_on_fd(fd, "persistent", -1, "/dev/nvidia-uvm:persistent");
+    }
+
     phase_f_debug_log("driver_phase_n_query_region cmd=%u id=%llu ioctl_done ret=%d errno=%d rmStatus=%u base=0x%llx length=%llu pool=%u flags=0x%x state=%u",
                       UVM_PHASE_N_QUERY_REGION_IOCTL,
                       static_cast<unsigned long long>(region_id),
-                      ret,
-                      saved_errno,
+                      final_ret,
+                      final_errno,
                       params.rmStatus,
                       static_cast<unsigned long long>(params.base),
                       static_cast<unsigned long long>(params.length),
@@ -1379,8 +1753,11 @@ int uvm_driver_phase_n_query_region_internal(uint64_t region_id,
                       params.flags,
                       params.state);
 
-    if (ret != 0) return -6;
-    if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+    if (existing_result <= 0 && persistent_result <= 0) {
+        if (persistent_result < 0)
+            return persistent_result;
+        return existing_result;
+    }
 
     values_out[0] = params.region_id;
     values_out[1] = params.base;
@@ -1721,6 +2098,14 @@ static int device_direct_pool_config_device = -1;
 static std::string device_direct_pool_config_error = "not_configured";
 static std::string device_direct_target_phases =
     "enabled:attention,enabled:moe,enabled:model_forward";
+static int kv_device_direct_enable = 0;
+static size_t kv_device_direct_min_bytes = 0;
+static size_t kv_device_direct_max_bytes = 0;
+static size_t kv_device_direct_max_total_bytes = 0;
+static int fixed_weight_device_direct_enable = 0;
+static size_t fixed_weight_device_direct_min_bytes = 0;
+static size_t fixed_weight_device_direct_max_bytes = 0;
+static size_t fixed_weight_device_direct_max_total_bytes = 0;
 static size_t kv_budget_bytes = 0;
 static std::string kv_budget_mode = "trace_only";
 static size_t weight_budget_bytes = 0;
@@ -2626,19 +3011,19 @@ static void update_device_direct_peak_live(size_t current_live) {
     }
 }
 
-static bool reserve_device_direct_budget(size_t size) {
+static bool reserve_device_direct_budget_with_limit(size_t size,
+                                                    size_t max_total_bytes) {
     size_t live = device_direct_live_bytes.load();
     while (true) {
-        if (device_direct_max_total_bytes > 0 &&
-            live > device_direct_max_total_bytes - std::min(size, device_direct_max_total_bytes)) {
+        if (max_total_bytes > 0 &&
+            live > max_total_bytes - std::min(size, max_total_bytes)) {
             return false;
         }
         size_t next_live = live + size;
         if (next_live < live) {
             return false;
         }
-        if (device_direct_max_total_bytes > 0 &&
-            next_live > device_direct_max_total_bytes) {
+        if (max_total_bytes > 0 && next_live > max_total_bytes) {
             return false;
         }
         if (device_direct_live_bytes.compare_exchange_weak(live, next_live)) {
@@ -2646,6 +3031,13 @@ static bool reserve_device_direct_budget(size_t size) {
             return true;
         }
     }
+}
+
+static bool reserve_device_direct_budget(size_t size) {
+    return reserve_device_direct_budget_with_limit(
+        size,
+        device_direct_max_total_bytes
+    );
 }
 
 static void release_device_direct_budget(size_t size) {
@@ -3666,7 +4058,7 @@ static AllocationClass classify_allocation(const std::string& phase,
     // 1. 模型加载阶段：判定为【持久权重】
     // 这里的内存通常包含 Transformer 的各层参数（Linear/Embedding 等）。
     // 这些内存一旦分配，在整个服务生命周期内都不会释放，且每一轮推理都要全量读取。
-    if (phase == "load_model") {
+    if (phase == "load_model" || phase == "fixed_weight_device_direct") {
         return AllocationClass::WeightPersistent;
     }
 
@@ -3911,6 +4303,40 @@ static void init_log_file() {
             "VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES",
             device_direct_target_phases.c_str()
         );
+        kv_device_direct_enable =
+            read_bool_from_env(
+                "VLLM_UVM_KV_DEVICE_DIRECT_ENABLE",
+                false
+            ) ? 1 : 0;
+        kv_device_direct_min_bytes = read_size_from_env(
+            "VLLM_UVM_KV_DEVICE_DIRECT_MIN_BYTES",
+            kv_device_direct_min_bytes
+        );
+        kv_device_direct_max_bytes = read_size_from_env_allow_zero(
+            "VLLM_UVM_KV_DEVICE_DIRECT_MAX_BYTES",
+            kv_device_direct_max_bytes
+        );
+        kv_device_direct_max_total_bytes = read_size_from_env_allow_zero(
+            "VLLM_UVM_KV_DEVICE_DIRECT_MAX_TOTAL_BYTES",
+            kv_device_direct_max_total_bytes
+        );
+        fixed_weight_device_direct_enable =
+            read_bool_from_env(
+                "VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_ENABLE",
+                false
+            ) ? 1 : 0;
+        fixed_weight_device_direct_min_bytes = read_size_from_env(
+            "VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_MIN_BYTES",
+            fixed_weight_device_direct_min_bytes
+        );
+        fixed_weight_device_direct_max_bytes = read_size_from_env_allow_zero(
+            "VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_BYTES",
+            fixed_weight_device_direct_max_bytes
+        );
+        fixed_weight_device_direct_max_total_bytes = read_size_from_env_allow_zero(
+            "VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_TOTAL_BYTES",
+            fixed_weight_device_direct_max_total_bytes
+        );
         kv_budget_bytes = read_size_from_env_allow_zero(
             "VLLM_UVM_KV_BUDGET_BYTES",
             kv_budget_bytes
@@ -4058,6 +4484,14 @@ static void init_log_file() {
                 "device_direct_pool_release_threshold_set=%d "
                 "device_direct_pool_release_threshold=%zu "
                 "device_direct_target_phases=%s "
+                "kv_device_direct_enable=%d "
+                "kv_device_direct_min_bytes=%zu "
+                "kv_device_direct_max_bytes=%zu "
+                "kv_device_direct_max_total_bytes=%zu "
+                "fixed_weight_device_direct_enable=%d "
+                "fixed_weight_device_direct_min_bytes=%zu "
+                "fixed_weight_device_direct_max_bytes=%zu "
+                "fixed_weight_device_direct_max_total_bytes=%zu "
                 "kv_budget_bytes=%zu kv_budget_mode=%s "
                 "weight_budget_bytes=%zu weight_budget_mode=%s "
                 "weight_budget_cpu_offload_enable=%d "
@@ -4097,6 +4531,14 @@ static void init_log_file() {
                 device_direct_pool_release_threshold_set ? 1 : 0,
                 device_direct_pool_release_threshold,
                 device_direct_target_phases.c_str(),
+                kv_device_direct_enable,
+                kv_device_direct_min_bytes,
+                kv_device_direct_max_bytes,
+                kv_device_direct_max_total_bytes,
+                fixed_weight_device_direct_enable,
+                fixed_weight_device_direct_min_bytes,
+                fixed_weight_device_direct_max_bytes,
+                fixed_weight_device_direct_max_total_bytes,
                 kv_budget_bytes,
                 kv_budget_mode.c_str(),
                 weight_budget_bytes,
@@ -5098,6 +5540,12 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     bool hot_gap_match = gap_watch_enabled && gap_overlap_bytes > 0;
     bool device_direct_requested = is_device_direct_action(policy_action);
     bool device_direct_phase_match = is_device_direct_target_phase(phase_snapshot);
+    bool kv_device_direct_requested =
+        kv_device_direct_enable != 0 && is_kv_allocation(alloc_class);
+    bool fixed_weight_device_direct_requested =
+        fixed_weight_device_direct_enable != 0 &&
+        phase_snapshot == "fixed_weight_device_direct" &&
+        is_weight_allocation(alloc_class);
 
     // 3.2 初始环境回显：记录后端默认为 managed。
     const char* placement_backend = "managed";
@@ -5112,6 +5560,20 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
 
     const char* device_direct_reason = "not_requested";
     bool device_direct_eligible = false;
+
+    if (kv_device_direct_requested) {
+        policy_action = PolicyAction::DeviceDirect;
+        policy_source = "kv_device_direct_policy";
+        device_direct_requested = true;
+        device_direct_reason = "kv_device_direct_requested";
+        cpu_access_risk = "low_gpu_only_kv_cache";
+    } else if (fixed_weight_device_direct_requested) {
+        policy_action = PolicyAction::DeviceDirect;
+        policy_source = "fixed_weight_device_direct_policy";
+        device_direct_requested = true;
+        device_direct_reason = "fixed_weight_device_direct_requested";
+        cpu_access_risk = "low_read_only_fixed_weight";
+    }
 
     // 3.4 核心组件显存记账 (KV & Weights)：
     // 这里的 record_* 调用会进行原子加减，确保我们永远知道 KV Cache 和模型权重占用了多少“真显存”。
@@ -5342,6 +5804,27 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     if (device_direct_requested) {
         if (device < 0) {
             device_direct_reason = "invalid_device";
+        } else if (kv_device_direct_requested) {
+            if (static_cast<size_t>(size) < kv_device_direct_min_bytes) {
+                device_direct_reason = "kv_device_direct_below_min_bytes";
+            } else if (kv_device_direct_max_bytes > 0 &&
+                       static_cast<size_t>(size) > kv_device_direct_max_bytes) {
+                device_direct_reason = "kv_device_direct_above_max_bytes";
+            } else {
+                device_direct_eligible = true;
+                device_direct_reason = "kv_device_direct_enabled";
+            }
+        } else if (fixed_weight_device_direct_requested) {
+            if (static_cast<size_t>(size) < fixed_weight_device_direct_min_bytes) {
+                device_direct_reason = "fixed_weight_device_direct_below_min_bytes";
+            } else if (fixed_weight_device_direct_max_bytes > 0 &&
+                       static_cast<size_t>(size) >
+                           fixed_weight_device_direct_max_bytes) {
+                device_direct_reason = "fixed_weight_device_direct_above_max_bytes";
+            } else {
+                device_direct_eligible = true;
+                device_direct_reason = "fixed_weight_device_direct_enabled";
+            }
         } else if (scratch_pool_budget_reserved) {
             device_direct_eligible = true;
         } else if (!hot_gap_match) {
@@ -5389,7 +5872,9 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     // 只有同时满足：1. 符合八要素准入；2. 策略动作为真实分配；3. 全局开关开启；4. 初始 UVM 指针有效。
     if (device_direct_eligible &&
             policy_action == PolicyAction::DeviceDirect &&
-            device_direct_enable &&
+            (device_direct_enable ||
+             kv_device_direct_requested ||
+             fixed_weight_device_direct_requested) &&
             ptr != NULL) {
 
         void* device_ptr = NULL;
@@ -5426,15 +5911,31 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
 
         bool budget_reserved = scratch_pool_reuse_cache_hit;
         if (!budget_reserved) {
-            budget_reserved = reserve_device_direct_budget(
-                static_cast<size_t>(size)
-            );
+            if (kv_device_direct_requested) {
+                budget_reserved = reserve_device_direct_budget_with_limit(
+                    static_cast<size_t>(size),
+                    kv_device_direct_max_total_bytes
+                );
+            } else if (fixed_weight_device_direct_requested) {
+                budget_reserved = reserve_device_direct_budget_with_limit(
+                    static_cast<size_t>(size),
+                    fixed_weight_device_direct_max_total_bytes
+                );
+            } else {
+                budget_reserved = reserve_device_direct_budget(
+                    static_cast<size_t>(size)
+                );
+            }
             device_direct_budget_reserved_for_request = budget_reserved;
         }
 
         if (!budget_reserved) {
             // 如果预算不足，记录原因并增加拒绝计数，随后程序将直接使用原本的 managed (UVM) 指针。
-            device_direct_reason = "device_direct_budget_exceeded";
+            device_direct_reason = kv_device_direct_requested
+                ? "kv_device_direct_budget_exceeded"
+                : (fixed_weight_device_direct_requested
+                    ? "fixed_weight_device_direct_budget_exceeded"
+                    : "device_direct_budget_exceeded");
             device_direct_budget_rejects.fetch_add(1);
             if (scratch_pool_budget_reserved) {
                 release_scratch_pool_device_direct_budget(static_cast<size_t>(size));
@@ -5493,7 +5994,11 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
                     policy_action_error = "none";
                     device_direct_reason = scratch_pool_reuse_cache_hit
                         ? "device_direct_reuse_cache_hit"
-                        : "device_direct_enabled";
+                        : (kv_device_direct_requested
+                            ? "kv_device_direct_enabled"
+                            : (fixed_weight_device_direct_requested
+                                ? "fixed_weight_device_direct_enabled"
+                                : "device_direct_enabled"));
                     if (scratch_pool_budget_reserved ||
                             scratch_pool_reuse_cache_hit) {
                         scratch_pool_device_direct = true;
@@ -7091,6 +7596,107 @@ int uvm_driver_phase_f_register_query_region(uint64_t region_id,
         base,
         length,
         device);
+}
+
+int uvm_driver_moe_slot_remap_batch(const uint32_t* layer_ids,
+                                    const uint32_t* expert_ids,
+                                    const uint32_t* slot_ids,
+                                    const uint32_t* roles,
+                                    const uintptr_t* ptrs,
+                                    const size_t* sizes,
+                                    size_t count,
+                                    uint32_t mode,
+                                    int device,
+                                    uint32_t validate_managed,
+                                    uint64_t* stats_out,
+                                    size_t stats_count) {
+    return uvm_driver_moe_slot_remap_batch_internal(
+        layer_ids,
+        expert_ids,
+        slot_ids,
+        roles,
+        ptrs,
+        sizes,
+        count,
+        mode,
+        device,
+        validate_managed,
+        stats_out,
+        stats_count);
+}
+
+int uvm_smoke_gpu_readback(const void* src, void* dst, size_t bytes, int device) {
+    if (src == nullptr || dst == nullptr || bytes == 0)
+        return -1;
+
+    cudaError_t err = cudaSetDevice(device);
+    if (err != cudaSuccess)
+        return -2;
+
+    unsigned char* device_dst = nullptr;
+    err = cudaMalloc(&device_dst, bytes);
+    if (err != cudaSuccess)
+        return -3;
+
+    int threads = 256;
+    int blocks = static_cast<int>((bytes + threads - 1) / threads);
+    if (blocks < 1)
+        blocks = 1;
+    if (blocks > 1024)
+        blocks = 1024;
+
+    uvm_smoke_copy_bytes_kernel<<<blocks, threads>>>(
+        static_cast<const unsigned char*>(src),
+        device_dst,
+        bytes);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        cudaFree(device_dst);
+        return -4;
+    }
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        cudaFree(device_dst);
+        return -5;
+    }
+
+    err = cudaMemcpy(dst, device_dst, bytes, cudaMemcpyDeviceToHost);
+    cudaFree(device_dst);
+    if (err != cudaSuccess)
+        return -6;
+
+    return 0;
+}
+
+int uvm_smoke_gpu_fill(void* dst, unsigned int value, size_t bytes, int device) {
+    if (dst == nullptr || bytes == 0 || value > 0xff)
+        return -1;
+
+    cudaError_t err = cudaSetDevice(device);
+    if (err != cudaSuccess)
+        return -2;
+
+    int threads = 256;
+    int blocks = static_cast<int>((bytes + threads - 1) / threads);
+    if (blocks < 1)
+        blocks = 1;
+    if (blocks > 1024)
+        blocks = 1024;
+
+    uvm_smoke_fill_bytes_kernel<<<blocks, threads>>>(
+        static_cast<unsigned char*>(dst),
+        static_cast<unsigned char>(value),
+        bytes);
+    err = cudaGetLastError();
+    if (err != cudaSuccess)
+        return -3;
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess)
+        return -4;
+
+    return 0;
 }
 
 int uvm_driver_phase_n_set_pool_budget(uint32_t pool,

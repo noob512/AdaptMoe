@@ -1102,6 +1102,227 @@ typedef struct
     NV_STATUS                rmStatus;                              // OUT
 } UVM_PHASE_F_BATCH_REGIONS_PARAMS;
 
+//
+// UvmMoeSlotRemapBatch
+//
+// Experimental batch interface for MoE cold slot remap planning. User space
+// submits explicit (layer, expert, slot, VA range) assignments after router/topk
+// and batch slot allocation. The initial driver implementation validates and
+// records the batch. COPY_ONLY mode allocates driver-owned slot backing pages
+// and copies the submitted user VA ranges into those pages without replacing
+// user PTEs. GPU_COPY_ONLY mode allocates driver-owned vidmem slot backing and
+// uses CE copies from a DMA-capable sysmem staging allocation. PTE replacement
+// and TLB invalidation are intentionally guarded. REMAP mode currently uses the
+// native UVM migrate/map machinery. SLOT_PTE_REMAP is a smoke-only mode for
+// explicitly-enabled experiments: it writes the target GPU page-table PTEs to
+// point at driver-owned VIDMEM slot backing without updating the full VA block
+// software state. SLOT_VA_BLOCK_REMAP first lets the target managed VA block
+// unmap the GPU range and wait its tracker, then installs the slot-backed PTE.
+//
+#define UVM_MOE_SLOT_REMAP_MAX_ENTRIES                                128
+
+typedef enum
+{
+    UVM_MOE_SLOT_REMAP_MODE_DRY_RUN = 0,
+    UVM_MOE_SLOT_REMAP_MODE_VALIDATE = 1,
+    UVM_MOE_SLOT_REMAP_MODE_REMAP = 2,
+    UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY = 3,
+    UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY = 4,
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP = 5,
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP = 6,
+} UVM_MOE_SLOT_REMAP_MODE;
+
+typedef enum
+{
+    UVM_MOE_SLOT_REMAP_ENTRY_OK = 0,
+    UVM_MOE_SLOT_REMAP_ENTRY_INVALID_ARGUMENT = 1,
+    UVM_MOE_SLOT_REMAP_ENTRY_INVALID_ADDRESS = 2,
+    UVM_MOE_SLOT_REMAP_ENTRY_SLOT_CONFLICT = 3,
+    UVM_MOE_SLOT_REMAP_ENTRY_REMAP_NOT_SUPPORTED = 4,
+    UVM_MOE_SLOT_REMAP_ENTRY_BACKING_ALLOC_FAILED = 5,
+    UVM_MOE_SLOT_REMAP_ENTRY_COPY_FAILED = 6,
+    UVM_MOE_SLOT_REMAP_ENTRY_REMAP_FAILED = 7,
+    UVM_MOE_SLOT_REMAP_ENTRY_ROLLED_BACK = 8,
+} UVM_MOE_SLOT_REMAP_ENTRY_STATUS;
+
+typedef struct
+{
+    NvU32 layer_id;                    // IN
+    NvU32 expert_id;                   // IN
+    NvU32 slot_id;                     // IN
+    NvU32 role;                        // IN
+    NvU64 va_base NV_ALIGN_BYTES(8);   // IN
+    NvU64 bytes NV_ALIGN_BYTES(8);     // IN
+    NvU64 slot_offset NV_ALIGN_BYTES(8); // IN, byte offset into the physical slot backing
+    NvU32 flags;                       // IN
+    NvU32 status;                      // OUT, UVM_MOE_SLOT_REMAP_ENTRY_STATUS
+} UVM_MOE_SLOT_REMAP_ENTRY;
+
+#define UVM_MOE_SLOT_REMAP_BATCH                                       UVM_IOCTL_BASE(91)
+typedef struct
+{
+    NvU32 mode;                                      // IN
+    NvU32 count;                                     // IN
+    NvProcessorUuid gpu_uuid;                        // IN, reserved for REMAP mode
+    NvU32 validate_managed;                          // IN
+    NvU32 success_count;                             // OUT
+    NvU32 failure_count;                             // OUT
+    NvU32 conflict_count;                            // OUT
+    NvU32 remap_count;                               // OUT
+    NvU32 tlb_invalidate_count;                      // OUT
+    NvU32 reserved;                                  // OUT
+    NvU64 requested_bytes NV_ALIGN_BYTES(8);         // OUT
+    NvU64 accepted_bytes NV_ALIGN_BYTES(8);          // OUT
+    UVM_MOE_SLOT_REMAP_ENTRY entries[UVM_MOE_SLOT_REMAP_MAX_ENTRIES]; // IN/OUT
+    NV_STATUS rmStatus;                              // OUT
+} UVM_MOE_SLOT_REMAP_BATCH_PARAMS;
+
+//
+// UvmMoeSlotPoolQuery
+//
+// Experimental debug interface for the MoE cold slot pool state recorded by
+// UVM_MOE_SLOT_REMAP_BATCH in VALIDATE mode. This is metadata only: it tracks
+// slot ownership, epochs, VA ranges accepted by the driver validation path,
+// and COPY_ONLY/GPU_COPY_ONLY backing/copy counters. These modes prove
+// driver-owned physical slot page management and data movement; they still do
+// not imply that user PTE replacement or TLB invalidation have been performed.
+//
+#define UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES                            128
+
+#define UVM_MOE_SLOT_POOL_QUERY_FLAG_FILTER_LAYER                      (1U << 0)
+#define UVM_MOE_SLOT_POOL_QUERY_FLAG_FILTER_SLOT                       (1U << 1)
+#define UVM_MOE_SLOT_POOL_QUERY_FLAG_RESET                             (1U << 31)
+
+typedef enum
+{
+    UVM_MOE_SLOT_POOL_STATE_EMPTY = 0,
+    UVM_MOE_SLOT_POOL_STATE_RESERVED = 1,
+    UVM_MOE_SLOT_POOL_STATE_LOADING = 2,
+    UVM_MOE_SLOT_POOL_STATE_READY = 3,
+    UVM_MOE_SLOT_POOL_STATE_IN_USE = 4,
+    UVM_MOE_SLOT_POOL_STATE_RELEASED = 5,
+    UVM_MOE_SLOT_POOL_STATE_ERROR = 6,
+} UVM_MOE_SLOT_POOL_STATE;
+
+typedef enum
+{
+    UVM_MOE_SLOT_POOL_BACKING_NONE = 0,
+    UVM_MOE_SLOT_POOL_BACKING_SYSMEM = 1,
+    UVM_MOE_SLOT_POOL_BACKING_SYSMEM_DMA = 2,
+    UVM_MOE_SLOT_POOL_BACKING_VIDMEM = 3,
+} UVM_MOE_SLOT_POOL_BACKING_KIND;
+
+typedef struct
+{
+    NvU32 layer_id;                       // OUT
+    NvU32 slot_id;                        // OUT
+    NvU32 owner_expert_id;                // OUT
+    NvU32 state;                          // OUT, UVM_MOE_SLOT_POOL_STATE
+    NvU32 range_count;                    // OUT
+    NvU32 last_role;                      // OUT
+    NvU32 flags;                          // OUT
+    NvU32 last_status;                    // OUT, UVM_MOE_SLOT_REMAP_ENTRY_STATUS
+    NvU64 epoch NV_ALIGN_BYTES(8);        // OUT
+    NvU64 batch_id NV_ALIGN_BYTES(8);     // OUT
+    NvU64 first_va_base NV_ALIGN_BYTES(8);// OUT
+    NvU64 last_va_base NV_ALIGN_BYTES(8); // OUT
+    NvU64 last_bytes NV_ALIGN_BYTES(8);   // OUT
+    NvU64 total_bytes NV_ALIGN_BYTES(8);  // OUT
+    NvU64 slot_bytes NV_ALIGN_BYTES(8);   // OUT, allocated logical slot backing bytes
+    NvU64 slot_physical_bytes NV_ALIGN_BYTES(8); // OUT, physical bytes backing slot_mem
+    NvU64 copy_count NV_ALIGN_BYTES(8);   // OUT
+    NvU64 copy_bytes NV_ALIGN_BYTES(8);   // OUT
+    NvU64 copy_failed_count NV_ALIGN_BYTES(8); // OUT
+    NvU64 pte_remap_bytes NV_ALIGN_BYTES(8); // OUT, smoke-only slot PTE mapping bytes
+    NvU64 pte_remap_count NV_ALIGN_BYTES(8); // OUT, successful smoke-only slot PTE writes
+    NvU64 pte_clear_count NV_ALIGN_BYTES(8); // OUT, smoke-only slot PTE clear operations
+    NvU64 pte_va_base NV_ALIGN_BYTES(8);     // OUT, last smoke-only slot PTE target VA
+    NvU64 pte_bytes NV_ALIGN_BYTES(8);       // OUT, last smoke-only slot PTE target bytes
+    NvU64 pte_block_unmap_count NV_ALIGN_BYTES(8); // OUT, VA-block-aware GPU unmaps before slot PTE writes
+    NvU64 pte_block_tracker_wait_count NV_ALIGN_BYTES(8); // OUT, VA block tracker waits before slot PTE writes
+    NvU64 pte_rollback_count NV_ALIGN_BYTES(8); // OUT, transactional slot PTE rollback operations
+    NvU64 pte_rollback_bytes NV_ALIGN_BYTES(8); // OUT, transactional slot PTE rollback bytes
+    NvU64 pte_failure_count NV_ALIGN_BYTES(8); // OUT, failed smoke-only slot PTE remap attempts
+    NvU64 pte_fault_clear_count NV_ALIGN_BYTES(8); // OUT, slot PTE clears before managed fault fallback
+    NvU64 pte_migrate_clear_count NV_ALIGN_BYTES(8); // OUT, slot PTE clears before native migrate/remap
+    NvU64 pte_unmap_clear_count NV_ALIGN_BYTES(8); // OUT, slot PTE clears before native unmap teardown
+    NvU64 pte_split_clear_count NV_ALIGN_BYTES(8); // OUT, slot PTE clears before VA block split
+    NvU64 pte_release_clear_count NV_ALIGN_BYTES(8); // OUT, slot PTE clears during VA/GPU VA-space release
+    NvU64 pte_evict_clear_count NV_ALIGN_BYTES(8); // OUT, slot PTE clears before backing eviction
+    NvU64 pte_dangerous_op_reject_count NV_ALIGN_BYTES(8); // OUT, read-only slot PTE dangerous op rejects
+    NvU32 backing_kind;                   // OUT, UVM_MOE_SLOT_POOL_BACKING_KIND
+    NvU32 copy_status;                    // OUT, last UVM_MOE_SLOT_REMAP_ENTRY_STATUS from COPY_ONLY/GPU_COPY_ONLY
+    NvU32 pte_mapped;                     // OUT, nonzero if smoke-only slot PTE mapping is installed
+    NvU32 pte_status;                     // OUT, last UVM_MOE_SLOT_REMAP_ENTRY_STATUS from SLOT_PTE_REMAP
+    NvU32 pte_mode;                       // OUT, UVM_MOE_SLOT_REMAP_MODE used for last PTE install
+    NvU32 pte_va_block_tracked;           // OUT, nonzero if VA block unmap/tracker path was used
+} UVM_MOE_SLOT_POOL_QUERY_ENTRY;
+
+#define UVM_MOE_SLOT_POOL_QUERY                                        UVM_IOCTL_BASE(92)
+typedef struct
+{
+    NvU32 flags;                                      // IN
+    NvU32 max_entries;                                // IN, clamped to UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES
+    NvU32 layer_id;                                   // IN, used with FILTER_LAYER
+    NvU32 slot_id;                                    // IN, used with FILTER_SLOT
+    NvU32 total_slots;                                // OUT, matching valid slots before max_entries truncation
+    NvU32 returned_slots;                             // OUT
+    NvU32 active_slots;                               // OUT, all valid slots in the driver pool
+    NvU32 backed_slots;                               // OUT, active slots with allocated backing
+    NvU64 current_epoch NV_ALIGN_BYTES(8);            // OUT
+    NvU64 validated_entries NV_ALIGN_BYTES(8);        // OUT
+    NvU64 overwrite_count NV_ALIGN_BYTES(8);          // OUT
+    NvU64 range_update_count NV_ALIGN_BYTES(8);       // OUT
+    NvU64 pool_full_count NV_ALIGN_BYTES(8);          // OUT
+    NvU64 slot_backing_bytes NV_ALIGN_BYTES(8);       // OUT, sum of active slot_bytes
+    NvU64 copy_count NV_ALIGN_BYTES(8);               // OUT, global successful copy range count
+    NvU64 copy_bytes NV_ALIGN_BYTES(8);               // OUT, global successful copy bytes
+    NvU64 copy_failed_count NV_ALIGN_BYTES(8);        // OUT, global failed copy range count
+    NvU64 vidmem_evict_count NV_ALIGN_BYTES(8);       // OUT, gpu_copy_only VIDMEM cache evictions
+    NvU64 pte_remap_count NV_ALIGN_BYTES(8);          // OUT, global smoke-only slot PTE writes
+    NvU64 pte_remap_bytes NV_ALIGN_BYTES(8);          // OUT, global smoke-only slot PTE bytes
+    NvU64 pte_clear_count NV_ALIGN_BYTES(8);          // OUT, global smoke-only slot PTE clears
+    NvU64 pte_block_unmap_count NV_ALIGN_BYTES(8);    // OUT, global VA-block-aware GPU unmaps before slot PTE writes
+    NvU64 pte_block_tracker_wait_count NV_ALIGN_BYTES(8); // OUT, global VA block tracker waits before slot PTE writes
+    NvU64 pte_rollback_count NV_ALIGN_BYTES(8);       // OUT, global transactional slot PTE rollbacks
+    NvU64 pte_rollback_bytes NV_ALIGN_BYTES(8);       // OUT, global transactional slot PTE rollback bytes
+    NvU64 pte_failure_count NV_ALIGN_BYTES(8);        // OUT, global failed smoke-only slot PTE remap attempts
+    NvU64 pte_fault_clear_count NV_ALIGN_BYTES(8);    // OUT, global slot PTE clears before managed fault fallback
+    NvU64 pte_migrate_clear_count NV_ALIGN_BYTES(8);  // OUT, global slot PTE clears before native migrate/remap
+    NvU64 pte_unmap_clear_count NV_ALIGN_BYTES(8);    // OUT, global slot PTE clears before native unmap teardown
+    NvU64 pte_split_clear_count NV_ALIGN_BYTES(8);    // OUT, global slot PTE clears before VA block split
+    NvU64 pte_release_clear_count NV_ALIGN_BYTES(8);  // OUT, global slot PTE clears during VA/GPU VA-space release
+    NvU64 pte_evict_clear_count NV_ALIGN_BYTES(8);    // OUT, global slot PTE clears before backing eviction
+    NvU64 pte_dangerous_op_reject_count NV_ALIGN_BYTES(8); // OUT, global read-only slot PTE dangerous op rejects
+    NvU64 pte_residual_va_block_count NV_ALIGN_BYTES(8); // OUT, VA blocks still carrying slot PTE metadata
+    NvU64 pte_residual_page_count NV_ALIGN_BYTES(8); // OUT, pages still carrying slot PTE metadata
+    NvU64 pte_residual_gpu_mask NV_ALIGN_BYTES(8);   // OUT, GPU id mask with residual slot PTE metadata
+    UVM_MOE_SLOT_POOL_QUERY_ENTRY entries[UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES]; // OUT
+    NV_STATUS rmStatus;                               // OUT
+} UVM_MOE_SLOT_POOL_QUERY_PARAMS;
+
+//
+// UvmMoeSlotPoolReadback
+//
+// Debug-only verification interface for COPY_ONLY/GPU_COPY_ONLY. It copies
+// bytes from driver-owned slot backing into a user buffer without changing user
+// VA mappings. VIDMEM backing is read back through a GPU_TO_CPU CE copy into a
+// DMA-capable sysmem staging allocation.
+//
+#define UVM_MOE_SLOT_POOL_READBACK                                     UVM_IOCTL_BASE(93)
+typedef struct
+{
+    NvU32 layer_id;                                   // IN
+    NvU32 slot_id;                                    // IN
+    NvU32 backing_kind;                               // OUT, UVM_MOE_SLOT_POOL_BACKING_KIND
+    NvU32 reserved;                                   // Reserved, must be zero
+    NvU64 slot_offset NV_ALIGN_BYTES(8);              // IN
+    NvU64 bytes NV_ALIGN_BYTES(8);                    // IN
+    NvU64 buffer NV_ALIGN_BYTES(8);                   // IN, user destination pointer
+    NvU64 copied_bytes NV_ALIGN_BYTES(8);             // OUT
+    NV_STATUS rmStatus;                               // OUT
+} UVM_MOE_SLOT_POOL_READBACK_PARAMS;
+
 typedef enum
 {
     UVM_PHASE_N_POOL_UNKNOWN = 0,
@@ -1140,6 +1361,9 @@ typedef enum
 #define UVM_PHASE_N_REGION_FLAG_CPU_NO_USER_MAPPING                  (1U << 8)
 #define UVM_PHASE_N_REGION_FLAG_GPU_READ_ONLY                        (1U << 9)
 #define UVM_PHASE_N_REGION_FLAG_GPU_READ_WRITE                       (1U << 10)
+#define UVM_PHASE_N_REGION_FLAG_HOT_SUBPOOL                          (1U << 11)
+#define UVM_PHASE_N_REGION_FLAG_STREAMING_SUBPOOL                    (1U << 12)
+#define UVM_PHASE_N_REGION_FLAG_COLD_SUBPOOL                         (1U << 13)
 
 #define UVM_PHASE_N_TRACE_VICTIM_MAX                                 8
 

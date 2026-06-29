@@ -29,7 +29,7 @@ all: uvm_allocator.so libcudamalloc_managed.so phase_f_smoke
 uvm: uvm_allocator.so
 
 uvm_allocator.so: uvm_allocator.cpp
-	$(NVCC) $(NVCCFLAGS) -shared -o $@ $< -lcudart
+	$(NVCC) $(NVCCFLAGS) -x cu -shared -o $@ $< -lcudart
 
 phase_f_smoke: phase_f_smoke.cpp uvm_allocator.so
 	$(CXX) -O2 -std=c++17 -I$(CUDA_INCLUDE) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< -l:uvm_allocator.so -L$(CUDA_LIB) -lcudart -ldl

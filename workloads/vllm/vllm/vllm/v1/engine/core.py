@@ -99,22 +99,43 @@ class EngineCore:
         self.log_stats = log_stats
 
         # Setup Model.
+        logger.info("UVM controlled remap boundary: executor_class init begin")
         self.model_executor = executor_class(vllm_config)
+        logger.info("UVM controlled remap boundary: executor_class init end")
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
         self.available_gpu_memory_for_kv_cache = -1
 
         # Setup KV Caches and update CacheConfig after profiling.
+        logger.info("UVM controlled remap boundary: _initialize_kv_caches call begin")
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
             vllm_config
+        )
+        logger.info(
+            "UVM controlled remap boundary: _initialize_kv_caches call end "
+            "num_gpu_blocks=%s num_cpu_blocks=%s",
+            num_gpu_blocks,
+            num_cpu_blocks,
         )
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
-        self.collective_rpc("initialize_cache", args=(num_gpu_blocks, num_cpu_blocks))
+        if os.environ.get("VLLM_UVM_CONTROLLED_REMAP_SKIP_ENGINE_CACHE_RPC") == "1":
+            logger.warning(
+                "Skipping EngineCore initialize_cache RPC for "
+                "VLLM_UVM_CONTROLLED_REMAP_SKIP_ENGINE_CACHE_RPC=1"
+            )
+        else:
+            logger.info("UVM controlled remap boundary: initialize_cache RPC begin")
+            self.collective_rpc(
+                "initialize_cache", args=(num_gpu_blocks, num_cpu_blocks)
+            )
+            logger.info("UVM controlled remap boundary: initialize_cache RPC end")
 
+        logger.info("UVM controlled remap boundary: structured_output_manager begin")
         self.structured_output_manager = StructuredOutputManager(vllm_config)
+        logger.info("UVM controlled remap boundary: structured_output_manager end")
 
         # Setup scheduler.
         Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
@@ -131,6 +152,7 @@ class EngineCore:
             * vllm_config.parallel_config.prefill_context_parallel_size
         )
 
+        logger.info("UVM controlled remap boundary: scheduler init begin")
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
@@ -139,14 +161,19 @@ class EngineCore:
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
         )
+        logger.info("UVM controlled remap boundary: scheduler init end")
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
+            logger.info("UVM controlled remap boundary: init_kv_output_aggregator begin")
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
+            logger.info("UVM controlled remap boundary: init_kv_output_aggregator end")
 
         self.mm_registry = mm_registry = MULTIMODAL_REGISTRY
+        logger.info("UVM controlled remap boundary: mm_receiver_cache begin")
         self.mm_receiver_cache = engine_receiver_cache_from_config(
             vllm_config, mm_registry
         )
+        logger.info("UVM controlled remap boundary: mm_receiver_cache end")
 
         # If a KV connector is initialized for scheduler, we want to collect
         # handshake metadata from all workers so the connector in the scheduler
@@ -155,9 +182,11 @@ class EngineCore:
         if kv_connector is not None:
             # Collect and store KV connector xfer metadata from workers
             # (after KV cache registration)
+            logger.info("UVM controlled remap boundary: kv connector metadata begin")
             xfer_handshake_metadata = (
                 self.model_executor.get_kv_connector_handshake_metadata()
             )
+            logger.info("UVM controlled remap boundary: kv connector metadata end")
 
             if xfer_handshake_metadata:
                 # xfer_handshake_metadata is list of dicts from workers
@@ -189,6 +218,7 @@ class EngineCore:
 
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
         if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
+            logger.info("UVM controlled remap boundary: request_block_hasher begin")
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo
             )
@@ -197,6 +227,7 @@ class EngineCore:
             self.request_block_hasher = get_request_block_hasher(
                 scheduler_block_size, caching_hash_fn
             )
+            logger.info("UVM controlled remap boundary: request_block_hasher end")
 
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
@@ -205,9 +236,13 @@ class EngineCore:
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
+        logger.info("UVM controlled remap boundary: freeze_gc_heap begin")
         freeze_gc_heap()
+        logger.info("UVM controlled remap boundary: freeze_gc_heap end")
         # If enable, attach GC debugger after static variable freeze.
+        logger.info("UVM controlled remap boundary: maybe_attach_gc_debug_callback begin")
         maybe_attach_gc_debug_callback()
+        logger.info("UVM controlled remap boundary: maybe_attach_gc_debug_callback end")
 
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
@@ -247,7 +282,9 @@ class EngineCore:
         num_cpu_blocks = 0
 
         # Initialize kv cache and warmup the execution
+        logger.info("UVM controlled remap boundary: initialize_from_config begin")
         self.model_executor.initialize_from_config(kv_cache_configs)
+        logger.info("UVM controlled remap boundary: initialize_from_config end")
 
         elapsed = time.time() - start
         logger.info_once(
@@ -585,6 +622,7 @@ class EngineCoreProc(EngineCore):
             vllm_config,
             client_handshake_address,
         ) as addresses:
+            logger.info("UVM controlled remap boundary: engine handshake HELLO/INIT complete")
             self.client_count = len(addresses.outputs)
 
             # Set up data parallel environment.
@@ -606,9 +644,11 @@ class EngineCoreProc(EngineCore):
 
             self._init_data_parallel(vllm_config)
 
+            logger.info("UVM controlled remap boundary: EngineCore super init begin")
             super().__init__(
                 vllm_config, executor_class, log_stats, executor_fail_callback
             )
+            logger.info("UVM controlled remap boundary: EngineCore super init end")
 
             # Background Threads and Queues for IO. These enable us to
             # overlap ZMQ socket IO with GPU since they release the GIL,
@@ -627,6 +667,7 @@ class EngineCoreProc(EngineCore):
                 daemon=True,
             )
             input_thread.start()
+            logger.info("UVM controlled remap boundary: EngineCore input thread started")
 
             self.output_thread = threading.Thread(
                 target=self.process_output_sockets,
@@ -638,6 +679,7 @@ class EngineCoreProc(EngineCore):
                 daemon=True,
             )
             self.output_thread.start()
+            logger.info("UVM controlled remap boundary: EngineCore output thread started")
 
             # Don't complete handshake until DP coordinator ready message is
             # received.
@@ -646,6 +688,8 @@ class EngineCoreProc(EngineCore):
                     raise RuntimeError("Input socket thread died during startup")
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
+
+        logger.info("UVM controlled remap boundary: EngineCore READY handshake sent")
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
@@ -730,12 +774,15 @@ class EngineCoreProc(EngineCore):
             bind=False,
         ) as handshake_socket:
             # Register engine with front-end.
+            logger.info("UVM controlled remap boundary: EngineCore startup HELLO begin")
             addresses = self.startup_handshake(
                 handshake_socket, local_client, headless, parallel_config_to_update
             )
+            logger.info("UVM controlled remap boundary: EngineCore startup HELLO/INIT end")
             yield addresses
 
             # Send ready message.
+            logger.info("UVM controlled remap boundary: EngineCore READY send begin")
             num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
             # We pass back the coordinator stats update address here for the
             # external LB case for our colocated front-end to use (coordinator
@@ -756,6 +803,7 @@ class EngineCoreProc(EngineCore):
                 )
 
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
+            logger.info("UVM controlled remap boundary: EngineCore READY send end")
 
     @staticmethod
     def startup_handshake(
@@ -974,6 +1022,7 @@ class EngineCoreProc(EngineCore):
         generic_decoder = MsgpackDecoder()
 
         with ExitStack() as stack, zmq.Context() as ctx:
+            logger.info("UVM controlled remap boundary: input socket thread enter")
             input_sockets = [
                 stack.enter_context(
                     make_zmq_socket(
@@ -1003,16 +1052,22 @@ class EngineCoreProc(EngineCore):
                 # Send initial message to each input socket - this is required
                 # before the front-end ROUTER socket can send input messages
                 # back to us.
+                logger.info("UVM controlled remap boundary: input socket initial send begin")
                 input_socket.send(b"")
+                logger.info("UVM controlled remap boundary: input socket initial send end")
                 poller.register(input_socket, zmq.POLLIN)
 
             if coord_socket is not None:
                 # Wait for ready message from coordinator.
+                logger.info("UVM controlled remap boundary: coordinator READY recv begin")
                 assert coord_socket.recv() == b"READY"
+                logger.info("UVM controlled remap boundary: coordinator READY recv end")
                 poller.register(coord_socket, zmq.POLLIN)
 
+            logger.info("UVM controlled remap boundary: input socket ready_event set")
             ready_event.set()
             del ready_event
+            logger.info("UVM controlled remap boundary: input socket poll loop begin")
             while True:
                 for input_socket, _ in poller.poll():
                     # (RequestType, RequestData)
@@ -1049,6 +1104,7 @@ class EngineCoreProc(EngineCore):
         # We must set linger to ensure the ENGINE_CORE_DEAD
         # message is sent prior to closing the socket.
         with ExitStack() as stack, zmq.Context() as ctx:
+            logger.info("UVM controlled remap boundary: output socket thread enter")
             sockets = [
                 stack.enter_context(
                     make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000)
@@ -1066,6 +1122,7 @@ class EngineCoreProc(EngineCore):
             )
             max_reuse_bufs = len(sockets) + 1
 
+            logger.info("UVM controlled remap boundary: output socket loop begin")
             while True:
                 output = self.output_queue.get()
                 if output == EngineCoreProc.ENGINE_CORE_DEAD:

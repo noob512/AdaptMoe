@@ -2665,6 +2665,55 @@ const uvm_page_mask_t *uvm_va_block_map_mask_get(uvm_va_block_t *block, uvm_proc
     return block_map_with_prot_mask_get(block, processor, UVM_PROT_READ_ONLY);
 }
 
+static bool block_page_is_moe_slot_backed(uvm_va_block_t *block,
+                                          uvm_processor_id_t processor,
+                                          uvm_page_index_t page_index)
+{
+    uvm_va_block_gpu_state_t *gpu_state;
+
+    if (!UVM_ID_IS_GPU(processor))
+        return false;
+
+    gpu_state = uvm_va_block_gpu_state_get(block, processor);
+    return gpu_state && uvm_page_mask_test(&gpu_state->moe_slot_pte_bits, page_index);
+}
+
+static bool block_root_chunk_has_moe_slot_pte(uvm_va_block_t *block,
+                                              uvm_gpu_t *gpu,
+                                              uvm_va_block_gpu_state_t *gpu_state,
+                                              uvm_gpu_chunk_t *root_chunk)
+{
+    uvm_va_block_region_t chunk_region;
+    size_t i;
+    size_t num_gpu_chunks;
+
+    if (!gpu_state || !gpu_state->chunks || uvm_page_mask_empty(&gpu_state->moe_slot_pte_bits))
+        return false;
+
+    num_gpu_chunks = block_num_gpu_chunks(block, gpu);
+    chunk_region.outer = 0;
+
+    for (i = 0; i < num_gpu_chunks; ++i) {
+        uvm_chunk_size_t chunk_size;
+        size_t chunk_index = block_gpu_chunk_index(block, gpu, chunk_region.outer, &chunk_size);
+
+        UVM_ASSERT(chunk_index == i);
+        chunk_region.first = chunk_region.outer;
+        chunk_region.outer = chunk_region.first + chunk_size / PAGE_SIZE;
+
+        if (!gpu_state->chunks[i])
+            continue;
+
+        if (!uvm_gpu_chunk_same_root(gpu_state->chunks[i], root_chunk))
+            continue;
+
+        if (!uvm_page_mask_region_empty(&gpu_state->moe_slot_pte_bits, chunk_region))
+            return true;
+    }
+
+    return false;
+}
+
 void uvm_va_block_unmapped_pages_get(uvm_va_block_t *va_block,
                                      uvm_va_block_region_t region,
                                      uvm_page_mask_t *out_mask)
@@ -2957,7 +3006,12 @@ static void block_get_mapped_processors(uvm_va_block_t *block,
 
     for_each_id_in_mask(mapped_id, &block->mapped) {
         if (uvm_page_mask_test(uvm_va_block_map_mask_get(block, mapped_id), page_index)) {
-            uvm_processor_id_t to_map_id = block_get_processor_to_map(block, block_context, mapped_id, page_index);
+            uvm_processor_id_t to_map_id;
+
+            if (block_page_is_moe_slot_backed(block, mapped_id, page_index))
+                continue;
+
+            to_map_id = block_get_processor_to_map(block, block_context, mapped_id, page_index);
 
             if (uvm_id_equal(to_map_id, resident_id))
                 uvm_processor_mask_set(mapped_procs, mapped_id);
@@ -5742,6 +5796,7 @@ static bool block_check_mappings_page(uvm_va_block_t *block,
 {
     uvm_processor_mask_t *atomic_mappings, *write_mappings, *read_mappings;
     uvm_processor_mask_t *remaining_mappings, *temp_mappings;
+    uvm_processor_mask_t moe_slot_mappings;
     uvm_processor_mask_t *resident_processors;
     uvm_processor_mask_t *native_atomics, *non_native_atomics;
     uvm_processor_mask_t *residency_accessible_from;
@@ -5765,6 +5820,16 @@ static bool block_check_mappings_page(uvm_va_block_t *block,
     block_page_authorized_processors(block, page_index, UVM_PROT_READ_WRITE_ATOMIC, atomic_mappings);
     block_page_authorized_processors(block, page_index, UVM_PROT_READ_WRITE, write_mappings);
     block_page_authorized_processors(block, page_index, UVM_PROT_READ_ONLY, read_mappings);
+
+    uvm_processor_mask_zero(&moe_slot_mappings);
+    for_each_id_in_mask(id, read_mappings) {
+        if (block_page_is_moe_slot_backed(block, id, page_index)) {
+            UVM_ASSERT(!uvm_processor_mask_test(write_mappings, id));
+            UVM_ASSERT(!uvm_processor_mask_test(atomic_mappings, id));
+            uvm_processor_mask_set(&moe_slot_mappings, id);
+        }
+    }
+    uvm_processor_mask_andnot(read_mappings, read_mappings, &moe_slot_mappings);
 
     // Each access bit implies all accesses below it
     UVM_ASSERT(uvm_processor_mask_subset(atomic_mappings, write_mappings));
@@ -6330,6 +6395,56 @@ static void block_gpu_pte_write_4k(uvm_va_block_t *block,
         // Handle PAGE_SIZE > GPU PTE size
         for (i = 0; i < ptes_per_page; i++) {
             NvU64 pte_val = tree->hal->make_pte(page_addr.aperture, page_addr.address, new_prot, pte_flags);
+            uvm_pte_batch_write_pte(pte_batch, pte_addr, pte_val, pte_size);
+            page_addr.address += UVM_PAGE_SIZE_4K;
+            pte_addr.address += pte_size;
+        }
+
+        if (tlb_batch) {
+            NvU64 page_virt_addr = uvm_va_block_cpu_page_address(block, page_index);
+            uvm_tlb_batch_invalidate(tlb_batch, page_virt_addr, PAGE_SIZE, UVM_PAGE_SIZE_4K, UVM_MEMBAR_NONE);
+        }
+    }
+}
+
+static void block_gpu_pte_write_moe_slot_4k(uvm_va_block_t *block,
+                                            uvm_gpu_t *gpu,
+                                            const uvm_page_mask_t *write_page_mask,
+                                            uvm_mem_t *slot_mem,
+                                            NvU64 slot_offset,
+                                            uvm_pte_batch_t *pte_batch,
+                                            uvm_tlb_batch_t *tlb_batch)
+{
+    uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(block, gpu->id);
+    uvm_page_tree_t *tree = &uvm_va_block_get_gpu_va_space(block, gpu)->page_tables;
+    NvU32 pte_size = uvm_mmu_pte_size(tree, UVM_PAGE_SIZE_4K);
+    const size_t ptes_per_page = PAGE_SIZE / UVM_PAGE_SIZE_4K;
+    uvm_page_index_t page_index;
+    NvU64 base_page_index;
+    NvU64 pte_flags = UVM_MMU_PTE_FLAGS_CACHED;
+
+    UVM_ASSERT(uvm_mem_is_local_vidmem(slot_mem, gpu));
+    UVM_ASSERT(IS_ALIGNED(slot_offset, UVM_PAGE_SIZE_4K));
+
+    base_page_index = uvm_va_block_first_page_in_mask(uvm_va_block_region_from_block(block), write_page_mask);
+
+    for_each_va_block_page_in_mask(page_index, write_page_mask, block) {
+        uvm_gpu_phys_address_t pte_addr;
+        uvm_gpu_phys_address_t page_addr = uvm_mem_gpu_physical(slot_mem,
+                                                                gpu,
+                                                                slot_offset + (page_index - base_page_index) * PAGE_SIZE,
+                                                                PAGE_SIZE);
+        size_t i;
+
+        pte_addr = uvm_page_table_range_entry_address(tree,
+                                                      &gpu_state->page_table_range_4k,
+                                                      page_index * ptes_per_page);
+
+        for (i = 0; i < ptes_per_page; i++) {
+            NvU64 pte_val = tree->hal->make_pte(page_addr.aperture,
+                                                page_addr.address,
+                                                UVM_PROT_READ_ONLY,
+                                                pte_flags);
             uvm_pte_batch_write_pte(pte_batch, pte_addr, pte_val, pte_size);
             page_addr.address += UVM_PAGE_SIZE_4K;
             pte_addr.address += pte_size;
@@ -8183,6 +8298,7 @@ static NV_STATUS block_unmap_gpu(uvm_va_block_t *block,
         if (pte_bit == UVM_PTE_BITS_GPU_READ && mask_empty)
             uvm_processor_mask_clear(&block->mapped, gpu->id);
     }
+    uvm_page_mask_andnot(&gpu_state->moe_slot_pte_bits, &gpu_state->moe_slot_pte_bits, pages_to_unmap);
 
     UVM_ASSERT(block_check_mappings(block, block_context));
 
@@ -8651,6 +8767,7 @@ static NV_STATUS block_map_gpu_to(uvm_va_block_t *va_block,
     // Update GPU mapping state
     for (pte_bit = 0; pte_bit <= prot_pte_bit; pte_bit++)
         uvm_page_mask_or(&gpu_state->pte_bits[pte_bit], &gpu_state->pte_bits[pte_bit], pages_to_map);
+    uvm_page_mask_andnot(&gpu_state->moe_slot_pte_bits, &gpu_state->moe_slot_pte_bits, pages_to_map);
 
     uvm_processor_mask_set(&va_block->mapped, gpu->id);
 
@@ -8674,6 +8791,185 @@ static NV_STATUS block_map_gpu_to(uvm_va_block_t *va_block,
     UVM_ASSERT(block_check_mappings(va_block, block_context));
 
     return uvm_tracker_add_push_safe(out_tracker, &push);
+}
+
+static NV_STATUS block_alloc_moe_slot_4k_ptes(uvm_va_block_t *va_block,
+                                              uvm_va_block_context_t *block_context,
+                                              uvm_gpu_t *gpu,
+                                              const uvm_page_mask_t *page_mask,
+                                              uvm_tracker_t *out_tracker)
+{
+    uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    uvm_va_block_new_pte_state_t *new_pte_state = &block_context->mapping.new_pte_state;
+
+    memset(new_pte_state, 0, sizeof(*new_pte_state));
+    new_pte_state->needs_4k = true;
+
+    if (uvm_va_block_num_big_pages(va_block) > 0) {
+        uvm_page_index_t page_index;
+
+        for_each_va_block_page_in_mask(page_index, page_mask, va_block) {
+            size_t big_page_index = uvm_va_block_big_page_index(va_block, page_index);
+
+            if (big_page_index != UVM_BIG_PAGES_PER_UVM_VA_BLOCK)
+                __set_bit(big_page_index, new_pte_state->big_ptes_covered);
+        }
+
+        bitmap_andnot(new_pte_state->big_ptes,
+                      gpu_state->big_ptes,
+                      new_pte_state->big_ptes_covered,
+                      UVM_BIG_PAGES_PER_UVM_VA_BLOCK);
+    }
+
+    return block_alloc_ptes_new_state(va_block, gpu, new_pte_state, out_tracker);
+}
+
+NV_STATUS uvm_va_block_map_moe_slot_readonly(uvm_va_block_t *va_block,
+                                             uvm_va_block_context_t *block_context,
+                                             uvm_gpu_t *gpu,
+                                             uvm_va_block_region_t region,
+                                             const uvm_page_mask_t *page_mask,
+                                             uvm_mem_t *slot_mem,
+                                             NvU64 slot_offset,
+                                             uvm_tracker_t *out_tracker)
+{
+    uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
+    uvm_va_block_gpu_state_t *gpu_state;
+    uvm_gpu_va_space_t *gpu_va_space;
+    uvm_page_tree_t *tree;
+    uvm_pte_batch_t *pte_batch = &block_context->mapping.pte_batch;
+    uvm_tlb_batch_t *tlb_batch = &block_context->mapping.tlb_batch;
+    uvm_push_t push;
+    NV_STATUS status;
+    uvm_page_mask_t *pages_to_map = &block_context->mapping.page_mask;
+
+    UVM_ASSERT(!uvm_va_block_is_dead(va_block));
+    uvm_assert_mutex_locked(&va_block->lock);
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    if (!gpu || !slot_mem || !uvm_mem_is_local_vidmem(slot_mem, gpu))
+        return NV_ERR_INVALID_STATE;
+
+    if (!IS_ALIGNED(slot_offset, UVM_PAGE_SIZE_4K))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    gpu_va_space = va_space->gpu_va_spaces[uvm_id_gpu_index(gpu->id)];
+    if (!gpu_va_space || uvm_gpu_va_space_state(gpu_va_space) != UVM_GPU_VA_SPACE_STATE_ACTIVE)
+        return NV_ERR_INVALID_DEVICE;
+
+    gpu_state = uvm_va_block_gpu_state_get_alloc(va_block, gpu);
+    if (!gpu_state)
+        return NV_ERR_NO_MEMORY;
+
+    uvm_page_mask_init_from_region(pages_to_map, region, page_mask);
+    if (uvm_page_mask_empty(pages_to_map))
+        return NV_OK;
+
+    status = block_alloc_moe_slot_4k_ptes(va_block, block_context, gpu, pages_to_map, out_tracker);
+    if (status != NV_OK)
+        return status;
+
+    tree = &gpu_va_space->page_tables;
+    status = uvm_push_begin_acquire(gpu->channel_manager,
+                                    UVM_CHANNEL_TYPE_MEMOPS,
+                                    &va_block->tracker,
+                                    &push,
+                                    "Mapping MoE slot pages in block [0x%llx, 0x%llx)",
+                                    va_block->start,
+                                    va_block->end + 1);
+    if (status != NV_OK)
+        return status;
+
+    if (gpu_state->pte_is_2m) {
+        block_gpu_split_2m(va_block, block_context, gpu, NULL, &push);
+    }
+    else if (!bitmap_empty(gpu_state->big_ptes, UVM_BIG_PAGES_PER_UVM_VA_BLOCK)) {
+        DECLARE_BITMAP(big_ptes_split, UVM_BIG_PAGES_PER_UVM_VA_BLOCK);
+        uvm_page_index_t page_index;
+
+        bitmap_zero(big_ptes_split, UVM_BIG_PAGES_PER_UVM_VA_BLOCK);
+        for_each_va_block_page_in_mask(page_index, pages_to_map, va_block) {
+            size_t big_page_index = uvm_va_block_big_page_index(va_block, page_index);
+
+            if (big_page_index != UVM_BIG_PAGES_PER_UVM_VA_BLOCK &&
+                test_bit(big_page_index, gpu_state->big_ptes))
+                __set_bit(big_page_index, big_ptes_split);
+        }
+
+        if (!bitmap_empty(big_ptes_split, UVM_BIG_PAGES_PER_UVM_VA_BLOCK))
+            block_gpu_split_big(va_block, block_context, gpu, big_ptes_split, &push);
+    }
+    else if (block_gpu_needs_to_activate_table(va_block, gpu)) {
+        uvm_tlb_batch_begin(tree, tlb_batch);
+        block_gpu_write_pde(va_block, gpu, &push, tlb_batch);
+        uvm_tlb_batch_end(tlb_batch, &push, UVM_MEMBAR_NONE);
+    }
+
+    uvm_pte_batch_begin(&push, pte_batch);
+    uvm_tlb_batch_begin(tree, tlb_batch);
+    block_gpu_pte_write_moe_slot_4k(va_block,
+                                    gpu,
+                                    pages_to_map,
+                                    slot_mem,
+                                    slot_offset,
+                                    pte_batch,
+                                    tlb_batch);
+    uvm_pte_batch_end(pte_batch);
+    uvm_tlb_batch_end(tlb_batch, &push, UVM_MEMBAR_GPU);
+
+    uvm_push_end(&push);
+    status = uvm_tracker_add_push_safe(out_tracker, &push);
+    if (status != NV_OK)
+        return status;
+
+    uvm_page_mask_or(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ],
+                     &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ],
+                     pages_to_map);
+    uvm_page_mask_andnot(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
+                         &gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
+                         pages_to_map);
+    uvm_page_mask_andnot(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_ATOMIC],
+                         &gpu_state->pte_bits[UVM_PTE_BITS_GPU_ATOMIC],
+                         pages_to_map);
+    uvm_page_mask_or(&gpu_state->moe_slot_pte_bits, &gpu_state->moe_slot_pte_bits, pages_to_map);
+    uvm_processor_mask_set(&va_block->mapped, gpu->id);
+
+    if (!uvm_va_block_is_hmm(va_block))
+        uvm_page_mask_or(&va_block->maybe_mapped_pages, &va_block->maybe_mapped_pages, pages_to_map);
+
+    UVM_ASSERT(block_check_mappings(va_block, block_context));
+
+    return NV_OK;
+}
+
+NV_STATUS uvm_va_block_unmap_moe_slot(uvm_va_block_t *va_block,
+                                      uvm_va_block_context_t *block_context,
+                                      uvm_gpu_t *gpu,
+                                      uvm_va_block_region_t region,
+                                      const uvm_page_mask_t *page_mask,
+                                      uvm_tracker_t *out_tracker)
+{
+    uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    uvm_page_mask_t *pages_to_unmap = &block_context->mapping.page_mask;
+    NV_STATUS status;
+
+    UVM_ASSERT(!uvm_va_block_is_dead(va_block));
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (!gpu_state)
+        return NV_OK;
+
+    uvm_page_mask_init_from_region(pages_to_unmap, region, page_mask);
+    if (!uvm_page_mask_and(pages_to_unmap, pages_to_unmap, &gpu_state->moe_slot_pte_bits))
+        return NV_OK;
+
+    // Keep moe_slot_pte_bits set while the normal unmap path runs. Several VA
+    // block checks and mapping helpers use this mask to distinguish slot-backed
+    // read-only PTEs from ordinary GPU-resident mappings. block_unmap_gpu()
+    // clears the mask atomically with the regular GPU PTE metadata.
+    status = uvm_va_block_unmap(va_block, block_context, gpu->id, region, pages_to_unmap, out_tracker);
+
+    return status;
 }
 
 // allowed_nid_mask is only valid if the CPU is set in allowed_mask.
@@ -10589,6 +10885,7 @@ void uvm_va_block_remove_gpu_va_space(uvm_va_block_t *va_block,
     gpu_state->activated_big = false;
     gpu_state->activated_4k = false;
     bitmap_zero(gpu_state->big_ptes, UVM_BIG_PAGES_PER_UVM_VA_BLOCK);
+    uvm_page_mask_zero(&gpu_state->moe_slot_pte_bits);
 
     UVM_ASSERT(block_check_mappings(va_block, block_context));
 }
@@ -11929,6 +12226,10 @@ static void block_split_gpu(uvm_va_block_t *existing, uvm_va_block_t *new, uvm_g
                               &new_gpu_state->pte_bits[pte_bit],
                               new_pages);
     }
+    block_split_page_mask(&existing_gpu_state->moe_slot_pte_bits,
+                          existing_pages,
+                          &new_gpu_state->moe_slot_pte_bits,
+                          new_pages);
 
     // Adjust page table ranges.
     gpu_va_space = uvm_gpu_va_space_get(va_space, gpu);
@@ -14834,6 +15135,13 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     if (!gpu_state)
         return NV_OK;
 
+    // PMM eviction is root-chunk based. A root chunk containing slot-backed PTEs
+    // must not be partially reclaimed here, because this path cannot take the VA
+    // space/mmap locks needed to clear the slot metadata and wait trackers. The
+    // slot pool's own eviction path handles clear+release under those locks.
+    if (block_root_chunk_has_moe_slot_pte(va_block, gpu, gpu_state, root_chunk))
+        return NV_ERR_NO_MEMORY;
+
     if (va_block_test && va_block_test->inject_eviction_error) {
         va_block_test->inject_eviction_error = false;
         return NV_ERR_NO_MEMORY;
@@ -14898,6 +15206,10 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                      &va_block->discarded_pages,
                      uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE));
     uvm_page_mask_and(pages_to_evict, pages_to_evict, &block_context->scratch_page_mask);
+    uvm_page_mask_andnot(pages_to_evict, pages_to_evict, &gpu_state->moe_slot_pte_bits);
+    if (uvm_page_mask_empty(pages_to_evict))
+        goto out;
+
     uvm_processor_mask_zero(&block_context->make_resident.all_involved_processors);
 
     if (uvm_va_block_is_hmm(va_block)) {

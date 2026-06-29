@@ -38,5 +38,4 @@
 #define NV_IS_EXPORT_SYMBOL_PRESENT_migrate_vma_setup 1
 #define NV_IS_EXPORT_SYMBOL_PRESENT___iowrite64_lo_hi 0
 #define NV_IS_EXPORT_SYMBOL_PRESENT_make_device_exclusive 0
-#define NV_IS_EXPORT_SYMBOL_GPL_platform_device_put 1
 // Kernel version:             "6.13.12-061312-generic"

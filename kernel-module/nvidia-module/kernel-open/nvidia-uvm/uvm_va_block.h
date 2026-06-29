@@ -260,6 +260,11 @@ typedef struct
     // Source classification for bg_promote_inflight.
     uvm_page_mask_t bg_promote_inflight_demand;
     uvm_page_mask_t bg_promote_inflight_prefetch;
+
+    // Experimental MoE slot-backed PTE smoke path. These pages are mapped in the
+    // block-owned GPU page tables, but their physical backing is driver-owned
+    // uvm_mem_t rather than normal VA block residency.
+    uvm_page_mask_t moe_slot_pte_bits;
 } uvm_va_block_gpu_state_t;
 
 typedef struct
@@ -1486,6 +1491,32 @@ NV_STATUS uvm_va_block_service_finish(uvm_processor_id_t processor_id,
 // rather than by the caller. Returns NULL if there is no memory.
 // Locking: The block lock must be held.
 uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get_alloc(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
+
+// Experimental MoE slot-backed readonly GPU mapping. This writes PTEs into the
+// VA block-owned GPU 4K page table and records a slot-specific map mask. It is
+// deliberately limited to smoke-sized readonly mappings and does not migrate or
+// replace normal VA block residency.
+//
+// Locking: the va_block lock must be held. The va_space lock must be held.
+NV_STATUS uvm_va_block_map_moe_slot_readonly(uvm_va_block_t *va_block,
+                                             uvm_va_block_context_t *block_context,
+                                             uvm_gpu_t *gpu,
+                                             uvm_va_block_region_t region,
+                                             const uvm_page_mask_t *page_mask,
+                                             uvm_mem_t *slot_mem,
+                                             NvU64 slot_offset,
+                                             uvm_tracker_t *out_tracker);
+
+// Clears MoE slot-backed mappings previously installed by
+// uvm_va_block_map_moe_slot_readonly().
+//
+// Locking: the va_block lock must be held. The va_space lock must be held.
+NV_STATUS uvm_va_block_unmap_moe_slot(uvm_va_block_t *va_block,
+                                      uvm_va_block_context_t *block_context,
+                                      uvm_gpu_t *gpu,
+                                      uvm_va_block_region_t region,
+                                      const uvm_page_mask_t *page_mask,
+                                      uvm_tracker_t *out_tracker);
 
 // Release any GPU or policy data associated with the given region in response
 // to munmap().

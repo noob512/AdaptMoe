@@ -334,6 +334,25 @@ NV_STATUS uvm_api_unregister_channel(UVM_UNREGISTER_CHANNEL_PARAMS *params, stru
 NV_STATUS uvm_api_enable_read_duplication(const UVM_ENABLE_READ_DUPLICATION_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_disable_read_duplication(const UVM_DISABLE_READ_DUPLICATION_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp);
+bool uvm_moe_slot_pool_range_has_mappings(uvm_va_space_t *va_space, NvU64 base, NvU64 bytes);
+NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_fault(uvm_va_space_t *va_space, NvU64 base, NvU64 bytes);
+NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_migrate(uvm_va_space_t *va_space, NvU64 base, NvU64 bytes);
+NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_discard(uvm_va_space_t *va_space, NvU64 base, NvU64 bytes);
+NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_unmap_locked(uvm_va_space_t *va_space,
+                                                                  struct mm_struct *mm,
+                                                                  NvU64 base,
+                                                                  NvU64 bytes);
+NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_native_invalidate(uvm_va_space_t *va_space,
+                                                                       struct mm_struct *mm,
+                                                                       NvU64 base,
+                                                                       NvU64 bytes);
+NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_split_locked(uvm_va_space_t *va_space,
+                                                                  struct mm_struct *mm,
+                                                                  NvU64 base,
+                                                                  NvU64 bytes);
+NV_STATUS uvm_moe_slot_pool_clear_gpu_va_space_mappings_locked(uvm_va_space_t *va_space,
+                                                               uvm_gpu_t *gpu,
+                                                               struct mm_struct *mm);
 NV_STATUS uvm_phase_n_reclaim_pool_over_budget(uvm_va_space_t *va_space,
                                                NvU32 pool,
                                                NvU32 gpu_id,

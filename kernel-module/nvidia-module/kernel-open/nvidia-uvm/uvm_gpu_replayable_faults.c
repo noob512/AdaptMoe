@@ -2448,6 +2448,30 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
             continue;
         }
 
+        if (uvm_moe_slot_pool_range_has_mappings(va_space,
+                                                 UVM_VA_BLOCK_ALIGN_DOWN(current_entry->fault_address),
+                                                 UVM_VA_BLOCK_SIZE)) {
+            if (prev_gpu_va_space) {
+                status = uvm_ats_invalidate_tlbs(prev_gpu_va_space, ats_invalidate, &batch_context->tracker);
+                if (status != NV_OK)
+                    goto fail;
+            }
+
+            uvm_va_space_up_read(va_space);
+            uvm_va_space_mm_release_unlock(va_space, mm);
+            mm = NULL;
+            va_space = NULL;
+            prev_gpu_va_space = NULL;
+
+            status = uvm_moe_slot_pool_clear_range_mappings_for_fault(current_entry->va_space,
+                                                                      UVM_VA_BLOCK_ALIGN_DOWN(current_entry->fault_address),
+                                                                      UVM_VA_BLOCK_SIZE);
+            if (status != NV_OK)
+                goto fail;
+
+            continue;
+        }
+
         status = service_fault_batch_dispatch(va_space,
                                               gpu_va_space,
                                               batch_context,

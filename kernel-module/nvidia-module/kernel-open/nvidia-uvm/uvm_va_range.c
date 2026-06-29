@@ -1212,6 +1212,14 @@ static NV_STATUS uvm_va_range_split_blocks(uvm_va_range_managed_t *existing, uvm
         old_block = uvm_va_range_block(existing, split_index);
         if (old_block) {
             UVM_ASSERT(old_block->start < new->va_range.node.start);
+
+            status = uvm_moe_slot_pool_clear_range_mappings_for_split_locked(existing->va_range.va_space,
+                                                                              NULL,
+                                                                              old_block->start,
+                                                                              old_block->end - old_block->start + 1);
+            if (status != NV_OK)
+                return status;
+
             status = uvm_va_block_split(old_block, new->va_range.node.start - 1, &block, new);
             if (status != NV_OK)
                 return status;

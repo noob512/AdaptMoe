@@ -59,6 +59,11 @@ _UVM_DRIVER_BATCH_MAX_RANGES = 64
 _UVM_INITIALIZE_IOCTL = 0x30000001
 _UVM_PHASE_F_BATCH_EXECUTOR_IOCTL = 81
 _UVM_PHASE_F_MAX_RANGES = 64
+_UVM_MOE_SLOT_REMAP_BATCH_IOCTL = 91
+_UVM_MOE_SLOT_POOL_QUERY_IOCTL = 92
+_UVM_MOE_SLOT_REMAP_MAX_ENTRIES = 128
+_UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES = 128
+_UVM_MOE_SLOT_REMAP_STATS_COUNT = 8
 _UVM_PAGE_SIZE = 0
 
 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ = 5
@@ -88,6 +93,9 @@ UVM_REGION_FLAG_ACTIVE = 1 << 2
 UVM_REGION_FLAG_PREFETCHABLE = 1 << 3
 UVM_REGION_FLAG_PINNED = 1 << 4
 UVM_REGION_FLAG_TRANSIENT = 1 << 5
+UVM_REGION_FLAG_HOT_SUBPOOL = 1 << 11
+UVM_REGION_FLAG_STREAMING_SUBPOOL = 1 << 12
+UVM_REGION_FLAG_COLD_SUBPOOL = 1 << 13
 
 UVM_REGION_STATE_UNKNOWN = 0
 UVM_REGION_STATE_COLD = 1
@@ -99,6 +107,35 @@ UVM_REGION_STATE_INACTIVE = 5
 UVM_POOL_BUDGET_MODE_TRACE_ONLY = 0
 UVM_POOL_BUDGET_MODE_SOFT = 1
 UVM_POOL_BUDGET_MODE_ENFORCE = 2
+
+UVM_MOE_SLOT_REMAP_MODE_DRY_RUN = 0
+UVM_MOE_SLOT_REMAP_MODE_VALIDATE = 1
+UVM_MOE_SLOT_REMAP_MODE_REMAP = 2
+UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY = 3
+UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY = 4
+UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP = 5
+UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP = 6
+
+UVM_MOE_SLOT_REMAP_ROLE_UNKNOWN = 0
+UVM_MOE_SLOT_REMAP_ROLE_GATE_UP = 3
+UVM_MOE_SLOT_REMAP_ROLE_DOWN = 4
+
+UVM_MOE_SLOT_POOL_QUERY_FLAG_FILTER_LAYER = 1 << 0
+UVM_MOE_SLOT_POOL_QUERY_FLAG_FILTER_SLOT = 1 << 1
+UVM_MOE_SLOT_POOL_QUERY_FLAG_RESET = 1 << 31
+
+UVM_MOE_SLOT_POOL_STATE_EMPTY = 0
+UVM_MOE_SLOT_POOL_STATE_RESERVED = 1
+UVM_MOE_SLOT_POOL_STATE_LOADING = 2
+UVM_MOE_SLOT_POOL_STATE_READY = 3
+UVM_MOE_SLOT_POOL_STATE_IN_USE = 4
+UVM_MOE_SLOT_POOL_STATE_RELEASED = 5
+UVM_MOE_SLOT_POOL_STATE_ERROR = 6
+
+UVM_MOE_SLOT_POOL_BACKING_NONE = 0
+UVM_MOE_SLOT_POOL_BACKING_SYSMEM = 1
+UVM_MOE_SLOT_POOL_BACKING_SYSMEM_DMA = 2
+UVM_MOE_SLOT_POOL_BACKING_VIDMEM = 3
 
 
 class _UvmInitializeParams(ctypes.Structure):
@@ -147,6 +184,129 @@ class _PhaseFBatchExecutorParams(ctypes.Structure):
     ]
 
 
+class _MoeSlotRemapEntry(ctypes.Structure):
+    _fields_ = [
+        ("layer_id", ctypes.c_uint32),
+        ("expert_id", ctypes.c_uint32),
+        ("slot_id", ctypes.c_uint32),
+        ("role", ctypes.c_uint32),
+        ("va_base", ctypes.c_uint64),
+        ("bytes", ctypes.c_uint64),
+        ("slot_offset", ctypes.c_uint64),
+        ("flags", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+    ]
+
+
+class _MoeSlotRemapBatchParams(ctypes.Structure):
+    _fields_ = [
+        ("mode", ctypes.c_uint32),
+        ("count", ctypes.c_uint32),
+        ("gpu_uuid", _PhaseFUuid),
+        ("validate_managed", ctypes.c_uint32),
+        ("success_count", ctypes.c_uint32),
+        ("failure_count", ctypes.c_uint32),
+        ("conflict_count", ctypes.c_uint32),
+        ("remap_count", ctypes.c_uint32),
+        ("tlb_invalidate_count", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("requested_bytes", ctypes.c_uint64),
+        ("accepted_bytes", ctypes.c_uint64),
+        ("entries", _MoeSlotRemapEntry * _UVM_MOE_SLOT_REMAP_MAX_ENTRIES),
+        ("rmStatus", ctypes.c_uint32),
+    ]
+
+
+class _MoeSlotPoolQueryEntry(ctypes.Structure):
+    _fields_ = [
+        ("layer_id", ctypes.c_uint32),
+        ("slot_id", ctypes.c_uint32),
+        ("owner_expert_id", ctypes.c_uint32),
+        ("state", ctypes.c_uint32),
+        ("range_count", ctypes.c_uint32),
+        ("last_role", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("last_status", ctypes.c_uint32),
+        ("epoch", ctypes.c_uint64),
+        ("batch_id", ctypes.c_uint64),
+        ("first_va_base", ctypes.c_uint64),
+        ("last_va_base", ctypes.c_uint64),
+        ("last_bytes", ctypes.c_uint64),
+        ("total_bytes", ctypes.c_uint64),
+        ("slot_bytes", ctypes.c_uint64),
+        ("slot_physical_bytes", ctypes.c_uint64),
+        ("copy_count", ctypes.c_uint64),
+        ("copy_bytes", ctypes.c_uint64),
+        ("copy_failed_count", ctypes.c_uint64),
+        ("pte_remap_bytes", ctypes.c_uint64),
+        ("pte_remap_count", ctypes.c_uint64),
+        ("pte_clear_count", ctypes.c_uint64),
+        ("pte_va_base", ctypes.c_uint64),
+        ("pte_bytes", ctypes.c_uint64),
+        ("pte_block_unmap_count", ctypes.c_uint64),
+        ("pte_block_tracker_wait_count", ctypes.c_uint64),
+        ("pte_rollback_count", ctypes.c_uint64),
+        ("pte_rollback_bytes", ctypes.c_uint64),
+        ("pte_failure_count", ctypes.c_uint64),
+        ("pte_fault_clear_count", ctypes.c_uint64),
+        ("pte_migrate_clear_count", ctypes.c_uint64),
+        ("pte_unmap_clear_count", ctypes.c_uint64),
+        ("pte_split_clear_count", ctypes.c_uint64),
+        ("pte_release_clear_count", ctypes.c_uint64),
+        ("pte_evict_clear_count", ctypes.c_uint64),
+        ("pte_dangerous_op_reject_count", ctypes.c_uint64),
+        ("backing_kind", ctypes.c_uint32),
+        ("copy_status", ctypes.c_uint32),
+        ("pte_mapped", ctypes.c_uint32),
+        ("pte_status", ctypes.c_uint32),
+        ("pte_mode", ctypes.c_uint32),
+        ("pte_va_block_tracked", ctypes.c_uint32),
+    ]
+
+
+class _MoeSlotPoolQueryParams(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint32),
+        ("max_entries", ctypes.c_uint32),
+        ("layer_id", ctypes.c_uint32),
+        ("slot_id", ctypes.c_uint32),
+        ("total_slots", ctypes.c_uint32),
+        ("returned_slots", ctypes.c_uint32),
+        ("active_slots", ctypes.c_uint32),
+        ("backed_slots", ctypes.c_uint32),
+        ("current_epoch", ctypes.c_uint64),
+        ("validated_entries", ctypes.c_uint64),
+        ("overwrite_count", ctypes.c_uint64),
+        ("range_update_count", ctypes.c_uint64),
+        ("pool_full_count", ctypes.c_uint64),
+        ("slot_backing_bytes", ctypes.c_uint64),
+        ("copy_count", ctypes.c_uint64),
+        ("copy_bytes", ctypes.c_uint64),
+        ("copy_failed_count", ctypes.c_uint64),
+        ("vidmem_evict_count", ctypes.c_uint64),
+        ("pte_remap_count", ctypes.c_uint64),
+        ("pte_remap_bytes", ctypes.c_uint64),
+        ("pte_clear_count", ctypes.c_uint64),
+        ("pte_block_unmap_count", ctypes.c_uint64),
+        ("pte_block_tracker_wait_count", ctypes.c_uint64),
+        ("pte_rollback_count", ctypes.c_uint64),
+        ("pte_rollback_bytes", ctypes.c_uint64),
+        ("pte_failure_count", ctypes.c_uint64),
+        ("pte_fault_clear_count", ctypes.c_uint64),
+        ("pte_migrate_clear_count", ctypes.c_uint64),
+        ("pte_unmap_clear_count", ctypes.c_uint64),
+        ("pte_split_clear_count", ctypes.c_uint64),
+        ("pte_release_clear_count", ctypes.c_uint64),
+        ("pte_evict_clear_count", ctypes.c_uint64),
+        ("pte_dangerous_op_reject_count", ctypes.c_uint64),
+        ("pte_residual_va_block_count", ctypes.c_uint64),
+        ("pte_residual_page_count", ctypes.c_uint64),
+        ("pte_residual_gpu_mask", ctypes.c_uint64),
+        ("entries", _MoeSlotPoolQueryEntry * _UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES),
+        ("rmStatus", ctypes.c_uint32),
+    ]
+
+
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _LIBC.ioctl.restype = ctypes.c_int
 
@@ -189,6 +349,174 @@ def _open_initialized_uvm_fd() -> int:
             f"ret={ret} errno={saved_errno} rmStatus={int(params.rmStatus)}"
         )
     return fd
+
+
+def _fd_link_is_uvm(link_target: str) -> bool:
+    base = os.path.basename(link_target)
+    return base == "nvidia-uvm" or base.startswith("nvidia-uvm ")
+
+
+def _iter_existing_uvm_fd_sources() -> list[int]:
+    try:
+        fd_names = sorted(
+            os.listdir("/proc/self/fd"),
+            key=lambda value: int(value) if value.isdigit() else -1,
+        )
+    except OSError:
+        return []
+
+    sources: list[int] = []
+    for name in fd_names:
+        if not name.isdigit():
+            continue
+        source_fd = int(name)
+        if source_fd < 3:
+            continue
+        try:
+            link_target = os.readlink(f"/proc/self/fd/{source_fd}")
+        except OSError:
+            continue
+        if not _fd_link_is_uvm(link_target):
+            continue
+        sources.append(source_fd)
+    return sources
+
+
+def _initialize_duplicated_uvm_fd(source_fd: int) -> Optional[int]:
+    try:
+        fd = os.dup(source_fd)
+    except OSError:
+        return None
+
+    params = _UvmInitializeParams()
+    ret = _libc_ioctl(fd, _UVM_INITIALIZE_IOCTL, params)
+    if ret == 0 and int(params.rmStatus) == 0:
+        return fd
+
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    return None
+
+
+def _adopt_existing_uvm_fd() -> Optional[int]:
+    for source_fd in _iter_existing_uvm_fd_sources():
+        fd = _initialize_duplicated_uvm_fd(source_fd)
+        if fd is not None:
+            return fd
+    return None
+
+
+def _iter_initialized_existing_uvm_fds():
+    for source_fd in _iter_existing_uvm_fd_sources():
+        fd = _initialize_duplicated_uvm_fd(source_fd)
+        if fd is not None:
+            yield fd
+
+
+def _open_or_adopt_initialized_uvm_fd(*, prefer_existing: bool = False) -> int:
+    if prefer_existing:
+        fd = _adopt_existing_uvm_fd()
+        if fd is not None:
+            return fd
+
+    return _open_initialized_uvm_fd()
+
+
+def _fill_moe_slot_remap_params(
+    params: _MoeSlotRemapBatchParams,
+    *,
+    chunk: list[dict[str, int]],
+    mode_value: int,
+    gpu_uuid: _PhaseFUuid,
+    validate_managed: bool,
+) -> None:
+    params.mode = mode_value
+    params.count = len(chunk)
+    params.gpu_uuid = gpu_uuid
+    params.validate_managed = 1 if validate_managed else 0
+    for index, entry in enumerate(chunk):
+        params.entries[index].layer_id = entry["layer_id"]
+        params.entries[index].expert_id = entry["expert_id"]
+        params.entries[index].slot_id = entry["slot_id"]
+        params.entries[index].role = entry["role"]
+        params.entries[index].va_base = entry["va_base"]
+        params.entries[index].bytes = entry["bytes"]
+        params.entries[index].slot_offset = entry["slot_offset"]
+        params.entries[index].flags = entry["flags"]
+
+
+def _moe_slot_fd_validates_targets(
+    fd: int,
+    normalized: list[dict[str, int]],
+    *,
+    gpu_uuid: _PhaseFUuid,
+) -> bool:
+    for start in range(0, len(normalized), _UVM_MOE_SLOT_REMAP_MAX_ENTRIES):
+        chunk = normalized[start:start + _UVM_MOE_SLOT_REMAP_MAX_ENTRIES]
+        params = _MoeSlotRemapBatchParams()
+        _fill_moe_slot_remap_params(
+            params,
+            chunk=chunk,
+            mode_value=UVM_MOE_SLOT_REMAP_MODE_DRY_RUN,
+            gpu_uuid=gpu_uuid,
+            validate_managed=True,
+        )
+        ctypes.set_errno(0)
+        ret = _libc_ioctl(fd, _UVM_MOE_SLOT_REMAP_BATCH_IOCTL, params)
+        if (
+            ret != 0
+            or int(params.rmStatus) != 0
+            or int(params.success_count) != len(chunk)
+            or int(params.failure_count) != 0
+        ):
+            return False
+    return True
+
+
+def _open_moe_slot_uvm_fd_for_targets(
+    normalized: list[dict[str, int]],
+    *,
+    mode_value: int,
+    gpu_uuid: _PhaseFUuid,
+    prefer_existing: bool,
+) -> int:
+    needs_target_owner = mode_value in (
+        UVM_MOE_SLOT_REMAP_MODE_REMAP,
+        UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY,
+        UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY,
+        UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP,
+        UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP,
+    )
+
+    if prefer_existing:
+        fallback_fd: Optional[int] = None
+        for fd in _iter_initialized_existing_uvm_fds():
+            if needs_target_owner:
+                if _moe_slot_fd_validates_targets(
+                    fd,
+                    normalized,
+                    gpu_uuid=gpu_uuid,
+                ):
+                    if fallback_fd is not None:
+                        os.close(fallback_fd)
+                    return fd
+                os.close(fd)
+                continue
+            elif fallback_fd is None:
+                fallback_fd = fd
+                continue
+
+            if fallback_fd is None:
+                fallback_fd = fd
+            else:
+                os.close(fd)
+
+        if fallback_fd is not None:
+            return fallback_fd
+
+    return _open_initialized_uvm_fd()
 
 
 def find_uvm_allocator_library() -> Optional[str]:
@@ -420,6 +748,23 @@ def load_uvm_library() -> ctypes.CDLL:
         ctypes.c_size_t,
         ctypes.c_int,
     ]
+
+    if hasattr(lib, "uvm_driver_moe_slot_remap_batch"):
+        lib.uvm_driver_moe_slot_remap_batch.restype = ctypes.c_int
+        lib.uvm_driver_moe_slot_remap_batch.argtypes = [
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_size_t,
+        ]
 
     if hasattr(lib, "uvm_driver_phase_n_set_pool_budget"):
         lib.uvm_driver_phase_n_set_pool_budget.restype = ctypes.c_int
@@ -1058,6 +1403,640 @@ def driver_phase_f_batch_execute_ranges(
                 pass
 
 
+def _moe_slot_remap_mode_value(mode: str | int) -> int:
+    if isinstance(mode, int):
+        return int(mode)
+    normalized = str(mode or "dry_run").strip().lower()
+    if normalized in ("dry_run", "dry-run", "trace", "trace_only"):
+        return UVM_MOE_SLOT_REMAP_MODE_DRY_RUN
+    if normalized in ("validate", "validate_only"):
+        return UVM_MOE_SLOT_REMAP_MODE_VALIDATE
+    if normalized in ("remap", "pte_remap", "real"):
+        return UVM_MOE_SLOT_REMAP_MODE_REMAP
+    if normalized in ("copy_only", "copy-only", "copy", "migration", "migrate"):
+        return UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY
+    if normalized in (
+        "gpu_copy_only",
+        "gpu-copy-only",
+        "gpu_copy",
+        "vidmem_copy_only",
+        "vidmem-copy-only",
+    ):
+        return UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY
+    if normalized in (
+        "slot_pte_remap",
+        "slot-pte-remap",
+        "pte_remap",
+        "pte-remap",
+        "slot_pte",
+    ):
+        return UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP
+    if normalized in (
+        "slot_va_block_remap",
+        "slot-va-block-remap",
+        "slot_va_block",
+        "va_block_remap",
+        "va-block-remap",
+    ):
+        return UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP
+    return UVM_MOE_SLOT_REMAP_MODE_DRY_RUN
+
+
+def _moe_slot_role_value(role: str | int | None) -> int:
+    if isinstance(role, int):
+        return int(role)
+    normalized = str(role or "").strip().lower()
+    if normalized in ("moe_gate_up", "gate_up", "w13", "w13_weight"):
+        return UVM_MOE_SLOT_REMAP_ROLE_GATE_UP
+    if normalized in ("moe_down", "down", "w2", "w2_weight"):
+        return UVM_MOE_SLOT_REMAP_ROLE_DOWN
+    return UVM_MOE_SLOT_REMAP_ROLE_UNKNOWN
+
+
+def _normalize_moe_slot_remap_entries(
+    entries: Sequence[dict[str, object]],
+    *,
+    round_to_pages: bool = True,
+) -> list[dict[str, int]]:
+    page = get_uvm_page_size()
+    normalized: list[dict[str, int]] = []
+    for entry in entries:
+        try:
+            va_base = int(entry.get("va_base", entry.get("ptr", 0)))
+            size_bytes = int(entry.get("bytes", entry.get("size", 0)))
+            layer_id = int(entry.get("layer_id", 0))
+            expert_id = int(entry.get("expert_id", 0))
+            slot_id = int(entry.get("slot_id", 0))
+            slot_offset = int(entry.get("slot_offset", 0))
+            flags = int(entry.get("flags", 0))
+        except (TypeError, ValueError, AttributeError):
+            continue
+
+        if va_base <= 0 or size_bytes <= 0:
+            continue
+        if round_to_pages:
+            end = va_base + size_bytes
+            va_base = va_base - (va_base % page)
+            rounded_end = ((end + page - 1) // page) * page
+            size_bytes = max(rounded_end - va_base, 0)
+        if size_bytes <= 0:
+            continue
+        normalized.append({
+            "layer_id": layer_id,
+            "expert_id": expert_id,
+            "slot_id": slot_id,
+            "role": _moe_slot_role_value(entry.get("role")),
+            "va_base": va_base,
+            "bytes": size_bytes,
+            "slot_offset": slot_offset,
+            "flags": flags,
+        })
+    return normalized
+
+
+def _empty_moe_slot_remap_result(
+    *,
+    mode: str | int,
+    ioctl_ret: int = 0,
+    rm_status: int = 0,
+) -> dict[str, object]:
+    mode_value = _moe_slot_remap_mode_value(mode)
+    return {
+        "mode": mode_value,
+        "mode_name": {
+            UVM_MOE_SLOT_REMAP_MODE_DRY_RUN: "dry_run",
+            UVM_MOE_SLOT_REMAP_MODE_VALIDATE: "validate",
+            UVM_MOE_SLOT_REMAP_MODE_REMAP: "remap",
+            UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY: "copy_only",
+            UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY: "gpu_copy_only",
+            UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP: "slot_pte_remap",
+            UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP: "slot_va_block_remap",
+        }.get(mode_value, str(mode)),
+        "entry_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "conflict_count": 0,
+        "requested_bytes": 0,
+        "accepted_bytes": 0,
+        "remap_count": 0,
+        "tlb_invalidate_count": 0,
+        "copy_count": 0,
+        "copy_bytes": 0,
+        "copy_failed_count": 0,
+        "rm_status": int(rm_status),
+        "ioctl_ret": int(ioctl_ret),
+        "ok": int(ioctl_ret) == 0 and int(rm_status) == 0,
+        "backend": "none",
+    }
+
+
+def _driver_moe_slot_remap_batch_cpp_helper(
+    entries: list[dict[str, int]],
+    *,
+    mode: str | int = "dry_run",
+    device: int = 0,
+    validate_managed: bool = False,
+) -> dict[str, int | str | bool] | None:
+    if _uvm_lib is None or not hasattr(_uvm_lib, "uvm_driver_moe_slot_remap_batch"):
+        return None
+    if not entries:
+        return _empty_moe_slot_remap_result(mode=mode)
+
+    helper = _uvm_lib.uvm_driver_moe_slot_remap_batch
+    mode_value = _moe_slot_remap_mode_value(mode)
+    if (mode_value in (
+            UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY,
+            UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY,
+    ) or
+            any(int(entry.get("slot_offset") or 0) != 0 for entry in entries)):
+        return None
+    total = _empty_moe_slot_remap_result(mode=mode)
+    total["backend"] = "cpp_helper"
+    total["ok"] = True
+
+    for start in range(0, len(entries), _UVM_MOE_SLOT_REMAP_MAX_ENTRIES):
+        chunk = entries[start:start + _UVM_MOE_SLOT_REMAP_MAX_ENTRIES]
+        count = len(chunk)
+        layer_ids = (ctypes.c_uint32 * count)(*(e["layer_id"] for e in chunk))
+        expert_ids = (ctypes.c_uint32 * count)(*(e["expert_id"] for e in chunk))
+        slot_ids = (ctypes.c_uint32 * count)(*(e["slot_id"] for e in chunk))
+        roles = (ctypes.c_uint32 * count)(*(e["role"] for e in chunk))
+        ptrs = (ctypes.c_uint64 * count)(*(e["va_base"] for e in chunk))
+        sizes = (ctypes.c_size_t * count)(*(e["bytes"] for e in chunk))
+        stats = (ctypes.c_uint64 * _UVM_MOE_SLOT_REMAP_STATS_COUNT)()
+        ret = int(helper(
+            layer_ids,
+            expert_ids,
+            slot_ids,
+            roles,
+            ptrs,
+            sizes,
+            ctypes.c_size_t(count),
+            ctypes.c_uint32(mode_value),
+            ctypes.c_int(device),
+            ctypes.c_uint32(1 if validate_managed else 0),
+            stats,
+            ctypes.c_size_t(_UVM_MOE_SLOT_REMAP_STATS_COUNT),
+        ))
+
+        total["entry_count"] = int(total["entry_count"]) + count
+        total["rm_status"] = int(stats[0])
+        total["success_count"] = int(total["success_count"]) + int(stats[1])
+        total["failure_count"] = int(total["failure_count"]) + int(stats[2])
+        total["conflict_count"] = int(total["conflict_count"]) + int(stats[3])
+        total["requested_bytes"] = int(total["requested_bytes"]) + int(stats[4])
+        total["accepted_bytes"] = int(total["accepted_bytes"]) + int(stats[5])
+        total["remap_count"] = int(total["remap_count"]) + int(stats[6])
+        total["tlb_invalidate_count"] = (
+            int(total["tlb_invalidate_count"]) + int(stats[7])
+        )
+        total["ioctl_ret"] = ret if ret < 0 else 0
+        if ret < 0 or int(stats[0]) != 0:
+            total["ok"] = False
+            break
+
+    if mode_value in (
+            UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY,
+            UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY,
+    ):
+        total["copy_count"] = int(total["success_count"])
+        total["copy_bytes"] = int(total["accepted_bytes"])
+        total["copy_failed_count"] = int(total["failure_count"])
+
+    return total
+
+
+def driver_moe_slot_remap_batch(
+    entries: Sequence[dict[str, object]],
+    *,
+    mode: str | int = "dry_run",
+    device: int = 0,
+    validate_managed: bool = False,
+    round_to_pages: bool = True,
+    fd_target_entries: Sequence[dict[str, object]] | None = None,
+    fd_target_round_to_pages: bool | None = None,
+    reset_slot_pool_after: bool = False,
+) -> dict[str, object]:
+    """Submit MoE slot remap assignments to the modified UVM driver."""
+    normalized = _normalize_moe_slot_remap_entries(
+        entries,
+        round_to_pages=round_to_pages,
+    )
+    if not normalized or uvm_residency_tag_only_enabled():
+        return _empty_moe_slot_remap_result(mode=mode)
+
+    fd_targets = normalized
+    if fd_target_entries is not None:
+        fd_targets = _normalize_moe_slot_remap_entries(
+            fd_target_entries,
+            round_to_pages=(
+                round_to_pages
+                if fd_target_round_to_pages is None
+                else fd_target_round_to_pages
+            ),
+        )
+        if not fd_targets:
+            result = _empty_moe_slot_remap_result(mode=mode, ioctl_ret=-5)
+            result["entry_count"] = len(normalized)
+            result["failure_count"] = len(normalized)
+            result["requested_bytes"] = sum(e["bytes"] for e in normalized)
+            result["backend"] = "python_ioctl"
+            result["ok"] = False
+            return result
+    else:
+        helper_result = _driver_moe_slot_remap_batch_cpp_helper(
+            normalized,
+            mode=mode,
+            device=device,
+            validate_managed=validate_managed,
+        ) if not reset_slot_pool_after else None
+        if helper_result is not None:
+            return helper_result
+
+    try:
+        gpu_uuid = _phase_f_gpu_uuid(device) if int(device) >= 0 else _PhaseFUuid()
+    except Exception:
+        logger.debug("Failed to resolve CUDA UUID for MoE slot remap ioctl",
+                     exc_info=True)
+        result = _empty_moe_slot_remap_result(mode=mode, ioctl_ret=-3)
+        result["entry_count"] = len(normalized)
+        result["failure_count"] = len(normalized)
+        result["requested_bytes"] = sum(e["bytes"] for e in normalized)
+        result["backend"] = "python_ioctl"
+        result["ok"] = False
+        return result
+
+    mode_value = _moe_slot_remap_mode_value(mode)
+    fd = -1
+    total = _empty_moe_slot_remap_result(mode=mode)
+    total["backend"] = "python_ioctl"
+    total["ok"] = True
+    try:
+        prefer_existing_fd = (
+            validate_managed
+            or mode_value in (
+                UVM_MOE_SLOT_REMAP_MODE_REMAP,
+                UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY,
+                UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY,
+                UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP,
+                UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP,
+            )
+        )
+        fd = _open_moe_slot_uvm_fd_for_targets(
+            fd_targets,
+            mode_value=mode_value,
+            gpu_uuid=gpu_uuid,
+            prefer_existing=prefer_existing_fd,
+        )
+        for start in range(0, len(normalized), _UVM_MOE_SLOT_REMAP_MAX_ENTRIES):
+            chunk = normalized[start:start + _UVM_MOE_SLOT_REMAP_MAX_ENTRIES]
+            params = _MoeSlotRemapBatchParams()
+            _fill_moe_slot_remap_params(
+                params,
+                chunk=chunk,
+                mode_value=mode_value,
+                gpu_uuid=gpu_uuid,
+                validate_managed=validate_managed,
+            )
+
+            ret = _libc_ioctl(fd, _UVM_MOE_SLOT_REMAP_BATCH_IOCTL, params)
+            total["entry_count"] = int(total["entry_count"]) + len(chunk)
+            total["success_count"] = (
+                int(total["success_count"]) + int(params.success_count)
+            )
+            total["failure_count"] = (
+                int(total["failure_count"]) + int(params.failure_count)
+            )
+            total["conflict_count"] = (
+                int(total["conflict_count"]) + int(params.conflict_count)
+            )
+            total["requested_bytes"] = (
+                int(total["requested_bytes"]) + int(params.requested_bytes)
+            )
+            total["accepted_bytes"] = (
+                int(total["accepted_bytes"]) + int(params.accepted_bytes)
+            )
+            total["remap_count"] = int(total["remap_count"]) + int(params.remap_count)
+            total["tlb_invalidate_count"] = (
+                int(total["tlb_invalidate_count"]) + int(params.tlb_invalidate_count)
+            )
+            total["rm_status"] = int(params.rmStatus)
+            total["ioctl_ret"] = int(ret)
+
+            if ret != 0 or int(params.rmStatus) != 0:
+                saved_errno = ctypes.get_errno()
+                logger.warning(
+                    "MoE slot remap ioctl failed: mode=%s ret=%s errno=%s "
+                    "rmStatus=%s success=%s failure=%s conflicts=%s",
+                    mode,
+                    ret,
+                    saved_errno,
+                    int(params.rmStatus),
+                    int(params.success_count),
+                    int(params.failure_count),
+                    int(params.conflict_count),
+                )
+                total["ok"] = False
+                break
+        if reset_slot_pool_after and total.get("ok") is True:
+            reset_result = _driver_moe_slot_pool_reset_after_remap_on_fd(fd)
+            total["slot_pool_reset_after_remap"] = reset_result
+            if reset_result.get("ok") is not True:
+                total["ok"] = False
+                total["reset_after_remap_failed"] = True
+        if mode_value in (
+                UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY,
+                UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY,
+        ):
+            total["copy_count"] = int(total["success_count"])
+            total["copy_bytes"] = int(total["accepted_bytes"])
+            total["copy_failed_count"] = int(total["failure_count"])
+        return total
+    except Exception:
+        logger.debug("MoE slot remap direct ioctl failed", exc_info=True)
+        result = _empty_moe_slot_remap_result(mode=mode, ioctl_ret=-4)
+        result["entry_count"] = len(normalized)
+        result["failure_count"] = len(normalized)
+        result["requested_bytes"] = sum(e["bytes"] for e in normalized)
+        result["backend"] = "python_ioctl"
+        result["ok"] = False
+        return result
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _moe_slot_pool_entry_to_dict(entry: _MoeSlotPoolQueryEntry) -> dict[str, int]:
+    return {
+        "layer_id": int(entry.layer_id),
+        "slot_id": int(entry.slot_id),
+        "owner_expert_id": int(entry.owner_expert_id),
+        "state": int(entry.state),
+        "range_count": int(entry.range_count),
+        "last_role": int(entry.last_role),
+        "flags": int(entry.flags),
+        "last_status": int(entry.last_status),
+        "epoch": int(entry.epoch),
+        "batch_id": int(entry.batch_id),
+        "first_va_base": int(entry.first_va_base),
+        "last_va_base": int(entry.last_va_base),
+        "last_bytes": int(entry.last_bytes),
+        "total_bytes": int(entry.total_bytes),
+        "slot_bytes": int(entry.slot_bytes),
+        "slot_physical_bytes": int(entry.slot_physical_bytes),
+        "copy_count": int(entry.copy_count),
+        "copy_bytes": int(entry.copy_bytes),
+        "copy_failed_count": int(entry.copy_failed_count),
+        "pte_remap_bytes": int(entry.pte_remap_bytes),
+        "pte_remap_count": int(entry.pte_remap_count),
+        "pte_clear_count": int(entry.pte_clear_count),
+        "pte_va_base": int(entry.pte_va_base),
+        "pte_bytes": int(entry.pte_bytes),
+        "pte_block_unmap_count": int(entry.pte_block_unmap_count),
+        "pte_block_tracker_wait_count": int(entry.pte_block_tracker_wait_count),
+        "pte_rollback_count": int(entry.pte_rollback_count),
+        "pte_rollback_bytes": int(entry.pte_rollback_bytes),
+        "pte_failure_count": int(entry.pte_failure_count),
+        "pte_fault_clear_count": int(entry.pte_fault_clear_count),
+        "pte_migrate_clear_count": int(entry.pte_migrate_clear_count),
+        "pte_unmap_clear_count": int(entry.pte_unmap_clear_count),
+        "pte_split_clear_count": int(entry.pte_split_clear_count),
+        "pte_release_clear_count": int(entry.pte_release_clear_count),
+        "pte_evict_clear_count": int(entry.pte_evict_clear_count),
+        "pte_dangerous_op_reject_count": int(entry.pte_dangerous_op_reject_count),
+        "backing_kind": int(entry.backing_kind),
+        "copy_status": int(entry.copy_status),
+        "pte_mapped": int(entry.pte_mapped),
+        "pte_status": int(entry.pte_status),
+        "pte_mode": int(entry.pte_mode),
+        "pte_va_block_tracked": int(entry.pte_va_block_tracked),
+    }
+
+
+_MOE_SLOT_POOL_QUERY_SUMMARY_KEYS = (
+    "ok",
+    "ioctl_ret",
+    "errno",
+    "rm_status",
+    "total_slots",
+    "returned_slots",
+    "active_slots",
+    "backed_slots",
+    "current_epoch",
+    "validated_entries",
+    "overwrite_count",
+    "range_update_count",
+    "pool_full_count",
+    "slot_backing_bytes",
+    "copy_count",
+    "copy_bytes",
+    "copy_failed_count",
+    "vidmem_evict_count",
+    "pte_remap_count",
+    "pte_remap_bytes",
+    "pte_clear_count",
+    "pte_block_unmap_count",
+    "pte_block_tracker_wait_count",
+    "pte_rollback_count",
+    "pte_rollback_bytes",
+    "pte_failure_count",
+    "pte_fault_clear_count",
+    "pte_migrate_clear_count",
+    "pte_unmap_clear_count",
+    "pte_split_clear_count",
+    "pte_release_clear_count",
+    "pte_evict_clear_count",
+    "pte_dangerous_op_reject_count",
+    "pte_residual_va_block_count",
+    "pte_residual_page_count",
+    "pte_residual_gpu_mask",
+)
+
+
+def _compact_moe_slot_pool_query_result(
+    result: dict[str, object],
+) -> dict[str, int | bool]:
+    return {
+        key: bool(result.get(key)) if key == "ok" else int(result.get(key) or 0)
+        for key in _MOE_SLOT_POOL_QUERY_SUMMARY_KEYS
+    }
+
+
+def _make_moe_slot_pool_query_params(
+    *,
+    layer_id: int | None = None,
+    slot_id: int | None = None,
+    max_entries: int = _UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES,
+    reset: bool = False,
+) -> tuple[_MoeSlotPoolQueryParams, int]:
+    flags = 0
+    if layer_id is not None:
+        flags |= UVM_MOE_SLOT_POOL_QUERY_FLAG_FILTER_LAYER
+    if slot_id is not None:
+        flags |= UVM_MOE_SLOT_POOL_QUERY_FLAG_FILTER_SLOT
+    if reset:
+        flags |= UVM_MOE_SLOT_POOL_QUERY_FLAG_RESET
+
+    params = _MoeSlotPoolQueryParams()
+    params.flags = flags
+    params.max_entries = max(0, min(
+        int(max_entries),
+        _UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES,
+    ))
+    params.layer_id = 0 if layer_id is None else int(layer_id)
+    params.slot_id = 0 if slot_id is None else int(slot_id)
+    return params, flags
+
+
+def _empty_moe_slot_pool_query_result(flags: int = 0) -> dict[str, object]:
+    return {
+        "ok": False,
+        "ioctl": _UVM_MOE_SLOT_POOL_QUERY_IOCTL,
+        "ioctl_ret": -1,
+        "errno": 0,
+        "rm_status": 0,
+        "flags": flags,
+        "entries": [],
+    }
+
+
+def _driver_moe_slot_pool_query_on_fd(
+    fd: int,
+    *,
+    layer_id: int | None = None,
+    slot_id: int | None = None,
+    max_entries: int = _UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES,
+    reset: bool = False,
+) -> dict[str, object]:
+    params, flags = _make_moe_slot_pool_query_params(
+        layer_id=layer_id,
+        slot_id=slot_id,
+        max_entries=max_entries,
+        reset=reset,
+    )
+    result = _empty_moe_slot_pool_query_result(flags)
+
+    ctypes.set_errno(0)
+    ret = _libc_ioctl(fd, _UVM_MOE_SLOT_POOL_QUERY_IOCTL, params)
+    saved_errno = ctypes.get_errno()
+    entries = [
+        _moe_slot_pool_entry_to_dict(params.entries[index])
+        for index in range(int(params.returned_slots))
+    ]
+    result.update({
+        "ok": ret == 0 and int(params.rmStatus) == 0,
+        "ioctl_ret": int(ret),
+        "errno": int(saved_errno),
+        "rm_status": int(params.rmStatus),
+        "total_slots": int(params.total_slots),
+        "returned_slots": int(params.returned_slots),
+        "active_slots": int(params.active_slots),
+        "backed_slots": int(params.backed_slots),
+        "current_epoch": int(params.current_epoch),
+        "validated_entries": int(params.validated_entries),
+        "overwrite_count": int(params.overwrite_count),
+        "range_update_count": int(params.range_update_count),
+        "pool_full_count": int(params.pool_full_count),
+        "slot_backing_bytes": int(params.slot_backing_bytes),
+        "copy_count": int(params.copy_count),
+        "copy_bytes": int(params.copy_bytes),
+        "copy_failed_count": int(params.copy_failed_count),
+        "vidmem_evict_count": int(params.vidmem_evict_count),
+        "pte_remap_count": int(params.pte_remap_count),
+        "pte_remap_bytes": int(params.pte_remap_bytes),
+        "pte_clear_count": int(params.pte_clear_count),
+        "pte_block_unmap_count": int(params.pte_block_unmap_count),
+        "pte_block_tracker_wait_count": int(params.pte_block_tracker_wait_count),
+        "pte_rollback_count": int(params.pte_rollback_count),
+        "pte_rollback_bytes": int(params.pte_rollback_bytes),
+        "pte_failure_count": int(params.pte_failure_count),
+        "pte_fault_clear_count": int(params.pte_fault_clear_count),
+        "pte_migrate_clear_count": int(params.pte_migrate_clear_count),
+        "pte_unmap_clear_count": int(params.pte_unmap_clear_count),
+        "pte_split_clear_count": int(params.pte_split_clear_count),
+        "pte_release_clear_count": int(params.pte_release_clear_count),
+        "pte_evict_clear_count": int(params.pte_evict_clear_count),
+        "pte_dangerous_op_reject_count": int(params.pte_dangerous_op_reject_count),
+        "pte_residual_va_block_count": int(params.pte_residual_va_block_count),
+        "pte_residual_page_count": int(params.pte_residual_page_count),
+        "pte_residual_gpu_mask": int(params.pte_residual_gpu_mask),
+        "entries": entries,
+    })
+    return result
+
+
+def _driver_moe_slot_pool_reset_after_remap_on_fd(
+    fd: int,
+) -> dict[str, object]:
+    before = _driver_moe_slot_pool_query_on_fd(fd, max_entries=0)
+    reset = _driver_moe_slot_pool_query_on_fd(fd, max_entries=0, reset=True)
+    after = _driver_moe_slot_pool_query_on_fd(fd, max_entries=0)
+
+    before_summary = _compact_moe_slot_pool_query_result(before)
+    reset_summary = _compact_moe_slot_pool_query_result(reset)
+    after_summary = _compact_moe_slot_pool_query_result(after)
+    ok = (
+        bool(before_summary["ok"])
+        and bool(reset_summary["ok"])
+        and bool(after_summary["ok"])
+        and int(after_summary["active_slots"]) == 0
+        and int(after_summary["backed_slots"]) == 0
+        and int(after_summary["slot_backing_bytes"]) == 0
+        and int(reset_summary["pte_residual_va_block_count"]) == 0
+        and int(reset_summary["pte_residual_page_count"]) == 0
+        and int(after_summary["pte_residual_va_block_count"]) == 0
+        and int(after_summary["pte_residual_page_count"]) == 0
+    )
+    return {
+        "ok": ok,
+        "before": before_summary,
+        "reset": reset_summary,
+        "after": after_summary,
+    }
+
+
+def driver_moe_slot_pool_query(
+    *,
+    layer_id: int | None = None,
+    slot_id: int | None = None,
+    max_entries: int = _UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES,
+    reset: bool = False,
+    prefer_existing: bool = False,
+) -> dict[str, object]:
+    """Query the experimental UVM driver-side MoE slot pool metadata."""
+    _, flags = _make_moe_slot_pool_query_params(
+        layer_id=layer_id,
+        slot_id=slot_id,
+        max_entries=max_entries,
+        reset=reset,
+    )
+    result = _empty_moe_slot_pool_query_result(flags)
+
+    fd = -1
+    try:
+        fd = _open_or_adopt_initialized_uvm_fd(prefer_existing=prefer_existing)
+        return _driver_moe_slot_pool_query_on_fd(
+            fd,
+            layer_id=layer_id,
+            slot_id=slot_id,
+            max_entries=max_entries,
+            reset=reset,
+        )
+    except Exception:
+        logger.debug("MoE slot pool query ioctl failed", exc_info=True)
+        result["ioctl_ret"] = -4
+        return result
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def driver_prepare_ranges_remote_read_bg_deferred(
     ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
     *,
@@ -1369,39 +2348,61 @@ def driver_batch_query_ranges_residency_bytes(
     if not _uvm_enabled or _uvm_lib is None:
         return result
 
-    ptr_array, size_array, count = _prepare_uvm_range_arrays(ranges)
-    if count <= 0:
+    range_list = list(ranges)
+    if not range_list:
         result["ok"] = True
         result["status"] = 0
         return result
 
-    gpu_bytes = ctypes.c_uint64(0)
-    cpu_bytes = ctypes.c_uint64(0)
-    any_bytes = ctypes.c_uint64(0)
-    unknown_bytes = ctypes.c_uint64(0)
-    queried_bytes = ctypes.c_uint64(0)
-    status = int(
-        _uvm_lib.uvm_driver_batch_query_residency_bytes(
-            ptr_array,
-            size_array,
-            ctypes.c_size_t(count),
-            ctypes.c_int(device),
-            ctypes.byref(gpu_bytes),
-            ctypes.byref(cpu_bytes),
-            ctypes.byref(any_bytes),
-            ctypes.byref(unknown_bytes),
-            ctypes.byref(queried_bytes),
+    final_status = 0
+    total_gpu_bytes = 0
+    total_cpu_bytes = 0
+    total_any_bytes = 0
+    total_unknown_bytes = 0
+    total_queried_bytes = 0
+
+    for start in range(0, len(range_list), _UVM_DRIVER_BATCH_MAX_RANGES):
+        chunk = range_list[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
+        ptr_array, size_array, count = _prepare_uvm_range_arrays(chunk)
+        if count <= 0:
+            continue
+        gpu_bytes = ctypes.c_uint64(0)
+        cpu_bytes = ctypes.c_uint64(0)
+        any_bytes = ctypes.c_uint64(0)
+        unknown_bytes = ctypes.c_uint64(0)
+        queried_bytes = ctypes.c_uint64(0)
+        status = int(
+            _uvm_lib.uvm_driver_batch_query_residency_bytes(
+                ptr_array,
+                size_array,
+                ctypes.c_size_t(count),
+                ctypes.c_int(device),
+                ctypes.byref(gpu_bytes),
+                ctypes.byref(cpu_bytes),
+                ctypes.byref(any_bytes),
+                ctypes.byref(unknown_bytes),
+                ctypes.byref(queried_bytes),
+            )
         )
-    )
+        if status < 0:
+            final_status = status
+            break
+        final_status += status
+        total_gpu_bytes += int(gpu_bytes.value)
+        total_cpu_bytes += int(cpu_bytes.value)
+        total_any_bytes += int(any_bytes.value)
+        total_unknown_bytes += int(unknown_bytes.value)
+        total_queried_bytes += int(queried_bytes.value)
+
     result.update(
         {
-            "ok": status >= 0,
-            "status": status,
-            "queried_bytes": int(queried_bytes.value),
-            "gpu_bytes": int(gpu_bytes.value),
-            "cpu_bytes": int(cpu_bytes.value),
-            "any_bytes": int(any_bytes.value),
-            "unknown_bytes": int(unknown_bytes.value),
+            "ok": final_status >= 0,
+            "status": final_status,
+            "queried_bytes": total_queried_bytes,
+            "gpu_bytes": total_gpu_bytes,
+            "cpu_bytes": total_cpu_bytes,
+            "any_bytes": total_any_bytes,
+            "unknown_bytes": total_unknown_bytes,
         }
     )
     return result

@@ -990,6 +990,10 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
         return NV_ERR_INVALID_ARGUMENT;
     }
 
+    status = uvm_moe_slot_pool_clear_range_mappings_for_migrate(va_space, params->base, params->length);
+    if (status != NV_OK)
+        return status;
+
     gpus_to_check_for_nvlink_errors = uvm_processor_mask_cache_alloc();
     if (!gpus_to_check_for_nvlink_errors)
         return NV_ERR_NO_MEMORY;

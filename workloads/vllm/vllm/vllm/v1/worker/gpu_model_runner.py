@@ -57,6 +57,8 @@ from vllm.device_allocator.uvm import (
     batch_prepare_ranges_for_native_remote_access_with_executor,
     batch_prepare_ranges_for_remote_read_with_executor,
     batch_prefetch_ranges_to_device,
+    driver_batch_query_ranges_residency_bytes,
+    driver_moe_slot_pool_query,
     probe_driver_capable_range,
     uvm_allocation_phase,
     uvm_enabled_allocation_phase,
@@ -66,6 +68,7 @@ from vllm.device_allocator.uvm_kv_init_probe import (
     synchronize_kv_init_probe_tensor,
 )
 from vllm.device_allocator.uvm_pool_residency import (
+    get_uvm_real_residency_snapshot,
     get_uvm_pool_residency_manager,
     register_uvm_residency_region,
 )
@@ -3552,6 +3555,17 @@ class GPUModelRunner(
             return default
         return env_value.lower() in ("1", "true", "yes", "on")
 
+    @staticmethod
+    def _env_int_value(env_name: str, default: int = 0) -> int:
+        env_value = os.environ.get(env_name)
+        if env_value is None or env_value == "":
+            return default
+        try:
+            return int(env_value)
+        except ValueError:
+            logger.warning("Ignoring invalid integer env %s=%r", env_name, env_value)
+            return default
+
     def _is_uvm_address_logging_enabled(self) -> bool:
         # Default to enabled when UVM allocator mode is enabled.
         default_enabled = self._env_flag_enabled("VLLM_USE_UVM", default=False)
@@ -3573,6 +3587,60 @@ class GPUModelRunner(
     def _uvm_weight_map_file(self) -> str:
         return os.environ.get(
             "VLLM_UVM_WEIGHT_MAP_FILE", "vllm_uvm_weight_regions.jsonl"
+        )
+
+    def _uvm_weight_map_include_aliases(self) -> bool:
+        return self._env_flag_enabled(
+            "VLLM_UVM_WEIGHT_MAP_INCLUDE_ALIASES", default=False
+        )
+
+    def _uvm_weight_map_probe_managed(self) -> bool:
+        return self._env_flag_enabled(
+            "VLLM_UVM_WEIGHT_MAP_PROBE_MANAGED", default=True
+        )
+
+    def _uvm_weight_map_register_expert_tensors(self) -> bool:
+        return self._env_flag_enabled(
+            "VLLM_UVM_WEIGHT_MAP_REGISTER_EXPERT_TENSORS", default=True
+        )
+
+    def _uvm_weight_map_include_expert_slices(self) -> bool:
+        return self._env_flag_enabled(
+            "VLLM_UVM_WEIGHT_MAP_INCLUDE_EXPERT_SLICES", default=True
+        )
+
+    def _uvm_weight_map_query_expert_slices(self) -> bool:
+        return self._env_flag_enabled(
+            "VLLM_UVM_WEIGHT_MAP_QUERY_EXPERT_SLICES", default=True
+        )
+
+    def _uvm_weight_map_real_residency_snapshot_enabled(self) -> bool:
+        return self._env_flag_enabled(
+            "VLLM_UVM_WEIGHT_MAP_REAL_RESIDENCY_SNAPSHOT_ENABLE", default=False
+        )
+
+    def _uvm_weight_map_query_residency_enabled(self) -> bool:
+        return self._env_flag_enabled(
+            "VLLM_UVM_WEIGHT_MAP_QUERY_RESIDENCY_ENABLE", default=False
+        )
+
+    def _uvm_weight_map_query_residency_device(self) -> int:
+        return self._env_int_value("VLLM_UVM_WEIGHT_MAP_QUERY_RESIDENCY_DEVICE", 0)
+
+    def _uvm_weight_map_query_residency_round_pages(self) -> bool:
+        return self._env_flag_enabled(
+            "VLLM_UVM_WEIGHT_MAP_QUERY_RESIDENCY_ROUND_PAGES", default=True
+        )
+
+    def _uvm_fixed_weight_device_direct_enabled(self) -> bool:
+        return self._env_flag_enabled(
+            "VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_ENABLE", default=False
+        )
+
+    def _uvm_fixed_weight_device_direct_trace_file(self) -> str:
+        return os.environ.get(
+            "VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_TRACE_FILE",
+            "vllm_uvm_fixed_weight_device_direct.jsonl",
         )
 
     def _prepare_uvm_address_log(self) -> None:
@@ -3685,11 +3753,15 @@ class GPUModelRunner(
     @staticmethod
     def _uvm_weight_semantic_tags(name: str) -> dict[str, Any]:
         parts = name.split(".")
+        lower_parts = [part.lower() for part in parts]
         layer_id: int | None = None
         expert_id: int | None = None
         role = "other"
         shard_id: str | None = None
         is_moe_expert = False
+        is_main_weight = False
+        is_moe_expert_main_weight = False
+        semantic_type = "other"
 
         for idx, part in enumerate(parts):
             if part == "layers" and idx + 1 < len(parts):
@@ -3705,37 +3777,158 @@ class GPUModelRunner(
                     pass
 
         lowered = name.lower()
-        if "experts" in parts or "fused_experts" in lowered:
+        leaf = parts[-1].lower() if parts else lowered
+        if "experts" in lower_parts or "fused_experts" in lowered:
             is_moe_expert = True
-        if any(token in lowered for token in ("w13", "gate_up_proj")):
-            role = "moe_gate_up"
-            shard_id = "w13"
-        elif any(token in lowered for token in ("w1", "gate_proj")):
-            role = "moe_gate"
-            shard_id = "w1"
-        elif any(token in lowered for token in ("w3", "up_proj")):
-            role = "moe_up"
-            shard_id = "w3"
-        elif any(token in lowered for token in ("w2", "down_proj")):
-            role = "moe_down"
-            shard_id = "w2"
+
+        if is_moe_expert:
+            semantic_type = "moe_expert"
+            if leaf in ("w13_weight", "w13"):
+                role = "moe_gate_up"
+                shard_id = "w13"
+                is_main_weight = True
+                is_moe_expert_main_weight = True
+            elif leaf in ("w2_weight", "w2"):
+                role = "moe_down"
+                shard_id = "w2"
+                is_main_weight = True
+                is_moe_expert_main_weight = True
+            elif leaf in ("w3_weight", "w3"):
+                role = "moe_up"
+                shard_id = "w3"
+                is_main_weight = True
+                is_moe_expert_main_weight = True
+            elif leaf in ("w1_weight", "w1"):
+                role = "moe_gate"
+                shard_id = "w1"
+                is_main_weight = True
+                is_moe_expert_main_weight = True
+            elif any(token in leaf for token in ("scale", "scales", "amax")):
+                role = "moe_quant_aux"
+                semantic_type = "moe_expert_aux"
+            else:
+                role = "moe_expert_other"
         elif "router" in lowered or "gate" in lowered:
             role = "moe_router"
-        elif "self_attn" in lowered or ".attn." in lowered:
-            role = "attention"
-        elif "mlp" in lowered:
-            role = "mlp"
+            semantic_type = "moe_router"
+        elif "lm_head" in lowered:
+            role = "lm_head"
+            semantic_type = "lm_head"
         elif "embed" in lowered:
             role = "embedding"
+            semantic_type = "embedding"
+        elif "self_attn" in lowered or ".attn." in lowered:
+            role = "attention"
+            semantic_type = "attention"
+        elif "shared_expert" in lowered:
+            role = "shared_expert"
+            semantic_type = "mlp_dense"
+        elif "mlp" in lowered:
+            role = "mlp_dense"
+            semantic_type = "mlp_dense"
         elif "norm" in lowered:
             role = "norm"
+            semantic_type = "norm"
+        elif any(token in lowered for token in ("scale", "scales", "amax")):
+            role = "quant_aux"
+            semantic_type = "quant_aux"
+        elif any(token in lowered for token in ("rotary", "cos_cached", "sin_cached")):
+            role = "positional"
+            semantic_type = "positional"
+        if not is_main_weight:
+            is_main_weight = leaf in (
+                "weight",
+                "qweight",
+                "wq",
+                "qweight_g_idx",
+            ) or leaf.endswith("_weight")
 
+        fixed_weight = not is_moe_expert
         return {
             "layer_id": layer_id,
             "expert_id": expert_id,
             "role": role,
             "shard_id": shard_id,
             "is_moe_expert": is_moe_expert,
+            "is_main_weight": is_main_weight,
+            "is_moe_expert_main_weight": is_moe_expert_main_weight,
+            "semantic_type": semantic_type,
+            "weight_class": semantic_type,
+            "fixed_weight": fixed_weight,
+            "protected": fixed_weight,
+            "evictable": not fixed_weight,
+            "placement_policy": "fixed_gpu" if fixed_weight else "expert_policy",
+        }
+
+    @staticmethod
+    def _uvm_tensor_address_span(tensor: torch.Tensor) -> dict[str, Any] | None:
+        numel = int(tensor.numel())
+        element_size = int(tensor.element_size())
+        tensor_bytes = numel * element_size
+        data_ptr = int(tensor.data_ptr())
+        if data_ptr <= 0 or tensor_bytes <= 0:
+            return None
+
+        storage_ptr = data_ptr
+        storage_nbytes = tensor_bytes
+        try:
+            storage = tensor.untyped_storage()
+            storage_ptr = int(storage.data_ptr())
+            storage_nbytes = int(storage.nbytes())
+        except Exception:
+            storage_ptr = data_ptr
+            storage_nbytes = tensor_bytes
+
+        try:
+            storage_offset = int(tensor.storage_offset())
+        except Exception:
+            storage_offset = 0
+
+        shape = [int(dim) for dim in tensor.shape]
+        stride = [int(item) for item in tensor.stride()]
+        min_offset = storage_offset
+        max_offset = storage_offset
+        if shape and len(shape) == len(stride):
+            for dim, dim_stride in zip(shape, stride):
+                if dim <= 1:
+                    continue
+                delta = (dim - 1) * dim_stride
+                if delta >= 0:
+                    max_offset += delta
+                else:
+                    min_offset += delta
+        else:
+            max_offset = storage_offset + numel - 1
+
+        span_start = storage_ptr + min_offset * element_size
+        span_end = storage_ptr + max_offset * element_size + element_size - 1
+        if span_end < span_start:
+            span_start = data_ptr
+            span_end = data_ptr + tensor_bytes - 1
+
+        storage_end = storage_ptr + storage_nbytes - 1
+        if storage_ptr > 0 and storage_nbytes > 0:
+            span_start = max(span_start, storage_ptr)
+            span_end = min(span_end, storage_end)
+            if span_end < span_start:
+                span_start = data_ptr
+                span_end = data_ptr + tensor_bytes - 1
+        else:
+            storage_end = data_ptr + tensor_bytes - 1
+
+        return {
+            "data_ptr": data_ptr,
+            "data_end": data_ptr + tensor_bytes - 1,
+            "storage_ptr": storage_ptr,
+            "storage_end": storage_end,
+            "storage_nbytes": storage_nbytes,
+            "storage_offset": storage_offset,
+            "start": span_start,
+            "end": span_end,
+            "size_bytes": span_end - span_start + 1,
+            "tensor_bytes": tensor_bytes,
+            "shape": shape,
+            "stride": stride,
         }
 
     def _append_uvm_weight_map_log(
@@ -3761,6 +3954,9 @@ class GPUModelRunner(
 
     @staticmethod
     def _uvm_weight_region_id(record: dict[str, Any]) -> str:
+        region_id = record.get("region_id")
+        if region_id:
+            return str(region_id)
         name = str(record.get("name") or "unknown")
         ptr = int(record.get("start_int") or 0)
         return f"weight:{name}:{ptr:x}"
@@ -3773,7 +3969,13 @@ class GPUModelRunner(
         manager = get_uvm_pool_residency_manager()
         if not manager.active:
             return
+        register_expert_tensors = self._uvm_weight_map_register_expert_tensors()
         for record in records:
+            if bool(record.get("is_alias")):
+                continue
+            is_moe_expert = bool(record.get("is_moe_expert"))
+            if is_moe_expert and not register_expert_tensors:
+                continue
             ptr = int(record.get("start_int") or 0)
             size_bytes = int(record.get("size_bytes") or 0)
             if ptr <= 0 or size_bytes <= 0:
@@ -3788,30 +3990,43 @@ class GPUModelRunner(
                     "role",
                     "shard_id",
                     "is_moe_expert",
+                    "semantic_type",
+                    "weight_class",
+                    "fixed_weight",
+                    "protected",
+                    "evictable",
+                    "placement_policy",
                     "dtype",
                     "shape",
+                    "stride",
                     "device",
+                    "driver_capable",
+                    "driver_capability_reason",
+                    "driver_probe_result",
                 )
                 if key in record
             }
-            is_moe_expert = bool(record.get("is_moe_expert"))
-            driver_capable, driver_reason, driver_probe_result = (
-                probe_driver_capable_range(ptr, size_bytes)
-            )
+            driver_capable = bool(record.get("driver_capable"))
+            driver_reason = str(record.get("driver_capability_reason") or "not_probed")
+            driver_probe_result = int(record.get("driver_probe_result") or 0)
+            if "driver_capable" not in record:
+                driver_capable, driver_reason, driver_probe_result = (
+                    probe_driver_capable_range(ptr, size_bytes)
+                )
             register_uvm_residency_region(
                 pool="weights",
                 region_id=self._uvm_weight_region_id(record),
                 ptr=ptr,
                 bytes=size_bytes,
                 state="gpu",
-                evictable=is_moe_expert,
+                evictable=bool(record.get("evictable", is_moe_expert)),
                 active=False,
                 metadata={
                     **semantic,
                     "stage": "stage_n",
                     "source": "weight_address_map",
                     "phase": phase,
-                    "protected": not is_moe_expert,
+                    "protected": bool(record.get("protected", not is_moe_expert)),
                     "prefetchable": is_moe_expert,
                     "driver_capable": driver_capable,
                     "driver_capability_reason": driver_reason,
@@ -3832,6 +4047,201 @@ class GPUModelRunner(
         # 初始化用于存储结果的列表
         rows: list[tuple[str, str, int, int, int]] = []
         semantic_records: list[dict[str, Any]] = []
+        primary_name_by_range: dict[tuple[int, int], str] = {}
+        include_aliases = self._uvm_weight_map_include_aliases()
+        probe_managed = self._uvm_weight_map_probe_managed()
+        query_residency = self._uvm_weight_map_query_residency_enabled()
+        query_residency_device = self._uvm_weight_map_query_residency_device()
+        query_residency_round_pages = (
+            self._uvm_weight_map_query_residency_round_pages()
+        )
+
+        def query_tensor_residency(
+            ptr: int,
+            size_bytes: int,
+            *,
+            driver_capable: bool,
+            tensor_is_cuda: bool,
+        ) -> dict[str, Any]:
+            result: dict[str, Any] = {
+                "residency_query_enabled": bool(query_residency),
+                "residency_query_ok": False,
+                "residency_query_status": -1,
+                "residency_query_device": query_residency_device,
+                "residency_queried_bytes": 0,
+                "resident_gpu_bytes": 0,
+                "resident_cpu_bytes": 0,
+                "resident_any_bytes": 0,
+                "resident_unknown_bytes": 0,
+                "resident_gpu_ratio": None,
+                "resident_cpu_ratio": None,
+                "resident_unknown_ratio": None,
+                "residency_state": "not_queried",
+                "residency_query_granularity": (
+                    "page_rounded" if query_residency_round_pages else "exact"
+                ),
+                "residency_query_start_int": ptr,
+                "residency_query_size_bytes": size_bytes,
+            }
+            if ptr <= 0 or size_bytes <= 0:
+                result["residency_state"] = "invalid_range"
+                return result
+            query_ptr = ptr
+            query_size = size_bytes
+            if query_residency_round_pages:
+                try:
+                    page_size = int(os.sysconf("SC_PAGE_SIZE"))
+                except (ValueError, OSError, AttributeError):
+                    page_size = 4096
+                if page_size <= 0:
+                    page_size = 4096
+                query_start = ptr - (ptr % page_size)
+                query_end = (
+                    ((ptr + size_bytes + page_size - 1) // page_size) * page_size
+                )
+                query_ptr = query_start
+                query_size = max(query_end - query_start, size_bytes)
+                result["residency_query_start_int"] = query_ptr
+                result["residency_query_size_bytes"] = query_size
+            if not query_residency:
+                if not driver_capable and tensor_is_cuda:
+                    result["residency_state"] = "cuda_non_uvm_assumed_gpu_resident"
+                return result
+            if not driver_capable:
+                if tensor_is_cuda:
+                    result.update(
+                        {
+                            "residency_query_ok": True,
+                            "residency_query_status": 0,
+                            "residency_queried_bytes": query_size,
+                            "resident_gpu_bytes": query_size,
+                            "resident_gpu_ratio": 1.0,
+                            "resident_cpu_ratio": 0.0,
+                            "resident_unknown_ratio": 0.0,
+                            "residency_state": "cuda_non_uvm_assumed_gpu_resident",
+                        }
+                    )
+                else:
+                    result["residency_state"] = "not_cuda"
+                return result
+            try:
+                residency = driver_batch_query_ranges_residency_bytes(
+                    [(query_ptr, query_size)], device=query_residency_device
+                )
+            except Exception:
+                logger.debug("Failed to query weight tensor residency", exc_info=True)
+                result["residency_state"] = "query_exception"
+                return result
+
+            queried_bytes = int(residency.get("queried_bytes") or 0)
+            gpu_bytes = int(residency.get("gpu_bytes") or 0)
+            cpu_bytes = int(residency.get("cpu_bytes") or 0)
+            unknown_bytes = int(residency.get("unknown_bytes") or 0)
+            result.update(
+                {
+                    "residency_query_ok": bool(residency.get("ok")),
+                    "residency_query_status": int(residency.get("status") or 0),
+                    "residency_queried_bytes": queried_bytes,
+                    "resident_gpu_bytes": gpu_bytes,
+                    "resident_cpu_bytes": cpu_bytes,
+                    "resident_any_bytes": int(residency.get("any_bytes") or 0),
+                    "resident_unknown_bytes": unknown_bytes,
+                }
+            )
+            denom = queried_bytes if queried_bytes > 0 else size_bytes
+            result["resident_gpu_ratio"] = (
+                float(gpu_bytes) / float(denom) if denom > 0 else None
+            )
+            result["resident_cpu_ratio"] = (
+                float(cpu_bytes) / float(denom) if denom > 0 else None
+            )
+            result["resident_unknown_ratio"] = (
+                float(unknown_bytes) / float(denom) if denom > 0 else None
+            )
+            if not bool(residency.get("ok")):
+                result["residency_state"] = "query_failed"
+            elif queried_bytes <= 0:
+                result["residency_state"] = "query_empty"
+            elif gpu_bytes >= queried_bytes:
+                result["residency_state"] = "gpu_full"
+            elif gpu_bytes > 0:
+                result["residency_state"] = "gpu_partial"
+            elif cpu_bytes >= queried_bytes:
+                result["residency_state"] = "cpu_full"
+            elif cpu_bytes > 0:
+                result["residency_state"] = "cpu_partial"
+            elif unknown_bytes > 0:
+                result["residency_state"] = "unknown"
+            else:
+                result["residency_state"] = "not_resident_reported"
+            return result
+
+        def make_record(
+            *,
+            kind: str,
+            name: str,
+            tensor: torch.Tensor,
+            span: dict[str, Any],
+            semantic: dict[str, Any],
+            is_alias: bool,
+            alias_of: str | None,
+            accounted_size_bytes: int,
+            driver_capable: bool = False,
+            driver_reason: str = "not_probed",
+            driver_probe_result: int = 0,
+            residency: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            ptr = int(span["start"])
+            end = int(span["end"])
+            semantic_type = str(semantic.get("semantic_type") or "other")
+            residency = residency or {}
+            if kind == "weight:expert_slice":
+                tensor_kind = "logical_expert_slice"
+            elif kind.endswith("param"):
+                tensor_kind = "parameter"
+            else:
+                tensor_kind = "buffer"
+            return {
+                "schema_version": 2,
+                "kind": kind,
+                "tensor_kind": tensor_kind,
+                "name": name,
+                "region_id": f"weight:{semantic_type}:{name}:{ptr:x}",
+                "start": f"0x{ptr:x}",
+                "end": f"0x{end:x}",
+                "start_int": ptr,
+                "end_int": end,
+                "size_bytes": int(span["size_bytes"]),
+                "accounted_size_bytes": accounted_size_bytes,
+                "tensor_bytes": int(span["tensor_bytes"]),
+                "data_ptr": f"0x{int(span['data_ptr']):x}",
+                "data_start_int": int(span["data_ptr"]),
+                "data_end": f"0x{int(span['data_end']):x}",
+                "data_end_int": int(span["data_end"]),
+                "storage_ptr": f"0x{int(span['storage_ptr']):x}",
+                "storage_start_int": int(span["storage_ptr"]),
+                "storage_end": f"0x{int(span['storage_end']):x}",
+                "storage_end_int": int(span["storage_end"]),
+                "storage_nbytes": int(span["storage_nbytes"]),
+                "storage_offset": int(span["storage_offset"]),
+                "numel": int(tensor.numel()),
+                "element_size": int(tensor.element_size()),
+                "dtype": str(tensor.dtype),
+                "shape": list(span["shape"]),
+                "stride": list(span["stride"]),
+                "is_contiguous": bool(tensor.is_contiguous()),
+                "requires_grad": bool(getattr(tensor, "requires_grad", False)),
+                "device": str(tensor.device),
+                "is_cuda": bool(tensor.is_cuda),
+                "is_alias": is_alias,
+                "alias_of": alias_of,
+                "is_logical_slice": kind == "weight:expert_slice",
+                "driver_capable": driver_capable,
+                "driver_capability_reason": driver_reason,
+                "driver_probe_result": driver_probe_result,
+                **residency,
+                **semantic,
+            }
 
         # 定义一个内部辅助函数，用于处理和记录单个张量 (Tensor) 的信息
         def record_tensor(kind: str, name: str, tensor: torch.Tensor) -> None:
@@ -3839,9 +4249,15 @@ class GPUModelRunner(
             # 这里只关心显存的占用情况，驻留在 CPU 的权重不需要记录。
             if not tensor.is_cuda:
                 return
-                
-            # 获取张量底层数据在显存中的起始指针地址
-            ptr = tensor.data_ptr()
+
+            span = self._uvm_tensor_address_span(tensor)
+            if span is None:
+                return
+
+            ptr = int(span["start"])
+            end = int(span["end"])
+            size_bytes = int(span["size_bytes"])
+            range_key = (ptr, end)
             
             # 过滤检查 2：
             # ptr == 0: 表示该张量尚未分配实际的物理内存。
@@ -3849,10 +4265,25 @@ class GPUModelRunner(
             # 在某些模型架构中（如权重绑定 weight tying），多个参数名称可能指向同一块物理内存。
             # 确保同一块内存地址只被记录一次，避免重复统计。
             if ptr == 0 or ptr in self._logged_weight_ptrs:
+                if include_aliases and ptr != 0 and size_bytes > 0:
+                    semantic = self._uvm_weight_semantic_tags(name)
+                    semantic_records.append(
+                        make_record(
+                            kind=kind,
+                            name=name,
+                            tensor=tensor,
+                            span=span,
+                            semantic=semantic,
+                            is_alias=True,
+                            alias_of=primary_name_by_range.get(range_key),
+                            accounted_size_bytes=0,
+                            residency={
+                                "residency_query_enabled": bool(query_residency),
+                                "residency_state": "alias_not_queried",
+                            },
+                        )
+                    )
                 return
-                
-            # 计算该张量占用的总字节数 = 元素总数 (numel) * 单个元素的字节数 (element_size)
-            size_bytes = tensor.numel() * tensor.element_size()
             
             # 过滤检查 3：忽略大小为 0 的空张量
             if size_bytes <= 0:
@@ -3860,26 +4291,110 @@ class GPUModelRunner(
                 
             # 将该指针地址加入已记录集合，防止后续出现指向同地址的张量被重复记录
             self._logged_weight_ptrs.add(ptr)
+            primary_name_by_range[range_key] = name
             
             # 将收集到的信息打包为元组并添加到列表中。
             # 结束地址计算方式为：起始地址 + 总字节数 - 1
-            rows.append((kind, name, ptr, ptr + size_bytes - 1, size_bytes))
+            rows.append((kind, name, ptr, end, size_bytes))
             semantic = self._uvm_weight_semantic_tags(name)
-            semantic_records.append(
-                {
-                    "kind": kind,
-                    "name": name,
-                    "start": f"0x{ptr:x}",
-                    "end": f"0x{ptr + size_bytes - 1:x}",
-                    "start_int": ptr,
-                    "end_int": ptr + size_bytes - 1,
-                    "size_bytes": size_bytes,
-                    "dtype": str(tensor.dtype),
-                    "shape": list(tensor.shape),
-                    "device": str(tensor.device),
-                    **semantic,
-                }
+            driver_capable = False
+            driver_reason = "not_probed"
+            driver_probe_result = 0
+            if probe_managed:
+                driver_capable, driver_reason, driver_probe_result = (
+                    probe_driver_capable_range(ptr, size_bytes)
+                )
+            residency = query_tensor_residency(
+                ptr,
+                size_bytes,
+                driver_capable=driver_capable,
+                tensor_is_cuda=bool(tensor.is_cuda),
             )
+            semantic_records.append(
+                make_record(
+                    kind=kind,
+                    name=name,
+                    tensor=tensor,
+                    span=span,
+                    semantic=semantic,
+                    is_alias=False,
+                    alias_of=None,
+                    accounted_size_bytes=size_bytes,
+                    driver_capable=driver_capable,
+                    driver_reason=driver_reason,
+                    driver_probe_result=driver_probe_result,
+                    residency=residency,
+                )
+            )
+
+            if (
+                self._uvm_weight_map_include_expert_slices()
+                and bool(semantic.get("is_moe_expert_main_weight"))
+                and len(span["shape"]) >= 2
+                and int(span["shape"][0]) > 0
+            ):
+                expert_count = int(span["shape"][0])
+                parent_region_id = f"weight:{semantic.get('semantic_type')}:{name}:{ptr:x}"
+                query_slices = (
+                    query_residency
+                    and self._uvm_weight_map_query_expert_slices()
+                )
+                for expert_id in range(expert_count):
+                    try:
+                        expert_tensor = tensor[expert_id]
+                    except Exception:
+                        logger.debug(
+                            "Failed to create expert slice view for %s[%d]",
+                            name,
+                            expert_id,
+                            exc_info=True,
+                        )
+                        continue
+                    expert_span = self._uvm_tensor_address_span(expert_tensor)
+                    if expert_span is None:
+                        continue
+                    expert_size_bytes = int(expert_span["size_bytes"])
+                    if expert_size_bytes <= 0:
+                        continue
+                    expert_semantic = dict(semantic)
+                    expert_semantic["expert_id"] = expert_id
+                    expert_semantic["is_logical_expert_slice"] = True
+                    expert_semantic["logical_parent_name"] = name
+                    expert_semantic["logical_parent_region_id"] = parent_region_id
+                    expert_semantic["logical_parent_start_int"] = ptr
+                    expert_semantic["logical_parent_end_int"] = end
+                    expert_semantic["logical_slice_axis"] = 0
+                    expert_semantic["logical_slice_index"] = expert_id
+                    expert_semantic["logical_slice_count"] = expert_count
+                    expert_semantic["logical_slice_bytes"] = expert_size_bytes
+                    expert_residency = {
+                        "residency_query_enabled": bool(query_slices),
+                        "residency_query_ok": None,
+                        "residency_state": "expert_slice_not_queried",
+                    }
+                    if query_slices:
+                        expert_residency = query_tensor_residency(
+                            int(expert_span["start"]),
+                            expert_size_bytes,
+                            driver_capable=driver_capable,
+                            tensor_is_cuda=bool(expert_tensor.is_cuda),
+                        )
+                    semantic_records.append(
+                        make_record(
+                            kind="weight:expert_slice",
+                            name=f"{name}.expert_{expert_id}",
+                            tensor=expert_tensor,
+                            span=expert_span,
+                            semantic=expert_semantic,
+                            is_alias=True,
+                            alias_of=name,
+                            accounted_size_bytes=0,
+                            driver_capable=driver_capable,
+                            driver_reason=driver_reason,
+                            driver_probe_result=driver_probe_result,
+                            residency=expert_residency,
+                        )
+                    )
 
         # 获取底层的 PyTorch 模型实例
         model = self.get_model()
@@ -3887,14 +4402,26 @@ class GPUModelRunner(
         # 遍历模型中所有注册的参数 (Parameters)
         # recurse=True 表示会递归遍历所有子模块 (Sub-modules)
         # Parameters 通常是模型中需要计算梯度、参与训练的权重 (如 Linear 层的 weight 和 bias)
-        for name, param in model.named_parameters(recurse=True):
+        try:
+            parameter_iter = model.named_parameters(
+                recurse=True, remove_duplicate=not include_aliases
+            )
+        except TypeError:
+            parameter_iter = model.named_parameters(recurse=True)
+        for name, param in parameter_iter:
             if param is not None:
                 record_tensor("weight:param", name, param)
                 
         # 遍历模型中所有注册的缓冲区 (Buffers)
         # Buffers 通常是模型状态的一部分，但在训练过程中不需要计算梯度的张量
         # (例如 BatchNorm 中的 running_mean/running_var，或者大模型中预先计算好的位置编码如 RoPE 缓存)
-        for name, buffer in model.named_buffers(recurse=True):
+        try:
+            buffer_iter = model.named_buffers(
+                recurse=True, remove_duplicate=not include_aliases
+            )
+        except TypeError:
+            buffer_iter = model.named_buffers(recurse=True)
+        for name, buffer in buffer_iter:
             record_tensor("weight:buffer", name, buffer)
 
         # 返回旧 CSV 地址行和 Stage E2 语义 sidecar 记录
@@ -4037,6 +4564,187 @@ class GPUModelRunner(
         self._append_uvm_address_log(phase, rows)
         self._append_uvm_weight_map_log(phase, semantic_records)
         self._register_uvm_weight_residency_tags(phase, semantic_records)
+        if self._uvm_weight_map_real_residency_snapshot_enabled():
+            try:
+                get_uvm_real_residency_snapshot(trigger=f"weight_map_{phase}")
+            except Exception:
+                logger.debug("Failed to snapshot weight map real residency", exc_info=True)
+
+    def _write_fixed_weight_device_direct_record(
+        self, record: dict[str, Any]
+    ) -> None:
+        trace_file = self._uvm_fixed_weight_device_direct_trace_file()
+        if not trace_file:
+            return
+        try:
+            os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
+            with open(trace_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError as exc:
+            logger.warning(
+                "Failed to write fixed weight device-direct trace %s: %s",
+                trace_file,
+                exc,
+            )
+
+    def _materialize_fixed_weights_device_direct(self) -> None:
+        if not self._uvm_fixed_weight_device_direct_enabled():
+            return
+        if not self._env_flag_enabled("VLLM_USE_UVM", default=False):
+            logger.warning(
+                "Ignoring VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_ENABLE because "
+                "VLLM_USE_UVM is not enabled."
+            )
+            return
+
+        model = self.get_model()
+        try:
+            parameter_iter = model.named_parameters(
+                recurse=True, remove_duplicate=False
+            )
+        except TypeError:
+            parameter_iter = model.named_parameters(recurse=True)
+
+        trace_file = self._uvm_fixed_weight_device_direct_trace_file()
+        if trace_file:
+            try:
+                os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
+                if is_global_first_rank():
+                    with open(trace_file, "w", encoding="utf-8"):
+                        pass
+            except OSError as exc:
+                logger.warning(
+                    "Failed to reset fixed weight device-direct trace %s: %s",
+                    trace_file,
+                    exc,
+                )
+
+        processed_params: set[int] = set()
+        converted_count = 0
+        skipped_count = 0
+        converted_bytes = 0
+        failed_count = 0
+        start_time = time.perf_counter()
+
+        with torch.no_grad():
+            for name, param in parameter_iter:
+                if param is None:
+                    continue
+                param_id = id(param)
+                if param_id in processed_params:
+                    skipped_count += 1
+                    continue
+                processed_params.add(param_id)
+
+                tensor = param.data
+                semantic = self._uvm_weight_semantic_tags(name)
+                if (
+                    not bool(semantic.get("fixed_weight"))
+                    or bool(semantic.get("is_moe_expert"))
+                    or not tensor.is_cuda
+                    or int(tensor.numel()) <= 0
+                ):
+                    skipped_count += 1
+                    continue
+
+                span_before = self._uvm_tensor_address_span(tensor)
+                if span_before is None:
+                    skipped_count += 1
+                    continue
+                size_bytes = int(span_before["tensor_bytes"])
+                old_ptr = int(span_before["data_ptr"])
+                old_driver_capable, old_driver_reason, old_probe_result = (
+                    probe_driver_capable_range(old_ptr, size_bytes)
+                )
+
+                try:
+                    with uvm_allocation_phase("fixed_weight_device_direct"):
+                        native_tensor = torch.empty_strided(
+                            tuple(tensor.size()),
+                            tuple(tensor.stride()),
+                            dtype=tensor.dtype,
+                            device=tensor.device,
+                        )
+                    native_tensor.copy_(tensor, non_blocking=False)
+                    param.data = native_tensor
+                    span_after = self._uvm_tensor_address_span(param.data)
+                    if span_after is None:
+                        raise RuntimeError("missing span after materialization")
+                    new_ptr = int(span_after["data_ptr"])
+                    new_driver_capable, new_driver_reason, new_probe_result = (
+                        probe_driver_capable_range(new_ptr, size_bytes)
+                    )
+                    converted_count += 1
+                    converted_bytes += size_bytes
+                    self._write_fixed_weight_device_direct_record(
+                        {
+                            "event": "fixed_weight_device_direct_materialized",
+                            "name": name,
+                            "kind": "weight:param",
+                            "bytes": size_bytes,
+                            "old_ptr": old_ptr,
+                            "old_ptr_hex": f"0x{old_ptr:x}",
+                            "new_ptr": new_ptr,
+                            "new_ptr_hex": f"0x{new_ptr:x}",
+                            "old_driver_capable": bool(old_driver_capable),
+                            "old_driver_capability_reason": old_driver_reason,
+                            "old_driver_probe_result": int(old_probe_result),
+                            "new_driver_capable": bool(new_driver_capable),
+                            "new_driver_capability_reason": new_driver_reason,
+                            "new_driver_probe_result": int(new_probe_result),
+                            **semantic,
+                        }
+                    )
+                except Exception as exc:
+                    failed_count += 1
+                    self._write_fixed_weight_device_direct_record(
+                        {
+                            "event": "fixed_weight_device_direct_failed",
+                            "name": name,
+                            "bytes": size_bytes,
+                            "error": str(exc),
+                            **semantic,
+                        }
+                    )
+                    logger.warning(
+                        "Failed to materialize fixed weight %s with "
+                        "device-direct allocation: %s",
+                        name,
+                        exc,
+                    )
+
+        try:
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            logger.debug(
+                "Failed to synchronize/empty cache after fixed weight "
+                "device-direct materialization",
+                exc_info=True,
+            )
+
+        elapsed = time.perf_counter() - start_time
+        summary = {
+            "event": "fixed_weight_device_direct_summary",
+            "converted_count": converted_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "converted_bytes": converted_bytes,
+            "converted_gib": converted_bytes / GiB_bytes,
+            "elapsed_seconds": elapsed,
+        }
+        self._write_fixed_weight_device_direct_record(summary)
+        logger.info_once(
+            "Materialized %d fixed non-expert weights (%.3f GiB) with "
+            "device-direct allocation in %.3f s; skipped=%d failed=%d",
+            converted_count,
+            converted_bytes / GiB_bytes,
+            elapsed,
+            skipped_count,
+            failed_count,
+            scope="local",
+        )
 
     def _log_kv_cache_addresses(self, kv_caches: dict[str, Any], phase: str) -> None:
         """
@@ -4336,6 +5044,7 @@ class GPUModelRunner(
                 if self.eplb_state.is_async:
                     self.eplb_state.start_async_loop(rank_mapping=rank_mapping)
 
+            self._materialize_fixed_weights_device_direct()
             # 记录模型权重的内存地址（通常用于调试或低级别内存管理验证）
             self._log_model_weight_addresses("load_model")
 
@@ -5152,23 +5861,56 @@ class GPUModelRunner(
             gc.collect()
 
     def run_uvm_init_time_weight_placement(self) -> None:
+        debug_start = time.monotonic()
+        logger.warning("UVM controlled remap debug: model_runner Stage M placement entered")
         matched_issued = self._run_uvm_matched_cpu_offload_manifest()
-        if os.environ.get("VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE", "0") != "1":
+        init_weight_offload_enabled = (
+            os.environ.get("VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE", "0") == "1"
+        )
+        init_hot_prefetch_enabled = (
+            os.environ.get("VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_ENABLE", "0") == "1"
+        )
+        if not (init_weight_offload_enabled or init_hot_prefetch_enabled):
+            logger.warning(
+                "UVM controlled remap debug: model_runner Stage M placement skipped "
+                "disabled elapsed=%.3fs",
+                time.monotonic() - debug_start,
+            )
             return
         if getattr(self, "_uvm_init_weight_placement_done", False):
+            logger.warning(
+                "UVM controlled remap debug: model_runner Stage M placement skipped "
+                "already_done elapsed=%.3fs",
+                time.monotonic() - debug_start,
+            )
             return
         self._uvm_init_weight_placement_done = True
         model = self.get_model()
         issued_modules = 0
+        section_start = time.monotonic()
+        logger.warning("UVM controlled remap debug: model_runner Stage M module loop begin")
         with uvm_enabled_allocation_phase("enabled:init_weight_offload"):
             for module in model.modules():
                 init_offload = getattr(module, "run_uvm_init_weight_offload", None)
                 if callable(init_offload):
                     init_offload()
                     issued_modules += 1
+        logger.warning(
+            "UVM controlled remap debug: model_runner Stage M module loop end "
+            "issued_modules=%d elapsed=%.3fs",
+            issued_modules,
+            time.monotonic() - section_start,
+        )
         if os.environ.get("VLLM_UVM_INIT_WEIGHT_SYNC", "1") == "1":
+            section_start = time.monotonic()
+            logger.warning("UVM controlled remap debug: model_runner Stage M cuda sync begin")
             try:
                 torch.cuda.synchronize()
+                logger.warning(
+                    "UVM controlled remap debug: model_runner Stage M cuda sync end "
+                    "elapsed=%.3fs",
+                    time.monotonic() - section_start,
+                )
             except Exception:
                 logger.debug("Failed to synchronize after Stage M weight offload",
                              exc_info=True)
@@ -5177,11 +5919,119 @@ class GPUModelRunner(
                 "Stage M init-time weight placement visited %d MoE modules.",
                 issued_modules,
             )
+            section_start = time.monotonic()
+            logger.warning("UVM controlled remap debug: model_runner Stage M slot PTE clear begin")
+            self._maybe_clear_uvm_init_time_slot_ptes_after_placement()
+            logger.warning(
+                "UVM controlled remap debug: model_runner Stage M slot PTE clear end "
+                "elapsed=%.3fs",
+                time.monotonic() - section_start,
+            )
         if matched_issued:
             logger.info(
                 "Stage M matched CPU offload issued %d parameter ranges.",
                 matched_issued,
             )
+        logger.warning(
+            "UVM controlled remap debug: model_runner Stage M placement returning "
+            "issued_modules=%d matched_issued=%d elapsed=%.3fs",
+            issued_modules,
+            matched_issued,
+            time.monotonic() - debug_start,
+        )
+
+    def _maybe_clear_uvm_init_time_slot_ptes_after_placement(self) -> None:
+        driver_mode = os.environ.get(
+            "VLLM_UVM_COLD_SLOT_POOL_DRIVER_MODE",
+            "",
+        ).strip().lower().replace("-", "_")
+        setting = os.environ.get(
+            "VLLM_UVM_INIT_WEIGHT_CLEAR_SLOT_PTES_AFTER_PLACEMENT",
+            "auto",
+        ).strip().lower()
+
+        if setting in ("0", "false", "no", "off"):
+            return
+        if setting in ("1", "true", "yes", "on"):
+            should_clear = True
+        else:
+            should_clear = driver_mode in ("slot_pte_remap", "slot_va_block_remap")
+        if not should_clear:
+            return
+
+        def _summary(result: dict[str, object]) -> dict[str, int | bool]:
+            keys = (
+                "ok",
+                "ioctl_ret",
+                "errno",
+                "rm_status",
+                "active_slots",
+                "backed_slots",
+                "slot_backing_bytes",
+                "copy_count",
+                "copy_bytes",
+                "copy_failed_count",
+                "pte_remap_count",
+                "pte_remap_bytes",
+                "pte_clear_count",
+                "pte_failure_count",
+                "pte_dangerous_op_reject_count",
+                "pte_residual_va_block_count",
+                "pte_residual_page_count",
+                "pte_residual_gpu_mask",
+            )
+            return {
+                key: bool(result.get(key))
+                if key == "ok"
+                else int(result.get(key) or 0)
+                for key in keys
+            }
+
+        before = driver_moe_slot_pool_query(max_entries=0, prefer_existing=True)
+        before_summary = _summary(before)
+        if not before_summary["ok"]:
+            raise RuntimeError(
+                "Stage M controlled remap slot pool pre-clear query failed: "
+                f"{before_summary}"
+            )
+
+        reset = driver_moe_slot_pool_query(
+            max_entries=0,
+            reset=True,
+            prefer_existing=True,
+        )
+        reset_summary = _summary(reset)
+        if not reset_summary["ok"]:
+            raise RuntimeError(
+                "Stage M controlled remap slot PTE reset failed: "
+                f"before={before_summary} reset={reset_summary}"
+            )
+
+        after = driver_moe_slot_pool_query(max_entries=0, prefer_existing=True)
+        after_summary = _summary(after)
+        if (
+            not after_summary["ok"]
+            or int(after_summary["active_slots"]) != 0
+            or int(after_summary["backed_slots"]) != 0
+            or int(after_summary["slot_backing_bytes"]) != 0
+            or int(reset_summary["pte_residual_va_block_count"]) != 0
+            or int(reset_summary["pte_residual_page_count"]) != 0
+            or int(after_summary["pte_residual_va_block_count"]) != 0
+            or int(after_summary["pte_residual_page_count"]) != 0
+        ):
+            raise RuntimeError(
+                "Stage M controlled remap slot PTE reset left active or residual state: "
+                f"before={before_summary} reset={reset_summary} after={after_summary}"
+            )
+
+        logger.info(
+            "Stage M controlled remap slot PTEs cleared after init placement: "
+            "mode=%s before=%s reset=%s after=%s",
+            driver_mode or "unknown",
+            before_summary,
+            reset_summary,
+            after_summary,
+        )
 
     def _load_uvm_matched_cpu_offload_manifest(self) -> list[dict[str, object]]:
         manifest_file = os.environ.get(
@@ -6339,8 +7189,19 @@ class GPUModelRunner(
         """
 
         # Try creating KV caches optimized for kv-connector transfers
+        debug_start = time.monotonic()
         cache_dtype = self.cache_config.cache_dtype
+        logger.warning(
+            "UVM controlled remap debug: model_runner initialize_kv_cache_tensors "
+            "entered uniform=%s groups=%d tensors=%d",
+            self.use_uniform_kv_cache(self.attn_groups, cache_dtype),
+            len(kv_cache_config.kv_cache_groups),
+            len(kv_cache_config.kv_cache_tensors),
+        )
         if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
+            section_start = time.monotonic()
+            logger.warning(
+                "UVM controlled remap debug: model_runner allocate_uniform_kv_caches begin")
             kv_caches, cross_layers_kv_cache, attn_backend = (
                 self.allocate_uniform_kv_caches(
                     kv_cache_config,
@@ -6352,17 +7213,48 @@ class GPUModelRunner(
             )
             self.cross_layers_kv_cache = cross_layers_kv_cache
             self.cross_layers_attn_backend = attn_backend
+            logger.warning(
+                "UVM controlled remap debug: model_runner allocate_uniform_kv_caches end "
+                "kv_caches=%d cross_layers=%s elapsed=%.3fs",
+                len(kv_caches),
+                cross_layers_kv_cache is not None,
+                time.monotonic() - section_start,
+            )
         else:
             # Fallback to the general case
             # Initialize the memory buffer for KV cache
+            section_start = time.monotonic()
+            logger.warning(
+                "UVM controlled remap debug: model_runner _allocate_kv_cache_tensors begin")
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+            logger.warning(
+                "UVM controlled remap debug: model_runner _allocate_kv_cache_tensors end "
+                "raw_tensors=%d elapsed=%.3fs",
+                len(kv_cache_raw_tensors),
+                time.monotonic() - section_start,
+            )
 
             # Change the memory buffer to the desired shape
+            section_start = time.monotonic()
+            logger.warning(
+                "UVM controlled remap debug: model_runner _reshape_kv_cache_tensors begin")
             kv_caches = self._reshape_kv_cache_tensors(
                 kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes
             )
+            logger.warning(
+                "UVM controlled remap debug: model_runner _reshape_kv_cache_tensors end "
+                "kv_caches=%d elapsed=%.3fs",
+                len(kv_caches),
+                time.monotonic() - section_start,
+            )
 
         # Set up cross-layer KV cache sharing
+        section_start = time.monotonic()
+        logger.warning(
+            "UVM controlled remap debug: model_runner kv cache sharing/bind begin "
+            "shared_layers=%d",
+            len(self.shared_kv_cache_layers),
+        )
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
@@ -6376,8 +7268,33 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+        logger.warning(
+            "UVM controlled remap debug: model_runner kv cache sharing/bind end "
+            "kv_caches=%d elapsed=%.3fs",
+            len(kv_caches),
+            time.monotonic() - section_start,
+        )
+        section_start = time.monotonic()
+        logger.warning("UVM controlled remap debug: model_runner _log_kv_cache_addresses begin")
         self._log_kv_cache_addresses(kv_caches, "initialize_kv_cache")
+        logger.warning(
+            "UVM controlled remap debug: model_runner _log_kv_cache_addresses end "
+            "elapsed=%.3fs",
+            time.monotonic() - section_start,
+        )
+        section_start = time.monotonic()
+        logger.warning("UVM controlled remap debug: model_runner _write_stage_l6_kv_pointer_map begin")
         self._write_stage_l6_kv_pointer_map(kv_cache_config, kv_caches)
+        logger.warning(
+            "UVM controlled remap debug: model_runner _write_stage_l6_kv_pointer_map end "
+            "elapsed=%.3fs",
+            time.monotonic() - section_start,
+        )
+        logger.warning(
+            "UVM controlled remap debug: model_runner initialize_kv_cache_tensors returning "
+            "elapsed=%.3fs",
+            time.monotonic() - debug_start,
+        )
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
@@ -6416,34 +7333,102 @@ class GPUModelRunner(
             cache size of each layer
         """
         with uvm_allocation_phase("initialize_kv_cache"):
+            debug_start = time.monotonic()
+            logger.warning("UVM controlled remap debug: model_runner initialize_kv_cache entered")
             kv_cache_config = deepcopy(kv_cache_config)
+            logger.warning("UVM controlled remap debug: model_runner initialize_kv_cache deepcopy end")
             self.kv_cache_config = kv_cache_config
+            section_start = time.monotonic()
+            logger.warning(
+                "UVM controlled remap debug: model_runner may_add_encoder_only_layers begin")
             self.may_add_encoder_only_layers_to_kv_cache_config()
+            logger.warning(
+                "UVM controlled remap debug: model_runner may_add_encoder_only_layers end "
+                "elapsed=%.3fs",
+                time.monotonic() - section_start,
+            )
+            section_start = time.monotonic()
+            logger.warning(
+                "UVM controlled remap debug: model_runner maybe_add_kv_sharing_layers begin")
             self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+            logger.warning(
+                "UVM controlled remap debug: model_runner maybe_add_kv_sharing_layers end "
+                "elapsed=%.3fs",
+                time.monotonic() - section_start,
+            )
+            section_start = time.monotonic()
+            logger.warning("UVM controlled remap debug: model_runner initialize_attn_backend begin")
             self.initialize_attn_backend(kv_cache_config)
+            logger.warning(
+                "UVM controlled remap debug: model_runner initialize_attn_backend end "
+                "elapsed=%.3fs",
+                time.monotonic() - section_start,
+            )
             # The kernel block size for all KV cache groups. For example, if
             # kv_cache_manager uses block_size 256 for a given group, but the attention
             # backends for that group only supports block_size 64, we will return
             # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
             # tokens each.
+            section_start = time.monotonic()
+            logger.warning("UVM controlled remap debug: model_runner _prepare_kernel_block_sizes begin")
             kernel_block_sizes = self._prepare_kernel_block_sizes(kv_cache_config)
+            logger.warning(
+                "UVM controlled remap debug: model_runner _prepare_kernel_block_sizes end "
+                "count=%d elapsed=%.3fs",
+                len(kernel_block_sizes),
+                time.monotonic() - section_start,
+            )
 
             # create metadata builders
+            section_start = time.monotonic()
+            logger.warning("UVM controlled remap debug: model_runner initialize_metadata_builders begin")
             self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+            logger.warning(
+                "UVM controlled remap debug: model_runner initialize_metadata_builders end "
+                "elapsed=%.3fs",
+                time.monotonic() - section_start,
+            )
 
             # Reinitialize need to after initialize_attn_backend
+            section_start = time.monotonic()
+            logger.warning("UVM controlled remap debug: model_runner may_reinitialize_input_batch begin")
             self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+            logger.warning(
+                "UVM controlled remap debug: model_runner may_reinitialize_input_batch end "
+                "elapsed=%.3fs",
+                time.monotonic() - section_start,
+            )
+            section_start = time.monotonic()
+            logger.warning("UVM controlled remap debug: model_runner initialize_kv_cache_tensors begin")
             kv_caches = self.initialize_kv_cache_tensors(
                 kv_cache_config, kernel_block_sizes
             )
+            logger.warning(
+                "UVM controlled remap debug: model_runner initialize_kv_cache_tensors end "
+                "elapsed=%.3fs",
+                time.monotonic() - section_start,
+            )
 
             if self.speculative_config and self.speculative_config.use_eagle():
+                section_start = time.monotonic()
+                logger.warning("UVM controlled remap debug: model_runner drafter validate begin")
                 assert isinstance(self.drafter, EagleProposer)
                 # validate all draft model layers belong to the same kv cache
                 # group
                 self.drafter.validate_same_kv_cache_group(kv_cache_config)
+                logger.warning(
+                    "UVM controlled remap debug: model_runner drafter validate end "
+                    "elapsed=%.3fs",
+                    time.monotonic() - section_start,
+                )
 
             if has_kv_transfer_group():
+                section_start = time.monotonic()
+                logger.warning(
+                    "UVM controlled remap debug: model_runner kv_transfer_group register begin "
+                    "cross_layers=%s",
+                    self.cross_layers_kv_cache is not None,
+                )
                 kv_transfer_group = get_kv_transfer_group()
                 if self.cross_layers_kv_cache is not None:
                     assert self.cross_layers_attn_backend is not None
@@ -6453,8 +7438,17 @@ class GPUModelRunner(
                 else:
                     kv_transfer_group.register_kv_caches(kv_caches)
                 kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+                logger.warning(
+                    "UVM controlled remap debug: model_runner kv_transfer_group register end "
+                    "elapsed=%.3fs",
+                    time.monotonic() - section_start,
+                )
+            else:
+                logger.warning("UVM controlled remap debug: model_runner kv_transfer_group skipped")
 
             if self.dcp_world_size > 1:
+                section_start = time.monotonic()
+                logger.warning("UVM controlled remap debug: model_runner dcp validation begin")
                 layer_type = cast(type[Any], AttentionLayerBase)
                 layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
                 for layer in layers.values():
@@ -6467,6 +7461,16 @@ class GPUModelRunner(
                         f"{layer_impl.__class__.__name__} "
                         "does not return the softmax lse for decode."
                     )
+                logger.warning(
+                    "UVM controlled remap debug: model_runner dcp validation end "
+                    "elapsed=%.3fs",
+                    time.monotonic() - section_start,
+                )
+            logger.warning(
+                "UVM controlled remap debug: model_runner initialize_kv_cache returning "
+                "elapsed=%.3fs",
+                time.monotonic() - debug_start,
+            )
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

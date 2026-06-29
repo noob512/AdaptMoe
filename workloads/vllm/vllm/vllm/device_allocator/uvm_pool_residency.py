@@ -55,6 +55,9 @@ DRIVER_FLAG_ACTIVE = 1 << 2
 DRIVER_FLAG_PREFETCHABLE = 1 << 3
 DRIVER_FLAG_PINNED = 1 << 4
 DRIVER_FLAG_TRANSIENT = 1 << 5
+DRIVER_FLAG_HOT_SUBPOOL = 1 << 11
+DRIVER_FLAG_STREAMING_SUBPOOL = 1 << 12
+DRIVER_FLAG_COLD_SUBPOOL = 1 << 13
 DRIVER_FLAG_MASK = (
     DRIVER_FLAG_EVICTABLE
     | DRIVER_FLAG_PROTECTED
@@ -62,6 +65,9 @@ DRIVER_FLAG_MASK = (
     | DRIVER_FLAG_PREFETCHABLE
     | DRIVER_FLAG_PINNED
     | DRIVER_FLAG_TRANSIENT
+    | DRIVER_FLAG_HOT_SUBPOOL
+    | DRIVER_FLAG_STREAMING_SUBPOOL
+    | DRIVER_FLAG_COLD_SUBPOOL
 )
 
 DRIVER_REGION_STATES = {
@@ -202,6 +208,49 @@ def _metadata_int(metadata: dict[str, Any], key: str, default: int = 0) -> int:
         return default
 
 
+def _metadata_has_expert_id(metadata: dict[str, Any]) -> bool:
+    for key in ("global_expert_id", "local_expert_id", "expert_id"):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        try:
+            int(value)
+            return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _skip_moe_parent_driver_tag(metadata: dict[str, Any]) -> bool:
+    raw = os.environ.get("VLLM_UVM_DRIVER_TAG_SKIP_MOE_PARENT")
+    if raw is not None and raw.strip():
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    slices_enabled = (
+        os.environ.get("VLLM_UVM_WEIGHT_MAP_INCLUDE_EXPERT_SLICES", "")
+        .strip()
+        .lower()
+        in ("1", "true", "yes", "on")
+    )
+    if not slices_enabled:
+        return False
+
+    role = str(metadata.get("role") or "").strip().lower()
+    is_moe_parent = bool(metadata.get("is_moe_expert")) and not _metadata_has_expert_id(
+        metadata
+    )
+    return is_moe_parent and role in (
+        "moe_gate_up",
+        "moe_down",
+        "w13",
+        "w13_weight",
+        "w2",
+        "w2_weight",
+        "moe_expert_w13",
+        "moe_expert_w2",
+    )
+
+
 def _driver_role_id(pool: str, metadata: dict[str, Any]) -> int:
     explicit = metadata.get("driver_role_id")
     if explicit is not None:
@@ -244,6 +293,31 @@ def _driver_flags(
         flags |= DRIVER_FLAG_PINNED
     if pool == "scratch" or bool(metadata.get("transient")):
         flags |= DRIVER_FLAG_TRANSIENT
+    pool_class = str(
+        metadata.get("pool_class")
+        or metadata.get("driver_subpool")
+        or metadata.get("subpool")
+        or ""
+    ).strip().lower()
+    if pool_class == "hot" or bool(metadata.get("init_hot")):
+        flags |= (
+            DRIVER_FLAG_HOT_SUBPOOL
+            | DRIVER_FLAG_PROTECTED
+            | DRIVER_FLAG_PINNED
+            | DRIVER_FLAG_PREFETCHABLE
+        )
+    if pool_class == "streaming" or bool(metadata.get("streaming")):
+        flags |= (
+            DRIVER_FLAG_STREAMING_SUBPOOL
+            | DRIVER_FLAG_EVICTABLE
+            | DRIVER_FLAG_PREFETCHABLE
+            | DRIVER_FLAG_TRANSIENT
+        )
+    if (
+        pool_class in ("cold", "init_cold", "cold_init")
+        or bool(metadata.get("init_cold"))
+    ):
+        flags |= DRIVER_FLAG_COLD_SUBPOOL | DRIVER_FLAG_EVICTABLE
     if state == "gpu" and pool == "weights" and not evictable:
         flags |= DRIVER_FLAG_PROTECTED
     return flags
@@ -1391,6 +1465,10 @@ class UvmPoolResidencyManager:
         if not isinstance(region.ptr, int) or region.ptr <= 0 or region.bytes <= 0:
             self._summary["driver_tag_register_skips"] += 1
             record["reason"] = "missing_ptr_or_size"
+            return record
+        if _skip_moe_parent_driver_tag(region.metadata):
+            self._summary["driver_tag_register_skips"] += 1
+            record["reason"] = "moe_parent_skipped_for_expert_slices"
             return record
         if (
             self.driver_tag_require_managed

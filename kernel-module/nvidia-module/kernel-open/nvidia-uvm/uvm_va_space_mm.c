@@ -243,6 +243,8 @@ struct mm_struct *uvm_va_space_mm_retain(uvm_va_space_t *va_space)
 {
     uvm_va_space_mm_t *va_space_mm = &va_space->va_space_mm;
     struct mm_struct *mm = NULL;
+    void *caller = __builtin_return_address(0);
+    NvU32 retained_count = 0;
 
     if (!uvm_va_space_mm_enabled(va_space))
         return NULL;
@@ -253,6 +255,7 @@ struct mm_struct *uvm_va_space_mm_retain(uvm_va_space_t *va_space)
         goto out;
 
     ++va_space_mm->retained_count;
+    retained_count = va_space_mm->retained_count;
 
     mm = va_space_mm->mm;
     UVM_ASSERT(mm);
@@ -264,6 +267,16 @@ out:
         UVM_ASSERT(atomic_read(&mm->mm_users) > 0);
 
     uvm_spin_unlock(&va_space_mm->lock);
+
+    if (mm) {
+        UVM_INFO_PRINT("MoE controlled remap debug: mm_retain va_space=%px mm=%px pid=%d comm=%s retained=%u caller=%pS\n",
+                       va_space,
+                       mm,
+                       current->pid,
+                       current->comm,
+                       retained_count,
+                       caller);
+    }
 
     return mm;
 }
@@ -294,6 +307,10 @@ struct mm_struct *uvm_va_space_mm_or_current_retain(uvm_va_space_t *va_space)
 void uvm_va_space_mm_release(uvm_va_space_t *va_space)
 {
     uvm_va_space_mm_t *va_space_mm = &va_space->va_space_mm;
+    void *caller = __builtin_return_address(0);
+    NvU32 retained_count;
+    struct mm_struct *mm;
+    NvBool wake_waiters;
 
     UVM_ASSERT(uvm_va_space_mm_enabled(va_space));
 
@@ -304,10 +321,21 @@ void uvm_va_space_mm_release(uvm_va_space_t *va_space)
 
     UVM_ASSERT(va_space_mm->retained_count > 0);
     --va_space_mm->retained_count;
+    retained_count = va_space_mm->retained_count;
+    mm = va_space_mm->mm;
+    wake_waiters = retained_count == 0 && !uvm_va_space_mm_alive(va_space_mm);
 
     // If we're the last retainer on a dead mm, signal any potential waiters
-    if (va_space_mm->retained_count == 0 && !uvm_va_space_mm_alive(va_space_mm)) {
+    if (wake_waiters) {
         uvm_spin_unlock(&va_space_mm->lock);
+
+        UVM_INFO_PRINT("MoE controlled remap debug: mm_release va_space=%px mm=%px pid=%d comm=%s retained=%u caller=%pS\n",
+                       va_space,
+                       mm,
+                       current->pid,
+                       current->comm,
+                       retained_count,
+                       caller);
 
         // There could be a thread in uvm_va_space_mm_shutdown()
         // waiting on us, so wake it up.
@@ -315,6 +343,14 @@ void uvm_va_space_mm_release(uvm_va_space_t *va_space)
     }
     else {
         uvm_spin_unlock(&va_space_mm->lock);
+
+        UVM_INFO_PRINT("MoE controlled remap debug: mm_release va_space=%px mm=%px pid=%d comm=%s retained=%u caller=%pS\n",
+                       va_space,
+                       mm,
+                       current->pid,
+                       current->comm,
+                       retained_count,
+                       caller);
     }
 }
 
@@ -335,7 +371,12 @@ static void uvm_va_space_mm_shutdown(uvm_va_space_t *va_space)
     uvm_parent_processor_mask_t flushed_parent_gpus;
     LIST_HEAD(deferred_free_list);
 
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown enter va_space=%px retained=%u\n",
+                   va_space,
+                   va_space_mm->retained_count);
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown down_write begin va_space=%px\n", va_space);
     uvm_va_space_down_write(va_space);
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown down_write end va_space=%px\n", va_space);
 
     // Prevent future registrations of any kind. We'll be iterating over all
     // GPUs and GPU VA spaces below but taking and dropping the VA space lock.
@@ -349,18 +390,22 @@ static void uvm_va_space_mm_shutdown(uvm_va_space_t *va_space)
     uvm_va_space_downgrade_write_rm(va_space);
 
     // Stop channels to prevent new accesses and new faults on non-MPS
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown stop_channels begin va_space=%px\n", va_space);
     uvm_va_space_stop_all_user_channels(va_space);
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown stop_channels end va_space=%px\n", va_space);
 
     uvm_va_space_up_read_rm(va_space);
 
     // Detach all channels to prevent pending untranslated faults from getting
     // to this VA space. This also removes those channels from the VA space and
     // puts them on the deferred free list.
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown detach begin va_space=%px\n", va_space);
     uvm_va_space_down_write(va_space);
     uvm_va_space_detach_all_user_channels(va_space, &deferred_free_list);
     uvm_processor_mask_copy(retained_gpus, &va_space->registered_gpus);
     uvm_global_gpu_retain(retained_gpus);
     uvm_va_space_up_write(va_space);
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown detach end va_space=%px\n", va_space);
 
     // It's ok to use retained_gpus outside the lock since there can only be one
     // thread executing in uvm_va_space_mm_shutdown at a time.
@@ -385,11 +430,13 @@ static void uvm_va_space_mm_shutdown(uvm_va_space_t *va_space)
     // We need only one thread to make this call, but we could have one thread
     // in here and one in destroy_gpu_va_space. Serialize these by starting in
     // write mode then downgrading to read.
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown unset_page_dir begin va_space=%px\n", va_space);
     uvm_va_space_down_write(va_space);
     uvm_va_space_downgrade_write_rm(va_space);
     for_each_gpu_va_space(gpu_va_space, va_space)
         uvm_gpu_va_space_unset_page_dir(gpu_va_space);
     uvm_va_space_up_read_rm(va_space);
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown unset_page_dir end va_space=%px\n", va_space);
 
     // The above call to uvm_gpu_va_space_unset_page_dir handles the GPU VA
     // spaces which are known to be registered. However, we could've raced with
@@ -411,8 +458,12 @@ static void uvm_va_space_mm_shutdown(uvm_va_space_t *va_space)
     //
     // We can be sure that num_pending will eventually go to zero because we've
     // prevented new GPU VA spaces from being registered above.
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown deferred_free wait begin va_space=%px pending=%d\n",
+                   va_space,
+                   atomic_read(&va_space->gpu_va_space_deferred_free.num_pending));
     wait_event(va_space->gpu_va_space_deferred_free.wait_queue,
                atomic_read(&va_space->gpu_va_space_deferred_free.num_pending) == 0);
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown deferred_free wait end va_space=%px\n", va_space);
 
     // Now that there won't be any new GPU faults, prevent subsequent retainers
     // from accessing this mm.
@@ -425,7 +476,11 @@ static void uvm_va_space_mm_shutdown(uvm_va_space_t *va_space)
     uvm_deferred_free_object_list(&deferred_free_list);
 
     // Flush out all pending retainers
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown retainer wait begin va_space=%px retained=%u\n",
+                   va_space,
+                   va_space_mm->retained_count);
     wait_event(va_space_mm->last_retainer_wait_queue, va_space_mm->retained_count == 0);
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown retainer wait end va_space=%px\n", va_space);
 }
 
 static NV_STATUS mm_read64(struct mm_struct *mm, NvU64 addr, NvU64 *val)

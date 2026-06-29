@@ -22,6 +22,7 @@
 *******************************************************************************/
 
 #include "uvm_hmm.h"
+#include "uvm_api.h"
 
 // Support for HMM ( https://docs.kernel.org/mm/hmm.html ):
 
@@ -435,8 +436,12 @@ static bool hmm_invalidate(uvm_va_block_t *va_block,
     uvm_va_block_context_t *va_block_context;
     uvm_va_block_region_t region;
     NvU64 start, end;
+    NvU64 guard_start = 0;
+    NvU64 guard_bytes = 0;
+    uvm_va_space_t *guard_va_space = NULL;
     uvm_processor_id_t id;
     NV_STATUS status = NV_OK;
+    NV_STATUS guard_status = NV_OK;
 
     // The MMU_NOTIFY_RELEASE event isn't really needed since mn_itree_release()
     // doesn't remove the interval notifiers from the struct_mm so there will
@@ -517,16 +522,29 @@ static bool hmm_invalidate(uvm_va_block_t *va_block,
     if (status == NV_OK)
         status = uvm_tracker_wait(&va_block->tracker);
 
+    if (status == NV_OK) {
+        guard_va_space = uvm_va_block_get_va_space(va_block);
+        guard_start = start;
+        guard_bytes = end - start + 1;
+    }
+
     // Remove stale HMM struct page pointers to system memory.
     uvm_va_block_remove_cpu_chunks(va_block, region);
 
 unlock:
     uvm_mutex_unlock(&va_block->lock);
 
+    if (guard_va_space) {
+        guard_status = uvm_moe_slot_pool_clear_range_mappings_for_native_invalidate(guard_va_space,
+                                                                                    mm,
+                                                                                    guard_start,
+                                                                                    guard_bytes);
+    }
+
     uvm_va_block_context_free(va_block_context);
 
     UVM_ASSERT(status == NV_OK);
-    return true;
+    return guard_status == NV_OK;
 }
 
 static bool uvm_hmm_invalidate_entry(struct mmu_interval_notifier *mni,
@@ -874,6 +892,13 @@ static NV_STATUS hmm_split_block(uvm_va_block_t *va_block,
     UVM_ASSERT(new_end > va_block->start);
     UVM_ASSERT(new_end < va_block->end);
     UVM_ASSERT(PAGE_ALIGNED(new_end + 1));
+
+    status = uvm_moe_slot_pool_clear_range_mappings_for_split_locked(va_space,
+                                                                      mm,
+                                                                      va_block->start,
+                                                                      va_block->end - va_block->start + 1);
+    if (status != NV_OK)
+        return status;
 
     status = uvm_va_block_create(NULL, new_end + 1, va_block->end, &new_va_block);
     if (status != NV_OK)

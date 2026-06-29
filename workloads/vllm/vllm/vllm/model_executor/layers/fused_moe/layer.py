@@ -3,10 +3,13 @@
 
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
+import ctypes
 from enum import Enum
 from functools import partial
 import json
+import mmap
 import os
+import threading
 import time
 from typing import Literal, cast, get_args, overload
 
@@ -27,6 +30,7 @@ from vllm.device_allocator.uvm import (
     batch_prefetch_ranges_to_device,
     batch_prefetch_ranges_to_device_with_executor,
     driver_batch_query_ranges_residency_bytes,
+    driver_moe_slot_remap_batch,
     offload_range_to_cpu,
     prefetch_range_to_device,
     probe_driver_capable_range,
@@ -120,6 +124,12 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 )
 
 logger = init_logger(__name__)
+
+_UVM_COLD_STREAMING_LOCK = threading.Lock()
+_UVM_COLD_STREAMING_REGIONS: dict[str, dict[str, object]] = {}
+_UVM_COLD_STREAMING_BYTES = 0
+_UVM_COLD_SLOT_POOL_LOCK = threading.Lock()
+_UVM_COLD_SLOT_POOL_LAYERS: dict[int, dict[str, object]] = {}
 
 
 def _env_flag_enabled(env_name: str, default: bool = False) -> bool:
@@ -1019,6 +1029,176 @@ class FusedMoE(CustomOp):
         )
         if self.uvm_residency_weight_evict_protect_recent_steps < 0:
             self.uvm_residency_weight_evict_protect_recent_steps = 0
+        self.uvm_cold_streaming_enable = _env_flag_enabled(
+            "VLLM_UVM_COLD_STREAMING_ENABLE",
+            default=False,
+        )
+        self.uvm_cold_streaming_trace_only = _env_flag_enabled(
+            "VLLM_UVM_COLD_STREAMING_TRACE_ONLY",
+            default=False,
+        )
+        self.uvm_cold_streaming_hot_plan_enable = _env_flag_enabled(
+            "VLLM_UVM_COLD_STREAMING_HOT_PLAN_ENABLE",
+            default=True,
+        )
+        self.uvm_cold_streaming_budget_bytes = _env_int(
+            "VLLM_UVM_COLD_STREAMING_BUDGET_BYTES",
+            default=0,
+        )
+        if self.uvm_cold_streaming_budget_bytes < 0:
+            self.uvm_cold_streaming_budget_bytes = 0
+        self.uvm_cold_streaming_ttl_steps = _env_int(
+            "VLLM_UVM_COLD_STREAMING_TTL_STEPS",
+            default=64,
+        )
+        if self.uvm_cold_streaming_ttl_steps < 0:
+            self.uvm_cold_streaming_ttl_steps = 0
+        self.uvm_cold_streaming_max_bytes_per_step = _env_int(
+            "VLLM_UVM_COLD_STREAMING_MAX_BYTES_PER_STEP",
+            default=256 * 1024 * 1024,
+        )
+        if self.uvm_cold_streaming_max_bytes_per_step < 0:
+            self.uvm_cold_streaming_max_bytes_per_step = 0
+        self.uvm_cold_streaming_max_experts_per_layer = _env_int(
+            "VLLM_UVM_COLD_STREAMING_MAX_EXPERTS_PER_LAYER",
+            default=0,
+        )
+        if self.uvm_cold_streaming_max_experts_per_layer < 0:
+            self.uvm_cold_streaming_max_experts_per_layer = 0
+        self.uvm_cold_streaming_evict_policy = os.environ.get(
+            "VLLM_UVM_COLD_STREAMING_EVICT_POLICY",
+            "ttl_lru",
+        )
+        if self.uvm_cold_streaming_evict_policy not in ("lru", "ttl_lru"):
+            logger.warning(
+                "Unknown VLLM_UVM_COLD_STREAMING_EVICT_POLICY=%s; using ttl_lru",
+                self.uvm_cold_streaming_evict_policy,
+            )
+            self.uvm_cold_streaming_evict_policy = "ttl_lru"
+        self.uvm_cold_streaming_evict_enable = _env_flag_enabled(
+            "VLLM_UVM_COLD_STREAMING_EVICT_ENABLE",
+            default=True,
+        )
+        self.uvm_cold_streaming_trace_file = os.environ.get(
+            "VLLM_UVM_COLD_STREAMING_TRACE_FILE",
+            "vllm_uvm_cold_streaming_stage_m.jsonl",
+        ) or "vllm_uvm_cold_streaming_stage_m.jsonl"
+        self.uvm_cold_streaming_device = _env_int(
+            "VLLM_UVM_COLD_STREAMING_DEVICE",
+            default=-1,
+        )
+        self.uvm_cold_streaming_sync_prefetch = _env_flag_enabled(
+            "VLLM_UVM_COLD_STREAMING_SYNC_PREFETCH",
+            default=False,
+        )
+        self.uvm_cold_streaming_sync_evict = _env_flag_enabled(
+            "VLLM_UVM_COLD_STREAMING_SYNC_EVICT",
+            default=True,
+        )
+        self.uvm_cold_streaming_real_query_enable = _env_flag_enabled(
+            "VLLM_UVM_COLD_STREAMING_REAL_QUERY_ENABLE",
+            default=False,
+        )
+        self.uvm_cold_slot_pool_enable = _env_flag_enabled(
+            "VLLM_UVM_COLD_SLOT_POOL_ENABLE",
+            default=False,
+        )
+        self.uvm_cold_slot_pool_trace_only = _env_flag_enabled(
+            "VLLM_UVM_COLD_SLOT_POOL_TRACE_ONLY",
+            default=True,
+        )
+        self.uvm_cold_slot_pool_backend = os.environ.get(
+            "VLLM_UVM_COLD_SLOT_POOL_BACKEND",
+            "trace_only",
+        )
+        if self.uvm_cold_slot_pool_backend not in (
+            "trace_only",
+            "legacy_prefetch",
+            "driver_slot_remap",
+        ):
+            logger.warning(
+                "Unknown VLLM_UVM_COLD_SLOT_POOL_BACKEND=%s; using trace_only",
+                self.uvm_cold_slot_pool_backend,
+            )
+            self.uvm_cold_slot_pool_backend = "trace_only"
+        if self.uvm_cold_slot_pool_trace_only:
+            self.uvm_cold_slot_pool_backend = "trace_only"
+        self.uvm_cold_slot_pool_slots_per_layer = _env_int(
+            "VLLM_UVM_COLD_SLOT_POOL_SLOTS_PER_LAYER",
+            default=40,
+        )
+        if self.uvm_cold_slot_pool_slots_per_layer < 0:
+            self.uvm_cold_slot_pool_slots_per_layer = 0
+        self.uvm_cold_slot_pool_trace_file = os.environ.get(
+            "VLLM_UVM_COLD_SLOT_POOL_TRACE_FILE",
+            "vllm_uvm_cold_slot_pool_stage_m.jsonl",
+        ) or "vllm_uvm_cold_slot_pool_stage_m.jsonl"
+        self.uvm_cold_slot_pool_overflow_mode = os.environ.get(
+            "VLLM_UVM_COLD_SLOT_POOL_OVERFLOW_MODE",
+            "trace_only",
+        )
+        if self.uvm_cold_slot_pool_overflow_mode not in (
+            "trace_only",
+            "fallback_streaming",
+        ):
+            logger.warning(
+                "Unknown VLLM_UVM_COLD_SLOT_POOL_OVERFLOW_MODE=%s; using trace_only",
+                self.uvm_cold_slot_pool_overflow_mode,
+            )
+            self.uvm_cold_slot_pool_overflow_mode = "trace_only"
+        self.uvm_cold_slot_pool_trace_assignments_limit = _env_int(
+            "VLLM_UVM_COLD_SLOT_POOL_TRACE_ASSIGNMENTS_LIMIT",
+            default=128,
+        )
+        if self.uvm_cold_slot_pool_trace_assignments_limit < 0:
+            self.uvm_cold_slot_pool_trace_assignments_limit = 0
+        self.uvm_cold_slot_pool_sync_migration = _env_flag_enabled(
+            "VLLM_UVM_COLD_SLOT_POOL_SYNC_MIGRATION",
+            default=False,
+        )
+        self.uvm_cold_slot_pool_driver_mode = os.environ.get(
+            "VLLM_UVM_COLD_SLOT_POOL_DRIVER_MODE",
+            "dry_run",
+        ).strip().lower().replace("-", "_")
+        if self.uvm_cold_slot_pool_driver_mode not in (
+            "dry_run",
+            "validate",
+            "remap",
+            "copy_only",
+            "gpu_copy_only",
+            "slot_pte_remap",
+            "slot_va_block_remap",
+        ):
+            logger.warning(
+                "Unknown VLLM_UVM_COLD_SLOT_POOL_DRIVER_MODE=%s; using dry_run",
+                self.uvm_cold_slot_pool_driver_mode,
+            )
+            self.uvm_cold_slot_pool_driver_mode = "dry_run"
+        self.uvm_cold_slot_pool_driver_validate_managed = _env_flag_enabled(
+            "VLLM_UVM_COLD_SLOT_POOL_DRIVER_VALIDATE_MANAGED",
+            default=False,
+        )
+        self.uvm_cold_slot_pool_clear_slot_ptes_after_remap = os.environ.get(
+            "VLLM_UVM_COLD_SLOT_POOL_CLEAR_SLOT_PTES_AFTER_REMAP",
+            "auto",
+        ).strip().lower()
+        if self.uvm_cold_slot_pool_clear_slot_ptes_after_remap not in (
+            "auto",
+            "0",
+            "1",
+            "false",
+            "true",
+            "no",
+            "yes",
+            "off",
+            "on",
+        ):
+            logger.warning(
+                "Unknown VLLM_UVM_COLD_SLOT_POOL_CLEAR_SLOT_PTES_AFTER_REMAP=%s; "
+                "using auto",
+                self.uvm_cold_slot_pool_clear_slot_ptes_after_remap,
+            )
+            self.uvm_cold_slot_pool_clear_slot_ptes_after_remap = "auto"
 
         self.quant_config = quant_config
 
@@ -2095,6 +2275,7 @@ class FusedMoE(CustomOp):
             router_logits=router_logits,
         )
         self._maybe_prefetch_uvm_expert_weights(topk_ids)
+        self._maybe_stream_uvm_cold_expert_weights(topk_ids)
         self._maybe_offload_uvm_cold_expert_weights(topk_ids)
         self._uvm_moe_trace_step += 1
         return topk_weights, topk_ids, zero_expert_result
@@ -3356,8 +3537,13 @@ class FusedMoE(CustomOp):
                         **metadata,
                         "source": "stage_m",
                         "stage": "stage_m",
+                        "pool_class": "hot",
+                        "driver_subpool": "hot",
                         "init_hot": True,
                         "protected": True,
+                        "pinned": True,
+                        "prefetchable": True,
+                        "priority": 100,
                         "plan_policy": self.uvm_init_weight_plan_policy,
                     },
                 )
@@ -3368,8 +3554,13 @@ class FusedMoE(CustomOp):
                         **metadata,
                         "source": "stage_m",
                         "stage": "stage_m",
+                        "pool_class": "hot",
+                        "driver_subpool": "hot",
                         "init_hot": True,
                         "protected": True,
+                        "pinned": True,
+                        "prefetchable": True,
+                        "priority": 100,
                         "plan_policy": self.uvm_init_weight_plan_policy,
                     },
                 )
@@ -3534,8 +3725,13 @@ class FusedMoE(CustomOp):
                             **cast(dict[str, object], item["residency_metadata"]),
                             "source": "stage_m",
                             "stage": "stage_m",
+                            "pool_class": "hot",
+                            "driver_subpool": "hot",
                             "init_hot": True,
                             "protected": True,
+                            "pinned": True,
+                            "prefetchable": True,
+                            "priority": 100,
                             "plan_policy": self.uvm_init_weight_plan_policy,
                             "executor": executor_used,
                             "sync_prefetch": self.uvm_init_weight_hot_prefetch_sync,
@@ -3588,8 +3784,16 @@ class FusedMoE(CustomOp):
         }
 
     def run_uvm_init_weight_offload(self) -> None:
-        """Stage M: offload planned cold MoE expert weights before warmup."""
-        if not self.uvm_init_weight_offload_enable:
+        """Stage M: apply init-time MoE expert placement before warmup.
+
+        Hot prefetch and cold offload are intentionally independent.  Static
+        hot-residency sanity runs need to prefetch the hot plan to GPU while
+        leaving cold expert streaming/offload disabled.
+        """
+        if not (
+            self.uvm_init_weight_offload_enable
+            or self.uvm_init_weight_hot_prefetch_enable
+        ):
             return
         if self._uvm_init_weight_offload_done:
             return
@@ -3598,6 +3802,7 @@ class FusedMoE(CustomOp):
         accepted_init_plan_policies = {
             "routing_heatmap_v1",
             "exact_used_oracle_v1",
+            "train_test_static_hotset_v1",
         }
         if (
             self.uvm_init_weight_require_routing_plan
@@ -3639,13 +3844,15 @@ class FusedMoE(CustomOp):
             hot_stats = self._register_uvm_init_hot_weight_regions(
                 layer_id
             )
-            expert_pairs = self._uvm_plan_local_experts(
-                self.uvm_init_weight_offload_plan_keys
-            )
-            if self.uvm_init_weight_offload_max_experts_per_layer > 0:
-                expert_pairs = expert_pairs[
-                    : self.uvm_init_weight_offload_max_experts_per_layer
-                ]
+            expert_pairs: list[tuple[int, int]] = []
+            if self.uvm_init_weight_offload_enable:
+                expert_pairs = self._uvm_plan_local_experts(
+                    self.uvm_init_weight_offload_plan_keys
+                )
+                if self.uvm_init_weight_offload_max_experts_per_layer > 0:
+                    expert_pairs = expert_pairs[
+                        : self.uvm_init_weight_offload_max_experts_per_layer
+                    ]
 
             attempted_bytes = 0
             issued_bytes = 0
@@ -3689,7 +3896,12 @@ class FusedMoE(CustomOp):
                             **residency_metadata,
                             "source": "stage_m",
                             "stage": "stage_m",
+                            "pool_class": "cold",
+                            "driver_subpool": "cold",
                             "init_cold": True,
+                            "protected": False,
+                            "prefetchable": True,
+                            "priority": 10,
                             "plan_policy": self.uvm_init_weight_plan_policy,
                         },
                     )
@@ -3755,6 +3967,8 @@ class FusedMoE(CustomOp):
 
                     action = "init_weight_offload_trace_candidate"
                     success = False
+                    advise_success = False
+                    prefetch_success = False
                     if self.uvm_init_weight_offload_mode == "advise_cpu":
                         success = advise_range_preferred_location(ptr, size_bytes, -1)
                         action = (
@@ -3798,7 +4012,12 @@ class FusedMoE(CustomOp):
                                 **residency_metadata,
                                 "source": "stage_m",
                                 "stage": "stage_m",
+                                "pool_class": "cold",
+                                "driver_subpool": "cold",
                                 "init_cold": True,
+                                "protected": False,
+                                "prefetchable": True,
+                                "priority": 10,
                                 "plan_policy": self.uvm_init_weight_plan_policy,
                                 "sync_offload": self.uvm_init_weight_offload_sync,
                             },
@@ -3908,7 +4127,12 @@ class FusedMoE(CustomOp):
                                 **cast(dict[str, object], item["residency_metadata"]),
                                 "source": "stage_m",
                                 "stage": "stage_m",
+                                "pool_class": "cold",
+                                "driver_subpool": "cold",
                                 "init_cold": True,
+                                "protected": False,
+                                "prefetchable": True,
+                                "priority": 10,
                                 "plan_policy": self.uvm_init_weight_plan_policy,
                                 "sync_offload": self.uvm_init_weight_offload_sync,
                                 "executor": executor_used,
@@ -3984,6 +4208,1616 @@ class FusedMoE(CustomOp):
                 )
         except Exception:
             logger.debug("Failed to run Stage M init weight offload", exc_info=True)
+
+    def _append_uvm_cold_streaming_trace(self, record: dict[str, object]) -> None:
+        if not self.uvm_cold_streaming_enable:
+            return
+        try:
+            trace_dir = os.path.dirname(self.uvm_cold_streaming_trace_file)
+            if trace_dir:
+                os.makedirs(trace_dir, exist_ok=True)
+            with open(
+                self.uvm_cold_streaming_trace_file,
+                "a",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError:
+            logger.debug("Failed to write UVM cold streaming trace", exc_info=True)
+
+    def _append_uvm_cold_slot_pool_trace(self, record: dict[str, object]) -> None:
+        if not self.uvm_cold_slot_pool_enable:
+            return
+        try:
+            trace_dir = os.path.dirname(self.uvm_cold_slot_pool_trace_file)
+            if trace_dir:
+                os.makedirs(trace_dir, exist_ok=True)
+            with open(
+                self.uvm_cold_slot_pool_trace_file,
+                "a",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError:
+            logger.debug("Failed to write UVM cold slot pool trace", exc_info=True)
+
+    def _uvm_cold_slot_pool_allocate_batch(
+        self,
+        *,
+        layer_id: int,
+        active_cold_expert_ids: list[int],
+        step: int,
+    ) -> dict[str, object]:
+        start_ns = time.perf_counter_ns()
+        capacity = self.uvm_cold_slot_pool_slots_per_layer
+        active_ids: list[int] = []
+        seen_active: set[int] = set()
+        for expert_id in active_cold_expert_ids:
+            expert_id = int(expert_id)
+            if expert_id in seen_active:
+                continue
+            seen_active.add(expert_id)
+            active_ids.append(expert_id)
+
+        with _UVM_COLD_SLOT_POOL_LOCK:
+            layer_state = _UVM_COLD_SLOT_POOL_LAYERS.get(layer_id)
+            if (
+                layer_state is None
+                or int(layer_state.get("capacity", -1)) != capacity
+            ):
+                slots = [
+                    {
+                        "slot_id": slot_id,
+                        "owner_layer": None,
+                        "owner_expert": None,
+                        "state": "FREE",
+                        "epoch": 0,
+                        "last_access_step": -1,
+                        "ready_event_step": -1,
+                        "release_event_step": step,
+                    }
+                    for slot_id in range(capacity)
+                ]
+                layer_state = {
+                    "capacity": capacity,
+                    "free_cursor": 0,
+                    "slots": slots,
+                    "expert_to_slot": {},
+                }
+                _UVM_COLD_SLOT_POOL_LAYERS[layer_id] = layer_state
+
+            slots = cast(list[dict[str, object]], layer_state["slots"])
+            expert_to_slot = cast(dict[int, int], layer_state["expert_to_slot"])
+
+            released_slots = 0
+            for slot in slots:
+                if str(slot.get("state") or "FREE") in (
+                    "RESERVED",
+                    "LOADING",
+                    "IN_USE",
+                ):
+                    slot["state"] = "READY"
+                    slot["release_event_step"] = step
+                    released_slots += 1
+
+            slot_hits: list[dict[str, int]] = []
+            missing_expert_ids: list[int] = []
+            protected_slot_ids: set[int] = set()
+            stale_mappings = 0
+            for expert_id in active_ids:
+                raw_slot_id = expert_to_slot.get(expert_id)
+                if raw_slot_id is None:
+                    missing_expert_ids.append(expert_id)
+                    continue
+                try:
+                    slot_id = int(raw_slot_id)
+                except (TypeError, ValueError):
+                    expert_to_slot.pop(expert_id, None)
+                    missing_expert_ids.append(expert_id)
+                    stale_mappings += 1
+                    continue
+                if slot_id < 0 or slot_id >= len(slots):
+                    expert_to_slot.pop(expert_id, None)
+                    missing_expert_ids.append(expert_id)
+                    stale_mappings += 1
+                    continue
+                slot = slots[slot_id]
+                state = str(slot.get("state") or "FREE")
+                owner_expert = slot.get("owner_expert")
+                try:
+                    owner_expert_id = int(owner_expert)
+                except (TypeError, ValueError):
+                    owner_expert_id = -1
+                if (
+                    state in ("READY", "IN_USE")
+                    and owner_expert_id == expert_id
+                ):
+                    slot["state"] = "IN_USE"
+                    slot["last_access_step"] = step
+                    protected_slot_ids.add(slot_id)
+                    slot_hits.append(
+                        {
+                            "expert_id": expert_id,
+                            "slot_id": slot_id,
+                        }
+                    )
+                    continue
+                expert_to_slot.pop(expert_id, None)
+                missing_expert_ids.append(expert_id)
+                stale_mappings += 1
+
+            assignments: list[dict[str, object]] = []
+            overflow_experts: list[int] = []
+            used_slot_ids = set(protected_slot_ids)
+            reusable_probe_count = 0
+            cursor = int(layer_state.get("free_cursor") or 0)
+
+            def choose_slot() -> int | None:
+                nonlocal reusable_probe_count
+                if capacity <= 0:
+                    return None
+                for offset in range(capacity):
+                    slot_id = (cursor + offset) % capacity
+                    reusable_probe_count += 1
+                    if slot_id in used_slot_ids:
+                        continue
+                    state = str(slots[slot_id].get("state") or "FREE")
+                    if state in ("RESERVED", "LOADING", "IN_USE"):
+                        continue
+                    return slot_id
+                return None
+
+            for expert_id in missing_expert_ids:
+                slot_id = choose_slot()
+                if slot_id is None:
+                    overflow_experts.append(expert_id)
+                    continue
+                slot = slots[slot_id]
+                old_owner_expert = slot.get("owner_expert")
+                if old_owner_expert is not None:
+                    try:
+                        old_expert_id = int(old_owner_expert)
+                    except (TypeError, ValueError):
+                        old_expert_id = -1
+                    if expert_to_slot.get(old_expert_id) == slot_id:
+                        expert_to_slot.pop(old_expert_id, None)
+                epoch = int(slot.get("epoch") or 0) + 1
+                slot.update(
+                    {
+                        "owner_layer": layer_id,
+                        "owner_expert": expert_id,
+                        "state": "IN_USE",
+                        "epoch": epoch,
+                        "last_access_step": step,
+                        "ready_event_step": step,
+                        "release_event_step": -1,
+                    }
+                )
+                expert_to_slot[expert_id] = slot_id
+                used_slot_ids.add(slot_id)
+                assignments.append(
+                    {
+                        "expert_id": expert_id,
+                        "slot_id": slot_id,
+                        "old_owner_expert": old_owner_expert,
+                        "epoch": epoch,
+                    }
+                )
+                cursor = (slot_id + 1) % capacity if capacity > 0 else 0
+
+            layer_state["free_cursor"] = cursor
+
+            assignment_slot_ids = [
+                int(assignment["slot_id"]) for assignment in assignments
+            ]
+            slot_id_conflicts = (
+                len(assignment_slot_ids) - len(set(assignment_slot_ids))
+            )
+            protected_slot_conflicts = len(
+                set(assignment_slot_ids).intersection(protected_slot_ids)
+            )
+            state_counts: dict[str, int] = {}
+            for slot in slots:
+                state = str(slot.get("state") or "FREE")
+                state_counts[state] = state_counts.get(state, 0) + 1
+
+            limit = self.uvm_cold_slot_pool_trace_assignments_limit
+            traced_assignments = assignments[:limit] if limit else []
+
+        allocation_us = (time.perf_counter_ns() - start_ns) / 1000.0
+        return {
+            "slot_capacity": capacity,
+            "slot_hits": len(slot_hits),
+            "slot_misses": len(missing_expert_ids),
+            "slot_hit_experts": [
+                int(record["expert_id"]) for record in slot_hits
+            ],
+            "slot_miss_experts": missing_expert_ids,
+            "slot_assignments": traced_assignments,
+            "slot_assignments_omitted": max(
+                len(assignments) - len(traced_assignments),
+                0,
+            ),
+            "slot_assignment_count": len(assignments),
+            "assignment_count": len(assignments),
+            "assignment_slot_ids": assignment_slot_ids,
+            "slot_id_conflicts": slot_id_conflicts,
+            "protected_slot_conflicts": protected_slot_conflicts,
+            "overflow_count": len(overflow_experts),
+            "overflow_experts": overflow_experts,
+            "released_slots": released_slots,
+            "protected_current_batch_slots": sorted(protected_slot_ids),
+            "reusable_probe_count": reusable_probe_count,
+            "stale_mapping_count": stale_mappings,
+            "slot_state_counts": state_counts,
+            "free_cursor": cursor,
+            "allocation_us": allocation_us,
+            "stale_read_detected": bool(
+                slot_id_conflicts or protected_slot_conflicts
+            ),
+            }
+
+    def _uvm_cold_slot_pool_forget_layer(self, layer_id: int) -> int:
+        with _UVM_COLD_SLOT_POOL_LOCK:
+            layer_state = _UVM_COLD_SLOT_POOL_LAYERS.get(layer_id)
+            if not layer_state:
+                return 0
+            slots = cast(list[dict[str, object]], layer_state.get("slots") or [])
+            released = 0
+            for slot in slots:
+                if str(slot.get("state") or "FREE") != "FREE":
+                    released += 1
+                slot.update({
+                    "owner_layer": None,
+                    "owner_expert": None,
+                    "state": "FREE",
+                    "last_access_step": -1,
+                    "release_event_step": self._uvm_moe_trace_step,
+                })
+            expert_to_slot = cast(
+                dict[int, int],
+                layer_state.get("expert_to_slot") or {},
+            )
+            expert_to_slot.clear()
+            layer_state["expert_to_slot"] = expert_to_slot
+            layer_state["free_cursor"] = 0
+            return released
+
+    def _uvm_cold_slot_pool_legacy_prefetch_backend(
+        self,
+        *,
+        layer_id: int,
+        allocation: dict[str, object],
+        expert_local_ids: dict[int, int],
+    ) -> dict[str, object]:
+        start_ns = time.perf_counter_ns()
+        ranges: list[tuple[int, int]] = []
+        assignment_experts: set[int] = set()
+        assignment_count = int(allocation.get("assignment_count") or 0)
+        miss_experts = allocation.get("slot_miss_experts")
+        slot_ids = allocation.get("assignment_slot_ids")
+        if not isinstance(miss_experts, list):
+            miss_experts = []
+        if not isinstance(slot_ids, list):
+            slot_ids = []
+        for index, expert_item in enumerate(miss_experts[: len(slot_ids)]):
+            try:
+                expert_id = int(expert_item)
+            except (TypeError, ValueError):
+                continue
+            local_expert_id = expert_local_ids.get(expert_id)
+            if local_expert_id is None:
+                continue
+            assignment_experts.add(expert_id)
+            try:
+                slot_id = int(slot_ids[index])
+            except (TypeError, ValueError):
+                slot_id = -1
+            for _, ptr, size_bytes in self._uvm_expert_weight_slices(
+                local_expert_id,
+                self.uvm_weight_prefetch_target_roles,
+            ):
+                ranges.append((int(ptr), int(size_bytes)))
+
+        if not ranges:
+            return {
+                "backend": "legacy_prefetch",
+                "backend_status": "no_ranges",
+                "backend_success": True,
+                "backend_error": "",
+                "parallel_copy_count": 0,
+                "batch_copy_us": 0.0,
+                "backend_migration_us": 0.0,
+                "migration_range_count": 0,
+                "migration_expert_count": 0,
+                "migration_bytes": 0,
+                "migration_issued_records": 0,
+                "migration_failed_records": 0,
+                "migration_issued_bytes": 0,
+                "remap_count": 0,
+                "tlb_invalidate_count": 0,
+                "planned_remap_count": 0,
+                "planned_tlb_invalidate_count": 0,
+                "executor": "",
+                "driver_result": None,
+            }
+
+        batch_successes = 0
+        executor = ""
+        driver_result: object = None
+        backend_status = "ok"
+        backend_error = ""
+        try:
+            (
+                batch_successes,
+                executor,
+                driver_result,
+            ) = batch_prefetch_ranges_to_device_with_executor(
+                ranges,
+                self._uvm_cold_streaming_device_id(),
+                executor=self.uvm_weight_executor,
+            )
+            if self.uvm_cold_slot_pool_sync_migration and batch_successes > 0:
+                try:
+                    torch.cuda.synchronize()
+                except Exception as exc:
+                    backend_status = "sync_failed"
+                    backend_error = str(exc)
+        except Exception as exc:
+            logger.debug("Failed to run cold slot pool legacy prefetch backend", exc_info=True)
+            backend_status = "prefetch_failed"
+            backend_error = str(exc)
+            batch_successes = 0
+
+        migration_us = (time.perf_counter_ns() - start_ns) / 1000.0
+        issued_ranges = ranges[:batch_successes]
+        issued_bytes = sum(size_bytes for _, size_bytes in issued_ranges)
+        total_bytes = sum(size_bytes for _, size_bytes in ranges)
+        return {
+            "backend": "legacy_prefetch",
+            "backend_status": backend_status,
+            "backend_success": backend_status in ("ok", "sync_failed"),
+            "backend_error": backend_error,
+            "parallel_copy_count": len(assignment_experts),
+            "batch_copy_us": migration_us,
+            "backend_migration_us": migration_us,
+            "migration_range_count": len(ranges),
+            "migration_expert_count": len(assignment_experts),
+            "assigned_slot_count": len(slot_ids),
+            "migration_bytes": total_bytes,
+            "migration_issued_records": batch_successes,
+            "migration_failed_records": max(len(ranges) - batch_successes, 0),
+            "migration_issued_bytes": issued_bytes,
+            "remap_count": 0,
+            "tlb_invalidate_count": 0,
+            "planned_remap_count": 1 if assignment_count else 0,
+            "planned_tlb_invalidate_count": 1 if assignment_count else 0,
+            "executor": executor,
+            "driver_result": driver_result,
+            "sync_migration": self.uvm_cold_slot_pool_sync_migration,
+        }
+
+    def _uvm_cold_slot_pool_driver_remap_backend(
+        self,
+        *,
+        layer_id: int,
+        allocation: dict[str, object],
+        expert_local_ids: dict[int, int],
+    ) -> dict[str, object]:
+        start_ns = time.perf_counter_ns()
+        entries: list[dict[str, object]] = []
+        assignment_experts: set[int] = set()
+        assignment_count = int(allocation.get("assignment_count") or 0)
+        miss_experts = allocation.get("slot_miss_experts")
+        slot_ids = allocation.get("assignment_slot_ids")
+        if not isinstance(miss_experts, list):
+            miss_experts = []
+        if not isinstance(slot_ids, list):
+            slot_ids = []
+
+        for index, expert_item in enumerate(miss_experts[: len(slot_ids)]):
+            try:
+                expert_id = int(expert_item)
+                slot_id = int(slot_ids[index])
+            except (TypeError, ValueError):
+                continue
+            local_expert_id = expert_local_ids.get(expert_id)
+            if local_expert_id is None:
+                continue
+            assignment_experts.add(expert_id)
+            slot_offset = 0
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            for role, ptr, size_bytes in self._uvm_expert_weight_slices(
+                local_expert_id,
+                self.uvm_weight_prefetch_target_roles,
+            ):
+                ptr_int = int(ptr)
+                size_int = int(size_bytes)
+                rounded_base = ptr_int - (ptr_int % page_size)
+                rounded_end = (
+                    ((ptr_int + size_int + page_size - 1) // page_size)
+                    * page_size
+                )
+                rounded_bytes = max(rounded_end - rounded_base, 0)
+                entries.append(
+                    {
+                        "layer_id": int(layer_id),
+                        "expert_id": expert_id,
+                        "slot_id": slot_id,
+                        "role": role,
+                        "va_base": ptr_int,
+                        "bytes": size_int,
+                        "slot_offset": slot_offset,
+                    }
+                )
+                slot_offset += rounded_bytes
+
+        if not entries:
+            return {
+                "backend": "driver_slot_remap",
+                "backend_status": "no_ranges",
+                "backend_success": True,
+                "backend_error": "",
+                "parallel_copy_count": 0,
+                "batch_copy_us": 0.0,
+                "backend_migration_us": 0.0,
+                "migration_range_count": 0,
+                "migration_expert_count": 0,
+                "assigned_slot_count": len(slot_ids),
+                "migration_bytes": 0,
+                "migration_issued_records": 0,
+                "migration_failed_records": 0,
+                "migration_issued_bytes": 0,
+                "remap_count": 0,
+                "tlb_invalidate_count": 0,
+                "planned_remap_count": 1 if assignment_count else 0,
+                "planned_tlb_invalidate_count": 1 if assignment_count else 0,
+                "executor": "driver_slot_remap",
+                "driver_result": None,
+                "driver_slot_remap_mode": self.uvm_cold_slot_pool_driver_mode,
+                "driver_slot_remap_validate_managed": (
+                    self.uvm_cold_slot_pool_driver_validate_managed
+                ),
+            }
+
+        backend_status = "ok"
+        backend_error = ""
+        driver_result: dict[str, object] | None = None
+        driver_prefill_result: dict[str, object] | None = None
+        slot_pte_modes = ("slot_pte_remap", "slot_va_block_remap")
+        clear_setting = self.uvm_cold_slot_pool_clear_slot_ptes_after_remap
+        if clear_setting in ("1", "true", "yes", "on"):
+            reset_after_remap = True
+        elif clear_setting in ("0", "false", "no", "off"):
+            reset_after_remap = False
+        else:
+            reset_after_remap = self.uvm_cold_slot_pool_driver_mode in slot_pte_modes
+        driver_prefill_staging = "none"
+        driver_prefill_staging_bytes = 0
+        driver_prefill_staging_entries = 0
+        driver_slot_pool_python_forget_count = 0
+        driver_prefill_buffers: list[mmap.mmap] = []
+        managed_probe_samples: list[dict[str, object]] = []
+        managed_probe_failed_count = 0
+        try:
+            if self.uvm_cold_slot_pool_driver_mode in slot_pte_modes:
+                for entry in entries:
+                    ptr_int = int(entry.get("va_base") or 0)
+                    size_int = int(entry.get("bytes") or 0)
+                    capable, reason, code = probe_driver_capable_range(
+                        ptr_int,
+                        size_int,
+                    )
+                    if len(managed_probe_samples) < 8:
+                        managed_probe_samples.append(
+                            {
+                                "layer_id": int(entry.get("layer_id") or 0),
+                                "expert_id": int(entry.get("expert_id") or 0),
+                                "slot_id": int(entry.get("slot_id") or 0),
+                                "role": str(entry.get("role") or ""),
+                                "ptr": f"0x{ptr_int:x}",
+                                "bytes": size_int,
+                                "driver_capable": bool(capable),
+                                "driver_capability_reason": reason,
+                                "driver_capability_code": int(code),
+                            }
+                        )
+                    if not capable:
+                        managed_probe_failed_count += 1
+
+                if managed_probe_failed_count:
+                    backend_status = "driver_non_managed_target"
+                    backend_error = (
+                        "non_managed_target_ranges="
+                        f"{managed_probe_failed_count}"
+                    )
+                    raise RuntimeError(backend_error)
+
+            if self.uvm_cold_slot_pool_driver_mode in slot_pte_modes:
+                prefill_entries: list[dict[str, object]] = []
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                for entry in entries:
+                    src = int(entry.get("va_base") or 0)
+                    size_bytes = int(entry.get("bytes") or 0)
+                    if src <= 0 or size_bytes <= 0:
+                        continue
+
+                    rounded_base = src - (src % page_size)
+                    rounded_end = (
+                        ((src + size_bytes + page_size - 1) // page_size)
+                        * page_size
+                    )
+                    rounded_bytes = max(rounded_end - rounded_base, 0)
+                    if rounded_bytes <= 0:
+                        continue
+
+                    host_buffer = mmap.mmap(-1, rounded_bytes)
+                    host_addr = ctypes.addressof(ctypes.c_char.from_buffer(host_buffer))
+                    if host_addr % page_size != 0:
+                        host_buffer.close()
+                        raise RuntimeError(
+                            "host staging mmap for MoE slot prefill is not page-aligned"
+                        )
+
+                    ctypes.memmove(host_addr, rounded_base, rounded_bytes)
+                    driver_prefill_buffers.append(host_buffer)
+                    driver_prefill_staging_bytes += rounded_bytes
+                    driver_prefill_staging_entries += 1
+                    prefill_entries.append(
+                        {
+                            "layer_id": int(entry.get("layer_id") or 0),
+                            "expert_id": int(entry.get("expert_id") or 0),
+                            "slot_id": int(entry.get("slot_id") or 0),
+                            "role": entry.get("role"),
+                            "va_base": host_addr,
+                            "bytes": rounded_bytes,
+                            "slot_offset": int(entry.get("slot_offset") or 0),
+                        }
+                    )
+
+                if len(prefill_entries) != len(entries):
+                    backend_status = "driver_prefill_staging_failed"
+                    backend_error = (
+                        "prefill_staged_entries="
+                        f"{len(prefill_entries)} expected={len(entries)}"
+                    )
+                    raise RuntimeError(backend_error)
+
+                driver_prefill_staging = "host_mmap"
+                driver_prefill_result = driver_moe_slot_remap_batch(
+                    prefill_entries,
+                    mode="gpu_copy_only",
+                    device=self._uvm_cold_streaming_device_id(),
+                    validate_managed=False,
+                    round_to_pages=False,
+                    fd_target_entries=entries,
+                    fd_target_round_to_pages=True,
+                )
+                if driver_prefill_result.get("ok") is not True:
+                    rm_status = int(driver_prefill_result.get("rm_status") or 0)
+                    ioctl_ret = int(driver_prefill_result.get("ioctl_ret") or 0)
+                    backend_status = "driver_prefill_failed"
+                    backend_error = (
+                        f"prefill_rm_status={rm_status} "
+                        f"prefill_ioctl_ret={ioctl_ret}"
+                    )
+                    driver_result = driver_prefill_result
+                    raise RuntimeError(backend_error)
+
+            driver_result = driver_moe_slot_remap_batch(
+                entries,
+                mode=self.uvm_cold_slot_pool_driver_mode,
+                device=self._uvm_cold_streaming_device_id(),
+                validate_managed=self.uvm_cold_slot_pool_driver_validate_managed,
+                round_to_pages=True,
+                reset_slot_pool_after=reset_after_remap,
+            )
+            if driver_result.get("ok") is not True:
+                rm_status = int(driver_result.get("rm_status") or 0)
+                ioctl_ret = int(driver_result.get("ioctl_ret") or 0)
+                if driver_result.get("reset_after_remap_failed"):
+                    backend_status = "driver_reset_after_remap_failed"
+                elif self.uvm_cold_slot_pool_driver_mode == "remap":
+                    backend_status = "remap_not_supported"
+                elif rm_status or ioctl_ret:
+                    backend_status = "driver_failed"
+                else:
+                    backend_status = "driver_rejected"
+                reset_result = driver_result.get("slot_pool_reset_after_remap")
+                reset_error = (
+                    f" reset_after_remap={reset_result}"
+                    if reset_result is not None
+                    else ""
+                )
+                backend_error = (
+                    f"rm_status={rm_status} ioctl_ret={ioctl_ret}"
+                    f"{reset_error}"
+                )
+            elif self.uvm_cold_slot_pool_driver_mode in (
+                "dry_run",
+                "validate",
+                "copy_only",
+                "gpu_copy_only",
+            ):
+                backend_status = f"{self.uvm_cold_slot_pool_driver_mode}_ok"
+            if (
+                reset_after_remap
+                and isinstance(driver_result, dict)
+                and driver_result.get("ok") is True
+                and isinstance(driver_result.get("slot_pool_reset_after_remap"), dict)
+                and driver_result["slot_pool_reset_after_remap"].get("ok") is True
+            ):
+                driver_slot_pool_python_forget_count = (
+                    self._uvm_cold_slot_pool_forget_layer(layer_id)
+                )
+        except Exception as exc:
+            logger.debug("Failed to run cold slot pool driver remap backend", exc_info=True)
+            if backend_status == "ok":
+                backend_status = "driver_exception"
+                backend_error = str(exc)
+                driver_result = None
+        finally:
+            for host_buffer in driver_prefill_buffers:
+                try:
+                    host_buffer.close()
+                except BufferError:
+                    logger.debug(
+                        "Failed to close MoE slot prefill staging buffer",
+                        exc_info=True,
+                    )
+
+        migration_us = (time.perf_counter_ns() - start_ns) / 1000.0
+        success_records = (
+            int(driver_result.get("success_count") or 0)
+            if isinstance(driver_result, dict)
+            else 0
+        )
+        failure_records = (
+            int(driver_result.get("failure_count") or 0)
+            if isinstance(driver_result, dict)
+            else len(entries)
+        )
+        requested_bytes = (
+            int(driver_result.get("requested_bytes") or 0)
+            if isinstance(driver_result, dict)
+            else sum(int(entry["bytes"]) for entry in entries)
+        )
+        accepted_bytes = (
+            int(driver_result.get("accepted_bytes") or 0)
+            if isinstance(driver_result, dict)
+            else 0
+        )
+        real_remap_count = (
+            int(driver_result.get("remap_count") or 0)
+            if isinstance(driver_result, dict)
+            else 0
+        )
+        real_tlb_count = (
+            int(driver_result.get("tlb_invalidate_count") or 0)
+            if isinstance(driver_result, dict)
+            else 0
+        )
+        copy_count = (
+            int(driver_result.get("copy_count") or 0)
+            if isinstance(driver_result, dict)
+            else 0
+        )
+        if isinstance(driver_prefill_result, dict):
+            copy_count += int(driver_prefill_result.get("copy_count") or 0)
+        copy_bytes = (
+            int(driver_result.get("copy_bytes") or 0)
+            if isinstance(driver_result, dict)
+            else 0
+        )
+        if isinstance(driver_prefill_result, dict):
+            copy_bytes += int(driver_prefill_result.get("copy_bytes") or 0)
+        copy_failed_count = (
+            int(driver_result.get("copy_failed_count") or 0)
+            if isinstance(driver_result, dict)
+            else 0
+        )
+        if isinstance(driver_prefill_result, dict):
+            copy_failed_count += int(driver_prefill_result.get("copy_failed_count") or 0)
+        is_success = backend_status in (
+            "dry_run_ok",
+            "validate_ok",
+            "copy_only_ok",
+            "gpu_copy_only_ok",
+            "ok",
+        )
+
+        return {
+            "backend": "driver_slot_remap",
+            "backend_status": backend_status,
+            "backend_success": is_success,
+            "backend_error": backend_error,
+            "parallel_copy_count": len(assignment_experts),
+            "batch_copy_us": migration_us,
+            "backend_migration_us": migration_us,
+            "migration_range_count": len(entries),
+            "migration_expert_count": len(assignment_experts),
+            "assigned_slot_count": len(slot_ids),
+            "migration_bytes": requested_bytes,
+            "migration_issued_records": success_records,
+            "migration_failed_records": failure_records,
+            "migration_issued_bytes": accepted_bytes,
+            "remap_count": real_remap_count,
+            "tlb_invalidate_count": real_tlb_count,
+            "planned_remap_count": 1 if assignment_count else 0,
+            "planned_tlb_invalidate_count": 1 if assignment_count else 0,
+            "executor": "driver_slot_remap",
+            "driver_result": driver_result,
+            "driver_prefill_result": driver_prefill_result,
+            "driver_slot_remap_mode": self.uvm_cold_slot_pool_driver_mode,
+            "driver_slot_remap_validate_managed": (
+                self.uvm_cold_slot_pool_driver_validate_managed
+            ),
+            "driver_slot_remap_entry_count": len(entries),
+            "driver_slot_remap_success_count": success_records,
+            "driver_slot_remap_failure_count": failure_records,
+            "driver_slot_remap_copy_count": copy_count,
+            "driver_slot_remap_copy_bytes": copy_bytes,
+            "driver_slot_remap_copy_failed_count": copy_failed_count,
+            "driver_slot_remap_conflict_count": (
+                int(driver_result.get("conflict_count") or 0)
+                if isinstance(driver_result, dict)
+                else 0
+            ),
+            "driver_prefill_staging": driver_prefill_staging,
+            "driver_prefill_staging_entries": driver_prefill_staging_entries,
+            "driver_prefill_staging_bytes": driver_prefill_staging_bytes,
+            "driver_slot_remap_reset_after_remap": reset_after_remap,
+            "driver_slot_remap_reset_after_remap_result": (
+                driver_result.get("slot_pool_reset_after_remap")
+                if isinstance(driver_result, dict)
+                else None
+            ),
+            "driver_slot_pool_python_forget_count": (
+                driver_slot_pool_python_forget_count
+            ),
+            "driver_slot_remap_requested_bytes": requested_bytes,
+            "driver_slot_remap_accepted_bytes": accepted_bytes,
+            "driver_slot_remap_managed_probe_failed_count": (
+                managed_probe_failed_count
+            ),
+            "driver_slot_remap_managed_probe_samples": managed_probe_samples,
+        }
+
+    def _uvm_cold_slot_pool_backend_result(
+        self,
+        *,
+        layer_id: int,
+        allocation: dict[str, object],
+        expert_local_ids: dict[int, int],
+    ) -> dict[str, object]:
+        assignment_count = int(allocation.get("assignment_count") or 0)
+        if self.uvm_cold_slot_pool_backend == "legacy_prefetch":
+            return self._uvm_cold_slot_pool_legacy_prefetch_backend(
+                layer_id=layer_id,
+                allocation=allocation,
+                expert_local_ids=expert_local_ids,
+            )
+        if self.uvm_cold_slot_pool_backend == "driver_slot_remap":
+            return self._uvm_cold_slot_pool_driver_remap_backend(
+                layer_id=layer_id,
+                allocation=allocation,
+                expert_local_ids=expert_local_ids,
+            )
+        return {
+            "backend": "trace_only",
+            "backend_status": "planned",
+            "backend_success": True,
+            "backend_error": "",
+            "parallel_copy_count": assignment_count,
+            "batch_copy_us": 0.0,
+            "backend_migration_us": 0.0,
+            "migration_range_count": 0,
+            "migration_expert_count": 0,
+            "migration_bytes": 0,
+            "migration_issued_records": 0,
+            "migration_failed_records": 0,
+            "migration_issued_bytes": 0,
+            "remap_count": 0,
+            "tlb_invalidate_count": 0,
+            "planned_remap_count": 1 if assignment_count else 0,
+            "planned_tlb_invalidate_count": 1 if assignment_count else 0,
+            "executor": "",
+            "driver_result": None,
+        }
+
+    def _run_uvm_cold_slot_pool_step(
+        self,
+        *,
+        layer_id: int,
+        num_tokens: int,
+        topk_shape: list[int],
+        active_pairs: list[tuple[int, int]],
+        cold_candidate_pairs: list[tuple[int, int]],
+        hot_active_experts: int,
+    ) -> None:
+        active_cold_expert_ids = [
+            global_expert_id for global_expert_id, _ in cold_candidate_pairs
+        ]
+        expert_local_ids = {
+            int(global_expert_id): int(local_expert_id)
+            for global_expert_id, local_expert_id in cold_candidate_pairs
+        }
+        allocation = self._uvm_cold_slot_pool_allocate_batch(
+            layer_id=layer_id,
+            active_cold_expert_ids=active_cold_expert_ids,
+            step=self._uvm_moe_trace_step,
+        )
+        backend = self._uvm_cold_slot_pool_backend_result(
+            layer_id=layer_id,
+            allocation=allocation,
+            expert_local_ids=expert_local_ids,
+        )
+        self._append_uvm_cold_slot_pool_trace(
+            {
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "layer_name": self.layer_name,
+                "layer_id": layer_id,
+                "step": self._uvm_moe_trace_step,
+                "action": "cold_slot_pool_step_summary",
+                "mode": "slot_pool_backend_v1",
+                "fence_model": "release_previous_batch_at_next_layer_call",
+                "num_tokens": num_tokens,
+                "topk_shape": topk_shape,
+                "active_expert_records": len(active_pairs),
+                "active_hot_experts": hot_active_experts,
+                "active_cold_experts": len(active_cold_expert_ids),
+                "overflow_mode": self.uvm_cold_slot_pool_overflow_mode,
+                "trace_only": self.uvm_cold_slot_pool_trace_only,
+                "slot_hit": allocation.get("slot_hits", 0),
+                "slot_miss": allocation.get("slot_misses", 0),
+                **allocation,
+                **backend,
+            }
+        )
+
+    def _uvm_cold_streaming_is_hot(
+        self,
+        layer_id: int | None,
+        global_expert_id: int,
+    ) -> bool:
+        if not self.uvm_cold_streaming_hot_plan_enable:
+            return False
+        if layer_id is None:
+            return False
+        return (
+            (layer_id, global_expert_id) in self.uvm_init_weight_hot_plan_keys
+            or (layer_id, global_expert_id) in self.uvm_weight_prefetch_plan_keys
+        )
+
+    def _uvm_cold_streaming_device_id(self) -> int:
+        if self.uvm_cold_streaming_device >= 0:
+            return self.uvm_cold_streaming_device
+        try:
+            return int(torch.cuda.current_device())
+        except Exception:
+            return 0
+
+    def _uvm_cold_streaming_live_snapshot(self) -> tuple[int, int]:
+        with _UVM_COLD_STREAMING_LOCK:
+            return (
+                int(_UVM_COLD_STREAMING_BYTES),
+                len(_UVM_COLD_STREAMING_REGIONS),
+            )
+
+    def _uvm_cold_streaming_touch_live_region(
+        self,
+        *,
+        region_id: str,
+        step: int,
+    ) -> bool:
+        with _UVM_COLD_STREAMING_LOCK:
+            entry = _UVM_COLD_STREAMING_REGIONS.get(region_id)
+            if entry is None:
+                return False
+            entry["last_access_step"] = step
+            if self.uvm_cold_streaming_ttl_steps > 0:
+                entry["ttl_deadline_step"] = (
+                    step + self.uvm_cold_streaming_ttl_steps
+                )
+            return bool(entry.get("estimated_gpu_resident", False))
+
+    def _uvm_cold_streaming_add_live_region(
+        self,
+        *,
+        region_id: str,
+        ptr: int,
+        size_bytes: int,
+        step: int,
+        metadata: dict[str, object],
+    ) -> None:
+        global _UVM_COLD_STREAMING_BYTES
+        ttl_deadline = (
+            step + self.uvm_cold_streaming_ttl_steps
+            if self.uvm_cold_streaming_ttl_steps > 0
+            else 0
+        )
+        with _UVM_COLD_STREAMING_LOCK:
+            old_entry = _UVM_COLD_STREAMING_REGIONS.get(region_id)
+            old_bytes = int(old_entry.get("bytes") or 0) if old_entry else 0
+            _UVM_COLD_STREAMING_REGIONS[region_id] = {
+                "region_id": region_id,
+                "ptr": ptr,
+                "bytes": size_bytes,
+                "last_access_step": step,
+                "last_prefetch_step": step,
+                "ttl_deadline_step": ttl_deadline,
+                "estimated_gpu_resident": True,
+                "metadata": dict(metadata),
+            }
+            _UVM_COLD_STREAMING_BYTES = max(
+                _UVM_COLD_STREAMING_BYTES - old_bytes + size_bytes,
+                0,
+            )
+
+    def _uvm_cold_streaming_remove_live_region(
+        self,
+        region_id: str,
+    ) -> None:
+        global _UVM_COLD_STREAMING_BYTES
+        with _UVM_COLD_STREAMING_LOCK:
+            old_entry = _UVM_COLD_STREAMING_REGIONS.pop(region_id, None)
+            if old_entry is not None:
+                _UVM_COLD_STREAMING_BYTES = max(
+                    _UVM_COLD_STREAMING_BYTES
+                    - int(old_entry.get("bytes") or 0),
+                    0,
+                )
+
+    def _uvm_cold_streaming_select_victims(
+        self,
+        *,
+        required_bytes: int,
+        active_region_ids: set[str],
+        step: int,
+    ) -> list[dict[str, object]]:
+        if required_bytes <= 0:
+            return []
+        with _UVM_COLD_STREAMING_LOCK:
+            candidates: list[dict[str, object]] = []
+            for entry in _UVM_COLD_STREAMING_REGIONS.values():
+                region_id = str(entry.get("region_id") or "")
+                metadata = entry.get("metadata")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                if not region_id or region_id in active_region_ids:
+                    continue
+                if metadata.get("init_hot") is True or metadata.get("protected") is True:
+                    continue
+                if metadata.get("pool_class") != "streaming":
+                    continue
+                candidates.append(dict(entry))
+
+            def victim_key(entry: dict[str, object]) -> tuple[int, int, int, str]:
+                ttl_deadline = int(entry.get("ttl_deadline_step") or 0)
+                last_access = int(entry.get("last_access_step") or -1)
+                size_bytes = int(entry.get("bytes") or 0)
+                region_id = str(entry.get("region_id") or "")
+                expired_rank = 1
+                if (
+                    self.uvm_cold_streaming_evict_policy == "ttl_lru"
+                    and ttl_deadline > 0
+                    and ttl_deadline <= step
+                ):
+                    expired_rank = 0
+                return (expired_rank, last_access, -size_bytes, region_id)
+
+            candidates.sort(key=victim_key)
+            victims: list[dict[str, object]] = []
+            reclaimed = 0
+            for entry in candidates:
+                victims.append(entry)
+                reclaimed += int(entry.get("bytes") or 0)
+                if reclaimed >= required_bytes:
+                    break
+            return victims
+
+    def _uvm_cold_streaming_offload_victims(
+        self,
+        *,
+        victims: list[dict[str, object]],
+        scope_key: str,
+    ) -> tuple[int, int, int, int, object, object]:
+        if not victims:
+            return 0, 0, 0, 0, None, None
+        ranges = [
+            (int(victim["ptr"]), int(victim["bytes"]))
+            for victim in victims
+            if int(victim.get("ptr") or 0) > 0 and int(victim.get("bytes") or 0) > 0
+        ]
+        if not ranges:
+            return 0, 0, 0, 0, None, None
+        (
+            batch_successes,
+            executor_used,
+            driver_advise_result,
+            driver_prefetch_result,
+        ) = batch_offload_ranges_to_cpu_with_executor(
+            ranges,
+            sync=self.uvm_cold_streaming_sync_evict,
+            executor=self.uvm_weight_executor,
+        )
+        issued = 0
+        issued_bytes = 0
+        hot_evicted = 0
+        for batch_index, victim in enumerate(victims[: len(ranges)]):
+            region_id = str(victim.get("region_id") or "")
+            size_bytes = int(victim.get("bytes") or 0)
+            metadata = victim.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            if metadata.get("init_hot") is True or metadata.get("protected") is True:
+                hot_evicted += 1
+            success = batch_index < batch_successes
+            if success:
+                issued += 1
+                issued_bytes += size_bytes
+                self._uvm_cold_streaming_remove_live_region(region_id)
+                next_state = (
+                    "cpu" if self.uvm_cold_streaming_sync_evict else "prefetching_cpu"
+                )
+                mark_uvm_residency_state(
+                    region_id=region_id,
+                    state=next_state,
+                    metadata={
+                        **cast(dict[str, object], metadata),
+                        "stage": "stage_m_cold_streaming",
+                        "pool_class": "streaming",
+                        "last_streaming_evict_step": self._uvm_moe_trace_step,
+                        "scope_key": scope_key,
+                        "executor": executor_used,
+                        "active": False,
+                        "evictable": True,
+                    },
+                )
+                layer_id = metadata.get("layer_id")
+                global_expert_id = metadata.get("global_expert_id")
+                role = metadata.get("role")
+                if isinstance(global_expert_id, int) and isinstance(role, str):
+                    self._uvm_update_weight_expert_role_cache(
+                        layer_id=layer_id if isinstance(layer_id, int) else None,
+                        global_expert_id=global_expert_id,
+                        role=role,
+                        state=next_state,
+                        estimated_gpu_resident=False,
+                    )
+            record_uvm_residency_action(
+                action=(
+                    "cold_streaming_evict_issued"
+                    if success
+                    else "cold_streaming_evict_failed"
+                ),
+                pool="weights",
+                region_id=region_id,
+                bytes=size_bytes,
+                metadata={
+                    **cast(dict[str, object], metadata),
+                    "stage": "stage_m_cold_streaming",
+                    "scope_key": scope_key,
+                    "executor": executor_used,
+                    "requested_executor": self.uvm_weight_executor,
+                    "batch_index": batch_index,
+                    "batch_size": len(ranges),
+                    "batch_successes": batch_successes,
+                    "driver_advise_result": driver_advise_result,
+                    "driver_prefetch_result": driver_prefetch_result,
+                    "sync_evict": self.uvm_cold_streaming_sync_evict,
+                },
+                success=success,
+            )
+        return (
+            issued,
+            issued_bytes,
+            len(ranges),
+            hot_evicted,
+            driver_advise_result,
+            driver_prefetch_result,
+        )
+
+    def _maybe_stream_uvm_cold_expert_weights(self, topk_ids: torch.Tensor) -> None:
+        if not self.uvm_cold_streaming_enable:
+            return
+        if (
+            self.uvm_weight_router_topk_every_n_steps > 1
+            and (self._uvm_moe_trace_step % self.uvm_weight_router_topk_every_n_steps) != 0
+        ):
+            return
+        try:
+            self._refresh_uvm_weight_action_plans()
+            layer_id = self._uvm_layer_id()
+            if layer_id is None:
+                return
+            num_tokens = int(topk_ids.shape[0]) if topk_ids.ndim > 0 else 1
+            topk_shape = [int(dim) for dim in topk_ids.shape]
+            active_pairs = self._uvm_active_expert_pairs(topk_ids)
+            if not active_pairs:
+                return
+            device = self._uvm_cold_streaming_device_id()
+            scope_key = f"cold_streaming:{os.getpid()}:{self._uvm_moe_trace_step}"
+            if self.uvm_cold_slot_pool_enable and self.uvm_cold_slot_pool_trace_only:
+                active_region_ids: set[str] = set()
+            else:
+                active_region_ids = {
+                    self._uvm_expert_weight_region_id(
+                        layer_id,
+                        global_expert_id,
+                        role,
+                    )
+                    for global_expert_id, local_expert_id in active_pairs
+                    for role, _, _ in self._uvm_expert_weight_slices(
+                        local_expert_id,
+                        self.uvm_weight_prefetch_target_roles,
+                    )
+                }
+
+            hot_active_experts = 0
+            cold_active_pairs: list[tuple[int, int]] = []
+            hot_active_region_records = 0
+            hot_missing_region_records = 0
+            for global_expert_id, local_expert_id in active_pairs:
+                if self._uvm_cold_streaming_is_hot(layer_id, global_expert_id):
+                    hot_active_experts += 1
+                    for role, ptr, size_bytes in self._uvm_expert_weight_slices(
+                        local_expert_id,
+                        self.uvm_weight_prefetch_target_roles,
+                    ):
+                        region_id = self._uvm_expert_weight_region_id(
+                            layer_id,
+                            global_expert_id,
+                            role,
+                        )
+                        metadata = self._uvm_expert_weight_residency_metadata(
+                            layer_id=layer_id,
+                            global_expert_id=global_expert_id,
+                            local_expert_id=local_expert_id,
+                            role=role,
+                            ptr=ptr,
+                            size_bytes=size_bytes,
+                            active_this_step=True,
+                            source_action="cold_streaming_hot_access",
+                        )
+                        existing = get_uvm_residency_region_snapshot(region_id)
+                        if existing is None:
+                            hot_missing_region_records += 1
+                            register_uvm_residency_region(
+                                pool="weights",
+                                region_id=region_id,
+                                ptr=ptr,
+                                bytes=size_bytes,
+                                state="gpu",
+                                evictable=False,
+                                active=False,
+                                metadata={
+                                    **metadata,
+                                    "stage": "stage_m_cold_streaming",
+                                    "pool_class": "hot",
+                                    "driver_subpool": "hot",
+                                    "init_hot": True,
+                                    "protected": True,
+                                    "pinned": True,
+                                    "prefetchable": True,
+                                    "priority": 100,
+                                },
+                            )
+                        record_uvm_residency_access(
+                            region_id=region_id,
+                            step=self._uvm_moe_trace_step,
+                            metadata={
+                                **metadata,
+                                "stage": "stage_m_cold_streaming",
+                                "pool_class": "hot",
+                                "driver_subpool": "hot",
+                                "init_hot": True,
+                                "protected": True,
+                                "pinned": True,
+                                "prefetchable": True,
+                                "priority": 100,
+                            },
+                        )
+                        hot_active_region_records += 1
+                    continue
+                cold_active_pairs.append((global_expert_id, local_expert_id))
+
+            cold_candidate_pairs = cold_active_pairs
+            if self.uvm_cold_streaming_max_experts_per_layer > 0:
+                cold_candidate_pairs = cold_candidate_pairs[
+                    : self.uvm_cold_streaming_max_experts_per_layer
+                ]
+            if self.uvm_cold_slot_pool_enable:
+                self._run_uvm_cold_slot_pool_step(
+                    layer_id=layer_id,
+                    num_tokens=num_tokens,
+                    topk_shape=topk_shape,
+                    active_pairs=active_pairs,
+                    cold_candidate_pairs=cold_candidate_pairs,
+                    hot_active_experts=hot_active_experts,
+                )
+                return
+
+            candidate_items: list[dict[str, object]] = []
+            cold_hit_region_records = 0
+            cold_miss_region_records = 0
+            cold_miss_experts: set[int] = set()
+            budget_reject_records = 0
+            budget_reject_bytes = 0
+            candidate_bytes = 0
+            protected_collision_records = 0
+
+            for global_expert_id, local_expert_id in cold_candidate_pairs:
+                expert_had_miss = False
+                for role, ptr, size_bytes in self._uvm_expert_weight_slices(
+                    local_expert_id,
+                    self.uvm_weight_prefetch_target_roles,
+                ):
+                    region_id = self._uvm_expert_weight_region_id(
+                        layer_id,
+                        global_expert_id,
+                        role,
+                    )
+                    metadata = self._uvm_expert_weight_residency_metadata(
+                        layer_id=layer_id,
+                        global_expert_id=global_expert_id,
+                        local_expert_id=local_expert_id,
+                        role=role,
+                        ptr=ptr,
+                        size_bytes=size_bytes,
+                        active_this_step=True,
+                        source_action="cold_streaming",
+                    )
+                    metadata = {
+                        **metadata,
+                        "stage": "stage_m_cold_streaming",
+                        "pool_class": "streaming",
+                        "driver_subpool": "streaming",
+                        "streaming": True,
+                        "init_cold": False,
+                        "protected": False,
+                        "prefetchable": True,
+                        "transient": True,
+                        "priority": 20,
+                    }
+                    existing = get_uvm_residency_region_snapshot(region_id)
+                    existing_metadata = (
+                        existing.get("metadata") if existing is not None else {}
+                    )
+                    if not isinstance(existing_metadata, dict):
+                        existing_metadata = {}
+                    if (
+                        existing_metadata.get("init_hot") is True
+                        or existing_metadata.get("protected") is True
+                    ):
+                        protected_collision_records += 1
+                        continue
+                    existing_state = (
+                        str(existing.get("state"))
+                        if existing is not None
+                        else self.uvm_residency_weight_initial_state
+                    )
+                    register_uvm_residency_region(
+                        pool="weights",
+                        region_id=region_id,
+                        ptr=ptr,
+                        bytes=size_bytes,
+                        state=existing_state,
+                        evictable=True,
+                        active=False,
+                        metadata=metadata,
+                    )
+                    record_uvm_residency_access(
+                        region_id=region_id,
+                        step=self._uvm_moe_trace_step,
+                        metadata=metadata,
+                    )
+                    self._uvm_weight_recent_active_region_steps[region_id] = (
+                        self._uvm_moe_trace_step
+                    )
+                    if self._uvm_cold_streaming_touch_live_region(
+                        region_id=region_id,
+                        step=self._uvm_moe_trace_step,
+                    ):
+                        cold_hit_region_records += 1
+                        continue
+                    if (
+                        self.uvm_cold_streaming_max_bytes_per_step > 0
+                        and candidate_bytes + size_bytes
+                        > self.uvm_cold_streaming_max_bytes_per_step
+                    ):
+                        budget_reject_records += 1
+                        budget_reject_bytes += size_bytes
+                        continue
+                    expert_had_miss = True
+                    cold_miss_region_records += 1
+                    candidate_bytes += size_bytes
+                    candidate_items.append(
+                        {
+                            "region_id": region_id,
+                            "ptr": ptr,
+                            "bytes": size_bytes,
+                            "role": role,
+                            "layer_id": layer_id,
+                            "global_expert_id": global_expert_id,
+                            "local_expert_id": local_expert_id,
+                            "metadata": metadata,
+                        }
+                    )
+                if expert_had_miss:
+                    cold_miss_experts.add(global_expert_id)
+
+            live_bytes_before, live_records_before = (
+                self._uvm_cold_streaming_live_snapshot()
+            )
+            streaming_budget_reject_records = 0
+            streaming_budget_reject_bytes = 0
+            selected_victim_bytes = 0
+            selected_victims: list[dict[str, object]] = []
+            if (
+                self.uvm_cold_streaming_budget_bytes > 0
+                and candidate_items
+                and self.uvm_cold_streaming_evict_enable
+                and not self.uvm_cold_streaming_trace_only
+            ):
+                free_bytes = max(
+                    self.uvm_cold_streaming_budget_bytes - live_bytes_before,
+                    0,
+                )
+                need_evict_bytes = max(candidate_bytes - free_bytes, 0)
+                selected_victims = self._uvm_cold_streaming_select_victims(
+                    required_bytes=need_evict_bytes,
+                    active_region_ids=active_region_ids,
+                    step=self._uvm_moe_trace_step,
+                )
+                selected_victim_bytes = sum(
+                    int(victim.get("bytes") or 0) for victim in selected_victims
+                )
+                allowed_new_bytes = free_bytes + selected_victim_bytes
+                if candidate_bytes > allowed_new_bytes:
+                    kept_items: list[dict[str, object]] = []
+                    kept_bytes = 0
+                    for item in candidate_items:
+                        item_bytes = int(item.get("bytes") or 0)
+                        if kept_bytes + item_bytes > allowed_new_bytes:
+                            streaming_budget_reject_records += 1
+                            streaming_budget_reject_bytes += item_bytes
+                            continue
+                        kept_items.append(item)
+                        kept_bytes += item_bytes
+                candidate_items = kept_items
+                candidate_bytes = kept_bytes
+
+            evict_issued_records = 0
+            evict_issued_bytes = 0
+            evict_candidate_records = len(selected_victims)
+            hot_evicted_by_cold_count = 0
+            evict_driver_advise_result: object = None
+            evict_driver_prefetch_result: object = None
+            if selected_victims and not self.uvm_cold_streaming_trace_only:
+                (
+                    evict_issued_records,
+                    evict_issued_bytes,
+                    evict_candidate_records,
+                    hot_evicted_by_cold_count,
+                    evict_driver_advise_result,
+                    evict_driver_prefetch_result,
+                ) = self._uvm_cold_streaming_offload_victims(
+                    victims=selected_victims,
+                    scope_key=scope_key,
+                )
+
+            prefetch_issued_records = 0
+            prefetch_issued_bytes = 0
+            prefetch_failed_records = 0
+            prefetch_executor = ""
+            prefetch_driver_result: object = None
+            real_query_records = 0
+            real_queried_bytes = 0
+            real_gpu_bytes = 0
+            real_gpu_ratio: float | None = None
+            if candidate_items and not self.uvm_cold_streaming_trace_only:
+                ranges = [
+                    (int(item["ptr"]), int(item["bytes"]))
+                    for item in candidate_items
+                ]
+                (
+                    batch_successes,
+                    prefetch_executor,
+                    prefetch_driver_result,
+                ) = batch_prefetch_ranges_to_device_with_executor(
+                    ranges,
+                    device,
+                    executor=self.uvm_weight_executor,
+                )
+                if self.uvm_cold_streaming_sync_prefetch and batch_successes > 0:
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        logger.debug(
+                            "Failed to synchronize after cold streaming prefetch",
+                            exc_info=True,
+                        )
+                successful_ranges = ranges[:batch_successes]
+                if self.uvm_cold_streaming_real_query_enable and successful_ranges:
+                    try:
+                        real_result = driver_batch_query_ranges_residency_bytes(
+                            successful_ranges,
+                            device,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to query cold streaming residency",
+                            exc_info=True,
+                        )
+                        real_result = {
+                            "queried_bytes": 0,
+                            "gpu_bytes": 0,
+                        }
+                    real_query_records = 1
+                    real_queried_bytes = int(real_result.get("queried_bytes") or 0)
+                    real_gpu_bytes = int(real_result.get("gpu_bytes") or 0)
+                    real_gpu_ratio = (
+                        real_gpu_bytes / real_queried_bytes
+                        if real_queried_bytes
+                        else 0.0
+                    )
+                for batch_index, item in enumerate(candidate_items):
+                    success = batch_index < batch_successes
+                    region_id = str(item["region_id"])
+                    size_bytes = int(item["bytes"])
+                    metadata = cast(dict[str, object], item["metadata"])
+                    if success:
+                        prefetch_issued_records += 1
+                        prefetch_issued_bytes += size_bytes
+                        state = (
+                            "gpu"
+                            if self.uvm_cold_streaming_sync_prefetch
+                            else "prefetching_gpu"
+                        )
+                        mark_uvm_residency_state(
+                            region_id=region_id,
+                            state=state,
+                            metadata={
+                                **metadata,
+                                "last_streaming_prefetch_step": (
+                                    self._uvm_moe_trace_step
+                                ),
+                                "executor": prefetch_executor,
+                                "active": False,
+                                "evictable": True,
+                            },
+                        )
+                        self._uvm_cold_streaming_add_live_region(
+                            region_id=region_id,
+                            ptr=int(item["ptr"]),
+                            size_bytes=size_bytes,
+                            step=self._uvm_moe_trace_step,
+                            metadata={
+                                **metadata,
+                                "executor": prefetch_executor,
+                            },
+                        )
+                        self._uvm_update_weight_expert_role_cache(
+                            layer_id=layer_id,
+                            global_expert_id=int(item["global_expert_id"]),
+                            role=str(item["role"]),
+                            state=state,
+                            estimated_gpu_resident=True,
+                        )
+                    else:
+                        prefetch_failed_records += 1
+                    record_uvm_residency_action(
+                        action=(
+                            "cold_streaming_prefetch_issued"
+                            if success
+                            else "cold_streaming_prefetch_failed"
+                        ),
+                        pool="weights",
+                        region_id=region_id,
+                        bytes=size_bytes,
+                        metadata={
+                            **metadata,
+                            "scope_key": scope_key,
+                            "executor": prefetch_executor,
+                            "requested_executor": self.uvm_weight_executor,
+                            "batch_index": batch_index,
+                            "batch_size": len(candidate_items),
+                            "batch_successes": batch_successes,
+                            "driver_result": prefetch_driver_result,
+                            "device": device,
+                            "sync_prefetch": self.uvm_cold_streaming_sync_prefetch,
+                        },
+                        success=success,
+                    )
+
+            live_bytes_after, live_records_after = (
+                self._uvm_cold_streaming_live_snapshot()
+            )
+            if (
+                hot_active_experts
+                or cold_active_pairs
+                or cold_miss_region_records
+                or cold_hit_region_records
+                or prefetch_issued_records
+                or evict_issued_records
+                or budget_reject_records
+                or streaming_budget_reject_records
+            ):
+                self._append_uvm_cold_streaming_trace(
+                    {
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "layer_name": self.layer_name,
+                        "layer_id": layer_id,
+                        "step": self._uvm_moe_trace_step,
+                        "action": "cold_streaming_step_summary",
+                        "num_tokens": num_tokens,
+                        "topk_shape": topk_shape,
+                        "active_expert_records": len(active_pairs),
+                        "active_region_records": len(active_region_ids),
+                        "active_hot_experts": hot_active_experts,
+                        "active_cold_experts": len(cold_active_pairs),
+                        "candidate_cold_experts": len(cold_candidate_pairs),
+                        "hot_active_region_records": hot_active_region_records,
+                        "hot_missing_region_records": hot_missing_region_records,
+                        "cold_hit_region_records": cold_hit_region_records,
+                        "cold_miss_experts": len(cold_miss_experts),
+                        "cold_miss_region_records": cold_miss_region_records,
+                        "cold_miss_bytes": (
+                            candidate_bytes + streaming_budget_reject_bytes
+                        ),
+                        "prefetch_candidate_records": len(candidate_items),
+                        "prefetch_candidate_bytes": candidate_bytes,
+                        "streaming_prefetch_issued_records": (
+                            prefetch_issued_records
+                        ),
+                        "streaming_prefetch_issued_bytes": prefetch_issued_bytes,
+                        "streaming_prefetch_failed_records": (
+                            prefetch_failed_records
+                        ),
+                        "streaming_eviction_candidate_records": (
+                            evict_candidate_records
+                        ),
+                        "streaming_eviction_candidate_bytes": (
+                            selected_victim_bytes
+                        ),
+                        "streaming_eviction_count": evict_issued_records,
+                        "streaming_eviction_bytes": evict_issued_bytes,
+                        "hot_evicted_by_cold_count": hot_evicted_by_cold_count,
+                        "protected_collision_records": protected_collision_records,
+                        "max_bytes_per_step_reject_records": budget_reject_records,
+                        "max_bytes_per_step_reject_bytes": budget_reject_bytes,
+                        "streaming_budget_reject_records": (
+                            streaming_budget_reject_records
+                        ),
+                        "streaming_budget_reject_bytes": (
+                            streaming_budget_reject_bytes
+                        ),
+                        "streaming_budget_bytes": (
+                            self.uvm_cold_streaming_budget_bytes
+                        ),
+                        "streaming_live_bytes_before": live_bytes_before,
+                        "streaming_live_records_before": live_records_before,
+                        "streaming_live_bytes_after": live_bytes_after,
+                        "streaming_live_records_after": live_records_after,
+                        "ttl_steps": self.uvm_cold_streaming_ttl_steps,
+                        "evict_policy": self.uvm_cold_streaming_evict_policy,
+                        "device": device,
+                        "executor": prefetch_executor,
+                        "requested_executor": self.uvm_weight_executor,
+                        "prefetch_driver_result": prefetch_driver_result,
+                        "evict_driver_advise_result": evict_driver_advise_result,
+                        "evict_driver_prefetch_result": evict_driver_prefetch_result,
+                        "real_query_records": real_query_records,
+                        "real_queried_bytes": real_queried_bytes,
+                        "real_gpu_bytes": real_gpu_bytes,
+                        "real_gpu_ratio": real_gpu_ratio,
+                    }
+                )
+        except Exception:
+            logger.debug("Failed to run UVM cold streaming", exc_info=True)
 
     def _maybe_prefetch_uvm_expert_weights(self, topk_ids: torch.Tensor) -> None:
         if not self.uvm_weight_prefetch_enabled:

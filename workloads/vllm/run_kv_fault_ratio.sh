@@ -20,7 +20,7 @@ PROMPTS=5
 REQUEST_RATE=5
 OUTPUT_LEN=512
 SEED=42
-STARTUP_TIMEOUT=600
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-600}"
 CHECK_INTERVAL=2
 SERVER_MAX_NUM_SEQS="${VLLM_SERVER_MAX_NUM_SEQS:-8}"
 SERVER_MAX_NUM_BATCHED_TOKENS="${VLLM_SERVER_MAX_NUM_BATCHED_TOKENS:-}"
@@ -41,7 +41,13 @@ UVM_PHASE_N_AUTO_RECLAIM_FAILURE_BACKOFF_EPOCHS="${UVM_PHASE_N_AUTO_RECLAIM_FAIL
 UVM_PHASE_N_BLOCK_QUOTA_ENABLE="${UVM_PHASE_N_BLOCK_QUOTA_ENABLE:-0}"
 UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY="${UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY:-1}"
 UVM_PHASE_N_NATIVE_BLOCK_ENABLE="${UVM_PHASE_N_NATIVE_BLOCK_ENABLE:-0}"
+UVM_MOE_SLOT_PTE_REMAP_ENABLE="${UVM_MOE_SLOT_PTE_REMAP_ENABLE:-${VLLM_UVM_MOE_SLOT_PTE_REMAP_ENABLE:-0}}"
+UVM_MOE_SLOT_PTE_REMAP_MAX_BYTES="${UVM_MOE_SLOT_PTE_REMAP_MAX_BYTES:-${VLLM_UVM_MOE_SLOT_PTE_REMAP_MAX_BYTES:-65536}}"
+UVM_MOE_SLOT_POOL_VIDMEM_BUDGET_BYTES="${UVM_MOE_SLOT_POOL_VIDMEM_BUDGET_BYTES:-${VLLM_UVM_MOE_SLOT_POOL_VIDMEM_BUDGET_BYTES:-536870912}}"
+CONTROLLED_REMAP_PREFLIGHT="${CONTROLLED_REMAP_PREFLIGHT:-0}"
+ALLOW_D_STATE_PROCESSES="${ALLOW_D_STATE_PROCESSES:-0}"
 UVM_CAPTURE_STARTUP_FAULTS="${VLLM_UVM_CAPTURE_STARTUP_FAULTS:-0}"
+UVM_SKIP_FAULT_PARAM_CONFIG="${VLLM_UVM_SKIP_FAULT_PARAM_CONFIG:-0}"
 
 DATASET_PATH="${DATASET_PATH:-$SCRIPT_DIR/datasets/ShareGPT_V3_unfiltered_cleaned_split.json}"
 ADDRESS_LOG="/tmp/vllm_uvm_address_regions.log"
@@ -77,6 +83,16 @@ UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES="${VLLM_UVM_DEVICE_DIRECT_MAX_TOTAL_BYTES:-268
 UVM_DEVICE_DIRECT_BACKEND="${VLLM_UVM_DEVICE_DIRECT_BACKEND:-cuda_malloc}"
 UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD="${VLLM_UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD:-}"
 UVM_DEVICE_DIRECT_TARGET_PHASES="${VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES:-enabled:attention,enabled:moe,enabled:model_forward}"
+UVM_KV_DEVICE_DIRECT_ENABLE="${VLLM_UVM_KV_DEVICE_DIRECT_ENABLE:-0}"
+UVM_KV_DEVICE_DIRECT_MIN_BYTES="${VLLM_UVM_KV_DEVICE_DIRECT_MIN_BYTES:-0}"
+UVM_KV_DEVICE_DIRECT_MAX_BYTES="${VLLM_UVM_KV_DEVICE_DIRECT_MAX_BYTES:-0}"
+UVM_KV_DEVICE_DIRECT_MAX_TOTAL_BYTES="${VLLM_UVM_KV_DEVICE_DIRECT_MAX_TOTAL_BYTES:-0}"
+UVM_KV_RANGE_CONFIG_ENABLE="${VLLM_UVM_KV_RANGE_CONFIG_ENABLE:-1}"
+UVM_FIXED_WEIGHT_DEVICE_DIRECT_ENABLE="${VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_ENABLE:-0}"
+UVM_FIXED_WEIGHT_DEVICE_DIRECT_MIN_BYTES="${VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_MIN_BYTES:-0}"
+UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_BYTES="${VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_BYTES:-0}"
+UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_TOTAL_BYTES="${VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_TOTAL_BYTES:-0}"
+UVM_FIXED_WEIGHT_DEVICE_DIRECT_TRACE_FILE="${VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_TRACE_FILE:-}"
 UVM_KV_BUDGET_BYTES="${VLLM_UVM_KV_BUDGET_BYTES:-0}"
 UVM_KV_BUDGET_MODE="${VLLM_UVM_KV_BUDGET_MODE:-trace_only}"
 UVM_KV_RUNTIME_ENABLE="${VLLM_UVM_KV_RUNTIME_ENABLE:-0}"
@@ -121,6 +137,30 @@ UVM_WEIGHT_PREFETCH_HIT_DRIVER_QUERY_ENABLE="${VLLM_UVM_WEIGHT_PREFETCH_HIT_DRIV
 UVM_WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP="${VLLM_UVM_WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP:-64}"
 UVM_WEIGHT_BATCH_EXECUTOR_ENABLE="${VLLM_UVM_WEIGHT_BATCH_EXECUTOR_ENABLE:-1}"
 UVM_WEIGHT_EXECUTOR="${VLLM_UVM_WEIGHT_EXECUTOR:-cpp_batch}"
+UVM_COLD_STREAMING_ENABLE="${VLLM_UVM_COLD_STREAMING_ENABLE:-0}"
+UVM_COLD_STREAMING_TRACE_ONLY="${VLLM_UVM_COLD_STREAMING_TRACE_ONLY:-0}"
+UVM_COLD_STREAMING_BUDGET_BYTES="${VLLM_UVM_COLD_STREAMING_BUDGET_BYTES:-0}"
+UVM_COLD_STREAMING_TTL_STEPS="${VLLM_UVM_COLD_STREAMING_TTL_STEPS:-64}"
+UVM_COLD_STREAMING_MAX_BYTES_PER_STEP="${VLLM_UVM_COLD_STREAMING_MAX_BYTES_PER_STEP:-268435456}"
+UVM_COLD_STREAMING_MAX_EXPERTS_PER_LAYER="${VLLM_UVM_COLD_STREAMING_MAX_EXPERTS_PER_LAYER:-0}"
+UVM_COLD_STREAMING_EVICT_POLICY="${VLLM_UVM_COLD_STREAMING_EVICT_POLICY:-ttl_lru}"
+UVM_COLD_STREAMING_EVICT_ENABLE="${VLLM_UVM_COLD_STREAMING_EVICT_ENABLE:-1}"
+UVM_COLD_STREAMING_TRACE_FILE="${VLLM_UVM_COLD_STREAMING_TRACE_FILE:-}"
+UVM_COLD_STREAMING_DEVICE="${VLLM_UVM_COLD_STREAMING_DEVICE:--1}"
+UVM_COLD_STREAMING_SYNC_PREFETCH="${VLLM_UVM_COLD_STREAMING_SYNC_PREFETCH:-0}"
+UVM_COLD_STREAMING_SYNC_EVICT="${VLLM_UVM_COLD_STREAMING_SYNC_EVICT:-1}"
+UVM_COLD_STREAMING_REAL_QUERY_ENABLE="${VLLM_UVM_COLD_STREAMING_REAL_QUERY_ENABLE:-0}"
+UVM_COLD_SLOT_POOL_ENABLE="${VLLM_UVM_COLD_SLOT_POOL_ENABLE:-0}"
+UVM_COLD_SLOT_POOL_TRACE_ONLY="${VLLM_UVM_COLD_SLOT_POOL_TRACE_ONLY:-1}"
+UVM_COLD_SLOT_POOL_BACKEND="${VLLM_UVM_COLD_SLOT_POOL_BACKEND:-trace_only}"
+UVM_COLD_SLOT_POOL_SLOTS_PER_LAYER="${VLLM_UVM_COLD_SLOT_POOL_SLOTS_PER_LAYER:-40}"
+UVM_COLD_SLOT_POOL_TRACE_FILE="${VLLM_UVM_COLD_SLOT_POOL_TRACE_FILE:-}"
+UVM_COLD_SLOT_POOL_OVERFLOW_MODE="${VLLM_UVM_COLD_SLOT_POOL_OVERFLOW_MODE:-trace_only}"
+UVM_COLD_SLOT_POOL_TRACE_ASSIGNMENTS_LIMIT="${VLLM_UVM_COLD_SLOT_POOL_TRACE_ASSIGNMENTS_LIMIT:-128}"
+UVM_COLD_SLOT_POOL_SYNC_MIGRATION="${VLLM_UVM_COLD_SLOT_POOL_SYNC_MIGRATION:-0}"
+UVM_COLD_SLOT_POOL_DRIVER_MODE="${VLLM_UVM_COLD_SLOT_POOL_DRIVER_MODE:-dry_run}"
+UVM_COLD_SLOT_POOL_DRIVER_VALIDATE_MANAGED="${VLLM_UVM_COLD_SLOT_POOL_DRIVER_VALIDATE_MANAGED:-0}"
+UVM_COLD_SLOT_POOL_CLEAR_SLOT_PTES_AFTER_REMAP="${VLLM_UVM_COLD_SLOT_POOL_CLEAR_SLOT_PTES_AFTER_REMAP:-auto}"
 UVM_WEIGHT_OFFLOAD_ENABLE="${VLLM_UVM_WEIGHT_OFFLOAD_ENABLE:-0}"
 UVM_WEIGHT_OFFLOAD_MODE="${VLLM_UVM_WEIGHT_OFFLOAD_MODE:-trace_only}"
 UVM_WEIGHT_OFFLOAD_PLAN_FILE="${VLLM_UVM_WEIGHT_OFFLOAD_PLAN_FILE:-}"
@@ -145,6 +185,7 @@ UVM_INIT_WEIGHT_HOT_PREFETCH_SYNC="${VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_SYNC:-1}"
 UVM_INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES="${VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES:-0}"
 UVM_INIT_WEIGHT_HOT_PREFETCH_DEVICE="${VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_DEVICE:--1}"
 UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE="${VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE:-0}"
+UVM_INIT_WEIGHT_CLEAR_SLOT_PTES_AFTER_PLACEMENT="${VLLM_UVM_INIT_WEIGHT_CLEAR_SLOT_PTES_AFTER_PLACEMENT:-auto}"
 UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE="${VLLM_UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE:-0}"
 UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS="${VLLM_UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS:-1}"
 UVM_HOT_RESIDENCY_STAGE_DEVICE="${VLLM_UVM_HOT_RESIDENCY_STAGE_DEVICE:--1}"
@@ -239,7 +280,7 @@ ENABLE_FAULT_ADDRESS_LOG=0
 KEEP_ON_EXIT=0
 NO_CLEANUP=0
 NO_BENCH=0
-RESET_COUNTERS=1
+RESET_COUNTERS="${VLLM_UVM_RESET_COUNTERS:-1}"
 UVM_KO_PATH="$REPO_ROOT/kernel-module/nvidia-module/kernel-open/nvidia-uvm.ko"
 UVM_ENABLE_DEBUG_PROCFS=1
 UVM_ENABLE_BUILTIN_TESTS="${VLLM_UVM_ENABLE_BUILTIN_TESTS:-0}"
@@ -335,6 +376,31 @@ Options:
   --uvm-device-direct-target-phases <csv>
                              Comma-separated phase prefixes allowed for Stage B eligibility
                              (default: enabled:attention,enabled:moe,enabled:model_forward)
+  --uvm-kv-device-direct-enable <0|1>
+                             Allocate initialize_kv_cache/KvPersistent tensors with
+                             native cudaMalloc/cudaMallocAsync instead of managed UVM.
+                             Default 0 preserves existing global-UVM behavior.
+  --uvm-kv-device-direct-min-bytes <n>
+                             Min KV allocation size for native device-direct (default: 0)
+  --uvm-kv-device-direct-max-bytes <n>
+                             Max KV allocation size for native device-direct; 0 means unlimited (default: 0)
+  --uvm-kv-device-direct-max-total-bytes <n>
+                             Max live KV-native bytes; 0 means unlimited (default: 0)
+  --uvm-kv-range-config-enable <0|1>
+                             Configure nvidia_uvm's single contiguous KV fault
+                             attribution range. Disable for non-contiguous native
+                             KV cudaMalloc experiments (default: 1).
+  --uvm-fixed-weight-device-direct-enable <0|1>
+                             Rematerialize non-expert fixed weights with native
+                             cudaMalloc/cudaMallocAsync after model load.
+  --uvm-fixed-weight-device-direct-min-bytes <n>
+                             Min fixed-weight allocation size for native device-direct.
+  --uvm-fixed-weight-device-direct-max-bytes <n>
+                             Max fixed-weight allocation size; 0 means unlimited.
+  --uvm-fixed-weight-device-direct-max-total-bytes <n>
+                             Max total fixed-weight native bytes; 0 means unlimited.
+  --uvm-fixed-weight-device-direct-trace-file <path>
+                             JSONL trace for fixed-weight materialization.
   --uvm-kv-budget-bytes <n>
                              Stage D KV cache logical budget in bytes.
                              0 means unlimited telemetry-only budget (default: 0)
@@ -556,6 +622,20 @@ Options:
                              L2 victim action: advise_cpu|prefetch_cpu|offload_cpu.
   --uvm-residency-weight-evict-protect-recent-steps <n>
                              Protect recently active weight regions from eviction.
+  --uvm-real-residency-enable <0|1>
+                             Enable driver-backed real residency snapshots.
+  --uvm-real-residency-trace-file <path>
+                             Real residency JSONL trace path.
+  --uvm-real-residency-device <n>
+                             GPU device id used for real residency queries.
+  --uvm-real-residency-on-register-every <n>
+                             Snapshot every N region registrations; 0 disables.
+  --uvm-real-residency-on-action-every <n>
+                             Snapshot every N residency actions; 0 disables.
+  --uvm-real-residency-max-snapshots <n>
+                             Max real residency snapshots; 0 means unlimited.
+  --uvm-real-residency-max-regions-per-pool <n>
+                             Max queried regions per pool per snapshot; 0 means all.
   --uvm-matched-cpu-offload-enable <0|1>
                              Apply UVM CPU placement to the exact parameter set
                              recorded by vLLM native CPU offload manifest.
@@ -640,6 +720,10 @@ Options:
                              server launch. Quote as one shell string.
   --with-address-log         Also enable per-fault address logs
   --no-cleanup               Skip workloads/cleanup_gpu.py before run
+  CONTROLLED_REMAP_PREFLIGHT=1
+                             Refuse to run if D-state processes are present.
+                             This is forced for slot_va_block_remap.
+  ALLOW_D_STATE_PROCESSES=1  Override the controlled-remap preflight refusal.
   --no-bench                 Configure params only, do not run benchmark
   --reset-counters           Reset total_* counters by reloading nvidia_uvm (default: on)
   --no-reset-counters        Do not reload nvidia_uvm before run
@@ -732,6 +816,58 @@ die() {
   exit 1
 }
 
+check_no_d_state_processes() {
+  [ "$ALLOW_D_STATE_PROCESSES" = "1" ] && return 0
+
+  local dstate
+  dstate="$(ps -eLo pid,tid,ppid,stat,comm,wchan:32,args | awk '$4 ~ /D/ && $7 !~ /^\[/ {print}' | head -50 || true)"
+  if [ -n "$dstate" ]; then
+    echo "D-state user threads detected before controlled remap run:" >&2
+    echo "$dstate" >&2
+    die "Refusing controlled remap run on a dirty NVIDIA/UVM node; reboot or set ALLOW_D_STATE_PROCESSES=1 to override"
+  fi
+}
+
+controlled_slot_remap_requested() {
+  case "$UVM_COLD_SLOT_POOL_DRIVER_MODE" in
+    slot_pte_remap|slot_va_block_remap)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+read_uvm_module_param() {
+  local name="$1"
+  local path="$PARAM_DIR/$name"
+
+  [ -r "$path" ] || die "Missing nvidia_uvm module parameter: $name. Load the patched module first."
+  cat "$path" 2>/dev/null || die "Failed to read nvidia_uvm module parameter: $name"
+}
+
+ensure_controlled_slot_remap_module_state() {
+  local pte_enable pte_max vidmem_budget
+
+  controlled_slot_remap_requested || return 0
+
+  [ "$UVM_MOE_SLOT_PTE_REMAP_ENABLE" = "1" ] \
+    || die "slot-backed PTE remap mode requires UVM_MOE_SLOT_PTE_REMAP_ENABLE=1"
+
+  pte_enable="$(read_uvm_module_param uvm_moe_slot_pte_remap_enable)"
+  [ "$pte_enable" = "$UVM_MOE_SLOT_PTE_REMAP_ENABLE" ] \
+    || die "uvm_moe_slot_pte_remap_enable expected $UVM_MOE_SLOT_PTE_REMAP_ENABLE, got $pte_enable"
+
+  pte_max="$(read_uvm_module_param uvm_moe_slot_pte_remap_max_bytes)"
+  [ "$pte_max" -ge "$UVM_MOE_SLOT_PTE_REMAP_MAX_BYTES" ] \
+    || die "uvm_moe_slot_pte_remap_max_bytes=$pte_max is smaller than requested $UVM_MOE_SLOT_PTE_REMAP_MAX_BYTES"
+
+  vidmem_budget="$(read_uvm_module_param uvm_moe_slot_pool_vidmem_budget_bytes)"
+  [ "$vidmem_budget" = "$UVM_MOE_SLOT_POOL_VIDMEM_BUDGET_BYTES" ] \
+    || die "uvm_moe_slot_pool_vidmem_budget_bytes expected $UVM_MOE_SLOT_POOL_VIDMEM_BUDGET_BYTES, got $vidmem_budget"
+}
+
 need_file() {
   local path="$1"
   [ -e "$path" ] || die "Missing required path: $path"
@@ -805,6 +941,45 @@ normalize_output_paths() {
   fi
   if [ -n "$ALLOCATOR_TRACE_LOG" ]; then
     ALLOCATOR_TRACE_LOG="$(abs_path_from_cwd "$ALLOCATOR_TRACE_LOG")"
+  fi
+  if [ -n "$UVM_WEIGHT_MAP_FILE" ]; then
+    UVM_WEIGHT_MAP_FILE="$(abs_path_from_cwd "$UVM_WEIGHT_MAP_FILE")"
+  fi
+  if [ -n "$UVM_MOE_ROUTING_TRACE_FILE" ]; then
+    UVM_MOE_ROUTING_TRACE_FILE="$(abs_path_from_cwd "$UVM_MOE_ROUTING_TRACE_FILE")"
+  fi
+  if [ -n "$UVM_WEIGHT_PREFETCH_TRACE_FILE" ]; then
+    UVM_WEIGHT_PREFETCH_TRACE_FILE="$(abs_path_from_cwd "$UVM_WEIGHT_PREFETCH_TRACE_FILE")"
+  fi
+  if [ -n "$UVM_COLD_STREAMING_TRACE_FILE" ]; then
+    UVM_COLD_STREAMING_TRACE_FILE="$(abs_path_from_cwd "$UVM_COLD_STREAMING_TRACE_FILE")"
+  fi
+  if [ -n "$UVM_COLD_SLOT_POOL_TRACE_FILE" ]; then
+    UVM_COLD_SLOT_POOL_TRACE_FILE="$(abs_path_from_cwd "$UVM_COLD_SLOT_POOL_TRACE_FILE")"
+  fi
+  if [ -n "$UVM_INIT_KV_TRACE_FILE" ]; then
+    UVM_INIT_KV_TRACE_FILE="$(abs_path_from_cwd "$UVM_INIT_KV_TRACE_FILE")"
+  fi
+  if [ -n "$UVM_INIT_WEIGHT_TRACE_FILE" ]; then
+    UVM_INIT_WEIGHT_TRACE_FILE="$(abs_path_from_cwd "$UVM_INIT_WEIGHT_TRACE_FILE")"
+  fi
+  if [ -n "$UVM_KV_RUNTIME_TRACE_FILE" ]; then
+    UVM_KV_RUNTIME_TRACE_FILE="$(abs_path_from_cwd "$UVM_KV_RUNTIME_TRACE_FILE")"
+  fi
+  if [ -n "$UVM_POOL_COORDINATOR_TRACE_FILE" ]; then
+    UVM_POOL_COORDINATOR_TRACE_FILE="$(abs_path_from_cwd "$UVM_POOL_COORDINATOR_TRACE_FILE")"
+  fi
+  if [ -n "$UVM_RESIDENCY_TRACE_FILE" ]; then
+    UVM_RESIDENCY_TRACE_FILE="$(abs_path_from_cwd "$UVM_RESIDENCY_TRACE_FILE")"
+  fi
+  if [ -n "$UVM_KV_INIT_FAULT_PROBE_FILE" ]; then
+    UVM_KV_INIT_FAULT_PROBE_FILE="$(abs_path_from_cwd "$UVM_KV_INIT_FAULT_PROBE_FILE")"
+  fi
+  if [ -n "$UVM_REAL_RESIDENCY_TRACE_FILE" ]; then
+    UVM_REAL_RESIDENCY_TRACE_FILE="$(abs_path_from_cwd "$UVM_REAL_RESIDENCY_TRACE_FILE")"
+  fi
+  if [ -n "$UVM_FIXED_WEIGHT_DEVICE_DIRECT_TRACE_FILE" ]; then
+    UVM_FIXED_WEIGHT_DEVICE_DIRECT_TRACE_FILE="$(abs_path_from_cwd "$UVM_FIXED_WEIGHT_DEVICE_DIRECT_TRACE_FILE")"
   fi
 }
 
@@ -903,6 +1078,16 @@ start_server() {
                 VLLM_UVM_DEVICE_DIRECT_BACKEND='$UVM_DEVICE_DIRECT_BACKEND' \
                 VLLM_UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD='$UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD' \
                 VLLM_UVM_DEVICE_DIRECT_TARGET_PHASES='$UVM_DEVICE_DIRECT_TARGET_PHASES' \
+                VLLM_UVM_KV_DEVICE_DIRECT_ENABLE='$UVM_KV_DEVICE_DIRECT_ENABLE' \
+                VLLM_UVM_KV_DEVICE_DIRECT_MIN_BYTES='$UVM_KV_DEVICE_DIRECT_MIN_BYTES' \
+                VLLM_UVM_KV_DEVICE_DIRECT_MAX_BYTES='$UVM_KV_DEVICE_DIRECT_MAX_BYTES' \
+                VLLM_UVM_KV_DEVICE_DIRECT_MAX_TOTAL_BYTES='$UVM_KV_DEVICE_DIRECT_MAX_TOTAL_BYTES' \
+                VLLM_UVM_KV_RANGE_CONFIG_ENABLE='$UVM_KV_RANGE_CONFIG_ENABLE' \
+                VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_ENABLE='$UVM_FIXED_WEIGHT_DEVICE_DIRECT_ENABLE' \
+                VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_MIN_BYTES='$UVM_FIXED_WEIGHT_DEVICE_DIRECT_MIN_BYTES' \
+                VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_BYTES='$UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_BYTES' \
+                VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_TOTAL_BYTES='$UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_TOTAL_BYTES' \
+                VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_TRACE_FILE='$UVM_FIXED_WEIGHT_DEVICE_DIRECT_TRACE_FILE' \
                 VLLM_UVM_KV_BUDGET_BYTES='$UVM_KV_BUDGET_BYTES' \
                 VLLM_UVM_KV_BUDGET_MODE='$UVM_KV_BUDGET_MODE' \
                 VLLM_UVM_KV_RUNTIME_ENABLE='$UVM_KV_RUNTIME_ENABLE' \
@@ -947,6 +1132,30 @@ start_server() {
                 VLLM_UVM_WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP='$UVM_WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP' \
                 VLLM_UVM_WEIGHT_BATCH_EXECUTOR_ENABLE='$UVM_WEIGHT_BATCH_EXECUTOR_ENABLE' \
                 VLLM_UVM_WEIGHT_EXECUTOR='$UVM_WEIGHT_EXECUTOR' \
+                VLLM_UVM_COLD_STREAMING_ENABLE='$UVM_COLD_STREAMING_ENABLE' \
+                VLLM_UVM_COLD_STREAMING_TRACE_ONLY='$UVM_COLD_STREAMING_TRACE_ONLY' \
+                VLLM_UVM_COLD_STREAMING_BUDGET_BYTES='$UVM_COLD_STREAMING_BUDGET_BYTES' \
+                VLLM_UVM_COLD_STREAMING_TTL_STEPS='$UVM_COLD_STREAMING_TTL_STEPS' \
+                VLLM_UVM_COLD_STREAMING_MAX_BYTES_PER_STEP='$UVM_COLD_STREAMING_MAX_BYTES_PER_STEP' \
+                VLLM_UVM_COLD_STREAMING_MAX_EXPERTS_PER_LAYER='$UVM_COLD_STREAMING_MAX_EXPERTS_PER_LAYER' \
+                VLLM_UVM_COLD_STREAMING_EVICT_POLICY='$UVM_COLD_STREAMING_EVICT_POLICY' \
+                VLLM_UVM_COLD_STREAMING_EVICT_ENABLE='$UVM_COLD_STREAMING_EVICT_ENABLE' \
+                VLLM_UVM_COLD_STREAMING_TRACE_FILE='$UVM_COLD_STREAMING_TRACE_FILE' \
+                VLLM_UVM_COLD_STREAMING_DEVICE='$UVM_COLD_STREAMING_DEVICE' \
+                VLLM_UVM_COLD_STREAMING_SYNC_PREFETCH='$UVM_COLD_STREAMING_SYNC_PREFETCH' \
+                VLLM_UVM_COLD_STREAMING_SYNC_EVICT='$UVM_COLD_STREAMING_SYNC_EVICT' \
+                VLLM_UVM_COLD_STREAMING_REAL_QUERY_ENABLE='$UVM_COLD_STREAMING_REAL_QUERY_ENABLE' \
+                VLLM_UVM_COLD_SLOT_POOL_ENABLE='$UVM_COLD_SLOT_POOL_ENABLE' \
+                VLLM_UVM_COLD_SLOT_POOL_TRACE_ONLY='$UVM_COLD_SLOT_POOL_TRACE_ONLY' \
+                VLLM_UVM_COLD_SLOT_POOL_BACKEND='$UVM_COLD_SLOT_POOL_BACKEND' \
+                VLLM_UVM_COLD_SLOT_POOL_SLOTS_PER_LAYER='$UVM_COLD_SLOT_POOL_SLOTS_PER_LAYER' \
+                VLLM_UVM_COLD_SLOT_POOL_TRACE_FILE='$UVM_COLD_SLOT_POOL_TRACE_FILE' \
+                VLLM_UVM_COLD_SLOT_POOL_OVERFLOW_MODE='$UVM_COLD_SLOT_POOL_OVERFLOW_MODE' \
+                VLLM_UVM_COLD_SLOT_POOL_TRACE_ASSIGNMENTS_LIMIT='$UVM_COLD_SLOT_POOL_TRACE_ASSIGNMENTS_LIMIT' \
+                VLLM_UVM_COLD_SLOT_POOL_SYNC_MIGRATION='$UVM_COLD_SLOT_POOL_SYNC_MIGRATION' \
+                VLLM_UVM_COLD_SLOT_POOL_DRIVER_MODE='$UVM_COLD_SLOT_POOL_DRIVER_MODE' \
+                VLLM_UVM_COLD_SLOT_POOL_DRIVER_VALIDATE_MANAGED='$UVM_COLD_SLOT_POOL_DRIVER_VALIDATE_MANAGED' \
+                VLLM_UVM_COLD_SLOT_POOL_CLEAR_SLOT_PTES_AFTER_REMAP='$UVM_COLD_SLOT_POOL_CLEAR_SLOT_PTES_AFTER_REMAP' \
                 VLLM_UVM_WEIGHT_OFFLOAD_ENABLE='$UVM_WEIGHT_OFFLOAD_ENABLE' \
                 VLLM_UVM_WEIGHT_OFFLOAD_MODE='$UVM_WEIGHT_OFFLOAD_MODE' \
                 VLLM_UVM_WEIGHT_OFFLOAD_PLAN_FILE='$UVM_WEIGHT_OFFLOAD_PLAN_FILE' \
@@ -971,6 +1180,7 @@ start_server() {
                 VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES='$UVM_INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES' \
                 VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_DEVICE='$UVM_INIT_WEIGHT_HOT_PREFETCH_DEVICE' \
                 VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE='$UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE' \
+                VLLM_UVM_INIT_WEIGHT_CLEAR_SLOT_PTES_AFTER_PLACEMENT='$UVM_INIT_WEIGHT_CLEAR_SLOT_PTES_AFTER_PLACEMENT' \
                 VLLM_UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE='$UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE' \
                 VLLM_UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS='$UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS' \
                 VLLM_UVM_HOT_RESIDENCY_STAGE_DEVICE='$UVM_HOT_RESIDENCY_STAGE_DEVICE' \
@@ -1129,7 +1339,12 @@ stop_server_if_needed() {
 
 wait_for_server_and_kv_range() {
   local start_ts now elapsed
+  local kv_range_required=0
   start_ts="$(date +%s)"
+
+  if [ "$UVM_KV_RANGE_CONFIG_ENABLE" -eq 1 ]; then
+    kv_range_required=1
+  fi
 
   while true; do
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -1138,8 +1353,8 @@ wait_for_server_and_kv_range() {
       die "Server exited before ready"
     fi
 
-    if extract_kv_range_from_log; then
-      if curl -fsS "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; then
+    if curl -fsS "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; then
+      if [ "$kv_range_required" -eq 0 ] || extract_kv_range_from_log; then
         return 0
       fi
     fi
@@ -1149,9 +1364,12 @@ wait_for_server_and_kv_range() {
     if [ "$elapsed" -ge "$STARTUP_TIMEOUT" ]; then
       echo "===== server log tail =====" >&2
       tail -n 120 "$SERVER_LOG" >&2 || true
-      echo "===== address log tail =====" >&2
-      tail -n 60 "$ADDRESS_LOG" >&2 || true
-      die "Timeout waiting for server readiness and KV range (>${STARTUP_TIMEOUT}s)"
+      if [ "$kv_range_required" -eq 1 ]; then
+        echo "===== address log tail =====" >&2
+        tail -n 60 "$ADDRESS_LOG" >&2 || true
+        die "Timeout waiting for server readiness and KV range (>${STARTUP_TIMEOUT}s)"
+      fi
+      die "Timeout waiting for server readiness (>${STARTUP_TIMEOUT}s)"
     fi
 
     sleep "$CHECK_INTERVAL"
@@ -1286,6 +1504,9 @@ reload_uvm_module_for_counter_reset() {
     uvm_phase_n_block_quota_enable="$UVM_PHASE_N_BLOCK_QUOTA_ENABLE" \
     uvm_phase_n_block_quota_trace_only="$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY" \
     uvm_phase_n_native_block_enable="$UVM_PHASE_N_NATIVE_BLOCK_ENABLE" \
+    uvm_moe_slot_pte_remap_enable="$UVM_MOE_SLOT_PTE_REMAP_ENABLE" \
+    uvm_moe_slot_pte_remap_max_bytes="$UVM_MOE_SLOT_PTE_REMAP_MAX_BYTES" \
+    uvm_moe_slot_pool_vidmem_budget_bytes="$UVM_MOE_SLOT_POOL_VIDMEM_BUDGET_BYTES" \
     uvm_perf_fault_log_destination=0 \
     uvm_perf_fault_log_counters=0 \
     uvm_perf_fault_log_addresses=0 \
@@ -1351,6 +1572,24 @@ reload_uvm_module_for_counter_reset() {
     native_block_enable_val="$(cat "$PARAM_DIR/uvm_phase_n_native_block_enable" 2>/dev/null || true)"
     [ "$native_block_enable_val" = "$UVM_PHASE_N_NATIVE_BLOCK_ENABLE" ] \
       || die "uvm_phase_n_native_block_enable expected $UVM_PHASE_N_NATIVE_BLOCK_ENABLE, got $native_block_enable_val"
+  fi
+  if [ -r "$PARAM_DIR/uvm_moe_slot_pte_remap_enable" ]; then
+    local moe_slot_pte_enable_val
+    moe_slot_pte_enable_val="$(cat "$PARAM_DIR/uvm_moe_slot_pte_remap_enable" 2>/dev/null || true)"
+    [ "$moe_slot_pte_enable_val" = "$UVM_MOE_SLOT_PTE_REMAP_ENABLE" ] \
+      || die "uvm_moe_slot_pte_remap_enable expected $UVM_MOE_SLOT_PTE_REMAP_ENABLE, got $moe_slot_pte_enable_val"
+  fi
+  if [ -r "$PARAM_DIR/uvm_moe_slot_pte_remap_max_bytes" ]; then
+    local moe_slot_pte_max_val
+    moe_slot_pte_max_val="$(cat "$PARAM_DIR/uvm_moe_slot_pte_remap_max_bytes" 2>/dev/null || true)"
+    [ "$moe_slot_pte_max_val" = "$UVM_MOE_SLOT_PTE_REMAP_MAX_BYTES" ] \
+      || die "uvm_moe_slot_pte_remap_max_bytes expected $UVM_MOE_SLOT_PTE_REMAP_MAX_BYTES, got $moe_slot_pte_max_val"
+  fi
+  if [ -r "$PARAM_DIR/uvm_moe_slot_pool_vidmem_budget_bytes" ]; then
+    local moe_slot_vidmem_budget_val
+    moe_slot_vidmem_budget_val="$(cat "$PARAM_DIR/uvm_moe_slot_pool_vidmem_budget_bytes" 2>/dev/null || true)"
+    [ "$moe_slot_vidmem_budget_val" = "$UVM_MOE_SLOT_POOL_VIDMEM_BUDGET_BYTES" ] \
+      || die "uvm_moe_slot_pool_vidmem_budget_bytes expected $UVM_MOE_SLOT_POOL_VIDMEM_BUDGET_BYTES, got $moe_slot_vidmem_budget_val"
   fi
 
   # Optional: clear old kernel ring lines so dmesg mode only shows this run.
@@ -1435,18 +1674,30 @@ resolve_trace_dir() {
 }
 
 configure_uvm_params() {
+  if [ "$UVM_SKIP_FAULT_PARAM_CONFIG" -eq 1 ]; then
+    echo "Skipping UVM fault sysfs parameter configuration."
+    return 0
+  fi
   local destination=0
   [ "$MODE" = "trace" ] && destination=1
 
-  write_param uvm_perf_fault_kv_start "$KV_START"
-  write_param uvm_perf_fault_kv_end "$KV_END"
-  write_param uvm_perf_fault_kv_range_enable 1
+  if [ "$UVM_KV_RANGE_CONFIG_ENABLE" -eq 1 ]; then
+    write_param uvm_perf_fault_kv_start "$KV_START"
+    write_param uvm_perf_fault_kv_end "$KV_END"
+    write_param uvm_perf_fault_kv_range_enable 1
+  else
+    write_param uvm_perf_fault_kv_range_enable 0
+  fi
   write_param uvm_perf_fault_log_destination "$destination"
   write_param uvm_perf_fault_log_counters 1
   write_param uvm_perf_fault_log_addresses "$ENABLE_FAULT_ADDRESS_LOG"
 }
 
 configure_uvm_params_for_startup_capture() {
+  if [ "$UVM_SKIP_FAULT_PARAM_CONFIG" -eq 1 ]; then
+    echo "Skipping startup UVM fault sysfs parameter configuration."
+    return 0
+  fi
   local destination=0
   [ "$MODE" = "trace" ] && destination=1
 
@@ -1464,10 +1715,12 @@ cleanup() {
     if [ "$UVM_PHASE_N_AUTO_RECLAIM_EXECUTE_ON_READY" = "1" ]; then
       write_param uvm_phase_n_auto_reclaim_execute 0 || true
     fi
-    write_param uvm_perf_fault_log_counters 0 || true
-    write_param uvm_perf_fault_kv_range_enable 0 || true
-    write_param uvm_perf_fault_log_addresses 0 || true
-    write_param uvm_perf_fault_log_destination 0 || true
+    if [ "$UVM_SKIP_FAULT_PARAM_CONFIG" -eq 0 ]; then
+      write_param uvm_perf_fault_log_counters 0 || true
+      write_param uvm_perf_fault_kv_range_enable 0 || true
+      write_param uvm_perf_fault_log_addresses 0 || true
+      write_param uvm_perf_fault_log_destination 0 || true
+    fi
   fi
 
   stop_server_if_needed || true
@@ -1524,6 +1777,16 @@ parse_args() {
       --uvm-device-direct-backend) UVM_DEVICE_DIRECT_BACKEND="$2"; shift 2 ;; # device_direct C2 后端 cuda_malloc/cuda_malloc_async
       --uvm-device-direct-pool-release-threshold) UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD="$2"; shift 2 ;; # cuda_malloc_async 默认 mempool release threshold
       --uvm-device-direct-target-phases) UVM_DEVICE_DIRECT_TARGET_PHASES="$2"; shift 2 ;; # device_direct 候选 phase 前缀 allowlist
+      --uvm-kv-device-direct-enable) UVM_KV_DEVICE_DIRECT_ENABLE="$2"; shift 2 ;; # KV cache 使用 native cudaMalloc/cudaMallocAsync
+      --uvm-kv-device-direct-min-bytes) UVM_KV_DEVICE_DIRECT_MIN_BYTES="$2"; shift 2 ;; # KV device-direct 最小尺寸
+      --uvm-kv-device-direct-max-bytes) UVM_KV_DEVICE_DIRECT_MAX_BYTES="$2"; shift 2 ;; # KV device-direct 最大尺寸，0 表示不限
+      --uvm-kv-device-direct-max-total-bytes) UVM_KV_DEVICE_DIRECT_MAX_TOTAL_BYTES="$2"; shift 2 ;; # KV native live bytes 预算，0 表示不限
+      --uvm-kv-range-config-enable) UVM_KV_RANGE_CONFIG_ENABLE="$2"; shift 2 ;; # 是否配置 UVM 内核单段 KV fault 归因范围
+      --uvm-fixed-weight-device-direct-enable) UVM_FIXED_WEIGHT_DEVICE_DIRECT_ENABLE="$2"; shift 2 ;; # 非 expert fixed weight 使用 native cudaMalloc/cudaMallocAsync
+      --uvm-fixed-weight-device-direct-min-bytes) UVM_FIXED_WEIGHT_DEVICE_DIRECT_MIN_BYTES="$2"; shift 2 ;; # fixed weight native 最小尺寸
+      --uvm-fixed-weight-device-direct-max-bytes) UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_BYTES="$2"; shift 2 ;; # fixed weight native 最大尺寸，0 表示不限
+      --uvm-fixed-weight-device-direct-max-total-bytes) UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_TOTAL_BYTES="$2"; shift 2 ;; # fixed weight native live bytes 预算，0 表示不限
+      --uvm-fixed-weight-device-direct-trace-file) UVM_FIXED_WEIGHT_DEVICE_DIRECT_TRACE_FILE="$2"; shift 2 ;; # fixed weight native JSONL trace
       --uvm-kv-budget-bytes) UVM_KV_BUDGET_BYTES="$2"; shift 2 ;; # Stage D KV cache 独立预算，0 表示不限额
       --uvm-kv-budget-mode) UVM_KV_BUDGET_MODE="$2"; shift 2 ;; # Stage D KV budget 模式 trace_only/enforce
       --uvm-kv-runtime-enable) UVM_KV_RUNTIME_ENABLE="$2"; shift 2 ;; # Stage J runtime KV pressure policy 开关
@@ -1568,6 +1831,28 @@ parse_args() {
       --uvm-weight-prefetch-hit-max-regions-per-step) UVM_WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP="$2"; shift 2 ;; # Stage M real query sample limit
       --uvm-weight-batch-executor-enable) UVM_WEIGHT_BATCH_EXECUTOR_ENABLE="$2"; shift 2 ;; # Stage M/E C++ batch executor gate
       --uvm-weight-executor) UVM_WEIGHT_EXECUTOR="$2"; shift 2 ;; # Stage M/F executor cpp_batch/driver_batch/auto
+      --uvm-cold-streaming-enable) UVM_COLD_STREAMING_ENABLE="$2"; shift 2 ;; # Stage M cold expert streaming gate
+      --uvm-cold-streaming-budget-bytes) UVM_COLD_STREAMING_BUDGET_BYTES="$2"; shift 2 ;; # Stage M cold streaming GPU byte budget
+      --uvm-cold-streaming-ttl-steps) UVM_COLD_STREAMING_TTL_STEPS="$2"; shift 2 ;; # Stage M cold streaming TTL
+      --uvm-cold-streaming-max-bytes-per-step) UVM_COLD_STREAMING_MAX_BYTES_PER_STEP="$2"; shift 2 ;; # Stage M cold streaming per-step prefetch cap
+      --uvm-cold-streaming-max-experts-per-layer) UVM_COLD_STREAMING_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;; # Stage M cold streaming per-layer expert cap
+      --uvm-cold-streaming-evict-policy) UVM_COLD_STREAMING_EVICT_POLICY="$2"; shift 2 ;; # Stage M cold streaming lru/ttl_lru
+      --uvm-cold-streaming-trace-file) UVM_COLD_STREAMING_TRACE_FILE="$2"; shift 2 ;; # Stage M cold streaming JSONL trace
+      --uvm-cold-streaming-device) UVM_COLD_STREAMING_DEVICE="$2"; shift 2 ;; # Stage M cold streaming target device
+      --uvm-cold-streaming-sync-prefetch) UVM_COLD_STREAMING_SYNC_PREFETCH="$2"; shift 2 ;; # Stage M synchronize cold prefetch
+      --uvm-cold-streaming-sync-evict) UVM_COLD_STREAMING_SYNC_EVICT="$2"; shift 2 ;; # Stage M synchronize cold eviction
+      --uvm-cold-streaming-real-query-enable) UVM_COLD_STREAMING_REAL_QUERY_ENABLE="$2"; shift 2 ;; # Stage M real residency query after cold prefetch
+      --uvm-cold-slot-pool-enable) UVM_COLD_SLOT_POOL_ENABLE="$2"; shift 2 ;; # Stage M batch slot allocation prototype
+      --uvm-cold-slot-pool-trace-only) UVM_COLD_SLOT_POOL_TRACE_ONLY="$2"; shift 2 ;; # Stage M slot pool trace-only gate
+      --uvm-cold-slot-pool-backend) UVM_COLD_SLOT_POOL_BACKEND="$2"; shift 2 ;; # Stage M slot pool backend
+      --uvm-cold-slot-pool-slots-per-layer) UVM_COLD_SLOT_POOL_SLOTS_PER_LAYER="$2"; shift 2 ;; # Stage M slot pool capacity per layer
+      --uvm-cold-slot-pool-trace-file) UVM_COLD_SLOT_POOL_TRACE_FILE="$2"; shift 2 ;; # Stage M slot pool JSONL trace
+      --uvm-cold-slot-pool-overflow-mode) UVM_COLD_SLOT_POOL_OVERFLOW_MODE="$2"; shift 2 ;; # Stage M slot pool overflow mode
+      --uvm-cold-slot-pool-trace-assignments-limit) UVM_COLD_SLOT_POOL_TRACE_ASSIGNMENTS_LIMIT="$2"; shift 2 ;; # Stage M slot assignment trace cap
+      --uvm-cold-slot-pool-sync-migration) UVM_COLD_SLOT_POOL_SYNC_MIGRATION="$2"; shift 2 ;; # Stage M synchronize slot pool migration backend
+      --uvm-cold-slot-pool-driver-mode) UVM_COLD_SLOT_POOL_DRIVER_MODE="$2"; shift 2 ;; # Stage M driver slot remap mode dry_run/validate/remap/copy_only/gpu_copy_only/slot_pte_remap/slot_va_block_remap
+      --uvm-cold-slot-pool-driver-validate-managed) UVM_COLD_SLOT_POOL_DRIVER_VALIDATE_MANAGED="$2"; shift 2 ;; # Stage M driver managed VA validation
+      --uvm-cold-slot-pool-clear-slot-ptes-after-remap) UVM_COLD_SLOT_POOL_CLEAR_SLOT_PTES_AFTER_REMAP="$2"; shift 2 ;; # Clear controlled remap slot PTEs after each runtime remap: auto/0/1
       --uvm-weight-offload-enable) UVM_WEIGHT_OFFLOAD_ENABLE="$2"; shift 2 ;; # Stage I cold expert offload/advise 开关
       --uvm-weight-offload-mode) UVM_WEIGHT_OFFLOAD_MODE="$2"; shift 2 ;; # Stage I cold expert mode trace_only/advise_cpu/prefetch_cpu
       --uvm-weight-offload-plan-file) UVM_WEIGHT_OFFLOAD_PLAN_FILE="$2"; shift 2 ;; # Stage I Stage H offload plan JSON
@@ -1592,6 +1877,7 @@ parse_args() {
       --uvm-init-weight-hot-prefetch-max-bytes) UVM_INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES="$2"; shift 2 ;; # Stage M total init hot GPU prefetch byte cap
       --uvm-init-weight-hot-prefetch-device) UVM_INIT_WEIGHT_HOT_PREFETCH_DEVICE="$2"; shift 2 ;; # Stage M init hot GPU prefetch target device
       --uvm-init-weight-hot-prefetch-real-query-enable) UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE="$2"; shift 2 ;; # Query real GPU residency after init hot prefetch
+      --uvm-init-weight-clear-slot-ptes-after-placement) UVM_INIT_WEIGHT_CLEAR_SLOT_PTES_AFTER_PLACEMENT="$2"; shift 2 ;; # Clear controlled remap slot PTEs after init placement: auto/0/1
       --uvm-hot-residency-stage-trace-enable) UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE="$2"; shift 2 ;; # Query hot plan residency at stage markers
       --uvm-hot-residency-stage-max-num-tokens) UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS="$2"; shift 2 ;; # Decode marker threshold
       --uvm-hot-residency-stage-device) UVM_HOT_RESIDENCY_STAGE_DEVICE="$2"; shift 2 ;; # Stage marker query device
@@ -1656,6 +1942,13 @@ parse_args() {
       --uvm-residency-weight-active-evict-enable) UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE="$2"; shift 2 ;; # Stage L2 active-set eviction gate
       --uvm-residency-weight-active-evict-max-experts-per-layer) UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;; # Stage L2 active-set eviction cap
       --uvm-residency-weight-evict-protect-recent-steps) UVM_RESIDENCY_WEIGHT_EVICT_PROTECT_RECENT_STEPS="$2"; shift 2 ;; # Stage L2 recent active protection
+      --uvm-real-residency-enable) UVM_REAL_RESIDENCY_ENABLE="$2"; shift 2 ;; # Stage L real residency snapshot gate
+      --uvm-real-residency-trace-file) UVM_REAL_RESIDENCY_TRACE_FILE="$2"; shift 2 ;; # Stage L real residency JSONL trace
+      --uvm-real-residency-device) UVM_REAL_RESIDENCY_DEVICE="$2"; shift 2 ;; # Stage L real residency query device
+      --uvm-real-residency-on-register-every) UVM_REAL_RESIDENCY_ON_REGISTER_EVERY="$2"; shift 2 ;; # Snapshot every N registrations
+      --uvm-real-residency-on-action-every) UVM_REAL_RESIDENCY_ON_ACTION_EVERY="$2"; shift 2 ;; # Snapshot every N actions
+      --uvm-real-residency-max-snapshots) UVM_REAL_RESIDENCY_MAX_SNAPSHOTS="$2"; shift 2 ;; # Max real residency snapshots
+      --uvm-real-residency-max-regions-per-pool) UVM_REAL_RESIDENCY_MAX_REGIONS_PER_POOL="$2"; shift 2 ;; # Max regions queried per pool
       --uvm-pool-registry-enable) UVM_POOL_REGISTRY_ENABLE="$2"; shift 2 ;; # Stage F unified pool registry telemetry
       --uvm-scratch-pool-enable) UVM_SCRATCH_POOL_ENABLE="$2"; shift 2 ;; # Stage G scratch pool admission control
       --uvm-scratch-pool-budget-bytes) UVM_SCRATCH_POOL_BUDGET_BYTES="$2"; shift 2 ;; # Stage G scratch pool device-direct live bytes budget
@@ -1708,6 +2001,9 @@ parse_args() {
       --uvm-phase-n-block-quota-enable) UVM_PHASE_N_BLOCK_QUOTA_ENABLE="$2"; shift 2 ;; # insmod 时开启 Stage N block quota path
       --uvm-phase-n-block-quota-trace-only) UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY="$2"; shift 2 ;; # insmod 时控制 block quota 是否只 trace
       --uvm-phase-n-native-block-enable) UVM_PHASE_N_NATIVE_BLOCK_ENABLE="$2"; shift 2 ;; # insmod 时开启 native va_range/va_block fast path
+      --uvm-moe-slot-pte-remap-enable) UVM_MOE_SLOT_PTE_REMAP_ENABLE="$2"; shift 2 ;; # insmod 时开启 MoE slot-backed PTE remap
+      --uvm-moe-slot-pte-remap-max-bytes) UVM_MOE_SLOT_PTE_REMAP_MAX_BYTES="$2"; shift 2 ;; # 单个 MoE slot PTE entry 最大字节数
+      --uvm-moe-slot-pool-vidmem-budget-bytes) UVM_MOE_SLOT_POOL_VIDMEM_BUDGET_BYTES="$2"; shift 2 ;; # MoE slot pool VIDMEM backing 预算
       --capture-startup-faults) UVM_CAPTURE_STARTUP_FAULTS="$2"; shift 2 ;; # 在 vLLM server/KV 初始化前启动 fault trace
       --keep) KEEP_ON_EXIT=1; shift ;;                         # 退出时不重置内核状态
 
@@ -1751,18 +2047,20 @@ validate_inputs() {
     # 3. 验证 NVIDIA UVM 内核参数接口：
     # 依次检查定义的 sysfs 文件是否存在。如果这些文件缺失，说明 nvidia_uvm 驱动版本不匹配
     # 或者没有打上支持 KV Cache 统计的内核补丁。
+  if [ "$UVM_SKIP_FAULT_PARAM_CONFIG" -eq 0 ]; then
     need_file "$PARAM_DIR/uvm_perf_fault_log_counters"
     need_file "$PARAM_DIR/uvm_perf_fault_log_destination"
-  need_file "$PARAM_DIR/uvm_perf_fault_log_addresses"
-  need_file "$PARAM_DIR/uvm_perf_fault_kv_range_enable"
-  need_file "$PARAM_DIR/uvm_perf_fault_kv_start"
-  need_file "$PARAM_DIR/uvm_perf_fault_kv_end"
-  need_writable_param "uvm_perf_fault_log_counters"
-  need_writable_param "uvm_perf_fault_log_destination"
-  need_writable_param "uvm_perf_fault_log_addresses"
-  need_writable_param "uvm_perf_fault_kv_range_enable"
-  need_writable_param "uvm_perf_fault_kv_start"
-  need_writable_param "uvm_perf_fault_kv_end"
+    need_file "$PARAM_DIR/uvm_perf_fault_log_addresses"
+    need_file "$PARAM_DIR/uvm_perf_fault_kv_range_enable"
+    need_file "$PARAM_DIR/uvm_perf_fault_kv_start"
+    need_file "$PARAM_DIR/uvm_perf_fault_kv_end"
+    need_writable_param "uvm_perf_fault_log_counters"
+    need_writable_param "uvm_perf_fault_log_destination"
+    need_writable_param "uvm_perf_fault_log_addresses"
+    need_writable_param "uvm_perf_fault_kv_range_enable"
+    need_writable_param "uvm_perf_fault_kv_start"
+    need_writable_param "uvm_perf_fault_kv_end"
+  fi
 
     # 4. 验证数据集文件：确保指定的 ShareGPT 等测试数据集路径有效
     need_file "$DATASET_PATH"
@@ -1790,6 +2088,15 @@ validate_inputs() {
       [[ "$UVM_DEVICE_DIRECT_POOL_RELEASE_THRESHOLD" =~ ^[0-9]+$ ]] || die "--uvm-device-direct-pool-release-threshold must be a non-negative integer"
     fi
     [ -n "$UVM_DEVICE_DIRECT_TARGET_PHASES" ] || die "--uvm-device-direct-target-phases must not be empty"
+    [[ "$UVM_KV_DEVICE_DIRECT_ENABLE" =~ ^[01]$ ]] || die "--uvm-kv-device-direct-enable must be 0 or 1"
+    [[ "$UVM_KV_DEVICE_DIRECT_MIN_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-kv-device-direct-min-bytes must be a non-negative integer"
+    [[ "$UVM_KV_DEVICE_DIRECT_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-kv-device-direct-max-bytes must be a non-negative integer"
+    [[ "$UVM_KV_DEVICE_DIRECT_MAX_TOTAL_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-kv-device-direct-max-total-bytes must be a non-negative integer"
+    [[ "$UVM_KV_RANGE_CONFIG_ENABLE" =~ ^[01]$ ]] || die "--uvm-kv-range-config-enable must be 0 or 1"
+    [[ "$UVM_FIXED_WEIGHT_DEVICE_DIRECT_ENABLE" =~ ^[01]$ ]] || die "--uvm-fixed-weight-device-direct-enable must be 0 or 1"
+    [[ "$UVM_FIXED_WEIGHT_DEVICE_DIRECT_MIN_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-fixed-weight-device-direct-min-bytes must be a non-negative integer"
+    [[ "$UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-fixed-weight-device-direct-max-bytes must be a non-negative integer"
+    [[ "$UVM_FIXED_WEIGHT_DEVICE_DIRECT_MAX_TOTAL_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-fixed-weight-device-direct-max-total-bytes must be a non-negative integer"
     [[ "$UVM_KV_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-kv-budget-bytes must be a non-negative integer"
     [[ "$UVM_KV_BUDGET_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-kv-budget-mode must be trace_only or enforce"
     [[ "$UVM_KV_RUNTIME_ENABLE" =~ ^[01]$ ]] || die "--uvm-kv-runtime-enable must be 0 or 1"
@@ -1828,6 +2135,28 @@ validate_inputs() {
     fi
     [[ "$UVM_WEIGHT_BATCH_EXECUTOR_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-batch-executor-enable must be 0 or 1"
     [[ "$UVM_WEIGHT_EXECUTOR" =~ ^(cpp_batch|driver_batch|auto)$ ]] || die "--uvm-weight-executor must be cpp_batch, driver_batch, or auto"
+    [[ "$UVM_COLD_STREAMING_ENABLE" =~ ^[01]$ ]] || die "--uvm-cold-streaming-enable must be 0 or 1"
+    [[ "$UVM_COLD_STREAMING_TRACE_ONLY" =~ ^[01]$ ]] || die "VLLM_UVM_COLD_STREAMING_TRACE_ONLY must be 0 or 1"
+    [[ "$UVM_COLD_STREAMING_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-cold-streaming-budget-bytes must be a non-negative integer"
+    [[ "$UVM_COLD_STREAMING_TTL_STEPS" =~ ^[0-9]+$ ]] || die "--uvm-cold-streaming-ttl-steps must be a non-negative integer"
+    [[ "$UVM_COLD_STREAMING_MAX_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-cold-streaming-max-bytes-per-step must be a non-negative integer"
+    [[ "$UVM_COLD_STREAMING_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-cold-streaming-max-experts-per-layer must be a non-negative integer"
+    [[ "$UVM_COLD_STREAMING_EVICT_POLICY" =~ ^(lru|ttl_lru)$ ]] || die "--uvm-cold-streaming-evict-policy must be lru or ttl_lru"
+    [[ "$UVM_COLD_STREAMING_EVICT_ENABLE" =~ ^[01]$ ]] || die "VLLM_UVM_COLD_STREAMING_EVICT_ENABLE must be 0 or 1"
+    [[ "$UVM_COLD_STREAMING_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-cold-streaming-device must be an integer"
+    [[ "$UVM_COLD_STREAMING_SYNC_PREFETCH" =~ ^[01]$ ]] || die "--uvm-cold-streaming-sync-prefetch must be 0 or 1"
+    [[ "$UVM_COLD_STREAMING_SYNC_EVICT" =~ ^[01]$ ]] || die "--uvm-cold-streaming-sync-evict must be 0 or 1"
+    [[ "$UVM_COLD_STREAMING_REAL_QUERY_ENABLE" =~ ^[01]$ ]] || die "--uvm-cold-streaming-real-query-enable must be 0 or 1"
+    [[ "$UVM_COLD_SLOT_POOL_ENABLE" =~ ^[01]$ ]] || die "--uvm-cold-slot-pool-enable must be 0 or 1"
+    [[ "$UVM_COLD_SLOT_POOL_TRACE_ONLY" =~ ^[01]$ ]] || die "--uvm-cold-slot-pool-trace-only must be 0 or 1"
+    [[ "$UVM_COLD_SLOT_POOL_BACKEND" =~ ^(trace_only|legacy_prefetch|driver_slot_remap)$ ]] || die "--uvm-cold-slot-pool-backend must be trace_only, legacy_prefetch, or driver_slot_remap"
+    [[ "$UVM_COLD_SLOT_POOL_SLOTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-cold-slot-pool-slots-per-layer must be a non-negative integer"
+    [[ "$UVM_COLD_SLOT_POOL_OVERFLOW_MODE" =~ ^(trace_only|fallback_streaming)$ ]] || die "--uvm-cold-slot-pool-overflow-mode must be trace_only or fallback_streaming"
+    [[ "$UVM_COLD_SLOT_POOL_TRACE_ASSIGNMENTS_LIMIT" =~ ^[0-9]+$ ]] || die "--uvm-cold-slot-pool-trace-assignments-limit must be a non-negative integer"
+    [[ "$UVM_COLD_SLOT_POOL_SYNC_MIGRATION" =~ ^[01]$ ]] || die "--uvm-cold-slot-pool-sync-migration must be 0 or 1"
+    [[ "$UVM_COLD_SLOT_POOL_DRIVER_MODE" =~ ^(dry_run|validate|remap|copy_only|gpu_copy_only|slot_pte_remap|slot_va_block_remap)$ ]] || die "--uvm-cold-slot-pool-driver-mode must be dry_run, validate, remap, copy_only, gpu_copy_only, slot_pte_remap, or slot_va_block_remap"
+    [[ "$UVM_COLD_SLOT_POOL_DRIVER_VALIDATE_MANAGED" =~ ^[01]$ ]] || die "--uvm-cold-slot-pool-driver-validate-managed must be 0 or 1"
+    [[ "$UVM_COLD_SLOT_POOL_CLEAR_SLOT_PTES_AFTER_REMAP" =~ ^(auto|0|1|true|false|yes|no|on|off)$ ]] || die "--uvm-cold-slot-pool-clear-slot-ptes-after-remap must be auto, 0, or 1"
     [[ "$UVM_WEIGHT_OFFLOAD_ENABLE" =~ ^[01]$ ]] || die "--uvm-weight-offload-enable must be 0 or 1"
     [[ "$UVM_WEIGHT_OFFLOAD_MODE" =~ ^(trace_only|advise_cpu|prefetch_cpu)$ ]] || die "--uvm-weight-offload-mode must be trace_only, advise_cpu, or prefetch_cpu"
     [[ "$UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-weight-offload-max-bytes-per-step must be a non-negative integer"
@@ -1849,6 +2178,7 @@ validate_inputs() {
     [[ "$UVM_INIT_WEIGHT_HOT_PREFETCH_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-init-weight-hot-prefetch-max-bytes must be a non-negative integer"
     [[ "$UVM_INIT_WEIGHT_HOT_PREFETCH_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-init-weight-hot-prefetch-device must be an integer"
     [[ "$UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE" =~ ^[01]$ ]] || die "--uvm-init-weight-hot-prefetch-real-query-enable must be 0 or 1"
+    [[ "$UVM_INIT_WEIGHT_CLEAR_SLOT_PTES_AFTER_PLACEMENT" =~ ^(auto|0|1|true|false|yes|no|on|off)$ ]] || die "--uvm-init-weight-clear-slot-ptes-after-placement must be auto, 0, or 1"
     [[ "$UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE" =~ ^[01]$ ]] || die "--uvm-hot-residency-stage-trace-enable must be 0 or 1"
     [[ "$UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS" =~ ^[0-9]+$ ]] || die "--uvm-hot-residency-stage-max-num-tokens must be a non-negative integer"
     [[ "$UVM_HOT_RESIDENCY_STAGE_DEVICE" =~ ^-?[0-9]+$ ]] || die "--uvm-hot-residency-stage-device must be an integer"
@@ -1917,7 +2247,13 @@ validate_inputs() {
     [[ "$UVM_PHASE_N_BLOCK_QUOTA_ENABLE" =~ ^[01]$ ]] || die "--uvm-phase-n-block-quota-enable must be 0 or 1"
     [[ "$UVM_PHASE_N_BLOCK_QUOTA_TRACE_ONLY" =~ ^[01]$ ]] || die "--uvm-phase-n-block-quota-trace-only must be 0 or 1"
     [[ "$UVM_PHASE_N_NATIVE_BLOCK_ENABLE" =~ ^[01]$ ]] || die "--uvm-phase-n-native-block-enable must be 0 or 1"
+    [[ "$UVM_MOE_SLOT_PTE_REMAP_ENABLE" =~ ^[01]$ ]] || die "--uvm-moe-slot-pte-remap-enable must be 0 or 1"
+    [[ "$UVM_MOE_SLOT_PTE_REMAP_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-moe-slot-pte-remap-max-bytes must be a non-negative integer"
+    [[ "$UVM_MOE_SLOT_POOL_VIDMEM_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-moe-slot-pool-vidmem-budget-bytes must be a non-negative integer"
+    [[ "$CONTROLLED_REMAP_PREFLIGHT" =~ ^[01]$ ]] || die "CONTROLLED_REMAP_PREFLIGHT must be 0 or 1"
+    [[ "$ALLOW_D_STATE_PROCESSES" =~ ^[01]$ ]] || die "ALLOW_D_STATE_PROCESSES must be 0 or 1"
     [[ "$UVM_CAPTURE_STARTUP_FAULTS" =~ ^[01]$ ]] || die "--capture-startup-faults must be 0 or 1"
+    [[ "$UVM_SKIP_FAULT_PARAM_CONFIG" =~ ^[01]$ ]] || die "VLLM_UVM_SKIP_FAULT_PARAM_CONFIG must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_ENABLE" =~ ^[01]$ ]] || die "--uvm-scratch-pool-enable must be 0 or 1"
     [[ "$UVM_SCRATCH_POOL_BUDGET_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-scratch-pool-budget-bytes must be a non-negative integer"
     [[ "$UVM_SCRATCH_POOL_MODE" =~ ^(trace_only|enforce)$ ]] || die "--uvm-scratch-pool-mode must be trace_only or enforce"
@@ -2079,6 +2415,9 @@ run_benchmark_phase() {
   } | tee -a "$BENCH_LOG"
 
   set +e
+  HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" \
+  TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}" \
+  HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}" \
   "${phase_cmd[@]}" 2>&1 | tee -a "$BENCH_LOG"
   local bench_status=$?
   set -e
@@ -2388,6 +2727,12 @@ main() {
 
   trap cleanup EXIT INT TERM
 
+  validate_inputs
+
+  if [ "$CONTROLLED_REMAP_PREFLIGHT" = "1" ] || controlled_slot_remap_requested; then
+    check_no_d_state_processes
+  fi
+
   if [ "$NO_CLEANUP" -eq 0 ]; then
     python3 "$REPO_ROOT/workloads/cleanup_gpu.py" || true
     sleep 2
@@ -2396,8 +2741,8 @@ main() {
   if [ "$RESET_COUNTERS" -eq 1 ]; then
     reload_uvm_module_for_counter_reset
   fi
+  ensure_controlled_slot_remap_module_state
 
-  validate_inputs
   : > "$BENCH_LOG"
   stage_phase_n_auto_reclaim_execute_for_startup
 
@@ -2427,14 +2772,22 @@ main() {
   echo "Starting single-process vLLM server..."
   start_server
 
-  echo "Waiting for server readiness + fresh KV range..."
+  if [ "$UVM_KV_RANGE_CONFIG_ENABLE" -eq 1 ]; then
+    echo "Waiting for server readiness + fresh KV range..."
+  else
+    echo "Waiting for server readiness..."
+  fi
   wait_for_server_and_kv_range
 
   echo "KV range (same server process): start=$KV_START end=$KV_END"
   configure_uvm_params
   enable_phase_n_auto_reclaim_execute_after_ready
 
-  echo "UVM params configured."
+  if [ "$UVM_KV_RANGE_CONFIG_ENABLE" -eq 1 ]; then
+    echo "UVM params configured."
+  else
+    echo "UVM params configured with KV range attribution disabled."
+  fi
   echo "Stats log: $TRACE_LOG"
   [ "$ENABLE_FAULT_ADDRESS_LOG" -eq 1 ] && echo "Address log: $ADDRESS_TRACE_LOG"
 

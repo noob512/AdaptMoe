@@ -4,6 +4,7 @@
 
 import gc
 import os
+import time
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
@@ -222,8 +223,15 @@ class Worker(WorkerBase):
             return nullcontext()
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
+        logger.warning(
+            "UVM controlled remap debug: worker initialize_cache entered "
+            "num_gpu_blocks=%s num_cpu_blocks=%s",
+            num_gpu_blocks,
+            num_cpu_blocks,
+        )
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
+        logger.warning("UVM controlled remap debug: worker initialize_cache returning")
 
     def init_device(self):
         device = self.device_config.device
@@ -383,15 +391,6 @@ class Worker(WorkerBase):
             by adjusting the `gpu_memory_utilization` parameter.
         """
         GiB = lambda b: b / GiB_bytes
-        try:
-            from vllm.device_allocator.uvm import is_uvm_enabled
-            if is_uvm_enabled():
-                uvm_kv_size_gb = float(os.environ.get("VLLM_UVM_KV_CACHE_SIZE_GB", "6"))
-                uvm_kv_size_bytes = int(uvm_kv_size_gb * GiB_bytes)
-                logger.info("UVM enabled: setting KV cache size to %.1f GiB", uvm_kv_size_gb)
-                return uvm_kv_size_bytes
-        except ImportError:
-            pass
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
@@ -411,6 +410,16 @@ class Worker(WorkerBase):
             )
             logger.info(msg)
             return kv_cache_memory_bytes
+
+        try:
+            from vllm.device_allocator.uvm import is_uvm_enabled
+            if is_uvm_enabled():
+                uvm_kv_size_gb = float(os.environ.get("VLLM_UVM_KV_CACHE_SIZE_GB", "6"))
+                uvm_kv_size_bytes = int(uvm_kv_size_gb * GiB_bytes)
+                logger.info("UVM enabled: setting KV cache size to %.1f GiB", uvm_kv_size_gb)
+                return uvm_kv_size_bytes
+        except ImportError:
+            pass
 
         torch.cuda.empty_cache()
         try:
@@ -491,6 +500,14 @@ class Worker(WorkerBase):
         根据指定的 kv_cache_config 配置，在 GPU 上分配 KV Cache 内存。
         这是大模型推理引擎初始化的关键步骤，因为 KV Cache 通常会占据可用显存的绝大部分。
         """
+        init_start = time.monotonic()
+        logger.warning(
+            "UVM controlled remap debug: worker initialize_from_config entered "
+            "sleep_mode=%s score_bridge=%s kv_cache_config_type=%s",
+            self.vllm_config.model_config.enable_sleep_mode,
+            self.score_bridge is not None,
+            type(kv_cache_config).__name__,
+        )
 
         # 1. 初始化 KV Cache 连接器 (KV Cache Connector/Transfer)
         # 这里的 Connector 通常用于分布式环境下的 KV Cache 传输（例如：在不同的 GPU、节点
@@ -500,7 +517,15 @@ class Worker(WorkerBase):
         # 因为后续的 `initialize_kv_cache` 方法可能会注入一些与连接器无关的、特殊的 
         # KV Cache 组（例如为了实现注意力共享层 PagedAttention 的层级共享机制）。
         # 如果不提前初始化连接器，这些复杂的内部共享层可能会破坏连接器对连续内存或特定结构的假设。
+        section_start = time.monotonic()
+        logger.warning(
+            "UVM controlled remap debug: ensure_kv_transfer_initialized begin")
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        logger.warning(
+            "UVM controlled remap debug: ensure_kv_transfer_initialized end "
+            "elapsed=%.3fs",
+            time.monotonic() - section_start,
+        )
 
         # 2. 判断是否启用了“休眠模式 (Sleep Mode)”
         # 休眠模式允许 vLLM 实例在闲置时释放物理计算资源，这是弹性计算（Elasticity）的重要特性。
@@ -516,11 +541,29 @@ class Worker(WorkerBase):
             # 使用上下文管理器接管内存分配。
             # 在这个 `with` 块内部，vLLM 分配的 KV Cache 张量会被打上 "kv_cache" 的标签，
             # 并被路由到专门支持解绑/休眠的 CuMem 内存池中。
+            section_start = time.monotonic()
+            logger.warning(
+                "UVM controlled remap debug: initialize_kv_cache begin "
+                "allocator=cumem")
             with allocator.use_memory_pool(tag="kv_cache"):
                 self.model_runner.initialize_kv_cache(kv_cache_config)
+            logger.warning(
+                "UVM controlled remap debug: initialize_kv_cache end "
+                "allocator=cumem elapsed=%.3fs",
+                time.monotonic() - section_start,
+            )
         else:
             # 如果没有启用休眠模式，则走常规的 PyTorch 默认内存分配路径分配 KV Cache。
+            section_start = time.monotonic()
+            logger.warning(
+                "UVM controlled remap debug: initialize_kv_cache begin "
+                "allocator=default")
             self.model_runner.initialize_kv_cache(kv_cache_config)
+            logger.warning(
+                "UVM controlled remap debug: initialize_kv_cache end "
+                "allocator=default elapsed=%.3fs",
+                time.monotonic() - section_start,
+            )
 
         # 3. eBPF 内存评分桥接机制 (Score Bridge) 接入
         # 当底层的物理/虚拟内存已经切切实实分配完毕后，我们需要告诉操作系统内核这块内存的存在。
@@ -531,19 +574,65 @@ class Worker(WorkerBase):
                 # KV Cache Tensor，提取它们的虚拟内存地址（Base VA）和大小。
                 # 然后将这些页面地址发送给 BPF Map，打上特定的分数（通常 KV Cache 的分数会低于模型权重，
                 # 意味着在极端内存压力下，内核应该优先驱逐/换出 KV Cache，而不是模型权重）。
+                section_start = time.monotonic()
+                logger.warning(
+                    "UVM controlled remap debug: score_bridge update begin")
                 entries = self.score_bridge.update_from_vllm_worker(self)
                 logger.info("Score bridge initialized KV pages: %d", entries)
+                logger.warning(
+                    "UVM controlled remap debug: score_bridge update end "
+                    "entries=%d elapsed=%.3fs",
+                    entries,
+                    time.monotonic() - section_start,
+                )
             except Exception as e:
                 # 非阻塞式容错：如果与内核的通信失败，仅仅打印警告，保证模型正常对外提供推理服务。
                 logger.warning("Score bridge KV init update failed: %s", e)
+        else:
+            logger.warning("UVM controlled remap debug: score_bridge skipped")
 
         # Stage M init-time placement must run on the UVM fast path too.
         # determine_available_memory() skips profile_run() when UVM is enabled,
         # so this is the first common point after model weights and KV cache
         # metadata exist but before compile/kernel/sampler warmup touches MoE.
+        logger.info("UVM controlled remap boundary: Stage M init-time placement begin")
+        section_start = time.monotonic()
+        logger.warning(
+            "UVM controlled remap debug: run_uvm_init_time_weight_placement begin")
         self.model_runner.run_uvm_init_time_weight_placement()
+        logger.warning(
+            "UVM controlled remap debug: run_uvm_init_time_weight_placement end "
+            "elapsed=%.3fs",
+            time.monotonic() - section_start,
+        )
+        logger.info("UVM controlled remap boundary: Stage M init-time placement end")
+        logger.warning(
+            "UVM controlled remap debug: worker initialize_from_config returning "
+            "elapsed=%.3fs",
+            time.monotonic() - init_start,
+        )
     
     def compile_or_warm_up_model(self) -> None:
+        driver_mode = os.environ.get(
+            "VLLM_UVM_COLD_SLOT_POOL_DRIVER_MODE",
+            "",
+        ).strip().lower().replace("-", "_")
+        skip_uvm_controlled_warmup = (
+            driver_mode == "slot_va_block_remap"
+            and os.environ.get(
+                "VLLM_UVM_CONTROLLED_REMAP_SKIP_POST_INIT_WARMUP",
+                "0",
+            ).strip().lower() in ("1", "true", "yes", "on")
+        )
+        if skip_uvm_controlled_warmup:
+            logger.warning(
+                "Skipping post-init compile/kernel/sampler warmup for "
+                "VLLM_UVM_CONTROLLED_REMAP_SKIP_POST_INIT_WARMUP=1"
+            )
+            set_random_seed(self.model_config.seed)
+            return
+
+        logger.info("UVM controlled remap boundary: compile_or_warm_up_model begin")
         # warm up sizes that are not in cudagraph capture sizes,
         # but users still want to compile for better performance,
         # e.g. for the max-num-batched token size in chunked prefill.
@@ -566,13 +655,17 @@ class Worker(WorkerBase):
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
+        logger.info("UVM controlled remap boundary: kernel_warmup begin")
         with uvm_allocation_phase("kernel_warmup"):
             kernel_warmup(self)
+        logger.info("UVM controlled remap boundary: kernel_warmup end")
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
+            logger.info("UVM controlled remap boundary: capture_model begin")
             with uvm_allocation_phase("capture_model"):
                 cuda_graph_memory_bytes = self.model_runner.capture_model()
+            logger.info("UVM controlled remap boundary: capture_model end")
 
         if self.cache_config.kv_cache_memory_bytes is None and hasattr(
             self, "peak_activation_memory"
@@ -644,6 +737,7 @@ class Worker(WorkerBase):
 
             # We skip EPLB here since we don't want to record dummy metrics.
             # Keep this sampler warmup out of enabled:* serving phases.
+            logger.info("UVM controlled remap boundary: sampler_warmup begin")
             with uvm_allocation_phase("sampler_warmup"):
                 hidden_states, last_hidden_states = self.model_runner._dummy_run(
                     num_tokens=max_num_reqs,
@@ -655,10 +749,12 @@ class Worker(WorkerBase):
                     self.model_runner._dummy_sampler_run(
                         hidden_states=last_hidden_states
                     )
+            logger.info("UVM controlled remap boundary: sampler_warmup end")
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        logger.info("UVM controlled remap boundary: compile_or_warm_up_model end")
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()

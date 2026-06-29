@@ -1784,6 +1784,8 @@ static void remove_gpu_va_space(uvm_gpu_va_space_t *gpu_va_space,
     // those channels.
     UVM_ASSERT(list_empty(&gpu_va_space->channel_va_ranges));
 
+    (void)uvm_moe_slot_pool_clear_gpu_va_space_mappings_locked(va_space, gpu_va_space->gpu, mm);
+
     // Unmap all page tables in this VA space on this GPU.
     // TODO: Bug 1799173: This will need to add objects to deferred_free_list
     uvm_for_each_va_range_safe(va_range, va_range_next, va_space)

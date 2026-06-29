@@ -729,6 +729,23 @@ static NV_STATUS service_fault_once(uvm_parent_gpu_t *parent_gpu,
 
     fault_entry->fault_source.channel_id = user_channel->hw_channel_id;
 
+    if (!fault_entry->is_fatal &&
+        uvm_moe_slot_pool_range_has_mappings(va_space,
+                                             UVM_VA_BLOCK_ALIGN_DOWN(fault_entry->fault_address),
+                                             UVM_VA_BLOCK_SIZE)) {
+        uvm_va_space_up_read(va_space);
+        uvm_va_space_mm_release_unlock(va_space, mm);
+        mm = NULL;
+
+        status = uvm_moe_slot_pool_clear_range_mappings_for_fault(va_space,
+                                                                  UVM_VA_BLOCK_ALIGN_DOWN(fault_entry->fault_address),
+                                                                  UVM_VA_BLOCK_SIZE);
+        if (status == NV_OK)
+            status = NV_WARN_MORE_PROCESSING_REQUIRED;
+
+        goto exit_unlocked;
+    }
+
     if (!fault_entry->is_fatal) {
         if (mm) {
             status = uvm_va_block_find_create(va_space,
@@ -770,6 +787,7 @@ exit_no_channel:
     uvm_va_space_up_read(va_space);
     uvm_va_space_mm_release_unlock(va_space, mm);
 
+exit_unlocked:
     if (status != NV_OK &&
         status != NV_WARN_MORE_PROCESSING_REQUIRED &&
         status != NV_WARN_MISMATCHED_TARGET)

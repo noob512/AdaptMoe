@@ -1727,6 +1727,29 @@ static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_count
                 gpu_va_space = uvm_gpu_va_space_get(va_space, current_entry->gpu);
             }
 
+            if (gpu_va_space &&
+                uvm_moe_slot_pool_range_has_mappings(va_space,
+                                                     UVM_VA_BLOCK_ALIGN_DOWN(current_entry->address),
+                                                     UVM_VA_BLOCK_SIZE)) {
+                uvm_va_space_t *clear_va_space = va_space;
+
+                uvm_va_space_up_read(va_space);
+                uvm_va_space_mm_release_unlock(va_space, mm);
+                mm = NULL;
+                va_space = NULL;
+                prev_va_space = NULL;
+                prev_gpu = NULL;
+                gpu_va_space = NULL;
+
+                status = uvm_moe_slot_pool_clear_range_mappings_for_fault(clear_va_space,
+                                                                          UVM_VA_BLOCK_ALIGN_DOWN(current_entry->address),
+                                                                          UVM_VA_BLOCK_SIZE);
+                if (status != NV_OK)
+                    break;
+
+                continue;
+            }
+
             if (gpu_va_space && uvm_va_space_has_access_counter_migrations(va_space)) {
                 status = service_notifications_batch(gpu_va_space, mm, access_counters, i, &i);
             }

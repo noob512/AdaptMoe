@@ -14,14 +14,33 @@ import sys
 import time
 
 
+def nvidia_smi_timeout_seconds() -> int:
+    value = os.environ.get("CLEANUP_GPU_NVIDIA_SMI_TIMEOUT", "5")
+    try:
+        timeout = int(value)
+    except ValueError:
+        timeout = 5
+    return max(timeout, 1)
+
+
 def get_gpu_processes():
     """Return list of (pid, type, name, mem) from nvidia-smi."""
+    if os.environ.get("CLEANUP_GPU_DISABLE_NVIDIA_SMI", "0").lower() in (
+        "1", "true", "yes", "on",
+    ):
+        print("Skipping nvidia-smi GPU process query (CLEANUP_GPU_DISABLE_NVIDIA_SMI=1).")
+        return []
+
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, check=True,
+            timeout=nvidia_smi_timeout_seconds(),
         )
+    except subprocess.TimeoutExpired:
+        print("Warning: nvidia-smi timed out while querying GPU processes.", file=sys.stderr)
+        return []
     except (subprocess.CalledProcessError, FileNotFoundError):
         return []
 

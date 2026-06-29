@@ -909,6 +909,7 @@ NV_STATUS uvm_api_discard(UVM_DISCARD_PARAMS *params, struct file *filp)
     if (params->flags && params->flags != UVM_DISCARD_FLAGS_UNMAP)
         return NV_ERR_INVALID_ARGUMENT;
 
+retry_after_slot_clear:
     // Use a read lock for va_space, so UvmDiscard could concurrently happen
     // with a UvmMigrate The user space caller is responsible for coordinating
     // calls to UvmMigrate and UvmDiscard. Otherwise, even using a write lock
@@ -925,6 +926,17 @@ NV_STATUS uvm_api_discard(UVM_DISCARD_PARAMS *params, struct file *filp)
             status = NV_ERR_INVALID_ADDRESS;
 
         goto done;
+    }
+
+    if (uvm_moe_slot_pool_range_has_mappings(va_space, base, length)) {
+        uvm_va_space_up_read(va_space);
+        uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+
+        status = uvm_moe_slot_pool_clear_range_mappings_for_discard(va_space, base, length);
+        if (status != NV_OK)
+            return status;
+
+        goto retry_after_slot_clear;
     }
 
     // TODO: Bug 5260180: Remove this check after tests and 

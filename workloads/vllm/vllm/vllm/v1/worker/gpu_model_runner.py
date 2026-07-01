@@ -4746,6 +4746,44 @@ class GPUModelRunner(
             scope="local",
         )
 
+    def _record_uvm_init_weight_plan_residency(self, marker: str) -> int:
+        if os.environ.get(
+            "VLLM_UVM_INIT_WEIGHT_PLAN_RESIDENCY_TRACE_ENABLE", "0"
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            return 0
+
+        model = getattr(self, "model", None)
+        if model is None:
+            return 0
+
+        records = 0
+        try:
+            for module in model.modules():
+                recorder = getattr(
+                    module,
+                    "record_uvm_init_weight_plan_residency",
+                    None,
+                )
+                if not callable(recorder):
+                    continue
+                result = recorder(marker)
+                if result is not None:
+                    records += 1
+        except Exception:
+            logger.debug(
+                "Failed to record UVM init weight plan residency marker=%s",
+                marker,
+                exc_info=True,
+            )
+
+        if records:
+            logger.warning(
+                "UVM init weight plan residency snapshot marker=%s records=%d",
+                marker,
+                records,
+            )
+        return records
+
     def _log_kv_cache_addresses(self, kv_caches: dict[str, Any], phase: str) -> None:
         """
         记录 KV Cache (键值缓存) 的底层内存/显存地址信息。
@@ -5047,6 +5085,7 @@ class GPUModelRunner(
             self._materialize_fixed_weights_device_direct()
             # 记录模型权重的内存地址（通常用于调试或低级别内存管理验证）
             self._log_model_weight_addresses("load_model")
+            self._record_uvm_init_weight_plan_residency("after_load_model")
 
             # 处理模型图编译加速
             # 1. 尝试使用原生的 PyTorch 图编译 (torch.compile)
@@ -5886,6 +5925,7 @@ class GPUModelRunner(
             return
         self._uvm_init_weight_placement_done = True
         model = self.get_model()
+        self._record_uvm_init_weight_plan_residency("before_stage_m")
         issued_modules = 0
         section_start = time.monotonic()
         logger.warning("UVM controlled remap debug: model_runner Stage M module loop begin")
@@ -5927,6 +5967,23 @@ class GPUModelRunner(
                 "elapsed=%.3fs",
                 time.monotonic() - section_start,
             )
+            if os.environ.get("VLLM_UVM_CONTROLLED_REMAP_SYNC_AFTER_CLEAR", "1") == "1":
+                section_start = time.monotonic()
+                logger.warning(
+                    "UVM controlled remap debug: model_runner Stage M "
+                    "post-clear cuda sync begin"
+                )
+                try:
+                    torch.cuda.synchronize()
+                    logger.warning(
+                        "UVM controlled remap debug: model_runner Stage M "
+                        "post-clear cuda sync end elapsed=%.3fs",
+                        time.monotonic() - section_start,
+                    )
+                except Exception:
+                    logger.debug("Failed to synchronize after Stage M slot PTE clear",
+                                 exc_info=True)
+            self._record_uvm_init_weight_plan_residency("after_stage_m_clear")
         if matched_issued:
             logger.info(
                 "Stage M matched CPU offload issued %d parameter ranges.",

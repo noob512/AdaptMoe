@@ -32,6 +32,8 @@
 
 #include <linux/sched/mm.h>
 
+#define UVM_VA_SPACE_MM_RETAIN_DEBUG_SLOTS 8
+
 typedef enum
 {
     // The va_space_mm has not yet been initialized by
@@ -69,6 +71,15 @@ struct uvm_va_space_mm_struct
 
     // Refcount for uvm_va_space_mm_retain()/uvm_va_space_mm_release()
     NvU32 retained_count;
+
+    NvU32 retain_debug_next;
+    struct {
+        NvU32 pid;
+        NvU32 retained_count;
+        bool release;
+        const void *caller;
+        char comm[TASK_COMM_LEN];
+    } retain_debug[UVM_VA_SPACE_MM_RETAIN_DEBUG_SLOTS];
 
     // Wait queue for threads waiting for retainers to finish (retained_count
     // going to 0 when not alive).

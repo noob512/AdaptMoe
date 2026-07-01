@@ -22,6 +22,7 @@
 *******************************************************************************/
 
 #include "linux/kernel.h"
+#include "linux/sched.h"
 #include "linux/sort.h"
 #include "nv_uvm_interface.h"
 #include "uvm_common.h"
@@ -74,7 +75,7 @@ static unsigned uvm_perf_reenable_prefetch_faults_lapse_msec = UVM_PERF_REENABLE
 module_param(uvm_perf_reenable_prefetch_faults_lapse_msec, uint, S_IRUGO);
 
 #define UVM_PERF_FAULT_BATCH_COUNT_MIN 1
-#define UVM_PERF_FAULT_BATCH_COUNT_DEFAULT 256
+#define UVM_PERF_FAULT_BATCH_COUNT_DEFAULT 32
 
 // Number of entries that are fetched from the GPU fault buffer and serviced in
 // batch
@@ -104,7 +105,7 @@ module_param(uvm_perf_fault_replay_policy, uint, S_IRUGO);
 static unsigned uvm_perf_fault_replay_update_put_ratio = UVM_PERF_FAULT_REPLAY_UPDATE_PUT_RATIO_DEFAULT;
 module_param(uvm_perf_fault_replay_update_put_ratio, uint, S_IRUGO);
 
-#define UVM_PERF_FAULT_MAX_BATCHES_PER_SERVICE_DEFAULT 20
+#define UVM_PERF_FAULT_MAX_BATCHES_PER_SERVICE_DEFAULT 4
 
 #define UVM_PERF_FAULT_MAX_THROTTLE_PER_SERVICE_DEFAULT 5
 
@@ -116,8 +117,95 @@ module_param(uvm_perf_fault_max_batches_per_service, uint, S_IRUGO);
 static unsigned uvm_perf_fault_max_throttle_per_service = UVM_PERF_FAULT_MAX_THROTTLE_PER_SERVICE_DEFAULT;
 module_param(uvm_perf_fault_max_throttle_per_service, uint, S_IRUGO);
 
+// Under heavy oversubscription a single replayable fault service pass can keep
+// mmap_lock held for read long enough to block ordinary userspace mmap/brk and
+// teardown writers. Periodically drop the VA-space and mmap read locks between
+// serviced fault groups to keep forward progress fair.
+#define UVM_PERF_FAULT_MMAP_LOCK_YIELD_INTERVAL_DEFAULT 4
+static unsigned uvm_perf_fault_mmap_lock_yield_interval = UVM_PERF_FAULT_MMAP_LOCK_YIELD_INTERVAL_DEFAULT;
+module_param(uvm_perf_fault_mmap_lock_yield_interval, uint, S_IRUGO);
+
 static unsigned uvm_perf_fault_coalesce = 1;
 module_param(uvm_perf_fault_coalesce, uint, S_IRUGO);
+
+#define UVM_PHASE_N_EXPERT_WEIGHT_POOL 2
+#define UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W13 3
+#define UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W2 4
+
+static unsigned uvm_phase_n_expert_fault_readdup_enable = 0;
+module_param(uvm_phase_n_expert_fault_readdup_enable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_expert_fault_readdup_enable,
+                 "Force expert-tagged W13/W2 GPU read faults through read-duplicate service. Default: 0.");
+
+static unsigned uvm_phase_n_expert_fault_fastpath_enable = 0;
+module_param(uvm_phase_n_expert_fault_fastpath_enable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_expert_fault_fastpath_enable,
+                 "Service eligible expert-tagged GPU read faults with a dedicated read-duplicate fast path. Default: 0.");
+
+static bool phase_n_range_tag_is_expert_weight(const uvm_phase_n_range_tag_t *tag)
+{
+    return tag &&
+           tag->valid &&
+           !tag->mixed &&
+           tag->pool == UVM_PHASE_N_EXPERT_WEIGHT_POOL &&
+           (tag->role == UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W13 ||
+            tag->role == UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W2);
+}
+
+static bool phase_n_expert_fault_readdup_allowed(uvm_va_block_t *va_block,
+                                                 uvm_page_index_t page_index,
+                                                 uvm_gpu_id_t gpu_id,
+                                                 uvm_fault_access_type_t service_access_type,
+                                                 const uvm_perf_thrashing_hint_t *thrashing_hint,
+                                                 const bool hmm_migratable)
+{
+    uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
+    uvm_va_block_gpu_state_t *gpu_state;
+
+    if (!uvm_phase_n_expert_fault_readdup_enable)
+        return false;
+
+    if (uvm_va_block_is_hmm(va_block) || !hmm_migratable)
+        return false;
+
+    if (!phase_n_range_tag_is_expert_weight(&va_block->managed_range->phase_n_tag))
+        return false;
+
+    if (service_access_type > UVM_FAULT_ACCESS_TYPE_READ)
+        return false;
+
+    if (thrashing_hint->type == UVM_PERF_THRASHING_HINT_TYPE_PIN)
+        return false;
+
+    if (!uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index))
+        return false;
+
+    gpu_state = uvm_va_block_gpu_state_get(va_block, gpu_id);
+    if (gpu_state && uvm_page_mask_test(&gpu_state->resident, page_index))
+        return false;
+
+    if (!uvm_processor_mask_test(&va_space->accessible_from[uvm_id_value(UVM_ID_CPU)], gpu_id))
+        return false;
+
+    return true;
+}
+
+static void phase_n_record_managed_fault_dispatch(uvm_gpu_t *gpu,
+                                                  uvm_va_range_managed_t *managed_range,
+                                                  NvU32 block_faults)
+{
+    if (!managed_range || block_faults == 0)
+        return;
+
+    if (phase_n_range_tag_is_expert_weight(&managed_range->phase_n_tag)) {
+        ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_dispatches;
+        gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_faults_serviced += block_faults;
+    }
+    else {
+        ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_non_expert_managed_dispatches;
+        gpu->parent->fault_buffer.replayable.stats.num_phase_n_non_expert_managed_faults_serviced += block_faults;
+    }
+}
 
 static unsigned uvm_perf_fault_log_addresses;
 module_param(uvm_perf_fault_log_addresses, uint, S_IRUGO | S_IWUSR);
@@ -1490,19 +1578,17 @@ static uvm_fault_access_type_t check_fault_access_permissions(uvm_gpu_t *gpu,
     return ret;
 }
 
-// We notify the fault event for all faults within the block so that the
-// performance heuristics are updated. Then, all required actions for the block
-// data are performed by the performance heuristics code.
+// 处理同一个 VA Block 内的一批缺页异常。
+// 我们会先通知性能启发式算法更新状态，然后根据算法的决策执行必要的内存迁移或映射操作。
+// 
+// 致命错误（Fatal faults）会被标记，以便后续取消操作。由于权限不足或地址无效导致的致命错误
+// 不会中断整个批次的服务。
 //
-// Fatal faults are flagged as fatal for later cancellation. Servicing is not
-// interrupted on fatal faults due to insufficient permissions or invalid
-// addresses.
-//
-// Return codes:
-// - NV_OK if all faults were handled (both fatal and non-fatal)
-// - NV_ERR_MORE_PROCESSING_REQUIRED if servicing needs allocation retry
-// - NV_ERR_NO_MEMORY if the faults could not be serviced due to OOM
-// - Any other value is a UVM-global error
+// 返回码：
+// - NV_OK：所有异常（包括致命和非致命）都已处理
+// - NV_ERR_MORE_PROCESSING_REQUIRED：处理过程中需要重试（如等待内存分配）
+// - NV_ERR_NO_MEMORY：内存不足导致无法处理
+// - 其他值：UVM 全局错误
 static NV_STATUS service_fault_batch_block_locked(uvm_gpu_t *gpu,
                                                   uvm_va_block_t *va_block,
                                                   uvm_va_block_retry_t *va_block_retry,
@@ -1517,37 +1603,45 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_t *gpu,
     uvm_page_index_t last_page_index;
     NvU32 page_fault_count = 0;
     uvm_range_group_range_iter_t iter;
+    
+    // 获取重放故障缓冲区及其相关的服务上下文
     uvm_replayable_fault_buffer_t *replayable_faults = &gpu->parent->fault_buffer.replayable;
     uvm_fault_buffer_entry_t **ordered_fault_cache = batch_context->ordered_fault_cache;
     uvm_fault_buffer_entry_t *first_fault_entry = ordered_fault_cache[first_fault_index];
     uvm_service_block_context_t *block_context = &replayable_faults->block_service_context;
+    
+    // 获取该块所属的虚拟地址空间（VA Space）
     uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
     const uvm_va_policy_t *policy;
     NvU64 end;
 
-    // Check that all uvm_fault_access_type_t values can fit into an NvU8
+    // 编译期检查：确保访问类型总数能存入一个 8 位无符号整数中
     BUILD_BUG_ON(UVM_FAULT_ACCESS_TYPE_COUNT > (int)(NvU8)-1);
 
+    // 运行期安全断言：确保调用此函数前已经获取了该 va_block 的互斥锁
     uvm_assert_mutex_locked(&va_block->lock);
 
     *block_faults = 0;
 
+    // 初始化页面索引边界，用于后续计算本批次影响的页面范围
     first_page_index = PAGES_PER_UVM_VA_BLOCK;
     last_page_index = 0;
 
-    // Initialize fault service block context
+    // 初始化故障服务块上下文的掩码和计数器
     uvm_processor_mask_zero(&block_context->resident_processors);
     block_context->thrashing_pin_count = 0;
     block_context->read_duplicate_count = 0;
 
+    // 初始化迁移迭代器，用于遍历该地址块的迁移属性
     uvm_range_group_range_migratability_iter_first(va_space, va_block->start, va_block->end, &iter);
 
-    // The first entry is guaranteed to fall within this block
+    // 确保传入的第一个故障条目合法且确实落在当前处理的 VA Block 范围内
     UVM_ASSERT(first_fault_entry->va_space == va_space);
     UVM_ASSERT(first_fault_entry->gpu == gpu);
     UVM_ASSERT(first_fault_entry->fault_address >= va_block->start);
     UVM_ASSERT(first_fault_entry->fault_address <= va_block->end);
 
+    // 获取内存策略（Policy）：区分是 HMM（异构内存管理）还是 UVM 传统托管范围
     if (uvm_va_block_is_hmm(va_block)) {
         policy = uvm_hmm_find_policy_end(va_block,
                                          block_context->block_context->hmm.vma,
@@ -1559,42 +1653,43 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_t *gpu,
         end = va_block->end;
     }
 
-    // Scan the sorted array and notify the fault event for all fault entries
-    // in the block
+    // 核心循环：扫描已排序的故障缓存数组，处理所有属于当前 block 的故障
     for (i = first_fault_index;
          i < batch_context->num_coalesced_faults &&
          ordered_fault_cache[i]->va_space == va_space &&
          ordered_fault_cache[i]->gpu == gpu &&
          ordered_fault_cache[i]->fault_address <= end;
          ++i) {
+        
         uvm_fault_buffer_entry_t *current_entry = ordered_fault_cache[i];
         const uvm_fault_buffer_entry_t *previous_entry = NULL;
         bool read_duplicate;
         uvm_processor_id_t new_residency;
         uvm_perf_thrashing_hint_t thrashing_hint;
+        
+        // 计算故障地址在 VA block 内的页面索引
         uvm_page_index_t page_index = uvm_va_block_cpu_page_index(va_block, current_entry->fault_address);
         bool is_duplicate = false;
         uvm_fault_access_type_t service_access_type;
         NvU32 service_access_type_mask;
 
+        // 断言确保故障访问类型是掩码中最高级的（如 Write 优先于 Read）
         UVM_ASSERT(current_entry->fault_access_type ==
                    uvm_fault_access_type_mask_highest(current_entry->access_type_mask));
 
-        // Unserviceable faults were already skipped by the caller. There are no
-        // unserviceable fault types that could be in the same VA block as a
-        // serviceable fault.
+        // 无法服务的故障已被调用者跳过。确保当前处理的不是致命错误
         UVM_ASSERT(!current_entry->is_fatal);
-        current_entry->is_throttled        = false;
+        current_entry->is_throttled    = false;
         current_entry->is_invalid_prefetch = false;
 
+        // 检查与前一个故障条目是否为重复异常（比如同一页面上的并发请求）
         if (i > first_fault_index) {
             previous_entry = ordered_fault_cache[i - 1];
             is_duplicate = check_fault_entry_duplicate(current_entry, previous_entry);
         }
 
-        // Only update counters the first time since logical permissions cannot
-        // change while we hold the VA space lock.
-        // TODO: Bug 1750144: That might not be true with HMM.
+        // 首次尝试时（非重试状态），更新性能启发式指标并触发缺页通知
+        // 因为在持有 VA space 锁期间，逻辑权限不会改变
         if (block_context->num_retries == 0) {
             update_batch_and_notify_fault(gpu,
                                           batch_context,
@@ -1604,38 +1699,33 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_t *gpu,
                                           is_duplicate);
         }
 
-        // Service the most intrusive fault per page, only. Waive the rest
+        // 如果是重复故障，合并标志位。我们只处理每页侵入性最强的故障（如写故障覆盖读故障）
         if (is_duplicate) {
             fault_entry_duplicate_flags(batch_context, current_entry, previous_entry);
-
-            // The previous fault was non-fatal so the page has been already
-            // serviced
+            // 如果前一个非致命，说明该页面的处理意图已经被记录，跳过当前循环
             if (!previous_entry->is_fatal)
                 continue;
         }
 
-        // Ensure that the migratability iterator covers the current fault
-        // address
+        // 推进迁移迭代器以覆盖当前的故障地址
         while (iter.end < current_entry->fault_address)
             uvm_range_group_range_migratability_iter_next(va_space, &iter, va_block->end);
 
         UVM_ASSERT(iter.start <= current_entry->fault_address && iter.end >= current_entry->fault_address);
 
+        // 检查权限：确定该请求是否具有相应的逻辑访问权限
         service_access_type = check_fault_access_permissions(gpu,
                                                              batch_context,
                                                              va_block,
                                                              block_context,
                                                              current_entry);
 
-        // Do not exit early due to logical errors such as access permission
-        // violation.
+        // 如果权限越界或无效，不直接退出，跳过本条目继续处理其余故障
         if (service_access_type == UVM_FAULT_ACCESS_TYPE_COUNT)
             continue;
 
+        // 降级处理：如果请求的权限部分无效，重新计算需要提供服务的权限掩码
         if (service_access_type != current_entry->fault_access_type) {
-            // Some of the fault instances cannot be serviced due to invalid
-            // access permissions. Recompute the access type service mask to
-            // service the rest.
             UVM_ASSERT(service_access_type < current_entry->fault_access_type);
             service_access_type_mask = uvm_fault_access_type_mask_bit(service_access_type);
         }
@@ -1643,39 +1733,34 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_t *gpu,
             service_access_type_mask = current_entry->access_type_mask;
         }
 
-        // If the GPU already has the necessary access permission, the fault
-        // does not need to be serviced
+        // 优化点：如果 GPU 已经拥有所需的访问权限（页表已就绪），则无需做任何操作
         if (uvm_va_block_page_is_gpu_authorized(va_block,
                                                 page_index,
                                                 gpu->id,
                                                 uvm_fault_access_type_to_prot(service_access_type)))
             continue;
 
+        // 查询性能启发式算法中的 "Thrashing" (内存颠簸) 提示
         thrashing_hint = uvm_perf_thrashing_get_hint(va_block,
                                                      block_context->block_context,
                                                      current_entry->fault_address,
                                                      gpu->id);
+        
         if (thrashing_hint.type == UVM_PERF_THRASHING_HINT_TYPE_THROTTLE) {
-            // Throttling is implemented by sleeping in the fault handler on
-            // the CPU and by continuing to process faults on other pages on
-            // the GPU
-            //
-            // Only update the flag the first time since logical permissions
-            // cannot change while we hold the VA space lock.
-            // TODO: Bug 1750144: That might not be true with HMM.
+            // 节流处理 (Throttle)：页面在 CPU/GPU 间频繁迁移颠簸，算法建议暂停处理
+            // CPU 会在异常处理程序中休眠，同时允许 GPU 继续处理其他页面的异常
             if (block_context->num_retries == 0)
                 mark_fault_throttled(batch_context, current_entry);
-
             continue;
         }
         else if (thrashing_hint.type == UVM_PERF_THRASHING_HINT_TYPE_PIN) {
+            // 锁定处理 (Pin)：算法建议将此页面固定在当前处理器中，避免迁移
             if (block_context->thrashing_pin_count++ == 0)
                 uvm_page_mask_zero(&block_context->thrashing_pin_mask);
-
             uvm_page_mask_set(&block_context->thrashing_pin_mask, page_index);
         }
 
-        // Compute new residency and update the masks
+        // 核心决策：计算页面应该驻留的新位置（迁移目标）并更新掩码
         new_residency = uvm_va_block_select_residency(va_block,
                                                       block_context->block_context,
                                                       page_index,
@@ -1687,37 +1772,55 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_t *gpu,
                                                       hmm_migratable,
                                                       &read_duplicate);
 
+        // 专家模式覆盖机制：检查是否强制开启 Read Duplication (读复制)
+        if (phase_n_expert_fault_readdup_allowed(va_block,
+                                                 page_index,
+                                                 gpu->id,
+                                                 service_access_type,
+                                                 &thrashing_hint,
+                                                 hmm_migratable)) {
+            new_residency = gpu->id;
+            read_duplicate = true;
+            // 更新统计信息
+            ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_forced_readdup_faults;
+            ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_forced_readdup_pages;
+        }
+
+        // 记录新驻留位置的映射掩码，如果该驻留位置第一次出现，先清空其页面掩码
         if (!uvm_processor_mask_test_and_set(&block_context->resident_processors, new_residency))
             uvm_page_mask_zero(&block_context->per_processor_masks[uvm_id_value(new_residency)].new_residency);
 
         uvm_page_mask_set(&block_context->per_processor_masks[uvm_id_value(new_residency)].new_residency, page_index);
 
+        // 如果启用了读复制，更新对应掩码
         if (read_duplicate) {
             if (block_context->read_duplicate_count++ == 0)
                 uvm_page_mask_zero(&block_context->read_duplicate_mask);
-
             uvm_page_mask_set(&block_context->read_duplicate_mask, page_index);
         }
 
         ++page_fault_count;
-
         block_context->access_type[page_index] = service_access_type;
 
+        // 追踪受影响的最小和最大页面索引，以便后续批量服务时确定操作范围
         if (page_index < first_page_index)
             first_page_index = page_index;
         if (page_index > last_page_index)
             last_page_index = page_index;
     }
 
-    // Apply the changes computed in the fault service block context, if there
-    // are pages to be serviced
+    // 执行阶段：如果该 block 内有需要处理的缺页异常
+    // 将上面收集到的状态（掩码、驻留决策）应用于内存子系统
     if (page_fault_count > 0) {
         block_context->region = uvm_va_block_region(first_page_index, last_page_index + 1);
+        // 调用底层核心函数执行实际的内存迁移、页面分配和页表更新
         status = uvm_va_block_service_locked(gpu->id, va_block, va_block_retry, block_context);
     }
 
+    // 返回本 block 成功遍历/处理的异常数量
     *block_faults = i - first_fault_index;
-
+    
+    // 递增重试计数，以防此操作返回 NV_ERR_MORE_PROCESSING_REQUIRED
     ++block_context->num_retries;
 
     return status;
@@ -1768,6 +1871,179 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_t *gpu,
         uvm_hmm_migrate_finish(va_block);
 
     return status == NV_OK? tracker_status: status;
+}
+
+static bool phase_n_expert_fault_fastpath_candidate(uvm_va_block_t *va_block,
+                                                    uvm_va_range_managed_t *managed_range,
+                                                    const bool hmm_migratable)
+{
+    if (!uvm_phase_n_expert_fault_fastpath_enable)
+        return false;
+
+    if (!managed_range)
+        return false;
+
+    if (uvm_va_block_is_hmm(va_block) || !hmm_migratable)
+        return false;
+
+    if (uvm_va_range_is_managed_zombie(&managed_range->va_range))
+        return false;
+
+    return phase_n_range_tag_is_expert_weight(&managed_range->phase_n_tag);
+}
+
+static NV_STATUS service_fault_batch_block_expert_readdup_locked(uvm_gpu_t *gpu,
+                                                                 uvm_va_block_t *va_block,
+                                                                 uvm_va_block_retry_t *va_block_retry,
+                                                                 uvm_fault_service_batch_context_t *batch_context,
+                                                                 NvU32 first_fault_index,
+                                                                 NvU32 *block_faults)
+{
+    NV_STATUS status;
+    NvU32 i;
+    uvm_page_index_t page_index;
+    NvU32 readdup_page_count = 0;
+    uvm_replayable_fault_buffer_t *replayable_faults = &gpu->parent->fault_buffer.replayable;
+    uvm_fault_buffer_entry_t **ordered_fault_cache = batch_context->ordered_fault_cache;
+    uvm_fault_buffer_entry_t *first_fault_entry = ordered_fault_cache[first_fault_index];
+    uvm_service_block_context_t *service_context = &replayable_faults->block_service_context;
+    uvm_page_mask_t *new_residency_mask =
+        &service_context->per_processor_masks[uvm_id_value(gpu->id)].new_residency;
+    uvm_page_mask_t demand_fault_mask;
+    uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
+    uvm_va_block_gpu_state_t *gpu_state;
+
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    *block_faults = 0;
+
+    UVM_ASSERT(first_fault_entry->va_space == va_space);
+    UVM_ASSERT(first_fault_entry->gpu == gpu);
+    UVM_ASSERT(first_fault_entry->fault_address >= va_block->start);
+    UVM_ASSERT(first_fault_entry->fault_address <= va_block->end);
+    UVM_ASSERT(!uvm_va_block_is_hmm(va_block));
+    UVM_ASSERT(phase_n_range_tag_is_expert_weight(&va_block->managed_range->phase_n_tag));
+
+    if (!uvm_processor_mask_test(&va_space->accessible_from[uvm_id_value(UVM_ID_CPU)], gpu->id))
+        return NV_WARN_NOTHING_TO_DO;
+
+    gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+
+    uvm_processor_mask_zero(&service_context->resident_processors);
+    uvm_processor_mask_set(&service_context->resident_processors, gpu->id);
+    uvm_page_mask_zero(new_residency_mask);
+    uvm_page_mask_zero(&demand_fault_mask);
+    uvm_page_mask_zero(&service_context->read_duplicate_mask);
+    service_context->read_duplicate_count = 0;
+    service_context->thrashing_pin_count = 0;
+    service_context->prefetch_hint.residency = UVM_ID_INVALID;
+    uvm_page_mask_zero(&service_context->prefetch_hint.prefetch_pages_mask);
+    service_context->block_context->make_resident.dest_nid = NUMA_NO_NODE;
+
+    for (i = first_fault_index;
+         i < batch_context->num_coalesced_faults &&
+         ordered_fault_cache[i]->va_space == va_space &&
+         ordered_fault_cache[i]->gpu == gpu &&
+         ordered_fault_cache[i]->fault_address <= va_block->end;
+         ++i) {
+        uvm_fault_buffer_entry_t *current_entry = ordered_fault_cache[i];
+        uvm_page_index_t page_index;
+
+        if (current_entry->is_fatal)
+            return NV_WARN_NOTHING_TO_DO;
+
+        if (current_entry->fault_access_type != UVM_FAULT_ACCESS_TYPE_READ)
+            return NV_WARN_NOTHING_TO_DO;
+
+        if (uvm_fault_access_type_mask_highest(current_entry->access_type_mask) != UVM_FAULT_ACCESS_TYPE_READ)
+            return NV_WARN_NOTHING_TO_DO;
+
+        page_index = uvm_va_block_cpu_page_index(va_block, current_entry->fault_address);
+
+        if (uvm_va_block_page_is_gpu_authorized(va_block, page_index, gpu->id, UVM_PROT_READ_ONLY))
+            continue;
+
+        if (!uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index))
+            return NV_WARN_NOTHING_TO_DO;
+
+        if (gpu_state && uvm_page_mask_test(&gpu_state->resident, page_index))
+            return NV_WARN_NOTHING_TO_DO;
+
+        uvm_page_mask_set(&demand_fault_mask, page_index);
+    }
+
+    *block_faults = i - first_fault_index;
+
+    for_each_va_block_page(page_index, va_block) {
+        if (uvm_va_block_page_is_gpu_authorized(va_block, page_index, gpu->id, UVM_PROT_READ_ONLY))
+            continue;
+
+        if (!uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index))
+            continue;
+
+        if (gpu_state && uvm_page_mask_test(&gpu_state->resident, page_index))
+            continue;
+
+        uvm_page_mask_set(new_residency_mask, page_index);
+        uvm_page_mask_set(&service_context->read_duplicate_mask, page_index);
+        service_context->access_type[page_index] =
+            uvm_page_mask_test(&demand_fault_mask, page_index) ?
+                UVM_FAULT_ACCESS_TYPE_READ :
+                UVM_FAULT_ACCESS_TYPE_PREFETCH;
+        ++service_context->read_duplicate_count;
+        ++readdup_page_count;
+    }
+
+    if (readdup_page_count == 0)
+        return NV_OK;
+
+    service_context->region = uvm_va_block_region_from_mask(va_block, new_residency_mask);
+
+    status = uvm_va_block_service_copy(gpu->id, gpu->id, va_block, va_block_retry, service_context);
+    if (status != NV_OK)
+        return status;
+
+    status = uvm_va_block_service_finish(gpu->id, va_block, service_context);
+    if (status != NV_OK)
+        return status;
+
+    ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_dispatches;
+    gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_faults_serviced += *block_faults;
+    gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_pages += readdup_page_count;
+
+    return NV_OK;
+}
+
+static NV_STATUS service_fault_batch_block_expert_readdup(uvm_gpu_t *gpu,
+                                                          uvm_va_block_t *va_block,
+                                                          uvm_fault_service_batch_context_t *batch_context,
+                                                          NvU32 first_fault_index,
+                                                          NvU32 *block_faults)
+{
+    NV_STATUS status;
+    uvm_va_block_retry_t va_block_retry;
+    NV_STATUS tracker_status;
+    uvm_replayable_fault_buffer_t *replayable_faults = &gpu->parent->fault_buffer.replayable;
+    uvm_service_block_context_t *fault_block_context = &replayable_faults->block_service_context;
+
+    fault_block_context->operation = UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS;
+    fault_block_context->num_retries = 0;
+
+    uvm_mutex_lock(&va_block->lock);
+
+    status = UVM_VA_BLOCK_RETRY_LOCKED(va_block, &va_block_retry,
+                                       service_fault_batch_block_expert_readdup_locked(gpu,
+                                                                                      va_block,
+                                                                                      &va_block_retry,
+                                                                                      batch_context,
+                                                                                      first_fault_index,
+                                                                                      block_faults));
+
+    tracker_status = uvm_tracker_add_tracker_safe(&batch_context->tracker, &va_block->tracker);
+
+    uvm_mutex_unlock(&va_block->lock);
+
+    return status == NV_OK ? tracker_status : status;
 }
 
 typedef enum
@@ -2109,7 +2385,25 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
         status = NV_ERR_INVALID_ADDRESS;
 
     if (status == NV_OK) {
-        status = service_fault_batch_block(gpu, va_block, batch_context, fault_index, hmm_migratable, block_faults);
+        uvm_va_range_managed_t *managed_range = uvm_va_range_to_managed_or_null(va_range);
+
+        if (phase_n_expert_fault_fastpath_candidate(va_block, managed_range, hmm_migratable)) {
+            status = service_fault_batch_block_expert_readdup(gpu,
+                                                              va_block,
+                                                              batch_context,
+                                                              fault_index,
+                                                              block_faults);
+            if (status == NV_WARN_NOTHING_TO_DO) {
+                ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_fallbacks;
+                status = service_fault_batch_block(gpu, va_block, batch_context, fault_index, hmm_migratable, block_faults);
+            }
+        }
+        else {
+            status = service_fault_batch_block(gpu, va_block, batch_context, fault_index, hmm_migratable, block_faults);
+        }
+
+        if (status == NV_OK)
+            phase_n_record_managed_fault_dispatch(gpu, managed_range, *block_faults);
     }
     else if ((status == NV_ERR_INVALID_ADDRESS) && uvm_ats_can_service_faults(gpu_va_space, mm)) {
         NvU64 outer = ~0ULL;
@@ -2373,6 +2667,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
         &parent_gpu->fault_buffer.replayable.block_service_context;
     uvm_va_block_context_t *va_block_context = service_context->block_context;
     bool hmm_migratable = true;
+    NvU32 faults_since_lock_yield = 0;
 
     ats_invalidate->tlb_batch_pending = false;
 
@@ -2497,6 +2792,7 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
 
         hmm_migratable = true;
         i += block_faults;
+        faults_since_lock_yield += block_faults;
 
         // Don't issue replays in cancel mode
         if (replay_per_va_block && !batch_context->fatal_va_space) {
@@ -2508,6 +2804,29 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
             // is used, as we issue a replay after servicing each VA block
             // and we can service a number of VA blocks before returning.
             ++batch_context->batch_id;
+        }
+
+        if (service_mode == FAULT_SERVICE_MODE_REGULAR &&
+            uvm_perf_fault_mmap_lock_yield_interval != 0 &&
+            faults_since_lock_yield >= uvm_perf_fault_mmap_lock_yield_interval &&
+            i < batch_context->num_coalesced_faults) {
+            if (prev_gpu_va_space) {
+                status = uvm_ats_invalidate_tlbs(prev_gpu_va_space, ats_invalidate, &batch_context->tracker);
+                if (status != NV_OK)
+                    goto fail;
+
+                prev_gpu_va_space = NULL;
+            }
+
+            if (va_space) {
+                uvm_va_space_up_read(va_space);
+                uvm_va_space_mm_release_unlock(va_space, mm);
+                va_space = NULL;
+                mm = NULL;
+            }
+
+            faults_since_lock_yield = 0;
+            cond_resched();
         }
     }
 
@@ -3070,27 +3389,37 @@ static NV_STATUS phase_n_auto_reclaim_after_replayable_batch(uvm_fault_service_b
     return first_error;
 }
 
+// 处理指定 GPU 上的可重放缺页异常（Replayable Page Faults）。
+// 该函数是 UVM 处理 GPU 缺页的顶层循环，它会从硬件的缺页缓冲区中按批次（Batch）
+// 提取、预处理并服务缺页异常，最后根据配置的策略触发硬件重放（Replay）。
 void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 {
-    NvU32 num_replays = 0;
-    NvU32 num_batches = 0;
-    NvU32 num_throttled = 0;
+    NvU32 num_replays = 0;   // 记录触发重放操作的次数
+    NvU32 num_batches = 0;   // 记录已处理的缺页批次数量
+    NvU32 num_throttled = 0; // 记录因内存颠簸（Thrashing）被节流的批次数量
     NV_STATUS status = NV_OK;
+    
+    // 获取可重放缺页缓冲区及其批处理上下文
     uvm_replayable_fault_buffer_t *replayable_faults = &parent_gpu->fault_buffer.replayable;
     uvm_fault_service_batch_context_t *batch_context = &replayable_faults->batch_service_context;
 
+    // 初始化异步操作追踪器（Tracker），用于等待 GPU 上的内存操作完成
     uvm_tracker_init(&batch_context->tracker);
 
-    // Process all faults in the buffer
+    // 持续处理缓冲区中的所有缺页异常，直到缓冲区为空或达到阈值限制
     while (1) {
+        // 记录处理前的 KV（内核虚拟地址）缺页数，用于后续统计本批次的增量
         NvU64 total_kv_faults_before = parent_gpu->fault_buffer.replayable.stats.num_kv_faults;
         NvU64 total_kv_duplicates_before = parent_gpu->fault_buffer.replayable.stats.num_kv_duplicate_faults;
 
+        // 退出条件：为了防止在严重内存颠簸或高负载下长时间占用 CPU，
+        // 限制每次服务调用的最大节流次数和最大批处理次数。
         if (num_throttled >= uvm_perf_fault_max_throttle_per_service ||
             num_batches >= uvm_perf_fault_max_batches_per_service) {
             break;
         }
 
+        // 重置本批次的统计数据和状态标志
         batch_context->num_invalid_prefetch_faults = 0;
         batch_context->num_duplicate_faults        = 0;
         batch_context->num_kv_faults               = 0;
@@ -3100,36 +3429,41 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
         batch_context->fatal_gpu                   = NULL;
         batch_context->has_throttled_faults        = false;
 
+        // 1. 获取缺页条目：从硬件环形缓冲区中读取一批缺页记录
         status = fetch_fault_buffer_entries(parent_gpu, batch_context, FAULT_FETCH_MODE_BATCH_READY);
         if (status != NV_OK)
             break;
 
+        // 如果没有获取到任何缺页异常，说明当前缓冲区已空，退出循环
         if (batch_context->num_cached_faults == 0)
             break;
 
         ++batch_context->batch_id;
 
+        // 2. 预处理：按虚拟地址排序、去重、过滤无效或已取消的地址
         status = preprocess_fault_batch(parent_gpu, batch_context);
 
+        // 累加预处理阶段可能已经触发的重放次数（例如处理特定错误时）
         num_replays += batch_context->num_replays;
 
         if (status == NV_WARN_MORE_PROCESSING_REQUIRED)
-            continue;
+            continue; // 需要重试
         else if (status != NV_OK)
-            break;
+            break;    // 遇到无法恢复的错误
 
+        // 3. 执行服务：核心函数，分配物理页面、更新页表以解决这一批缺页异常
         status = service_fault_batch(parent_gpu, FAULT_SERVICE_MODE_REGULAR, batch_context);
 
-        // We may have issued replays even if status != NV_OK if
-        // UVM_PERF_FAULT_REPLAY_POLICY_BLOCK is being used or the fault buffer
-        // was flushed
+        // 如果采用了 BLOCK 级别的重放策略，或者缓冲区被刷新，服务过程中可能已经触发了重放
         num_replays += batch_context->num_replays;
 
+        // 4. 后处理阶段：内存回收和预取调整
         if (status == NV_OK)
             status = phase_n_auto_reclaim_after_replayable_batch(batch_context);
 
         enable_disable_prefetch_faults(parent_gpu, batch_context);
 
+        // 计算并更新本批次内与 KV (Kernel Virtual) 相关的统计信息
         batch_context->num_kv_faults = parent_gpu->fault_buffer.replayable.stats.num_kv_faults >= total_kv_faults_before ?
                                        (NvU32)(parent_gpu->fault_buffer.replayable.stats.num_kv_faults - total_kv_faults_before) :
                                        0;
@@ -3138,6 +3472,7 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             (NvU32)(parent_gpu->fault_buffer.replayable.stats.num_kv_duplicate_faults - total_kv_duplicates_before) :
             0;
 
+        // 记录性能日志
         if (uvm_perf_fault_log_counters) {
             log_replayable_fault_counters(parent_gpu,
                                           batch_context->num_cached_faults,
@@ -3146,41 +3481,45 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
                                           batch_context->num_kv_duplicate_faults);
         }
 
+        // 错误处理逻辑
         if (status != NV_OK) {
-            // Unconditionally cancel all faults to trigger RC. This will not
-            // provide precise attribution, but this case handles global
-            // errors such as OOM or ECC where it's not reasonable to
-            // guarantee precise attribution. We ignore the return value of
-            // the cancel operation since this path is already returning an
-            // error code.
+            // 全局致命错误（如 OOM 或 ECC 错误）：
+            // 无条件取消批次中的所有缺页。由于发生全局错误，我们不强求精确的错误归因。
+            // 忽略 cancel 函数的返回值，直接跳出循环。
             cancel_fault_batch(parent_gpu, batch_context, uvm_tools_status_to_fatal_fault_reason(status));
             break;
         }
 
+        // 处理精确致命错误（通常是因为权限不足或地址越界，仅影响特定 VA space）
         if (batch_context->fatal_va_space) {
+            // 必须先等待所有已发起的页表操作完成
             status = uvm_tracker_wait(&batch_context->tracker);
             if (status == NV_OK) {
+                // 精确取消引发致命错误的具体缺页记录
                 status = cancel_faults_precise(batch_context);
                 if (status == NV_OK) {
-                    // Cancel handling should've issued at least one replay
+                    // 取消操作至少会发起一次重放指令
                     UVM_ASSERT(batch_context->num_replays > 0);
                     ++num_batches;
-                    continue;
+                    continue; // 错误已处理，继续下一个批次
                 }
             }
-
-            break;
+            break; // tracker 等待失败或精准取消失败，跳出
         }
 
+        // 5. 根据预设策略触发重放（Replay），通知 GPU 重新执行因缺页暂停的指令
         if (replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH) {
+            // 每个批次处理完后立刻发送一条 START 类型的重放指令
             status = push_replay_on_parent_gpu(parent_gpu, UVM_FAULT_REPLAY_TYPE_START, batch_context);
             if (status != NV_OK)
                 break;
             ++num_replays;
         }
         else if (replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_BATCH_FLUSH) {
+            // 批次加刷新策略：根据重复率动态决定如何更新硬件的 PUT 指针
             uvm_gpu_buffer_flush_mode_t flush_mode = UVM_GPU_BUFFER_FLUSH_MODE_CACHED_PUT;
 
+            // 如果重复率过高（超出设定比例），强制使用 UPDATE_PUT 模式，防止旧的重复缺页阻塞缓冲区
             if (batch_context->num_duplicate_faults * 100 >
                 batch_context->num_cached_faults * replayable_faults->replay_update_put_ratio) {
                 flush_mode = UVM_GPU_BUFFER_FLUSH_MODE_UPDATE_PUT;
@@ -3190,28 +3529,37 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
             if (status != NV_OK)
                 break;
             ++num_replays;
+            // 必须等待重放完成
             status = uvm_tracker_wait(&replayable_faults->replay_tracker);
             if (status != NV_OK)
                 break;
         }
 
+        // 更新颠簸（Thrashing）节流计数
         if (batch_context->has_throttled_faults)
             ++num_throttled;
 
         ++num_batches;
+
+        // 如果配置了释放 mmap_lock 的让步间隔，主动调用调度器出让 CPU，避免长时间占用
+        if (uvm_perf_fault_mmap_lock_yield_interval != 0)
+            cond_resched();
     }
 
     if (status == NV_WARN_MORE_PROCESSING_REQUIRED)
         status = NV_OK;
 
-    // Make sure that we issue at least one replay if no replay has been
-    // issued yet to avoid dropping faults that do not show up in the buffer
+    // 安全兜底逻辑：
+    // 如果策略要求只发一次重放（ONCE），或者整个循环由于各种原因没有发出过重放指令，
+    // 我们必须在这里至少发送一次重放，以防止 GPU 卡死在旧的未记录或未处理的缺页上。
     if ((status == NV_OK && replayable_faults->replay_policy == UVM_PERF_FAULT_REPLAY_POLICY_ONCE) ||
         num_replays == 0)
         status = push_replay_on_parent_gpu(parent_gpu, UVM_FAULT_REPLAY_TYPE_START, batch_context);
 
+    // 清理追踪器
     uvm_tracker_deinit(&batch_context->tracker);
 
+    // 记录错误日志
     if (status != NV_OK)
         UVM_DBG_PRINT("Error servicing replayable faults on GPU: %s\n", uvm_parent_gpu_name(parent_gpu));
 }

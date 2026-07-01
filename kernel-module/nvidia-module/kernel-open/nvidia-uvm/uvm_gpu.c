@@ -768,6 +768,32 @@ gpu_fault_stats_print_common(uvm_parent_gpu_t *parent_gpu, struct seq_file *s)
                          parent_gpu->fault_buffer.replayable.stats.num_phase_n_unregistered_faults);
     UVM_SEQ_OR_DBG_PRINT(s, "phase_n_unregistered_duplicate_faults %llu\n",
                          parent_gpu->fault_buffer.replayable.stats.num_phase_n_unregistered_duplicate_faults);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_dispatches %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_dispatches);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_faults_serviced %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_faults_serviced);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_forced_readdup_faults %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_forced_readdup_faults);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_forced_readdup_pages %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_forced_readdup_pages);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_fastpath_dispatches %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_dispatches);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_fastpath_faults_serviced %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_faults_serviced);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_fastpath_pages %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_pages);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_fastpath_fallbacks %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_fallbacks);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_migrate_fastpath_ranges %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_migrate_fastpath_ranges);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_migrate_fastpath_pages %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_migrate_fastpath_pages);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_migrate_fastpath_fallbacks %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_migrate_fastpath_fallbacks);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_non_expert_managed_dispatches %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_non_expert_managed_dispatches);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_non_expert_managed_faults_serviced %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_non_expert_managed_faults_serviced);
     UVM_SEQ_OR_DBG_PRINT(s, "faults_by_access_type:\n");
     UVM_SEQ_OR_DBG_PRINT(s, "  prefetch             %llu\n",
                          parent_gpu->fault_buffer.replayable.stats.num_prefetch_faults);

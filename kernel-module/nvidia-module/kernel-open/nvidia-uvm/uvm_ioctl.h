@@ -1027,6 +1027,9 @@ typedef enum
     UVM_PHASE_F_ACTION_PREFETCH_CPU_NO_MAP = 15,
     UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16,
     UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17,
+    // Expert-only read-duplicate promotion. This bypasses the generic migrate
+    // API path and only accepts managed ranges tagged as MoE expert weights.
+    UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST = 18,
 } UVM_PHASE_F_ACTION;
 
 typedef struct
@@ -1130,6 +1133,18 @@ typedef enum
     UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY = 4,
     UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP = 5,
     UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP = 6,
+    // Experimental stage-boundary path. entry->va_base is the target managed
+    // VA to remap. entry->slot_offset is a managed user backing VA which must
+    // already be GPU-resident on gpu_uuid, typically after cudaMemcpyAsync and
+    // copy_done_event. No slot copy is performed by this mode.
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_USER_BACKING_REMAP = 7,
+    // Preallocate driver-owned VIDMEM slot backing for the submitted logical
+    // slots. This does not copy data and does not install PTEs.
+    UVM_MOE_SLOT_REMAP_MODE_VIDMEM_PREALLOC = 8,
+    // Submit a CPU-to-GPU copy into an existing or newly allocated
+    // driver-owned VIDMEM slot and return without waiting for the copy engine.
+    // UVM_MOE_SLOT_POOL_QUERY polls completion and finalizes copy counters.
+    UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ASYNC_SUBMIT = 9,
 } UVM_MOE_SLOT_REMAP_MODE;
 
 typedef enum

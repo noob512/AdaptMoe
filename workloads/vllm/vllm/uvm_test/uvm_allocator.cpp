@@ -88,8 +88,10 @@ constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ = 5;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG = 6;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED = 7;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_START_BG_PROMOTION = 8;
+constexpr uint32_t UVM_TEST_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT = 14;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17;
+constexpr uint32_t UVM_TEST_PHASE_F_ACTION_EXPERT_READ_DUP_FAST = 18;
 
 constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_DRY_RUN = 0;
 constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_VALIDATE = 1;
@@ -581,10 +583,14 @@ const char* phase_f_action_name(uint32_t action) {
             return "PREPARE_REMOTE_READ_BG_DEFERRED";
         case UVM_TEST_PHASE_F_ACTION_START_BG_PROMOTION:
             return "START_BG_PROMOTION";
+        case UVM_TEST_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT:
+            return "GPU_ONLY_READ_DUP_SOFT";
         case UVM_TEST_PHASE_F_ACTION_PAUSE_BG_PROMOTION:
             return "PAUSE_BG_PROMOTION";
         case UVM_TEST_PHASE_F_ACTION_RESUME_BG_PROMOTION:
             return "RESUME_BG_PROMOTION";
+        case UVM_TEST_PHASE_F_ACTION_EXPERT_READ_DUP_FAST:
+            return "EXPERT_READ_DUP_FAST";
         default:
             return "UNKNOWN";
     }
@@ -598,6 +604,8 @@ bool phase_f_action_needs_gpu_uuid(uint32_t action) {
         case UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG:
         case UVM_TEST_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED:
         case UVM_TEST_PHASE_F_ACTION_START_BG_PROMOTION:
+        case UVM_TEST_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT:
+        case UVM_TEST_PHASE_F_ACTION_EXPERT_READ_DUP_FAST:
             return true;
         default:
             return false;
@@ -7453,6 +7461,36 @@ int uvm_driver_batch_start_bg_promotion(const uintptr_t* ptrs,
         sizes,
         count,
         UVM_TEST_PHASE_F_ACTION_START_BG_PROMOTION,
+        device,
+        async,
+        nullptr);
+}
+
+int uvm_driver_batch_gpu_only_read_dup_soft(const uintptr_t* ptrs,
+                                            const size_t* sizes,
+                                            size_t count,
+                                            int device,
+                                            int async) {
+    return uvm_driver_batch_execute_internal(
+        ptrs,
+        sizes,
+        count,
+        UVM_TEST_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT,
+        device,
+        async,
+        nullptr);
+}
+
+int uvm_driver_batch_expert_read_dup_fast(const uintptr_t* ptrs,
+                                          const size_t* sizes,
+                                          size_t count,
+                                          int device,
+                                          int async) {
+    return uvm_driver_batch_execute_internal(
+        ptrs,
+        sizes,
+        count,
+        UVM_TEST_PHASE_F_ACTION_EXPERT_READ_DUP_FAST,
         device,
         async,
         nullptr);

@@ -421,6 +421,32 @@ typedef struct
 
             NvU64 num_phase_n_unregistered_duplicate_faults;
 
+            NvU64 num_phase_n_expert_dispatches;
+
+            NvU64 num_phase_n_expert_faults_serviced;
+
+            NvU64 num_phase_n_expert_forced_readdup_faults;
+
+            NvU64 num_phase_n_expert_forced_readdup_pages;
+
+            NvU64 num_phase_n_expert_fastpath_dispatches;
+
+            NvU64 num_phase_n_expert_fastpath_faults_serviced;
+
+            NvU64 num_phase_n_expert_fastpath_pages;
+
+            NvU64 num_phase_n_expert_fastpath_fallbacks;
+
+            NvU64 num_phase_n_expert_migrate_fastpath_ranges;
+
+            NvU64 num_phase_n_expert_migrate_fastpath_pages;
+
+            NvU64 num_phase_n_expert_migrate_fastpath_fallbacks;
+
+            NvU64 num_phase_n_non_expert_managed_dispatches;
+
+            NvU64 num_phase_n_non_expert_managed_faults_serviced;
+
             atomic64_t num_pages_out;
 
             atomic64_t num_pages_in;

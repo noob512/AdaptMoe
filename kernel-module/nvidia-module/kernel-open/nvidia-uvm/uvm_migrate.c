@@ -57,9 +57,27 @@ module_param(uvm_perf_migrate_cpu_preunmap_enable, int, S_IRUGO);
 static unsigned uvm_perf_migrate_cpu_preunmap_block_order = UVM_PERF_MIGRATE_CPU_PREUNMAP_BLOCK_ORDER_DEFAULT;
 module_param(uvm_perf_migrate_cpu_preunmap_block_order, uint, S_IRUGO);
 
+#define UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W13 3
+#define UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W2 4
+
+static unsigned uvm_phase_n_expert_migrate_fastpath_enable = 0;
+module_param(uvm_phase_n_expert_migrate_fastpath_enable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_expert_migrate_fastpath_enable,
+                 "Use expert-tagged single-va_range read-duplicate fast path for GPU UVM_MIGRATE. Default: 0.");
+
 // Global post-processed values of the module parameters
 static bool g_uvm_perf_migrate_cpu_preunmap_enable __read_mostly;
 static NvU64 g_uvm_perf_migrate_cpu_preunmap_size __read_mostly;
+
+static bool phase_n_migrate_tag_is_expert_weight(const uvm_phase_n_range_tag_t *tag)
+{
+    return tag &&
+           tag->valid &&
+           !tag->mixed &&
+           tag->pool == UVM_PHASE_N_POOL_WEIGHT &&
+           (tag->role == UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W13 ||
+            tag->role == UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W2);
+}
 
 static bool is_migration_single_block(uvm_va_range_managed_t *first_managed_range, NvU64 base, NvU64 length)
 {
@@ -613,6 +631,131 @@ static NV_STATUS uvm_migrate_ranges(uvm_va_space_t *va_space,
     return NV_OK;
 }
 
+static bool uvm_migrate_expert_read_dup_fastpath_can_service(uvm_va_range_managed_t *managed_range,
+                                                             NvU64 base,
+                                                             NvU64 length,
+                                                             uvm_processor_id_t dest_id,
+                                                             NvU32 migrate_flags)
+{
+    NvU64 end;
+
+    if (!uvm_phase_n_expert_migrate_fastpath_enable)
+        return false;
+
+    if (!UVM_ID_IS_GPU(dest_id))
+        return false;
+
+    if (migrate_flags & ~UVM_MIGRATE_FLAG_ASYNC)
+        return false;
+
+    if (!managed_range || length == 0)
+        return false;
+
+    end = base + length - 1;
+    if (end < base)
+        return false;
+
+    if (base < managed_range->va_range.node.start || end > managed_range->va_range.node.end)
+        return false;
+
+    if (uvm_va_range_is_managed_zombie(&managed_range->va_range))
+        return false;
+
+    return phase_n_migrate_tag_is_expert_weight(&managed_range->phase_n_tag);
+}
+
+static NV_STATUS uvm_migrate_expert_read_dup_fastpath(uvm_va_space_t *va_space,
+                                                      struct mm_struct *mm,
+                                                      NvU64 base,
+                                                      NvU64 length,
+                                                      uvm_gpu_t *dest_gpu,
+                                                      uvm_va_range_managed_t *managed_range,
+                                                      uvm_tracker_t *out_tracker,
+                                                      uvm_processor_mask_t *gpus_to_check_for_nvlink_errors)
+{
+    NV_STATUS status = NV_OK;
+    uvm_service_block_context_t *service_context;
+    uvm_va_block_context_t *block_context;
+    NvU64 end = base + length - 1;
+    const size_t first_block_index = uvm_va_range_block_index(managed_range, base);
+    const size_t last_block_index = uvm_va_range_block_index(managed_range, end);
+    size_t block_index;
+    NvU64 committed_pages_total = 0;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+    UVM_ASSERT(dest_gpu);
+    UVM_ASSERT(UVM_ID_IS_GPU(dest_gpu->id));
+    UVM_ASSERT(base >= managed_range->va_range.node.start);
+    UVM_ASSERT(end <= managed_range->va_range.node.end);
+    UVM_ASSERT(phase_n_migrate_tag_is_expert_weight(&managed_range->phase_n_tag));
+
+    service_context = uvm_service_block_context_alloc(mm);
+    if (!service_context)
+        return NV_ERR_NO_MEMORY;
+
+    service_context->prefetch_hint.residency = UVM_ID_INVALID;
+    service_context->block_context->make_resident.dest_nid = NUMA_NO_NODE;
+    uvm_processor_mask_zero(&service_context->gpus_to_check_for_nvlink_errors);
+    block_context = service_context->block_context;
+
+    for (block_index = first_block_index; block_index <= last_block_index; ++block_index) {
+        uvm_va_block_t *va_block;
+        uvm_va_block_retry_t va_block_retry;
+        uvm_va_block_region_t region;
+        NvU64 block_start;
+        NvU64 block_end;
+        NvU32 committed_pages = 0;
+        NV_STATUS tracker_status;
+
+        status = uvm_va_range_block_create(managed_range, block_index, &va_block);
+        if (status != NV_OK)
+            break;
+
+        block_start = max(base, va_block->start);
+        block_end = min(end, va_block->end);
+        region = uvm_va_block_region_from_start_end(va_block, block_start, block_end);
+
+        status = UVM_VA_BLOCK_LOCK_RETRY(va_block,
+                                         &va_block_retry,
+                                         ({
+                                             uvm_processor_mask_zero(&block_context->make_resident.all_involved_processors);
+                                             uvm_va_block_promote_read_duplicate_now(va_block,
+                                                                                    &va_block_retry,
+                                                                                    block_context,
+                                                                                    dest_gpu->id,
+                                                                                    region,
+                                                                                    false,
+                                                                                    &committed_pages);
+                                         }));
+        if (status != NV_OK)
+            break;
+
+        if (out_tracker) {
+            tracker_status = uvm_tracker_add_tracker_safe(out_tracker, &va_block->tracker);
+            if (tracker_status != NV_OK) {
+                status = tracker_status;
+                break;
+            }
+        }
+
+        uvm_processor_mask_or(&service_context->gpus_to_check_for_nvlink_errors,
+                              &service_context->gpus_to_check_for_nvlink_errors,
+                              &block_context->make_resident.all_involved_processors);
+        committed_pages_total += committed_pages;
+    }
+
+    if (status == NV_OK) {
+        ++dest_gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_migrate_fastpath_ranges;
+        dest_gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_migrate_fastpath_pages +=
+            committed_pages_total;
+    }
+
+    uvm_processor_mask_copy(gpus_to_check_for_nvlink_errors, &service_context->gpus_to_check_for_nvlink_errors);
+    uvm_service_block_context_free(service_context);
+
+    return status;
+}
+
 static NV_STATUS uvm_migrate(uvm_va_space_t *va_space,
                              struct mm_struct *mm,
                              NvU64 base,
@@ -1115,16 +1258,43 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
             status = uvm_migrate_pageable(&uvm_migrate_args);
         }
         else {
-            status = uvm_migrate(va_space,
-                                 mm,
-                                 params->base,
-                                 params->length,
-                                 dest_id,
-                                 (UVM_ID_IS_CPU(dest_id) ? cpu_numa_node : NUMA_NO_NODE),
-                                 params->flags,
-                                 uvm_va_space_iter_managed_first(va_space, params->base, params->base),
-                                 tracker_ptr,
-                                 gpus_to_check_for_nvlink_errors);
+            uvm_va_range_managed_t *first_managed_range =
+                uvm_va_space_iter_managed_first(va_space, params->base, params->base);
+            bool tried_expert_fastpath = false;
+
+            if (type == UVM_API_RANGE_TYPE_MANAGED &&
+                dest_gpu &&
+                uvm_migrate_expert_read_dup_fastpath_can_service(first_managed_range,
+                                                                 params->base,
+                                                                 params->length,
+                                                                 dest_id,
+                                                                 params->flags)) {
+                tried_expert_fastpath = true;
+                status = uvm_migrate_expert_read_dup_fastpath(va_space,
+                                                              mm,
+                                                              params->base,
+                                                              params->length,
+                                                              dest_gpu,
+                                                              first_managed_range,
+                                                              tracker_ptr,
+                                                              gpus_to_check_for_nvlink_errors);
+            }
+
+            if (!tried_expert_fastpath || status != NV_OK) {
+                if (tried_expert_fastpath && dest_gpu)
+                    ++dest_gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_migrate_fastpath_fallbacks;
+
+                status = uvm_migrate(va_space,
+                                     mm,
+                                     params->base,
+                                     params->length,
+                                     dest_id,
+                                     (UVM_ID_IS_CPU(dest_id) ? cpu_numa_node : NUMA_NO_NODE),
+                                     params->flags,
+                                     first_managed_range,
+                                     tracker_ptr,
+                                     gpus_to_check_for_nvlink_errors);
+            }
         }
     }
 

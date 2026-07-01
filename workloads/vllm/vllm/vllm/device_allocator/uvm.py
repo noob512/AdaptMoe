@@ -36,6 +36,7 @@ Warning:
 
 import atexit
 import ctypes
+import gc
 import os
 import uuid as uuidlib
 from contextlib import contextmanager
@@ -70,8 +71,10 @@ UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ = 5
 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG = 6
 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED = 7
 UVM_PHASE_F_ACTION_START_BG_PROMOTION = 8
+UVM_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT = 14
 UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16
 UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17
+UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST = 18
 
 UVM_REGION_POOL_UNKNOWN = 0
 UVM_REGION_POOL_KV = 1
@@ -692,6 +695,8 @@ def load_uvm_library() -> ctypes.CDLL:
         "uvm_driver_batch_prepare_remote_read",
         "uvm_driver_batch_prepare_remote_read_bg_deferred",
         "uvm_driver_batch_start_bg_promotion",
+        "uvm_driver_batch_gpu_only_read_dup_soft",
+        "uvm_driver_batch_expert_read_dup_fast",
         "uvm_driver_batch_pause_bg_promotion",
         "uvm_driver_batch_resume_bg_promotion",
     ):
@@ -861,6 +866,36 @@ def ensure_uvm_runtime_library() -> ctypes.CDLL:
         _uvm_lib.uvm_set_prefetch(0)
         _uvm_lib.uvm_set_verbose(0)
     return _uvm_lib
+
+
+def cleanup_uvm_local_memory_pool() -> None:
+    """Drop local UVM MemPool objects before interpreter/CUDA teardown.
+
+    PyTorch's CUDAPluggableAllocator/MemPool destructors can run very late
+    during Python shutdown. Keeping the local UVM allocator cached globally
+    until then has caused process-exit segfaults in isolated microbenchmarks,
+    even after all tensors were explicitly deleted. Clearing the cached pool
+    while CUDA and Python runtime state are still healthy avoids that teardown
+    ordering hazard.
+    """
+    global _uvm_local_allocator, _uvm_local_mem_pool
+
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        logger.debug("Failed to synchronize before UVM local pool cleanup", exc_info=True)
+
+    _uvm_local_mem_pool = None
+    _uvm_local_allocator = None
+    gc.collect()
+
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        logger.debug("Failed to synchronize after UVM local pool cleanup", exc_info=True)
 
 
 @contextmanager
@@ -1240,6 +1275,10 @@ def _phase_f_cpp_helper_name(action: int) -> str | None:
         return "uvm_driver_batch_prepare_remote_read_bg_deferred"
     if action == UVM_PHASE_F_ACTION_START_BG_PROMOTION:
         return "uvm_driver_batch_start_bg_promotion"
+    if action == UVM_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT:
+        return "uvm_driver_batch_gpu_only_read_dup_soft"
+    if action == UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST:
+        return "uvm_driver_batch_expert_read_dup_fast"
     if action == UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION:
         return "uvm_driver_batch_pause_bg_promotion"
     if action == UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION:
@@ -1352,7 +1391,7 @@ def driver_phase_f_batch_execute_ranges(
 
     fd = -1
     try:
-        fd = _open_initialized_uvm_fd()
+        fd = _open_or_adopt_initialized_uvm_fd(prefer_existing=True)
         total_success = 0
         total_failure = 0
         last_rm_status = 0
@@ -2072,6 +2111,34 @@ def driver_start_ranges_bg_promotion(
         ranges,
         UVM_PHASE_F_ACTION_START_BG_PROMOTION,
         device=device,
+    )
+
+
+def driver_gpu_only_read_dup_soft(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    device: int = 0,
+    async_: bool = False,
+) -> tuple[int, int, int, int]:
+    return driver_phase_f_batch_execute_ranges(
+        ranges,
+        UVM_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT,
+        device=device,
+        async_=async_,
+    )
+
+
+def driver_expert_read_dup_fast(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    device: int = 0,
+    async_: bool = False,
+) -> tuple[int, int, int, int]:
+    return driver_phase_f_batch_execute_ranges(
+        ranges,
+        UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST,
+        device=device,
+        async_=async_,
     )
 
 

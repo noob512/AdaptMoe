@@ -939,6 +939,14 @@ class FusedMoE(CustomOp):
             "VLLM_UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE",
             default=False,
         )
+        self.uvm_init_weight_plan_residency_trace_enable = _env_flag_enabled(
+            "VLLM_UVM_INIT_WEIGHT_PLAN_RESIDENCY_TRACE_ENABLE",
+            default=False,
+        )
+        self.uvm_init_weight_plan_residency_trace_max_experts = _env_int(
+            "VLLM_UVM_INIT_WEIGHT_PLAN_RESIDENCY_TRACE_MAX_EXPERTS",
+            default=0,
+        )
         self.uvm_hot_residency_stage_max_num_tokens = _env_int(
             "VLLM_UVM_HOT_RESIDENCY_STAGE_MAX_NUM_TOKENS",
             default=1,
@@ -3004,6 +3012,152 @@ class FusedMoE(CustomOp):
             }
         )
         return payload
+
+    def record_uvm_init_weight_plan_residency(
+        self,
+        marker: str,
+    ) -> dict[str, object] | None:
+        if not self.uvm_init_weight_plan_residency_trace_enable:
+            return None
+
+        layer_id = self._uvm_layer_id()
+        if layer_id is None:
+            return None
+
+        self._refresh_uvm_weight_action_plans()
+        plan_specs = (
+            ("hot", self.uvm_init_weight_hot_plan_keys),
+            ("cold", self.uvm_init_weight_offload_plan_keys),
+        )
+        max_experts = self.uvm_init_weight_plan_residency_trace_max_experts
+        device = self._uvm_hot_residency_query_device()
+        summary: dict[str, object] = {
+            "timestamp": time.time(),
+            "pid": os.getpid(),
+            "layer_name": self.layer_name,
+            "layer_id": layer_id,
+            "action": "init_weight_plan_residency_snapshot",
+            "marker": marker,
+            "device": device,
+            "plan_policy": self.uvm_init_weight_plan_policy,
+        }
+
+        for plan_name, plan_keys in plan_specs:
+            pairs = self._uvm_plan_local_experts(plan_keys)
+            if max_experts > 0:
+                pairs = pairs[:max_experts]
+
+            ranges: list[tuple[int, int]] = []
+            managed_records = 0
+            non_managed_records = 0
+            invalid_records = 0
+            sample_records: list[dict[str, object]] = []
+
+            for global_expert_id, local_expert_id in pairs:
+                for role, ptr, size_bytes in self._uvm_expert_weight_slices(
+                    local_expert_id,
+                    self.uvm_init_weight_offload_target_roles,
+                ):
+                    capable, reason, code = probe_driver_capable_range(
+                        ptr,
+                        size_bytes,
+                    )
+                    if capable:
+                        managed_records += 1
+                        ranges.append((ptr, size_bytes))
+                    elif ptr > 0 and size_bytes > 0:
+                        non_managed_records += 1
+                    else:
+                        invalid_records += 1
+
+                    if len(sample_records) < 8:
+                        sample_records.append(
+                            {
+                                "global_expert_id": global_expert_id,
+                                "local_expert_id": local_expert_id,
+                                "role": role,
+                                "ptr": f"0x{ptr:x}",
+                                "bytes": size_bytes,
+                                "driver_capable": bool(capable),
+                                "driver_capability_reason": reason,
+                                "driver_capability_code": int(code),
+                            }
+                        )
+
+            result: dict[str, object]
+            if ranges:
+                try:
+                    result = driver_batch_query_ranges_residency_bytes(
+                        ranges,
+                        device,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to query %s plan residency for marker=%s",
+                        plan_name,
+                        marker,
+                        exc_info=True,
+                    )
+                    result = {
+                        "ok": False,
+                        "status": -1,
+                        "queried_bytes": 0,
+                        "gpu_bytes": 0,
+                        "cpu_bytes": 0,
+                        "any_bytes": 0,
+                        "unknown_bytes": 0,
+                    }
+            else:
+                result = {
+                    "ok": True,
+                    "status": 0,
+                    "queried_bytes": 0,
+                    "gpu_bytes": 0,
+                    "cpu_bytes": 0,
+                    "any_bytes": 0,
+                    "unknown_bytes": 0,
+                }
+
+            queried_bytes = int(result.get("queried_bytes") or 0)
+            gpu_bytes = int(result.get("gpu_bytes") or 0)
+            cpu_bytes = int(result.get("cpu_bytes") or 0)
+            unknown_bytes = int(result.get("unknown_bytes") or 0)
+            prefix = f"{plan_name}_plan"
+            summary.update(
+                {
+                    f"{prefix}_expert_records": len(pairs),
+                    f"{prefix}_range_records": len(ranges),
+                    f"{prefix}_managed_records": managed_records,
+                    f"{prefix}_non_managed_records": non_managed_records,
+                    f"{prefix}_invalid_records": invalid_records,
+                    f"{prefix}_query_ok": bool(result.get("ok")),
+                    f"{prefix}_query_status": int(result.get("status") or 0),
+                    f"{prefix}_queried_bytes": queried_bytes,
+                    f"{prefix}_gpu_bytes": gpu_bytes,
+                    f"{prefix}_cpu_bytes": cpu_bytes,
+                    f"{prefix}_any_bytes": int(result.get("any_bytes") or 0),
+                    f"{prefix}_unknown_bytes": unknown_bytes,
+                    f"{prefix}_gpu_ratio": (
+                        float(gpu_bytes) / float(queried_bytes)
+                        if queried_bytes
+                        else 0.0
+                    ),
+                    f"{prefix}_cpu_ratio": (
+                        float(cpu_bytes) / float(queried_bytes)
+                        if queried_bytes
+                        else 0.0
+                    ),
+                    f"{prefix}_unknown_ratio": (
+                        float(unknown_bytes) / float(queried_bytes)
+                        if queried_bytes
+                        else 0.0
+                    ),
+                    f"{prefix}_samples": sample_records,
+                }
+            )
+
+        self._append_uvm_init_weight_trace(summary)
+        return summary
 
     def _register_uvm_residency_cold_weight_candidates(
         self,

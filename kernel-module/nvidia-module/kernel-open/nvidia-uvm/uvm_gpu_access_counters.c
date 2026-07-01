@@ -35,6 +35,7 @@
 #include "uvm_perf_module.h"
 #include "uvm_ats.h"
 #include "uvm_ats_faults.h"
+#include "linux/sched.h"
 
 #define UVM_PERF_ACCESS_COUNTER_BATCH_COUNT_MIN     1
 #define UVM_PERF_ACCESS_COUNTER_BATCH_COUNT_DEFAULT 256
@@ -1775,6 +1776,8 @@ static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_count
 
         if (status != NV_OK)
             break;
+
+        cond_resched();
     }
 
     if (va_space) {

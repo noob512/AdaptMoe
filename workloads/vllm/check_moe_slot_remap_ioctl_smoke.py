@@ -34,6 +34,9 @@ MODE_VALUES = {
     "gpu_copy_only": 4,
     "slot_pte_remap": 5,
     "slot_va_block_remap": 6,
+    "slot_va_block_user_backing_remap": 7,
+    "vidmem_prealloc": 8,
+    "gpu_copy_async_submit": 9,
 }
 
 ENTRY_OK = 0
@@ -1017,13 +1020,20 @@ def main() -> int:
     if args.clear_via_release:
         return run_release_parent(args, remap_bytes)
     managed_modes = ("remap", "slot_pte_remap", "slot_va_block_remap")
-    gpu_uuid_modes = ("remap", "gpu_copy_only", "slot_pte_remap", "slot_va_block_remap")
+    gpu_uuid_modes = (
+        "remap",
+        "gpu_copy_only",
+        "gpu_copy_async_submit",
+        "slot_pte_remap",
+        "slot_va_block_remap",
+        "vidmem_prealloc",
+    )
     base = args.base - (args.base % page_size)
     source = None
     target_source = None
     slot_source = None
     reset_needed = args.mode in slot_pte_modes
-    if args.mode in ("copy_only", "gpu_copy_only") and args.count > 0:
+    if args.mode in ("copy_only", "gpu_copy_only", "gpu_copy_async_submit", "vidmem_prealloc") and args.count > 0:
         source = mmap.mmap(-1, args.count * remap_bytes)
         source.write(bytes((index % 251 for index in range(args.count * remap_bytes))))
         source.seek(0)
@@ -1216,7 +1226,14 @@ def main() -> int:
         if args.mode in slot_pte_modes:
             result["slot_pool_after_slot_pte_remap"] = query_slot_pool(fd)
 
-        if args.mode in ("dry_run", "validate", "copy_only", "gpu_copy_only") and not args.validate_managed:
+        if args.mode in (
+            "dry_run",
+            "validate",
+            "copy_only",
+            "gpu_copy_only",
+            "gpu_copy_async_submit",
+            "vidmem_prealloc",
+        ) and not args.validate_managed:
             passed = (
                 remap_ret == 0
                 and int(params.rmStatus) == 0

@@ -1019,6 +1019,21 @@ NV_STATUS uvm_va_block_clear_gpu_only_soft(uvm_va_block_t *va_block,
                                            uvm_va_block_region_t region,
                                            NvU32 *cleared_pages_out);
 
+// Expert-weight read-copy fast path. This copies CPU-resident managed pages to
+// the destination GPU as read duplicates and maps them read-only locally. It is
+// intended for policy code which has already validated the range semantics.
+//
+// LOCKING: The caller must hold the va_block lock. If va_block_context->mm !=
+//          NULL, va_block_context->mm->mmap_lock must be held in at least read
+//          mode.
+NV_STATUS uvm_va_block_promote_read_duplicate_now(uvm_va_block_t *va_block,
+                                                  uvm_va_block_retry_t *retry,
+                                                  uvm_va_block_context_t *block_context,
+                                                  uvm_gpu_id_t gpu_id,
+                                                  uvm_va_block_region_t region,
+                                                  bool wait_for_gpu_mapping,
+                                                  NvU32 *committed_pages_out);
+
 // Like uvm_va_block_map, except it maps all processors in the input mask. The
 // VA block tracker contains all map operations on return.
 //
@@ -1506,6 +1521,23 @@ NV_STATUS uvm_va_block_map_moe_slot_readonly(uvm_va_block_t *va_block,
                                              uvm_mem_t *slot_mem,
                                              NvU64 slot_offset,
                                              uvm_tracker_t *out_tracker);
+
+// Experimental MoE user-backing readonly GPU mapping. This writes target block
+// PTEs to physical pages from backing_va_block. The backing pages must already
+// be resident on gpu. This is intended for route-time async H2D into managed
+// backing memory followed by a kernel-boundary remap.
+//
+// Locking: the target va_block lock must be held. The backing block lock must
+// be held. The va_space lock must be held.
+NV_STATUS uvm_va_block_map_moe_user_backing_readonly(uvm_va_block_t *target_va_block,
+                                                     uvm_va_block_context_t *block_context,
+                                                     uvm_gpu_t *gpu,
+                                                     uvm_va_block_region_t target_region,
+                                                     const uvm_page_mask_t *target_page_mask,
+                                                     uvm_va_block_t *backing_va_block,
+                                                     NvU64 backing_va_base,
+                                                     NvBool defer_tlb_invalidate,
+                                                     uvm_tracker_t *out_tracker);
 
 // Clears MoE slot-backed mappings previously installed by
 // uvm_va_block_map_moe_slot_readonly().

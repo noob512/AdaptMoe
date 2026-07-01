@@ -164,6 +164,49 @@ MODULE_PARM_DESC(uvm_enable_va_space_mm,
                  "will also disable pageable memory access via either ATS or "
                  "HMM.");
 
+static void uvm_va_space_mm_record_retain_debug_locked(uvm_va_space_mm_t *va_space_mm,
+                                                       bool release,
+                                                       NvU32 retained_count,
+                                                       const void *caller)
+{
+    NvU32 index = va_space_mm->retain_debug_next++ % UVM_VA_SPACE_MM_RETAIN_DEBUG_SLOTS;
+
+    va_space_mm->retain_debug[index].pid = current->pid;
+    va_space_mm->retain_debug[index].retained_count = retained_count;
+    va_space_mm->retain_debug[index].release = release;
+    va_space_mm->retain_debug[index].caller = caller;
+    strscpy(va_space_mm->retain_debug[index].comm,
+            current->comm,
+            sizeof(va_space_mm->retain_debug[index].comm));
+}
+
+static void uvm_va_space_mm_dump_retain_debug(uvm_va_space_t *va_space)
+{
+    uvm_va_space_mm_t *va_space_mm = &va_space->va_space_mm;
+    NvU32 i;
+
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm retain history va_space=%px retained=%u next=%u\n",
+                   va_space,
+                   va_space_mm->retained_count,
+                   va_space_mm->retain_debug_next);
+
+    for (i = 0; i < UVM_VA_SPACE_MM_RETAIN_DEBUG_SLOTS; ++i) {
+        const NvU32 index = (va_space_mm->retain_debug_next + i) % UVM_VA_SPACE_MM_RETAIN_DEBUG_SLOTS;
+        const typeof(va_space_mm->retain_debug[0]) *entry = &va_space_mm->retain_debug[index];
+
+        if (!entry->caller)
+            continue;
+
+        UVM_INFO_PRINT("MoE controlled remap debug: retain_history idx=%u op=%s pid=%u comm=%s retained=%u caller=%pS\n",
+                       index,
+                       entry->release ? "release" : "retain",
+                       entry->pid,
+                       entry->comm,
+                       entry->retained_count,
+                       entry->caller);
+    }
+}
+
 bool uvm_va_space_mm_enabled_system(void)
 {
     return UVM_CAN_USE_MMU_NOTIFIERS() && uvm_enable_va_space_mm;
@@ -243,8 +286,6 @@ struct mm_struct *uvm_va_space_mm_retain(uvm_va_space_t *va_space)
 {
     uvm_va_space_mm_t *va_space_mm = &va_space->va_space_mm;
     struct mm_struct *mm = NULL;
-    void *caller = __builtin_return_address(0);
-    NvU32 retained_count = 0;
 
     if (!uvm_va_space_mm_enabled(va_space))
         return NULL;
@@ -255,7 +296,10 @@ struct mm_struct *uvm_va_space_mm_retain(uvm_va_space_t *va_space)
         goto out;
 
     ++va_space_mm->retained_count;
-    retained_count = va_space_mm->retained_count;
+    uvm_va_space_mm_record_retain_debug_locked(va_space_mm,
+                                               false,
+                                               va_space_mm->retained_count,
+                                               __builtin_return_address(0));
 
     mm = va_space_mm->mm;
     UVM_ASSERT(mm);
@@ -267,16 +311,6 @@ out:
         UVM_ASSERT(atomic_read(&mm->mm_users) > 0);
 
     uvm_spin_unlock(&va_space_mm->lock);
-
-    if (mm) {
-        UVM_INFO_PRINT("MoE controlled remap debug: mm_retain va_space=%px mm=%px pid=%d comm=%s retained=%u caller=%pS\n",
-                       va_space,
-                       mm,
-                       current->pid,
-                       current->comm,
-                       retained_count,
-                       caller);
-    }
 
     return mm;
 }
@@ -307,7 +341,6 @@ struct mm_struct *uvm_va_space_mm_or_current_retain(uvm_va_space_t *va_space)
 void uvm_va_space_mm_release(uvm_va_space_t *va_space)
 {
     uvm_va_space_mm_t *va_space_mm = &va_space->va_space_mm;
-    void *caller = __builtin_return_address(0);
     NvU32 retained_count;
     struct mm_struct *mm;
     NvBool wake_waiters;
@@ -322,36 +355,21 @@ void uvm_va_space_mm_release(uvm_va_space_t *va_space)
     UVM_ASSERT(va_space_mm->retained_count > 0);
     --va_space_mm->retained_count;
     retained_count = va_space_mm->retained_count;
+    uvm_va_space_mm_record_retain_debug_locked(va_space_mm,
+                                               true,
+                                               retained_count,
+                                               __builtin_return_address(0));
     mm = va_space_mm->mm;
     wake_waiters = retained_count == 0 && !uvm_va_space_mm_alive(va_space_mm);
 
     // If we're the last retainer on a dead mm, signal any potential waiters
-    if (wake_waiters) {
-        uvm_spin_unlock(&va_space_mm->lock);
+    uvm_spin_unlock(&va_space_mm->lock);
 
-        UVM_INFO_PRINT("MoE controlled remap debug: mm_release va_space=%px mm=%px pid=%d comm=%s retained=%u caller=%pS\n",
-                       va_space,
-                       mm,
-                       current->pid,
-                       current->comm,
-                       retained_count,
-                       caller);
-
-        // There could be a thread in uvm_va_space_mm_shutdown()
-        // waiting on us, so wake it up.
+    // There could be a thread in uvm_va_space_mm_shutdown() waiting on us, so
+    // wake it up. Keep the hot retain/release path quiet: replayable fault and
+    // eviction service can call this thousands of times per second.
+    if (wake_waiters)
         wake_up(&va_space_mm->last_retainer_wait_queue);
-    }
-    else {
-        uvm_spin_unlock(&va_space_mm->lock);
-
-        UVM_INFO_PRINT("MoE controlled remap debug: mm_release va_space=%px mm=%px pid=%d comm=%s retained=%u caller=%pS\n",
-                       va_space,
-                       mm,
-                       current->pid,
-                       current->comm,
-                       retained_count,
-                       caller);
-    }
 }
 
 void uvm_va_space_mm_or_current_release(uvm_va_space_t *va_space, struct mm_struct *mm)
@@ -374,6 +392,20 @@ static void uvm_va_space_mm_shutdown(uvm_va_space_t *va_space)
     UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown enter va_space=%px retained=%u\n",
                    va_space,
                    va_space_mm->retained_count);
+    if (va_space_mm->retained_count != 0)
+        uvm_va_space_mm_dump_retain_debug(va_space);
+
+    // In controlled-remap/vLLM stress, replayable faults may keep arriving
+    // while teardown is trying to become the VA-space writer. Stop channels
+    // first under the RM-safe read path so the later write lock has a bounded
+    // set of readers to wait for.
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown pre_stop_channels begin va_space=%px\n", va_space);
+    uvm_va_space_down_read_rm(va_space);
+    if (!atomic_read(&va_space->user_channels_stopped))
+        uvm_va_space_stop_all_user_channels(va_space);
+    uvm_va_space_up_read_rm(va_space);
+    UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown pre_stop_channels end va_space=%px\n", va_space);
+
     UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown down_write begin va_space=%px\n", va_space);
     uvm_va_space_down_write(va_space);
     UVM_INFO_PRINT("MoE controlled remap debug: va_space_mm_shutdown down_write end va_space=%px\n", va_space);

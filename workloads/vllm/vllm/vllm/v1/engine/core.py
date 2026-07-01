@@ -99,6 +99,20 @@ class EngineCore:
         self.log_stats = log_stats
 
         # Setup Model.
+        self.structured_output_manager = None
+        if os.environ.get(
+            "VLLM_UVM_CONTROLLED_REMAP_EARLY_STRUCTURED_OUTPUT_MANAGER"
+        ) == "1":
+            logger.info(
+                "UVM controlled remap boundary: "
+                "early structured_output_manager begin"
+            )
+            self.structured_output_manager = StructuredOutputManager(vllm_config)
+            logger.info(
+                "UVM controlled remap boundary: "
+                "early structured_output_manager end"
+            )
+
         logger.info("UVM controlled remap boundary: executor_class init begin")
         self.model_executor = executor_class(vllm_config)
         logger.info("UVM controlled remap boundary: executor_class init end")
@@ -133,9 +147,15 @@ class EngineCore:
             )
             logger.info("UVM controlled remap boundary: initialize_cache RPC end")
 
-        logger.info("UVM controlled remap boundary: structured_output_manager begin")
-        self.structured_output_manager = StructuredOutputManager(vllm_config)
-        logger.info("UVM controlled remap boundary: structured_output_manager end")
+        if self.structured_output_manager is None:
+            logger.info("UVM controlled remap boundary: structured_output_manager begin")
+            self.structured_output_manager = StructuredOutputManager(vllm_config)
+            logger.info("UVM controlled remap boundary: structured_output_manager end")
+        else:
+            logger.info(
+                "UVM controlled remap boundary: "
+                "structured_output_manager already initialized"
+            )
 
         # Setup scheduler.
         Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
@@ -666,6 +686,7 @@ class EngineCoreProc(EngineCore):
                 ),
                 daemon=True,
             )
+            logger.info("UVM controlled remap boundary: EngineCore input thread start begin")
             input_thread.start()
             logger.info("UVM controlled remap boundary: EngineCore input thread started")
 
@@ -678,6 +699,7 @@ class EngineCoreProc(EngineCore):
                 ),
                 daemon=True,
             )
+            logger.info("UVM controlled remap boundary: EngineCore output thread start begin")
             self.output_thread.start()
             logger.info("UVM controlled remap boundary: EngineCore output thread started")
 

@@ -45,6 +45,24 @@ class CUDAGraphMetaData:
     outputs: Any | None = None
 
 
+def _slice_moe_token_trace_metadata(
+    metadata: dict[str, Any] | None,
+    token_slice: slice,
+) -> dict[str, Any] | None:
+    if metadata is None:
+        return None
+
+    sliced = dict(metadata)
+    for key in ("request_indices", "request_ids", "token_positions", "token_ids"):
+        values = metadata.get(key)
+        if isinstance(values, list):
+            sliced[key] = values[token_slice]
+    parent_offset = int(metadata.get("token_slice_offset") or 0)
+    sliced["token_slice_offset"] = parent_offset + int(token_slice.start or 0)
+    sliced["num_actual_tokens"] = len(sliced.get("request_ids") or [])
+    return sliced
+
+
 class SMControlContextManager:
     def __init__(
         self,
@@ -304,6 +322,9 @@ class UBatchWrapper:
     ) -> list[UbatchMetadata]:
         # Create one forward context per ubatch
         forward_contexts = []
+        parent_moe_token_trace_metadata = (
+            get_forward_context().moe_token_trace_metadata
+        )
         for i, ubatch_slice in enumerate(ubatch_slices):
             forward_contexts.append(
                 create_forward_context(
@@ -312,6 +333,10 @@ class UBatchWrapper:
                     dp_metadata=dp_metadata,
                     batch_descriptor=batch_descriptor,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    moe_token_trace_metadata=_slice_moe_token_trace_metadata(
+                        parent_moe_token_trace_metadata,
+                        ubatch_slice.token_slice,
+                    ),
                 )
             )
 

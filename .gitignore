@@ -13,6 +13,14 @@
 .venv/
 venv/
 
+# Global: Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # Global: build output directories
 build/
 dist/

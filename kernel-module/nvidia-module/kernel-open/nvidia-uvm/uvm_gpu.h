@@ -443,6 +443,12 @@ typedef struct
 
             NvU64 num_phase_n_expert_migrate_fastpath_fallbacks;
 
+            NvU64 num_phase_n_expert_prefetch_waits;
+
+            NvU64 num_phase_n_expert_prefetch_wait_successes;
+
+            NvU64 num_phase_n_expert_prefetch_wait_timeouts;
+
             NvU64 num_phase_n_non_expert_managed_dispatches;
 
             NvU64 num_phase_n_non_expert_managed_faults_serviced;

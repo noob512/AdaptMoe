@@ -202,6 +202,16 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+def _moe_token_expert_trace_enabled() -> bool:
+    for env_name in (
+        "VLLM_MOE_TOKEN_EXPERT_TRACE_ENABLE",
+        "VLLM_QWEN3_MOE_EXPERT_TRACE_ENABLE",
+    ):
+        if os.environ.get(env_name, "0").lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -497,6 +507,7 @@ class GPUModelRunner(
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.positions = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
+        self._moe_token_trace_metadata: dict[str, Any] | None = None
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -1266,6 +1277,59 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def _make_moe_token_trace_metadata(
+        self,
+        *,
+        req_indices: np.ndarray,
+        positions_np: np.ndarray,
+        num_scheduled_tokens: np.ndarray,
+        cu_num_tokens: np.ndarray,
+        total_num_scheduled_tokens: int,
+        num_reqs: int,
+    ) -> dict[str, Any] | None:
+        if not _moe_token_expert_trace_enabled():
+            return None
+
+        try:
+            req_ids_by_index = list(self.input_batch.req_ids[:num_reqs])
+            request_indices = [
+                int(value) for value in req_indices[:total_num_scheduled_tokens]
+            ]
+            request_ids = [
+                req_ids_by_index[req_index]
+                if 0 <= req_index < len(req_ids_by_index)
+                else None
+                for req_index in request_indices
+            ]
+            input_token_ids = self.input_ids.cpu[:total_num_scheduled_tokens].tolist()
+            return {
+                "source": "gpu_model_runner",
+                "pid": os.getpid(),
+                "num_reqs": int(num_reqs),
+                "num_actual_tokens": int(total_num_scheduled_tokens),
+                "req_ids_by_index": req_ids_by_index,
+                "request_indices": request_indices,
+                "request_ids": request_ids,
+                "token_positions": [
+                    int(value) for value in positions_np[:total_num_scheduled_tokens]
+                ],
+                "token_ids": [int(value) for value in input_token_ids],
+                "num_scheduled_tokens": [
+                    int(value) for value in num_scheduled_tokens[:num_reqs]
+                ],
+                "num_computed_tokens": [
+                    int(value)
+                    for value in self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                ],
+                "query_start_loc": [0]
+                + [int(value) for value in cu_num_tokens[:num_reqs]],
+            }
+        except Exception:
+            logger.debug(
+                "Failed to build MoE token expert trace metadata", exc_info=True
+            )
+            return None
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1287,6 +1351,7 @@ class GPUModelRunner(
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        self._moe_token_trace_metadata = None
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -1335,6 +1400,14 @@ class GPUModelRunner(
             0,
             token_indices_tensor,
             out=self.input_ids.cpu[:total_num_scheduled_tokens],
+        )
+        self._moe_token_trace_metadata = self._make_moe_token_trace_metadata(
+            req_indices=req_indices,
+            positions_np=positions_np,
+            num_scheduled_tokens=num_scheduled_tokens,
+            cu_num_tokens=cu_num_tokens,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
+            num_reqs=num_reqs,
         )
         if self.enable_prompt_embeds:
             is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
@@ -3075,6 +3148,7 @@ class GPUModelRunner(
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_descriptor,
                 ubatch_slices=ubatch_slices,
+                moe_token_trace_metadata=self._moe_token_trace_metadata,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,

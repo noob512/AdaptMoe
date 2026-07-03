@@ -5,6 +5,7 @@
 import functools
 import json
 import os
+import atexit
 from collections.abc import Callable
 from typing import Any
 
@@ -57,6 +58,186 @@ from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 from vllm.utils.torch_utils import direct_register_custom_op, is_torch_equal_or_newer
 
 logger = init_logger(__name__)
+
+_MOE_REMOTE_REUSE_TRACE_ENABLED = os.environ.get(
+    "VLLM_MOE_REMOTE_REUSE_TRACE_STDOUT", ""
+).strip().lower() in ("1", "true", "yes", "on")
+_MOE_REMOTE_REUSE_TRACE_TOPK = int(os.environ.get("VLLM_MOE_REMOTE_REUSE_TRACE_TOPK", "8"))
+_MOE_REMOTE_REUSE_TRACE_TARGET_ASSIGNMENTS = int(
+    os.environ.get("VLLM_MOE_REMOTE_REUSE_TRACE_TARGET_ASSIGNMENTS", "0")
+)
+_MOE_REMOTE_REUSE_TRACE_RECORDS: list[dict[str, Any]] = []
+
+
+def _trace_percentile(values: list[int], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * q)))
+    return float(ordered[idx])
+
+
+def _trace_int_summary(values: list[int]) -> dict[str, float]:
+    if not values:
+        return {"count": 0.0, "mean": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
+    return {
+        "count": float(len(values)),
+        "mean": float(sum(values)) / float(len(values)),
+        "p50": _trace_percentile(values, 0.50),
+        "p95": _trace_percentile(values, 0.95),
+        "max": float(max(values)),
+    }
+
+
+def _record_moe_remote_reuse_trace(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    config: dict[str, Any],
+) -> None:
+    if not _MOE_REMOTE_REUSE_TRACE_ENABLED:
+        return
+
+    try:
+        block_m = int(config["BLOCK_SIZE_M"])
+        padded_tokens = int(num_tokens_post_padded.item())
+        valid_m_blocks = triton.cdiv(padded_tokens, block_m)
+        valid_expert_ids = expert_ids[:valid_m_blocks].detach().to("cpu")
+        sorted_ids = sorted_token_ids[:padded_tokens].detach().to("cpu")
+        num_valid_tokens = int(A.size(0) * top_k)
+        phase = "w13" if top_k == _MOE_REMOTE_REUSE_TRACE_TOPK else "w2"
+
+        m_blocks_by_expert: dict[int, int] = {}
+        assignments_by_expert: dict[int, int] = {}
+        total_assignments = 0
+
+        for block_idx, expert_tensor in enumerate(valid_expert_ids):
+            expert = int(expert_tensor.item())
+            if expert < 0:
+                continue
+
+            block_start = block_idx * block_m
+            block_end = min(block_start + block_m, int(sorted_ids.numel()))
+            token_block = sorted_ids[block_start:block_end]
+            valid_tokens = int((token_block < num_valid_tokens).sum().item())
+            if valid_tokens <= 0:
+                continue
+
+            m_blocks_by_expert[expert] = m_blocks_by_expert.get(expert, 0) + 1
+            assignments_by_expert[expert] = assignments_by_expert.get(expert, 0) + valid_tokens
+            total_assignments += valid_tokens
+
+        m_blocks = list(m_blocks_by_expert.values())
+        assignments = list(assignments_by_expert.values())
+        _MOE_REMOTE_REUSE_TRACE_RECORDS.append({
+            "phase": phase,
+            "top_k": int(top_k),
+            "B_shape": tuple(int(x) for x in B.shape),
+            "B_mib_per_expert": float(B[0].numel() * B.element_size() / (1024**2)),
+            "block_m": block_m,
+            "active_experts": len(m_blocks),
+            "total_assignments": total_assignments,
+            "m_blocks": m_blocks,
+            "assignments": assignments,
+            "max_m_blocks": max(m_blocks) if m_blocks else 0,
+            "repeated_experts": sum(1 for value in m_blocks if value > 1),
+            "repeated_extra_m_blocks": sum(value - 1 for value in m_blocks if value > 1),
+        })
+    except Exception as exc:
+        logger.warning("MoE remote reuse trace failed: %s", exc)
+
+
+def _record_moe_batched_remote_reuse_trace(
+    B: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    config: dict[str, Any],
+    phase: str,
+) -> None:
+    if not _MOE_REMOTE_REUSE_TRACE_ENABLED:
+        return
+
+    try:
+        block_m = int(config["BLOCK_SIZE_M"])
+        tokens_by_expert = expert_num_tokens.detach().to("cpu")
+
+        m_blocks: list[int] = []
+        assignments: list[int] = []
+        total_assignments = 0
+        for tokens_tensor in tokens_by_expert:
+            tokens = int(tokens_tensor.item())
+            if tokens <= 0:
+                continue
+
+            assignments.append(tokens)
+            m_blocks.append(triton.cdiv(tokens, block_m))
+            total_assignments += tokens
+
+        _MOE_REMOTE_REUSE_TRACE_RECORDS.append({
+            "phase": phase,
+            "top_k": _MOE_REMOTE_REUSE_TRACE_TOPK if phase == "w13" else 1,
+            "trace_path": "batched_triton",
+            "B_shape": tuple(int(x) for x in B.shape),
+            "B_mib_per_expert": float(B[0].numel() * B.element_size() / (1024**2)),
+            "block_m": block_m,
+            "active_experts": len(m_blocks),
+            "total_assignments": total_assignments,
+            "m_blocks": m_blocks,
+            "assignments": assignments,
+            "max_m_blocks": max(m_blocks) if m_blocks else 0,
+            "repeated_experts": sum(1 for value in m_blocks if value > 1),
+            "repeated_extra_m_blocks": sum(value - 1 for value in m_blocks if value > 1),
+        })
+    except Exception as exc:
+        logger.warning("Batched MoE remote reuse trace failed: %s", exc)
+
+
+def _print_moe_remote_reuse_trace_summary() -> None:
+    if not _MOE_REMOTE_REUSE_TRACE_ENABLED:
+        return
+
+    records = _MOE_REMOTE_REUSE_TRACE_RECORDS
+    target = _MOE_REMOTE_REUSE_TRACE_TARGET_ASSIGNMENTS
+    filtered = [
+        record for record in records
+        if target <= 0 or int(record["total_assignments"]) == target
+    ]
+    print("MOE_REMOTE_REUSE_TRACE_SUMMARY", flush=True)
+    print(f"  total_records={len(records)} filtered_records={len(filtered)} target_assignments={target}", flush=True)
+
+    for phase in ("w13", "w2"):
+        phase_records = [record for record in filtered if record["phase"] == phase]
+        active_experts = [int(record["active_experts"]) for record in phase_records]
+        max_m_blocks = [int(record["max_m_blocks"]) for record in phase_records]
+        repeated_experts = [int(record["repeated_experts"]) for record in phase_records]
+        repeated_extra = [int(record["repeated_extra_m_blocks"]) for record in phase_records]
+        assignments: list[int] = []
+        m_blocks: list[int] = []
+        for record in phase_records:
+            assignments.extend(int(value) for value in record["assignments"])
+            m_blocks.extend(int(value) for value in record["m_blocks"])
+
+        one_block = sum(1 for value in m_blocks if value == 1)
+        total_expert_uses = len(m_blocks)
+        one_block_pct = (100.0 * one_block / total_expert_uses) if total_expert_uses else 0.0
+
+        print(f"  phase={phase}", flush=True)
+        print(f"    layers={len(phase_records)} active_experts={_trace_int_summary(active_experts)}", flush=True)
+        print(f"    assignments_per_active_expert={_trace_int_summary(assignments)}", flush=True)
+        print(f"    m_blocks_per_active_expert={_trace_int_summary(m_blocks)}", flush=True)
+        print(
+            "    repeated_address_ranges "
+            f"layers_with_max_m_blocks_gt1={sum(1 for value in max_m_blocks if value > 1)} "
+            f"repeated_experts_total={sum(repeated_experts)} "
+            f"repeated_extra_m_blocks_total={sum(repeated_extra)}",
+            flush=True,
+        )
+        print(f"    one_mblock_fraction={one_block}/{total_expert_uses} ({one_block_pct:.2f}%)", flush=True)
+
+
+atexit.register(_print_moe_remote_reuse_trace_summary)
 
 
 @triton.jit
@@ -594,6 +775,15 @@ def invoke_fused_moe_kernel(
         # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
         # and we can skip some invalid blocks.
         EM = min(sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"])
+    _record_moe_remote_reuse_trace(
+        A,
+        B,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        config,
+    )
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),

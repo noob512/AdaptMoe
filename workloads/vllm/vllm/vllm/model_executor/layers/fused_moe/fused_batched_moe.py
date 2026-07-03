@@ -6,7 +6,10 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-from vllm.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_config
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    _record_moe_batched_remote_reuse_trace,
+    try_get_optimal_moe_config,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
     TopKWeightAndReduceNaiveBatched,
@@ -956,6 +959,7 @@ class BatchedTritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         a1q_scale = normalize_batched_scales_shape(a1q_scale, E)
 
         # MM1
+        _record_moe_batched_remote_reuse_trace(w1, expert_num_tokens, config, "w13")
         invoke_moe_batched_triton_kernel(
             A=hidden_states,
             B=w1,
@@ -994,6 +998,7 @@ class BatchedTritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             self.block_shape,
         )
 
+        _record_moe_batched_remote_reuse_trace(w2, expert_num_tokens, config, "w2")
         invoke_moe_batched_triton_kernel(
             A=qintermediate_cache2,
             B=w2,

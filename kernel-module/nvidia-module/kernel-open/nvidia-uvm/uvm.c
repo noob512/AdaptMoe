@@ -372,6 +372,16 @@ module_param(uvm_phase_n_block_quota_trace_only, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_phase_n_block_quota_trace_only,
                  "Keep Stage N block quota in trace/accounting-only mode. Default: 1.");
 
+static int uvm_phase_n_admission_enable __read_mostly = 0;
+module_param(uvm_phase_n_admission_enable, int, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_admission_enable,
+                 "Enable Stage N pre-allocation GPU residency admission checks. Default: 0.");
+
+static unsigned uvm_phase_n_admission_trace_only __read_mostly = 1;
+module_param(uvm_phase_n_admission_trace_only, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_admission_trace_only,
+                 "Keep Stage N admission in trace-only mode. If 0, over-budget tagged KV/WEIGHT blocks are denied. Default: 1.");
+
 static int uvm_phase_n_native_block_enable __read_mostly = 0;
 module_param(uvm_phase_n_native_block_enable, int, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_phase_n_native_block_enable,
@@ -1322,6 +1332,96 @@ static void uvm_phase_n_native_mark_block_resident(uvm_va_space_t *va_space,
                           budget_blocks,
                           materialized_blocks,
                           over_blocks);
+}
+
+NV_STATUS uvm_phase_n_admit_gpu_chunk(uvm_va_space_t *va_space,
+                                      uvm_va_block_t *va_block,
+                                      uvm_va_block_region_t chunk_region,
+                                      uvm_processor_id_t dest_id,
+                                      NvU64 chunk_bytes)
+{
+    uvm_phase_n_block_pool_t *block_pool;
+    unsigned long irq_flags;
+    NvU64 resident_blocks;
+    NvU64 budget_blocks;
+    NvU64 projected_blocks;
+    NvU64 over_blocks;
+    NvBool new_resident_block;
+    NvBool would_deny;
+    NvU32 pool;
+    NV_STATUS status = NV_OK;
+
+    if (!uvm_phase_n_admission_enable)
+        return NV_OK;
+
+    if (!uvm_phase_n_native_fast_path_enabled())
+        return NV_OK;
+
+    if (!UVM_ID_IS_GPU(dest_id))
+        return NV_OK;
+
+    if (!va_block || !va_block->managed_range)
+        return NV_OK;
+
+    uvm_assert_mutex_locked(&va_block->lock);
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    if (!va_block->phase_n.tag_valid && va_block->managed_range->phase_n_tag.valid)
+        uvm_phase_n_va_block_copy_tag(va_block, &va_block->managed_range->phase_n_tag);
+
+    if (!va_block->phase_n.tag_valid ||
+        va_block->phase_n.mixed_pool ||
+        !uvm_phase_n_native_pool_supported(va_block->phase_n.pool)) {
+        return NV_OK;
+    }
+
+    pool = va_block->phase_n.pool;
+    block_pool = &va_space->phase_n_block_pools[pool];
+
+    spin_lock_irqsave(&va_space->phase_n_native_block_pool_locks[pool], irq_flags);
+
+    resident_blocks = block_pool->resident_blocks;
+    budget_blocks = block_pool->budget_blocks;
+    new_resident_block = !va_block->phase_n.gpu_resident;
+    projected_blocks = resident_blocks + (new_resident_block ? 1 : 0);
+    over_blocks = budget_blocks > 0 && projected_blocks > budget_blocks ?
+                      projected_blocks - budget_blocks :
+                      0;
+    would_deny = over_blocks > 0;
+
+    if (would_deny) {
+        ++block_pool->quota_over_events;
+        block_pool->max_over_blocks = max(block_pool->max_over_blocks, over_blocks);
+        va_space->phase_n_pools[pool].over_budget_events = block_pool->quota_over_events;
+        va_space->phase_n_pools[pool].over_budget_bytes = over_blocks * UVM_VA_BLOCK_SIZE;
+        va_space->phase_n_pools[pool].reclaim_target_bytes = over_blocks * UVM_VA_BLOCK_SIZE;
+
+        if (!uvm_phase_n_admission_trace_only)
+            status = NV_ERR_NO_MEMORY;
+    }
+
+    spin_unlock_irqrestore(&va_space->phase_n_native_block_pool_locks[pool], irq_flags);
+
+    uvm_phase_f_route_log("phase_n_admission pool=%u region_id=%llu block=0x%llx block_start=0x%llx block_end=0x%llx chunk_start=0x%llx chunk_end=0x%llx chunk_bytes=%llu gpu_id=%u resident_blocks=%llu budget_blocks=%llu projected_blocks=%llu over_blocks=%llu new_resident_block=%u trace_only=%u would_deny=%u status=%u\n",
+                          pool,
+                          va_block->phase_n.region_id,
+                          (NvU64)(uintptr_t)va_block,
+                          va_block->start,
+                          va_block->end,
+                          uvm_va_block_region_start(va_block, chunk_region),
+                          uvm_va_block_region_end(va_block, chunk_region),
+                          chunk_bytes,
+                          uvm_id_value(dest_id),
+                          resident_blocks,
+                          budget_blocks,
+                          projected_blocks,
+                          over_blocks,
+                          new_resident_block ? 1 : 0,
+                          uvm_phase_n_admission_trace_only ? 1 : 0,
+                          would_deny ? 1 : 0,
+                          status);
+
+    return status;
 }
 
 static void uvm_phase_n_native_clear_block(uvm_va_space_t *va_space,

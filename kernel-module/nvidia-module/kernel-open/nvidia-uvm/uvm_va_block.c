@@ -114,6 +114,21 @@ module_param(uvm_latency_bg_promote_reschedule_delay_ms, uint, S_IRUGO | S_IWUSR
 MODULE_PARM_DESC(uvm_latency_bg_promote_reschedule_delay_ms,
                  "Delay between read-only background promotion worker passes when pending work remains. Default: 0.");
 
+unsigned uvm_phase_n_expert_prefetch_wait_enable __read_mostly = 0;
+module_param(uvm_phase_n_expert_prefetch_wait_enable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_expert_prefetch_wait_enable,
+                 "Let expert-tagged replayable faults wait for in-flight API prefetch instead of migrating. Default: 0.");
+
+unsigned uvm_phase_n_expert_prefetch_wait_timeout_ms __read_mostly = 10;
+module_param(uvm_phase_n_expert_prefetch_wait_timeout_ms, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_expert_prefetch_wait_timeout_ms,
+                 "Timeout for expert prefetch-pending waits before falling back to normal fault service. Default: 10 ms.");
+
+static unsigned uvm_phase_n_fault_prefetch_disable __read_mostly = 0;
+module_param(uvm_phase_n_fault_prefetch_disable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_fault_prefetch_disable,
+                 "Disable software prefetch expansion from replayable fault service. Default: 0.");
+
 static unsigned uvm_stage_a_cpu_fault_observe_enable __read_mostly = 0;
 module_param(uvm_stage_a_cpu_fault_observe_enable, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_stage_a_cpu_fault_observe_enable,
@@ -159,6 +174,7 @@ static atomic64_t g_uvm_latency_bg_promote_resume_calls = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_latency_bg_promote_paused_blocks = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_latency_bg_promote_resumed_blocks = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_latency_bg_promote_gate_skips = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_phase_n_fault_prefetch_suppressed = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_cpu_faults_total = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_cpu_faults_registered = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_cpu_faults_candidate = ATOMIC64_INIT(0);
@@ -265,6 +281,8 @@ void uvm_va_block_print_latency_stats(struct seq_file *s)
                          (NvU64)atomic64_read(&g_uvm_latency_bg_promote_resumed_blocks));
     UVM_SEQ_OR_DBG_PRINT(s, "bg_promote_gate_skips           %llu\n",
                          (NvU64)atomic64_read(&g_uvm_latency_bg_promote_gate_skips));
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_fault_prefetch_suppressed %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_phase_n_fault_prefetch_suppressed));
     UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_total        %llu\n",
                          (NvU64)atomic64_read(&g_uvm_stage_a_cpu_faults_total));
     UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_registered   %llu\n",
@@ -370,6 +388,7 @@ void uvm_va_block_reset_latency_stats(void)
     atomic64_set(&g_uvm_latency_bg_promote_paused_blocks, 0);
     atomic64_set(&g_uvm_latency_bg_promote_resumed_blocks, 0);
     atomic64_set(&g_uvm_latency_bg_promote_gate_skips, 0);
+    atomic64_set(&g_uvm_phase_n_fault_prefetch_suppressed, 0);
     atomic64_set(&g_uvm_stage_a_cpu_faults_total, 0);
     atomic64_set(&g_uvm_stage_a_cpu_faults_registered, 0);
     atomic64_set(&g_uvm_stage_a_cpu_faults_candidate, 0);
@@ -1568,6 +1587,116 @@ static void uvm_va_block_free(uvm_va_block_t *block)
     }
 }
 
+void uvm_va_block_expert_prefetch_mark_pending(uvm_va_block_t *va_block,
+                                               uvm_processor_id_t dst_id,
+                                               uvm_va_block_region_t region)
+{
+    uvm_page_mask_t pending_pages;
+
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (!uvm_phase_n_expert_prefetch_wait_enable || !UVM_ID_IS_GPU(dst_id))
+        return;
+
+    uvm_page_mask_init_from_region(&pending_pages, region, NULL);
+    uvm_page_mask_or(&va_block->phase_n_expert_prefetch.pages,
+                     &va_block->phase_n_expert_prefetch.pages,
+                     &pending_pages);
+    va_block->phase_n_expert_prefetch.dst_id = dst_id;
+    WRITE_ONCE(va_block->phase_n_expert_prefetch.submitted, false);
+    WRITE_ONCE(va_block->phase_n_expert_prefetch.active, true);
+}
+
+void uvm_va_block_expert_prefetch_mark_submitted(uvm_va_block_t *va_block,
+                                                 uvm_processor_id_t dst_id)
+{
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (!uvm_phase_n_expert_prefetch_wait_enable || !UVM_ID_IS_GPU(dst_id))
+        return;
+
+    if (!va_block->phase_n_expert_prefetch.active ||
+        !uvm_id_equal(va_block->phase_n_expert_prefetch.dst_id, dst_id))
+        return;
+
+    WRITE_ONCE(va_block->phase_n_expert_prefetch.submitted, true);
+    wake_up_all(&va_block->phase_n_expert_prefetch.wait_queue);
+}
+
+void uvm_va_block_expert_prefetch_clear_pending(uvm_va_block_t *va_block,
+                                                uvm_processor_id_t dst_id,
+                                                uvm_va_block_region_t region)
+{
+    uvm_page_mask_t clear_pages;
+
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (!uvm_phase_n_expert_prefetch_wait_enable || !UVM_ID_IS_GPU(dst_id))
+        return;
+
+    if (!va_block->phase_n_expert_prefetch.active ||
+        !uvm_id_equal(va_block->phase_n_expert_prefetch.dst_id, dst_id))
+        return;
+
+    uvm_page_mask_init_from_region(&clear_pages, region, NULL);
+    if (!uvm_page_mask_andnot(&va_block->phase_n_expert_prefetch.pages,
+                              &va_block->phase_n_expert_prefetch.pages,
+                              &clear_pages)) {
+        va_block->phase_n_expert_prefetch.dst_id = UVM_ID_INVALID;
+        WRITE_ONCE(va_block->phase_n_expert_prefetch.submitted, false);
+        WRITE_ONCE(va_block->phase_n_expert_prefetch.active, false);
+        wake_up_all(&va_block->phase_n_expert_prefetch.wait_queue);
+    }
+}
+
+bool uvm_va_block_expert_prefetch_page_pending(uvm_va_block_t *va_block,
+                                               uvm_processor_id_t dst_id,
+                                               uvm_page_index_t page_index)
+{
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (!uvm_phase_n_expert_prefetch_wait_enable ||
+        !UVM_ID_IS_GPU(dst_id) ||
+        !va_block->phase_n_expert_prefetch.active ||
+        !uvm_id_equal(va_block->phase_n_expert_prefetch.dst_id, dst_id) ||
+        !uvm_page_mask_test(&va_block->phase_n_expert_prefetch.pages, page_index))
+        return false;
+
+    if (va_block->phase_n_expert_prefetch.submitted &&
+        uvm_tracker_is_completed(&va_block->tracker)) {
+        uvm_page_mask_zero(&va_block->phase_n_expert_prefetch.pages);
+        va_block->phase_n_expert_prefetch.dst_id = UVM_ID_INVALID;
+        WRITE_ONCE(va_block->phase_n_expert_prefetch.submitted, false);
+        WRITE_ONCE(va_block->phase_n_expert_prefetch.active, false);
+        wake_up_all(&va_block->phase_n_expert_prefetch.wait_queue);
+        return false;
+    }
+
+    return true;
+}
+
+bool uvm_va_block_expert_prefetch_wait(uvm_va_block_t *va_block,
+                                       uvm_processor_id_t dst_id,
+                                       unsigned timeout_ms)
+{
+    long timeout = msecs_to_jiffies(timeout_ms);
+
+    if (!uvm_phase_n_expert_prefetch_wait_enable || !UVM_ID_IS_GPU(dst_id))
+        return false;
+
+    if (timeout == 0)
+        timeout = 1;
+
+    if (wait_event_timeout(va_block->phase_n_expert_prefetch.wait_queue,
+                           !READ_ONCE(va_block->phase_n_expert_prefetch.active) ||
+                           READ_ONCE(va_block->phase_n_expert_prefetch.submitted),
+                           timeout) == 0)
+        return false;
+
+    return READ_ONCE(va_block->phase_n_expert_prefetch.active) &&
+           READ_ONCE(va_block->phase_n_expert_prefetch.submitted);
+}
+
 NV_STATUS uvm_va_block_create(uvm_va_range_managed_t *managed_range,
                               NvU64 start,
                               NvU64 end,
@@ -1627,6 +1756,9 @@ NV_STATUS uvm_va_block_create(uvm_va_range_managed_t *managed_range,
     block->managed_range = managed_range;
     uvm_tracker_init(&block->tracker);
     block->prefetch_info.last_migration_proc_id = UVM_ID_INVALID;
+    block->phase_n_expert_prefetch.dst_id = UVM_ID_INVALID;
+    init_waitqueue_head(&block->phase_n_expert_prefetch.wait_queue);
+    block->phase_n_expert_prefetch.submitted = false;
 
     nv_kthread_q_item_init(&block->eviction_mappings_q_item, block_add_eviction_mappings_entry, block);
     nv_kthread_q_item_init(&block->bg_promote_q_item, block_bg_promote_entry, block);
@@ -3261,6 +3393,14 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
     }
 
     UVM_ASSERT(uvm_page_mask_region_empty(&gpu_state->resident, chunk_region));
+
+    status = uvm_phase_n_admit_gpu_chunk(uvm_va_block_get_va_space(block),
+                                         block,
+                                         chunk_region,
+                                         gpu->id,
+                                         chunk_size);
+    if (status != NV_OK)
+        return status;
 
     status = block_alloc_gpu_chunk(block, retry, gpu, chunk_size, &chunk);
     if (status != NV_OK)
@@ -13600,6 +13740,14 @@ static void uvm_va_block_get_prefetch_hint(uvm_va_block_t *va_block,
                                            uvm_service_block_context_t *service_context)
 {
     uvm_processor_id_t new_residency;
+
+    if (uvm_phase_n_fault_prefetch_disable &&
+        service_context->operation == UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS) {
+        service_context->prefetch_hint.residency = UVM_ID_INVALID;
+        uvm_page_mask_zero(&service_context->prefetch_hint.prefetch_pages_mask);
+        atomic64_inc(&g_uvm_phase_n_fault_prefetch_suppressed);
+        return;
+    }
 
     // Performance heuristics policy: we only consider prefetching when there
     // are migrations to a single processor, only.

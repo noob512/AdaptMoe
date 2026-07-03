@@ -4,6 +4,7 @@
 #   make              # Build all
 #   make uvm          # Build PyTorch pluggable allocator
 #   make preload      # Build LD_PRELOAD interceptor
+#   make budget       # Build managed-budget LD_PRELOAD helper and probe
 #   make clean        # Clean build artifacts
 #
 # To use the LD_PRELOAD interceptor:
@@ -23,7 +24,7 @@ NVCCFLAGS = -Xcompiler -fPIC -O2 -std=c++17
 LDFLAGS = -shared -L$(CUDA_LIB) -lcudart -ldl
 
 # Targets
-all: uvm_allocator.so libcudamalloc_managed.so phase_f_smoke
+all: uvm_allocator.so libcudamalloc_managed.so libuvm_managed_budget.so phase_f_smoke managed_pool_probe
 
 # PyTorch pluggable allocator (same as before)
 uvm: uvm_allocator.so
@@ -40,7 +41,15 @@ preload: libcudamalloc_managed.so
 libcudamalloc_managed.so: cuda_malloc_managed_preload.cpp
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -I$(CUDA_INCLUDE) -o $@ $<
 
-clean:
-	rm -f uvm_allocator.so libcudamalloc_managed.so phase_f_smoke
+budget: libuvm_managed_budget.so managed_pool_probe
 
-.PHONY: all uvm preload clean
+libuvm_managed_budget.so: cuda_managed_budget_preload.cpp
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -I$(CUDA_INCLUDE) -o $@ $<
+
+managed_pool_probe: managed_pool_probe.cu
+	$(NVCC) -O2 -std=c++17 -o $@ $< -lcudart
+
+clean:
+	rm -f uvm_allocator.so libcudamalloc_managed.so libuvm_managed_budget.so phase_f_smoke managed_pool_probe
+
+.PHONY: all uvm preload budget clean

@@ -89,6 +89,8 @@ class InputBatch:
     # [num_reqs + 1]
     cu_num_logits: torch.Tensor
 
+    moe_token_trace_metadata: dict[str, Any] | None = None
+
     @classmethod
     def make_dummy(
         cls,

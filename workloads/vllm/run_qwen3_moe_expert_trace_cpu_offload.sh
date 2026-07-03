@@ -45,6 +45,13 @@ SUMMARY_MD="$RUN_ROOT/qwen3_moe_expert_trace_summary.md"
 SUMMARY_CSV="$RUN_ROOT/qwen3_moe_expert_trace_layer_summary.csv"
 SUMMARY_ROUND_CSV="$RUN_ROOT/qwen3_moe_expert_trace_round_summary.csv"
 SUMMARY_JSON="$RUN_ROOT/qwen3_moe_expert_trace_summary.json"
+TOKEN_ANALYSIS_MD="$RUN_ROOT/qwen3_moe_token_expert_trace_analysis.md"
+TOKEN_ANALYSIS_JSON="$RUN_ROOT/qwen3_moe_token_expert_trace_analysis.json"
+TOKEN_LAYER_CSV="$RUN_ROOT/qwen3_moe_token_expert_trace_layer_summary.csv"
+TOKEN_LAYER_PAIR_CSV="$RUN_ROOT/qwen3_moe_token_expert_trace_layer_pair_summary.csv"
+TIER_ANALYSIS_MD="$RUN_ROOT/qwen3_moe_tier_adjacent_similarity.md"
+TIER_ANALYSIS_JSON="$RUN_ROOT/qwen3_moe_tier_adjacent_similarity.json"
+TIER_ANALYSIS_CSV="$RUN_ROOT/qwen3_moe_tier_adjacent_similarity.csv"
 
 cleanup_gpu() {
   pkill -f "vllm bench serve" >/dev/null 2>&1 || true
@@ -93,6 +100,7 @@ write_metadata() {
     echo "cpu_offload_gb=$CPU_OFFLOAD_GB"
     echo "vllm_cmd=${VLLM_CMD[*]}"
     echo "trace_jsonl=$TRACE_JSONL"
+    echo "token_analysis_md=$TOKEN_ANALYSIS_MD"
     echo
     nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total,memory.free --format=csv,noheader || true
     echo
@@ -404,6 +412,7 @@ sleep 2
   cd "$SCRIPT_DIR" || exit 1
   env -u VLLM_USE_UVM -u LD_PRELOAD \
     VLLM_QWEN3_MOE_EXPERT_TRACE_ENABLE=1 \
+    VLLM_MOE_TOKEN_EXPERT_TRACE_ENABLE=1 \
     VLLM_QWEN3_MOE_EXPERT_TRACE_FILE="$TRACE_JSONL" \
     "${VLLM_CMD[@]}" serve "$MODEL" \
       --enforce-eager \
@@ -445,7 +454,22 @@ fi
 cleanup_gpu
 
 summarize_trace
+python3 "$SCRIPT_DIR/analyze_qwen3_moe_token_expert_trace.py" "$TRACE_JSONL" \
+  --output-md "$TOKEN_ANALYSIS_MD" \
+  --output-json "$TOKEN_ANALYSIS_JSON" \
+  --layer-csv "$TOKEN_LAYER_CSV" \
+  --layer-pair-csv "$TOKEN_LAYER_PAIR_CSV"
+python3 "$SCRIPT_DIR/analyze_qwen3_moe_tier_adjacent_similarity.py" "$TRACE_JSONL" \
+  --output-md "$TIER_ANALYSIS_MD" \
+  --output-json "$TIER_ANALYSIS_JSON" \
+  --output-csv "$TIER_ANALYSIS_CSV"
 
 echo "summary_md=$SUMMARY_MD"
 echo "summary_csv=$SUMMARY_CSV"
+echo "token_analysis_md=$TOKEN_ANALYSIS_MD"
+echo "token_layer_csv=$TOKEN_LAYER_CSV"
+echo "token_layer_pair_csv=$TOKEN_LAYER_PAIR_CSV"
+echo "tier_analysis_md=$TIER_ANALYSIS_MD"
+echo "tier_analysis_csv=$TIER_ANALYSIS_CSV"
 echo "trace_jsonl=$TRACE_JSONL"
+exit "$status"

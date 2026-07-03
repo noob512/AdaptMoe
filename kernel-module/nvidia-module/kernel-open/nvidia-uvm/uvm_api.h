@@ -360,6 +360,11 @@ NV_STATUS uvm_phase_n_reclaim_pool_over_budget(uvm_va_space_t *va_space,
                                                NvU64 cooldown_epochs,
                                                NvU32 max_victims,
                                                NvBool async);
+NV_STATUS uvm_phase_n_admit_gpu_chunk(uvm_va_space_t *va_space,
+                                      uvm_va_block_t *va_block,
+                                      uvm_va_block_region_t chunk_region,
+                                      uvm_processor_id_t dest_id,
+                                      NvU64 chunk_bytes);
 void uvm_phase_n_make_resident_reclaim_hook(uvm_va_space_t *va_space,
                                             NvU64 address,
                                             NvU64 length,

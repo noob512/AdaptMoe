@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any
@@ -56,6 +57,16 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunne
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 logger = init_logger(__name__)
+
+
+def _moe_token_expert_trace_enabled() -> bool:
+    for env_name in (
+        "VLLM_MOE_TOKEN_EXPERT_TRACE_ENABLE",
+        "VLLM_QWEN3_MOE_EXPERT_TRACE_ENABLE",
+    ):
+        if os.environ.get(env_name, "0").lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
 
 
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
@@ -451,6 +462,67 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 overwrite=overwrite,
             )
 
+    def _make_moe_token_trace_metadata(
+        self,
+        *,
+        req_ids: list[str],
+        idx_mapping_np: np.ndarray,
+        num_scheduled_tokens: np.ndarray,
+        query_start_loc_np: np.ndarray,
+        num_tokens: int,
+    ) -> dict[str, Any] | None:
+        if not _moe_token_expert_trace_enabled():
+            return None
+
+        try:
+            num_reqs = len(req_ids)
+            request_indices_np = np.repeat(
+                np.arange(num_reqs, dtype=np.int32), num_scheduled_tokens
+            )
+            request_indices = [int(value) for value in request_indices_np]
+            positions = (
+                self.input_buffers.positions[:num_tokens]
+                .detach()
+                .to("cpu")
+                .tolist()
+            )
+            token_ids = (
+                self.input_buffers.input_ids.gpu[:num_tokens]
+                .detach()
+                .to("cpu")
+                .tolist()
+            )
+            return {
+                "source": "gpu_v2_model_runner",
+                "pid": os.getpid(),
+                "num_reqs": int(num_reqs),
+                "num_actual_tokens": int(num_tokens),
+                "req_ids_by_index": list(req_ids),
+                "request_indices": request_indices,
+                "request_ids": [
+                    req_ids[req_index]
+                    if 0 <= req_index < len(req_ids)
+                    else None
+                    for req_index in request_indices
+                ],
+                "token_positions": [int(value) for value in positions],
+                "token_ids": [int(value) for value in token_ids],
+                "num_scheduled_tokens": [
+                    int(value) for value in num_scheduled_tokens[:num_reqs]
+                ],
+                "request_state_indices": [
+                    int(value) for value in idx_mapping_np[:num_reqs]
+                ],
+                "query_start_loc": [
+                    int(value) for value in query_start_loc_np[: num_reqs + 1]
+                ],
+            }
+        except Exception:
+            logger.debug(
+                "Failed to build MoE token expert trace metadata", exc_info=True
+            )
+            return None
+
     def prepare_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -553,6 +625,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             cu_num_logits,
             total_num_logits,
         )
+        moe_token_trace_metadata = self._make_moe_token_trace_metadata(
+            req_ids=req_ids,
+            idx_mapping_np=idx_mapping_np,
+            num_scheduled_tokens=num_scheduled_tokens,
+            query_start_loc_np=query_start_loc_np,
+            num_tokens=num_tokens,
+        )
 
         # Compute slot mappings: [num_kv_cache_groups, num_tokens]
         slot_mappings = self.block_tables.compute_slot_mappings(
@@ -603,6 +682,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             attn_metadata=attn_metadata,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
+            moe_token_trace_metadata=moe_token_trace_metadata,
         )
 
     def sample(
@@ -952,6 +1032,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_tokens=input_batch.num_tokens_after_padding,
                 cudagraph_runtime_mode=cudagraph_mode,
                 num_tokens_across_dp=num_tokens_across_dp,
+                moe_token_trace_metadata=input_batch.moe_token_trace_metadata,
             ):
                 hidden_states = self.model(
                     input_ids=input_batch.input_ids,

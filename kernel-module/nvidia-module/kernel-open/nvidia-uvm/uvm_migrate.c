@@ -471,6 +471,11 @@ static NV_STATUS uvm_va_range_migrate_multi_block(uvm_va_range_managed_t *manage
     size_t i;
     const size_t first_block_index = uvm_va_range_block_index(managed_range, start);
     const size_t last_block_index = uvm_va_range_block_index(managed_range, end);
+    NV_STATUS status = NV_OK;
+    const bool expert_prefetch_pending =
+        uvm_phase_n_expert_prefetch_wait_enable &&
+        UVM_ID_IS_GPU(dest_id) &&
+        phase_n_migrate_tag_is_expert_weight(&managed_range->phase_n_tag);
 
     UVM_ASSERT(start >= managed_range->va_range.node.start);
     UVM_ASSERT(end  <= managed_range->va_range.node.end);
@@ -478,15 +483,34 @@ static NV_STATUS uvm_va_range_migrate_multi_block(uvm_va_range_managed_t *manage
 
     UVM_ASSERT(uvm_range_group_all_migratable(managed_range->va_range.va_space, start, end));
 
+    if (expert_prefetch_pending) {
+        for (i = first_block_index; i <= last_block_index; i++) {
+            uvm_va_block_t *va_block;
+            uvm_va_block_region_t region;
+
+            status = uvm_va_range_block_create(managed_range, i, &va_block);
+            if (status != NV_OK)
+                goto clear_pending;
+
+            region = uvm_va_block_region_from_start_end(va_block,
+                                                        max(start, va_block->start),
+                                                        min(end, va_block->end));
+
+            uvm_mutex_lock(&va_block->lock);
+            uvm_va_block_expert_prefetch_mark_pending(va_block, dest_id, region);
+            uvm_mutex_unlock(&va_block->lock);
+        }
+    }
+
     // Iterate over blocks, populating them if necessary
     for (i = first_block_index; i <= last_block_index; i++) {
         uvm_va_block_retry_t va_block_retry;
         uvm_va_block_region_t region;
         uvm_va_block_t *va_block;
-        NV_STATUS status = uvm_va_range_block_create(managed_range, i, &va_block);
 
+        status = uvm_va_range_block_create(managed_range, i, &va_block);
         if (status != NV_OK)
-            return status;
+            goto clear_pending;
 
         region = uvm_va_block_region_from_start_end(va_block,
                                                     max(start, va_block->start),
@@ -501,11 +525,39 @@ static NV_STATUS uvm_va_range_migrate_multi_block(uvm_va_range_managed_t *manage
                                                                      dest_id,
                                                                      mode,
                                                                      out_tracker));
+        if (expert_prefetch_pending && status == NV_OK) {
+            uvm_mutex_lock(&va_block->lock);
+            uvm_va_block_expert_prefetch_mark_submitted(va_block, dest_id);
+            uvm_mutex_unlock(&va_block->lock);
+        }
+
         if (status != NV_OK)
-            return status;
+            goto clear_pending;
     }
 
     return NV_OK;
+
+clear_pending:
+    if (expert_prefetch_pending) {
+        size_t clear_index;
+
+        for (clear_index = first_block_index; clear_index <= last_block_index; clear_index++) {
+            uvm_va_block_t *va_block = uvm_va_range_block(managed_range, clear_index);
+            uvm_va_block_region_t region;
+
+            if (!va_block)
+                continue;
+
+            region = uvm_va_block_region_from_start_end(va_block,
+                                                        max(start, va_block->start),
+                                                        min(end, va_block->end));
+            uvm_mutex_lock(&va_block->lock);
+            uvm_va_block_expert_prefetch_clear_pending(va_block, dest_id, region);
+            uvm_mutex_unlock(&va_block->lock);
+        }
+    }
+
+    return status;
 }
 
 static NV_STATUS uvm_va_range_migrate(uvm_va_range_managed_t *managed_range,

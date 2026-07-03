@@ -125,6 +125,111 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 
 logger = init_logger(__name__)
 
+_UVM_PRE_EXPERT_TIMING_LOCK = threading.Lock()
+_UVM_PRE_EXPERT_TIMING_STARTS: dict[str, dict[str, object]] = {}
+
+
+def _uvm_pre_expert_timing_enabled() -> bool:
+    return os.environ.get("VLLM_UVM_PRE_EXPERT_TIMING_ENABLE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _uvm_pre_expert_timing_file() -> str:
+    return os.environ.get("VLLM_UVM_PRE_EXPERT_TIMING_FILE", "")
+
+
+def record_uvm_pre_expert_timing_layer_start(
+    *,
+    layer_name: str,
+    layer_id: int | None,
+    num_tokens: int,
+    positions: torch.Tensor,
+) -> None:
+    if not _uvm_pre_expert_timing_enabled() or not torch.cuda.is_available():
+        return
+
+    try:
+        start_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(torch.cuda.current_stream())
+        position_min = None
+        position_max = None
+        if positions.numel() > 0:
+            position_min = int(positions.detach().min().item())
+            position_max = int(positions.detach().max().item())
+
+        with _UVM_PRE_EXPERT_TIMING_LOCK:
+            _UVM_PRE_EXPERT_TIMING_STARTS[layer_name] = {
+                "event": start_event,
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "layer_name": layer_name,
+                "layer_id": layer_id,
+                "num_tokens": int(num_tokens),
+                "position_min": position_min,
+                "position_max": position_max,
+            }
+    except Exception:
+        logger.debug("Failed to record UVM pre-expert timing start", exc_info=True)
+
+
+def _record_uvm_pre_expert_timing_ids_ready(
+    *,
+    layer_name: str,
+    topk_ids: torch.Tensor,
+) -> None:
+    trace_file = _uvm_pre_expert_timing_file()
+    if (
+        not _uvm_pre_expert_timing_enabled()
+        or not trace_file
+        or not torch.cuda.is_available()
+    ):
+        return
+
+    try:
+        with _UVM_PRE_EXPERT_TIMING_LOCK:
+            start_record = _UVM_PRE_EXPERT_TIMING_STARTS.pop(layer_name, None)
+        if start_record is None:
+            return
+
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record(torch.cuda.current_stream())
+        end_event.synchronize()
+        elapsed_ms = float(start_record["event"].elapsed_time(end_event))  # type: ignore[union-attr]
+
+        ids = topk_ids.detach()
+        valid_ids = ids[ids >= 0].to(dtype=torch.long)
+        active_experts = 0
+        if valid_ids.numel() > 0:
+            active_experts = int(torch.unique(valid_ids).numel())
+
+        record = {
+            "event": "uvm_pre_expert_timing",
+            "timestamp": time.time(),
+            "pid": int(start_record["pid"]),
+            "layer_name": start_record["layer_name"],
+            "layer_id": start_record["layer_id"],
+            "num_tokens": start_record["num_tokens"],
+            "position_min": start_record["position_min"],
+            "position_max": start_record["position_max"],
+            "kv_len_approx": (
+                int(start_record["position_max"]) + 1
+                if start_record["position_max"] is not None
+                else None
+            ),
+            "topk_shape": [int(value) for value in topk_ids.shape],
+            "active_experts": active_experts,
+            "elapsed_ms": elapsed_ms,
+        }
+        os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
+        with open(trace_file, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception:
+        logger.debug("Failed to record UVM pre-expert timing end", exc_info=True)
+
 _UVM_COLD_STREAMING_LOCK = threading.Lock()
 _UVM_COLD_STREAMING_REGIONS: dict[str, dict[str, object]] = {}
 _UVM_COLD_STREAMING_BYTES = 0
@@ -2259,6 +2364,10 @@ class FusedMoE(CustomOp):
             topk_ids = topk_ids.to(dtype=indices_type)
 
         assert topk_ids.dtype == indices_type or indices_type is None
+        _record_uvm_pre_expert_timing_ids_ready(
+            layer_name=self.layer_name,
+            topk_ids=topk_ids,
+        )
 
         # Compute zero expert result if needed
         if (

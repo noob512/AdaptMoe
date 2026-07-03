@@ -207,6 +207,45 @@ static void phase_n_record_managed_fault_dispatch(uvm_gpu_t *gpu,
     }
 }
 
+static bool phase_n_expert_prefetch_wait_if_pending(uvm_gpu_t *gpu,
+                                                    uvm_va_block_t *va_block,
+                                                    uvm_fault_buffer_entry_t *fault_entry)
+{
+    uvm_page_index_t page_index;
+    bool pending;
+    bool waited;
+
+    if (!uvm_phase_n_expert_prefetch_wait_enable)
+        return false;
+
+    if (uvm_va_block_is_hmm(va_block) || !va_block->managed_range)
+        return false;
+
+    if (!phase_n_range_tag_is_expert_weight(&va_block->managed_range->phase_n_tag))
+        return false;
+
+    if (fault_entry->fault_access_type > UVM_FAULT_ACCESS_TYPE_READ)
+        return false;
+
+    page_index = uvm_va_block_cpu_page_index(va_block, fault_entry->fault_address);
+
+    uvm_mutex_lock(&va_block->lock);
+    pending = uvm_va_block_expert_prefetch_page_pending(va_block, gpu->id, page_index);
+    uvm_mutex_unlock(&va_block->lock);
+
+    if (!pending)
+        return false;
+
+    ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_prefetch_waits;
+    waited = uvm_va_block_expert_prefetch_wait(va_block, gpu->id, uvm_phase_n_expert_prefetch_wait_timeout_ms);
+    if (waited)
+        ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_prefetch_wait_successes;
+    else
+        ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_prefetch_wait_timeouts;
+
+    return waited;
+}
+
 static unsigned uvm_perf_fault_log_addresses;
 module_param(uvm_perf_fault_log_addresses, uint, S_IRUGO | S_IWUSR);
 
@@ -2386,6 +2425,8 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
 
     if (status == NV_OK) {
         uvm_va_range_managed_t *managed_range = uvm_va_range_to_managed_or_null(va_range);
+
+        phase_n_expert_prefetch_wait_if_pending(gpu, va_block, current_entry);
 
         if (phase_n_expert_fault_fastpath_candidate(va_block, managed_range, hmm_migratable)) {
             status = service_fault_batch_block_expert_readdup(gpu,

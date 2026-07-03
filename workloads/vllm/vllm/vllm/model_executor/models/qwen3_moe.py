@@ -42,12 +42,17 @@ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import (
+    record_uvm_pre_expert_timing_layer_start,
+)
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -88,20 +93,32 @@ _QWEN3_MOE_TRACE_STEP = 0
 
 
 def _qwen3_moe_trace_enabled() -> bool:
-    return os.environ.get("VLLM_QWEN3_MOE_EXPERT_TRACE_ENABLE", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    for env_name in (
+        "VLLM_QWEN3_MOE_EXPERT_TRACE_ENABLE",
+        "VLLM_MOE_TOKEN_EXPERT_TRACE_ENABLE",
+    ):
+        if os.environ.get(env_name, "0").lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
 
 
 def _qwen3_moe_trace_file() -> str:
-    return os.environ.get("VLLM_QWEN3_MOE_EXPERT_TRACE_FILE", "")
+    return os.environ.get(
+        "VLLM_QWEN3_MOE_EXPERT_TRACE_FILE",
+        os.environ.get("VLLM_MOE_TOKEN_EXPERT_TRACE_FILE", ""),
+    )
+
+
+def _qwen3_moe_trace_next_step() -> int:
+    global _QWEN3_MOE_TRACE_STEP
+    with _QWEN3_MOE_TRACE_LOCK:
+        _QWEN3_MOE_TRACE_STEP += 1
+        return _QWEN3_MOE_TRACE_STEP
 
 
 def _qwen3_moe_trace_active_experts(
     *,
+    step: int,
     layer_name: str,
     layer_id: int | None,
     num_tokens: int,
@@ -113,14 +130,11 @@ def _qwen3_moe_trace_active_experts(
     if not trace_file:
         return
 
-    global _QWEN3_MOE_TRACE_STEP
     flat_ids = topk_ids.detach().reshape(-1).to("cpu").tolist()
     valid_ids = [int(expert_id) for expert_id in flat_ids if int(expert_id) >= 0]
     counts = Counter(valid_ids)
     active_experts = sorted(counts)
     with _QWEN3_MOE_TRACE_LOCK:
-        _QWEN3_MOE_TRACE_STEP += 1
-        step = _QWEN3_MOE_TRACE_STEP
         record = {
             "event": "qwen3_moe_expert_trace",
             "timestamp": time.time(),
@@ -145,6 +159,134 @@ def _qwen3_moe_trace_active_experts(
         os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
         with open(trace_file, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _qwen3_moe_slice_trace_values(
+    values: list[Any],
+    *,
+    start: int,
+    count: int,
+    default: Any,
+) -> list[Any]:
+    sliced = values[start : start + count]
+    if len(sliced) < count:
+        sliced = sliced + [default] * (count - len(sliced))
+    return sliced[:count]
+
+
+def _qwen3_moe_current_token_metadata(
+    *,
+    num_tokens: int,
+    is_sequence_parallel: bool,
+) -> dict[str, Any]:
+    if not is_forward_context_available():
+        return {"metadata_available": False}
+
+    metadata = get_forward_context().moe_token_trace_metadata
+    if not isinstance(metadata, dict):
+        return {"metadata_available": False}
+
+    request_ids = list(metadata.get("request_ids") or [])
+    request_indices = list(metadata.get("request_indices") or [])
+    token_positions = list(metadata.get("token_positions") or [])
+    token_ids = list(metadata.get("token_ids") or [])
+    slice_start = 0
+
+    if is_sequence_parallel:
+        original_count = int(metadata.get("num_actual_tokens") or len(request_ids))
+        tp_size = max(int(get_tensor_model_parallel_world_size()), 1)
+        tp_rank = int(get_tensor_model_parallel_rank())
+        padded_count = ((original_count + tp_size - 1) // tp_size) * tp_size
+        chunk = padded_count // tp_size if tp_size else original_count
+        slice_start = tp_rank * chunk
+
+    return {
+        "metadata_available": True,
+        "metadata_source": metadata.get("source"),
+        "num_reqs": metadata.get("num_reqs"),
+        "num_actual_tokens": metadata.get("num_actual_tokens"),
+        "token_slice_offset": int(metadata.get("token_slice_offset") or 0)
+        + slice_start,
+        "request_ids": _qwen3_moe_slice_trace_values(
+            request_ids,
+            start=slice_start,
+            count=num_tokens,
+            default=None,
+        ),
+        "request_indices": _qwen3_moe_slice_trace_values(
+            request_indices,
+            start=slice_start,
+            count=num_tokens,
+            default=-1,
+        ),
+        "token_positions": _qwen3_moe_slice_trace_values(
+            token_positions,
+            start=slice_start,
+            count=num_tokens,
+            default=-1,
+        ),
+        "token_ids": _qwen3_moe_slice_trace_values(
+            token_ids,
+            start=slice_start,
+            count=num_tokens,
+            default=-1,
+        ),
+    }
+
+
+def _qwen3_moe_trace_token_experts(
+    *,
+    step: int,
+    layer_name: str,
+    layer_id: int | None,
+    top_k: int,
+    num_experts: int,
+    topk_ids: torch.Tensor,
+    is_sequence_parallel: bool,
+) -> None:
+    trace_file = _qwen3_moe_trace_file()
+    if not trace_file:
+        return
+
+    try:
+        num_tokens = int(topk_ids.shape[0]) if topk_ids.ndim > 0 else 1
+        ids = topk_ids.detach().reshape(num_tokens, -1).to("cpu")
+        ids_list = [
+            [int(expert_id) for expert_id in row if int(expert_id) >= 0]
+            for row in ids.tolist()
+        ]
+        token_metadata = _qwen3_moe_current_token_metadata(
+            num_tokens=num_tokens,
+            is_sequence_parallel=is_sequence_parallel,
+        )
+        request_ids = token_metadata.get("request_ids") or [None] * num_tokens
+        token_positions = token_metadata.get("token_positions") or [-1] * num_tokens
+        mapped_tokens = sum(
+            1
+            for request_id, token_position in zip(request_ids, token_positions)
+            if request_id is not None and int(token_position) >= 0
+        )
+        record = {
+            "event": "qwen3_moe_token_expert_trace",
+            "timestamp": time.time(),
+            "pid": os.getpid(),
+            "step": step,
+            "layer_name": layer_name,
+            "layer_id": layer_id,
+            "num_tokens": num_tokens,
+            "mapped_tokens": int(mapped_tokens),
+            "top_k": int(top_k),
+            "num_experts": int(num_experts),
+            "topk_ids": ids_list,
+            "is_sequence_parallel": bool(is_sequence_parallel),
+            **token_metadata,
+        }
+        with _QWEN3_MOE_TRACE_LOCK:
+            os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
+            with open(trace_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception:
+        logger.debug("Failed to write Qwen3 MoE token expert trace", exc_info=True)
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -274,13 +416,24 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
             )
+            trace_step = _qwen3_moe_trace_next_step()
             _qwen3_moe_trace_active_experts(
+                step=trace_step,
                 layer_name=self.layer_name,
                 layer_id=self.layer_id,
                 num_tokens=hidden_states.shape[0],
                 top_k=self.experts.top_k,
                 num_experts=self.n_routed_experts,
                 topk_ids=topk_ids,
+            )
+            _qwen3_moe_trace_token_experts(
+                step=trace_step,
+                layer_name=self.layer_name,
+                layer_id=self.layer_id,
+                top_k=self.experts.top_k,
+                num_experts=self.n_routed_experts,
+                topk_ids=topk_ids,
+                is_sequence_parallel=self.is_sequence_parallel,
             )
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
@@ -439,6 +592,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             self.mlp = Qwen3MoeSparseMoeBlock(
                 vllm_config=vllm_config, prefix=f"{prefix}.mlp"
             )
+            self._uvm_pre_expert_timing_layer_name = self.mlp.experts.layer_name
         else:
             self.mlp = Qwen3MoeMLP(
                 hidden_size=config.hidden_size,
@@ -447,6 +601,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
+            self._uvm_pre_expert_timing_layer_name = None
+        self._uvm_pre_expert_timing_layer_id = layer_idx
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -459,6 +615,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+        if self._uvm_pre_expert_timing_layer_name is not None:
+            record_uvm_pre_expert_timing_layer_start(
+                layer_name=self._uvm_pre_expert_timing_layer_name,
+                layer_id=self._uvm_pre_expert_timing_layer_id,
+                num_tokens=int(hidden_states.shape[0]),
+                positions=positions,
+            )
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)

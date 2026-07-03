@@ -344,6 +344,19 @@ struct uvm_va_block_struct
     // uvm_phase_n_native_block_enable is set, and is otherwise inert.
     uvm_phase_n_va_block_state_t phase_n;
 
+    // Experimental expert-prefetch handoff. When enabled, API prefetch marks
+    // expert-tagged blocks before walking them. Replayable faults hitting the
+    // same block can wait for the prefetch path instead of launching their own
+    // make-resident work.
+    struct
+    {
+        uvm_page_mask_t pages;
+        uvm_processor_id_t dst_id;
+        wait_queue_head_t wait_queue;
+        bool active;
+        bool submitted;
+    } phase_n_expert_prefetch;
+
     // Per-processor residency bit vector, used for fast lookup of which
     // processors are active in this block.
     //
@@ -1708,6 +1721,28 @@ NV_STATUS uvm_va_block_migrate_locked(uvm_va_block_t *va_block,
                                       uvm_processor_id_t dest_id,
                                       uvm_migrate_mode_t mode,
                                       uvm_tracker_t *out_tracker);
+
+extern unsigned uvm_phase_n_expert_prefetch_wait_enable;
+extern unsigned uvm_phase_n_expert_prefetch_wait_timeout_ms;
+
+void uvm_va_block_expert_prefetch_mark_pending(uvm_va_block_t *va_block,
+                                               uvm_processor_id_t dst_id,
+                                               uvm_va_block_region_t region);
+
+void uvm_va_block_expert_prefetch_mark_submitted(uvm_va_block_t *va_block,
+                                                 uvm_processor_id_t dst_id);
+
+void uvm_va_block_expert_prefetch_clear_pending(uvm_va_block_t *va_block,
+                                                uvm_processor_id_t dst_id,
+                                                uvm_va_block_region_t region);
+
+bool uvm_va_block_expert_prefetch_page_pending(uvm_va_block_t *va_block,
+                                               uvm_processor_id_t dst_id,
+                                               uvm_page_index_t page_index);
+
+bool uvm_va_block_expert_prefetch_wait(uvm_va_block_t *va_block,
+                                       uvm_processor_id_t dst_id,
+                                       unsigned timeout_ms);
 
 // Write block's data from a CPU buffer
 //

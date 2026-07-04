@@ -87,6 +87,7 @@ typedef struct
     NvBool tag_valid;
     NvBool materialized;
     NvBool gpu_resident;
+    NvBool gpu_resident_pending;
     NvBool queued;
     NvBool in_reclaim;
     NvBool mixed_pool;

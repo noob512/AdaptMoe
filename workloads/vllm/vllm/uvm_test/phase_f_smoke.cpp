@@ -96,6 +96,29 @@ int uvm_driver_phase_n_get_pool_state(uint32_t pool,
                                       uint32_t gpu_id,
                                       uint64_t* values_out,
                                       size_t values_count);
+int uvm_driver_phase_n_set_dynamic_budgets(uint32_t gpu_id,
+                                           uint64_t epoch,
+                                           uint64_t managed_hbm_budget_bytes,
+                                           uint64_t safety_margin_bytes,
+                                           uint64_t scratch_workspace_bytes,
+                                           uint64_t kv_budget_bytes,
+                                           uint64_t expert_hot_budget_bytes,
+                                           uint64_t expert_streaming_budget_bytes,
+                                           uint32_t mode,
+                                           uint32_t flags,
+                                           uint64_t* values_out,
+                                           size_t values_count);
+int uvm_driver_phase_n_protect_active_kv(uint32_t gpu_id,
+                                         uint64_t epoch,
+                                         uint64_t active_kv_bytes,
+                                         uint64_t managed_hbm_budget_bytes,
+                                         uint64_t safety_margin_bytes,
+                                         uint64_t scratch_workspace_bytes,
+                                         uint64_t region_id,
+                                         uint32_t mode,
+                                         uint32_t flags,
+                                         uint64_t* values_out,
+                                         size_t values_count);
 int uvm_driver_phase_n_metadata_state_smoke(uint32_t pool,
                                             uint64_t budget_bytes,
                                             uint64_t* values_out,
@@ -131,7 +154,7 @@ namespace {
 // shell 脚本 run_stage_m_phase_f_smoke.sh 会把同名 --step 继续传进来。
 void usage(const char* argv0) {
     std::fprintf(stderr,
-                 "Usage: %s [--step all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|register-region|query-region|phase-n-region|phase-n-metadata-state|phase-n-reclaim|phase-n-block-quota|query|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu] "
+                 "Usage: %s [--step all|ping-open|ping-init|ping-small|batch-mini0|batch-mini1|ping-ioctl|ping|probe-uvm-fd|register-region|query-region|phase-n-region|phase-n-metadata-state|phase-n-reclaim|phase-n-block-quota|phase-n-dynamic-budget|phase-n-dynamic-budget-auto|phase-n-kv-protect|phase-n-synthetic-planner|query|prefetch-gpu|prefetch-gpu-query|advise-cpu|prefetch-cpu] "
                  "[--bytes N] [--device N] [--async 0|1] [--pool N] [--blocks N] [--budget-blocks N]\n",
                  argv0);
 }
@@ -319,6 +342,564 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(values[35]));
         trace("after_phase_n_metadata_state");
         if (failed || step == "phase-n-metadata-state") return failed;
+    }
+
+    if (step == "phase-n-dynamic-budget" ||
+        step == "phase-n-dynamic-budget-auto" ||
+        step == "phase-n-kv-protect") {
+        const bool auto_budget = step == "phase-n-dynamic-budget-auto";
+        const bool kv_protect = step == "phase-n-kv-protect";
+        if (bytes == 0 || blocks < 2 || budget_blocks == 0 || budget_blocks >= blocks) {
+            std::fprintf(stderr, "%s requires --bytes > 0 and --blocks > --budget-blocks > 0\n",
+                         step.c_str());
+            return 2;
+        }
+        if (blocks > static_cast<size_t>(-1) / bytes) {
+            std::fprintf(stderr, "%s allocation size overflow\n", step.c_str());
+            return 2;
+        }
+
+        trace("before_dynamic_cuda_set_device");
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "cudaSetDevice failed: %s\n", cudaGetErrorString(err));
+            return 3;
+        }
+
+        const size_t pool_bytes = bytes * blocks;
+        void* kv_ptr = nullptr;
+        void* expert_ptr = nullptr;
+        trace("before_dynamic_cuda_malloc_managed");
+        err = cudaMallocManaged(&kv_ptr, pool_bytes);
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "cudaMallocManaged kv failed: %s\n", cudaGetErrorString(err));
+            return 4;
+        }
+        err = cudaMallocManaged(&expert_ptr, pool_bytes);
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "cudaMallocManaged expert failed: %s\n", cudaGetErrorString(err));
+            cudaFree(kv_ptr);
+            return 4;
+        }
+
+        uintptr_t kv_base = reinterpret_cast<uintptr_t>(kv_ptr);
+        uintptr_t expert_base = reinterpret_cast<uintptr_t>(expert_ptr);
+        const uint64_t kv_region_id = 2001;
+        const uint64_t expert_region_id = 2002;
+        const uint64_t kv_initial_budget = static_cast<uint64_t>(budget_blocks) * static_cast<uint64_t>(bytes);
+        const uint64_t expert_initial_budget = static_cast<uint64_t>(blocks) * static_cast<uint64_t>(bytes);
+        const uint64_t kv_after_budget = static_cast<uint64_t>(blocks) * static_cast<uint64_t>(bytes);
+        const uint64_t expert_after_budget = static_cast<uint64_t>(budget_blocks) * static_cast<uint64_t>(bytes);
+        const uint64_t managed_budget = kv_after_budget + expert_after_budget;
+        uint64_t dyn[8] = {};
+        uint64_t kv_state[38] = {};
+        uint64_t expert_state[38] = {};
+        uint64_t reclaim_values[45] = {};
+        uint64_t protect_values[12] = {};
+
+        std::printf("phase_n_dynamic_budget_alloc kv=0x%llx expert=0x%llx pool_bytes=%zu block_bytes=%zu blocks=%zu budget_blocks=%zu\n",
+                    static_cast<unsigned long long>(kv_base),
+                    static_cast<unsigned long long>(expert_base),
+                    pool_bytes,
+                    bytes,
+                    blocks,
+                    budget_blocks);
+
+        auto cleanup_dynamic = [&]() {
+            (void)uvm_driver_phase_f_unregister_region(kv_region_id);
+            (void)uvm_driver_phase_f_unregister_region(expert_region_id);
+            cudaFree(kv_ptr);
+            cudaFree(expert_ptr);
+        };
+
+        auto touch_block = [&](void* ptr, size_t block_index, int value, const char* label) -> int {
+            char* block_ptr = static_cast<char*>(ptr) + block_index * bytes;
+            size_t touch_bytes = bytes < 4096 ? bytes : 4096;
+            cudaError_t local_err = cudaMemset(block_ptr, value, touch_bytes);
+            if (local_err != cudaSuccess) {
+                std::fprintf(stderr, "cudaMemset %s block=%zu failed: %s\n",
+                             label, block_index, cudaGetErrorString(local_err));
+                return 6;
+            }
+            local_err = cudaDeviceSynchronize();
+            if (local_err != cudaSuccess) {
+                std::fprintf(stderr, "cudaDeviceSynchronize %s block=%zu failed: %s\n",
+                             label, block_index, cudaGetErrorString(local_err));
+                return 7;
+            }
+            return 0;
+        };
+
+        trace("before_phase_n_dynamic_budget");
+        int failed = run_step(
+            "phase-n-dynamic-register-kv",
+            uvm_driver_phase_f_register_region(kv_region_id,
+                                               kv_base,
+                                               pool_bytes,
+                                               1,
+                                               0,
+                                               0,
+                                               1,
+                                               0x1));
+        if (!failed) {
+            failed = run_step(
+                "phase-n-dynamic-register-expert",
+                uvm_driver_phase_f_register_region(expert_region_id,
+                                                   expert_base,
+                                                   pool_bytes,
+                                                   2,
+                                                   0,
+                                                   0,
+                                                   2,
+                                                   0x1));
+        }
+        if (!failed) {
+            failed = run_step(
+                "phase-n-dynamic-initial-budget",
+                uvm_driver_phase_n_set_dynamic_budgets(0,
+                                                       1,
+                                                       managed_budget,
+                                                       0,
+                                                       0,
+                                                       kv_initial_budget,
+                                                       expert_initial_budget,
+                                                       0,
+                                                       2,
+                                                       0,
+                                                       dyn,
+                                                       8));
+            std::printf("phase_n_dynamic_budget_initial kv_budget=%llu expert_budget=%llu managed=%llu kv_resident=%llu kv_pending=%llu expert_resident=%llu expert_pending=%llu shared_over=%llu kv_over=%llu expert_over=%llu\n",
+                        static_cast<unsigned long long>(kv_initial_budget),
+                        static_cast<unsigned long long>(expert_initial_budget),
+                        static_cast<unsigned long long>(managed_budget),
+                        static_cast<unsigned long long>(dyn[0]),
+                        static_cast<unsigned long long>(dyn[1]),
+                        static_cast<unsigned long long>(dyn[2]),
+                        static_cast<unsigned long long>(dyn[3]),
+                        static_cast<unsigned long long>(dyn[4]),
+                        static_cast<unsigned long long>(dyn[5]),
+                        static_cast<unsigned long long>(dyn[6]));
+        }
+
+        for (size_t i = 0; !failed && i < budget_blocks; ++i)
+            failed = touch_block(kv_ptr, i, 0x41, "kv_initial");
+        for (size_t i = 0; !failed && i < blocks; ++i)
+            failed = touch_block(expert_ptr, i, 0x51, "expert_initial");
+
+        if (!failed) {
+            failed = run_step(
+                "phase-n-dynamic-kv-state-before",
+                uvm_driver_phase_n_get_pool_state(1, 0, kv_state, 38));
+        }
+        if (!failed) {
+            failed = run_step(
+                "phase-n-dynamic-expert-state-before",
+                uvm_driver_phase_n_get_pool_state(2, 0, expert_state, 38));
+        }
+        if (!failed) {
+            std::printf("phase_n_dynamic_budget_before kv_budget=%llu kv_resident=%llu kv_pending=%llu kv_over=%llu expert_budget=%llu expert_resident=%llu expert_pending=%llu expert_over=%llu\n",
+                        static_cast<unsigned long long>(kv_state[0]),
+                        static_cast<unsigned long long>(kv_state[1]),
+                        static_cast<unsigned long long>(kv_state[36]),
+                        static_cast<unsigned long long>(kv_state[6]),
+                        static_cast<unsigned long long>(expert_state[0]),
+                        static_cast<unsigned long long>(expert_state[1]),
+                        static_cast<unsigned long long>(expert_state[36]),
+                        static_cast<unsigned long long>(expert_state[6]));
+        }
+
+        if (!failed && kv_protect) {
+            failed = run_step(
+                "phase-n-kv-protect-active",
+                uvm_driver_phase_n_protect_active_kv(0,
+                                                     2,
+                                                     kv_after_budget,
+                                                     managed_budget,
+                                                     0,
+                                                     0,
+                                                     kv_region_id,
+                                                     2,
+                                                     0,
+                                                     protect_values,
+                                                     12));
+            std::printf("phase_n_kv_protect_signal active_kv=%llu managed=%llu old_kv_budget=%llu new_kv_budget=%llu old_expert_budget=%llu new_expert_budget=%llu kv_resident=%llu kv_pending=%llu expert_resident=%llu expert_pending=%llu shared_over=%llu kv_over=%llu expert_over=%llu\n",
+                        static_cast<unsigned long long>(kv_after_budget),
+                        static_cast<unsigned long long>(managed_budget),
+                        static_cast<unsigned long long>(protect_values[0]),
+                        static_cast<unsigned long long>(protect_values[1]),
+                        static_cast<unsigned long long>(protect_values[2]),
+                        static_cast<unsigned long long>(protect_values[3]),
+                        static_cast<unsigned long long>(protect_values[4]),
+                        static_cast<unsigned long long>(protect_values[5]),
+                        static_cast<unsigned long long>(protect_values[6]),
+                        static_cast<unsigned long long>(protect_values[7]),
+                        static_cast<unsigned long long>(protect_values[8]),
+                        static_cast<unsigned long long>(protect_values[9]),
+                        static_cast<unsigned long long>(protect_values[10]));
+        }
+        else if (!failed) {
+            std::memset(dyn, 0, sizeof(dyn));
+            failed = run_step(
+                auto_budget ? "phase-n-dynamic-auto-shift-budget" : "phase-n-dynamic-shift-budget",
+                uvm_driver_phase_n_set_dynamic_budgets(0,
+                                                       2,
+                                                       managed_budget,
+                                                       0,
+                                                       0,
+                                                       kv_after_budget,
+                                                       auto_budget ? 0 : expert_after_budget,
+                                                       0,
+                                                       2,
+                                                       auto_budget ? 1 : 0,
+                                                       dyn,
+                                                       8));
+            std::printf("%s kv_budget=%llu expert_budget=%llu managed=%llu kv_resident=%llu kv_pending=%llu expert_resident=%llu expert_pending=%llu shared_over=%llu kv_over=%llu expert_over=%llu flags=0x%x\n",
+                        auto_budget ? "phase_n_dynamic_budget_auto_shift" : "phase_n_dynamic_budget_shift",
+                        static_cast<unsigned long long>(kv_after_budget),
+                        static_cast<unsigned long long>(expert_after_budget),
+                        static_cast<unsigned long long>(managed_budget),
+                        static_cast<unsigned long long>(dyn[0]),
+                        static_cast<unsigned long long>(dyn[1]),
+                        static_cast<unsigned long long>(dyn[2]),
+                        static_cast<unsigned long long>(dyn[3]),
+                        static_cast<unsigned long long>(dyn[4]),
+                        static_cast<unsigned long long>(dyn[5]),
+                        static_cast<unsigned long long>(dyn[6]),
+                        auto_budget ? 1 : 0);
+        }
+
+        if (!failed && !auto_budget && !kv_protect) {
+            failed = run_step(
+                "phase-n-dynamic-reclaim-expert",
+                uvm_driver_phase_n_reclaim_pool(2, 0, 0, 2, 0, 8, async, 0, reclaim_values, 45));
+            std::printf("phase_n_dynamic_budget_reclaim_expert attempted=%llu success=%llu failure=%llu victim_count=%llu budget=%llu resident_before=%llu over=%llu target=%llu attempted_bytes=%llu reclaimed=%llu failed_bytes=%llu\n",
+                        static_cast<unsigned long long>(reclaim_values[0]),
+                        static_cast<unsigned long long>(reclaim_values[1]),
+                        static_cast<unsigned long long>(reclaim_values[2]),
+                        static_cast<unsigned long long>(reclaim_values[3]),
+                        static_cast<unsigned long long>(reclaim_values[4]),
+                        static_cast<unsigned long long>(reclaim_values[5]),
+                        static_cast<unsigned long long>(reclaim_values[6]),
+                        static_cast<unsigned long long>(reclaim_values[7]),
+                        static_cast<unsigned long long>(reclaim_values[8]),
+                        static_cast<unsigned long long>(reclaim_values[9]),
+                        static_cast<unsigned long long>(reclaim_values[10]));
+        }
+        else if (!failed) {
+            std::printf("%s manual_reclaim=0 reason=auto_reclaim_expected\n",
+                        kv_protect ? "phase_n_kv_protect" : "phase_n_dynamic_budget_auto");
+        }
+
+        for (size_t i = budget_blocks; !failed && i < blocks; ++i)
+            failed = touch_block(kv_ptr, i, 0x42, "kv_after_shift");
+
+        if (!failed) {
+            std::memset(kv_state, 0, sizeof(kv_state));
+            std::memset(expert_state, 0, sizeof(expert_state));
+            failed = run_step(
+                "phase-n-dynamic-kv-state-after",
+                uvm_driver_phase_n_get_pool_state(1, 0, kv_state, 38));
+        }
+        if (!failed) {
+            failed = run_step(
+                "phase-n-dynamic-expert-state-after",
+                uvm_driver_phase_n_get_pool_state(2, 0, expert_state, 38));
+        }
+        if (!failed) {
+            std::printf("%s kv_budget=%llu kv_resident=%llu kv_pending=%llu kv_over=%llu expert_budget=%llu expert_resident=%llu expert_pending=%llu expert_over=%llu\n",
+                        kv_protect ? "phase_n_kv_protect_after" :
+                                     (auto_budget ? "phase_n_dynamic_budget_auto_after" :
+                                                    "phase_n_dynamic_budget_after"),
+                        static_cast<unsigned long long>(kv_state[0]),
+                        static_cast<unsigned long long>(kv_state[1]),
+                        static_cast<unsigned long long>(kv_state[36]),
+                        static_cast<unsigned long long>(kv_state[6]),
+                        static_cast<unsigned long long>(expert_state[0]),
+                        static_cast<unsigned long long>(expert_state[1]),
+                        static_cast<unsigned long long>(expert_state[36]),
+                        static_cast<unsigned long long>(expert_state[6]));
+        }
+
+        cleanup_dynamic();
+        trace("after_phase_n_dynamic_budget");
+        return failed;
+    }
+
+    if (step == "phase-n-synthetic-planner") {
+        if (bytes == 0 || blocks < 4 || budget_blocks < 3 || budget_blocks > blocks) {
+            std::fprintf(stderr,
+                         "phase-n-synthetic-planner requires --bytes > 0 and --blocks >= --budget-blocks >= 3, with --blocks >= 4\n");
+            return 2;
+        }
+        if (blocks > static_cast<size_t>(-1) / bytes) {
+            std::fprintf(stderr, "phase-n-synthetic-planner allocation size overflow\n");
+            return 2;
+        }
+
+        trace("before_synthetic_planner_cuda_set_device");
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "cudaSetDevice failed: %s\n", cudaGetErrorString(err));
+            return 3;
+        }
+
+        const size_t pool_bytes = bytes * blocks;
+        const uint64_t block_bytes = static_cast<uint64_t>(bytes);
+        const uint64_t managed_budget = static_cast<uint64_t>(budget_blocks) * block_bytes;
+        const size_t kv_low_blocks = 1;
+        const size_t kv_high_blocks = budget_blocks > 1 ? budget_blocks - 1 : 1;
+        const size_t expert_high_blocks = budget_blocks - kv_low_blocks;
+        void* kv_ptr = nullptr;
+        void* expert_ptr = nullptr;
+        uintptr_t kv_base = 0;
+        uintptr_t expert_base = 0;
+        const uint64_t kv_region_id = 3001;
+        const uint64_t expert_region_id = 3002;
+        uint64_t dyn[8] = {};
+        uint64_t protect_values[12] = {};
+        uint64_t kv_state[38] = {};
+        uint64_t expert_state[38] = {};
+
+        trace("before_synthetic_planner_cuda_malloc_managed");
+        err = cudaMallocManaged(&kv_ptr, pool_bytes);
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "cudaMallocManaged kv failed: %s\n", cudaGetErrorString(err));
+            return 4;
+        }
+        err = cudaMallocManaged(&expert_ptr, pool_bytes);
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "cudaMallocManaged expert failed: %s\n", cudaGetErrorString(err));
+            cudaFree(kv_ptr);
+            return 4;
+        }
+
+        kv_base = reinterpret_cast<uintptr_t>(kv_ptr);
+        expert_base = reinterpret_cast<uintptr_t>(expert_ptr);
+
+        std::printf("phase_n_synthetic_planner_alloc kv=0x%llx expert=0x%llx logical_blocks=%zu managed_blocks=%zu block_bytes=%llu managed_budget=%llu\n",
+                    static_cast<unsigned long long>(kv_base),
+                    static_cast<unsigned long long>(expert_base),
+                    blocks,
+                    budget_blocks,
+                    static_cast<unsigned long long>(block_bytes),
+                    static_cast<unsigned long long>(managed_budget));
+
+        auto cleanup_synthetic = [&]() {
+            (void)uvm_driver_phase_f_unregister_region(kv_region_id);
+            (void)uvm_driver_phase_f_unregister_region(expert_region_id);
+            cudaFree(kv_ptr);
+            cudaFree(expert_ptr);
+        };
+
+        auto touch_block = [&](void* ptr, size_t block_index, int value, const char* label) -> int {
+            char* block_ptr = static_cast<char*>(ptr) + block_index * bytes;
+            size_t touch_bytes = bytes < 4096 ? bytes : 4096;
+            cudaError_t local_err = cudaMemset(block_ptr, value, touch_bytes);
+            if (local_err != cudaSuccess) {
+                std::fprintf(stderr, "cudaMemset %s block=%zu failed: %s\n",
+                             label, block_index, cudaGetErrorString(local_err));
+                return 6;
+            }
+            local_err = cudaDeviceSynchronize();
+            if (local_err != cudaSuccess) {
+                std::fprintf(stderr, "cudaDeviceSynchronize %s block=%zu failed: %s\n",
+                             label, block_index, cudaGetErrorString(local_err));
+                return 7;
+            }
+            return 0;
+        };
+
+        auto get_states = [&]() -> int {
+            std::memset(kv_state, 0, sizeof(kv_state));
+            std::memset(expert_state, 0, sizeof(expert_state));
+            int failed = run_step("phase-n-synthetic-kv-state",
+                                  uvm_driver_phase_n_get_pool_state(1, 0, kv_state, 38));
+            if (!failed) {
+                failed = run_step("phase-n-synthetic-expert-state",
+                                  uvm_driver_phase_n_get_pool_state(2, 0, expert_state, 38));
+            }
+            return failed;
+        };
+
+        auto print_step = [&](const char* name,
+                              uint32_t batch,
+                              uint32_t context_tokens,
+                              size_t active_kv_blocks,
+                              uint32_t expert_load_us,
+                              const char* action) {
+            std::printf("phase_n_synthetic_planner_step name=%s batch=%u context_tokens=%u active_kv_blocks=%zu expert_load_us=%u action=%s kv_budget=%llu kv_resident=%llu kv_pending=%llu kv_over=%llu expert_budget=%llu expert_resident=%llu expert_pending=%llu expert_over=%llu managed_budget=%llu\n",
+                        name,
+                        batch,
+                        context_tokens,
+                        active_kv_blocks,
+                        expert_load_us,
+                        action,
+                        static_cast<unsigned long long>(kv_state[0]),
+                        static_cast<unsigned long long>(kv_state[1]),
+                        static_cast<unsigned long long>(kv_state[36]),
+                        static_cast<unsigned long long>(kv_state[6]),
+                        static_cast<unsigned long long>(expert_state[0]),
+                        static_cast<unsigned long long>(expert_state[1]),
+                        static_cast<unsigned long long>(expert_state[36]),
+                        static_cast<unsigned long long>(expert_state[6]),
+                        static_cast<unsigned long long>(managed_budget));
+        };
+
+        trace("before_phase_n_synthetic_planner");
+        int failed = run_step(
+            "phase-n-synthetic-register-kv",
+            uvm_driver_phase_f_register_region(kv_region_id,
+                                               kv_base,
+                                               pool_bytes,
+                                               1,
+                                               0,
+                                               0,
+                                               1,
+                                               0x1));
+        if (!failed) {
+            failed = run_step(
+                "phase-n-synthetic-register-expert",
+                uvm_driver_phase_f_register_region(expert_region_id,
+                                                   expert_base,
+                                                   pool_bytes,
+                                                   2,
+                                                   0,
+                                                   0,
+                                                   2,
+                                                   0x1));
+        }
+
+        if (!failed) {
+            failed = run_step(
+                "phase-n-synthetic-initial-budget",
+                uvm_driver_phase_n_set_dynamic_budgets(0,
+                                                       1,
+                                                       managed_budget,
+                                                       0,
+                                                       0,
+                                                       kv_low_blocks * block_bytes,
+                                                       0,
+                                                       0,
+                                                       2,
+                                                       1,
+                                                       dyn,
+                                                       8));
+        }
+
+        for (size_t i = 0; !failed && i < kv_low_blocks; ++i)
+            failed = touch_block(kv_ptr, i, 0x31, "synthetic_kv_initial");
+        for (size_t i = 0; !failed && i < expert_high_blocks; ++i)
+            failed = touch_block(expert_ptr, i, 0x41, "synthetic_expert_initial");
+
+        if (!failed)
+            failed = get_states();
+        if (!failed)
+            print_step("expert_heavy_initial", 1, 512, kv_low_blocks, 700, "expert_hot_budget_high");
+
+        if (!failed) {
+            std::memset(protect_values, 0, sizeof(protect_values));
+            failed = run_step(
+                "phase-n-synthetic-protect-kv-heavy",
+                uvm_driver_phase_n_protect_active_kv(0,
+                                                     2,
+                                                     kv_high_blocks * block_bytes,
+                                                     managed_budget,
+                                                     0,
+                                                     0,
+                                                     kv_region_id,
+                                                     2,
+                                                     0,
+                                                     protect_values,
+                                                     12));
+            std::printf("phase_n_synthetic_planner_signal name=kv_heavy_long_context active_kv=%llu old_kv_budget=%llu new_kv_budget=%llu old_expert_budget=%llu new_expert_budget=%llu expert_over=%llu\n",
+                        static_cast<unsigned long long>(kv_high_blocks * block_bytes),
+                        static_cast<unsigned long long>(protect_values[0]),
+                        static_cast<unsigned long long>(protect_values[1]),
+                        static_cast<unsigned long long>(protect_values[2]),
+                        static_cast<unsigned long long>(protect_values[3]),
+                        static_cast<unsigned long long>(protect_values[10]));
+        }
+
+        for (size_t i = kv_low_blocks; !failed && i < kv_high_blocks; ++i)
+            failed = touch_block(kv_ptr, i, 0x51, "synthetic_kv_heavy");
+
+        if (!failed)
+            failed = get_states();
+        if (!failed)
+            print_step("kv_heavy_long_context", 4, 4096, kv_high_blocks, 2300, "protect_active_kv");
+
+        if (!failed) {
+            failed = run_step(
+                "phase-n-synthetic-unprotect-kv",
+                uvm_driver_phase_n_update_region_state(kv_region_id,
+                                                       5,
+                                                       0x1,
+                                                       0x6,
+                                                       9,
+                                                       3));
+        }
+
+        if (!failed) {
+            std::memset(dyn, 0, sizeof(dyn));
+            failed = run_step(
+                "phase-n-synthetic-expert-budget-restore",
+                uvm_driver_phase_n_set_dynamic_budgets(0,
+                                                       3,
+                                                       managed_budget,
+                                                       0,
+                                                       0,
+                                                       kv_low_blocks * block_bytes,
+                                                       0,
+                                                       0,
+                                                       2,
+                                                       1,
+                                                       dyn,
+                                                       8));
+            std::printf("phase_n_synthetic_planner_signal name=expert_heavy_recovery kv_budget=%llu expert_budget=%llu kv_over=%llu expert_over=%llu\n",
+                        static_cast<unsigned long long>(kv_low_blocks * block_bytes),
+                        static_cast<unsigned long long>(managed_budget - kv_low_blocks * block_bytes),
+                        static_cast<unsigned long long>(dyn[5]),
+                        static_cast<unsigned long long>(dyn[6]));
+        }
+
+        for (size_t i = 0; !failed && i < expert_high_blocks; ++i)
+            failed = touch_block(expert_ptr, i, 0x61, "synthetic_expert_recovery");
+
+        if (!failed)
+            failed = get_states();
+        if (!failed)
+            print_step("expert_heavy_recovery", 1, 1024, kv_low_blocks, 650, "restore_expert_budget");
+
+        if (!failed) {
+            const uint64_t kv_high_bytes = kv_high_blocks * block_bytes;
+            const uint64_t expert_high_bytes = expert_high_blocks * block_bytes;
+            const bool kv_phase_ok = protect_values[1] >= kv_high_bytes &&
+                                     protect_values[3] <= managed_budget - kv_high_bytes;
+            const bool final_kv_ok = kv_state[0] == kv_low_blocks * block_bytes &&
+                                     kv_state[1] <= kv_state[0] &&
+                                     kv_state[6] == 0;
+            const bool final_expert_ok = expert_state[0] == expert_high_bytes &&
+                                         expert_state[1] >= expert_high_bytes &&
+                                         expert_state[6] == 0;
+            const bool total_ok = kv_state[1] + expert_state[1] <= managed_budget;
+
+            std::printf("phase_n_synthetic_planner_final kv_phase_ok=%u final_kv_ok=%u final_expert_ok=%u total_ok=%u final_kv_budget=%llu final_kv_resident=%llu final_expert_budget=%llu final_expert_resident=%llu managed_budget=%llu\n",
+                        kv_phase_ok ? 1 : 0,
+                        final_kv_ok ? 1 : 0,
+                        final_expert_ok ? 1 : 0,
+                        total_ok ? 1 : 0,
+                        static_cast<unsigned long long>(kv_state[0]),
+                        static_cast<unsigned long long>(kv_state[1]),
+                        static_cast<unsigned long long>(expert_state[0]),
+                        static_cast<unsigned long long>(expert_state[1]),
+                        static_cast<unsigned long long>(managed_budget));
+            if (!kv_phase_ok || !final_kv_ok || !final_expert_ok || !total_ok)
+                failed = 1;
+        }
+
+        cleanup_synthetic();
+        trace("after_phase_n_synthetic_planner");
+        return failed;
     }
 
     // 从这里开始，后续 step 都需要真实 managed allocation。

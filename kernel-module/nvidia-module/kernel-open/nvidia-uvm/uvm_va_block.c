@@ -1693,8 +1693,11 @@ bool uvm_va_block_expert_prefetch_wait(uvm_va_block_t *va_block,
                            timeout) == 0)
         return false;
 
-    return READ_ONCE(va_block->phase_n_expert_prefetch.active) &&
-           READ_ONCE(va_block->phase_n_expert_prefetch.submitted);
+    if (!READ_ONCE(va_block->phase_n_expert_prefetch.active) ||
+        !READ_ONCE(va_block->phase_n_expert_prefetch.submitted))
+        return false;
+
+    return uvm_tracker_wait(&va_block->tracker) == NV_OK;
 }
 
 NV_STATUS uvm_va_block_create(uvm_va_range_managed_t *managed_range,
@@ -3403,8 +3406,18 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
         return status;
 
     status = block_alloc_gpu_chunk(block, retry, gpu, chunk_size, &chunk);
-    if (status != NV_OK)
+    if (status != NV_OK) {
+        if (status != NV_ERR_MORE_PROCESSING_REQUIRED) {
+            uvm_phase_n_abort_gpu_chunk(uvm_va_block_get_va_space(block),
+                                        block,
+                                        chunk_region,
+                                        gpu->id,
+                                        chunk_size,
+                                        status,
+                                        "alloc_failed");
+        }
         return status;
+    }
 
     // In some configurations such as SR-IOV heavy, the chunk cannot be
     // referenced using its physical address. Create a virtual mapping.
@@ -3450,6 +3463,14 @@ chunk_free:
     // block_zero_new_gpu_chunk may have pushed memsets on this chunk which it
     // placed in the block tracker.
     uvm_pmm_gpu_free(&gpu->pmm, chunk, &block->tracker);
+
+    uvm_phase_n_abort_gpu_chunk(uvm_va_block_get_va_space(block),
+                                block,
+                                chunk_region,
+                                gpu->id,
+                                chunk_size,
+                                status,
+                                "populate_failed");
 
     return status;
 }

@@ -246,6 +246,52 @@ static bool phase_n_expert_prefetch_wait_if_pending(uvm_gpu_t *gpu,
     return waited;
 }
 
+static bool phase_n_expert_prefetch_authorized_after_wait(uvm_gpu_t *gpu,
+                                                          uvm_va_block_t *va_block,
+                                                          uvm_fault_service_batch_context_t *batch_context,
+                                                          NvU32 first_fault_index,
+                                                          NvU32 *block_faults)
+{
+    uvm_fault_buffer_entry_t **ordered_fault_cache = batch_context->ordered_fault_cache;
+    uvm_fault_buffer_entry_t *first_fault_entry = ordered_fault_cache[first_fault_index];
+    uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
+    NvU32 i;
+
+    *block_faults = 0;
+
+    if (!phase_n_expert_prefetch_wait_if_pending(gpu, va_block, first_fault_entry))
+        return false;
+
+    uvm_mutex_lock(&va_block->lock);
+
+    for (i = first_fault_index;
+         i < batch_context->num_coalesced_faults &&
+         ordered_fault_cache[i]->va_space == va_space &&
+         ordered_fault_cache[i]->gpu == gpu &&
+         ordered_fault_cache[i]->fault_address <= va_block->end;
+         ++i) {
+        uvm_fault_buffer_entry_t *current_entry = ordered_fault_cache[i];
+        uvm_page_index_t page_index;
+
+        if (current_entry->is_fatal ||
+            current_entry->fault_access_type > UVM_FAULT_ACCESS_TYPE_READ ||
+            uvm_fault_access_type_mask_highest(current_entry->access_type_mask) > UVM_FAULT_ACCESS_TYPE_READ)
+            break;
+
+        page_index = uvm_va_block_cpu_page_index(va_block, current_entry->fault_address);
+        if (!uvm_va_block_page_is_gpu_authorized(va_block, page_index, gpu->id, UVM_PROT_READ_ONLY))
+            break;
+    }
+
+    uvm_mutex_unlock(&va_block->lock);
+
+    if (i == first_fault_index)
+        return false;
+
+    *block_faults = i - first_fault_index;
+    return true;
+}
+
 static unsigned uvm_perf_fault_log_addresses;
 module_param(uvm_perf_fault_log_addresses, uint, S_IRUGO | S_IWUSR);
 
@@ -2426,9 +2472,12 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
     if (status == NV_OK) {
         uvm_va_range_managed_t *managed_range = uvm_va_range_to_managed_or_null(va_range);
 
-        phase_n_expert_prefetch_wait_if_pending(gpu, va_block, current_entry);
-
-        if (phase_n_expert_fault_fastpath_candidate(va_block, managed_range, hmm_migratable)) {
+        if (managed_range &&
+            phase_n_range_tag_is_expert_weight(&managed_range->phase_n_tag) &&
+            phase_n_expert_prefetch_authorized_after_wait(gpu, va_block, batch_context, fault_index, block_faults)) {
+            status = NV_OK;
+        }
+        else if (phase_n_expert_fault_fastpath_candidate(va_block, managed_range, hmm_migratable)) {
             status = service_fault_batch_block_expert_readdup(gpu,
                                                               va_block,
                                                               batch_context,

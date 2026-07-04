@@ -75,9 +75,14 @@ constexpr unsigned int UVM_PHASE_N_QUERY_REGION_IOCTL = 88;
 constexpr unsigned int UVM_PHASE_N_QUERY_REGION_BY_VA_IOCTL = 89;
 constexpr unsigned int UVM_PHASE_N_RECLAIM_POOL_IOCTL = 90;
 constexpr unsigned int UVM_MOE_SLOT_REMAP_BATCH_IOCTL = 91;
+constexpr unsigned int UVM_PHASE_N_SET_DYNAMIC_BUDGETS_IOCTL = 94;
+constexpr unsigned int UVM_PHASE_N_PROTECT_ACTIVE_KV_IOCTL = 95;
+constexpr unsigned int UVM_PHASE_N_QUERY_REGION_BLOCKS_IOCTL = 96;
+constexpr unsigned int UVM_PHASE_N_RECLAIM_REGION_IOCTL = 97;
 constexpr size_t UVM_TEST_PHASE_F_MAX_RANGES = 64;
 constexpr size_t UVM_MOE_SLOT_REMAP_MAX_ENTRIES = 128;
 constexpr size_t UVM_PHASE_N_TRACE_VICTIM_MAX = 8;
+constexpr size_t UVM_PHASE_N_REGION_BLOCK_TRACE_MAX = 16;
 constexpr uint32_t UVM_TEST_PHASE_F_PING_MAGIC = 0x50464e47;  // "PFNG"
 
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU = 1;
@@ -92,7 +97,6 @@ constexpr uint32_t UVM_TEST_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT = 14;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_EXPERT_READ_DUP_FAST = 18;
-
 constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_DRY_RUN = 0;
 constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_VALIDATE = 1;
 constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_REMAP = 2;
@@ -186,6 +190,7 @@ struct PhaseNGetPoolStateParams {
     uint32_t gpu_id;
     uint64_t budget_bytes;
     uint64_t resident_gpu_bytes;
+    uint64_t pending_gpu_bytes;
     uint64_t resident_cpu_bytes;
     uint64_t reclaim_bytes;
     uint64_t protected_bytes;
@@ -206,6 +211,114 @@ struct PhaseNGetPoolStateParams {
     uint64_t accounting_corrections;
     uint32_t mode;
     uint32_t flags;
+    uint32_t rmStatus;
+};
+
+struct PhaseNSetDynamicBudgetsParams {
+    uint32_t gpu_id;
+    uint32_t mode;
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t epoch;
+    uint64_t managed_hbm_budget_bytes;
+    uint64_t safety_margin_bytes;
+    uint64_t scratch_workspace_bytes;
+    uint64_t kv_budget_bytes;
+    uint64_t expert_hot_budget_bytes;
+    uint64_t expert_streaming_budget_bytes;
+    uint64_t kv_resident_gpu_bytes;
+    uint64_t kv_pending_gpu_bytes;
+    uint64_t expert_resident_gpu_bytes;
+    uint64_t expert_pending_gpu_bytes;
+    uint64_t shared_over_budget_bytes;
+    uint64_t kv_over_budget_bytes;
+    uint64_t expert_over_budget_bytes;
+    uint32_t rmStatus;
+};
+
+struct PhaseNProtectActiveKvParams {
+    uint32_t gpu_id;
+    uint32_t mode;
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t epoch;
+    uint64_t active_kv_bytes;
+    uint64_t managed_hbm_budget_bytes;
+    uint64_t safety_margin_bytes;
+    uint64_t scratch_workspace_bytes;
+    uint64_t region_id;
+    uint64_t old_kv_budget_bytes;
+    uint64_t new_kv_budget_bytes;
+    uint64_t old_expert_budget_bytes;
+    uint64_t new_expert_budget_bytes;
+    uint64_t kv_resident_gpu_bytes;
+    uint64_t kv_pending_gpu_bytes;
+    uint64_t expert_resident_gpu_bytes;
+    uint64_t expert_pending_gpu_bytes;
+    uint64_t shared_over_budget_bytes;
+    uint64_t kv_over_budget_bytes;
+    uint64_t expert_over_budget_bytes;
+    uint32_t rmStatus;
+};
+
+struct PhaseNQueryRegionBlocksParams {
+    uint64_t region_id;
+    uint32_t gpu_id;
+    uint32_t reserved;
+    uint64_t base;
+    uint64_t length;
+    uint32_t pool;
+    uint32_t layer_id;
+    uint32_t expert_id;
+    uint32_t role;
+    uint32_t flags;
+    uint32_t state;
+    uint32_t priority;
+    uint32_t va_range_count;
+    uint64_t logical_block_count;
+    uint64_t populated_block_count;
+    uint64_t resident_block_count;
+    uint64_t pending_block_count;
+    uint64_t materialized_block_count;
+    uint64_t mixed_block_count;
+    uint64_t resident_gpu_bytes;
+    uint64_t pending_gpu_bytes;
+    uint64_t first_block_start;
+    uint64_t last_block_end;
+    uint32_t sampled_block_count;
+    uint32_t reserved_out;
+    uint64_t block_starts[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
+    uint64_t block_ends[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
+    uint64_t block_bytes[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
+    uint32_t block_states[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
+    uint32_t block_status[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
+    uint32_t rmStatus;
+};
+
+struct PhaseNReclaimRegionParams {
+    uint64_t region_id;
+    uint32_t gpu_id;
+    uint32_t async;
+    uint32_t flags;
+    uint32_t max_blocks;
+    uint64_t current_epoch;
+    uint32_t pool;
+    uint32_t skipped_protected;
+    uint64_t block_count;
+    uint64_t resident_blocks_before;
+    uint64_t resident_blocks_after;
+    uint64_t pending_blocks;
+    uint32_t attempted_blocks;
+    uint32_t success_blocks;
+    uint32_t failure_blocks;
+    uint32_t traced_blocks;
+    uint64_t attempted_bytes;
+    uint64_t reclaimed_bytes;
+    uint64_t failed_bytes;
+    uint64_t block_starts[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
+    uint64_t block_ends[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
+    uint64_t block_bytes[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
+    uint32_t block_status[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
     uint32_t rmStatus;
 };
 
@@ -1277,6 +1390,242 @@ int uvm_driver_phase_n_set_pool_budget_internal(uint32_t pool,
     return result;
 }
 
+int uvm_driver_phase_n_set_dynamic_budgets_internal(uint32_t gpu_id,
+                                                    uint64_t epoch,
+                                                    uint64_t managed_hbm_budget_bytes,
+                                                    uint64_t safety_margin_bytes,
+                                                    uint64_t scratch_workspace_bytes,
+                                                    uint64_t kv_budget_bytes,
+                                                    uint64_t expert_hot_budget_bytes,
+                                                    uint64_t expert_streaming_budget_bytes,
+                                                    uint32_t mode,
+                                                    uint32_t flags,
+                                                    uint64_t* values_out,
+                                                    size_t values_count) {
+    if (values_out == nullptr || values_count < 8) return -2;
+    PhaseNSetDynamicBudgetsParams best_params{};
+    bool have_best = false;
+    int best_score = -1;
+
+    auto copy_values = [&](const PhaseNSetDynamicBudgetsParams& params) {
+        values_out[0] = params.kv_resident_gpu_bytes;
+        values_out[1] = params.kv_pending_gpu_bytes;
+        values_out[2] = params.expert_resident_gpu_bytes;
+        values_out[3] = params.expert_pending_gpu_bytes;
+        values_out[4] = params.shared_over_budget_bytes;
+        values_out[5] = params.kv_over_budget_bytes;
+        values_out[6] = params.expert_over_budget_bytes;
+        values_out[7] = params.rmStatus;
+    };
+
+    auto set_dynamic_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
+        PhaseNSetDynamicBudgetsParams params{};
+        params.gpu_id = gpu_id;
+        params.mode = mode;
+        params.flags = flags;
+        params.epoch = epoch;
+        params.managed_hbm_budget_bytes = managed_hbm_budget_bytes;
+        params.safety_margin_bytes = safety_margin_bytes;
+        params.scratch_workspace_bytes = scratch_workspace_bytes;
+        params.kv_budget_bytes = kv_budget_bytes;
+        params.expert_hot_budget_bytes = expert_hot_budget_bytes;
+        params.expert_streaming_budget_bytes = expert_streaming_budget_bytes;
+
+        phase_f_debug_log("driver_phase_n_set_dynamic_budgets cmd=%u fd_source=%s source_fd=%d fd=%d path=%s gpu_id=%u epoch=%llu managed=%llu safety=%llu scratch=%llu kv=%llu expert_hot=%llu expert_streaming=%llu mode=%u flags=0x%x ioctl_begin",
+                          UVM_PHASE_N_SET_DYNAMIC_BUDGETS_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          path ? path : "",
+                          gpu_id,
+                          static_cast<unsigned long long>(epoch),
+                          static_cast<unsigned long long>(managed_hbm_budget_bytes),
+                          static_cast<unsigned long long>(safety_margin_bytes),
+                          static_cast<unsigned long long>(scratch_workspace_bytes),
+                          static_cast<unsigned long long>(kv_budget_bytes),
+                          static_cast<unsigned long long>(expert_hot_budget_bytes),
+                          static_cast<unsigned long long>(expert_streaming_budget_bytes),
+                          mode,
+                          flags);
+        int ret = ioctl(fd, UVM_PHASE_N_SET_DYNAMIC_BUDGETS_IOCTL, &params);
+        int saved_errno = errno;
+        phase_f_debug_log("driver_phase_n_set_dynamic_budgets cmd=%u fd_source=%s source_fd=%d fd=%d ioctl_done ret=%d errno=%d rmStatus=%u kv_resident=%llu kv_pending=%llu expert_resident=%llu expert_pending=%llu shared_over=%llu kv_over=%llu expert_over=%llu",
+                          UVM_PHASE_N_SET_DYNAMIC_BUDGETS_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          ret,
+                          saved_errno,
+                          params.rmStatus,
+                          static_cast<unsigned long long>(params.kv_resident_gpu_bytes),
+                          static_cast<unsigned long long>(params.kv_pending_gpu_bytes),
+                          static_cast<unsigned long long>(params.expert_resident_gpu_bytes),
+                          static_cast<unsigned long long>(params.expert_pending_gpu_bytes),
+                          static_cast<unsigned long long>(params.shared_over_budget_bytes),
+                          static_cast<unsigned long long>(params.kv_over_budget_bytes),
+                          static_cast<unsigned long long>(params.expert_over_budget_bytes));
+
+        if (ret != 0) return -6;
+        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+
+        int score = 0;
+        if (params.kv_resident_gpu_bytes > 0 ||
+            params.kv_pending_gpu_bytes > 0 ||
+            params.expert_resident_gpu_bytes > 0 ||
+            params.expert_pending_gpu_bytes > 0)
+            score += 100;
+        if (params.kv_over_budget_bytes > 0 ||
+            params.expert_over_budget_bytes > 0 ||
+            params.shared_over_budget_bytes > 0)
+            score += 50;
+        if (!have_best || score > best_score) {
+            best_params = params;
+            best_score = score;
+            have_best = true;
+        }
+        return 1;
+    };
+
+    int existing_result = apply_to_existing_uvm_fds(
+        "driver_phase_n_set_dynamic_budgets",
+        [&](int fd, int source_fd, const char* path) {
+            return set_dynamic_on_fd(fd, "adopted", source_fd, path);
+        });
+    if (existing_result > 0) {
+        if (have_best)
+            copy_values(best_params);
+        return existing_result;
+    }
+
+    int fd = open_initialized_uvm_fd("driver_phase_n_set_dynamic_budgets", false);
+    int result;
+    if (fd < 0) return -4;
+    result = set_dynamic_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
+    if (result > 0 && have_best)
+        copy_values(best_params);
+    close(fd);
+    return result;
+}
+
+int uvm_driver_phase_n_protect_active_kv_internal(uint32_t gpu_id,
+                                                  uint64_t epoch,
+                                                  uint64_t active_kv_bytes,
+                                                  uint64_t managed_hbm_budget_bytes,
+                                                  uint64_t safety_margin_bytes,
+                                                  uint64_t scratch_workspace_bytes,
+                                                  uint64_t region_id,
+                                                  uint32_t mode,
+                                                  uint32_t flags,
+                                                  uint64_t* values_out,
+                                                  size_t values_count) {
+    if (values_out == nullptr || values_count < 12) return -2;
+    PhaseNProtectActiveKvParams best_params{};
+    bool have_best = false;
+    int best_score = -1;
+
+    auto copy_values = [&](const PhaseNProtectActiveKvParams& params) {
+        values_out[0] = params.old_kv_budget_bytes;
+        values_out[1] = params.new_kv_budget_bytes;
+        values_out[2] = params.old_expert_budget_bytes;
+        values_out[3] = params.new_expert_budget_bytes;
+        values_out[4] = params.kv_resident_gpu_bytes;
+        values_out[5] = params.kv_pending_gpu_bytes;
+        values_out[6] = params.expert_resident_gpu_bytes;
+        values_out[7] = params.expert_pending_gpu_bytes;
+        values_out[8] = params.shared_over_budget_bytes;
+        values_out[9] = params.kv_over_budget_bytes;
+        values_out[10] = params.expert_over_budget_bytes;
+        values_out[11] = params.rmStatus;
+    };
+
+    auto protect_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
+        PhaseNProtectActiveKvParams params{};
+        params.gpu_id = gpu_id;
+        params.mode = mode;
+        params.flags = flags;
+        params.epoch = epoch;
+        params.active_kv_bytes = active_kv_bytes;
+        params.managed_hbm_budget_bytes = managed_hbm_budget_bytes;
+        params.safety_margin_bytes = safety_margin_bytes;
+        params.scratch_workspace_bytes = scratch_workspace_bytes;
+        params.region_id = region_id;
+
+        phase_f_debug_log("driver_phase_n_protect_active_kv cmd=%u fd_source=%s source_fd=%d fd=%d path=%s gpu_id=%u epoch=%llu active_kv=%llu managed=%llu safety=%llu scratch=%llu region_id=%llu mode=%u flags=0x%x ioctl_begin",
+                          UVM_PHASE_N_PROTECT_ACTIVE_KV_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          path ? path : "",
+                          gpu_id,
+                          static_cast<unsigned long long>(epoch),
+                          static_cast<unsigned long long>(active_kv_bytes),
+                          static_cast<unsigned long long>(managed_hbm_budget_bytes),
+                          static_cast<unsigned long long>(safety_margin_bytes),
+                          static_cast<unsigned long long>(scratch_workspace_bytes),
+                          static_cast<unsigned long long>(region_id),
+                          mode,
+                          flags);
+        int ret = ioctl(fd, UVM_PHASE_N_PROTECT_ACTIVE_KV_IOCTL, &params);
+        int saved_errno = errno;
+        phase_f_debug_log("driver_phase_n_protect_active_kv cmd=%u fd_source=%s source_fd=%d fd=%d ioctl_done ret=%d errno=%d rmStatus=%u old_kv=%llu new_kv=%llu old_expert=%llu new_expert=%llu kv_resident=%llu kv_pending=%llu expert_resident=%llu expert_pending=%llu shared_over=%llu kv_over=%llu expert_over=%llu",
+                          UVM_PHASE_N_PROTECT_ACTIVE_KV_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          ret,
+                          saved_errno,
+                          params.rmStatus,
+                          static_cast<unsigned long long>(params.old_kv_budget_bytes),
+                          static_cast<unsigned long long>(params.new_kv_budget_bytes),
+                          static_cast<unsigned long long>(params.old_expert_budget_bytes),
+                          static_cast<unsigned long long>(params.new_expert_budget_bytes),
+                          static_cast<unsigned long long>(params.kv_resident_gpu_bytes),
+                          static_cast<unsigned long long>(params.kv_pending_gpu_bytes),
+                          static_cast<unsigned long long>(params.expert_resident_gpu_bytes),
+                          static_cast<unsigned long long>(params.expert_pending_gpu_bytes),
+                          static_cast<unsigned long long>(params.shared_over_budget_bytes),
+                          static_cast<unsigned long long>(params.kv_over_budget_bytes),
+                          static_cast<unsigned long long>(params.expert_over_budget_bytes));
+
+        if (ret != 0) return -6;
+        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+
+        int score = 0;
+        if (params.new_kv_budget_bytes > 0 || params.new_expert_budget_bytes > 0)
+            score += 50;
+        if (params.kv_resident_gpu_bytes > 0 ||
+            params.expert_resident_gpu_bytes > 0 ||
+            params.expert_over_budget_bytes > 0)
+            score += 100;
+        if (!have_best || score > best_score) {
+            best_params = params;
+            best_score = score;
+            have_best = true;
+        }
+        return 1;
+    };
+
+    int existing_result = apply_to_existing_uvm_fds(
+        "driver_phase_n_protect_active_kv",
+        [&](int fd, int source_fd, const char* path) {
+            return protect_on_fd(fd, "adopted", source_fd, path);
+        });
+    if (existing_result > 0) {
+        if (have_best)
+            copy_values(best_params);
+        return existing_result;
+    }
+
+    int fd = open_initialized_uvm_fd("driver_phase_n_protect_active_kv", false);
+    int result;
+    if (fd < 0) return -4;
+    result = protect_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
+    if (result > 0 && have_best)
+        copy_values(best_params);
+    close(fd);
+    return result;
+}
+
 int uvm_driver_phase_n_get_pool_state_internal(uint32_t pool,
                                                uint32_t gpu_id,
                                                uint64_t* values_out,
@@ -1312,6 +1661,8 @@ int uvm_driver_phase_n_get_pool_state_internal(uint32_t pool,
         values_out[33] = best_params.accounting_corrections;
         values_out[34] = best_params.mode;
         values_out[35] = best_params.flags;
+        if (values_count > 36)
+            values_out[36] = best_params.pending_gpu_bytes;
     };
 
     auto query_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
@@ -1329,7 +1680,7 @@ int uvm_driver_phase_n_get_pool_state_internal(uint32_t pool,
                           gpu_id);
         int ret = ioctl(fd, UVM_PHASE_N_GET_POOL_STATE_IOCTL, &params);
         int saved_errno = errno;
-        phase_f_debug_log("driver_phase_n_get_pool_state cmd=%u fd_source=%s source_fd=%d fd=%d pool=%u ioctl_done ret=%d errno=%d rmStatus=%u budget=%llu gpu=%llu cpu=%llu reclaim=%llu evictable=%llu protected=%llu over=%llu target=%llu candidate=%llu candidate_regions=%llu selected_id=%llu selected_bytes=%llu victim_count=%u metadata_only=%u",
+        phase_f_debug_log("driver_phase_n_get_pool_state cmd=%u fd_source=%s source_fd=%d fd=%d pool=%u ioctl_done ret=%d errno=%d rmStatus=%u budget=%llu gpu=%llu pending=%llu cpu=%llu reclaim=%llu evictable=%llu protected=%llu over=%llu target=%llu candidate=%llu candidate_regions=%llu selected_id=%llu selected_bytes=%llu victim_count=%u metadata_only=%u",
                           UVM_PHASE_N_GET_POOL_STATE_IOCTL,
                           fd_source,
                           source_fd,
@@ -1340,6 +1691,7 @@ int uvm_driver_phase_n_get_pool_state_internal(uint32_t pool,
                           params.rmStatus,
                           static_cast<unsigned long long>(params.budget_bytes),
                           static_cast<unsigned long long>(params.resident_gpu_bytes),
+                          static_cast<unsigned long long>(params.pending_gpu_bytes),
                           static_cast<unsigned long long>(params.resident_cpu_bytes),
                           static_cast<unsigned long long>(params.reclaim_bytes),
                           static_cast<unsigned long long>(params.evictable_bytes),
@@ -1822,6 +2174,277 @@ int uvm_driver_phase_n_query_region_by_va_internal(uintptr_t address,
     values_out[8] = params.state;
     values_out[9] = params.priority;
     values_out[10] = params.last_access_epoch;
+    return 1;
+}
+
+int uvm_driver_phase_n_query_region_blocks_internal(uint64_t region_id,
+                                                    uint32_t gpu_id,
+                                                    uint64_t* values_out,
+                                                    size_t values_count) {
+    if (values_out == nullptr || values_count < 87) return -2;
+
+    PhaseNQueryRegionBlocksParams best_params{};
+    bool have_best = false;
+    int last_error = -4;
+
+    auto copy_values = [&]() {
+        values_out[0] = best_params.region_id;
+        values_out[1] = best_params.base;
+        values_out[2] = best_params.length;
+        values_out[3] = best_params.pool;
+        values_out[4] = best_params.layer_id;
+        values_out[5] = best_params.expert_id;
+        values_out[6] = best_params.role;
+        values_out[7] = best_params.flags;
+        values_out[8] = best_params.state;
+        values_out[9] = best_params.priority;
+        values_out[10] = best_params.va_range_count;
+        values_out[11] = best_params.logical_block_count;
+        values_out[12] = best_params.populated_block_count;
+        values_out[13] = best_params.resident_block_count;
+        values_out[14] = best_params.pending_block_count;
+        values_out[15] = best_params.materialized_block_count;
+        values_out[16] = best_params.mixed_block_count;
+        values_out[17] = best_params.resident_gpu_bytes;
+        values_out[18] = best_params.pending_gpu_bytes;
+        values_out[19] = best_params.first_block_start;
+        values_out[20] = best_params.last_block_end;
+        values_out[21] = best_params.sampled_block_count;
+        values_out[22] = best_params.rmStatus;
+        for (size_t i = 0; i < UVM_PHASE_N_REGION_BLOCK_TRACE_MAX; ++i) {
+            values_out[23 + i] = best_params.block_starts[i];
+            values_out[39 + i] = best_params.block_ends[i];
+            values_out[55 + i] = best_params.block_bytes[i];
+            values_out[71 + i] = best_params.block_states[i];
+        }
+    };
+
+    auto query_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
+        PhaseNQueryRegionBlocksParams params{};
+        params.region_id = region_id;
+        params.gpu_id = gpu_id;
+
+        phase_f_debug_log("driver_phase_n_query_region_blocks cmd=%u fd_source=%s source_fd=%d fd=%d path=%s id=%llu gpu_id=%u ioctl_begin",
+                          UVM_PHASE_N_QUERY_REGION_BLOCKS_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          path ? path : "",
+                          static_cast<unsigned long long>(region_id),
+                          gpu_id);
+        int ret = ioctl(fd, UVM_PHASE_N_QUERY_REGION_BLOCKS_IOCTL, &params);
+        int saved_errno = errno;
+        phase_f_debug_log("driver_phase_n_query_region_blocks cmd=%u fd_source=%s source_fd=%d fd=%d id=%llu ioctl_done ret=%d errno=%d rmStatus=%u pool=%u logical=%llu populated=%llu resident=%llu pending=%llu sampled=%u",
+                          UVM_PHASE_N_QUERY_REGION_BLOCKS_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          static_cast<unsigned long long>(region_id),
+                          ret,
+                          saved_errno,
+                          params.rmStatus,
+                          params.pool,
+                          static_cast<unsigned long long>(params.logical_block_count),
+                          static_cast<unsigned long long>(params.populated_block_count),
+                          static_cast<unsigned long long>(params.resident_block_count),
+                          static_cast<unsigned long long>(params.pending_block_count),
+                          params.sampled_block_count);
+
+        if (ret != 0) return -6;
+        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+
+        best_params = params;
+        have_best = true;
+        return 1;
+    };
+
+    if (phase_f_adopt_cuda_uvm_fd_enabled()) {
+        std::vector<UvmFdCandidate> candidates =
+            collect_existing_uvm_fd_candidates("driver_phase_n_query_region_blocks");
+        for (const UvmFdCandidate& candidate : candidates) {
+            int fd = duplicate_uvm_fd_candidate("driver_phase_n_query_region_blocks", candidate);
+            if (fd < 0)
+                continue;
+            if (!initialize_duplicated_uvm_fd("driver_phase_n_query_region_blocks", fd, candidate)) {
+                close(fd);
+                continue;
+            }
+            int result = query_on_fd(fd, "adopted", candidate.source_fd, candidate.path.c_str());
+            close(fd);
+            if (result < 0) {
+                last_error = result;
+                continue;
+            }
+            if (best_params.populated_block_count > 0 ||
+                best_params.resident_block_count > 0 ||
+                best_params.pending_block_count > 0) {
+                copy_values();
+                return 1;
+            }
+        }
+        if (have_best) {
+            copy_values();
+            return 1;
+        }
+    }
+
+    int fd = get_phase_n_persistent_fd("driver_phase_n_query_region_blocks_persistent");
+    if (fd >= 0) {
+        int result = query_on_fd(fd, "persistent", -1, "/dev/nvidia-uvm:persistent");
+        if (result > 0 && have_best) {
+            copy_values();
+            return 1;
+        }
+        if (result < 0)
+            last_error = result;
+    }
+
+    fd = open_initialized_uvm_fd("driver_phase_n_query_region_blocks", false);
+    if (fd < 0)
+        return last_error;
+    int result = query_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
+    close(fd);
+    if (result < 0)
+        return result;
+    copy_values();
+    return 1;
+}
+
+int uvm_driver_phase_n_reclaim_region_internal(uint64_t region_id,
+                                               uint32_t gpu_id,
+                                               uint32_t async,
+                                               uint32_t flags,
+                                               uint32_t max_blocks,
+                                               uint64_t current_epoch,
+                                               uint64_t* values_out,
+                                               size_t values_count) {
+    if (values_out == nullptr || values_count < 79) return -2;
+
+    PhaseNReclaimRegionParams best_params{};
+    bool have_best = false;
+    int last_error = -4;
+
+    auto copy_values = [&]() {
+        values_out[0] = best_params.region_id;
+        values_out[1] = best_params.pool;
+        values_out[2] = best_params.skipped_protected;
+        values_out[3] = best_params.block_count;
+        values_out[4] = best_params.resident_blocks_before;
+        values_out[5] = best_params.resident_blocks_after;
+        values_out[6] = best_params.pending_blocks;
+        values_out[7] = best_params.attempted_blocks;
+        values_out[8] = best_params.success_blocks;
+        values_out[9] = best_params.failure_blocks;
+        values_out[10] = best_params.traced_blocks;
+        values_out[11] = best_params.attempted_bytes;
+        values_out[12] = best_params.reclaimed_bytes;
+        values_out[13] = best_params.failed_bytes;
+        values_out[14] = best_params.rmStatus;
+        for (size_t i = 0; i < UVM_PHASE_N_REGION_BLOCK_TRACE_MAX; ++i) {
+            values_out[15 + i] = best_params.block_starts[i];
+            values_out[31 + i] = best_params.block_ends[i];
+            values_out[47 + i] = best_params.block_bytes[i];
+            values_out[63 + i] = best_params.block_status[i];
+        }
+    };
+
+    auto reclaim_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
+        PhaseNReclaimRegionParams params{};
+        params.region_id = region_id;
+        params.gpu_id = gpu_id;
+        params.async = async ? 1 : 0;
+        params.flags = flags;
+        params.max_blocks = max_blocks;
+        params.current_epoch = current_epoch;
+
+        phase_f_debug_log("driver_phase_n_reclaim_region cmd=%u fd_source=%s source_fd=%d fd=%d path=%s id=%llu gpu_id=%u async=%u flags=0x%x max_blocks=%u epoch=%llu ioctl_begin",
+                          UVM_PHASE_N_RECLAIM_REGION_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          path ? path : "",
+                          static_cast<unsigned long long>(region_id),
+                          gpu_id,
+                          async,
+                          flags,
+                          max_blocks,
+                          static_cast<unsigned long long>(current_epoch));
+        int ret = ioctl(fd, UVM_PHASE_N_RECLAIM_REGION_IOCTL, &params);
+        int saved_errno = errno;
+        phase_f_debug_log("driver_phase_n_reclaim_region cmd=%u fd_source=%s source_fd=%d fd=%d id=%llu ioctl_done ret=%d errno=%d rmStatus=%u pool=%u before=%llu after=%llu attempted=%u success=%u failure=%u reclaimed=%llu",
+                          UVM_PHASE_N_RECLAIM_REGION_IOCTL,
+                          fd_source,
+                          source_fd,
+                          fd,
+                          static_cast<unsigned long long>(region_id),
+                          ret,
+                          saved_errno,
+                          params.rmStatus,
+                          params.pool,
+                          static_cast<unsigned long long>(params.resident_blocks_before),
+                          static_cast<unsigned long long>(params.resident_blocks_after),
+                          params.attempted_blocks,
+                          params.success_blocks,
+                          params.failure_blocks,
+                          static_cast<unsigned long long>(params.reclaimed_bytes));
+
+        if (ret != 0) return -6;
+        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
+
+        best_params = params;
+        have_best = true;
+        return 1;
+    };
+
+    if (phase_f_adopt_cuda_uvm_fd_enabled()) {
+        std::vector<UvmFdCandidate> candidates =
+            collect_existing_uvm_fd_candidates("driver_phase_n_reclaim_region");
+        for (const UvmFdCandidate& candidate : candidates) {
+            int fd = duplicate_uvm_fd_candidate("driver_phase_n_reclaim_region", candidate);
+            if (fd < 0)
+                continue;
+            if (!initialize_duplicated_uvm_fd("driver_phase_n_reclaim_region", fd, candidate)) {
+                close(fd);
+                continue;
+            }
+            int result = reclaim_on_fd(fd, "adopted", candidate.source_fd, candidate.path.c_str());
+            close(fd);
+            if (result < 0) {
+                last_error = result;
+                continue;
+            }
+            if (best_params.attempted_blocks > 0 ||
+                best_params.success_blocks > 0 ||
+                best_params.resident_blocks_before > 0) {
+                copy_values();
+                return 1;
+            }
+        }
+        if (have_best) {
+            copy_values();
+            return 1;
+        }
+    }
+
+    int fd = get_phase_n_persistent_fd("driver_phase_n_reclaim_region_persistent");
+    if (fd >= 0) {
+        int result = reclaim_on_fd(fd, "persistent", -1, "/dev/nvidia-uvm:persistent");
+        if (result > 0 && have_best) {
+            copy_values();
+            return 1;
+        }
+        if (result < 0)
+            last_error = result;
+    }
+
+    fd = open_initialized_uvm_fd("driver_phase_n_reclaim_region", false);
+    if (fd < 0)
+        return last_error;
+    int result = reclaim_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
+    close(fd);
+    if (result < 0)
+        return result;
+    copy_values();
     return 1;
 }
 
@@ -7761,6 +8384,58 @@ int uvm_driver_phase_n_get_pool_state(uint32_t pool,
         values_count);
 }
 
+int uvm_driver_phase_n_set_dynamic_budgets(uint32_t gpu_id,
+                                           uint64_t epoch,
+                                           uint64_t managed_hbm_budget_bytes,
+                                           uint64_t safety_margin_bytes,
+                                           uint64_t scratch_workspace_bytes,
+                                           uint64_t kv_budget_bytes,
+                                           uint64_t expert_hot_budget_bytes,
+                                           uint64_t expert_streaming_budget_bytes,
+                                           uint32_t mode,
+                                           uint32_t flags,
+                                           uint64_t* values_out,
+                                           size_t values_count) {
+    return uvm_driver_phase_n_set_dynamic_budgets_internal(
+        gpu_id,
+        epoch,
+        managed_hbm_budget_bytes,
+        safety_margin_bytes,
+        scratch_workspace_bytes,
+        kv_budget_bytes,
+        expert_hot_budget_bytes,
+        expert_streaming_budget_bytes,
+        mode,
+        flags,
+        values_out,
+        values_count);
+}
+
+int uvm_driver_phase_n_protect_active_kv(uint32_t gpu_id,
+                                         uint64_t epoch,
+                                         uint64_t active_kv_bytes,
+                                         uint64_t managed_hbm_budget_bytes,
+                                         uint64_t safety_margin_bytes,
+                                         uint64_t scratch_workspace_bytes,
+                                         uint64_t region_id,
+                                         uint32_t mode,
+                                         uint32_t flags,
+                                         uint64_t* values_out,
+                                         size_t values_count) {
+    return uvm_driver_phase_n_protect_active_kv_internal(
+        gpu_id,
+        epoch,
+        active_kv_bytes,
+        managed_hbm_budget_bytes,
+        safety_margin_bytes,
+        scratch_workspace_bytes,
+        region_id,
+        mode,
+        flags,
+        values_out,
+        values_count);
+}
+
 int uvm_driver_phase_n_metadata_state_smoke(uint32_t pool,
                                             uint64_t budget_bytes,
                                             uint64_t* values_out,
@@ -7824,6 +8499,36 @@ int uvm_driver_phase_n_query_region_by_va(uintptr_t address,
                                           size_t values_count) {
     return uvm_driver_phase_n_query_region_by_va_internal(
         address,
+        values_out,
+        values_count);
+}
+
+int uvm_driver_phase_n_query_region_blocks(uint64_t region_id,
+                                           uint32_t gpu_id,
+                                           uint64_t* values_out,
+                                           size_t values_count) {
+    return uvm_driver_phase_n_query_region_blocks_internal(
+        region_id,
+        gpu_id,
+        values_out,
+        values_count);
+}
+
+int uvm_driver_phase_n_reclaim_region(uint64_t region_id,
+                                      uint32_t gpu_id,
+                                      uint32_t async,
+                                      uint32_t flags,
+                                      uint32_t max_blocks,
+                                      uint64_t current_epoch,
+                                      uint64_t* values_out,
+                                      size_t values_count) {
+    return uvm_driver_phase_n_reclaim_region_internal(
+        region_id,
+        gpu_id,
+        async,
+        flags,
+        max_blocks,
+        current_epoch,
         values_out,
         values_count);
 }

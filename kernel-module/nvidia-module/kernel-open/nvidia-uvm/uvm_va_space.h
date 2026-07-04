@@ -85,6 +85,7 @@ typedef struct
 {
     NvU64 budget_bytes;
     NvU64 resident_gpu_bytes;
+    NvU64 pending_gpu_bytes;
     NvU64 resident_cpu_bytes;
     NvU64 reclaim_bytes;
     NvU64 protected_bytes;
@@ -133,8 +134,11 @@ typedef struct
     NvU64 budget_bytes;
     NvU64 budget_blocks;
     NvU64 resident_blocks;
+    NvU64 pending_blocks;
     NvU64 materialized_blocks;
     NvU64 mixed_blocks;
+    NvU64 reservation_success;
+    NvU64 reservation_aborts;
     NvU64 reclaim_attempts;
     NvU64 reclaim_success;
     NvU64 reclaim_failures;
@@ -314,6 +318,17 @@ struct uvm_va_space_struct
     struct radix_tree_root phase_n_blocks;
     uvm_phase_n_block_pool_t phase_n_block_pools[UVM_PHASE_N_POOL_STATE_MAX];
     spinlock_t phase_n_native_block_pool_locks[UVM_PHASE_N_POOL_STATE_MAX];
+    NvU64 phase_n_dynamic_epoch;
+    NvU64 phase_n_managed_hbm_budget_bytes;
+    NvU64 phase_n_safety_margin_bytes;
+    NvU64 phase_n_scratch_workspace_bytes;
+    NvU64 phase_n_expert_hot_budget_bytes;
+    NvU64 phase_n_expert_streaming_budget_bytes;
+    NvU64 phase_n_shared_over_budget_bytes;
+    NvU32 phase_n_auto_reclaim_pending_mask;
+    NvU64 phase_n_auto_reclaim_request_epoch;
+    NvU64 phase_n_active_kv_required_bytes;
+    NvU64 phase_n_active_kv_protect_epoch;
 
     // Peer to peer table
     // A bitmask of peer to peer pairs enabled in this va_space

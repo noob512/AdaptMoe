@@ -52,6 +52,9 @@ TOKEN_LAYER_PAIR_CSV="$RUN_ROOT/qwen3_moe_token_expert_trace_layer_pair_summary.
 TIER_ANALYSIS_MD="$RUN_ROOT/qwen3_moe_tier_adjacent_similarity.md"
 TIER_ANALYSIS_JSON="$RUN_ROOT/qwen3_moe_tier_adjacent_similarity.json"
 TIER_ANALYSIS_CSV="$RUN_ROOT/qwen3_moe_tier_adjacent_similarity.csv"
+FIXED_TIER_STABILITY_MD="$RUN_ROOT/qwen3_moe_fixed_tier_stability.md"
+FIXED_TIER_STABILITY_JSON="$RUN_ROOT/qwen3_moe_fixed_tier_stability.json"
+FIXED_TIER_STABILITY_CSV="$RUN_ROOT/qwen3_moe_fixed_tier_stability.csv"
 
 cleanup_gpu() {
   pkill -f "vllm bench serve" >/dev/null 2>&1 || true
@@ -463,6 +466,10 @@ python3 "$SCRIPT_DIR/analyze_qwen3_moe_tier_adjacent_similarity.py" "$TRACE_JSON
   --output-md "$TIER_ANALYSIS_MD" \
   --output-json "$TIER_ANALYSIS_JSON" \
   --output-csv "$TIER_ANALYSIS_CSV"
+python3 "$SCRIPT_DIR/analyze_qwen3_moe_fixed_tier_stability.py" "$TRACE_JSONL" \
+  --output-md "$FIXED_TIER_STABILITY_MD" \
+  --output-json "$FIXED_TIER_STABILITY_JSON" \
+  --output-csv "$FIXED_TIER_STABILITY_CSV"
 
 echo "summary_md=$SUMMARY_MD"
 echo "summary_csv=$SUMMARY_CSV"
@@ -471,5 +478,7 @@ echo "token_layer_csv=$TOKEN_LAYER_CSV"
 echo "token_layer_pair_csv=$TOKEN_LAYER_PAIR_CSV"
 echo "tier_analysis_md=$TIER_ANALYSIS_MD"
 echo "tier_analysis_csv=$TIER_ANALYSIS_CSV"
+echo "fixed_tier_stability_md=$FIXED_TIER_STABILITY_MD"
+echo "fixed_tier_stability_csv=$FIXED_TIER_STABILITY_CSV"
 echo "trace_jsonl=$TRACE_JSONL"
 exit "$status"

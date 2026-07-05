@@ -152,6 +152,8 @@ struct ModeSample {
     int iter = 0;
     double total_ms = 0.0;
     double prefetch_ms = 0.0;
+    double submit_ms = 0.0;
+    double wait_ms = 0.0;
     double upper_prefetch_ms = 0.0;
     double lower_prefetch_ms = 0.0;
     double upper_kernel_ms = 0.0;
@@ -172,7 +174,7 @@ static void usage(const char *argv0)
     std::fprintf(stderr,
                  "usage: %s [--device N] [--experts N] [--repeats N] [--warmups N]\n"
                  "          [--expert-mib N] [--upper-us N] [--activation-us N] [--lower-us N]\n"
-                 "          [--blocks-per-sm N] [--mode all|compare_handoff|gpu_resident|fault_only|sync_full|split_overlap|async_full]\n"
+                 "          [--blocks-per-sm N] [--mode all|compare_handoff|gpu_resident|fault_only|sync_full|split_overlap|async_full|prefetch_split_timing]\n"
                  "          [--advise-read-mostly] [--tag-expert-regions]\n",
                  argv0);
 }
@@ -456,6 +458,46 @@ static float prefetch_many_sync(const std::vector<uint4 *> &experts,
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(end));
     return ms;
+}
+
+struct PrefetchTiming {
+    double event_ms = 0.0;
+    double submit_ms = 0.0;
+    double wait_ms = 0.0;
+    double wall_ms = 0.0;
+};
+
+static PrefetchTiming prefetch_many_sync_timing(const std::vector<uint4 *> &experts,
+                                                size_t offset_bytes,
+                                                size_t bytes,
+                                                int device,
+                                                cudaStream_t stream)
+{
+    cudaEvent_t start, end;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&end));
+
+    const double wall_start = now_ms();
+    CUDA_CHECK(cudaEventRecord(start, stream));
+    for (uint4 *expert : experts) {
+        void *ptr = reinterpret_cast<char *>(expert) + offset_bytes;
+        CUDA_CHECK(cudaMemPrefetchAsync(ptr, bytes, device, stream));
+    }
+    CUDA_CHECK(cudaEventRecord(end, stream));
+
+    const double submit_done = now_ms();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const double wait_done = now_ms();
+
+    PrefetchTiming timing;
+    timing.event_ms = elapsed_event(start, end);
+    timing.submit_ms = submit_done - wall_start;
+    timing.wait_ms = wait_done - submit_done;
+    timing.wall_ms = wait_done - wall_start;
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(end));
+    return timing;
 }
 
 static void prefetch_many_async_timed(const std::vector<uint4 *> &experts,
@@ -808,6 +850,32 @@ static ModeSample run_split_overlap(const std::vector<uint4 *> &experts,
     return sample;
 }
 
+static ModeSample run_prefetch_split_timing(const std::vector<uint4 *> &experts,
+                                            const Args &args,
+                                            int iter,
+                                            cudaStream_t setup_stream,
+                                            cudaStream_t prefetch_stream)
+{
+    const size_t half_bytes = args.expert_bytes / 2;
+    ModeSample sample;
+    sample.mode = "prefetch_split_timing";
+    sample.iter = iter;
+
+    setup_cpu_resident(experts, args, setup_stream, 0x60000u + (unsigned int)iter * 97u);
+
+    const double start = now_ms();
+    PrefetchTiming upper = prefetch_many_sync_timing(experts, 0, half_bytes, args.device, prefetch_stream);
+    PrefetchTiming lower = prefetch_many_sync_timing(experts, half_bytes, half_bytes, args.device, prefetch_stream);
+
+    sample.upper_prefetch_ms = upper.event_ms;
+    sample.lower_prefetch_ms = lower.event_ms;
+    sample.prefetch_ms = upper.event_ms + lower.event_ms;
+    sample.submit_ms = upper.submit_ms + lower.submit_ms;
+    sample.wait_ms = upper.wait_ms + lower.wait_ms;
+    sample.total_ms = now_ms() - start;
+    return sample;
+}
+
 static ModeSample run_async_full(const std::vector<uint4 *> &experts,
                                  const Args &args,
                                  int iter,
@@ -889,6 +957,8 @@ static std::vector<std::string> selected_modes(const std::string &mode)
         return {"gpu_resident", "fault_only", "sync_full", "split_overlap", "async_full"};
     if (mode == "compare_handoff")
         return {"gpu_resident", "sync_full", "split_overlap"};
+    if (mode == "prefetch_split_timing")
+        return {"prefetch_split_timing"};
     return {mode};
 }
 
@@ -907,12 +977,15 @@ static Stats stats_of(std::vector<double> values)
 static void print_sample(const ModeSample &s)
 {
     std::printf("sample mode=%s iter=%d total_ms=%.3f prefetch_ms=%.3f "
+                "submit_ms=%.3f wait_ms=%.3f "
                 "upper_prefetch_ms=%.3f lower_prefetch_ms=%.3f "
                 "upper_kernel_ms=%.3f activation_kernel_ms=%.3f lower_kernel_ms=%.3f\n",
                 s.mode.c_str(),
                 s.iter,
                 s.total_ms,
                 s.prefetch_ms,
+                s.submit_ms,
+                s.wait_ms,
                 s.upper_prefetch_ms,
                 s.lower_prefetch_ms,
                 s.upper_kernel_ms,
@@ -927,6 +1000,8 @@ static void print_summary(const std::string &mode, const std::vector<ModeSample>
     std::vector<double> activation_kernel;
     std::vector<double> lower_kernel;
     std::vector<double> prefetch;
+    std::vector<double> submit;
+    std::vector<double> wait;
 
     for (const ModeSample &s : samples) {
         if (s.mode != mode)
@@ -936,6 +1011,8 @@ static void print_summary(const std::string &mode, const std::vector<ModeSample>
         activation_kernel.push_back(s.activation_kernel_ms);
         lower_kernel.push_back(s.lower_kernel_ms);
         prefetch.push_back(s.prefetch_ms);
+        submit.push_back(s.submit_ms);
+        wait.push_back(s.wait_ms);
     }
 
     if (total.empty())
@@ -946,10 +1023,13 @@ static void print_summary(const std::string &mode, const std::vector<ModeSample>
     const Stats activation_s = stats_of(activation_kernel);
     const Stats lower_s = stats_of(lower_kernel);
     const Stats prefetch_s = stats_of(prefetch);
+    const Stats submit_s = stats_of(submit);
+    const Stats wait_s = stats_of(wait);
     const double speedup = (sync_p50 > 0.0 && mode != "sync_full") ? sync_p50 / total_s.p50 : 1.0;
 
     std::printf("summary mode=%s total_p50_ms=%.3f total_mean_ms=%.3f total_p90_ms=%.3f "
-                "prefetch_p50_ms=%.3f upper_kernel_p50_ms=%.3f activation_kernel_p50_ms=%.3f "
+                "prefetch_p50_ms=%.3f submit_p50_ms=%.3f wait_p50_ms=%.3f "
+                "upper_kernel_p50_ms=%.3f activation_kernel_p50_ms=%.3f "
                 "lower_kernel_p50_ms=%.3f "
                 "speedup_vs_sync_full=%.3f\n",
                 mode.c_str(),
@@ -957,6 +1037,8 @@ static void print_summary(const std::string &mode, const std::vector<ModeSample>
                 total_s.mean,
                 total_s.p90,
                 prefetch_s.p50,
+                submit_s.p50,
+                wait_s.p50,
                 upper_s.p50,
                 activation_s.p50,
                 lower_s.p50,
@@ -1088,6 +1170,13 @@ int main(int argc, char **argv)
                                            upper_prefetch_stream,
                                            lower_prefetch_stream,
                                            compute_stream);
+            }
+            else if (mode == "prefetch_split_timing") {
+                sample = run_prefetch_split_timing(experts,
+                                                   args,
+                                                   iter,
+                                                   setup_stream,
+                                                   upper_prefetch_stream);
             }
             else if (mode == "async_full") {
                 sample = run_async_full(experts,

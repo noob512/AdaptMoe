@@ -1048,6 +1048,29 @@ NV_STATUS uvm_va_block_promote_read_duplicate_now(uvm_va_block_t *va_block,
                                                   bool wait_for_gpu_mapping,
                                                   NvU32 *committed_pages_out);
 
+typedef struct
+{
+    uvm_va_block_t *va_block;
+    uvm_va_block_region_t region;
+    NvU32 committed_pages;
+} uvm_va_block_expert_batch_entry_t;
+
+// Expert-weight read-copy batch path. This is a narrow fast path for
+// CPU-resident managed pages copied read-only to one GPU. It batches the CE
+// memcpy submission across multiple VA blocks, then updates per-block UVM
+// residency/PTE metadata. Unsupported states return NV_WARN_MORE_PROCESSING_REQUIRED
+// so callers can fall back to the regular per-block path.
+//
+// LOCKING: The caller must hold va_space->lock. The helper locks entries in
+//          array order, so callers must pass entries sorted by increasing VA.
+NV_STATUS uvm_va_block_expert_promote_read_duplicate_batch(uvm_va_space_t *va_space,
+                                                           struct mm_struct *mm,
+                                                           uvm_gpu_t *dest_gpu,
+                                                           uvm_va_block_expert_batch_entry_t *entries,
+                                                           size_t entry_count,
+                                                           uvm_tracker_t *out_tracker,
+                                                           uvm_processor_mask_t *involved_processors);
+
 // Like uvm_va_block_map, except it maps all processors in the input mask. The
 // VA block tracker contains all map operations on return.
 //
@@ -2457,6 +2480,50 @@ void uvm_va_block_print_latency_stats(struct seq_file *s);
 // Reset global counters for the experimental latency-aware remote-first
 // background promotion path.
 void uvm_va_block_reset_latency_stats(void);
+
+typedef enum
+{
+    UVM_MIGRATE_PROFILE_API_TOTAL,
+    UVM_MIGRATE_PROFILE_API_LOCKS_AND_LOOKUP,
+    UVM_MIGRATE_PROFILE_API_CORE,
+    UVM_MIGRATE_PROFILE_API_TRACKER_WAIT,
+    UVM_MIGRATE_PROFILE_CORE_TOTAL,
+    UVM_MIGRATE_PROFILE_CORE_FIRST_PASS,
+    UVM_MIGRATE_PROFILE_CORE_SECOND_PASS,
+    UVM_MIGRATE_PROFILE_RANGES_TOTAL,
+    UVM_MIGRATE_PROFILE_RANGE_TOTAL,
+    UVM_MIGRATE_PROFILE_PREUNMAP,
+    UVM_MIGRATE_PROFILE_MULTI_BLOCK_TOTAL,
+    UVM_MIGRATE_PROFILE_BLOCK_CREATE,
+    UVM_MIGRATE_PROFILE_BLOCK_LOCK_MIGRATE,
+    UVM_MIGRATE_PROFILE_BLOCK_MIGRATE_TOTAL,
+    UVM_MIGRATE_PROFILE_BLOCK_MAKE_RESIDENT,
+    UVM_MIGRATE_PROFILE_BLOCK_MAP,
+    UVM_MIGRATE_PROFILE_MAKE_RESIDENT_COPY,
+    UVM_MIGRATE_PROFILE_MAKE_RESIDENT_FINISH,
+    UVM_MIGRATE_PROFILE_READ_DUP_TOTAL,
+    UVM_MIGRATE_PROFILE_READ_DUP_PREP,
+    UVM_MIGRATE_PROFILE_READ_DUP_POPULATE,
+    UVM_MIGRATE_PROFILE_READ_DUP_COPY,
+    UVM_MIGRATE_PROFILE_READ_DUP_FINISH,
+    UVM_MIGRATE_PROFILE_UNMAP,
+    UVM_MIGRATE_PROFILE_POPULATE_TOTAL,
+    UVM_MIGRATE_PROFILE_POPULATE_GPU,
+    UVM_MIGRATE_PROFILE_POPULATE_CPU,
+    UVM_MIGRATE_PROFILE_COPY_RESIDENT_TOTAL,
+    UVM_MIGRATE_PROFILE_COPY_BETWEEN_TOTAL,
+    UVM_MIGRATE_PROFILE_COPY_PUSH_BEGIN,
+    UVM_MIGRATE_PROFILE_COPY_PUSH_MEMCOPY,
+    UVM_MIGRATE_PROFILE_COPY_PUSH_END,
+    UVM_MIGRATE_PROFILE_MAP_TOTAL,
+    UVM_MIGRATE_PROFILE_MAP_GPU_TO,
+    UVM_MIGRATE_PROFILE_UNMAP_MASK,
+    UVM_MIGRATE_PROFILE_UNMAP_GPU,
+    UVM_MIGRATE_PROFILE_TLB_PHYS_INVALIDATE,
+    UVM_MIGRATE_PROFILE_COUNT
+} uvm_migrate_profile_stage_t;
+
+void uvm_migrate_profile_add(uvm_migrate_profile_stage_t stage, NvU64 ns, NvU64 pages, NvU64 bytes);
 
 // Pause or resume deferred read-only background promotion for the block. This
 // is an experimental runtime gate used by Phase F to keep background promotion

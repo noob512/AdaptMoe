@@ -209,8 +209,266 @@ static atomic64_t g_uvm_gpu_only_last_pool = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_gpu_only_last_fault_addr = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_gpu_only_last_is_write = ATOMIC64_INIT(0);
 
+typedef struct
+{
+    atomic64_t calls;
+    atomic64_t ns;
+    atomic64_t pages;
+    atomic64_t bytes;
+} uvm_migrate_profile_counter_t;
+
+static uvm_migrate_profile_counter_t g_uvm_migrate_profile[UVM_MIGRATE_PROFILE_COUNT] = {
+    [0 ... UVM_MIGRATE_PROFILE_COUNT - 1] = {
+        .calls = ATOMIC64_INIT(0),
+        .ns = ATOMIC64_INIT(0),
+        .pages = ATOMIC64_INIT(0),
+        .bytes = ATOMIC64_INIT(0),
+    },
+};
+
+typedef enum
+{
+    UVM_BG_PROMOTE_PROFILE_TOTAL = 0,
+    UVM_BG_PROMOTE_PROFILE_PREP,
+    UVM_BG_PROMOTE_PROFILE_POPULATE,
+    UVM_BG_PROMOTE_PROFILE_COPY,
+    UVM_BG_PROMOTE_PROFILE_COMMIT_PREP,
+    UVM_BG_PROMOTE_PROFILE_UNMAP,
+    UVM_BG_PROMOTE_PROFILE_METADATA,
+    UVM_BG_PROMOTE_PROFILE_MAP,
+    UVM_BG_PROMOTE_PROFILE_FINISH,
+    UVM_BG_PROMOTE_PROFILE_COUNT
+} uvm_bg_promote_profile_stage_t;
+
+static uvm_migrate_profile_counter_t g_uvm_bg_promote_profile[UVM_BG_PROMOTE_PROFILE_COUNT] = {
+    [0 ... UVM_BG_PROMOTE_PROFILE_COUNT - 1] = {
+        .calls = ATOMIC64_INIT(0),
+        .ns = ATOMIC64_INIT(0),
+        .pages = ATOMIC64_INIT(0),
+        .bytes = ATOMIC64_INIT(0),
+    },
+};
+
+typedef enum
+{
+    UVM_EXPERT_BATCH_PROFILE_TOTAL = 0,
+    UVM_EXPERT_BATCH_PROFILE_PREPARE,
+    UVM_EXPERT_BATCH_PROFILE_LOCK_REVALIDATE,
+    UVM_EXPERT_BATCH_PROFILE_COPY,
+    UVM_EXPERT_BATCH_PROFILE_METADATA,
+    UVM_EXPERT_BATCH_PROFILE_MAP,
+    UVM_EXPERT_BATCH_PROFILE_TRACKER,
+    UVM_EXPERT_BATCH_PROFILE_COUNT
+} uvm_expert_batch_profile_stage_t;
+
+static uvm_migrate_profile_counter_t g_uvm_expert_batch_profile[UVM_EXPERT_BATCH_PROFILE_COUNT] = {
+    [0 ... UVM_EXPERT_BATCH_PROFILE_COUNT - 1] = {
+        .calls = ATOMIC64_INIT(0),
+        .ns = ATOMIC64_INIT(0),
+        .pages = ATOMIC64_INIT(0),
+        .bytes = ATOMIC64_INIT(0),
+    },
+};
+
+static atomic64_t g_uvm_expert_batch_attempts = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_expert_batch_successes = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_expert_batch_fallbacks = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_expert_batch_errors = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_expert_batch_requested_entries = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_expert_batch_active_entries = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_expert_batch_committed_pages = ATOMIC64_INIT(0);
+
+static const char *uvm_migrate_profile_stage_name(uvm_migrate_profile_stage_t stage)
+{
+    static const char *names[UVM_MIGRATE_PROFILE_COUNT] = {
+        [UVM_MIGRATE_PROFILE_API_TOTAL] = "api_total",
+        [UVM_MIGRATE_PROFILE_API_LOCKS_AND_LOOKUP] = "api_locks_lookup",
+        [UVM_MIGRATE_PROFILE_API_CORE] = "api_core",
+        [UVM_MIGRATE_PROFILE_API_TRACKER_WAIT] = "api_tracker_wait",
+        [UVM_MIGRATE_PROFILE_CORE_TOTAL] = "core_total",
+        [UVM_MIGRATE_PROFILE_CORE_FIRST_PASS] = "core_first_pass",
+        [UVM_MIGRATE_PROFILE_CORE_SECOND_PASS] = "core_second_pass",
+        [UVM_MIGRATE_PROFILE_RANGES_TOTAL] = "ranges_total",
+        [UVM_MIGRATE_PROFILE_RANGE_TOTAL] = "range_total",
+        [UVM_MIGRATE_PROFILE_PREUNMAP] = "preunmap",
+        [UVM_MIGRATE_PROFILE_MULTI_BLOCK_TOTAL] = "multi_block_total",
+        [UVM_MIGRATE_PROFILE_BLOCK_CREATE] = "block_create",
+        [UVM_MIGRATE_PROFILE_BLOCK_LOCK_MIGRATE] = "block_lock_migrate",
+        [UVM_MIGRATE_PROFILE_BLOCK_MIGRATE_TOTAL] = "block_migrate_total",
+        [UVM_MIGRATE_PROFILE_BLOCK_MAKE_RESIDENT] = "block_make_resident",
+        [UVM_MIGRATE_PROFILE_BLOCK_MAP] = "block_map",
+        [UVM_MIGRATE_PROFILE_MAKE_RESIDENT_COPY] = "make_resident_copy",
+        [UVM_MIGRATE_PROFILE_MAKE_RESIDENT_FINISH] = "make_resident_finish",
+        [UVM_MIGRATE_PROFILE_READ_DUP_TOTAL] = "read_dup_total",
+        [UVM_MIGRATE_PROFILE_READ_DUP_PREP] = "read_dup_prep",
+        [UVM_MIGRATE_PROFILE_READ_DUP_POPULATE] = "read_dup_populate",
+        [UVM_MIGRATE_PROFILE_READ_DUP_COPY] = "read_dup_copy",
+        [UVM_MIGRATE_PROFILE_READ_DUP_FINISH] = "read_dup_finish",
+        [UVM_MIGRATE_PROFILE_UNMAP] = "unmap",
+        [UVM_MIGRATE_PROFILE_POPULATE_TOTAL] = "populate_total",
+        [UVM_MIGRATE_PROFILE_POPULATE_GPU] = "populate_gpu",
+        [UVM_MIGRATE_PROFILE_POPULATE_CPU] = "populate_cpu",
+        [UVM_MIGRATE_PROFILE_COPY_RESIDENT_TOTAL] = "copy_resident_total",
+        [UVM_MIGRATE_PROFILE_COPY_BETWEEN_TOTAL] = "copy_between_total",
+        [UVM_MIGRATE_PROFILE_COPY_PUSH_BEGIN] = "copy_push_begin",
+        [UVM_MIGRATE_PROFILE_COPY_PUSH_MEMCOPY] = "copy_push_memcopy",
+        [UVM_MIGRATE_PROFILE_COPY_PUSH_END] = "copy_push_end",
+        [UVM_MIGRATE_PROFILE_MAP_TOTAL] = "map_total",
+        [UVM_MIGRATE_PROFILE_MAP_GPU_TO] = "map_gpu_to",
+        [UVM_MIGRATE_PROFILE_UNMAP_MASK] = "unmap_mask",
+        [UVM_MIGRATE_PROFILE_UNMAP_GPU] = "unmap_gpu",
+        [UVM_MIGRATE_PROFILE_TLB_PHYS_INVALIDATE] = "tlb_phys_invalidate",
+    };
+
+    return names[stage] ? names[stage] : "unknown";
+}
+
+static const char *uvm_bg_promote_profile_stage_name(uvm_bg_promote_profile_stage_t stage)
+{
+    static const char *names[UVM_BG_PROMOTE_PROFILE_COUNT] = {
+        [UVM_BG_PROMOTE_PROFILE_TOTAL] = "total",
+        [UVM_BG_PROMOTE_PROFILE_PREP] = "prep",
+        [UVM_BG_PROMOTE_PROFILE_POPULATE] = "populate_gpu_pages",
+        [UVM_BG_PROMOTE_PROFILE_COPY] = "copy_resident_pages",
+        [UVM_BG_PROMOTE_PROFILE_COMMIT_PREP] = "commit_prep",
+        [UVM_BG_PROMOTE_PROFILE_UNMAP] = "unmap_old_gpu",
+        [UVM_BG_PROMOTE_PROFILE_METADATA] = "metadata_update",
+        [UVM_BG_PROMOTE_PROFILE_MAP] = "map_local_gpu_pte",
+        [UVM_BG_PROMOTE_PROFILE_FINISH] = "finish",
+    };
+
+    if (stage >= UVM_BG_PROMOTE_PROFILE_COUNT)
+        return "unknown";
+
+    return names[stage] ? names[stage] : "unknown";
+}
+
+static const char *uvm_expert_batch_profile_stage_name(uvm_expert_batch_profile_stage_t stage)
+{
+    static const char *names[UVM_EXPERT_BATCH_PROFILE_COUNT] = {
+        [UVM_EXPERT_BATCH_PROFILE_TOTAL] = "total",
+        [UVM_EXPERT_BATCH_PROFILE_PREPARE] = "prepare_populate_map_alloc",
+        [UVM_EXPERT_BATCH_PROFILE_LOCK_REVALIDATE] = "lock_revalidate",
+        [UVM_EXPERT_BATCH_PROFILE_COPY] = "batch_copy_push",
+        [UVM_EXPERT_BATCH_PROFILE_METADATA] = "metadata_update",
+        [UVM_EXPERT_BATCH_PROFILE_MAP] = "batch_map_push",
+        [UVM_EXPERT_BATCH_PROFILE_TRACKER] = "tracker_attach",
+    };
+
+    if (stage >= UVM_EXPERT_BATCH_PROFILE_COUNT)
+        return "unknown";
+
+    return names[stage] ? names[stage] : "unknown";
+}
+
+void uvm_migrate_profile_add(uvm_migrate_profile_stage_t stage, NvU64 ns, NvU64 pages, NvU64 bytes)
+{
+    if (stage >= UVM_MIGRATE_PROFILE_COUNT)
+        return;
+
+    atomic64_inc(&g_uvm_migrate_profile[stage].calls);
+    atomic64_add(ns, &g_uvm_migrate_profile[stage].ns);
+    atomic64_add(pages, &g_uvm_migrate_profile[stage].pages);
+    atomic64_add(bytes, &g_uvm_migrate_profile[stage].bytes);
+}
+
+static void uvm_bg_promote_profile_add(uvm_bg_promote_profile_stage_t stage, NvU64 ns, NvU64 pages)
+{
+    if (stage >= UVM_BG_PROMOTE_PROFILE_COUNT)
+        return;
+
+    atomic64_inc(&g_uvm_bg_promote_profile[stage].calls);
+    atomic64_add(ns, &g_uvm_bg_promote_profile[stage].ns);
+    atomic64_add(pages, &g_uvm_bg_promote_profile[stage].pages);
+    atomic64_add(pages * PAGE_SIZE, &g_uvm_bg_promote_profile[stage].bytes);
+}
+
+static void uvm_expert_batch_profile_add(uvm_expert_batch_profile_stage_t stage, NvU64 ns, NvU64 pages)
+{
+    if (stage >= UVM_EXPERT_BATCH_PROFILE_COUNT)
+        return;
+
+    atomic64_inc(&g_uvm_expert_batch_profile[stage].calls);
+    atomic64_add(ns, &g_uvm_expert_batch_profile[stage].ns);
+    atomic64_add(pages, &g_uvm_expert_batch_profile[stage].pages);
+    atomic64_add(pages * PAGE_SIZE, &g_uvm_expert_batch_profile[stage].bytes);
+}
+
 void uvm_va_block_print_latency_stats(struct seq_file *s)
 {
+    uvm_migrate_profile_stage_t stage;
+    uvm_bg_promote_profile_stage_t bg_stage;
+    uvm_expert_batch_profile_stage_t batch_stage;
+
+    UVM_SEQ_OR_DBG_PRINT(s, "migrate_profile:\n");
+    for (stage = 0; stage < UVM_MIGRATE_PROFILE_COUNT; ++stage) {
+        NvU64 calls = (NvU64)atomic64_read(&g_uvm_migrate_profile[stage].calls);
+        NvU64 ns = (NvU64)atomic64_read(&g_uvm_migrate_profile[stage].ns);
+        NvU64 pages = (NvU64)atomic64_read(&g_uvm_migrate_profile[stage].pages);
+        NvU64 bytes = (NvU64)atomic64_read(&g_uvm_migrate_profile[stage].bytes);
+        NvU64 avg_ns = calls ? ns / calls : 0;
+
+        UVM_SEQ_OR_DBG_PRINT(s,
+                             "  %-24s calls=%llu ns=%llu avg_ns=%llu pages=%llu bytes=%llu\n",
+                             uvm_migrate_profile_stage_name(stage),
+                             calls,
+                             ns,
+                             avg_ns,
+                             pages,
+                             bytes);
+    }
+
+    UVM_SEQ_OR_DBG_PRINT(s, "bg_promote_profile:\n");
+    for (bg_stage = 0; bg_stage < UVM_BG_PROMOTE_PROFILE_COUNT; ++bg_stage) {
+        NvU64 calls = (NvU64)atomic64_read(&g_uvm_bg_promote_profile[bg_stage].calls);
+        NvU64 ns = (NvU64)atomic64_read(&g_uvm_bg_promote_profile[bg_stage].ns);
+        NvU64 pages = (NvU64)atomic64_read(&g_uvm_bg_promote_profile[bg_stage].pages);
+        NvU64 bytes = (NvU64)atomic64_read(&g_uvm_bg_promote_profile[bg_stage].bytes);
+        NvU64 avg_ns = calls ? ns / calls : 0;
+
+        UVM_SEQ_OR_DBG_PRINT(s,
+                             "  %-24s calls=%llu ns=%llu avg_ns=%llu pages=%llu bytes=%llu\n",
+                             uvm_bg_promote_profile_stage_name(bg_stage),
+                             calls,
+                             ns,
+                             avg_ns,
+                             pages,
+                             bytes);
+    }
+
+    UVM_SEQ_OR_DBG_PRINT(s, "expert_batch_profile:\n");
+    for (batch_stage = 0; batch_stage < UVM_EXPERT_BATCH_PROFILE_COUNT; ++batch_stage) {
+        NvU64 calls = (NvU64)atomic64_read(&g_uvm_expert_batch_profile[batch_stage].calls);
+        NvU64 ns = (NvU64)atomic64_read(&g_uvm_expert_batch_profile[batch_stage].ns);
+        NvU64 pages = (NvU64)atomic64_read(&g_uvm_expert_batch_profile[batch_stage].pages);
+        NvU64 bytes = (NvU64)atomic64_read(&g_uvm_expert_batch_profile[batch_stage].bytes);
+        NvU64 avg_ns = calls ? ns / calls : 0;
+
+        UVM_SEQ_OR_DBG_PRINT(s,
+                             "  %-24s calls=%llu ns=%llu avg_ns=%llu pages=%llu bytes=%llu\n",
+                             uvm_expert_batch_profile_stage_name(batch_stage),
+                             calls,
+                             ns,
+                             avg_ns,
+                             pages,
+                             bytes);
+    }
+
+    UVM_SEQ_OR_DBG_PRINT(s, "expert_batch_attempts           %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_expert_batch_attempts));
+    UVM_SEQ_OR_DBG_PRINT(s, "expert_batch_successes          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_expert_batch_successes));
+    UVM_SEQ_OR_DBG_PRINT(s, "expert_batch_fallbacks          %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_expert_batch_fallbacks));
+    UVM_SEQ_OR_DBG_PRINT(s, "expert_batch_errors             %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_expert_batch_errors));
+    UVM_SEQ_OR_DBG_PRINT(s, "expert_batch_requested_entries  %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_expert_batch_requested_entries));
+    UVM_SEQ_OR_DBG_PRINT(s, "expert_batch_active_entries     %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_expert_batch_active_entries));
+    UVM_SEQ_OR_DBG_PRINT(s, "expert_batch_committed_pages    %llu\n",
+                         (NvU64)atomic64_read(&g_uvm_expert_batch_committed_pages));
+
     UVM_SEQ_OR_DBG_PRINT(s, "remote_first_faults             %llu\n",
                          (NvU64)atomic64_read(&g_uvm_latency_remote_first_faults));
     UVM_SEQ_OR_DBG_PRINT(s, "remote_first_pages              %llu\n",
@@ -353,6 +611,39 @@ void uvm_va_block_print_latency_stats(struct seq_file *s)
 
 void uvm_va_block_reset_latency_stats(void)
 {
+    uvm_migrate_profile_stage_t stage;
+    uvm_bg_promote_profile_stage_t bg_stage;
+    uvm_expert_batch_profile_stage_t batch_stage;
+
+    for (stage = 0; stage < UVM_MIGRATE_PROFILE_COUNT; ++stage) {
+        atomic64_set(&g_uvm_migrate_profile[stage].calls, 0);
+        atomic64_set(&g_uvm_migrate_profile[stage].ns, 0);
+        atomic64_set(&g_uvm_migrate_profile[stage].pages, 0);
+        atomic64_set(&g_uvm_migrate_profile[stage].bytes, 0);
+    }
+
+    for (bg_stage = 0; bg_stage < UVM_BG_PROMOTE_PROFILE_COUNT; ++bg_stage) {
+        atomic64_set(&g_uvm_bg_promote_profile[bg_stage].calls, 0);
+        atomic64_set(&g_uvm_bg_promote_profile[bg_stage].ns, 0);
+        atomic64_set(&g_uvm_bg_promote_profile[bg_stage].pages, 0);
+        atomic64_set(&g_uvm_bg_promote_profile[bg_stage].bytes, 0);
+    }
+
+    for (batch_stage = 0; batch_stage < UVM_EXPERT_BATCH_PROFILE_COUNT; ++batch_stage) {
+        atomic64_set(&g_uvm_expert_batch_profile[batch_stage].calls, 0);
+        atomic64_set(&g_uvm_expert_batch_profile[batch_stage].ns, 0);
+        atomic64_set(&g_uvm_expert_batch_profile[batch_stage].pages, 0);
+        atomic64_set(&g_uvm_expert_batch_profile[batch_stage].bytes, 0);
+    }
+
+    atomic64_set(&g_uvm_expert_batch_attempts, 0);
+    atomic64_set(&g_uvm_expert_batch_successes, 0);
+    atomic64_set(&g_uvm_expert_batch_fallbacks, 0);
+    atomic64_set(&g_uvm_expert_batch_errors, 0);
+    atomic64_set(&g_uvm_expert_batch_requested_entries, 0);
+    atomic64_set(&g_uvm_expert_batch_active_entries, 0);
+    atomic64_set(&g_uvm_expert_batch_committed_pages, 0);
+
     atomic64_set(&g_uvm_latency_remote_first_faults, 0);
     atomic64_set(&g_uvm_latency_remote_first_pages, 0);
     atomic64_set(&g_uvm_latency_bg_promote_enqueued_pages, 0);
@@ -3531,6 +3822,9 @@ static NV_STATUS block_populate_pages(uvm_va_block_t *block,
                                       uvm_va_block_region_t region,
                                       const uvm_page_mask_t *page_mask)
 {
+    NvU64 profile_start = NV_GETTIME();
+    NvU64 stage_start;
+    NvU64 region_bytes = uvm_va_block_region_size(region);
     NV_STATUS status;
     const uvm_page_mask_t *resident_mask = block_resident_mask_get_alloc(block,
                                                                          dest_id,
@@ -3554,12 +3848,19 @@ static NV_STATUS block_populate_pages(uvm_va_block_t *block,
         uvm_page_mask_t *scratch_page_mask = &block_context->scratch_page_mask;
         uvm_page_mask_t *id_resident_mask;
         uvm_processor_id_t id;
+        NvU64 populate_pages;
 
         tmp_processor_mask = uvm_processor_mask_cache_alloc();
         if (!tmp_processor_mask)
             return NV_ERR_NO_MEMORY;
 
+        populate_pages = uvm_page_mask_region_weight(populate_page_mask, region);
+        stage_start = NV_GETTIME();
         status = uvm_va_block_populate_pages_gpu(block, retry, dest_id, region, populate_page_mask);
+        uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_POPULATE_GPU,
+                                NV_GETTIME() - stage_start,
+                                populate_pages,
+                                populate_pages * PAGE_SIZE);
         if (status != NV_OK) {
             uvm_processor_mask_cache_free(tmp_processor_mask);
             return status;
@@ -3607,8 +3908,21 @@ static NV_STATUS block_populate_pages(uvm_va_block_t *block,
     }
 
     uvm_memcg_context_start(&memcg_context, block_context->mm);
-    status = block_populate_pages_cpu(block, cpu_populate_mask, region, block_context);
+    {
+        NvU64 populate_pages = uvm_page_mask_region_weight(cpu_populate_mask, region);
+
+        stage_start = NV_GETTIME();
+        status = block_populate_pages_cpu(block, cpu_populate_mask, region, block_context);
+        uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_POPULATE_CPU,
+                                NV_GETTIME() - stage_start,
+                                populate_pages,
+                                populate_pages * PAGE_SIZE);
+    }
     uvm_memcg_context_end(&memcg_context);
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_POPULATE_TOTAL,
+                            NV_GETTIME() - profile_start,
+                            region_bytes / PAGE_SIZE,
+                            region_bytes);
     return status;
 }
 
@@ -3774,8 +4088,15 @@ static uvm_gpu_address_t block_phys_page_copy_address(uvm_va_block_t *block,
 static void block_tlb_invalidate_phys(uvm_va_block_t *block, uvm_push_t *push)
 {
     uvm_parent_gpu_t *parent = uvm_push_get_gpu(push)->parent;
-    if (uvm_parent_processor_mask_test_and_clear(&block->needs_phys_invalidate, parent->id))
+    if (uvm_parent_processor_mask_test_and_clear(&block->needs_phys_invalidate, parent->id)) {
+        NvU64 profile_start = NV_GETTIME();
+
         uvm_hal_tlb_invalidate_phys(push, parent->ats.dma_map_invalidation);
+        uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_TLB_PHYS_INVALIDATE,
+                                NV_GETTIME() - profile_start,
+                                0,
+                                0);
+    }
 }
 
 typedef struct
@@ -3811,6 +4132,7 @@ typedef struct
 // to be a GPU.
 static NV_STATUS block_copy_begin_push(uvm_va_block_t *va_block, block_copy_state_t *copy_state, uvm_push_t *push)
 {
+    NvU64 profile_start = NV_GETTIME();
     uvm_gpu_t *gpu;
     NV_STATUS status;
     uvm_channel_type_t channel_type;
@@ -3926,6 +4248,10 @@ static NV_STATUS block_copy_begin_push(uvm_va_block_t *va_block, block_copy_stat
 out:
     // Caller is responsible for freeing the DMA buffer on error
     uvm_tracker_deinit(&local_tracker);
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_COPY_PUSH_BEGIN,
+                            NV_GETTIME() - profile_start,
+                            0,
+                            0);
     return status;
 }
 
@@ -4250,6 +4576,8 @@ static void block_copy_push(uvm_va_block_t *block,
                             uvm_va_block_region_t region,
                             uvm_push_t *push)
 {
+    NvU64 profile_start = NV_GETTIME();
+    NvU64 region_bytes = uvm_va_block_region_size(region);
     uvm_gpu_address_t gpu_dst_address, gpu_src_address;
     uvm_gpu_t *gpu = uvm_push_get_gpu(push);
 
@@ -4276,6 +4604,10 @@ static void block_copy_push(uvm_va_block_t *block,
         gpu->parent->ce_hal->memcopy(push, gpu_dst_address, gpu_src_address, uvm_va_block_region_size(region));
     }
 
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_COPY_PUSH_MEMCOPY,
+                            NV_GETTIME() - profile_start,
+                            region_bytes / PAGE_SIZE,
+                            region_bytes);
     copy_state->copy_pushed = true;
 }
 
@@ -4285,6 +4617,7 @@ static NV_STATUS block_copy_end_push(uvm_va_block_t *block,
                                      NV_STATUS push_status,
                                      uvm_push_t *push)
 {
+    NvU64 profile_start = NV_GETTIME();
     NV_STATUS tracker_status;
 
     // TODO: Bug 1766424: If the destination is a GPU and the copy was done
@@ -4312,6 +4645,10 @@ static NV_STATUS block_copy_end_push(uvm_va_block_t *block,
         uvm_tracker_deinit(&local_tracker);
     }
 
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_COPY_PUSH_END,
+                            NV_GETTIME() - profile_start,
+                            0,
+                            0);
     return push_status;
 }
 
@@ -4463,6 +4800,7 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
                                                    NvU32 *copied_pages,
                                                    uvm_tracker_t *copy_tracker)
 {
+    NvU64 profile_start = NV_GETTIME();
     NV_STATUS status = NV_OK;
     uvm_page_mask_t *dst_resident_mask = uvm_va_block_resident_mask_get(block, dst_id, dst_nid);
     uvm_gpu_t *copying_gpu = NULL;
@@ -4492,11 +4830,21 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
         UVM_ASSERT(dst_nid != NUMA_NO_NODE);
 
     // If there are no pages to be copied, exit early
-    if (!uvm_page_mask_andnot(copy_mask, copy_mask, dst_resident_mask))
+    if (!uvm_page_mask_andnot(copy_mask, copy_mask, dst_resident_mask)) {
+        uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_COPY_BETWEEN_TOTAL,
+                                NV_GETTIME() - profile_start,
+                                0,
+                                0);
         return NV_OK;
+    }
 
-    if (migrated_pages && !uvm_page_mask_andnot(copy_mask, copy_mask, migrated_pages))
+    if (migrated_pages && !uvm_page_mask_andnot(copy_mask, copy_mask, migrated_pages)) {
+        uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_COPY_BETWEEN_TOTAL,
+                                NV_GETTIME() - profile_start,
+                                0,
+                                0);
         return NV_OK;
+    }
 
     copy_state.src.id = src_id;
     copy_state.dst.id = dst_id;
@@ -4508,8 +4856,13 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
 
     // Zero destination pages if copying over nvlink that can hit STO
     status = zero_destination_mem_if_needed(block, region, copy_mask, src_id, dst_id);
-    if (status != NV_OK)
+    if (status != NV_OK) {
+        uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_COPY_BETWEEN_TOTAL,
+                                NV_GETTIME() - profile_start,
+                                0,
+                                0);
         return status;
+    }
 
 
     // uvm_range_group_range_iter_first should only be called when the va_space
@@ -4696,8 +5049,13 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
 
         if (!copy_state.src.is_block_contig || !copy_state.dst.is_block_contig) {
             status = block_copy_pages(block, &copy_state, uvm_va_block_region_for_page(page_index), &push);
-            if (status != NV_OK)
+            if (status != NV_OK) {
+                uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_COPY_BETWEEN_TOTAL,
+                                        NV_GETTIME() - profile_start,
+                                        0,
+                                        0);
                 return status;
+            }
         }
 
         last_index = page_index;
@@ -4708,8 +5066,13 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
     if (uvm_va_block_region_size(contig_region) && uvm_va_block_region_contains_region(region, contig_region)) {
         if (copy_state.src.is_block_contig && copy_state.dst.is_block_contig) {
             status = block_copy_pages(block, &copy_state, contig_region, &push);
-            if (status != NV_OK)
+            if (status != NV_OK) {
+                uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_COPY_BETWEEN_TOTAL,
+                                        NV_GETTIME() - profile_start,
+                                        0,
+                                        0);
                 return status;
+            }
         }
 
         if (block_copy_should_use_push(block, &copy_state)) {
@@ -4753,6 +5116,10 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
     if (*copied_pages && migrated_pages)
         uvm_page_mask_or(migrated_pages, migrated_pages, copy_mask);
 
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_COPY_BETWEEN_TOTAL,
+                            NV_GETTIME() - profile_start,
+                            *copied_pages,
+                            (NvU64)*copied_pages * PAGE_SIZE);
     return status;
 }
 
@@ -5059,6 +5426,8 @@ static NV_STATUS block_copy_resident_pages(uvm_va_block_t *block,
                                            const uvm_page_mask_t *prefetch_page_mask,
                                            uvm_va_block_transfer_mode_t transfer_mode)
 {
+    NvU64 profile_start = NV_GETTIME();
+    NvU64 region_bytes = uvm_va_block_region_size(region);
     NV_STATUS status = NV_OK;
     NV_STATUS tracker_status;
     uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
@@ -5251,6 +5620,10 @@ out:
     uvm_tracker_deinit(&local_tracker);
     uvm_processor_mask_cache_free(src_processor_mask);
 
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_COPY_RESIDENT_TOTAL,
+                            NV_GETTIME() - profile_start,
+                            region_bytes / PAGE_SIZE,
+                            region_bytes);
     return status == NV_OK ? tracker_status : status;
 }
 
@@ -5291,6 +5664,8 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
                                           const uvm_page_mask_t *prefetch_page_mask,
                                           uvm_make_resident_cause_t cause)
 {
+    NvU64 profile_start = NV_GETTIME();
+    NvU64 region_bytes = uvm_va_block_region_size(region);
     NV_STATUS status = NV_OK;
     uvm_processor_mask_t *unmap_processor_mask;
     uvm_page_mask_t *unmap_page_mask = &va_block_context->make_resident.page_mask;
@@ -5331,7 +5706,16 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
     uvm_page_mask_region_clear_outside(unmap_page_mask, region);
 
     // Unmap all pages not resident on the destination
-    status = uvm_va_block_unmap_mask(va_block, va_block_context, unmap_processor_mask, region, unmap_page_mask);
+    {
+        NvU64 unmap_start = NV_GETTIME();
+        NvU64 unmap_pages = uvm_page_mask_region_weight(unmap_page_mask, region);
+
+        status = uvm_va_block_unmap_mask(va_block, va_block_context, unmap_processor_mask, region, unmap_page_mask);
+        uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_UNMAP,
+                                NV_GETTIME() - unmap_start,
+                                unmap_pages,
+                                unmap_pages * PAGE_SIZE);
+    }
     if (status != NV_OK)
         goto out;
 
@@ -5343,7 +5727,16 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
 
     // Also unmap read-duplicated pages excluding dest_id
     uvm_processor_mask_clear(unmap_processor_mask, dest_id);
-    status = uvm_va_block_unmap_mask(va_block, va_block_context, unmap_processor_mask, region, unmap_page_mask);
+    {
+        NvU64 unmap_start = NV_GETTIME();
+        NvU64 unmap_pages = uvm_page_mask_region_weight(unmap_page_mask, region);
+
+        status = uvm_va_block_unmap_mask(va_block, va_block_context, unmap_processor_mask, region, unmap_page_mask);
+        uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_UNMAP,
+                                NV_GETTIME() - unmap_start,
+                                unmap_pages,
+                                unmap_pages * PAGE_SIZE);
+    }
     if (status != NV_OK)
         goto out;
 
@@ -5386,6 +5779,10 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
 
 out:
     uvm_processor_mask_cache_free(unmap_processor_mask);
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_MAKE_RESIDENT_COPY,
+                            NV_GETTIME() - profile_start,
+                            region_bytes / PAGE_SIZE,
+                            region_bytes);
     return status;
 }
 
@@ -5519,6 +5916,8 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
                                      const uvm_page_mask_t *prefetch_page_mask,
                                      uvm_make_resident_cause_t cause)
 {
+    NvU64 finish_start;
+    NvU64 region_bytes = uvm_va_block_region_size(region);
     NV_STATUS status;
 
     status = uvm_va_block_make_resident_copy(va_block,
@@ -5532,10 +5931,15 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
     if (status != NV_OK)
         return status;
 
+    finish_start = NV_GETTIME();
     uvm_va_block_make_resident_finish(va_block,
                                       va_block_context,
                                       region,
                                       page_mask);
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_MAKE_RESIDENT_FINISH,
+                            NV_GETTIME() - finish_start,
+                            region_bytes / PAGE_SIZE,
+                            region_bytes);
 
     if (UVM_ID_IS_GPU(dest_id)) {
         uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
@@ -5614,6 +6018,10 @@ NV_STATUS uvm_va_block_make_resident_read_duplicate(uvm_va_block_t *va_block,
                                                     const uvm_page_mask_t *prefetch_page_mask,
                                                     uvm_make_resident_cause_t cause)
 {
+    NvU64 profile_start = NV_GETTIME();
+    NvU64 stage_start;
+    NvU64 finish_start = 0;
+    NvU64 region_bytes = uvm_va_block_region_size(region);
     NV_STATUS status = NV_OK;
     uvm_processor_id_t src_id;
     uvm_page_mask_t *dst_resident_mask;
@@ -5641,8 +6049,13 @@ NV_STATUS uvm_va_block_make_resident_read_duplicate(uvm_va_block_t *va_block,
     UVM_ASSERT(!uvm_va_block_is_dead(va_block));
 
     scratch_residency_mask = kmem_cache_alloc(g_uvm_page_mask_cache, NV_UVM_GFP_FLAGS);
-    if (!scratch_residency_mask)
+    if (!scratch_residency_mask) {
+        uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_READ_DUP_TOTAL,
+                                NV_GETTIME() - profile_start,
+                                region_bytes / PAGE_SIZE,
+                                region_bytes);
         return NV_ERR_NO_MEMORY;
+    }
 
     // We cannot read-duplicate on different CPU NUMA nodes since there is only
     // one CPU page table. So, the page has to migrate from the source NUMA node
@@ -5697,15 +6110,26 @@ NV_STATUS uvm_va_block_make_resident_read_duplicate(uvm_va_block_t *va_block,
         if (!uvm_page_mask_and(preprocess_page_mask, preprocess_page_mask, resident_mask))
             continue;
 
+        stage_start = NV_GETTIME();
         status = block_prep_read_duplicate_mapping(va_block, va_block_context, src_id, region, preprocess_page_mask);
+        uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_READ_DUP_PREP,
+                                NV_GETTIME() - stage_start,
+                                uvm_page_mask_region_weight(preprocess_page_mask, region),
+                                (NvU64)uvm_page_mask_region_weight(preprocess_page_mask, region) * PAGE_SIZE);
         if (status != NV_OK)
             goto out;
     }
 
+    stage_start = NV_GETTIME();
     status = block_populate_pages(va_block, va_block_retry, va_block_context, dest_id, region, page_mask);
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_READ_DUP_POPULATE,
+                            NV_GETTIME() - stage_start,
+                            region_bytes / PAGE_SIZE,
+                            region_bytes);
     if (status != NV_OK)
         goto out;
 
+    stage_start = NV_GETTIME();
     status = block_copy_resident_pages(va_block,
                                        va_block_context,
                                        dest_id,
@@ -5713,8 +6137,14 @@ NV_STATUS uvm_va_block_make_resident_read_duplicate(uvm_va_block_t *va_block,
                                        page_mask,
                                        prefetch_page_mask,
                                        UVM_VA_BLOCK_TRANSFER_MODE_COPY);
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_READ_DUP_COPY,
+                            NV_GETTIME() - stage_start,
+                            region_bytes / PAGE_SIZE,
+                            region_bytes);
     if (status != NV_OK)
         goto out;
+
+    finish_start = NV_GETTIME();
 
     // Pages that weren't resident anywhere else were populated at the
     // destination directly. Mark them as resident now, since there were no
@@ -5780,6 +6210,16 @@ NV_STATUS uvm_va_block_make_resident_read_duplicate(uvm_va_block_t *va_block,
     // TODO: Bug 4207783: Check both CPU and GPU chunks.
     UVM_ASSERT(block_check_cpu_chunks(va_block));
 out:
+    if (finish_start != 0) {
+        uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_READ_DUP_FINISH,
+                                NV_GETTIME() - finish_start,
+                                region_bytes / PAGE_SIZE,
+                                region_bytes);
+    }
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_READ_DUP_TOTAL,
+                            NV_GETTIME() - profile_start,
+                            region_bytes / PAGE_SIZE,
+                            region_bytes);
     kmem_cache_free(g_uvm_page_mask_cache, scratch_residency_mask);
     return status;
 }
@@ -8444,6 +8884,8 @@ static NV_STATUS block_unmap_gpu(uvm_va_block_t *block,
                                  const uvm_page_mask_t *unmap_page_mask,
                                  uvm_tracker_t *out_tracker)
 {
+    NvU64 profile_start = NV_GETTIME();
+    NvU64 profile_pages = uvm_page_mask_weight(unmap_page_mask);
     uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(block, gpu->id);
     uvm_pte_bits_gpu_t pte_bit;
     uvm_push_t push;
@@ -8534,7 +8976,12 @@ static NV_STATUS block_unmap_gpu(uvm_va_block_t *block,
 
     UVM_ASSERT(block_check_mappings(block, block_context));
 
-    return uvm_tracker_add_push_safe(out_tracker, &push);
+    status = uvm_tracker_add_push_safe(out_tracker, &push);
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_UNMAP_GPU,
+                            NV_GETTIME() - profile_start,
+                            profile_pages,
+                            profile_pages * PAGE_SIZE);
+    return status;
 }
 
 NV_STATUS uvm_va_block_unmap(uvm_va_block_t *va_block,
@@ -8896,6 +9343,8 @@ static NV_STATUS block_map_gpu_to(uvm_va_block_t *va_block,
                                   uvm_prot_t new_prot,
                                   uvm_tracker_t *out_tracker)
 {
+    NvU64 profile_start = NV_GETTIME();
+    NvU64 profile_pages;
     uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
     uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
     uvm_push_t push;
@@ -8918,6 +9367,7 @@ static NV_STATUS block_map_gpu_to(uvm_va_block_t *va_block,
     // which are resident on the target.
     if (!uvm_page_mask_and(pages_to_map, map_page_mask, resident_mask))
         return NV_OK;
+    profile_pages = uvm_page_mask_weight(pages_to_map);
 
     UVM_ASSERT(block_check_mapping_residency(va_block, block_context, gpu, resident_id, pages_to_map));
 
@@ -9022,7 +9472,12 @@ static NV_STATUS block_map_gpu_to(uvm_va_block_t *va_block,
 
     UVM_ASSERT(block_check_mappings(va_block, block_context));
 
-    return uvm_tracker_add_push_safe(out_tracker, &push);
+    status = uvm_tracker_add_push_safe(out_tracker, &push);
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_MAP_GPU_TO,
+                            NV_GETTIME() - profile_start,
+                            profile_pages,
+                            profile_pages * PAGE_SIZE);
+    return status;
 }
 
 static NV_STATUS block_alloc_moe_slot_4k_ptes(uvm_va_block_t *va_block,
@@ -9399,6 +9854,8 @@ NV_STATUS uvm_va_block_map(uvm_va_block_t *va_block,
                            UvmEventMapRemoteCause cause,
                            uvm_tracker_t *out_tracker)
 {
+    NvU64 profile_start = NV_GETTIME();
+    NvU64 region_bytes = uvm_va_block_region_size(region);
     uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
     uvm_gpu_t *gpu = NULL;
     uvm_processor_mask_t *allowed_destinations;
@@ -9426,8 +9883,10 @@ NV_STATUS uvm_va_block_map(uvm_va_block_t *va_block,
         uvm_pte_bits_cpu_t prot_pte_bit;
 
         // Check if the current thread is allowed to call vm_insert_page
-        if (!uvm_va_block_is_hmm(va_block) && !uvm_va_range_vma_check(va_block->managed_range, va_block_context->mm))
-            return NV_OK;
+        if (!uvm_va_block_is_hmm(va_block) && !uvm_va_range_vma_check(va_block->managed_range, va_block_context->mm)) {
+            status = NV_OK;
+            goto out;
+        }
 
         prot_pte_bit = get_cpu_pte_bit_index(new_prot);
         pte_mask = &va_block->cpu.pte_bits[prot_pte_bit];
@@ -9440,12 +9899,16 @@ NV_STATUS uvm_va_block_map(uvm_va_block_t *va_block,
 
         // Although this GPU UUID is registered in the VA space, it might not
         // have a GPU VA space registered.
-        if (!uvm_gpu_va_space_get(va_space, gpu))
-            return NV_OK;
+        if (!uvm_gpu_va_space_get(va_space, gpu)) {
+            status = NV_OK;
+            goto out;
+        }
 
         gpu_state = uvm_va_block_gpu_state_get_alloc(va_block, gpu);
-        if (!gpu_state)
-            return NV_ERR_NO_MEMORY;
+        if (!gpu_state) {
+            status = NV_ERR_NO_MEMORY;
+            goto out;
+        }
 
         prot_pte_bit = get_gpu_pte_bit_index(new_prot);
         pte_mask = &gpu_state->pte_bits[prot_pte_bit];
@@ -9453,17 +9916,22 @@ NV_STATUS uvm_va_block_map(uvm_va_block_t *va_block,
 
     uvm_page_mask_init_from_region(running_page_mask, region, map_page_mask);
 
-    if (!uvm_page_mask_andnot(running_page_mask, running_page_mask, pte_mask))
-        return NV_OK;
+    if (!uvm_page_mask_andnot(running_page_mask, running_page_mask, pte_mask)) {
+        status = NV_OK;
+        goto out;
+    }
 
     allowed_destinations = uvm_processor_mask_cache_alloc();
-    if (!allowed_destinations)
-        return NV_ERR_NO_MEMORY;
+    if (!allowed_destinations) {
+        status = NV_ERR_NO_MEMORY;
+        goto out;
+    }
 
     allowed_nid_destinations = uvm_kvmalloc(sizeof(*allowed_nid_destinations));
     if (!allowed_nid_destinations) {
         uvm_processor_mask_cache_free(allowed_destinations);
-        return NV_ERR_NO_MEMORY;
+        status = NV_ERR_NO_MEMORY;
+        goto out;
     }
 
     // Map per resident location so we can more easily detect physically-
@@ -9524,6 +9992,11 @@ NV_STATUS uvm_va_block_map(uvm_va_block_t *va_block,
     uvm_processor_mask_cache_free(allowed_destinations);
     uvm_kvfree(allowed_nid_destinations);
 
+out:
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_MAP_TOTAL,
+                            NV_GETTIME() - profile_start,
+                            region_bytes / PAGE_SIZE,
+                            region_bytes);
     return status;
 }
 
@@ -10314,6 +10787,654 @@ static NV_STATUS block_bg_promote_map_local_locked(uvm_va_block_t *va_block,
     return status;
 }
 
+typedef struct
+{
+    uvm_page_mask_t eligible_mask;
+    uvm_page_mask_t migrated_pages;
+    uvm_page_mask_t map_pages;
+    uvm_va_block_region_t region;
+    int cpu_nid;
+    NvU32 committed_pages;
+    bool active;
+} uvm_va_block_expert_batch_state_t;
+
+static int block_expert_batch_single_cpu_nid(uvm_va_block_t *va_block,
+                                             uvm_va_block_region_t region,
+                                             const uvm_page_mask_t *page_mask)
+{
+    uvm_page_mask_t resident_pages;
+    int nid;
+    int found_nid = NUMA_NO_NODE;
+
+    for_each_possible_uvm_node(nid) {
+        uvm_page_mask_t *resident_mask = uvm_va_block_resident_mask_get(va_block, UVM_ID_CPU, nid);
+
+        if (uvm_page_mask_and(&resident_pages, page_mask, resident_mask)) {
+            if (found_nid != NUMA_NO_NODE)
+                return NUMA_NO_NODE;
+
+            if (uvm_page_mask_region_weight(&resident_pages, region) != uvm_page_mask_region_weight(page_mask, region))
+                return NUMA_NO_NODE;
+
+            found_nid = nid;
+        }
+    }
+
+    return found_nid;
+}
+
+static NV_STATUS block_expert_batch_prepare_locked(uvm_va_block_expert_batch_entry_t *entry,
+                                                   uvm_va_block_expert_batch_state_t *state,
+                                                   uvm_va_block_retry_t *retry,
+                                                   uvm_va_block_context_t *block_context,
+                                                   uvm_gpu_t *dest_gpu)
+{
+    NV_STATUS status;
+    uvm_va_block_t *va_block = entry->va_block;
+    uvm_page_mask_t *dst_resident_mask = uvm_va_block_resident_mask_get(va_block, dest_gpu->id, NUMA_NO_NODE);
+    uvm_va_block_gpu_state_t *gpu_state;
+    NvU32 eligible_pages;
+
+    entry->committed_pages = 0;
+    memset(state, 0, sizeof(*state));
+
+    if (uvm_va_block_is_hmm(va_block) || g_uvm_global.conf_computing_enabled)
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    uvm_page_mask_init_from_region(&state->eligible_mask, entry->region, NULL);
+    uvm_page_mask_andnot(&state->eligible_mask, &state->eligible_mask, dst_resident_mask);
+    uvm_page_mask_and(&state->eligible_mask, &state->eligible_mask, &va_block->cpu.resident);
+
+    if (uvm_page_mask_empty(&state->eligible_mask))
+        return NV_OK;
+
+    gpu_state = uvm_va_block_gpu_state_get(va_block, dest_gpu->id);
+    if (gpu_state &&
+        uvm_page_mask_and(&block_context->scratch_page_mask,
+                          &state->eligible_mask,
+                          &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ])) {
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+    }
+
+    state->region = uvm_va_block_region_from_mask(va_block, &state->eligible_mask);
+    eligible_pages = uvm_page_mask_region_weight(&state->eligible_mask, state->region);
+    state->cpu_nid = block_expert_batch_single_cpu_nid(va_block, state->region, &state->eligible_mask);
+    if (state->cpu_nid == NUMA_NO_NODE)
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    if (uvm_page_mask_and(&block_context->scratch_page_mask, &state->eligible_mask, &va_block->discarded_pages))
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    block_context->make_resident.dest_id = dest_gpu->id;
+    block_context->make_resident.dest_nid = NUMA_NO_NODE;
+    block_context->make_resident.cause = UVM_MAKE_RESIDENT_CAUSE_PREFETCH;
+    nodes_clear(block_context->make_resident.cpu_pages_used.nodes);
+    uvm_page_mask_zero(&block_context->make_resident.pages_changed_residency);
+    uvm_processor_mask_zero(&block_context->make_resident.all_involved_processors);
+    uvm_page_mask_zero(&block_context->discard.discarded_pages);
+
+    status = block_populate_pages(va_block, retry, block_context, dest_gpu->id, state->region, &state->eligible_mask);
+    if (status != NV_OK)
+        return status;
+
+    if (!uvm_page_mask_empty(&block_context->make_resident.pages_staged))
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    if (block_page_mask_copy_limited(&state->migrated_pages,
+                                     &state->eligible_mask,
+                                     state->region,
+                                     PAGES_PER_UVM_VA_BLOCK) != eligible_pages) {
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+    }
+
+    state->active = true;
+    state->committed_pages = eligible_pages;
+    entry->committed_pages = eligible_pages;
+
+    return NV_OK;
+}
+
+static NV_STATUS block_expert_batch_copy_locked(uvm_va_block_expert_batch_entry_t *entries,
+                                                uvm_va_block_expert_batch_state_t *states,
+                                                size_t entry_count,
+                                                uvm_gpu_t *dest_gpu,
+                                                uvm_tracker_t *batch_tracker,
+                                                NvU32 *committed_pages_total)
+{
+    NV_STATUS status = NV_OK;
+    NV_STATUS tracker_status;
+    uvm_tracker_t dependency_tracker = UVM_TRACKER_INIT();
+    uvm_push_t push;
+    size_t entry_index;
+    bool push_started = false;
+    bool any_active = false;
+    NvU32 committed_pages = 0;
+
+    *committed_pages_total = 0;
+
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        if (!states[entry_index].active)
+            continue;
+
+        any_active = true;
+        status = uvm_tracker_add_tracker_safe(&dependency_tracker, &entries[entry_index].va_block->tracker);
+        if (status != NV_OK)
+            goto out;
+    }
+
+    if (!any_active)
+        goto out;
+
+    status = uvm_push_begin_acquire(dest_gpu->channel_manager,
+                                    UVM_CHANNEL_TYPE_CPU_TO_GPU,
+                                    &dependency_tracker,
+                                    &push,
+                                    "Expert read-duplicate batch copy to %s",
+                                    uvm_processor_get_name(dest_gpu->id));
+    if (status != NV_OK)
+        goto out;
+
+    push_started = true;
+
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        uvm_va_block_t *va_block = entries[entry_index].va_block;
+        uvm_va_block_expert_batch_state_t *state = &states[entry_index];
+        uvm_va_block_region_t subregion;
+
+        if (!state->active)
+            continue;
+
+        for_each_va_block_subregion_in_mask(subregion, &state->migrated_pages, state->region) {
+            uvm_gpu_address_t dst_address = block_phys_page_copy_address(va_block,
+                                                                         block_phys_page(dest_gpu->id,
+                                                                                         NUMA_NO_NODE,
+                                                                                         subregion.first),
+                                                                         dest_gpu);
+            uvm_gpu_address_t src_address = block_phys_page_copy_address(va_block,
+                                                                         block_phys_page(UVM_ID_CPU,
+                                                                                         state->cpu_nid,
+                                                                                         subregion.first),
+                                                                         dest_gpu);
+
+            block_tlb_invalidate_phys(va_block, &push);
+
+            if (committed_pages > 0)
+                uvm_push_set_flag(&push, UVM_PUSH_FLAG_CE_NEXT_PIPELINED);
+
+            uvm_push_set_flag(&push, UVM_PUSH_FLAG_NEXT_MEMBAR_NONE);
+            dest_gpu->parent->ce_hal->memcopy(&push, dst_address, src_address, uvm_va_block_region_size(subregion));
+        }
+
+        committed_pages += state->committed_pages;
+    }
+
+    uvm_push_end(&push);
+    push_started = false;
+
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        if (!states[entry_index].active)
+            continue;
+
+        tracker_status = uvm_tracker_add_push_safe(&entries[entry_index].va_block->tracker, &push);
+        if (status == NV_OK)
+            status = tracker_status;
+    }
+
+    tracker_status = uvm_tracker_add_push_safe(batch_tracker, &push);
+    if (status == NV_OK)
+        status = tracker_status;
+
+    *committed_pages_total = committed_pages;
+
+out:
+    if (push_started)
+        uvm_push_end(&push);
+
+    uvm_tracker_deinit(&dependency_tracker);
+    return status;
+}
+
+static NV_STATUS block_expert_batch_update_residency_locked(uvm_va_block_expert_batch_entry_t *entry,
+                                                            uvm_va_block_expert_batch_state_t *state,
+                                                            uvm_va_block_context_t *block_context,
+                                                            uvm_gpu_t *dest_gpu)
+{
+    uvm_va_block_t *va_block = entry->va_block;
+    uvm_page_mask_t *dst_resident_mask;
+
+    if (!state->active)
+        return NV_OK;
+
+    dst_resident_mask = uvm_va_block_resident_mask_get(va_block, dest_gpu->id, NUMA_NO_NODE);
+    uvm_page_mask_or(dst_resident_mask, dst_resident_mask, &state->migrated_pages);
+    block_set_resident_processor(va_block, dest_gpu->id);
+    uvm_page_mask_or(&va_block->read_duplicated_pages, &va_block->read_duplicated_pages, &state->migrated_pages);
+    uvm_tools_record_read_duplicate(va_block, dest_gpu->id, state->region, &state->migrated_pages);
+
+    if (uvm_processor_mask_test(&va_block->evicted_gpus, dest_gpu->id))
+        block_make_resident_clear_evicted(va_block, dest_gpu->id, &state->migrated_pages);
+
+    if (uvm_page_mask_full(dst_resident_mask))
+        uvm_processor_mask_set(&va_block->ever_fully_resident, dest_gpu->id);
+
+    block_mark_memory_used(va_block, dest_gpu->id);
+    UVM_ASSERT(block_check_cpu_chunks(va_block));
+
+    return NV_OK;
+}
+
+static NV_STATUS block_expert_batch_revalidate_locked(uvm_va_block_expert_batch_entry_t *entries,
+                                                      uvm_va_block_expert_batch_state_t *states,
+                                                      uvm_va_block_context_t *block_context,
+                                                      size_t entry_count,
+                                                      uvm_gpu_t *dest_gpu)
+{
+    size_t entry_index;
+
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        uvm_va_block_t *va_block = entries[entry_index].va_block;
+        uvm_va_block_expert_batch_state_t *state = &states[entry_index];
+        uvm_va_block_gpu_state_t *gpu_state;
+
+        if (!state->active)
+            continue;
+
+        if (!uvm_page_mask_subset(&state->migrated_pages,
+                                  uvm_va_block_resident_mask_get(va_block, UVM_ID_CPU, state->cpu_nid))) {
+            return NV_WARN_MORE_PROCESSING_REQUIRED;
+        }
+
+        if (uvm_page_mask_and(&block_context->scratch_page_mask,
+                              &state->migrated_pages,
+                              uvm_va_block_resident_mask_get(va_block, dest_gpu->id, NUMA_NO_NODE))) {
+            return NV_WARN_MORE_PROCESSING_REQUIRED;
+        }
+
+        if (uvm_page_mask_and(&block_context->scratch_page_mask, &state->migrated_pages, &va_block->discarded_pages))
+            return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+        gpu_state = uvm_va_block_gpu_state_get(va_block, dest_gpu->id);
+        if (!gpu_state)
+            return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+        if (uvm_page_mask_and(&block_context->scratch_page_mask,
+                              &state->migrated_pages,
+                              &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ])) {
+            return NV_WARN_MORE_PROCESSING_REQUIRED;
+        }
+    }
+
+    return NV_OK;
+}
+
+static NV_STATUS block_expert_batch_prepare_map_locked(uvm_va_block_expert_batch_entry_t *entry,
+                                                       uvm_va_block_expert_batch_state_t *state,
+                                                       uvm_va_block_context_t *block_context,
+                                                       uvm_gpu_t *dest_gpu)
+{
+    NV_STATUS status;
+    uvm_va_block_t *va_block = entry->va_block;
+    uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, dest_gpu->id);
+    uvm_pte_bits_gpu_t prot_pte_bit = get_gpu_pte_bit_index(UVM_PROT_READ_ONLY);
+    uvm_page_mask_t *pages_after = &block_context->scratch_page_mask;
+
+    if (!state->active)
+        return NV_OK;
+
+    UVM_ASSERT(gpu_state);
+
+    uvm_page_mask_init_from_region(&state->map_pages, state->region, &state->migrated_pages);
+    if (!uvm_page_mask_andnot(&state->map_pages, &state->map_pages, &gpu_state->pte_bits[prot_pte_bit]))
+        return NV_OK;
+
+    uvm_page_mask_or(pages_after, &gpu_state->pte_bits[prot_pte_bit], &state->map_pages);
+    if (prot_pte_bit < UVM_PTE_BITS_GPU_ATOMIC)
+        uvm_page_mask_andnot(pages_after, pages_after, &gpu_state->pte_bits[prot_pte_bit + 1]);
+
+    block_gpu_compute_new_pte_state(va_block,
+                                    dest_gpu,
+                                    dest_gpu->id,
+                                    &state->map_pages,
+                                    pages_after,
+                                    &block_context->mapping.new_pte_state);
+
+    status = block_alloc_ptes_new_state(va_block, dest_gpu, &block_context->mapping.new_pte_state, &va_block->tracker);
+    if (status != NV_OK)
+        return status;
+
+    return NV_OK;
+}
+
+static NV_STATUS block_expert_batch_map_locked(uvm_va_block_expert_batch_entry_t *entries,
+                                               uvm_va_block_expert_batch_state_t *states,
+                                               uvm_va_block_context_t *block_context,
+                                               size_t entry_count,
+                                               uvm_gpu_t *dest_gpu,
+                                               uvm_tracker_t *batch_tracker)
+{
+    NV_STATUS status = NV_OK;
+    NV_STATUS tracker_status;
+    uvm_tracker_t dependency_tracker = UVM_TRACKER_INIT();
+    uvm_push_t push;
+    size_t entry_index;
+    bool push_started = false;
+    bool any_map = false;
+
+    block_context->mapping.cause = UvmEventMapRemoteCausePolicy;
+
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        if (!states[entry_index].active || uvm_page_mask_empty(&states[entry_index].map_pages))
+            continue;
+
+        any_map = true;
+        status = uvm_tracker_add_tracker_safe(&dependency_tracker, &entries[entry_index].va_block->tracker);
+        if (status != NV_OK)
+            goto out;
+    }
+
+    if (!any_map)
+        goto out;
+
+    status = uvm_push_begin_acquire(dest_gpu->channel_manager,
+                                    UVM_CHANNEL_TYPE_MEMOPS,
+                                    &dependency_tracker,
+                                    &push,
+                                    "Expert read-duplicate batch map on %s",
+                                    uvm_processor_get_name(dest_gpu->id));
+    if (status != NV_OK)
+        goto out;
+
+    push_started = true;
+
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        uvm_va_block_t *va_block = entries[entry_index].va_block;
+        uvm_va_block_expert_batch_state_t *state = &states[entry_index];
+        uvm_va_block_gpu_state_t *gpu_state;
+        uvm_pte_bits_gpu_t pte_bit;
+
+        if (!state->active || uvm_page_mask_empty(&state->map_pages))
+            continue;
+
+        gpu_state = uvm_va_block_gpu_state_get(va_block, dest_gpu->id);
+        UVM_ASSERT(gpu_state);
+        UVM_ASSERT(block_check_mapping_residency(va_block, block_context, dest_gpu, dest_gpu->id, &state->map_pages));
+
+        uvm_page_mask_or(&block_context->scratch_page_mask,
+                         &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ],
+                         &state->map_pages);
+        uvm_page_mask_andnot(&block_context->scratch_page_mask,
+                             &block_context->scratch_page_mask,
+                             &gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE]);
+
+        block_gpu_compute_new_pte_state(va_block,
+                                        dest_gpu,
+                                        dest_gpu->id,
+                                        &state->map_pages,
+                                        &block_context->scratch_page_mask,
+                                        &block_context->mapping.new_pte_state);
+
+        if (UVM_ID_IS_CPU(dest_gpu->id) || !uvm_parent_id_equal(uvm_parent_gpu_id_from_gpu_id(dest_gpu->id),
+                                                               dest_gpu->parent->id)) {
+            block_tlb_invalidate_phys(va_block, &push);
+        }
+
+        if (block_context->mapping.new_pte_state.pte_is_2m) {
+            block_gpu_map_to_2m(va_block,
+                                block_context,
+                                dest_gpu,
+                                dest_gpu->id,
+                                UVM_PROT_READ_ONLY,
+                                &push,
+                                BLOCK_PTE_OP_MAP);
+        }
+        else if (gpu_state->pte_is_2m) {
+            block_gpu_map_split_2m(va_block,
+                                   block_context,
+                                   dest_gpu,
+                                   dest_gpu->id,
+                                   &state->map_pages,
+                                   UVM_PROT_READ_ONLY,
+                                   &push,
+                                   BLOCK_PTE_OP_MAP);
+        }
+        else {
+            block_gpu_map_big_and_4k(va_block,
+                                     block_context,
+                                     dest_gpu,
+                                     dest_gpu->id,
+                                     &state->map_pages,
+                                     UVM_PROT_READ_ONLY,
+                                     &push,
+                                     BLOCK_PTE_OP_MAP);
+        }
+
+        for (pte_bit = 0; pte_bit <= UVM_PTE_BITS_GPU_READ; pte_bit++)
+            uvm_page_mask_or(&gpu_state->pte_bits[pte_bit], &gpu_state->pte_bits[pte_bit], &state->map_pages);
+        uvm_page_mask_andnot(&gpu_state->moe_slot_pte_bits, &gpu_state->moe_slot_pte_bits, &state->map_pages);
+
+        uvm_processor_mask_set(&va_block->mapped, dest_gpu->id);
+
+        if (!uvm_va_block_is_hmm(va_block))
+            uvm_page_mask_or(&va_block->maybe_mapped_pages, &va_block->maybe_mapped_pages, &state->map_pages);
+
+        UVM_ASSERT(block_check_mappings(va_block, block_context));
+    }
+
+    uvm_push_end(&push);
+    push_started = false;
+
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        if (!states[entry_index].active || uvm_page_mask_empty(&states[entry_index].map_pages))
+            continue;
+
+        tracker_status = uvm_tracker_add_push_safe(&entries[entry_index].va_block->tracker, &push);
+        if (status == NV_OK)
+            status = tracker_status;
+    }
+
+    tracker_status = uvm_tracker_add_push_safe(batch_tracker, &push);
+    if (status == NV_OK)
+        status = tracker_status;
+
+out:
+    if (push_started)
+        uvm_push_end(&push);
+
+    uvm_tracker_deinit(&dependency_tracker);
+    return status;
+}
+
+NV_STATUS uvm_va_block_expert_promote_read_duplicate_batch(uvm_va_space_t *va_space,
+                                                           struct mm_struct *mm,
+                                                           uvm_gpu_t *dest_gpu,
+                                                           uvm_va_block_expert_batch_entry_t *entries,
+                                                           size_t entry_count,
+                                                           uvm_tracker_t *out_tracker,
+                                                           uvm_processor_mask_t *involved_processors)
+{
+    NV_STATUS status = NV_OK;
+    uvm_va_block_expert_batch_state_t *states;
+    uvm_va_block_context_t *block_context;
+    uvm_tracker_t batch_tracker = UVM_TRACKER_INIT();
+    NvU64 total_start = NV_GETTIME();
+    NvU64 stage_start;
+    size_t entry_index;
+    size_t locked_count = 0;
+    NvU32 committed_pages_total = 0;
+    NvU32 prepared_pages_total = 0;
+    NvU32 active_entries = 0;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+    UVM_ASSERT(dest_gpu);
+    UVM_ASSERT(UVM_ID_IS_GPU(dest_gpu->id));
+    UVM_ASSERT(entries || entry_count == 0);
+
+    if (entry_count == 0)
+        return NV_OK;
+
+    atomic64_inc(&g_uvm_expert_batch_attempts);
+    atomic64_add(entry_count, &g_uvm_expert_batch_requested_entries);
+
+    if (entry_count > 64) {
+        atomic64_inc(&g_uvm_expert_batch_fallbacks);
+        uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_TOTAL, NV_GETTIME() - total_start, 0);
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+    }
+
+    states = uvm_kvmalloc_zero(sizeof(*states) * entry_count);
+    if (!states) {
+        atomic64_inc(&g_uvm_expert_batch_errors);
+        uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_TOTAL, NV_GETTIME() - total_start, 0);
+        return NV_ERR_NO_MEMORY;
+    }
+
+    block_context = uvm_va_block_context_alloc(mm);
+    if (!block_context) {
+        atomic64_inc(&g_uvm_expert_batch_errors);
+        uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_TOTAL, NV_GETTIME() - total_start, 0);
+        uvm_kvfree(states);
+        return NV_ERR_NO_MEMORY;
+    }
+
+    block_context->make_resident.dest_nid = NUMA_NO_NODE;
+    uvm_processor_mask_zero(involved_processors);
+
+    stage_start = NV_GETTIME();
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        uvm_va_block_retry_t retry;
+        uvm_va_block_t *va_block = entries[entry_index].va_block;
+
+        uvm_va_block_retry_init(&retry);
+        uvm_mutex_lock(&va_block->lock);
+        do {
+            status = block_expert_batch_prepare_locked(&entries[entry_index],
+                                                       &states[entry_index],
+                                                       &retry,
+                                                       block_context,
+                                                       dest_gpu);
+            if (status == NV_OK) {
+                status = block_expert_batch_prepare_map_locked(&entries[entry_index],
+                                                               &states[entry_index],
+                                                               block_context,
+                                                               dest_gpu);
+            }
+        } while (status == NV_ERR_MORE_PROCESSING_REQUIRED);
+        uvm_mutex_unlock(&va_block->lock);
+        uvm_va_block_retry_deinit(&retry, va_block);
+
+        if (status != NV_OK) {
+            uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_PREPARE,
+                                         NV_GETTIME() - stage_start,
+                                         prepared_pages_total);
+            goto out;
+        }
+
+        if (states[entry_index].active) {
+            ++active_entries;
+            prepared_pages_total += states[entry_index].committed_pages;
+        }
+    }
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_PREPARE,
+                                 NV_GETTIME() - stage_start,
+                                 prepared_pages_total);
+
+    stage_start = NV_GETTIME();
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        uvm_mutex_lock(&entries[entry_index].va_block->lock);
+        ++locked_count;
+    }
+
+    status = block_expert_batch_revalidate_locked(entries,
+                                                  states,
+                                                  block_context,
+                                                  entry_count,
+                                                  dest_gpu);
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_LOCK_REVALIDATE,
+                                 NV_GETTIME() - stage_start,
+                                 prepared_pages_total);
+    if (status != NV_OK)
+        goto unlock;
+
+    stage_start = NV_GETTIME();
+    status = block_expert_batch_copy_locked(entries,
+                                            states,
+                                            entry_count,
+                                            dest_gpu,
+                                            &batch_tracker,
+                                            &committed_pages_total);
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_COPY,
+                                 NV_GETTIME() - stage_start,
+                                 committed_pages_total);
+    if (status != NV_OK)
+        goto unlock;
+
+    stage_start = NV_GETTIME();
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        status = block_expert_batch_update_residency_locked(&entries[entry_index],
+                                                            &states[entry_index],
+                                                            block_context,
+                                                            dest_gpu);
+        if (status != NV_OK)
+            goto unlock;
+    }
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_METADATA,
+                                 NV_GETTIME() - stage_start,
+                                 committed_pages_total);
+
+    stage_start = NV_GETTIME();
+    status = block_expert_batch_map_locked(entries,
+                                           states,
+                                           block_context,
+                                           entry_count,
+                                           dest_gpu,
+                                           &batch_tracker);
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_MAP,
+                                 NV_GETTIME() - stage_start,
+                                 committed_pages_total);
+    if (status != NV_OK)
+        goto unlock;
+
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        if (!states[entry_index].active)
+            continue;
+
+        uvm_processor_mask_set(involved_processors, UVM_ID_CPU);
+        uvm_processor_mask_set(involved_processors, dest_gpu->id);
+    }
+
+    stage_start = NV_GETTIME();
+    if (out_tracker)
+        status = uvm_tracker_add_tracker_safe(out_tracker, &batch_tracker);
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_TRACKER,
+                                 NV_GETTIME() - stage_start,
+                                 committed_pages_total);
+
+unlock:
+    while (locked_count-- > 0)
+        uvm_mutex_unlock(&entries[locked_count].va_block->lock);
+
+out:
+    if (status == NV_OK) {
+        atomic64_inc(&g_uvm_expert_batch_successes);
+        atomic64_add(active_entries, &g_uvm_expert_batch_active_entries);
+        atomic64_add(committed_pages_total, &g_uvm_expert_batch_committed_pages);
+    }
+    else if (status == NV_WARN_MORE_PROCESSING_REQUIRED) {
+        atomic64_inc(&g_uvm_expert_batch_fallbacks);
+    }
+    else {
+        atomic64_inc(&g_uvm_expert_batch_errors);
+    }
+
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_TOTAL,
+                                 NV_GETTIME() - total_start,
+                                 committed_pages_total);
+    uvm_tracker_deinit(&batch_tracker);
+    uvm_va_block_context_free(block_context);
+    uvm_kvfree(states);
+    return status;
+}
+
 static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
                                                   uvm_va_block_retry_t *retry,
                                                   uvm_va_block_context_t *block_context,
@@ -10330,7 +11451,11 @@ static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
     uvm_page_mask_t *staged_pages;
     uvm_page_mask_t *dst_resident_mask;
     uvm_va_block_region_t region;
-    NvU32 copied_pages;
+    NvU64 total_start = NV_GETTIME();
+    NvU64 stage_start = total_start;
+    NvU32 copied_pages = 0;
+    NvU32 eligible_pages = 0;
+    NvU32 profile_pages = 0;
     bool gpu_state_updated = false;
 
     *committed_pages_out = 0;
@@ -10371,6 +11496,8 @@ static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
     }
 
     region = uvm_va_block_region_from_mask(va_block, eligible_mask);
+    eligible_pages = uvm_page_mask_region_weight(eligible_mask, region);
+    profile_pages = eligible_pages;
 
     block_context->make_resident.dest_id = gpu_id;
     block_context->make_resident.dest_nid = NUMA_NO_NODE;
@@ -10384,7 +11511,15 @@ static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
                       &block_context->discard.scratch_page_mask,
                       &va_block->discarded_pages);
 
+    uvm_bg_promote_profile_add(UVM_BG_PROMOTE_PROFILE_PREP,
+                               NV_GETTIME() - stage_start,
+                               eligible_pages);
+
+    stage_start = NV_GETTIME();
     status = block_populate_pages(va_block, retry, block_context, gpu_id, region, eligible_mask);
+    uvm_bg_promote_profile_add(UVM_BG_PROMOTE_PROFILE_POPULATE,
+                               NV_GETTIME() - stage_start,
+                               eligible_pages);
     if (status != NV_OK) {
         if (status != NV_ERR_MORE_PROCESSING_REQUIRED)
             atomic64_add(uvm_page_mask_region_weight(eligible_mask, region),
@@ -10392,6 +11527,7 @@ static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
         goto out;
     }
 
+    stage_start = NV_GETTIME();
     status = block_copy_resident_pages(va_block,
                                        block_context,
                                        gpu_id,
@@ -10399,12 +11535,16 @@ static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
                                        eligible_mask,
                                        NULL,
                                        UVM_VA_BLOCK_TRANSFER_MODE_COPY);
+    uvm_bg_promote_profile_add(UVM_BG_PROMOTE_PROFILE_COPY,
+                               NV_GETTIME() - stage_start,
+                               eligible_pages);
     if (status != NV_OK) {
         atomic64_add(uvm_page_mask_region_weight(eligible_mask, region),
                      &g_uvm_latency_bg_promote_failed_copy);
         goto out_cleanup;
     }
 
+    stage_start = NV_GETTIME();
     staged_pages = &block_context->make_resident.pages_staged;
     if (!uvm_page_mask_empty(staged_pages)) {
         uvm_va_block_cpu_set_resident_all_chunks(va_block, block_context, staged_pages);
@@ -10415,18 +11555,27 @@ static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
 
     migrated_pages = &block_context->make_resident.pages_migrated;
     uvm_page_mask_and(migrated_pages, migrated_pages, eligible_mask);
+    uvm_bg_promote_profile_add(UVM_BG_PROMOTE_PROFILE_COMMIT_PREP,
+                               NV_GETTIME() - stage_start,
+                               eligible_pages);
     if (uvm_page_mask_empty(migrated_pages))
         goto out;
 
     copied_pages = uvm_page_mask_region_weight(migrated_pages, region);
+    profile_pages = copied_pages;
     atomic64_add(copied_pages, &g_uvm_latency_bg_promote_copied_pages);
 
+    stage_start = NV_GETTIME();
     status = block_bg_promote_unmap_gpu_locked(va_block, block_context, gpu_id, region, migrated_pages);
+    uvm_bg_promote_profile_add(UVM_BG_PROMOTE_PROFILE_UNMAP,
+                               NV_GETTIME() - stage_start,
+                               copied_pages);
     if (status != NV_OK) {
         atomic64_add(copied_pages, &g_uvm_latency_bg_promote_failed_unmap);
         goto out_cleanup;
     }
 
+    stage_start = NV_GETTIME();
     dst_resident_mask = uvm_va_block_resident_mask_get(va_block, gpu_id, NUMA_NO_NODE);
     uvm_page_mask_or(dst_resident_mask, dst_resident_mask, migrated_pages);
     block_set_resident_processor(va_block, gpu_id);
@@ -10439,13 +11588,21 @@ static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
 
     if (uvm_page_mask_full(dst_resident_mask))
         uvm_processor_mask_set(&va_block->ever_fully_resident, gpu_id);
+    uvm_bg_promote_profile_add(UVM_BG_PROMOTE_PROFILE_METADATA,
+                               NV_GETTIME() - stage_start,
+                               copied_pages);
 
+    stage_start = NV_GETTIME();
     status = block_bg_promote_map_local_locked(va_block, block_context, gpu_id, region, migrated_pages);
+    uvm_bg_promote_profile_add(UVM_BG_PROMOTE_PROFILE_MAP,
+                               NV_GETTIME() - stage_start,
+                               copied_pages);
     if (status != NV_OK) {
         atomic64_add(copied_pages, &g_uvm_latency_bg_promote_failed_map);
         goto out_cleanup;
     }
 
+    stage_start = NV_GETTIME();
     *committed_pages_out = copied_pages;
     atomic64_add(*committed_pages_out, &g_uvm_latency_bg_promote_committed_pages);
     atomic64_add(*committed_pages_out, &g_uvm_latency_pte_switch_pages);
@@ -10464,11 +11621,17 @@ static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
 
     block_mark_memory_used(va_block, gpu_id);
     UVM_ASSERT(block_check_cpu_chunks(va_block));
+    uvm_bg_promote_profile_add(UVM_BG_PROMOTE_PROFILE_FINISH,
+                               NV_GETTIME() - stage_start,
+                               copied_pages);
 
 out_cleanup:
     if (status != NV_OK && status != NV_ERR_MORE_PROCESSING_REQUIRED && !gpu_state_updated)
         block_cleanup_temp_pinned_gpu_chunks(va_block, gpu_id);
 out:
+    uvm_bg_promote_profile_add(UVM_BG_PROMOTE_PROFILE_TOTAL,
+                               NV_GETTIME() - total_start,
+                               profile_pages);
     kmem_cache_free(g_uvm_page_mask_cache, eligible_mask);
     return status;
 }
@@ -11054,6 +12217,8 @@ NV_STATUS uvm_va_block_unmap_mask(uvm_va_block_t *va_block,
                                   uvm_va_block_region_t region,
                                   const uvm_page_mask_t *unmap_page_mask)
 {
+    NvU64 profile_start = NV_GETTIME();
+    NvU64 region_bytes = uvm_va_block_region_size(region);
     uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
     NV_STATUS status = NV_OK;
     NV_STATUS tracker_status;
@@ -11074,6 +12239,10 @@ NV_STATUS uvm_va_block_unmap_mask(uvm_va_block_t *va_block,
     tracker_status = uvm_tracker_add_tracker_safe(&va_block->tracker, &local_tracker);
     uvm_tracker_deinit(&local_tracker);
 
+    uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_UNMAP_MASK,
+                            NV_GETTIME() - profile_start,
+                            region_bytes / PAGE_SIZE,
+                            region_bytes);
     return status == NV_OK ? tracker_status : status;
 }
 

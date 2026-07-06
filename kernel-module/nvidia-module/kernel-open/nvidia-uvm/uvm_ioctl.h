@@ -1030,6 +1030,9 @@ typedef enum
     // Expert-only read-duplicate promotion. This bypasses the generic migrate
     // API path and only accepts managed ranges tagged as MoE expert weights.
     UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST = 18,
+    // Region-id executor variant which loops over registered expert regions
+    // and invokes the native EXPERT_READ_DUP_FAST range path for each region.
+    UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST_NATIVE_REGIONS = 19,
 } UVM_PHASE_F_ACTION;
 
 typedef struct

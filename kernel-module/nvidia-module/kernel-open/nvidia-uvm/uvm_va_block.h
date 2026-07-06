@@ -1071,6 +1071,30 @@ NV_STATUS uvm_va_block_expert_promote_read_duplicate_batch(uvm_va_space_t *va_sp
                                                            uvm_tracker_t *out_tracker,
                                                            uvm_processor_mask_t *involved_processors);
 
+// Trusted variant for Phase-F registered expert regions. This skips the second
+// prepare/revalidate pass after all blocks are locked, so callers must only use
+// it when the selected ranges are controlled expert-weight regions with no
+// concurrent UVM mutations expected.
+NV_STATUS uvm_va_block_expert_promote_read_duplicate_batch_trusted(uvm_va_space_t *va_space,
+                                                                   struct mm_struct *mm,
+                                                                   uvm_gpu_t *dest_gpu,
+                                                                   uvm_va_block_expert_batch_entry_t *entries,
+                                                                   size_t entry_count,
+                                                                   uvm_tracker_t *out_tracker,
+                                                                   uvm_processor_mask_t *involved_processors);
+
+// Experimental variant for entries sorted by VA and known to belong to one
+// managed va_range. It locks all blocks once, prepares/maps while holding those
+// locks, and skips the second revalidate pass. Unsupported retry cases return
+// NV_WARN_MORE_PROCESSING_REQUIRED for fallback.
+NV_STATUS uvm_va_block_expert_promote_read_duplicate_batch_single_lock(uvm_va_space_t *va_space,
+                                                                       struct mm_struct *mm,
+                                                                       uvm_gpu_t *dest_gpu,
+                                                                       uvm_va_block_expert_batch_entry_t *entries,
+                                                                       size_t entry_count,
+                                                                       uvm_tracker_t *out_tracker,
+                                                                       uvm_processor_mask_t *involved_processors);
+
 // Like uvm_va_block_map, except it maps all processors in the input mask. The
 // VA block tracker contains all map operations on return.
 //

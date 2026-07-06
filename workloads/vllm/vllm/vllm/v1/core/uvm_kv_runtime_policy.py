@@ -188,6 +188,14 @@ class UvmKvRuntimePolicy:
         self.stage_l6_pointer_map_file = os.environ.get(
             "VLLM_UVM_RESIDENCY_KV_POINTER_MAP_FILE", ""
         )
+        self.prefer_gpu_resident_free_blocks = _read_bool_env(
+            "VLLM_UVM_KV_PREFER_GPU_RESIDENT_FREE_BLOCKS",
+            False,
+        )
+        self.prefer_gpu_resident_allow_cached = _read_bool_env(
+            "VLLM_UVM_KV_PREFER_GPU_RESIDENT_ALLOW_CACHED",
+            False,
+        )
         self._stage_l6_pointer_map_loaded = False
         self._stage_l6_pointer_ranges: dict[str, list[tuple[int, int]]] = {}
         self.budget_bytes = _read_int_env("VLLM_UVM_KV_RUNTIME_BUDGET_BYTES", 0)
@@ -294,9 +302,121 @@ class UvmKvRuntimePolicy:
                 "active_protect_max_blocks": self.active_protect_max_blocks,
                 "stage_l6_max_offload_blocks": self.stage_l6_max_offload_blocks,
                 "stage_l6_pointer_map_file": self.stage_l6_pointer_map_file,
+                "prefer_gpu_resident_free_blocks": (
+                    self.prefer_gpu_resident_free_blocks
+                ),
+                "prefer_gpu_resident_allow_cached": (
+                    self.prefer_gpu_resident_allow_cached
+                ),
                 "num_kv_cache_groups": self.num_kv_cache_groups,
             }
         )
+
+    def select_free_blocks_for_allocation(
+        self,
+        *,
+        block_pool: Any,
+        num_blocks: int,
+        enable_caching: bool,
+    ) -> list[Any] | None:
+        """Prefer free KV blocks that are already resident on GPU.
+
+        This only changes which free block IDs vLLM reuses. Correctness still
+        relies on the normal active KV protect/prefetch path after allocation.
+        """
+        if num_blocks <= 0 or not self.prefer_gpu_resident_free_blocks:
+            return None
+        try:
+            free_blocks = block_pool.free_block_queue.get_all_free_blocks()
+        except Exception as exc:  # pragma: no cover - defensive trace path.
+            self._write(
+                {
+                    "action": "gpu_resident_free_block_select_failed",
+                    "reason": "free_queue_snapshot_failed",
+                    "error": repr(exc),
+                    "requested_blocks": num_blocks,
+                }
+            )
+            return None
+
+        if len(free_blocks) < num_blocks:
+            return None
+
+        gpu_blocks: list[Any] = []
+        unknown_blocks: list[Any] = []
+        cpu_blocks: list[Any] = []
+        skipped_cached = 0
+        skipped_unsafe = 0
+
+        for block in free_blocks:
+            block_id = int(getattr(block, "block_id", -1))
+            safe = (
+                block_id >= 0
+                and not bool(getattr(block, "is_null", False))
+                and getattr(block, "ref_cnt", None) == 0
+            )
+            if not safe:
+                skipped_unsafe += 1
+                continue
+            if (
+                enable_caching
+                and not self.prefer_gpu_resident_allow_cached
+                and getattr(block, "block_hash", None) is not None
+            ):
+                skipped_cached += 1
+                continue
+
+            state = self._kv_block_residency_class(block_id)
+            if state == "gpu":
+                gpu_blocks.append(block)
+            elif state == "cpu":
+                cpu_blocks.append(block)
+            else:
+                unknown_blocks.append(block)
+
+        selected = (gpu_blocks + unknown_blocks + cpu_blocks)[:num_blocks]
+        if len(selected) != num_blocks:
+            self._write(
+                {
+                    "action": "gpu_resident_free_block_select_fallback",
+                    "requested_blocks": num_blocks,
+                    "free_blocks": len(free_blocks),
+                    "gpu_candidates": len(gpu_blocks),
+                    "unknown_candidates": len(unknown_blocks),
+                    "cpu_candidates": len(cpu_blocks),
+                    "skipped_cached": skipped_cached,
+                    "skipped_unsafe": skipped_unsafe,
+                    "enable_caching": enable_caching,
+                }
+            )
+            return None
+
+        selected_ids = [int(getattr(block, "block_id", -1)) for block in selected]
+        self._write(
+            {
+                "action": "gpu_resident_free_block_select",
+                "requested_blocks": num_blocks,
+                "selected_block_ids": selected_ids,
+                "gpu_candidates": len(gpu_blocks),
+                "unknown_candidates": len(unknown_blocks),
+                "cpu_candidates": len(cpu_blocks),
+                "skipped_cached": skipped_cached,
+                "skipped_unsafe": skipped_unsafe,
+                "enable_caching": enable_caching,
+            }
+        )
+        return selected
+
+    def _kv_block_residency_class(self, block_id: int) -> str:
+        saw_unknown = False
+        for group_id in range(self.num_kv_cache_groups):
+            snapshot = get_uvm_residency_region_snapshot(f"kv:{group_id}:{block_id}")
+            state = str((snapshot or {}).get("state") or "unknown")
+            if state in ("cpu", "prefetching_cpu", "released"):
+                return "cpu"
+            if state not in ("gpu", "prefetching_gpu"):
+                saw_unknown = True
+        return "unknown" if saw_unknown else "gpu"
 
     def register_stage_l5_kv_blocks(self, block_pool: Any) -> None:
         """Register KV block metadata in Stage L residency.

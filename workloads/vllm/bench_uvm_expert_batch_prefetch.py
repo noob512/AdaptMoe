@@ -5,8 +5,8 @@ This does not modify or import the vLLM MoE layer. It simulates a layer with
 many UVM-resident MoE experts, selects a non-contiguous subset, and compares:
 
   * one Phase-F EXPERT_READ_DUP_FAST ioctl carrying all selected expert ranges
+  * one Phase-F EXPERT_READ_DUP_FAST region-id ioctl carrying selected expert ids
   * serial Phase-F EXPERT_READ_DUP_FAST calls, one expert range at a time
-  * one regular driver batch prefetch ioctl carrying all selected ranges
   * serial cudaMemPrefetchAsync via the existing allocator shim
 
 The goal is to validate the user-space shape needed by vLLM: after topk_ids are
@@ -44,6 +44,8 @@ from vllm.device_allocator.uvm import (  # noqa: E402
     batch_prefetch_ranges_to_cpu,
     cleanup_uvm_local_memory_pool,
     driver_expert_read_dup_fast,
+    driver_expert_read_dup_fast_native_regions,
+    driver_expert_read_dup_fast_regions,
     ensure_uvm_runtime_library,
     probe_driver_capable_range,
     uvm_local_memory_pool,
@@ -355,37 +357,6 @@ def verify_gpu_residency(
     return result
 
 
-def raw_driver_batch_prefetch_gpu(
-    ranges: list[tuple[int, int]],
-    *,
-    device_index: int,
-    async_ioctl: bool,
-) -> int:
-    if not ranges:
-        return 0
-
-    lib = ensure_uvm_runtime_library()
-    total = 0
-    max_ranges = 64
-    for start in range(0, len(ranges), max_ranges):
-        chunk = ranges[start:start + max_ranges]
-        ptr_array = (ctypes.c_uint64 * len(chunk))(*(ptr for ptr, _ in chunk))
-        size_array = (ctypes.c_size_t * len(chunk))(*(size for _, size in chunk))
-        result = int(
-            lib.uvm_driver_batch_prefetch_gpu(
-                ptr_array,
-                size_array,
-                ctypes.c_size_t(len(chunk)),
-                ctypes.c_int(device_index),
-                ctypes.c_int(1 if async_ioctl else 0),
-            )
-        )
-        if result < 0:
-            return result
-        total += result
-    return total
-
-
 def selected_ranges(all_ranges: list[ExpertRange], selected_ids: list[int]) -> list[ExpertRange]:
     selected = set(selected_ids)
     return [item for item in all_ranges if item.expert_id in selected]
@@ -438,18 +409,18 @@ def run_case(
 
         if case == "expert_fast_batch":
             submit = lambda: driver_expert_read_dup_fast(tuples, device=args.device, async_=args.async_ioctl)
+        elif case == "expert_fast_regions":
+            region_ids = [item.region_id for item in ranges]
+            submit = lambda: driver_expert_read_dup_fast_regions(region_ids, device=args.device, async_=args.async_ioctl)
+        elif case == "expert_fast_native_regions":
+            region_ids = [item.region_id for item in ranges]
+            submit = lambda: driver_expert_read_dup_fast_native_regions(region_ids, device=args.device, async_=args.async_ioctl)
         elif case == "expert_fast_serial":
             def submit() -> list[tuple[int, int, int, int]]:
                 return [
                     driver_expert_read_dup_fast([range_tuple], device=args.device, async_=args.async_ioctl)
                     for range_tuple in tuples
                 ]
-        elif case == "driver_prefetch_batch":
-            submit = lambda: raw_driver_batch_prefetch_gpu(
-                tuples,
-                device_index=args.device,
-                async_ioctl=args.async_ioctl,
-            )
         elif case == "cuda_prefetch_serial":
             submit = lambda: batch_prefetch_ranges_to_device(tuples, device=args.device)
         else:
@@ -668,14 +639,16 @@ def main() -> None:
         nargs="+",
         default=[
             "expert_fast_batch",
+            "expert_fast_regions",
+            "expert_fast_native_regions",
             "expert_fast_serial",
-            "driver_prefetch_batch",
             "cuda_prefetch_serial",
         ],
         choices=[
             "expert_fast_batch",
+            "expert_fast_regions",
+            "expert_fast_native_regions",
             "expert_fast_serial",
-            "driver_prefetch_batch",
             "cuda_prefetch_serial",
         ],
     )

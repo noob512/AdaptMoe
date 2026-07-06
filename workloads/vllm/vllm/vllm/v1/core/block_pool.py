@@ -305,7 +305,18 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        ret: list[KVCacheBlock] | None = None
+        if self.uvm_kv_runtime_policy is not None:
+            ret = self.uvm_kv_runtime_policy.select_free_blocks_for_allocation(
+                block_pool=self,
+                num_blocks=num_blocks,
+                enable_caching=self.enable_caching,
+            )
+            if ret is not None:
+                for block in ret:
+                    self.free_block_queue.remove(block)
+        if ret is None:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:

@@ -6206,6 +6206,17 @@ NV_STATUS uvm_va_block_make_resident_read_duplicate(uvm_va_block_t *va_block,
     if (UVM_ID_IS_GPU(dest_id) && uvm_page_mask_full(uvm_va_block_resident_mask_get(va_block, dest_id, NUMA_NO_NODE)))
         uvm_processor_mask_set(&va_block->ever_fully_resident, dest_id);
 
+    if (UVM_ID_IS_GPU(dest_id) && uvm_processor_mask_test(&va_block->resident, dest_id)) {
+        uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
+
+        uvm_phase_n_va_block_make_resident_hook(va_space,
+                                                va_block,
+                                                region,
+                                                dest_id,
+                                                cause,
+                                                NV_FALSE);
+    }
+
     // Check state of all chunks after residency change.
     // TODO: Bug 4207783: Check both CPU and GPU chunks.
     UVM_ASSERT(block_check_cpu_chunks(va_block));
@@ -11018,6 +11029,12 @@ static NV_STATUS block_expert_batch_update_residency_locked(uvm_va_block_expert_
         uvm_processor_mask_set(&va_block->ever_fully_resident, dest_gpu->id);
 
     block_mark_memory_used(va_block, dest_gpu->id);
+    uvm_phase_n_va_block_make_resident_hook(uvm_va_block_get_va_space(va_block),
+                                            va_block,
+                                            state->region,
+                                            dest_gpu->id,
+                                            UVM_MAKE_RESIDENT_CAUSE_PREFETCH,
+                                            NV_FALSE);
     UVM_ASSERT(block_check_cpu_chunks(va_block));
 
     return NV_OK;
@@ -11244,13 +11261,14 @@ out:
     return status;
 }
 
-NV_STATUS uvm_va_block_expert_promote_read_duplicate_batch(uvm_va_space_t *va_space,
-                                                           struct mm_struct *mm,
-                                                           uvm_gpu_t *dest_gpu,
-                                                           uvm_va_block_expert_batch_entry_t *entries,
-                                                           size_t entry_count,
-                                                           uvm_tracker_t *out_tracker,
-                                                           uvm_processor_mask_t *involved_processors)
+static NV_STATUS block_expert_promote_read_duplicate_batch_common(uvm_va_space_t *va_space,
+                                                                  struct mm_struct *mm,
+                                                                  uvm_gpu_t *dest_gpu,
+                                                                  uvm_va_block_expert_batch_entry_t *entries,
+                                                                  size_t entry_count,
+                                                                  uvm_tracker_t *out_tracker,
+                                                                  uvm_processor_mask_t *involved_processors,
+                                                                  bool skip_revalidate)
 {
     NV_STATUS status = NV_OK;
     uvm_va_block_expert_batch_state_t *states;
@@ -11344,11 +11362,12 @@ NV_STATUS uvm_va_block_expert_promote_read_duplicate_batch(uvm_va_space_t *va_sp
         ++locked_count;
     }
 
-    status = block_expert_batch_revalidate_locked(entries,
-                                                  states,
-                                                  block_context,
-                                                  entry_count,
-                                                  dest_gpu);
+    status = skip_revalidate ? NV_OK :
+                               block_expert_batch_revalidate_locked(entries,
+                                                                    states,
+                                                                    block_context,
+                                                                    entry_count,
+                                                                    dest_gpu);
     uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_LOCK_REVALIDATE,
                                  NV_GETTIME() - stage_start,
                                  prepared_pages_total);
@@ -11433,6 +11452,230 @@ out:
     uvm_va_block_context_free(block_context);
     uvm_kvfree(states);
     return status;
+}
+
+NV_STATUS uvm_va_block_expert_promote_read_duplicate_batch_single_lock(uvm_va_space_t *va_space,
+                                                                       struct mm_struct *mm,
+                                                                       uvm_gpu_t *dest_gpu,
+                                                                       uvm_va_block_expert_batch_entry_t *entries,
+                                                                       size_t entry_count,
+                                                                       uvm_tracker_t *out_tracker,
+                                                                       uvm_processor_mask_t *involved_processors)
+{
+    NV_STATUS status = NV_OK;
+    uvm_va_block_expert_batch_state_t *states;
+    uvm_va_block_retry_t *retries;
+    uvm_va_block_context_t *block_context;
+    uvm_tracker_t batch_tracker = UVM_TRACKER_INIT();
+    NvU64 total_start = NV_GETTIME();
+    NvU64 stage_start;
+    size_t entry_index;
+    size_t locked_count = 0;
+    size_t retry_init_count = 0;
+    NvU32 committed_pages_total = 0;
+    NvU32 prepared_pages_total = 0;
+    NvU32 active_entries = 0;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+    UVM_ASSERT(dest_gpu);
+    UVM_ASSERT(UVM_ID_IS_GPU(dest_gpu->id));
+    UVM_ASSERT(entries || entry_count == 0);
+
+    if (entry_count == 0)
+        return NV_OK;
+
+    atomic64_inc(&g_uvm_expert_batch_attempts);
+    atomic64_add(entry_count, &g_uvm_expert_batch_requested_entries);
+
+    if (entry_count > 64) {
+        atomic64_inc(&g_uvm_expert_batch_fallbacks);
+        uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_TOTAL, NV_GETTIME() - total_start, 0);
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+    }
+
+    states = uvm_kvmalloc_zero(sizeof(*states) * entry_count);
+    if (!states) {
+        atomic64_inc(&g_uvm_expert_batch_errors);
+        uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_TOTAL, NV_GETTIME() - total_start, 0);
+        return NV_ERR_NO_MEMORY;
+    }
+
+    retries = uvm_kvmalloc_zero(sizeof(*retries) * entry_count);
+    if (!retries) {
+        atomic64_inc(&g_uvm_expert_batch_errors);
+        uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_TOTAL, NV_GETTIME() - total_start, 0);
+        uvm_kvfree(states);
+        return NV_ERR_NO_MEMORY;
+    }
+
+    block_context = uvm_va_block_context_alloc(mm);
+    if (!block_context) {
+        atomic64_inc(&g_uvm_expert_batch_errors);
+        uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_TOTAL, NV_GETTIME() - total_start, 0);
+        uvm_kvfree(retries);
+        uvm_kvfree(states);
+        return NV_ERR_NO_MEMORY;
+    }
+
+    block_context->make_resident.dest_nid = NUMA_NO_NODE;
+    uvm_processor_mask_zero(involved_processors);
+
+    stage_start = NV_GETTIME();
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        uvm_va_block_retry_init(&retries[entry_index]);
+        ++retry_init_count;
+        uvm_mutex_lock(&entries[entry_index].va_block->lock);
+        ++locked_count;
+    }
+
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        status = block_expert_batch_prepare_locked(&entries[entry_index],
+                                                   &states[entry_index],
+                                                   &retries[entry_index],
+                                                   block_context,
+                                                   dest_gpu);
+        if (status == NV_ERR_MORE_PROCESSING_REQUIRED)
+            status = NV_WARN_MORE_PROCESSING_REQUIRED;
+        if (status != NV_OK)
+            break;
+
+        status = block_expert_batch_prepare_map_locked(&entries[entry_index],
+                                                       &states[entry_index],
+                                                       block_context,
+                                                       dest_gpu);
+        if (status != NV_OK)
+            break;
+
+        if (states[entry_index].active) {
+            ++active_entries;
+            prepared_pages_total += states[entry_index].committed_pages;
+        }
+    }
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_PREPARE,
+                                 NV_GETTIME() - stage_start,
+                                 prepared_pages_total);
+    if (status != NV_OK)
+        goto unlock;
+
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_LOCK_REVALIDATE, 0, prepared_pages_total);
+
+    stage_start = NV_GETTIME();
+    status = block_expert_batch_copy_locked(entries,
+                                            states,
+                                            entry_count,
+                                            dest_gpu,
+                                            &batch_tracker,
+                                            &committed_pages_total);
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_COPY,
+                                 NV_GETTIME() - stage_start,
+                                 committed_pages_total);
+    if (status != NV_OK)
+        goto unlock;
+
+    stage_start = NV_GETTIME();
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        status = block_expert_batch_update_residency_locked(&entries[entry_index],
+                                                            &states[entry_index],
+                                                            block_context,
+                                                            dest_gpu);
+        if (status != NV_OK)
+            goto unlock;
+    }
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_METADATA,
+                                 NV_GETTIME() - stage_start,
+                                 committed_pages_total);
+
+    stage_start = NV_GETTIME();
+    status = block_expert_batch_map_locked(entries,
+                                           states,
+                                           block_context,
+                                           entry_count,
+                                           dest_gpu,
+                                           &batch_tracker);
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_MAP,
+                                 NV_GETTIME() - stage_start,
+                                 committed_pages_total);
+    if (status != NV_OK)
+        goto unlock;
+
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        if (!states[entry_index].active)
+            continue;
+
+        uvm_processor_mask_set(involved_processors, UVM_ID_CPU);
+        uvm_processor_mask_set(involved_processors, dest_gpu->id);
+    }
+
+    stage_start = NV_GETTIME();
+    if (out_tracker)
+        status = uvm_tracker_add_tracker_safe(out_tracker, &batch_tracker);
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_TRACKER,
+                                 NV_GETTIME() - stage_start,
+                                 committed_pages_total);
+
+unlock:
+    while (locked_count-- > 0)
+        uvm_mutex_unlock(&entries[locked_count].va_block->lock);
+
+    while (retry_init_count-- > 0)
+        uvm_va_block_retry_deinit(&retries[retry_init_count], entries[retry_init_count].va_block);
+
+    if (status == NV_OK) {
+        atomic64_inc(&g_uvm_expert_batch_successes);
+        atomic64_add(active_entries, &g_uvm_expert_batch_active_entries);
+        atomic64_add(committed_pages_total, &g_uvm_expert_batch_committed_pages);
+    }
+    else if (status == NV_WARN_MORE_PROCESSING_REQUIRED) {
+        atomic64_inc(&g_uvm_expert_batch_fallbacks);
+    }
+    else {
+        atomic64_inc(&g_uvm_expert_batch_errors);
+    }
+
+    uvm_expert_batch_profile_add(UVM_EXPERT_BATCH_PROFILE_TOTAL,
+                                 NV_GETTIME() - total_start,
+                                 committed_pages_total);
+    uvm_tracker_deinit(&batch_tracker);
+    uvm_va_block_context_free(block_context);
+    uvm_kvfree(retries);
+    uvm_kvfree(states);
+    return status;
+}
+
+NV_STATUS uvm_va_block_expert_promote_read_duplicate_batch(uvm_va_space_t *va_space,
+                                                           struct mm_struct *mm,
+                                                           uvm_gpu_t *dest_gpu,
+                                                           uvm_va_block_expert_batch_entry_t *entries,
+                                                           size_t entry_count,
+                                                           uvm_tracker_t *out_tracker,
+                                                           uvm_processor_mask_t *involved_processors)
+{
+    return block_expert_promote_read_duplicate_batch_common(va_space,
+                                                            mm,
+                                                            dest_gpu,
+                                                            entries,
+                                                            entry_count,
+                                                            out_tracker,
+                                                            involved_processors,
+                                                            false);
+}
+
+NV_STATUS uvm_va_block_expert_promote_read_duplicate_batch_trusted(uvm_va_space_t *va_space,
+                                                                   struct mm_struct *mm,
+                                                                   uvm_gpu_t *dest_gpu,
+                                                                   uvm_va_block_expert_batch_entry_t *entries,
+                                                                   size_t entry_count,
+                                                                   uvm_tracker_t *out_tracker,
+                                                                   uvm_processor_mask_t *involved_processors)
+{
+    return block_expert_promote_read_duplicate_batch_common(va_space,
+                                                            mm,
+                                                            dest_gpu,
+                                                            entries,
+                                                            entry_count,
+                                                            out_tracker,
+                                                            involved_processors,
+                                                            true);
 }
 
 static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
@@ -11591,6 +11834,13 @@ static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
     uvm_bg_promote_profile_add(UVM_BG_PROMOTE_PROFILE_METADATA,
                                NV_GETTIME() - stage_start,
                                copied_pages);
+
+    uvm_phase_n_va_block_make_resident_hook(uvm_va_block_get_va_space(va_block),
+                                            va_block,
+                                            region,
+                                            gpu_id,
+                                            UVM_MAKE_RESIDENT_CAUSE_PREFETCH,
+                                            NV_FALSE);
 
     stage_start = NV_GETTIME();
     status = block_bg_promote_map_local_locked(va_block, block_context, gpu_id, region, migrated_pages);

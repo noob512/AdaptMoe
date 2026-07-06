@@ -75,6 +75,7 @@ UVM_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT = 14
 UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16
 UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17
 UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST = 18
+UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST_NATIVE_REGIONS = 19
 
 UVM_REGION_POOL_UNKNOWN = 0
 UVM_REGION_POOL_KV = 1
@@ -745,6 +746,25 @@ def load_uvm_library() -> ctypes.CDLL:
         ctypes.c_size_t,
         ctypes.c_int,
     ]
+
+    if hasattr(lib, "uvm_driver_batch_expert_read_dup_fast_regions"):
+        lib.uvm_driver_batch_expert_read_dup_fast_regions.restype = ctypes.c_int
+        lib.uvm_driver_batch_expert_read_dup_fast_regions.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+
+    if hasattr(lib, "uvm_driver_batch_expert_read_dup_fast_native_regions"):
+        lib.uvm_driver_batch_expert_read_dup_fast_native_regions.restype = ctypes.c_int
+        lib.uvm_driver_batch_expert_read_dup_fast_native_regions.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
 
     lib.uvm_driver_phase_f_register_query_region.restype = ctypes.c_int
     lib.uvm_driver_phase_f_register_query_region.argtypes = [
@@ -2140,6 +2160,92 @@ def driver_expert_read_dup_fast(
         device=device,
         async_=async_,
     )
+
+
+def driver_expert_read_dup_fast_regions(
+    region_ids: Sequence[int],
+    *,
+    device: int = 0,
+    async_: bool = False,
+) -> int:
+    try:
+        lib = ensure_uvm_runtime_library()
+    except Exception:
+        logger.debug("Failed to load UVM runtime library", exc_info=True)
+        return -1
+
+    if not hasattr(lib, "uvm_driver_batch_expert_read_dup_fast_regions"):
+        return -2
+
+    valid_ids = [int(region_id) for region_id in region_ids if int(region_id) > 0]
+    if not valid_ids:
+        return 0
+
+    total = 0
+    for start in range(0, len(valid_ids), _UVM_DRIVER_BATCH_MAX_RANGES):
+        chunk = valid_ids[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
+        id_array = (ctypes.c_uint64 * len(chunk))(*chunk)
+        try:
+            result = int(
+                lib.uvm_driver_batch_expert_read_dup_fast_regions(
+                    id_array,
+                    ctypes.c_size_t(len(chunk)),
+                    ctypes.c_int(device),
+                    ctypes.c_int(1 if async_ else 0),
+                )
+            )
+        except Exception:
+            logger.debug("Failed to expert-read-duplicate Phase F driver regions", exc_info=True)
+            return -3
+        if result < 0:
+            return result
+        total += result
+
+    return total
+
+
+def driver_expert_read_dup_fast_native_regions(
+    region_ids: Sequence[int],
+    *,
+    device: int = 0,
+    async_: bool = False,
+) -> int:
+    try:
+        lib = ensure_uvm_runtime_library()
+    except Exception:
+        logger.debug("Failed to load UVM runtime library", exc_info=True)
+        return -1
+
+    if not hasattr(lib, "uvm_driver_batch_expert_read_dup_fast_native_regions"):
+        return -2
+
+    valid_ids = [int(region_id) for region_id in region_ids if int(region_id) > 0]
+    if not valid_ids:
+        return 0
+
+    total = 0
+    stream = torch.cuda.current_stream().cuda_stream
+    for start in range(0, len(valid_ids), _UVM_DRIVER_BATCH_MAX_RANGES):
+        chunk = valid_ids[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
+        id_array = (ctypes.c_uint64 * len(chunk))(*chunk)
+        try:
+            result = int(
+                lib.uvm_driver_batch_expert_read_dup_fast_native_regions(
+                    id_array,
+                    ctypes.c_size_t(len(chunk)),
+                    ctypes.c_int(device),
+                    ctypes.c_int(1 if async_ else 0),
+                    ctypes.c_void_p(stream),
+                )
+            )
+        except Exception:
+            logger.debug("Failed to native expert-read-duplicate Phase F driver regions", exc_info=True)
+            return -3
+        if result < 0:
+            return result
+        total += result
+
+    return total
 
 
 def driver_pause_ranges_bg_promotion(

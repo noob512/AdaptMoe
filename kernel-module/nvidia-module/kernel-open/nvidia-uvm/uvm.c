@@ -408,6 +408,16 @@ module_param(uvm_phase_n_range_tag_enable, int, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_phase_n_range_tag_enable,
                  "Attach passive Stage N tags to managed va_ranges on region registration. Default: 1.");
 
+static int uvm_phase_n_expert_migrate_batch_skip_revalidate_enable __read_mostly = 0;
+module_param(uvm_phase_n_expert_migrate_batch_skip_revalidate_enable, int, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_expert_migrate_batch_skip_revalidate_enable,
+                 "Skip the second block revalidate pass for trusted Phase-F expert region batches. Experimental. Default: 0.");
+
+static int uvm_phase_n_expert_migrate_single_va_range_batch_enable __read_mostly = 0;
+module_param(uvm_phase_n_expert_migrate_single_va_range_batch_enable, int, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_n_expert_migrate_single_va_range_batch_enable,
+                 "Use ordered single-managed-va-range expert region batch collection and one-lock-pass promotion. Experimental. Default: 0.");
+
 #define UVM_PHASE_N_RECLAIM_FLAG_DRY_RUN_INTERNAL (1U << 31)
 #define UVM_PHASE_N_RECLAIM_VICTIM_SCAN_MAX 128
 #define UVM_PHASE_N_ENFORCE_RECLAIM_MAX_ROUNDS 16
@@ -4930,7 +4940,8 @@ static NV_STATUS uvm_phase_f_execute_range(NvU32 action,
     NvU64 last_address = 0;
     bool range_invalid = true;
     bool range_empty = true;
-    bool skip_range_diag = action == UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST;
+    bool skip_range_diag = action == UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST ||
+                           action == UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST_NATIVE_REGIONS;
 
     result->status = NV_OK;
     result->resident_on_count = 0;
@@ -5125,7 +5136,8 @@ static NV_STATUS uvm_phase_f_execute_range(NvU32 action,
                                            result,
                                            va_space);
     }
-    else if (action == UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST) {
+    else if (action == UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST ||
+             action == UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST_NATIVE_REGIONS) {
         status = uvm_phase_f_expert_read_dup_fast(gpu_uuid,
                                                   async,
                                                   base,
@@ -5164,6 +5176,18 @@ typedef struct
     NvU64 candidate_pages;
     NvU64 committed_pages;
 } uvm_phase_f_expert_batch_range_state_t;
+
+typedef struct
+{
+    uvm_phase_f_expert_batch_range_state_t range_states[UVM_PHASE_F_MAX_RANGES];
+    uvm_va_block_expert_batch_entry_t entries[UVM_PHASE_F_MAX_RANGES];
+    NvU32 entry_range_indices[UVM_PHASE_F_MAX_RANGES];
+    uvm_va_range_managed_t *single_managed_range;
+    size_t single_first_block_index;
+    size_t single_last_block_index;
+    DECLARE_BITMAP(single_block_seen, UVM_PHASE_F_MAX_RANGES);
+    NvU32 single_block_owner[UVM_PHASE_F_MAX_RANGES];
+} uvm_phase_f_expert_batch_region_work_t;
 
 static void uvm_phase_f_result_init(UVM_PHASE_F_RANGE_RESULT *result, NvU64 queried_bytes)
 {
@@ -5286,6 +5310,254 @@ static NV_STATUS uvm_phase_f_expert_batch_fill_entries(uvm_va_space_t *va_space,
     }
 
     UVM_ASSERT(entry_index == entry_count);
+    return NV_OK;
+}
+
+static bool uvm_phase_f_registered_region_is_expert_weight(const uvm_phase_f_region_t *region)
+{
+    return region->pool == UVM_PHASE_N_POOL_WEIGHT &&
+           (region->role == UVM_PHASE_N_ROLE_MOE_EXPERT_W13 ||
+            region->role == UVM_PHASE_N_ROLE_MOE_EXPERT_W2);
+}
+
+static NV_STATUS uvm_phase_f_expert_batch_collect_region(uvm_va_space_t *va_space,
+                                                         NvU64 region_id,
+                                                         NvU32 range_index,
+                                                         uvm_phase_f_expert_batch_range_state_t *range_state,
+                                                         uvm_va_block_expert_batch_entry_t *entries,
+                                                         NvU32 *entry_range_indices,
+                                                         size_t *entry_count_inout)
+{
+    uvm_phase_f_region_t *region;
+    uvm_va_range_managed_t *managed_range = NULL;
+    uvm_va_range_managed_t *managed_range_last = NULL;
+    NvU64 base;
+    NvU64 length;
+    NvU64 last_address;
+
+    if (region_id == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    region = radix_tree_lookup(&va_space->phase_f_regions, region_id);
+    if (!region)
+        return NV_ERR_OBJECT_NOT_FOUND;
+
+    if (!uvm_phase_f_registered_region_is_expert_weight(region))
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    base = region->base;
+    length = region->length;
+    if (base == 0 || length == 0 || uvm_api_range_invalid(base, length))
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+    if (!IS_ALIGNED(base, UVM_VA_BLOCK_SIZE) || !IS_ALIGNED(length, UVM_VA_BLOCK_SIZE))
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    last_address = base + length - 1;
+    range_state->covered_bytes = 0;
+    range_state->candidate_pages = 0;
+    range_state->committed_pages = 0;
+
+    uvm_for_each_va_range_managed_in_contig(managed_range, va_space, base, last_address) {
+        NvU64 range_start = max(base, managed_range->va_range.node.start);
+        NvU64 range_end = min(last_address, managed_range->va_range.node.end);
+        size_t first_block_index;
+        size_t last_block_index;
+        size_t block_index;
+
+        managed_range_last = managed_range;
+
+        first_block_index = uvm_va_range_block_index(managed_range, range_start);
+        last_block_index = uvm_va_range_block_index(managed_range, range_end);
+
+        if (last_block_index - first_block_index + 1 > UVM_PHASE_F_MAX_RANGES ||
+            *entry_count_inout > UVM_PHASE_F_MAX_RANGES - (last_block_index - first_block_index + 1)) {
+            return NV_WARN_MORE_PROCESSING_REQUIRED;
+        }
+
+        range_state->covered_bytes += range_end - range_start + 1;
+        range_state->candidate_pages += (range_end - range_start + 1) / PAGE_SIZE;
+
+        for (block_index = first_block_index; block_index <= last_block_index; ++block_index) {
+            uvm_va_block_t *block;
+            NvU64 block_start;
+            NvU64 block_end;
+            NV_STATUS status;
+
+            status = uvm_va_range_block_create(managed_range, block_index, &block);
+            if (status != NV_OK)
+                return status;
+
+            block_start = max(base, block->start);
+            block_end = min(last_address, block->end);
+            if (block_start > block_end)
+                continue;
+
+            entries[*entry_count_inout].va_block = block;
+            entries[*entry_count_inout].region = uvm_va_block_region_from_start_end(block, block_start, block_end);
+            entries[*entry_count_inout].committed_pages = 0;
+            entry_range_indices[*entry_count_inout] = range_index;
+            ++*entry_count_inout;
+        }
+    }
+
+    if (!managed_range_last || managed_range_last->va_range.node.end < last_address)
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    if (range_state->covered_bytes != length)
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_phase_f_expert_batch_probe_single_va_range_region(uvm_va_space_t *va_space,
+                                                                       NvU64 region_id,
+                                                                       NvU32 range_index,
+                                                                       uvm_phase_f_expert_batch_region_work_t *work)
+{
+    uvm_phase_f_region_t *region;
+    uvm_va_range_t *va_range;
+    uvm_va_range_managed_t *managed_range;
+    uvm_phase_f_expert_batch_range_state_t *range_state = &work->range_states[range_index];
+    NvU64 base;
+    NvU64 length;
+    NvU64 last_address;
+    size_t first_block_index;
+    size_t last_block_index;
+    size_t block_count;
+
+    if (region_id == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    region = radix_tree_lookup(&va_space->phase_f_regions, region_id);
+    if (!region)
+        return NV_ERR_OBJECT_NOT_FOUND;
+
+    if (!uvm_phase_f_registered_region_is_expert_weight(region))
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    base = region->base;
+    length = region->length;
+    if (base == 0 || length == 0 || uvm_api_range_invalid(base, length))
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    last_address = base + length - 1;
+    va_range = uvm_va_range_find(va_space, base);
+    managed_range = uvm_va_range_to_managed_or_null(va_range);
+    if (!managed_range || managed_range->va_range.node.end < last_address)
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    if (work->single_managed_range && work->single_managed_range != managed_range)
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    first_block_index = uvm_va_range_block_index(managed_range, base);
+    last_block_index = uvm_va_range_block_index(managed_range, last_address);
+    block_count = last_block_index - first_block_index + 1;
+    if (block_count > UVM_PHASE_F_MAX_RANGES)
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+    if (!work->single_managed_range) {
+        work->single_managed_range = managed_range;
+        work->single_first_block_index = first_block_index;
+        work->single_last_block_index = last_block_index;
+    }
+    else {
+        work->single_first_block_index = min(work->single_first_block_index, first_block_index);
+        work->single_last_block_index = max(work->single_last_block_index, last_block_index);
+        if (work->single_last_block_index - work->single_first_block_index + 1 > UVM_PHASE_F_MAX_RANGES)
+            return NV_WARN_MORE_PROCESSING_REQUIRED;
+    }
+
+    range_state->covered_bytes = length;
+    range_state->candidate_pages = length / PAGE_SIZE;
+    range_state->committed_pages = 0;
+    return NV_OK;
+}
+
+static NV_STATUS uvm_phase_f_expert_batch_mark_single_va_range_region(uvm_va_space_t *va_space,
+                                                                      NvU64 region_id,
+                                                                      NvU32 range_index,
+                                                                      uvm_phase_f_expert_batch_region_work_t *work)
+{
+    uvm_phase_f_region_t *region;
+    uvm_va_range_managed_t *managed_range = work->single_managed_range;
+    NvU64 base;
+    NvU64 last_address;
+    size_t first_block_index;
+    size_t last_block_index;
+    size_t block_index;
+
+    UVM_ASSERT(managed_range);
+
+    region = radix_tree_lookup(&va_space->phase_f_regions, region_id);
+    if (!region)
+        return NV_ERR_OBJECT_NOT_FOUND;
+
+    base = region->base;
+    last_address = base + region->length - 1;
+    first_block_index = uvm_va_range_block_index(managed_range, base);
+    last_block_index = uvm_va_range_block_index(managed_range, last_address);
+
+    for (block_index = first_block_index; block_index <= last_block_index; ++block_index) {
+        size_t seen_index = block_index - work->single_first_block_index;
+
+        if (!test_and_set_bit(seen_index, work->single_block_seen))
+            work->single_block_owner[seen_index] = range_index;
+    }
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_phase_f_expert_batch_emit_single_va_range_entries(uvm_phase_f_expert_batch_region_work_t *work,
+                                                                       UVM_PHASE_F_BATCH_REGIONS_PARAMS *params,
+                                                                       size_t *entry_count_out)
+{
+    uvm_va_range_managed_t *managed_range = work->single_managed_range;
+    size_t relative_index;
+    size_t span;
+
+    *entry_count_out = 0;
+    UVM_ASSERT(managed_range);
+
+    span = work->single_last_block_index - work->single_first_block_index + 1;
+    for (relative_index = 0; relative_index < span; ++relative_index) {
+        size_t block_index;
+        NvU32 owner;
+        uvm_phase_f_region_t *region;
+        uvm_va_block_t *block;
+        NvU64 last_address;
+        NvU64 block_start;
+        NvU64 block_end;
+        NV_STATUS status;
+
+        if (!test_bit(relative_index, work->single_block_seen))
+            continue;
+
+        if (*entry_count_out >= UVM_PHASE_F_MAX_RANGES)
+            return NV_WARN_MORE_PROCESSING_REQUIRED;
+
+        block_index = work->single_first_block_index + relative_index;
+        owner = work->single_block_owner[relative_index];
+        region = radix_tree_lookup(&managed_range->va_range.va_space->phase_f_regions, params->region_ids[owner]);
+        if (!region)
+            return NV_ERR_OBJECT_NOT_FOUND;
+
+        status = uvm_va_range_block_create(managed_range, block_index, &block);
+        if (status != NV_OK)
+            return status;
+
+        last_address = region->base + region->length - 1;
+        block_start = max(region->base, block->start);
+        block_end = min(last_address, block->end);
+        if (block_start > block_end)
+            continue;
+
+        work->entries[*entry_count_out].va_block = block;
+        work->entries[*entry_count_out].region = uvm_va_block_region_from_start_end(block, block_start, block_end);
+        work->entries[*entry_count_out].committed_pages = 0;
+        work->entry_range_indices[*entry_count_out] = owner;
+        ++*entry_count_out;
+    }
+
     return NV_OK;
 }
 
@@ -5466,6 +5738,212 @@ out:
         uvm_va_space_mm_or_current_release_unlock(va_space, mm);
 
     uvm_kvfree(range_states);
+
+    return status == NV_WARN_MORE_PROCESSING_REQUIRED ? status : first_error;
+}
+
+static NV_STATUS uvm_phase_f_expert_read_dup_fast_batch_regions(const NvProcessorUuid *gpu_uuid,
+                                                                NvBool async,
+                                                                UVM_PHASE_F_BATCH_REGIONS_PARAMS *params,
+                                                                struct file *filp)
+{
+    NV_STATUS status = NV_OK;
+    NV_STATUS first_error = NV_OK;
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    struct mm_struct *mm = NULL;
+    uvm_gpu_t *gpu = NULL;
+    uvm_phase_f_expert_batch_region_work_t *work = NULL;
+    uvm_processor_mask_t *involved_processors = NULL;
+    uvm_tracker_t batch_tracker = UVM_TRACKER_INIT();
+    size_t entry_count = 0;
+    size_t entry_index;
+    NvU32 range_index;
+    NvU64 committed_pages_total = 0;
+    bool mmap_lock_dropped = false;
+    bool single_va_range_fast = false;
+
+    UVM_ASSERT(params->action == UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST);
+    UVM_ASSERT(params->count > 1);
+
+    work = uvm_kvmalloc_zero(sizeof(*work));
+    if (!work)
+        return NV_ERR_NO_MEMORY;
+
+    for (range_index = 0; range_index < params->count; ++range_index)
+        uvm_phase_f_result_init(&params->results[range_index], 0);
+
+    involved_processors = uvm_processor_mask_cache_alloc();
+    if (!involved_processors) {
+        uvm_kvfree(work);
+        return NV_ERR_NO_MEMORY;
+    }
+
+    mm = uvm_va_space_mm_or_current_retain_lock(va_space);
+    uvm_va_space_down_read(va_space);
+
+    gpu = uvm_va_space_get_gpu_by_uuid(va_space, gpu_uuid);
+    if (!gpu) {
+        status = NV_ERR_INVALID_DEVICE;
+        goto out;
+    }
+
+    if (uvm_phase_n_expert_migrate_single_va_range_batch_enable) {
+        NV_STATUS fast_status = NV_OK;
+
+        for (range_index = 0; range_index < params->count; ++range_index) {
+            fast_status = uvm_phase_f_expert_batch_probe_single_va_range_region(va_space,
+                                                                                params->region_ids[range_index],
+                                                                                range_index,
+                                                                                work);
+            if (fast_status != NV_OK)
+                break;
+        }
+
+        if (fast_status == NV_OK) {
+            for (range_index = 0; range_index < params->count; ++range_index) {
+                fast_status = uvm_phase_f_expert_batch_mark_single_va_range_region(va_space,
+                                                                                   params->region_ids[range_index],
+                                                                                   range_index,
+                                                                                   work);
+                if (fast_status != NV_OK)
+                    break;
+            }
+        }
+
+        if (fast_status == NV_OK)
+            fast_status = uvm_phase_f_expert_batch_emit_single_va_range_entries(work, params, &entry_count);
+
+        if (fast_status == NV_OK) {
+            single_va_range_fast = true;
+            for (range_index = 0; range_index < params->count; ++range_index)
+                params->results[range_index].queried_bytes = work->range_states[range_index].covered_bytes;
+        }
+        else {
+            memset(work, 0, sizeof(*work));
+            entry_count = 0;
+        }
+    }
+
+    if (!single_va_range_fast) {
+        for (range_index = 0; range_index < params->count; ++range_index) {
+            status = uvm_phase_f_expert_batch_collect_region(va_space,
+                                                             params->region_ids[range_index],
+                                                             range_index,
+                                                             &work->range_states[range_index],
+                                                             work->entries,
+                                                             work->entry_range_indices,
+                                                             &entry_count);
+            if (status != NV_OK)
+                goto out;
+
+            params->results[range_index].queried_bytes = work->range_states[range_index].covered_bytes;
+        }
+    }
+
+    if (entry_count == 0) {
+        status = NV_WARN_MORE_PROCESSING_REQUIRED;
+        goto out;
+    }
+
+    if (!single_va_range_fast) {
+        uvm_phase_f_expert_batch_sort_entries(work->entries, work->entry_range_indices, entry_count);
+        if (uvm_phase_f_expert_batch_has_duplicate_blocks(work->entries, entry_count)) {
+            status = NV_WARN_MORE_PROCESSING_REQUIRED;
+            goto out;
+        }
+    }
+
+    if (single_va_range_fast) {
+        status = uvm_va_block_expert_promote_read_duplicate_batch_single_lock(va_space,
+                                                                              mm,
+                                                                              gpu,
+                                                                              work->entries,
+                                                                              entry_count,
+                                                                              &batch_tracker,
+                                                                              involved_processors);
+    }
+    else if (uvm_phase_n_expert_migrate_batch_skip_revalidate_enable) {
+        status = uvm_va_block_expert_promote_read_duplicate_batch_trusted(va_space,
+                                                                          mm,
+                                                                          gpu,
+                                                                          work->entries,
+                                                                          entry_count,
+                                                                          &batch_tracker,
+                                                                          involved_processors);
+    }
+    else {
+        status = uvm_va_block_expert_promote_read_duplicate_batch(va_space,
+                                                                  mm,
+                                                                  gpu,
+                                                                  work->entries,
+                                                                  entry_count,
+                                                                  &batch_tracker,
+                                                                  involved_processors);
+    }
+    if (status != NV_OK)
+        goto out;
+
+    if (!async) {
+        if (mm) {
+            uvm_up_read_mmap_lock_out_of_order(mm);
+            mmap_lock_dropped = true;
+        }
+
+        status = uvm_tracker_wait(&batch_tracker);
+        if (status != NV_OK)
+            goto out;
+    }
+
+    for (entry_index = 0; entry_index < entry_count; ++entry_index) {
+        NvU32 owner = work->entry_range_indices[entry_index];
+
+        work->range_states[owner].committed_pages += work->entries[entry_index].committed_pages;
+        committed_pages_total += work->entries[entry_index].committed_pages;
+    }
+
+out:
+    if (status != NV_WARN_MORE_PROCESSING_REQUIRED) {
+        params->success_count = 0;
+        params->failure_count = 0;
+
+        for (range_index = 0; range_index < params->count; ++range_index) {
+            UVM_PHASE_F_RANGE_RESULT *result = &params->results[range_index];
+            NV_STATUS range_status = status == NV_OK ? NV_OK : status;
+
+            result->status = range_status;
+            if (range_status == NV_OK) {
+                result->resident_gpu_bytes = work->range_states[range_index].committed_pages * PAGE_SIZE;
+                result->resident_cpu_bytes = work->range_states[range_index].committed_pages * PAGE_SIZE;
+                result->resident_any_bytes = work->range_states[range_index].covered_bytes;
+                result->resident_unknown_bytes = 0;
+            }
+
+            uvm_phase_f_note_status(range_status,
+                                    &params->success_count,
+                                    &params->failure_count,
+                                    &first_error);
+        }
+    }
+
+    uvm_phase_f_route_log("phase_f_expert_read_dup_fast_batch_regions count=%u entries=%zu status=0x%x gpu=%s async=%u single_va_range=%u committed_pages=%llu\n",
+                          params->count,
+                          entry_count,
+                          status,
+                          gpu ? gpu->name : "none",
+                          async,
+                          single_va_range_fast,
+                          committed_pages_total);
+
+    uvm_tracker_deinit(&batch_tracker);
+
+    uvm_va_space_up_read(va_space);
+    if (mmap_lock_dropped)
+        uvm_va_space_mm_or_current_release(va_space, mm);
+    else
+        uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+
+    uvm_processor_mask_cache_free(involved_processors);
+    uvm_kvfree(work);
 
     return status == NV_WARN_MORE_PROCESSING_REQUIRED ? status : first_error;
 }
@@ -5659,6 +6137,23 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
                           params->async,
                           params->count > 0 ? params->region_ids[0] : 0);
 
+    if (params->action == UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST && params->count > 1) {
+        NV_STATUS batch_status = uvm_phase_f_expert_read_dup_fast_batch_regions(&params->gpu_uuid,
+                                                                                params->async,
+                                                                                params,
+                                                                                filp);
+        if (batch_status != NV_WARN_MORE_PROCESSING_REQUIRED) {
+            first_error = batch_status;
+            goto out;
+        }
+
+        params->success_count = 0;
+        params->failure_count = 0;
+        first_error = NV_OK;
+        uvm_phase_f_route_log("phase_f_policy_batch_regions expert_fast_region_batch_fallback count=%u\n",
+                              params->count);
+    }
+
     for (i = 0; i < params->count; ++i) {
         uvm_phase_f_region_t *region;
         NvU64 base = 0;
@@ -5710,6 +6205,7 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
                                 &first_error);
     }
 
+out:
     uvm_phase_f_route_log("phase_f_policy_batch_regions end action=%u count=%u success=%u failure=%u first_error=0x%x\n",
                           params->action,
                           params->count,

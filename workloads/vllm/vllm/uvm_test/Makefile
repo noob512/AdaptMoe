@@ -41,6 +41,9 @@ phase_n_operator_sim: phase_n_operator_sim.cu uvm_allocator.so
 phase_n_object_mapping_smoke: phase_n_object_mapping_smoke.cu uvm_allocator.so
 	$(NVCC) -O2 -std=c++17 -I$(CUDA_INCLUDE) -L. -Xlinker -rpath,'$$ORIGIN' -o $@ $< -l:uvm_allocator.so -L$(CUDA_LIB) -lcudart -ldl
 
+phase_n_3gb_rebalance_smoke: phase_n_3gb_rebalance_smoke.cu uvm_allocator.so
+	$(NVCC) -O2 -std=c++17 -I$(CUDA_INCLUDE) -L. -Xlinker -rpath,'$$ORIGIN' -o $@ $< -l:uvm_allocator.so -L$(CUDA_LIB) -lcudart -ldl
+
 # LD_PRELOAD library to intercept all cudaMalloc calls
 preload: libcudamalloc_managed.so
 
@@ -56,6 +59,6 @@ managed_pool_probe: managed_pool_probe.cu
 	$(NVCC) -O2 -std=c++17 -o $@ $< -lcudart
 
 clean:
-	rm -f uvm_allocator.so libcudamalloc_managed.so libuvm_managed_budget.so phase_f_smoke phase_n_operator_sim phase_n_object_mapping_smoke managed_pool_probe
+	rm -f uvm_allocator.so libcudamalloc_managed.so libuvm_managed_budget.so phase_f_smoke phase_n_operator_sim phase_n_object_mapping_smoke phase_n_3gb_rebalance_smoke managed_pool_probe
 
 .PHONY: all uvm preload budget clean

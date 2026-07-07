@@ -62,8 +62,12 @@ _UVM_PHASE_F_BATCH_EXECUTOR_IOCTL = 81
 _UVM_PHASE_F_MAX_RANGES = 64
 _UVM_MOE_SLOT_REMAP_BATCH_IOCTL = 91
 _UVM_MOE_SLOT_POOL_QUERY_IOCTL = 92
+_UVM_EXPERT_RESERVED_POOL_IOCTL = 98
+_UVM_EXPERT_RESERVED_PREFETCH_BATCH_IOCTL = 99
 _UVM_MOE_SLOT_REMAP_MAX_ENTRIES = 128
 _UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES = 128
+_UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES = 128
+_UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES = 128
 _UVM_MOE_SLOT_REMAP_STATS_COUNT = 8
 _UVM_PAGE_SIZE = 0
 
@@ -100,6 +104,7 @@ UVM_REGION_FLAG_TRANSIENT = 1 << 5
 UVM_REGION_FLAG_HOT_SUBPOOL = 1 << 11
 UVM_REGION_FLAG_STREAMING_SUBPOOL = 1 << 12
 UVM_REGION_FLAG_COLD_SUBPOOL = 1 << 13
+UVM_REGION_FLAG_CPU_OFFLOADED_RESERVED = 1 << 14
 
 UVM_REGION_STATE_UNKNOWN = 0
 UVM_REGION_STATE_COLD = 1
@@ -140,6 +145,36 @@ UVM_MOE_SLOT_POOL_BACKING_NONE = 0
 UVM_MOE_SLOT_POOL_BACKING_SYSMEM = 1
 UVM_MOE_SLOT_POOL_BACKING_SYSMEM_DMA = 2
 UVM_MOE_SLOT_POOL_BACKING_VIDMEM = 3
+
+UVM_EXPERT_RESERVED_POOL_MODE_QUERY = 0
+UVM_EXPERT_RESERVED_POOL_MODE_PREALLOC = 1
+UVM_EXPERT_RESERVED_POOL_MODE_RESET = 2
+
+UVM_EXPERT_RESERVED_POOL_ENTRY_FLAG_ALLOW_EVICT = 1 << 0
+
+UVM_EXPERT_RESERVED_POOL_SLOT_EMPTY = 0
+UVM_EXPERT_RESERVED_POOL_SLOT_RESERVED = 1
+UVM_EXPERT_RESERVED_POOL_SLOT_LOADING = 2
+UVM_EXPERT_RESERVED_POOL_SLOT_ASSIGNED = 3
+UVM_EXPERT_RESERVED_POOL_SLOT_ERROR = 4
+
+UVM_EXPERT_RESERVED_PREFETCH_MODE_DRY_RUN = 0
+UVM_EXPERT_RESERVED_PREFETCH_MODE_RESOLVE = 1
+UVM_EXPERT_RESERVED_PREFETCH_MODE_INVALIDATE = 2
+UVM_EXPERT_RESERVED_PREFETCH_MODE_RESERVED_PREFETCH = 3
+
+UVM_EXPERT_RESERVED_PREFETCH_ENTRY_FLAG_STRICT_FOOTPRINT = 1 << 0
+
+UVM_EXPERT_RESERVED_PREFETCH_ENTRY_OK = 0
+UVM_EXPERT_RESERVED_PREFETCH_ENTRY_INVALID_ARGUMENT = 1
+UVM_EXPERT_RESERVED_PREFETCH_ENTRY_INVALID_DEVICE = 2
+UVM_EXPERT_RESERVED_PREFETCH_ENTRY_REGION_NOT_FOUND = 3
+UVM_EXPERT_RESERVED_PREFETCH_ENTRY_REGION_UNSUPPORTED = 4
+UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_NOT_FOUND = 5
+UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_UNBACKED = 6
+UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_TOO_SMALL = 7
+UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_IN_USE = 8
+UVM_EXPERT_RESERVED_PREFETCH_ENTRY_NATIVE_POPULATE_UNSUPPORTED = 9
 
 
 class _UvmInitializeParams(ctypes.Structure):
@@ -307,6 +342,98 @@ class _MoeSlotPoolQueryParams(ctypes.Structure):
         ("pte_residual_page_count", ctypes.c_uint64),
         ("pte_residual_gpu_mask", ctypes.c_uint64),
         ("entries", _MoeSlotPoolQueryEntry * _UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES),
+        ("rmStatus", ctypes.c_uint32),
+    ]
+
+
+class _ExpertReservedPoolEntry(ctypes.Structure):
+    _fields_ = [
+        ("pool_id", ctypes.c_uint32),
+        ("slot_id", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+        ("state", ctypes.c_uint32),
+        ("chunk_count", ctypes.c_uint32),
+        ("slot_bytes", ctypes.c_uint64),
+        ("physical_bytes", ctypes.c_uint64),
+        ("epoch", ctypes.c_uint64),
+        ("first_chunk_address", ctypes.c_uint64),
+        ("last_chunk_address", ctypes.c_uint64),
+    ]
+
+
+class _ExpertReservedPoolParams(ctypes.Structure):
+    _fields_ = [
+        ("mode", ctypes.c_uint32),
+        ("count", ctypes.c_uint32),
+        ("gpu_uuid", _PhaseFUuid),
+        ("max_entries", ctypes.c_uint32),
+        ("success_count", ctypes.c_uint32),
+        ("failure_count", ctypes.c_uint32),
+        ("total_slots", ctypes.c_uint32),
+        ("returned_slots", ctypes.c_uint32),
+        ("active_slots", ctypes.c_uint32),
+        ("backed_slots", ctypes.c_uint32),
+        ("chunk_size", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("reserved_backing_bytes", ctypes.c_uint64),
+        ("logical_slot_bytes", ctypes.c_uint64),
+        ("current_epoch", ctypes.c_uint64),
+        ("prealloc_count", ctypes.c_uint64),
+        ("reset_count", ctypes.c_uint64),
+        ("alloc_failed_count", ctypes.c_uint64),
+        (
+            "entries",
+            _ExpertReservedPoolEntry * _UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES,
+        ),
+        ("rmStatus", ctypes.c_uint32),
+    ]
+
+
+class _ExpertReservedPrefetchEntry(ctypes.Structure):
+    _fields_ = [
+        ("region_id", ctypes.c_uint64),
+        ("pool_id", ctypes.c_uint32),
+        ("slot_id", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+        ("slot_offset", ctypes.c_uint64),
+        ("bytes_override", ctypes.c_uint64),
+        ("resolved_base", ctypes.c_uint64),
+        ("resolved_bytes", ctypes.c_uint64),
+        ("layer_id", ctypes.c_uint32),
+        ("expert_id", ctypes.c_uint32),
+        ("role", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("slot_epoch", ctypes.c_uint64),
+        ("physical_bytes", ctypes.c_uint64),
+    ]
+
+
+class _ExpertReservedPrefetchBatchParams(ctypes.Structure):
+    _fields_ = [
+        ("mode", ctypes.c_uint32),
+        ("count", ctypes.c_uint32),
+        ("gpu_uuid", _PhaseFUuid),
+        ("async_", ctypes.c_uint32),
+        ("success_count", ctypes.c_uint32),
+        ("failure_count", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("requested_bytes", ctypes.c_uint64),
+        ("accepted_bytes", ctypes.c_uint64),
+        ("resolved_regions", ctypes.c_uint64),
+        ("assigned_slots", ctypes.c_uint64),
+        ("invalidated_slots", ctypes.c_uint64),
+        ("reserved_backing_bytes", ctypes.c_uint64),
+        ("ordinary_resident_bytes", ctypes.c_uint64),
+        ("pool_external_alloc_count", ctypes.c_uint64),
+        ("footprint_contract_broken", ctypes.c_uint64),
+        ("current_epoch", ctypes.c_uint64),
+        (
+            "entries",
+            _ExpertReservedPrefetchEntry *
+            _UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES,
+        ),
         ("rmStatus", ctypes.c_uint32),
     ]
 
@@ -2087,6 +2214,534 @@ def driver_moe_slot_pool_query(
     except Exception:
         logger.debug("MoE slot pool query ioctl failed", exc_info=True)
         result["ioctl_ret"] = -4
+        return result
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _expert_reserved_pool_mode_value(mode: str | int) -> int:
+    if isinstance(mode, int):
+        return int(mode)
+    normalized = str(mode or "query").strip().lower()
+    if normalized in ("query", "status", "state"):
+        return UVM_EXPERT_RESERVED_POOL_MODE_QUERY
+    if normalized in ("prealloc", "preallocate", "alloc", "reserve"):
+        return UVM_EXPERT_RESERVED_POOL_MODE_PREALLOC
+    if normalized in ("reset", "release", "clear"):
+        return UVM_EXPERT_RESERVED_POOL_MODE_RESET
+    return UVM_EXPERT_RESERVED_POOL_MODE_QUERY
+
+
+def _expert_reserved_pool_entry_to_dict(
+    entry: _ExpertReservedPoolEntry,
+) -> dict[str, int]:
+    return {
+        "pool_id": int(entry.pool_id),
+        "slot_id": int(entry.slot_id),
+        "flags": int(entry.flags),
+        "status": int(entry.status),
+        "state": int(entry.state),
+        "chunk_count": int(entry.chunk_count),
+        "slot_bytes": int(entry.slot_bytes),
+        "physical_bytes": int(entry.physical_bytes),
+        "epoch": int(entry.epoch),
+        "first_chunk_address": int(entry.first_chunk_address),
+        "last_chunk_address": int(entry.last_chunk_address),
+    }
+
+
+def _empty_expert_reserved_pool_result(
+    *,
+    mode: str | int = "query",
+    ioctl_ret: int = -1,
+    rm_status: int = 0,
+) -> dict[str, object]:
+    mode_value = _expert_reserved_pool_mode_value(mode)
+    return {
+        "ok": False,
+        "ioctl": _UVM_EXPERT_RESERVED_POOL_IOCTL,
+        "ioctl_ret": int(ioctl_ret),
+        "errno": 0,
+        "rm_status": int(rm_status),
+        "mode": mode_value,
+        "mode_name": {
+            UVM_EXPERT_RESERVED_POOL_MODE_QUERY: "query",
+            UVM_EXPERT_RESERVED_POOL_MODE_PREALLOC: "prealloc",
+            UVM_EXPERT_RESERVED_POOL_MODE_RESET: "reset",
+        }.get(mode_value, str(mode)),
+        "success_count": 0,
+        "failure_count": 0,
+        "total_slots": 0,
+        "returned_slots": 0,
+        "active_slots": 0,
+        "backed_slots": 0,
+        "chunk_size": 0,
+        "reserved_backing_bytes": 0,
+        "logical_slot_bytes": 0,
+        "current_epoch": 0,
+        "prealloc_count": 0,
+        "reset_count": 0,
+        "alloc_failed_count": 0,
+        "entries": [],
+    }
+
+
+def _fill_expert_reserved_pool_params(
+    params: _ExpertReservedPoolParams,
+    *,
+    mode_value: int,
+    entries: Sequence[dict[str, object]],
+    gpu_uuid: _PhaseFUuid,
+    max_entries: int,
+    allow_evict: bool,
+) -> None:
+    params.mode = mode_value
+    params.count = len(entries) if mode_value == UVM_EXPERT_RESERVED_POOL_MODE_PREALLOC else 0
+    params.gpu_uuid = gpu_uuid
+    params.max_entries = max(0, min(
+        int(max_entries),
+        _UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES,
+    ))
+    for index, entry in enumerate(entries[:_UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES]):
+        flags = int(entry.get("flags", 0))
+        if allow_evict:
+            flags |= UVM_EXPERT_RESERVED_POOL_ENTRY_FLAG_ALLOW_EVICT
+        params.entries[index].pool_id = int(entry.get("pool_id", 0))
+        params.entries[index].slot_id = int(entry.get("slot_id", index))
+        params.entries[index].flags = flags
+        params.entries[index].slot_bytes = int(
+            entry.get("slot_bytes", entry.get("bytes", 0))
+        )
+
+
+def _expert_reserved_pool_result_from_params(
+    params: _ExpertReservedPoolParams,
+    *,
+    mode: str | int,
+    ret: int,
+    saved_errno: int,
+) -> dict[str, object]:
+    returned_slots = max(0, min(
+        int(params.returned_slots),
+        _UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES,
+    ))
+    entries = [
+        _expert_reserved_pool_entry_to_dict(params.entries[index])
+        for index in range(returned_slots)
+    ]
+    if int(params.mode) == UVM_EXPERT_RESERVED_POOL_MODE_PREALLOC:
+        entries = [
+            _expert_reserved_pool_entry_to_dict(params.entries[index])
+            for index in range(max(0, min(
+                int(params.count),
+                _UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES,
+            )))
+        ]
+
+    result = _empty_expert_reserved_pool_result(
+        mode=mode,
+        ioctl_ret=ret,
+        rm_status=int(params.rmStatus),
+    )
+    result.update({
+        "ok": int(ret) == 0 and int(params.rmStatus) == 0,
+        "errno": int(saved_errno),
+        "mode": int(params.mode),
+        "success_count": int(params.success_count),
+        "failure_count": int(params.failure_count),
+        "total_slots": int(params.total_slots),
+        "returned_slots": int(params.returned_slots),
+        "active_slots": int(params.active_slots),
+        "backed_slots": int(params.backed_slots),
+        "chunk_size": int(params.chunk_size),
+        "reserved_backing_bytes": int(params.reserved_backing_bytes),
+        "logical_slot_bytes": int(params.logical_slot_bytes),
+        "current_epoch": int(params.current_epoch),
+        "prealloc_count": int(params.prealloc_count),
+        "reset_count": int(params.reset_count),
+        "alloc_failed_count": int(params.alloc_failed_count),
+        "entries": entries,
+    })
+    return result
+
+
+def driver_expert_reserved_pool(
+    *,
+    mode: str | int = "query",
+    entries: Sequence[dict[str, object]] = (),
+    device: int = 0,
+    max_entries: int = _UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES,
+    allow_evict: bool = False,
+    prefer_existing: bool = False,
+) -> dict[str, object]:
+    """Manage the Phase-1 reserved PMM chunk pool in the modified UVM driver."""
+    mode_value = _expert_reserved_pool_mode_value(mode)
+    normalized_entries = list(entries)
+    if len(normalized_entries) > _UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES:
+        result = _empty_expert_reserved_pool_result(mode=mode, ioctl_ret=-2)
+        result["failure_count"] = len(normalized_entries)
+        return result
+
+    try:
+        gpu_uuid = (
+            _phase_f_gpu_uuid(device)
+            if mode_value == UVM_EXPERT_RESERVED_POOL_MODE_PREALLOC
+            else _PhaseFUuid()
+        )
+    except Exception:
+        logger.debug("Failed to resolve CUDA UUID for expert reserved pool",
+                     exc_info=True)
+        result = _empty_expert_reserved_pool_result(mode=mode, ioctl_ret=-3)
+        result["failure_count"] = len(normalized_entries)
+        return result
+
+    params = _ExpertReservedPoolParams()
+    _fill_expert_reserved_pool_params(
+        params,
+        mode_value=mode_value,
+        entries=normalized_entries,
+        gpu_uuid=gpu_uuid,
+        max_entries=max_entries,
+        allow_evict=allow_evict,
+    )
+
+    fd = -1
+    try:
+        fd = _open_or_adopt_initialized_uvm_fd(prefer_existing=prefer_existing)
+        ctypes.set_errno(0)
+        ret = _libc_ioctl(fd, _UVM_EXPERT_RESERVED_POOL_IOCTL, params)
+        saved_errno = ctypes.get_errno()
+        return _expert_reserved_pool_result_from_params(
+            params,
+            mode=mode,
+            ret=int(ret),
+            saved_errno=int(saved_errno),
+        )
+    except Exception:
+        logger.debug("Expert reserved pool ioctl failed", exc_info=True)
+        result = _empty_expert_reserved_pool_result(mode=mode, ioctl_ret=-4)
+        result["failure_count"] = len(normalized_entries)
+        return result
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def driver_expert_reserved_pool_prealloc(
+    slots: Sequence[dict[str, object]],
+    *,
+    device: int = 0,
+    allow_evict: bool = False,
+    prefer_existing: bool = False,
+) -> dict[str, object]:
+    return driver_expert_reserved_pool(
+        mode="prealloc",
+        entries=slots,
+        device=device,
+        allow_evict=allow_evict,
+        prefer_existing=prefer_existing,
+    )
+
+
+def driver_expert_reserved_pool_query(
+    *,
+    max_entries: int = _UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES,
+    prefer_existing: bool = False,
+) -> dict[str, object]:
+    return driver_expert_reserved_pool(
+        mode="query",
+        max_entries=max_entries,
+        prefer_existing=prefer_existing,
+    )
+
+
+def driver_expert_reserved_pool_reset(
+    *,
+    max_entries: int = _UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES,
+    prefer_existing: bool = False,
+) -> dict[str, object]:
+    return driver_expert_reserved_pool(
+        mode="reset",
+        max_entries=max_entries,
+        prefer_existing=prefer_existing,
+    )
+
+
+def _expert_reserved_prefetch_mode_value(mode: str | int) -> int:
+    if isinstance(mode, int):
+        return int(mode)
+    normalized = str(mode or "dry_run").strip().lower()
+    if normalized in ("dry_run", "dry-run", "validate", "validate_only"):
+        return UVM_EXPERT_RESERVED_PREFETCH_MODE_DRY_RUN
+    if normalized in ("resolve", "assign", "bind"):
+        return UVM_EXPERT_RESERVED_PREFETCH_MODE_RESOLVE
+    if normalized in ("invalidate", "clear", "release"):
+        return UVM_EXPERT_RESERVED_PREFETCH_MODE_INVALIDATE
+    if normalized in (
+        "reserved_prefetch",
+        "reserved-prefetch",
+        "prefetch",
+        "native",
+        "native_prefetch",
+    ):
+        return UVM_EXPERT_RESERVED_PREFETCH_MODE_RESERVED_PREFETCH
+    return UVM_EXPERT_RESERVED_PREFETCH_MODE_DRY_RUN
+
+
+def _expert_reserved_prefetch_entry_to_dict(
+    entry: _ExpertReservedPrefetchEntry,
+) -> dict[str, int]:
+    return {
+        "region_id": int(entry.region_id),
+        "pool_id": int(entry.pool_id),
+        "slot_id": int(entry.slot_id),
+        "flags": int(entry.flags),
+        "status": int(entry.status),
+        "slot_offset": int(entry.slot_offset),
+        "bytes_override": int(entry.bytes_override),
+        "resolved_base": int(entry.resolved_base),
+        "resolved_bytes": int(entry.resolved_bytes),
+        "layer_id": int(entry.layer_id),
+        "expert_id": int(entry.expert_id),
+        "role": int(entry.role),
+        "slot_epoch": int(entry.slot_epoch),
+        "physical_bytes": int(entry.physical_bytes),
+    }
+
+
+def _empty_expert_reserved_prefetch_result(
+    *,
+    mode: str | int = "dry_run",
+    ioctl_ret: int = -1,
+    rm_status: int = 0,
+) -> dict[str, object]:
+    mode_value = _expert_reserved_prefetch_mode_value(mode)
+    return {
+        "ok": False,
+        "ioctl": _UVM_EXPERT_RESERVED_PREFETCH_BATCH_IOCTL,
+        "ioctl_ret": int(ioctl_ret),
+        "errno": 0,
+        "rm_status": int(rm_status),
+        "mode": mode_value,
+        "mode_name": {
+            UVM_EXPERT_RESERVED_PREFETCH_MODE_DRY_RUN: "dry_run",
+            UVM_EXPERT_RESERVED_PREFETCH_MODE_RESOLVE: "resolve",
+            UVM_EXPERT_RESERVED_PREFETCH_MODE_INVALIDATE: "invalidate",
+            UVM_EXPERT_RESERVED_PREFETCH_MODE_RESERVED_PREFETCH:
+                "reserved_prefetch",
+        }.get(mode_value, str(mode)),
+        "entry_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "requested_bytes": 0,
+        "accepted_bytes": 0,
+        "resolved_regions": 0,
+        "assigned_slots": 0,
+        "invalidated_slots": 0,
+        "reserved_backing_bytes": 0,
+        "ordinary_resident_bytes": 0,
+        "pool_external_alloc_count": 0,
+        "footprint_contract_broken": 0,
+        "current_epoch": 0,
+        "entries": [],
+    }
+
+
+def _normalize_expert_reserved_prefetch_assignments(
+    region_ids: Sequence[int] | None,
+    slot_ids: Sequence[int] | None,
+    *,
+    assignments: Sequence[dict[str, object]] | None,
+    pool_id: int,
+    slot_offsets: Sequence[int] | None,
+    bytes_overrides: Sequence[int] | None,
+    strict_footprint: bool,
+) -> list[dict[str, int]]:
+    normalized: list[dict[str, int]] = []
+    if assignments is not None:
+        source = assignments
+        for index, entry in enumerate(source):
+            try:
+                flags = int(entry.get("flags", 0))
+                if bool(entry.get("strict_footprint", strict_footprint)):
+                    flags |= UVM_EXPERT_RESERVED_PREFETCH_ENTRY_FLAG_STRICT_FOOTPRINT
+                normalized.append({
+                    "region_id": int(entry.get("region_id", 0)),
+                    "pool_id": int(entry.get("pool_id", pool_id)),
+                    "slot_id": int(entry.get("slot_id", index)),
+                    "flags": flags,
+                    "slot_offset": int(entry.get("slot_offset", 0)),
+                    "bytes_override": int(entry.get("bytes_override",
+                                                    entry.get("bytes", 0))),
+                })
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return normalized
+
+    if region_ids is None:
+        return normalized
+
+    region_list = list(region_ids)
+    slot_list = list(slot_ids) if slot_ids is not None else list(range(len(region_list)))
+    offset_list = list(slot_offsets) if slot_offsets is not None else []
+    bytes_list = list(bytes_overrides) if bytes_overrides is not None else []
+    for index, region_id in enumerate(region_list):
+        if index >= len(slot_list):
+            break
+        flags = (
+            UVM_EXPERT_RESERVED_PREFETCH_ENTRY_FLAG_STRICT_FOOTPRINT
+            if strict_footprint else 0
+        )
+        normalized.append({
+            "region_id": int(region_id),
+            "pool_id": int(pool_id),
+            "slot_id": int(slot_list[index]),
+            "flags": flags,
+            "slot_offset": int(offset_list[index]) if index < len(offset_list) else 0,
+            "bytes_override": int(bytes_list[index]) if index < len(bytes_list) else 0,
+        })
+    return normalized
+
+
+def _fill_expert_reserved_prefetch_params(
+    params: _ExpertReservedPrefetchBatchParams,
+    *,
+    mode_value: int,
+    entries: Sequence[dict[str, int]],
+    gpu_uuid: _PhaseFUuid,
+    async_: bool,
+) -> None:
+    params.mode = mode_value
+    params.count = len(entries)
+    params.gpu_uuid = gpu_uuid
+    params.async_ = 1 if async_ else 0
+    for index, entry in enumerate(entries[:_UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES]):
+        params.entries[index].region_id = int(entry.get("region_id", 0))
+        params.entries[index].pool_id = int(entry.get("pool_id", 0))
+        params.entries[index].slot_id = int(entry.get("slot_id", index))
+        params.entries[index].flags = int(entry.get("flags", 0))
+        params.entries[index].slot_offset = int(entry.get("slot_offset", 0))
+        params.entries[index].bytes_override = int(entry.get("bytes_override", 0))
+
+
+def _expert_reserved_prefetch_result_from_params(
+    params: _ExpertReservedPrefetchBatchParams,
+    *,
+    mode: str | int,
+    ret: int,
+    saved_errno: int,
+) -> dict[str, object]:
+    entry_count = max(0, min(
+        int(params.count),
+        _UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES,
+    ))
+    result = _empty_expert_reserved_prefetch_result(
+        mode=mode,
+        ioctl_ret=ret,
+        rm_status=int(params.rmStatus),
+    )
+    result.update({
+        "ok": int(ret) == 0 and int(params.rmStatus) == 0,
+        "errno": int(saved_errno),
+        "mode": int(params.mode),
+        "entry_count": entry_count,
+        "success_count": int(params.success_count),
+        "failure_count": int(params.failure_count),
+        "requested_bytes": int(params.requested_bytes),
+        "accepted_bytes": int(params.accepted_bytes),
+        "resolved_regions": int(params.resolved_regions),
+        "assigned_slots": int(params.assigned_slots),
+        "invalidated_slots": int(params.invalidated_slots),
+        "reserved_backing_bytes": int(params.reserved_backing_bytes),
+        "ordinary_resident_bytes": int(params.ordinary_resident_bytes),
+        "pool_external_alloc_count": int(params.pool_external_alloc_count),
+        "footprint_contract_broken": int(params.footprint_contract_broken),
+        "current_epoch": int(params.current_epoch),
+        "entries": [
+            _expert_reserved_prefetch_entry_to_dict(params.entries[index])
+            for index in range(entry_count)
+        ],
+    })
+    return result
+
+
+def driver_expert_reserved_prefetch_regions(
+    region_ids: Sequence[int] | None = None,
+    slot_ids: Sequence[int] | None = None,
+    *,
+    assignments: Sequence[dict[str, object]] | None = None,
+    pool_id: int = 0,
+    slot_offsets: Sequence[int] | None = None,
+    bytes_overrides: Sequence[int] | None = None,
+    device: int = 0,
+    async_: bool = True,
+    strict_footprint: bool = True,
+    mode: str | int = "resolve",
+    prefer_existing: bool = True,
+) -> dict[str, object]:
+    """Bind Phase-F expert regions to Phase-1 reserved slots.
+
+    Phase 2 validates and records region->slot assignment. The reserved_prefetch
+    mode copies CPU-resident expert pages into reserved PMM chunks and installs
+    readonly slot-backed GPU PTEs without attaching the chunks to ordinary UVM
+    residency metadata.
+    """
+    mode_value = _expert_reserved_prefetch_mode_value(mode)
+    normalized_entries = _normalize_expert_reserved_prefetch_assignments(
+        region_ids,
+        slot_ids,
+        assignments=assignments,
+        pool_id=pool_id,
+        slot_offsets=slot_offsets,
+        bytes_overrides=bytes_overrides,
+        strict_footprint=strict_footprint,
+    )
+    if len(normalized_entries) > _UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES:
+        result = _empty_expert_reserved_prefetch_result(mode=mode, ioctl_ret=-2)
+        result["failure_count"] = len(normalized_entries)
+        return result
+
+    try:
+        gpu_uuid = _phase_f_gpu_uuid(device)
+    except Exception:
+        logger.debug("Failed to resolve CUDA UUID for expert reserved prefetch",
+                     exc_info=True)
+        result = _empty_expert_reserved_prefetch_result(mode=mode, ioctl_ret=-3)
+        result["failure_count"] = len(normalized_entries)
+        return result
+
+    params = _ExpertReservedPrefetchBatchParams()
+    _fill_expert_reserved_prefetch_params(
+        params,
+        mode_value=mode_value,
+        entries=normalized_entries,
+        gpu_uuid=gpu_uuid,
+        async_=async_,
+    )
+
+    fd = -1
+    try:
+        fd = _open_or_adopt_initialized_uvm_fd(prefer_existing=prefer_existing)
+        ctypes.set_errno(0)
+        ret = _libc_ioctl(fd, _UVM_EXPERT_RESERVED_PREFETCH_BATCH_IOCTL, params)
+        saved_errno = ctypes.get_errno()
+        return _expert_reserved_prefetch_result_from_params(
+            params,
+            mode=mode,
+            ret=int(ret),
+            saved_errno=int(saved_errno),
+        )
+    except Exception:
+        logger.debug("Expert reserved prefetch ioctl failed", exc_info=True)
+        result = _empty_expert_reserved_prefetch_result(mode=mode, ioctl_ret=-4)
+        result["failure_count"] = len(normalized_entries)
         return result
     finally:
         if fd >= 0:

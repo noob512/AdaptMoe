@@ -152,6 +152,12 @@ static bool phase_n_range_tag_is_expert_weight(const uvm_phase_n_range_tag_t *ta
             tag->role == UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W2);
 }
 
+static bool phase_n_range_tag_is_cpu_offloaded_reserved_expert(const uvm_phase_n_range_tag_t *tag)
+{
+    return phase_n_range_tag_is_expert_weight(tag) &&
+           (tag->flags & UVM_PHASE_N_REGION_FLAG_CPU_OFFLOADED_RESERVED);
+}
+
 static bool phase_n_expert_fault_readdup_allowed(uvm_va_block_t *va_block,
                                                  uvm_page_index_t page_index,
                                                  uvm_gpu_id_t gpu_id,
@@ -2473,6 +2479,18 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
         uvm_va_range_managed_t *managed_range = uvm_va_range_to_managed_or_null(va_range);
 
         if (managed_range &&
+            phase_n_range_tag_is_cpu_offloaded_reserved_expert(&managed_range->phase_n_tag)) {
+            ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_reserved_fault_policy_violations;
+            ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_reserved_pool_external_alloc_attempts;
+            service_fault_batch_fatal_notify(gpu,
+                                             batch_context,
+                                             fault_index,
+                                             NV_ERR_INVALID_ACCESS_TYPE,
+                                             UVM_FAULT_CANCEL_VA_MODE_ALL,
+                                             block_faults);
+            status = NV_OK;
+        }
+        else if (managed_range &&
             phase_n_range_tag_is_expert_weight(&managed_range->phase_n_tag) &&
             phase_n_expert_prefetch_authorized_after_wait(gpu, va_block, batch_context, fault_index, block_faults)) {
             status = NV_OK;

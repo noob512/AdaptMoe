@@ -796,6 +796,12 @@ gpu_fault_stats_print_common(uvm_parent_gpu_t *parent_gpu, struct seq_file *s)
                          parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_prefetch_wait_successes);
     UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_prefetch_wait_timeouts %llu\n",
                          parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_prefetch_wait_timeouts);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_reserved_fault_policy_violations %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_reserved_fault_policy_violations);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_reserved_migrate_policy_violations %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_reserved_migrate_policy_violations);
+    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_reserved_pool_external_alloc_attempts %llu\n",
+                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_reserved_pool_external_alloc_attempts);
     UVM_SEQ_OR_DBG_PRINT(s, "phase_n_non_expert_managed_dispatches %llu\n",
                          parent_gpu->fault_buffer.replayable.stats.num_phase_n_non_expert_managed_dispatches);
     UVM_SEQ_OR_DBG_PRINT(s, "phase_n_non_expert_managed_faults_serviced %llu\n",

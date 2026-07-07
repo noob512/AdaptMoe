@@ -1583,6 +1583,25 @@ NV_STATUS uvm_va_block_map_moe_slot_readonly(uvm_va_block_t *va_block,
                                              NvU64 slot_offset,
                                              uvm_tracker_t *out_tracker);
 
+// Experimental reserved-PMM-chunk readonly GPU mapping. This copies
+// CPU-resident managed pages into caller-owned VIDMEM chunks and then maps the
+// target managed VA to those chunks with readonly GPU PTEs. It intentionally
+// does not attach the chunks to gpu_state->chunks[] and does not update normal
+// residency/read-duplicate metadata.
+//
+// Locking: the va_block lock must be held. The va_space lock must be held.
+NV_STATUS uvm_va_block_copy_and_map_reserved_readonly(uvm_va_block_t *va_block,
+                                                     uvm_va_block_context_t *block_context,
+                                                     uvm_gpu_t *gpu,
+                                                     uvm_va_block_region_t region,
+                                                     const uvm_page_mask_t *page_mask,
+                                                     uvm_gpu_chunk_t **slot_chunks,
+                                                     NvU32 slot_chunk_count,
+                                                     NvU64 slot_offset,
+                                                     NvU64 slot_bytes,
+                                                     uvm_tracker_t *out_tracker,
+                                                     NvU64 *copied_bytes_out);
+
 // Experimental MoE user-backing readonly GPU mapping. This writes target block
 // PTEs to physical pages from backing_va_block. The backing pages must already
 // be resident on gpu. This is intended for route-time async H2D into managed

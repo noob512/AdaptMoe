@@ -449,6 +449,12 @@ typedef struct
 
             NvU64 num_phase_n_expert_prefetch_wait_timeouts;
 
+            NvU64 num_phase_n_reserved_fault_policy_violations;
+
+            NvU64 num_phase_n_reserved_migrate_policy_violations;
+
+            NvU64 num_phase_n_reserved_pool_external_alloc_attempts;
+
             NvU64 num_phase_n_non_expert_managed_dispatches;
 
             NvU64 num_phase_n_non_expert_managed_faults_serviced;

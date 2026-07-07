@@ -1382,6 +1382,7 @@ typedef enum
 #define UVM_PHASE_N_REGION_FLAG_HOT_SUBPOOL                          (1U << 11)
 #define UVM_PHASE_N_REGION_FLAG_STREAMING_SUBPOOL                    (1U << 12)
 #define UVM_PHASE_N_REGION_FLAG_COLD_SUBPOOL                         (1U << 13)
+#define UVM_PHASE_N_REGION_FLAG_CPU_OFFLOADED_RESERVED               (1U << 14)
 
 #define UVM_PHASE_N_TRACE_VICTIM_MAX                                 8
 
@@ -1642,6 +1643,165 @@ typedef struct
     NV_STATUS block_status[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX]; // OUT
     NV_STATUS rmStatus;                     // OUT
 } UVM_PHASE_N_RECLAIM_REGION_PARAMS;
+
+//
+// UvmExpertReservedPool
+//
+// Experimental Phase-1 control plane for reserved-backed native residency.
+// This ioctl preallocates UVM PMM user chunks through the existing
+// uvm_pmm_gpu_alloc_user() path and keeps them TEMP_PINNED in a driver-owned
+// reserved pool. Phase 1 does not attach the chunks to VA blocks, install PTEs,
+// or update residency metadata; later phases consume these slots as the backing
+// source for ordinary UVM residency.
+//
+#define UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES                         128
+
+#define UVM_EXPERT_RESERVED_POOL_ENTRY_FLAG_ALLOW_EVICT              (1U << 0)
+
+typedef enum
+{
+    UVM_EXPERT_RESERVED_POOL_MODE_QUERY = 0,
+    UVM_EXPERT_RESERVED_POOL_MODE_PREALLOC = 1,
+    UVM_EXPERT_RESERVED_POOL_MODE_RESET = 2,
+} UVM_EXPERT_RESERVED_POOL_MODE;
+
+typedef enum
+{
+    UVM_EXPERT_RESERVED_POOL_SLOT_EMPTY = 0,
+    UVM_EXPERT_RESERVED_POOL_SLOT_RESERVED = 1,
+    UVM_EXPERT_RESERVED_POOL_SLOT_LOADING = 2,
+    UVM_EXPERT_RESERVED_POOL_SLOT_ASSIGNED = 3,
+    UVM_EXPERT_RESERVED_POOL_SLOT_ERROR = 4,
+} UVM_EXPERT_RESERVED_POOL_SLOT_STATE;
+
+typedef enum
+{
+    UVM_EXPERT_RESERVED_POOL_ENTRY_OK = 0,
+    UVM_EXPERT_RESERVED_POOL_ENTRY_INVALID_ARGUMENT = 1,
+    UVM_EXPERT_RESERVED_POOL_ENTRY_INVALID_DEVICE = 2,
+    UVM_EXPERT_RESERVED_POOL_ENTRY_SLOT_IN_USE = 3,
+    UVM_EXPERT_RESERVED_POOL_ENTRY_BACKING_ALLOC_FAILED = 4,
+    UVM_EXPERT_RESERVED_POOL_ENTRY_POOL_FULL = 5,
+} UVM_EXPERT_RESERVED_POOL_ENTRY_STATUS;
+
+typedef struct
+{
+    NvU32 pool_id;                         // IN/OUT
+    NvU32 slot_id;                         // IN/OUT
+    NvU32 flags;                           // IN, UVM_EXPERT_RESERVED_POOL_ENTRY_FLAG_*
+    NvU32 status;                          // OUT, UVM_EXPERT_RESERVED_POOL_ENTRY_STATUS
+    NvU32 state;                           // OUT, UVM_EXPERT_RESERVED_POOL_SLOT_STATE
+    NvU32 chunk_count;                     // OUT, number of PMM chunks backing the slot
+    NvU64 slot_bytes NV_ALIGN_BYTES(8);    // IN/OUT, logical bytes requested for this slot
+    NvU64 physical_bytes NV_ALIGN_BYTES(8);// OUT, chunk_count * UVM_CHUNK_SIZE_MAX
+    NvU64 epoch NV_ALIGN_BYTES(8);         // OUT, pool epoch when this slot was last updated
+    NvU64 first_chunk_address NV_ALIGN_BYTES(8); // OUT, debug physical address of first chunk
+    NvU64 last_chunk_address NV_ALIGN_BYTES(8);  // OUT, debug physical address of last chunk
+} UVM_EXPERT_RESERVED_POOL_ENTRY;
+
+#define UVM_EXPERT_RESERVED_POOL                                      UVM_IOCTL_BASE(98)
+typedef struct
+{
+    NvU32 mode;                                      // IN, UVM_EXPERT_RESERVED_POOL_MODE
+    NvU32 count;                                     // IN, number of entries for PREALLOC
+    NvProcessorUuid gpu_uuid;                        // IN, target GPU for PREALLOC
+    NvU32 max_entries;                               // IN, clamped for QUERY output
+    NvU32 success_count;                             // OUT
+    NvU32 failure_count;                             // OUT
+    NvU32 total_slots;                               // OUT, matching valid slots before truncation
+    NvU32 returned_slots;                            // OUT
+    NvU32 active_slots;                              // OUT, all valid slots in the reserved pool
+    NvU32 backed_slots;                              // OUT, active slots with allocated PMM chunks
+    NvU32 chunk_size;                                // OUT, PMM chunk size used by this pool
+    NvU32 reserved;                                  // Reserved, must be zero
+    NvU64 reserved_backing_bytes NV_ALIGN_BYTES(8);  // OUT, sum of physical backing bytes
+    NvU64 logical_slot_bytes NV_ALIGN_BYTES(8);      // OUT, sum of requested slot bytes
+    NvU64 current_epoch NV_ALIGN_BYTES(8);           // OUT
+    NvU64 prealloc_count NV_ALIGN_BYTES(8);          // OUT
+    NvU64 reset_count NV_ALIGN_BYTES(8);             // OUT
+    NvU64 alloc_failed_count NV_ALIGN_BYTES(8);      // OUT
+    UVM_EXPERT_RESERVED_POOL_ENTRY entries[UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES]; // IN/OUT
+    NV_STATUS rmStatus;                              // OUT
+} UVM_EXPERT_RESERVED_POOL_PARAMS;
+
+//
+// UvmExpertReservedPrefetchBatch
+//
+// Experimental Phase-2 control/data plane for reserved-backed expert prefetch.
+// This ioctl binds registered expert regions to reserved pool slots, validates
+// the fixed-footprint contract, and can install a short-term readonly
+// slot-backed GPU PTE mapping. The slot-backed mapping copies CPU-resident
+// managed pages into reserved PMM chunks, but intentionally does not attach
+// those chunks to gpu_state->chunks[] or update ordinary UVM residency metadata.
+//
+#define UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES                    128
+
+#define UVM_EXPERT_RESERVED_PREFETCH_ENTRY_FLAG_STRICT_FOOTPRINT    (1U << 0)
+
+typedef enum
+{
+    UVM_EXPERT_RESERVED_PREFETCH_MODE_DRY_RUN = 0,
+    UVM_EXPERT_RESERVED_PREFETCH_MODE_RESOLVE = 1,
+    UVM_EXPERT_RESERVED_PREFETCH_MODE_INVALIDATE = 2,
+    UVM_EXPERT_RESERVED_PREFETCH_MODE_RESERVED_PREFETCH = 3,
+} UVM_EXPERT_RESERVED_PREFETCH_MODE;
+
+typedef enum
+{
+    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_OK = 0,
+    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_INVALID_ARGUMENT = 1,
+    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_INVALID_DEVICE = 2,
+    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_REGION_NOT_FOUND = 3,
+    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_REGION_UNSUPPORTED = 4,
+    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_NOT_FOUND = 5,
+    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_UNBACKED = 6,
+    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_TOO_SMALL = 7,
+    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_IN_USE = 8,
+    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_NATIVE_POPULATE_UNSUPPORTED = 9,
+} UVM_EXPERT_RESERVED_PREFETCH_ENTRY_STATUS;
+
+typedef struct
+{
+    NvU64 region_id NV_ALIGN_BYTES(8);       // IN, phase_f registered region id
+    NvU32 pool_id;                           // IN, reserved pool id
+    NvU32 slot_id;                           // IN, reserved slot id
+    NvU32 flags;                             // IN, UVM_EXPERT_RESERVED_PREFETCH_ENTRY_FLAG_*
+    NvU32 status;                            // OUT, UVM_EXPERT_RESERVED_PREFETCH_ENTRY_STATUS
+    NvU64 slot_offset NV_ALIGN_BYTES(8);     // IN, byte offset inside reserved slot
+    NvU64 bytes_override NV_ALIGN_BYTES(8);  // IN, 0 means registered region length
+    NvU64 resolved_base NV_ALIGN_BYTES(8);   // OUT, registered region base
+    NvU64 resolved_bytes NV_ALIGN_BYTES(8);  // OUT, bytes accepted for this mapping
+    NvU32 layer_id;                          // OUT
+    NvU32 expert_id;                         // OUT
+    NvU32 role;                              // OUT
+    NvU32 reserved;                          // Reserved, must be zero
+    NvU64 slot_epoch NV_ALIGN_BYTES(8);      // OUT, slot epoch after this operation
+    NvU64 physical_bytes NV_ALIGN_BYTES(8);  // OUT, slot physical backing bytes
+} UVM_EXPERT_RESERVED_PREFETCH_ENTRY;
+
+#define UVM_EXPERT_RESERVED_PREFETCH_BATCH                           UVM_IOCTL_BASE(99)
+typedef struct
+{
+    NvU32 mode;                                      // IN, UVM_EXPERT_RESERVED_PREFETCH_MODE
+    NvU32 count;                                     // IN
+    NvProcessorUuid gpu_uuid;                        // IN, target GPU
+    NvU32 async;                                     // IN, reserved for future native populate
+    NvU32 success_count;                             // OUT
+    NvU32 failure_count;                             // OUT
+    NvU32 reserved;                                  // Reserved, must be zero
+    NvU64 requested_bytes NV_ALIGN_BYTES(8);         // OUT, sum of requested region bytes
+    NvU64 accepted_bytes NV_ALIGN_BYTES(8);          // OUT, sum of successfully assigned bytes
+    NvU64 resolved_regions NV_ALIGN_BYTES(8);        // OUT
+    NvU64 assigned_slots NV_ALIGN_BYTES(8);          // OUT
+    NvU64 invalidated_slots NV_ALIGN_BYTES(8);       // OUT
+    NvU64 reserved_backing_bytes NV_ALIGN_BYTES(8);  // OUT, current pool physical bytes
+    NvU64 ordinary_resident_bytes NV_ALIGN_BYTES(8); // OUT, must remain 0 in strict slot-backed Phase 2
+    NvU64 pool_external_alloc_count NV_ALIGN_BYTES(8); // OUT, must remain 0 in strict slot-backed Phase 2
+    NvU64 footprint_contract_broken NV_ALIGN_BYTES(8); // OUT, strict contract violation counter
+    NvU64 current_epoch NV_ALIGN_BYTES(8);           // OUT
+    UVM_EXPERT_RESERVED_PREFETCH_ENTRY entries[UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES]; // IN/OUT
+    NV_STATUS rmStatus;                              // OUT
+} UVM_EXPERT_RESERVED_PREFETCH_BATCH_PARAMS;
 
 //
 // UvmDiscard

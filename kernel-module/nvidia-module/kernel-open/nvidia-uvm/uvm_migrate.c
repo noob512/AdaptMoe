@@ -124,6 +124,31 @@ static bool phase_n_migrate_tag_is_expert_weight(const uvm_phase_n_range_tag_t *
             tag->role == UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W2);
 }
 
+static bool phase_n_migrate_tag_is_cpu_offloaded_reserved_expert(const uvm_phase_n_range_tag_t *tag)
+{
+    return phase_n_migrate_tag_is_expert_weight(tag) &&
+           (tag->flags & UVM_PHASE_N_REGION_FLAG_CPU_OFFLOADED_RESERVED);
+}
+
+static bool phase_n_migrate_range_has_cpu_offloaded_reserved_expert(uvm_va_space_t *va_space,
+                                                                    NvU64 base,
+                                                                    NvU64 length)
+{
+    uvm_va_range_managed_t *managed_range;
+    NvU64 end;
+
+    if (length == 0)
+        return false;
+
+    end = base + length - 1;
+    uvm_for_each_va_range_managed_in(managed_range, va_space, base, end) {
+        if (phase_n_migrate_tag_is_cpu_offloaded_reserved_expert(&managed_range->phase_n_tag))
+            return true;
+    }
+
+    return false;
+}
+
 static bool is_migration_single_block(uvm_va_range_managed_t *first_managed_range, NvU64 base, NvU64 length)
 {
     NvU64 end = base + length - 1;
@@ -1626,8 +1651,17 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
             uvm_va_range_managed_t *first_managed_range =
                 uvm_va_space_iter_managed_first(va_space, params->base, params->base);
             bool tried_expert_fastpath = false;
+            bool reserved_migrate_guard_rejected = false;
 
             if (type == UVM_API_RANGE_TYPE_MANAGED &&
+                dest_gpu &&
+                phase_n_migrate_range_has_cpu_offloaded_reserved_expert(va_space, params->base, params->length)) {
+                ++dest_gpu->parent->fault_buffer.replayable.stats.num_phase_n_reserved_migrate_policy_violations;
+                ++dest_gpu->parent->fault_buffer.replayable.stats.num_phase_n_reserved_pool_external_alloc_attempts;
+                reserved_migrate_guard_rejected = true;
+                status = NV_ERR_INVALID_ACCESS_TYPE;
+            }
+            else if (type == UVM_API_RANGE_TYPE_MANAGED &&
                 dest_gpu &&
                 uvm_migrate_expert_read_dup_fastpath_can_service(first_managed_range,
                                                                  params->base,
@@ -1645,7 +1679,7 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
                                                               gpus_to_check_for_nvlink_errors);
             }
 
-            if (!tried_expert_fastpath || status != NV_OK) {
+            if (!reserved_migrate_guard_rejected && (!tried_expert_fastpath || status != NV_OK)) {
                 NvU64 core_start = NV_GETTIME();
 
                 if (tried_expert_fastpath && dest_gpu)

@@ -1658,7 +1658,15 @@ def build_app(args: Namespace) -> FastAPI:
     app.include_router(router)
     app.root_path = args.root_path
 
-    mount_metrics(app)
+    if os.environ.get("VLLM_DISABLE_OPENAI_METRICS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        logger.warning("Skipping OpenAI API Prometheus metrics middleware")
+    else:
+        mount_metrics(app)
 
     app.add_middleware(
         CORSMiddleware,

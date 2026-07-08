@@ -79,8 +79,10 @@ constexpr unsigned int UVM_PHASE_N_SET_DYNAMIC_BUDGETS_IOCTL = 94;
 constexpr unsigned int UVM_PHASE_N_PROTECT_ACTIVE_KV_IOCTL = 95;
 constexpr unsigned int UVM_PHASE_N_QUERY_REGION_BLOCKS_IOCTL = 96;
 constexpr unsigned int UVM_PHASE_N_RECLAIM_REGION_IOCTL = 97;
+constexpr unsigned int UVM_EXPERT_RESERVED_PREFETCH_BATCH_IOCTL = 99;
 constexpr size_t UVM_TEST_PHASE_F_MAX_RANGES = 64;
 constexpr size_t UVM_MOE_SLOT_REMAP_MAX_ENTRIES = 128;
+constexpr size_t UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES = 128;
 constexpr size_t UVM_PHASE_N_TRACE_VICTIM_MAX = 8;
 constexpr size_t UVM_PHASE_N_REGION_BLOCK_TRACE_MAX = 16;
 constexpr uint32_t UVM_TEST_PHASE_F_PING_MAGIC = 0x50464e47;  // "PFNG"
@@ -105,6 +107,12 @@ constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY = 3;
 constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY = 4;
 constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP = 5;
 constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP = 6;
+constexpr uint32_t UVM_EXPERT_RESERVED_PREFETCH_MODE_DRY_RUN = 0;
+constexpr uint32_t UVM_EXPERT_RESERVED_PREFETCH_MODE_RESOLVE = 1;
+constexpr uint32_t UVM_EXPERT_RESERVED_PREFETCH_MODE_INVALIDATE = 2;
+constexpr uint32_t UVM_EXPERT_RESERVED_PREFETCH_MODE_RESERVED_PREFETCH = 3;
+constexpr uint32_t UVM_EXPERT_RESERVED_PREFETCH_ENTRY_INVALID_DEVICE = 2;
+constexpr uint32_t UVM_EXPERT_RESERVED_PREFETCH_ENTRY_REGION_NOT_FOUND = 3;
 
 struct PhaseFUuid {
     uint8_t uuid[16];
@@ -427,6 +435,46 @@ struct MoeSlotRemapBatchParams {
     uint64_t requested_bytes;
     uint64_t accepted_bytes;
     MoeSlotRemapEntry entries[UVM_MOE_SLOT_REMAP_MAX_ENTRIES];
+    uint32_t rmStatus;
+};
+
+struct ExpertReservedPrefetchEntry {
+    uint64_t region_id;
+    uint32_t pool_id;
+    uint32_t slot_id;
+    uint32_t flags;
+    uint32_t status;
+    uint64_t slot_offset;
+    uint64_t bytes_override;
+    uint64_t resolved_base;
+    uint64_t resolved_bytes;
+    uint32_t layer_id;
+    uint32_t expert_id;
+    uint32_t role;
+    uint32_t reserved;
+    uint64_t slot_epoch;
+    uint64_t physical_bytes;
+};
+
+struct ExpertReservedPrefetchBatchParams {
+    uint32_t mode;
+    uint32_t count;
+    PhaseFUuid gpu_uuid;
+    uint32_t async;
+    uint32_t success_count;
+    uint32_t failure_count;
+    uint32_t reserved;
+    uint64_t requested_bytes;
+    uint64_t accepted_bytes;
+    uint64_t resolved_regions;
+    uint64_t assigned_slots;
+    uint64_t invalidated_slots;
+    uint64_t reserved_backing_bytes;
+    uint64_t ordinary_resident_bytes;
+    uint64_t pool_external_alloc_count;
+    uint64_t footprint_contract_broken;
+    uint64_t current_epoch;
+    ExpertReservedPrefetchEntry entries[UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES];
     uint32_t rmStatus;
 };
 
@@ -1502,6 +1550,311 @@ int uvm_driver_moe_slot_remap_batch_internal(const uint32_t* layer_ids,
         stats_count);
     close(fd);
     return result;
+}
+
+int uvm_driver_expert_reserved_prefetch_regions_fd(int fd,
+                                                   const uint64_t* region_ids,
+                                                   const uint32_t* pool_ids,
+                                                   const uint32_t* slot_ids,
+                                                   const uint64_t* slot_offsets,
+                                                   const uint64_t* bytes_overrides,
+                                                   const uint32_t* flags,
+                                                   size_t count,
+                                                   uint32_t mode,
+                                                   int device,
+                                                   uint32_t async,
+                                                   uint64_t* stats_out,
+                                                   size_t stats_count,
+                                                   ExpertReservedPrefetchEntry* entries_out,
+                                                   size_t entries_count) {
+    if (stats_out != nullptr) {
+        for (size_t i = 0; i < stats_count; ++i)
+            stats_out[i] = 0;
+    }
+    if (entries_out != nullptr) {
+        for (size_t i = 0; i < entries_count; ++i)
+            entries_out[i] = ExpertReservedPrefetchEntry{};
+    }
+
+    if (count == 0)
+        return 0;
+    if (region_ids == nullptr || pool_ids == nullptr || slot_ids == nullptr ||
+        slot_offsets == nullptr || bytes_overrides == nullptr || flags == nullptr)
+        return -1;
+    if (count > UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES)
+        return -2;
+    if (mode > UVM_EXPERT_RESERVED_PREFETCH_MODE_RESERVED_PREFETCH)
+        return -1;
+
+    ExpertReservedPrefetchBatchParams params{};
+    params.mode = mode;
+    params.count = static_cast<uint32_t>(count);
+    params.async = async ? 1 : 0;
+
+    if (!get_cuda_device_uuid(device, &params.gpu_uuid)) {
+        phase_f_debug_log("driver_expert_reserved_prefetch count=%zu mode=%u device=%d uuid_lookup_failed",
+                          count, mode, device);
+        return -3;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        params.entries[i].region_id = region_ids[i];
+        params.entries[i].pool_id = pool_ids[i];
+        params.entries[i].slot_id = slot_ids[i];
+        params.entries[i].flags = flags[i];
+        params.entries[i].slot_offset = slot_offsets[i];
+        params.entries[i].bytes_override = bytes_overrides[i];
+    }
+
+    phase_f_debug_log("driver_expert_reserved_prefetch cmd=%u count=%zu mode=%u device=%d async=%u ioctl_begin first_region=%llu first_pool=%u first_slot=%u first_bytes=%llu",
+                      UVM_EXPERT_RESERVED_PREFETCH_BATCH_IOCTL,
+                      count,
+                      mode,
+                      device,
+                      async,
+                      count > 0 ? static_cast<unsigned long long>(params.entries[0].region_id) : 0ULL,
+                      count > 0 ? params.entries[0].pool_id : 0,
+                      count > 0 ? params.entries[0].slot_id : 0,
+                      count > 0 ? static_cast<unsigned long long>(params.entries[0].bytes_override) : 0ULL);
+    auto ioctl_begin = std::chrono::steady_clock::now();
+    int ret = ioctl(fd, UVM_EXPERT_RESERVED_PREFETCH_BATCH_IOCTL, &params);
+    auto ioctl_elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - ioctl_begin).count();
+    int saved_errno = errno;
+    phase_f_debug_log("driver_expert_reserved_prefetch cmd=%u count=%zu mode=%u ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u requested=%llu accepted=%llu resolved=%llu assigned=%llu invalidated=%llu backing=%llu first_status=%u elapsed_us=%lld",
+                      UVM_EXPERT_RESERVED_PREFETCH_BATCH_IOCTL,
+                      count,
+                      mode,
+                      ret,
+                      saved_errno,
+                      params.rmStatus,
+                      params.success_count,
+                      params.failure_count,
+                      static_cast<unsigned long long>(params.requested_bytes),
+                      static_cast<unsigned long long>(params.accepted_bytes),
+                      static_cast<unsigned long long>(params.resolved_regions),
+                      static_cast<unsigned long long>(params.assigned_slots),
+                      static_cast<unsigned long long>(params.invalidated_slots),
+                      static_cast<unsigned long long>(params.reserved_backing_bytes),
+                      count > 0 ? params.entries[0].status : 0,
+                      static_cast<long long>(ioctl_elapsed_us));
+
+    if (stats_out != nullptr && stats_count > 0) {
+        if (stats_count > 0) stats_out[0] = params.rmStatus;
+        if (stats_count > 1) stats_out[1] = params.success_count;
+        if (stats_count > 2) stats_out[2] = params.failure_count;
+        if (stats_count > 3) stats_out[3] = params.requested_bytes;
+        if (stats_count > 4) stats_out[4] = params.accepted_bytes;
+        if (stats_count > 5) stats_out[5] = params.resolved_regions;
+        if (stats_count > 6) stats_out[6] = params.assigned_slots;
+        if (stats_count > 7) stats_out[7] = params.invalidated_slots;
+        if (stats_count > 8) stats_out[8] = params.reserved_backing_bytes;
+        if (stats_count > 9) stats_out[9] = params.ordinary_resident_bytes;
+        if (stats_count > 10) stats_out[10] = params.pool_external_alloc_count;
+        if (stats_count > 11) stats_out[11] = params.footprint_contract_broken;
+        if (stats_count > 12) stats_out[12] = params.current_epoch;
+        if (stats_count > 13) stats_out[13] = static_cast<uint64_t>(ret == 0 ? 0 : saved_errno);
+        if (stats_count > 14) stats_out[14] = ret == 0 ? 0 : 1;
+    }
+
+    if (entries_out != nullptr) {
+        size_t copy_count = std::min(count, entries_count);
+        for (size_t i = 0; i < copy_count; ++i)
+            entries_out[i] = params.entries[i];
+    }
+
+    if (ret != 0)
+        return -6;
+    if (params.rmStatus != 0 && params.success_count == 0)
+        return -static_cast<int>(params.rmStatus);
+    if (params.failure_count != 0 && params.success_count == 0)
+        return -5;
+    return static_cast<int>(params.success_count);
+}
+
+bool expert_reserved_prefetch_result_is_safe_to_retry(int result,
+                                                      const uint64_t* stats,
+                                                      size_t stats_count,
+                                                      const ExpertReservedPrefetchEntry* entries,
+                                                      size_t count) {
+    uint64_t success_count = stats_count > 1 ? stats[1] : 0;
+    uint64_t assigned_slots = stats_count > 6 ? stats[6] : 0;
+    uint64_t invalidated_slots = stats_count > 7 ? stats[7] : 0;
+
+    if (result >= 0 || success_count > 0 || assigned_slots > 0 || invalidated_slots > 0)
+        return false;
+
+    if (entries == nullptr || count == 0)
+        return result == -38 || result == -5 || result == -4;
+
+    for (size_t i = 0; i < count; ++i) {
+        uint32_t status = entries[i].status;
+        if (status != UVM_EXPERT_RESERVED_PREFETCH_ENTRY_INVALID_DEVICE &&
+            status != UVM_EXPERT_RESERVED_PREFETCH_ENTRY_REGION_NOT_FOUND)
+            return false;
+    }
+
+    return true;
+}
+
+int uvm_driver_expert_reserved_prefetch_regions_internal(const uint64_t* region_ids,
+                                                         const uint32_t* pool_ids,
+                                                         const uint32_t* slot_ids,
+                                                         const uint64_t* slot_offsets,
+                                                         const uint64_t* bytes_overrides,
+                                                         const uint32_t* flags,
+                                                         size_t count,
+                                                         uint32_t mode,
+                                                         int device,
+                                                         uint32_t async,
+                                                         uint64_t* stats_out,
+                                                         size_t stats_count,
+                                                         ExpertReservedPrefetchEntry* entries_out,
+                                                         size_t entries_count) {
+    int final_result = -4;
+    uint64_t final_stats[16] = {};
+    ExpertReservedPrefetchEntry final_entries[UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES] = {};
+    size_t local_stats_count = std::min<size_t>(stats_count, 16);
+    bool attempted = false;
+
+    auto save_result = [&](int result, const uint64_t* stats, const ExpertReservedPrefetchEntry* entries) {
+        final_result = result;
+        if (stats != nullptr)
+            std::copy(stats, stats + local_stats_count, final_stats);
+        if (entries != nullptr)
+            std::copy(entries, entries + count, final_entries);
+    };
+
+    auto flush_result = [&]() {
+        if (stats_out != nullptr)
+            std::copy(final_stats, final_stats + local_stats_count, stats_out);
+        if (entries_out != nullptr) {
+            size_t copy_count = std::min(count, entries_count);
+            std::copy(final_entries, final_entries + copy_count, entries_out);
+        }
+    };
+
+    if (count > UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES)
+        return -2;
+
+    if (phase_f_adopt_cuda_uvm_fd_enabled()) {
+        std::vector<UvmFdCandidate> candidates =
+            collect_existing_uvm_fd_candidates("driver_expert_reserved_prefetch");
+
+        for (const UvmFdCandidate& candidate : candidates) {
+            int fd = duplicate_uvm_fd_candidate("driver_expert_reserved_prefetch", candidate);
+            uint64_t stats[16] = {};
+            ExpertReservedPrefetchEntry entries[UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES] = {};
+            int result;
+
+            if (fd < 0)
+                continue;
+
+            if (!initialize_duplicated_uvm_fd("driver_expert_reserved_prefetch", fd, candidate)) {
+                close(fd);
+                continue;
+            }
+
+            attempted = true;
+            phase_f_debug_log("driver_expert_reserved_prefetch fd_source=adopted source_fd=%d fd=%d path=%s count=%zu mode=%u",
+                              candidate.source_fd,
+                              fd,
+                              candidate.path.c_str(),
+                              count,
+                              mode);
+            result = uvm_driver_expert_reserved_prefetch_regions_fd(
+                fd,
+                region_ids,
+                pool_ids,
+                slot_ids,
+                slot_offsets,
+                bytes_overrides,
+                flags,
+                count,
+                mode,
+                device,
+                async,
+                stats,
+                16,
+                entries,
+                count);
+            close(fd);
+
+            save_result(result, stats, entries);
+            if (result >= 0 || !expert_reserved_prefetch_result_is_safe_to_retry(result, stats, 16, entries, count)) {
+                flush_result();
+                return result;
+            }
+        }
+    }
+
+    {
+        int fd = get_phase_n_persistent_fd("driver_expert_reserved_prefetch_persistent");
+        if (fd >= 0) {
+            uint64_t stats[16] = {};
+            ExpertReservedPrefetchEntry entries[UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES] = {};
+            int result;
+
+            attempted = true;
+            phase_f_debug_log("driver_expert_reserved_prefetch fd_source=persistent fd=%d count=%zu mode=%u",
+                              fd,
+                              count,
+                              mode);
+            result = uvm_driver_expert_reserved_prefetch_regions_fd(
+                fd,
+                region_ids,
+                pool_ids,
+                slot_ids,
+                slot_offsets,
+                bytes_overrides,
+                flags,
+                count,
+                mode,
+                device,
+                async,
+                stats,
+                16,
+                entries,
+                count);
+            save_result(result, stats, entries);
+            if (result >= 0 || !expert_reserved_prefetch_result_is_safe_to_retry(result, stats, 16, entries, count)) {
+                flush_result();
+                return result;
+            }
+        }
+    }
+
+    if (!attempted ||
+        mode == UVM_EXPERT_RESERVED_PREFETCH_MODE_DRY_RUN ||
+        mode == UVM_EXPERT_RESERVED_PREFETCH_MODE_INVALIDATE) {
+        int fd = open_initialized_uvm_fd("driver_expert_reserved_prefetch_new", false);
+        if (fd >= 0) {
+            uint64_t stats[16] = {};
+            ExpertReservedPrefetchEntry entries[UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES] = {};
+            int result = uvm_driver_expert_reserved_prefetch_regions_fd(
+                fd,
+                region_ids,
+                pool_ids,
+                slot_ids,
+                slot_offsets,
+                bytes_overrides,
+                flags,
+                count,
+                mode,
+                device,
+                async,
+                stats,
+                16,
+                entries,
+                count);
+            close(fd);
+            save_result(result, stats, entries);
+        }
+    }
+
+    flush_result();
+    return final_result;
 }
 
 int uvm_driver_phase_n_set_pool_budget_internal(uint32_t pool,
@@ -8506,6 +8859,38 @@ int uvm_driver_moe_slot_remap_batch(const uint32_t* layer_ids,
         validate_managed,
         stats_out,
         stats_count);
+}
+
+__attribute__((visibility("default")))
+int uvm_driver_expert_reserved_prefetch_regions(const uint64_t* region_ids,
+                                                const uint32_t* pool_ids,
+                                                const uint32_t* slot_ids,
+                                                const uint64_t* slot_offsets,
+                                                const uint64_t* bytes_overrides,
+                                                const uint32_t* flags,
+                                                size_t count,
+                                                uint32_t mode,
+                                                int device,
+                                                uint32_t async,
+                                                uint64_t* stats_out,
+                                                size_t stats_count,
+                                                void* entries_out,
+                                                size_t entries_count) {
+    return uvm_driver_expert_reserved_prefetch_regions_internal(
+        region_ids,
+        pool_ids,
+        slot_ids,
+        slot_offsets,
+        bytes_overrides,
+        flags,
+        count,
+        mode,
+        device,
+        async,
+        stats_out,
+        stats_count,
+        static_cast<ExpertReservedPrefetchEntry*>(entries_out),
+        entries_count);
 }
 
 int uvm_smoke_gpu_readback(const void* src, void* dst, size_t bytes, int device) {

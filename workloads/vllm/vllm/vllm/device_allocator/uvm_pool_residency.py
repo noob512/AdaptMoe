@@ -58,6 +58,7 @@ DRIVER_FLAG_TRANSIENT = 1 << 5
 DRIVER_FLAG_HOT_SUBPOOL = 1 << 11
 DRIVER_FLAG_STREAMING_SUBPOOL = 1 << 12
 DRIVER_FLAG_COLD_SUBPOOL = 1 << 13
+DRIVER_FLAG_CPU_OFFLOADED_RESERVED = 1 << 14
 DRIVER_FLAG_MASK = (
     DRIVER_FLAG_EVICTABLE
     | DRIVER_FLAG_PROTECTED
@@ -68,6 +69,7 @@ DRIVER_FLAG_MASK = (
     | DRIVER_FLAG_HOT_SUBPOOL
     | DRIVER_FLAG_STREAMING_SUBPOOL
     | DRIVER_FLAG_COLD_SUBPOOL
+    | DRIVER_FLAG_CPU_OFFLOADED_RESERVED
 )
 
 DRIVER_REGION_STATES = {
@@ -318,9 +320,27 @@ def _driver_flags(
         or bool(metadata.get("init_cold"))
     ):
         flags |= DRIVER_FLAG_COLD_SUBPOOL | DRIVER_FLAG_EVICTABLE
+    if (
+        bool(metadata.get("cpu_offloaded_reserved"))
+        or str(metadata.get("placement") or "").strip().upper()
+        == "CPU_OFFLOADED_RESERVED"
+    ):
+        flags |= (
+            DRIVER_FLAG_CPU_OFFLOADED_RESERVED
+            | DRIVER_FLAG_PREFETCHABLE
+            | DRIVER_FLAG_PROTECTED
+        )
     if state == "gpu" and pool == "weights" and not evictable:
         flags |= DRIVER_FLAG_PROTECTED
     return flags
+
+
+def _metadata_requests_cpu_offloaded_reserved(metadata: dict[str, Any]) -> bool:
+    return (
+        bool(metadata.get("cpu_offloaded_reserved"))
+        or str(metadata.get("placement") or "").strip().upper()
+        == "CPU_OFFLOADED_RESERVED"
+    )
 
 
 def _driver_region_state_id(
@@ -1452,8 +1472,37 @@ class UvmPoolResidencyManager:
             record["reason"] = "driver_tag_disabled"
             return record
         if region.driver_registered:
-            record["reason"] = "already_registered"
-            return record
+            if not (
+                _metadata_requests_cpu_offloaded_reserved(region.metadata)
+                and not bool(
+                    region.metadata.get(
+                        "driver_cpu_offloaded_reserved_registered",
+                        False,
+                    )
+                )
+            ):
+                record["reason"] = "already_registered"
+                return record
+            try:
+                from vllm.device_allocator.uvm import driver_unregister_region
+            except Exception as exc:  # pragma: no cover - diagnostic path
+                self._summary["driver_tag_register_failures"] += 1
+                record["reason"] = "cpu_offloaded_reserved_reregister_import_failed"
+                record["error"] = repr(exc)
+                return record
+            unregister_status = driver_unregister_region(region.driver_region_id)
+            record["cpu_offloaded_reserved_reregister_unregister_status"] = (
+                unregister_status
+            )
+            if unregister_status < 0:
+                self._summary["driver_tag_register_failures"] += 1
+                record["reason"] = (
+                    "cpu_offloaded_reserved_reregister_unregister_failed"
+                )
+                record["status"] = unregister_status
+                return record
+            region.driver_registered = False
+            region.driver_register_status = unregister_status
         if region.driver_region_id <= 0:
             self._summary["driver_tag_register_skips"] += 1
             record["reason"] = "invalid_driver_region_id"
@@ -1526,6 +1575,8 @@ class UvmPoolResidencyManager:
         record["status"] = status
         if status >= 0:
             region.driver_registered = True
+            if _metadata_requests_cpu_offloaded_reserved(metadata):
+                region.metadata["driver_cpu_offloaded_reserved_registered"] = True
             self._summary["driver_tag_register_success"] += 1
             record["registered"] = True
             record["reason"] = "registered"

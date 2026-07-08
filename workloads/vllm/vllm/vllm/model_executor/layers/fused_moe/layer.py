@@ -45,6 +45,10 @@ from vllm.device_allocator.uvm_pool_residency import (
     register_uvm_residency_region,
     request_uvm_gpu_residency,
 )
+from vllm.device_allocator.uvm_expert_reserved_executor import (
+    ReservedRegionItem,
+    get_expert_reserved_regions_executor,
+)
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -253,6 +257,20 @@ def _env_int(env_name: str, default: int) -> int:
     except ValueError:
         logger.warning("Invalid integer for %s=%s; using %s", env_name, env_value, default)
         return default
+
+
+def _parse_int_set_env(env_name: str) -> set[int]:
+    env_value = os.environ.get(env_name, "")
+    values: set[int] = set()
+    for item in env_value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.add(int(item))
+        except ValueError:
+            logger.warning("Ignoring invalid integer in %s=%s", env_name, item)
+    return values
 
 
 def _parse_plan_expert_keys(path: str, plan_key: str) -> set[tuple[int, int]]:
@@ -816,6 +834,19 @@ class FusedMoE(CustomOp):
             "VLLM_UVM_WEIGHT_PREFETCH_TRACE_FILE",
             "vllm_uvm_weight_prefetch_stage_i.jsonl",
         )
+        self.uvm_moe_stream_trace = _env_flag_enabled(
+            "VLLM_UVM_MOE_STREAM_TRACE",
+            default=False,
+        )
+        self.uvm_moe_stream_trace_file = os.environ.get(
+            "VLLM_UVM_MOE_STREAM_TRACE_FILE",
+            self.uvm_weight_prefetch_trace_file,
+        )
+        self.uvm_moe_stream_trace_marker = _env_flag_enabled(
+            "VLLM_UVM_MOE_STREAM_TRACE_MARKER",
+            default=False,
+        )
+        self._uvm_moe_stream_trace_marker_disabled = False
         self.uvm_weight_prefetch_max_bytes_per_step = _env_int(
             "VLLM_UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP",
             default=64 * 1024 * 1024,
@@ -922,12 +953,92 @@ class FusedMoE(CustomOp):
             "VLLM_UVM_WEIGHT_EXECUTOR",
             "cpp_batch",
         )
-        if self.uvm_weight_executor not in ("cpp_batch", "driver_batch", "auto"):
+        if self.uvm_weight_executor not in (
+            "cpp_batch",
+            "driver_batch",
+            "auto",
+            "expert_reserved_regions_async",
+        ):
             logger.warning(
                 "Unknown VLLM_UVM_WEIGHT_EXECUTOR=%s; using cpp_batch",
                 self.uvm_weight_executor,
             )
             self.uvm_weight_executor = "cpp_batch"
+        self.uvm_expert_reserved_enable = (
+            self.uvm_weight_executor == "expert_reserved_regions_async"
+        )
+        self.uvm_expert_reserved_pool_id = _env_int(
+            "VLLM_UVM_EXPERT_RESERVED_POOL_ID",
+            default=0,
+        )
+        self.uvm_expert_reserved_slot_count = _env_int(
+            "VLLM_UVM_EXPERT_RESERVED_SLOT_COUNT",
+            default=6,
+        )
+        if self.uvm_expert_reserved_slot_count < 0:
+            self.uvm_expert_reserved_slot_count = 0
+        self.uvm_expert_reserved_slot_bytes = _env_int(
+            "VLLM_UVM_EXPERT_RESERVED_SLOT_BYTES",
+            default=0,
+        )
+        if self.uvm_expert_reserved_slot_bytes < 0:
+            self.uvm_expert_reserved_slot_bytes = 0
+        self.uvm_expert_reserved_offloaded_per_layer = _env_int(
+            "VLLM_UVM_EXPERT_RESERVED_OFFLOADED_EXPERTS_PER_LAYER",
+            default=3,
+        )
+        if self.uvm_expert_reserved_offloaded_per_layer < 0:
+            self.uvm_expert_reserved_offloaded_per_layer = 0
+        self.uvm_expert_reserved_offloaded_ids = _parse_int_set_env(
+            "VLLM_UVM_EXPERT_RESERVED_OFFLOADED_EXPERT_IDS"
+        )
+        self.uvm_expert_reserved_cleanup_on_layer_done = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_RESERVED_CLEANUP_ON_LAYER_DONE",
+            default=True,
+        )
+        self.uvm_expert_reserved_cleanup_delay_steps = _env_int(
+            "VLLM_UVM_EXPERT_RESERVED_CLEANUP_DELAY_STEPS",
+            default=0,
+        )
+        if self.uvm_expert_reserved_cleanup_delay_steps < 0:
+            self.uvm_expert_reserved_cleanup_delay_steps = 0
+        self.uvm_expert_reserved_invalidate_on_layer_done = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_RESERVED_INVALIDATE_ON_LAYER_DONE",
+            default=True,
+        )
+        self.uvm_expert_reserved_strict_footprint = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_RESERVED_STRICT_FOOTPRINT",
+            default=True,
+        )
+        self.uvm_expert_reserved_async = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_RESERVED_ASYNC",
+            default=False,
+        )
+        self.uvm_expert_reserved_wait_on_reuse = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_RESERVED_WAIT_ON_REUSE",
+            default=True,
+        )
+        self.uvm_expert_reserved_sync_before_compute = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_RESERVED_SYNC_BEFORE_COMPUTE",
+            default=True,
+        )
+        self.uvm_expert_reserved_cleanup_synchronize = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_RESERVED_CLEANUP_SYNCHRONIZE",
+            default=True,
+        )
+        self.uvm_expert_reserved_debug_sync_compute = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_RESERVED_DEBUG_SYNC_COMPUTE",
+            default=False,
+        )
+        self.uvm_expert_reserved_stream_trace = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_RESERVED_STREAM_TRACE",
+            default=False,
+        )
+        self.uvm_expert_reserved_fail_fast = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_RESERVED_FAIL_FAST",
+            default=True,
+        )
+        self._uvm_expert_reserved_active_steps: set[int] = set()
         self.uvm_weight_offload_enable = _env_flag_enabled(
             "VLLM_UVM_WEIGHT_OFFLOAD_ENABLE",
             default=False,
@@ -1622,6 +1733,11 @@ class FusedMoE(CustomOp):
             # router/gate (next op below)
             assert self.shared_experts_stream is not None
             self.shared_experts_stream.wait_stream(current_stream())
+            self._append_uvm_reserved_debug_trace(
+                "reserved_stream_shared_experts_wait_current",
+                hidden_shape=list(hidden_states.shape),
+                use_chunked_impl=use_chunked_impl,
+            )
 
         return use_shared_experts_stream, hidden_states_clone
 
@@ -2793,6 +2909,327 @@ class FusedMoE(CustomOp):
             "source_action": source_action,
         }
 
+    def _uvm_expert_reserved_candidate(
+        self,
+        *,
+        layer_id: int | None,
+        global_expert_id: int,
+        metadata: dict[str, object],
+        existing_state: str,
+    ) -> bool:
+        if not self.uvm_expert_reserved_enable:
+            return False
+        offload_keys = (
+            set(self.uvm_weight_offload_plan_keys)
+            | set(self.uvm_init_weight_offload_plan_keys)
+        )
+        if layer_id is not None and (layer_id, global_expert_id) in offload_keys:
+            return True
+        if global_expert_id in self.uvm_expert_reserved_offloaded_ids:
+            return True
+        placement = str(metadata.get("placement") or "").strip().upper()
+        if placement == "CPU_OFFLOADED_RESERVED":
+            return True
+        if bool(metadata.get("cpu_offloaded_reserved")):
+            return True
+        return existing_state in ("cpu_offloaded_reserved", "reserved_cpu")
+
+    def _uvm_make_reserved_region_item(
+        self,
+        *,
+        item: dict[str, object],
+    ) -> ReservedRegionItem | None:
+        region_id = str(item["residency_region_id"])
+        snapshot = get_uvm_residency_region_snapshot(region_id)
+        if snapshot is None:
+            return None
+        try:
+            driver_region_id = int(snapshot.get("driver_region_id") or 0)
+            ptr = int(item["ptr"])
+            size_bytes = int(item["bytes"])
+            global_expert_id = int(item["global_expert_id"])
+            local_expert_id = int(item["local_expert_id"])
+        except (TypeError, ValueError, KeyError):
+            return None
+        metadata = cast(dict[str, object], item.get("residency_metadata") or {})
+        return ReservedRegionItem(
+            region_id=region_id,
+            driver_region_id=driver_region_id,
+            ptr=ptr,
+            bytes=size_bytes,
+            layer_id=cast(int | None, item.get("layer_id")),
+            global_expert_id=global_expert_id,
+            local_expert_id=local_expert_id,
+            role=str(item["role"]),
+            metadata={
+                **metadata,
+                "driver_registered": bool(snapshot.get("driver_registered")),
+                "driver_register_status": snapshot.get("driver_register_status"),
+                "driver_flags": int(metadata.get("driver_flags") or 0),
+            },
+        )
+
+    def _run_uvm_expert_reserved_prefetch_batch(
+        self,
+        *,
+        batch_prefetch_items: list[dict[str, object]],
+        device: int,
+        step: int,
+    ) -> dict[str, object]:
+        candidate_items: list[dict[str, object]] = []
+        skipped_items: list[dict[str, object]] = []
+        selected_experts: set[int] = set()
+        max_experts = self.uvm_expert_reserved_offloaded_per_layer
+        for item in batch_prefetch_items:
+            metadata = cast(dict[str, object], item.get("residency_metadata") or {})
+            global_expert_id = int(item["global_expert_id"])
+            existing_state = str(metadata.get("existing_state") or "")
+            if not self._uvm_expert_reserved_candidate(
+                layer_id=cast(int | None, item.get("layer_id")),
+                global_expert_id=global_expert_id,
+                metadata=metadata,
+                existing_state=existing_state,
+            ):
+                skipped_items.append(item)
+                continue
+            if max_experts > 0 and global_expert_id not in selected_experts:
+                if len(selected_experts) >= max_experts:
+                    skipped_items.append(item)
+                    continue
+                selected_experts.add(global_expert_id)
+            candidate_items.append(item)
+
+        reserved_items: list[ReservedRegionItem] = []
+        malformed_records = 0
+        for item in candidate_items:
+            region_item = self._uvm_make_reserved_region_item(item=item)
+            if region_item is None:
+                malformed_records += 1
+                continue
+            reserved_items.append(region_item)
+
+        executor = get_expert_reserved_regions_executor(
+            device=device,
+            pool_id=self.uvm_expert_reserved_pool_id,
+            slot_count=self.uvm_expert_reserved_slot_count,
+            slot_bytes=self.uvm_expert_reserved_slot_bytes,
+            strict_footprint=self.uvm_expert_reserved_strict_footprint,
+            async_=self.uvm_expert_reserved_async,
+            wait_on_reuse=self.uvm_expert_reserved_wait_on_reuse,
+            sync_before_compute=self.uvm_expert_reserved_sync_before_compute,
+            cleanup_synchronize=self.uvm_expert_reserved_cleanup_synchronize,
+        )
+        result = executor.prefetch_for_layer(
+            layer_name=self.layer_name,
+            step=step,
+            items=reserved_items,
+        )
+        success_ids = set(result.get("successful_region_ids") or [])
+        failed_ids = set(result.get("failed_region_ids") or [])
+        if success_ids:
+            self._uvm_expert_reserved_active_steps.add(step)
+
+        for item in candidate_items:
+            region_id = str(item["residency_region_id"])
+            success = region_id in success_ids
+            failed = region_id in failed_ids
+            metadata = cast(dict[str, object], item.get("residency_metadata") or {})
+            trace_record = {
+                **{
+                    key: value
+                    for key, value in item.items()
+                    if key != "residency_metadata"
+                },
+                "action": (
+                    "reserved_prefetch_issued"
+                    if success
+                    else "reserved_prefetch_failed"
+                    if failed
+                    else "reserved_prefetch_skipped"
+                ),
+                "ptr": f"0x{int(item['ptr']):x}",
+                "success": success,
+                "executor": "expert_reserved_regions_async",
+                "requested_executor": self.uvm_weight_executor,
+                "driver_result": result.get("driver_result"),
+                "reserved_executor_result": {
+                    key: value
+                    for key, value in result.items()
+                    if key != "driver_result"
+                },
+            }
+            self._append_uvm_weight_prefetch_trace(trace_record)
+            if not success:
+                if self.uvm_expert_reserved_fail_fast:
+                    raise RuntimeError(
+                        "reserved expert prefetch failed before MoE compute: "
+                        f"layer={self.layer_name} step={step} "
+                        f"region_id={region_id} role={item.get('role')} "
+                        f"expert={item.get('global_expert_id')} "
+                        f"result={result!r}"
+                    )
+                continue
+            mark_uvm_residency_state(
+                region_id=region_id,
+                state="prefetching_gpu",
+                metadata={
+                    **metadata,
+                    "executor": "expert_reserved_regions_async",
+                    "placement": "CPU_OFFLOADED_RESERVED",
+                    "cpu_offloaded_reserved": True,
+                },
+            )
+            self._uvm_update_weight_expert_role_cache(
+                layer_id=cast(int | None, item.get("layer_id")),
+                global_expert_id=int(item["global_expert_id"]),
+                role=str(item["role"]),
+                state="prefetching_gpu",
+                estimated_gpu_resident=True,
+            )
+            self._record_uvm_weight_prefetch_issue(
+                region_id=region_id,
+                layer_id=cast(int | None, item.get("layer_id")),
+                global_expert_id=int(item["global_expert_id"]),
+                local_expert_id=int(item["local_expert_id"]),
+                role=str(item["role"]),
+                ptr=int(item["ptr"]),
+                size_bytes=int(item["bytes"]),
+                device=device,
+                executor="expert_reserved_regions_async",
+            )
+
+        for item in skipped_items:
+            self._append_uvm_weight_prefetch_trace(
+                {
+                    **{
+                        key: value
+                        for key, value in item.items()
+                        if key != "residency_metadata"
+                    },
+                    "action": "reserved_prefetch_not_offloaded",
+                    "ptr": f"0x{int(item['ptr']):x}",
+                    "success": False,
+                    "executor": "expert_reserved_regions_async",
+                    "requested_executor": self.uvm_weight_executor,
+                }
+            )
+
+        return {
+            "reserved_candidate_records": len(candidate_items),
+            "reserved_skipped_records": len(skipped_items),
+            "reserved_malformed_records": malformed_records,
+            "reserved_success_records": len(success_ids),
+            "reserved_failed_records": len(failed_ids),
+            "reserved_selected_experts": sorted(selected_experts),
+            "reserved_executor_result": {
+                key: value for key, value in result.items() if key != "driver_result"
+            },
+        }
+
+    def _maybe_cleanup_uvm_expert_reserved_slots(self, step: int | None = None) -> None:
+        if not self.uvm_expert_reserved_enable:
+            return
+        if not self.uvm_expert_reserved_cleanup_on_layer_done:
+            return
+        if step is None:
+            latest_cleanup_step = (
+                self._uvm_moe_trace_step
+                - 1
+                - self.uvm_expert_reserved_cleanup_delay_steps
+            )
+            cleanup_steps = [
+                active_step
+                for active_step in sorted(self._uvm_expert_reserved_active_steps)
+                if active_step <= latest_cleanup_step
+            ]
+        else:
+            cleanup_steps = [int(step)]
+
+        if not cleanup_steps:
+            return
+
+        for cleanup_step in cleanup_steps:
+            if cleanup_step not in self._uvm_expert_reserved_active_steps:
+                continue
+            cleanup_start_ns = time.perf_counter_ns()
+            self._append_uvm_reserved_debug_trace(
+                "reserved_cleanup_wrapper_enter",
+                cleanup_step=cleanup_step,
+                cleanup_delay_steps=self.uvm_expert_reserved_cleanup_delay_steps,
+                cleanup_lag_steps=self._uvm_moe_trace_step - cleanup_step,
+                active_steps=sorted(self._uvm_expert_reserved_active_steps),
+            )
+            try:
+                device = (
+                    int(torch.cuda.current_device())
+                    if self.uvm_weight_prefetch_device < 0
+                    else self.uvm_weight_prefetch_device
+                )
+                executor = get_expert_reserved_regions_executor(
+                    device=device,
+                    pool_id=self.uvm_expert_reserved_pool_id,
+                    slot_count=self.uvm_expert_reserved_slot_count,
+                    slot_bytes=self.uvm_expert_reserved_slot_bytes,
+                    strict_footprint=self.uvm_expert_reserved_strict_footprint,
+                    async_=self.uvm_expert_reserved_async,
+                    wait_on_reuse=self.uvm_expert_reserved_wait_on_reuse,
+                    sync_before_compute=self.uvm_expert_reserved_sync_before_compute,
+                    cleanup_synchronize=self.uvm_expert_reserved_cleanup_synchronize,
+                )
+                result = executor.cleanup_layer(
+                    layer_name=self.layer_name,
+                    step=cleanup_step,
+                    record_event=True,
+                    invalidate=self.uvm_expert_reserved_invalidate_on_layer_done,
+                )
+                for region in result.get("regions") or []:
+                    try:
+                        layer_id = cast(int | None, region.get("layer_id"))
+                        global_expert_id = int(region["global_expert_id"])
+                        role = str(region["role"])
+                    except (TypeError, ValueError, KeyError, AttributeError):
+                        continue
+                    self._uvm_update_weight_expert_role_cache(
+                        layer_id=layer_id,
+                        global_expert_id=global_expert_id,
+                        role=role,
+                        state="cpu",
+                        estimated_gpu_resident=False,
+                    )
+                self._append_uvm_weight_prefetch_trace(
+                    {
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "layer_name": self.layer_name,
+                        "step": cleanup_step,
+                        "current_step": self._uvm_moe_trace_step,
+                        "cleanup_delay_steps": (
+                            self.uvm_expert_reserved_cleanup_delay_steps
+                        ),
+                        "mode": "reserved_cleanup",
+                        "prefetch_source": self.uvm_weight_prefetch_source,
+                        "action": "reserved_layer_done_cleanup",
+                        "executor": "expert_reserved_regions_async",
+                        "success": bool(result.get("ok")),
+                        "cleanup_result": result,
+                    }
+                )
+                self._append_uvm_reserved_debug_trace(
+                    "reserved_cleanup_wrapper_exit",
+                    cleanup_step=cleanup_step,
+                    success=bool(result.get("ok")),
+                    elapsed_us=(time.perf_counter_ns() - cleanup_start_ns) / 1000.0,
+                )
+            except Exception:
+                logger.debug("Failed to cleanup reserved expert slots", exc_info=True)
+                self._append_uvm_reserved_debug_trace(
+                    "reserved_cleanup_wrapper_exception",
+                    cleanup_step=cleanup_step,
+                    elapsed_us=(time.perf_counter_ns() - cleanup_start_ns) / 1000.0,
+                )
+            finally:
+                self._uvm_expert_reserved_active_steps.discard(cleanup_step)
+
     def _uvm_driver_capability_trace_fields(
         self, metadata: dict[str, object]
     ) -> dict[str, object]:
@@ -3743,6 +4180,155 @@ class FusedMoE(CustomOp):
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
         except OSError:
             logger.debug("Failed to write UVM weight prefetch trace", exc_info=True)
+
+    def _append_uvm_reserved_debug_trace(
+        self,
+        action: str,
+        **fields: object,
+    ) -> None:
+        self._append_uvm_moe_stream_trace(action, **fields)
+        if not self.uvm_expert_reserved_enable:
+            return
+        if self.uvm_expert_reserved_stream_trace:
+            fields = {
+                **self._uvm_reserved_stream_trace_fields(),
+                **fields,
+            }
+        self._append_uvm_weight_prefetch_trace(
+            {
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "layer_name": self.layer_name,
+                "step": self._uvm_moe_trace_step,
+                "mode": "reserved_debug",
+                "prefetch_source": self.uvm_weight_prefetch_source,
+                "executor": "expert_reserved_regions_async",
+                "action": action,
+                **fields,
+            }
+        )
+
+    def _append_uvm_moe_stream_trace(
+        self,
+        action: str,
+        **fields: object,
+    ) -> None:
+        if not self.uvm_moe_stream_trace:
+            return
+        try:
+            record = {
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "layer_name": self.layer_name,
+                "step": self._uvm_moe_trace_step,
+                "mode": "moe_stream_trace",
+                "action": action,
+                **self._uvm_reserved_stream_trace_fields(),
+                **fields,
+            }
+            trace_dir = os.path.dirname(self.uvm_moe_stream_trace_file)
+            if trace_dir:
+                os.makedirs(trace_dir, exist_ok=True)
+            with open(
+                self.uvm_moe_stream_trace_file,
+                "a",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+            self._write_uvm_moe_stream_trace_marker(record)
+        except OSError:
+            logger.debug("Failed to write UVM MoE stream trace", exc_info=True)
+
+    def _write_uvm_moe_stream_trace_marker(
+        self,
+        record: dict[str, object],
+    ) -> None:
+        if (
+            not self.uvm_moe_stream_trace_marker
+            or self._uvm_moe_stream_trace_marker_disabled
+        ):
+            return
+        marker_record = {
+            key: record.get(key)
+            for key in (
+                "pid",
+                "layer_name",
+                "step",
+                "action",
+                "stage",
+                "current_stream_cuda",
+                "shared_experts_stream_cuda",
+                "shared_experts_stream_enabled",
+            )
+            if key in record
+        }
+        try:
+            marker = "vllm_moe_stream " + json.dumps(
+                marker_record,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for path in (
+                "/sys/kernel/debug/tracing/trace_marker",
+                "/sys/kernel/tracing/trace_marker",
+            ):
+                if os.path.exists(path):
+                    with open(path, "w", encoding="utf-8") as handle:
+                        handle.write(marker + "\n")
+                    return
+        except OSError:
+            self._uvm_moe_stream_trace_marker_disabled = True
+            logger.debug("Failed to write UVM MoE stream trace marker", exc_info=True)
+
+    def _uvm_reserved_stream_trace_fields(self) -> dict[str, object]:
+        fields: dict[str, object] = {}
+        try:
+            stream = torch.cuda.current_stream()
+            fields["current_stream_cuda"] = int(stream.cuda_stream)
+            fields["current_stream_device"] = int(stream.device.index or 0)
+        except Exception:
+            fields["current_stream_cuda"] = -1
+        try:
+            shared_stream = self.shared_experts_stream
+        except AttributeError:
+            shared_stream = None
+        if shared_stream is not None:
+            try:
+                fields["shared_experts_stream_cuda"] = int(shared_stream.cuda_stream)
+                fields["shared_experts_stream_device"] = int(
+                    shared_stream.device.index or 0
+                )
+            except Exception:
+                fields["shared_experts_stream_cuda"] = -1
+        else:
+            fields["shared_experts_stream_cuda"] = 0
+        fields["shared_experts_stream_enabled"] = shared_stream is not None
+        return fields
+
+    def _maybe_sync_uvm_reserved_debug_compute(self, stage: str) -> None:
+        if not (
+            self.uvm_expert_reserved_enable
+            and self.uvm_expert_reserved_debug_sync_compute
+        ):
+            return
+        device = (
+            int(torch.cuda.current_device())
+            if self.uvm_weight_prefetch_device < 0
+            else self.uvm_weight_prefetch_device
+        )
+        start_ns = time.perf_counter_ns()
+        self._append_uvm_reserved_debug_trace(
+            "moe_compute_sync_enter",
+            stage=stage,
+            device=device,
+        )
+        torch.cuda.synchronize(device)
+        self._append_uvm_reserved_debug_trace(
+            "moe_compute_sync_exit",
+            stage=stage,
+            device=device,
+            elapsed_us=(time.perf_counter_ns() - start_ns) / 1000.0,
+        )
 
     def _append_uvm_init_weight_trace(self, record: dict[str, object]) -> None:
         try:
@@ -6086,6 +6672,16 @@ class FusedMoE(CustomOp):
         if not self.uvm_weight_prefetch_enabled:
             return
         if (
+            self.uvm_expert_reserved_enable
+            and self.uvm_expert_reserved_cleanup_delay_steps > 0
+        ):
+            self._maybe_cleanup_uvm_expert_reserved_slots(
+                step=(
+                    self._uvm_moe_trace_step
+                    - self.uvm_expert_reserved_cleanup_delay_steps
+                )
+            )
+        if (
             self.uvm_weight_router_topk_every_n_steps > 1
             and (self._uvm_moe_trace_step % self.uvm_weight_router_topk_every_n_steps) != 0
         ):
@@ -6122,7 +6718,10 @@ class FusedMoE(CustomOp):
                 expert_pairs, oracle_stats = self._uvm_oracle_replay_expert_pairs(
                     all_active_expert_pairs
                 )
-            if self.uvm_weight_prefetch_max_experts_per_layer > 0:
+            if (
+                self.uvm_weight_prefetch_max_experts_per_layer > 0
+                and self.uvm_weight_executor != "expert_reserved_regions_async"
+            ):
                 expert_pairs = expert_pairs[
                     : self.uvm_weight_prefetch_max_experts_per_layer
                 ]
@@ -6200,7 +6799,16 @@ class FusedMoE(CustomOp):
 
             for global_expert_id, local_expert_id in expert_pairs:
                 candidate_expert_records += 1
-                if self._uvm_weight_expert_cached_gpu(layer_id, global_expert_id):
+                expert_reserved_planned = self._uvm_expert_reserved_candidate(
+                    layer_id=layer_id,
+                    global_expert_id=global_expert_id,
+                    metadata={},
+                    existing_state="",
+                )
+                if (
+                    self._uvm_weight_expert_cached_gpu(layer_id, global_expert_id)
+                    and not expert_reserved_planned
+                ):
                     expert_resident_skip_records += 1
                     continue
                 expert_expanded_records += 1
@@ -6238,6 +6846,12 @@ class FusedMoE(CustomOp):
                     )
                     if not isinstance(existing_metadata, dict):
                         existing_metadata = {}
+                    reserved_existing_candidate = self._uvm_expert_reserved_candidate(
+                        layer_id=layer_id,
+                        global_expert_id=global_expert_id,
+                        metadata=existing_metadata,
+                        existing_state=existing_state,
+                    )
                     last_evict_step = existing_metadata.get("last_evict_step")
                     if (
                         isinstance(last_evict_step, int)
@@ -6259,6 +6873,7 @@ class FusedMoE(CustomOp):
                     if (
                         self.uvm_weight_prefetch_skip_resident
                         and already_resident
+                        and not reserved_existing_candidate
                     ):
                         resident_skip_records += 1
                         continue
@@ -6273,6 +6888,7 @@ class FusedMoE(CustomOp):
                         and last_prefetch_step is not None
                         and self._uvm_moe_trace_step - last_prefetch_step
                         <= cooldown_steps
+                        and not reserved_existing_candidate
                     ):
                         cooldown_skip_records += 1
                         continue
@@ -6288,6 +6904,24 @@ class FusedMoE(CustomOp):
                             source_action="prefetch",
                         )
                     )
+                    reserved_candidate = reserved_existing_candidate
+                    if reserved_candidate:
+                        residency_metadata = {
+                            **residency_metadata,
+                            "placement": "CPU_OFFLOADED_RESERVED",
+                            "cpu_offloaded_reserved": True,
+                            "driver_flags": (
+                                int(residency_metadata.get("driver_flags") or 0)
+                                | (1 << 14)
+                            ),
+                            "existing_state": existing_state,
+                        }
+                    else:
+                        residency_metadata = {
+                            **residency_metadata,
+                            "placement": "GPU_RESIDENT",
+                            "existing_state": existing_state,
+                        }
                     ensure_cold_candidates_registered()
                     register_uvm_residency_region(
                         pool="weights",
@@ -6609,7 +7243,17 @@ class FusedMoE(CustomOp):
                         }
                     )
 
-            if batch_prefetch_items:
+            reserved_batch_stats: dict[str, object] = {}
+            if (
+                batch_prefetch_items
+                and self.uvm_weight_executor == "expert_reserved_regions_async"
+            ):
+                reserved_batch_stats = self._run_uvm_expert_reserved_prefetch_batch(
+                    batch_prefetch_items=batch_prefetch_items,
+                    device=device,
+                    step=self._uvm_moe_trace_step,
+                )
+            elif batch_prefetch_items:
                 ranges = [
                     (int(item["ptr"]), int(item["bytes"]))
                     for item in batch_prefetch_items
@@ -6730,6 +7374,7 @@ class FusedMoE(CustomOp):
                         "cold_candidate_register_records": (
                             cold_candidate_register_records
                         ),
+                        **reserved_batch_stats,
                         **prefetch_hit_stats,
                         **oracle_stats,
                         "max_bytes_per_step": (
@@ -6745,6 +7390,11 @@ class FusedMoE(CustomOp):
             )
         except Exception:
             logger.debug("Failed to run UVM expert prefetch", exc_info=True)
+            if (
+                self.uvm_expert_reserved_enable
+                and self.uvm_expert_reserved_fail_fast
+            ):
+                raise
 
     def _maybe_offload_uvm_cold_expert_weights(self, topk_ids: torch.Tensor) -> None:
         if not self.uvm_weight_offload_enable:
@@ -7059,18 +7709,33 @@ class FusedMoE(CustomOp):
                 fused_output = self.forward_impl(hidden_states, router_logits)
                 assert not isinstance(fused_output, tuple)
             else:
+                compute_start_ns = time.perf_counter_ns()
+                self._append_uvm_reserved_debug_trace(
+                    "moe_forward_op_enter",
+                    shared_experts=False,
+                    hidden_shape=list(hidden_states.shape),
+                    router_shape=list(router_logits.shape),
+                )
                 fused_output = torch.ops.vllm.moe_forward(
                     hidden_states, router_logits, self.layer_name
                 )
+                self._append_uvm_reserved_debug_trace(
+                    "moe_forward_op_exit",
+                    shared_experts=False,
+                    elapsed_us=(time.perf_counter_ns() - compute_start_ns) / 1000.0,
+                )
+                self._maybe_sync_uvm_reserved_debug_compute("moe_forward")
             if self.zero_expert_num is not None and self.zero_expert_num > 0:
                 assert isinstance(fused_output, tuple)
                 fused_output, zero_expert_result = fused_output
-                return (
+                result = (
                     reduce_output(fused_output)
                     + zero_expert_result[..., :og_hidden_states]
                 )
             else:
-                return reduce_output(fused_output)
+                result = reduce_output(fused_output)
+            self._maybe_cleanup_uvm_expert_reserved_slots()
+            return result
         else:
             if current_platform.is_tpu():
                 # TODO: Once the OOM issue for the TPU backend is resolved, we
@@ -7079,13 +7744,28 @@ class FusedMoE(CustomOp):
                     hidden_states, router_logits
                 )
             else:
+                compute_start_ns = time.perf_counter_ns()
+                self._append_uvm_reserved_debug_trace(
+                    "moe_forward_op_enter",
+                    shared_experts=True,
+                    hidden_shape=list(hidden_states.shape),
+                    router_shape=list(router_logits.shape),
+                )
                 shared_output, fused_output = torch.ops.vllm.moe_forward_shared(
                     hidden_states, router_logits, self.layer_name
                 )
-            return (
+                self._append_uvm_reserved_debug_trace(
+                    "moe_forward_op_exit",
+                    shared_experts=True,
+                    elapsed_us=(time.perf_counter_ns() - compute_start_ns) / 1000.0,
+                )
+                self._maybe_sync_uvm_reserved_debug_compute("moe_forward_shared")
+            result = (
                 reduce_output(shared_output),
                 reduce_output(fused_output),
             )
+            self._maybe_cleanup_uvm_expert_reserved_slots()
+            return result
 
     def forward_cuda(
         self,
@@ -7145,6 +7825,16 @@ class FusedMoE(CustomOp):
             staged_router_logits.copy_(router_logits, non_blocking=True)
 
             # Matrix multiply.
+            compute_start_ns = time.perf_counter_ns()
+            self._append_uvm_reserved_debug_trace(
+                "moe_quant_apply_enter",
+                stage="chunked",
+                chunk_idx=chunk_idx,
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                hidden_shape=list(staged_hidden_states.shape),
+                router_shape=list(staged_router_logits.shape),
+            )
             final_hidden_states = self.quant_method.apply(
                 layer=self,
                 x=staged_hidden_states,
@@ -7168,6 +7858,13 @@ class FusedMoE(CustomOp):
                 logical_to_physical_map=self.logical_to_physical_map,
                 logical_replica_count=self.logical_replica_count,
             )
+            self._append_uvm_reserved_debug_trace(
+                "moe_quant_apply_exit",
+                stage="chunked",
+                chunk_idx=chunk_idx,
+                elapsed_us=(time.perf_counter_ns() - compute_start_ns) / 1000.0,
+            )
+            self._maybe_sync_uvm_reserved_debug_compute("quant_apply_chunked")
 
             if has_separate_shared_experts:
                 assert not isinstance(final_hidden_states, tuple)
@@ -7229,11 +7926,14 @@ class FusedMoE(CustomOp):
                 process_chunk(
                     chunk_start, chunk_end, skip_result_store=chunk_start_ >= num_tokens
                 )
+                self._maybe_cleanup_uvm_expert_reserved_slots()
 
         if self.shared_experts is None:
-            return full_fused_final_hidden_states
+            result = full_fused_final_hidden_states
         else:
-            return (full_shared_final_hidden_states, full_fused_final_hidden_states)
+            result = (full_shared_final_hidden_states, full_fused_final_hidden_states)
+        self._maybe_cleanup_uvm_expert_reserved_slots()
+        return result
 
     def forward_impl(
         self,
@@ -7266,9 +7966,11 @@ class FusedMoE(CustomOp):
             router_logits, _ = self.gate(hidden_states)
 
         if use_chunked_impl:
-            return self.forward_impl_chunked(
+            result = self.forward_impl_chunked(
                 hidden_states, router_logits, has_separate_shared_experts
             )
+            self._maybe_cleanup_uvm_expert_reserved_slots()
+            return result
 
         do_naive_dispatch_combine: bool = self.dp_size > 1 and not isinstance(
             self.quant_method, FusedMoEModularMethod
@@ -7306,6 +8008,15 @@ class FusedMoE(CustomOp):
                 )
 
             # Matrix multiply.
+            compute_start_ns = time.perf_counter_ns()
+            self._append_uvm_reserved_debug_trace(
+                "moe_quant_apply_enter",
+                stage="eager",
+                hidden_shape=list(hidden_states.shape),
+                router_shape=list(router_logits.shape),
+                do_naive_dispatch_combine=do_naive_dispatch_combine,
+                has_separate_shared_experts=has_separate_shared_experts,
+            )
             final_hidden_states = self.quant_method.apply(
                 layer=self,
                 x=hidden_states_combined
@@ -7332,6 +8043,12 @@ class FusedMoE(CustomOp):
                 logical_to_physical_map=self.logical_to_physical_map,
                 logical_replica_count=self.logical_replica_count,
             )
+            self._append_uvm_reserved_debug_trace(
+                "moe_quant_apply_exit",
+                stage="eager",
+                elapsed_us=(time.perf_counter_ns() - compute_start_ns) / 1000.0,
+            )
+            self._maybe_sync_uvm_reserved_debug_compute("quant_apply_eager")
 
             if has_separate_shared_experts:
                 assert self.shared_experts is not None
@@ -7343,10 +8060,22 @@ class FusedMoE(CustomOp):
                     # important to avoid excessive stream allocations by the cuda
                     # graph replay later.
                     with torch.cuda.stream(self.shared_experts_stream):
+                        self._append_uvm_reserved_debug_trace(
+                            "shared_experts_stream_compute_enter",
+                            stage="eager",
+                        )
                         # Note that hidden_states clone() is necessary here to avoid
                         # conflict with the main stream
                         shared_output = self.shared_experts(hidden_states_clone)
+                        self._append_uvm_reserved_debug_trace(
+                            "shared_experts_stream_compute_exit",
+                            stage="eager",
+                        )
                     current_stream().wait_stream(self.shared_experts_stream)
+                    self._append_uvm_reserved_debug_trace(
+                        "reserved_stream_current_wait_shared_experts",
+                        stage="eager",
+                    )
 
                 final_hidden_states = (
                     shared_output,
@@ -7369,15 +8098,17 @@ class FusedMoE(CustomOp):
                 return states
 
             if self.shared_experts is not None:
-                return (
+                result = (
                     final_hidden_states[0],
                     combine_output(final_hidden_states[1]),
                 )
             elif self.zero_expert_num is not None and self.zero_expert_num > 0:
                 assert isinstance(final_hidden_states, torch.Tensor)
-                return (combine_output(final_hidden_states), zero_expert_result)
+                result = (combine_output(final_hidden_states), zero_expert_result)
             else:
-                return combine_output(final_hidden_states)
+                result = combine_output(final_hidden_states)
+            self._maybe_cleanup_uvm_expert_reserved_slots()
+            return result
 
     @classmethod
     def make_expert_params_mapping(

@@ -9022,10 +9022,18 @@ static NV_STATUS uvm_moe_slot_pool_uninstall_va_block_slot_mapping(uvm_va_space_
         NvU64 slice_end;
 
         block_context->hmm.vma = NULL;
-        status = uvm_va_block_find(va_space, cursor, &block);
+        status = mm ?
+                    uvm_va_block_find_create(va_space, cursor, &block_context->hmm.vma, &block) :
+                    uvm_va_block_find(va_space, cursor, &block);
         if (status == NV_ERR_OBJECT_NOT_FOUND || status == NV_ERR_INVALID_ADDRESS) {
             NvU64 next_block = UVM_VA_BLOCK_ALIGN_UP(cursor + 1);
 
+            uvm_phase_f_route_log("expert_reserved_uninstall_skip va=0x%llx next=0x%llx end=0x%llx status=0x%x mm=%px\n",
+                                  cursor,
+                                  next_block,
+                                  va_end,
+                                  status,
+                                  mm);
             cursor = min(va_end, next_block);
             status = NV_OK;
             continue;
@@ -9039,10 +9047,20 @@ static NV_STATUS uvm_moe_slot_pool_uninstall_va_block_slot_mapping(uvm_va_space_
         }
 
         slice_end = min(va_end, block->end + 1);
+        if (block_context->hmm.vma)
+            slice_end = min(slice_end, (NvU64)block_context->hmm.vma->vm_end);
         if (slice_end <= cursor) {
             status = NV_ERR_INVALID_ARGUMENT;
             break;
         }
+
+        uvm_phase_f_route_log("expert_reserved_uninstall_slice begin block=0x%llx slice=0x%llx-0x%llx bytes=%llu mm=%px vma=%px\n",
+                              block->start,
+                              cursor,
+                              slice_end,
+                              slice_end - cursor,
+                              mm,
+                              block_context->hmm.vma);
 
         status = UVM_VA_BLOCK_LOCK_RETRY(block,
                                          &block_retry,
@@ -9051,6 +9069,11 @@ static NV_STATUS uvm_moe_slot_pool_uninstall_va_block_slot_mapping(uvm_va_space_
                                                                                       cursor,
                                                                                       slice_end - cursor,
                                                                                       gpu));
+        uvm_phase_f_route_log("expert_reserved_uninstall_slice end block=0x%llx slice=0x%llx-0x%llx status=0x%x\n",
+                              block->start,
+                              cursor,
+                              slice_end,
+                              status);
         if (status != NV_OK)
             break;
 
@@ -9102,10 +9125,25 @@ static NV_STATUS uvm_expert_reserved_pool_release_slot_mapping_locked(uvm_expert
         return NV_ERR_IN_USE;
 
     if (!mm) {
+        uvm_phase_f_route_log("expert_reserved_release_mapping metadata_only pool=%u slot=%u owner_region=%llu va=0x%llx bytes=%llu\n",
+                              slot->pool_id,
+                              slot->slot_id,
+                              slot->owner_region_id,
+                              slot->owner_va_base,
+                              slot->owner_bytes);
         uvm_expert_reserved_prefetch_clear_slot_owner(slot);
         return NV_OK;
     }
 
+    uvm_phase_f_route_log("expert_reserved_release_mapping begin pool=%u slot=%u owner_region=%llu va=0x%llx bytes=%llu layer=%u expert=%u role=%u\n",
+                          slot->pool_id,
+                          slot->slot_id,
+                          slot->owner_region_id,
+                          slot->owner_va_base,
+                          slot->owner_bytes,
+                          slot->owner_layer_id,
+                          slot->owner_expert_id,
+                          slot->owner_role);
     status = uvm_moe_slot_pool_uninstall_va_block_slot_mapping(locked_va_space,
                                                                slot->gpu,
                                                                mm,
@@ -9113,6 +9151,12 @@ static NV_STATUS uvm_expert_reserved_pool_release_slot_mapping_locked(uvm_expert
                                                                slot->owner_bytes,
                                                                block_unmap_count_out,
                                                                tracker_wait_count_out);
+    uvm_phase_f_route_log("expert_reserved_release_mapping end pool=%u slot=%u status=0x%x block_unmaps=%llu tracker_waits=%llu\n",
+                          slot->pool_id,
+                          slot->slot_id,
+                          status,
+                          block_unmap_count_out ? *block_unmap_count_out : 0,
+                          tracker_wait_count_out ? *tracker_wait_count_out : 0);
     if (status != NV_OK)
         return status;
 
@@ -9172,6 +9216,15 @@ static NV_STATUS uvm_expert_reserved_pool_install_entry_mapping_locked(uvm_va_sp
     if (!va_space || !gpu || !slot || entry->resolved_bytes == 0 || entry_end <= entry->resolved_base)
         return NV_ERR_INVALID_ARGUMENT;
 
+    uvm_phase_f_route_log("expert_reserved_install_mapping begin region=%llu pool=%u slot=%u va=0x%llx bytes=%llu slot_offset=%llu physical=%llu\n",
+                          entry->region_id,
+                          entry->pool_id,
+                          entry->slot_id,
+                          entry->resolved_base,
+                          entry->resolved_bytes,
+                          entry->slot_offset,
+                          slot->physical_bytes);
+
     block_context = uvm_va_block_context_alloc(mm);
     if (!block_context)
         return NV_ERR_NO_MEMORY;
@@ -9203,6 +9256,14 @@ static NV_STATUS uvm_expert_reserved_pool_install_entry_mapping_locked(uvm_va_sp
             break;
         }
 
+        uvm_phase_f_route_log("expert_reserved_install_slice begin region=%llu pool=%u slot=%u block=0x%llx slice=0x%llx-0x%llx slot_offset=%llu\n",
+                              entry->region_id,
+                              entry->pool_id,
+                              entry->slot_id,
+                              block->start,
+                              cursor,
+                              slice_end,
+                              entry->slot_offset + (cursor - entry->resolved_base));
         status = UVM_VA_BLOCK_LOCK_RETRY(block,
                                          &block_retry,
                                          uvm_expert_reserved_pool_map_va_block_reserved_locked(block,
@@ -9213,6 +9274,12 @@ static NV_STATUS uvm_expert_reserved_pool_install_entry_mapping_locked(uvm_va_sp
                                                                                               slice_end - cursor,
                                                                                               entry->slot_offset + (cursor - entry->resolved_base),
                                                                                               &slice_copied_bytes));
+        uvm_phase_f_route_log("expert_reserved_install_slice map_done region=%llu pool=%u slot=%u status=0x%x copied=%llu\n",
+                              entry->region_id,
+                              entry->pool_id,
+                              entry->slot_id,
+                              status,
+                              slice_copied_bytes);
         if (status != NV_OK)
             break;
 
@@ -9225,7 +9292,18 @@ static NV_STATUS uvm_expert_reserved_pool_install_entry_mapping_locked(uvm_va_sp
         if (status != NV_OK)
             break;
 
+        uvm_phase_f_route_log("expert_reserved_install_slice tracker_wait_begin region=%llu pool=%u slot=%u block=0x%llx\n",
+                              entry->region_id,
+                              entry->pool_id,
+                              entry->slot_id,
+                              block->start);
         status = uvm_tracker_wait_deinit(&local_tracker);
+        uvm_phase_f_route_log("expert_reserved_install_slice tracker_wait_end region=%llu pool=%u slot=%u block=0x%llx status=0x%x\n",
+                              entry->region_id,
+                              entry->pool_id,
+                              entry->slot_id,
+                              block->start,
+                              status);
         if (status != NV_OK)
             break;
 
@@ -9253,6 +9331,14 @@ static NV_STATUS uvm_expert_reserved_pool_install_entry_mapping_locked(uvm_va_sp
     if (status == NV_OK && copied_bytes_out)
         *copied_bytes_out = copied_bytes;
 
+    uvm_phase_f_route_log("expert_reserved_install_mapping end region=%llu pool=%u slot=%u status=0x%x installed=%llu copied=%llu\n",
+                          entry->region_id,
+                          entry->pool_id,
+                          entry->slot_id,
+                          status,
+                          installed_bytes,
+                          copied_bytes);
+
     return status;
 }
 
@@ -9268,6 +9354,17 @@ static NV_STATUS uvm_expert_reserved_prefetch_install_entry_locked(uvm_va_space_
     NvU64 copied_bytes = 0;
     NvU64 old_block_unmap_count = 0;
     NvU64 old_tracker_wait_count = 0;
+
+    uvm_phase_f_route_log("expert_reserved_install_entry begin region=%llu pool=%u slot=%u resolved=0x%llx bytes=%llu offset=%llu layer=%u expert=%u role=%u\n",
+                          entry->region_id,
+                          entry->pool_id,
+                          entry->slot_id,
+                          entry->resolved_base,
+                          entry->resolved_bytes,
+                          entry->slot_offset,
+                          entry->layer_id,
+                          entry->expert_id,
+                          entry->role);
 
     mutex_lock(&g_uvm_expert_reserved_pool_lock);
 
@@ -9307,6 +9404,13 @@ static NV_STATUS uvm_expert_reserved_prefetch_install_entry_locked(uvm_va_space_
                                                                   mm,
                                                                   &old_block_unmap_count,
                                                                   &old_tracker_wait_count);
+    uvm_phase_f_route_log("expert_reserved_install_entry release_old_done region=%llu pool=%u slot=%u status=0x%x old_unmaps=%llu old_waits=%llu\n",
+                          entry->region_id,
+                          entry->pool_id,
+                          entry->slot_id,
+                          status,
+                          old_block_unmap_count,
+                          old_tracker_wait_count);
     if (status != NV_OK) {
         entry->status = status == NV_ERR_IN_USE ?
                             UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_IN_USE :
@@ -9359,6 +9463,14 @@ out:
     else if (!entry_status_set)
         entry->status = uvm_expert_reserved_prefetch_entry_status_from_nv_status(status);
 
+    uvm_phase_f_route_log("expert_reserved_install_entry end region=%llu pool=%u slot=%u status=0x%x entry_status=%u copied=%llu\n",
+                          entry->region_id,
+                          entry->pool_id,
+                          entry->slot_id,
+                          status,
+                          entry->status,
+                          copied_bytes);
+
     mutex_unlock(&g_uvm_expert_reserved_pool_lock);
     return status;
 }
@@ -9377,6 +9489,10 @@ static NV_STATUS uvm_expert_reserved_prefetch_invalidate_entry_locked(uvm_va_spa
         entry->flags & ~UVM_EXPERT_RESERVED_PREFETCH_ENTRY_FLAG_STRICT_FOOTPRINT) {
         return NV_ERR_INVALID_ARGUMENT;
     }
+
+    uvm_phase_f_route_log("expert_reserved_invalidate_entry begin pool=%u slot=%u\n",
+                          entry->pool_id,
+                          entry->slot_id);
 
     mutex_lock(&g_uvm_expert_reserved_pool_lock);
 
@@ -9401,6 +9517,13 @@ static NV_STATUS uvm_expert_reserved_prefetch_invalidate_entry_locked(uvm_va_spa
     entry->role = slot->owner_role;
 
     status = uvm_expert_reserved_pool_release_slot_mapping_locked(slot, va_space, mm, NULL, NULL);
+    uvm_phase_f_route_log("expert_reserved_invalidate_entry release_done pool=%u slot=%u region=%llu va=0x%llx bytes=%llu status=0x%x\n",
+                          entry->pool_id,
+                          entry->slot_id,
+                          entry->region_id,
+                          entry->resolved_base,
+                          entry->resolved_bytes,
+                          status);
     if (status != NV_OK) {
         entry->status = status == NV_ERR_IN_USE ?
                             UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_IN_USE :
@@ -9418,6 +9541,13 @@ out:
         entry->status = UVM_EXPERT_RESERVED_PREFETCH_ENTRY_OK;
     else if (!entry_status_set)
         entry->status = uvm_expert_reserved_prefetch_entry_status_from_nv_status(status);
+
+    uvm_phase_f_route_log("expert_reserved_invalidate_entry end pool=%u slot=%u status=0x%x entry_status=%u epoch=%llu\n",
+                          entry->pool_id,
+                          entry->slot_id,
+                          status,
+                          entry->status,
+                          entry->slot_epoch);
 
     mutex_unlock(&g_uvm_expert_reserved_pool_lock);
     return status;
@@ -10697,6 +10827,13 @@ static NV_STATUS uvm_api_expert_reserved_prefetch_batch(UVM_EXPERT_RESERVED_PREF
     else {
         uvm_va_space_down_read(va_space);
     }
+
+    uvm_phase_f_route_log("expert_reserved_prefetch lock_acquired mode=%u count=%u write_locked=%u mm=%px va_space=%px\n",
+                          params->mode,
+                          params->count,
+                          write_locked,
+                          mm,
+                          va_space);
 
     gpu = uvm_va_space_get_gpu_by_uuid(va_space, &params->gpu_uuid);
     if (!gpu) {

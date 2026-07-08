@@ -9901,6 +9901,7 @@ NV_STATUS uvm_va_block_unmap_moe_slot(uvm_va_block_t *va_block,
 {
     uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
     uvm_page_mask_t *pages_to_unmap = &block_context->mapping.page_mask;
+    uvm_page_mask_t *pages_to_restore = &block_context->caller_page_mask;
     NV_STATUS status;
 
     UVM_ASSERT(!uvm_va_block_is_dead(va_block));
@@ -9918,6 +9919,26 @@ NV_STATUS uvm_va_block_unmap_moe_slot(uvm_va_block_t *va_block,
     // read-only PTEs from ordinary GPU-resident mappings. block_unmap_gpu()
     // clears the mask atomically with the regular GPU PTE metadata.
     status = uvm_va_block_unmap(va_block, block_context, gpu->id, region, pages_to_unmap, out_tracker);
+    if (status != NV_OK)
+        return status;
+
+    // The slot-backed path does not make the reserved chunks ordinary UVM
+    // residency. If we leave the VA as a bare unmapped GPU PTE after cleanup,
+    // subsequent GPU reads of the same managed VA can fault through a state
+    // combination the normal fault path does not expect. Restore a normal
+    // CPU-backed read-only GPU mapping for pages whose source copy is still CPU
+    // resident. This preserves the "offloaded" footprint contract while making
+    // accidental or later reaccesses of the same VA correct.
+    if (uvm_page_mask_and(pages_to_restore, pages_to_unmap, &va_block->cpu.resident)) {
+        status = uvm_va_block_map(va_block,
+                                  block_context,
+                                  gpu->id,
+                                  region,
+                                  pages_to_restore,
+                                  UVM_PROT_READ_ONLY,
+                                  UvmEventMapRemoteCausePolicy,
+                                  out_tracker);
+    }
 
     return status;
 }

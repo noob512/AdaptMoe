@@ -273,6 +273,7 @@ struct Args {
     int experts = 1;
     int repeats = 1;
     size_t bytes = 2ull * 1024 * 1024;
+    size_t base_offset = 0;
     bool native_baseline = false;
     bool strict_migrate_guard_test = false;
 };
@@ -290,6 +291,8 @@ static Args parse_args(int argc, char **argv)
             args.repeats = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--bytes") == 0 && i + 1 < argc)
             args.bytes = (size_t)std::strtoull(argv[++i], nullptr, 0);
+        else if (std::strcmp(argv[i], "--base-offset") == 0 && i + 1 < argc)
+            args.base_offset = (size_t)std::strtoull(argv[++i], nullptr, 0);
         else if (std::strcmp(argv[i], "--native-baseline") == 0)
             args.native_baseline = true;
         else if (std::strcmp(argv[i], "--strict-migrate-guard-test") == 0)
@@ -297,13 +300,18 @@ static Args parse_args(int argc, char **argv)
         else {
             std::fprintf(stderr,
                          "usage: %s [--device N] [--experts N] [--repeats N] "
-                         "[--bytes N] [--native-baseline] [--strict-migrate-guard-test]\n",
+                         "[--bytes N] [--base-offset N] [--native-baseline] "
+                         "[--strict-migrate-guard-test]\n",
                          argv[0]);
             std::exit(2);
         }
     }
 
-    if (args.experts <= 0 || args.repeats <= 0 || args.bytes == 0 || args.bytes % sizeof(unsigned int) != 0) {
+    if (args.experts <= 0 ||
+        args.repeats <= 0 ||
+        args.bytes == 0 ||
+        args.bytes % sizeof(unsigned int) != 0 ||
+        args.base_offset % sizeof(unsigned int) != 0) {
         std::fprintf(stderr, "invalid arguments\n");
         std::exit(2);
     }
@@ -372,8 +380,10 @@ int main(int argc, char **argv)
     Args args = parse_args(argc, argv);
     const int device = args.device;
     const size_t bytes = args.bytes;
+    const size_t allocation_bytes = args.base_offset + bytes;
     const size_t words = bytes / sizeof(unsigned int);
     const unsigned long long region_base_id = 0xABC200000001ull;
+    std::vector<unsigned int *> allocations(args.experts, nullptr);
     std::vector<unsigned int *> experts(args.experts, nullptr);
     std::vector<unsigned long long> region_ids(args.experts, 0);
     std::vector<double> reserved_ms;
@@ -391,7 +401,9 @@ int main(int argc, char **argv)
     CU_CHECK(cuDeviceGetUuid(&cuda_uuid, cu_device));
 
     for (int expert = 0; expert < args.experts; ++expert) {
-        CUDA_CHECK(cudaMallocManaged(&experts[expert], bytes));
+        CUDA_CHECK(cudaMallocManaged(&allocations[expert], allocation_bytes));
+        experts[expert] = reinterpret_cast<unsigned int *>(
+            reinterpret_cast<unsigned char *>(allocations[expert]) + args.base_offset);
         fill_pattern(experts[expert], words, expert);
         region_ids[expert] = region_base_id + (unsigned long long)expert;
     }
@@ -480,10 +492,12 @@ int main(int argc, char **argv)
         }
     }
 
-    std::printf("slot_reuse_begin experts=%d repeats=%d bytes=%zu slot_count=1 slot_bytes=%llu gpu=%s\n",
+    std::printf("slot_reuse_begin experts=%d repeats=%d bytes=%zu base_offset=%zu "
+                "slot_count=1 slot_bytes=%llu gpu=%s\n",
                 args.experts,
                 args.repeats,
                 bytes,
+                args.base_offset,
                 pool.entries[0].physical_bytes,
                 prop.name);
 
@@ -586,7 +600,7 @@ int main(int argc, char **argv)
     close(fd);
     CUDA_CHECK(cudaFree(errors));
     for (int expert = 0; expert < args.experts; ++expert)
-        CUDA_CHECK(cudaFree(experts[expert]));
+        CUDA_CHECK(cudaFree(allocations[expert]));
 
     return host_errors == 0 ? 0 : 2;
 }

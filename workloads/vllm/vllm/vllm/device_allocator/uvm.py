@@ -69,6 +69,7 @@ _UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES = 128
 _UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES = 128
 _UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES = 128
 _UVM_MOE_SLOT_REMAP_STATS_COUNT = 8
+_UVM_EXPERT_RESERVED_PREFETCH_STATS_COUNT = 16
 _UVM_PAGE_SIZE = 0
 
 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ = 5
@@ -918,6 +919,25 @@ def load_uvm_library() -> ctypes.CDLL:
             ctypes.c_size_t,
         ]
 
+    if hasattr(lib, "uvm_driver_expert_reserved_prefetch_regions"):
+        lib.uvm_driver_expert_reserved_prefetch_regions.restype = ctypes.c_int
+        lib.uvm_driver_expert_reserved_prefetch_regions.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_size_t,
+            ctypes.POINTER(_ExpertReservedPrefetchEntry),
+            ctypes.c_size_t,
+        ]
+
     if hasattr(lib, "uvm_driver_phase_n_set_pool_budget"):
         lib.uvm_driver_phase_n_set_pool_budget.restype = ctypes.c_int
         lib.uvm_driver_phase_n_set_pool_budget.argtypes = [
@@ -1306,13 +1326,16 @@ def probe_driver_capable_range(ptr: int, size: int) -> tuple[bool, str, int]:
     VA blocks. This probe records the CUDA runtime's pointer classification so
     weight traces can distinguish non-managed tensors from driver plumbing bugs.
     """
-    if _uvm_lib is None:
+    try:
+        lib = ensure_uvm_runtime_library()
+    except Exception:
+        logger.debug("Failed to load UVM runtime library", exc_info=True)
         return False, "uvm_library_unavailable", -2
     if ptr <= 0 or size <= 0:
         return False, "invalid_range", -3
     try:
         result = int(
-            _uvm_lib.uvm_is_managed_pointer(
+            lib.uvm_is_managed_pointer(
                 ctypes.c_uint64(ptr),
                 ctypes.c_size_t(size),
             )
@@ -2631,6 +2654,128 @@ def _fill_expert_reserved_prefetch_params(
         params.entries[index].bytes_override = int(entry.get("bytes_override", 0))
 
 
+def _ioctl_expert_reserved_prefetch_on_fd(
+    fd: int,
+    *,
+    mode: str | int,
+    mode_value: int,
+    entries: Sequence[dict[str, int]],
+    gpu_uuid: _PhaseFUuid,
+    async_: bool,
+) -> dict[str, object]:
+    params = _ExpertReservedPrefetchBatchParams()
+    _fill_expert_reserved_prefetch_params(
+        params,
+        mode_value=mode_value,
+        entries=entries,
+        gpu_uuid=gpu_uuid,
+        async_=async_,
+    )
+    ctypes.set_errno(0)
+    ret = _libc_ioctl(fd, _UVM_EXPERT_RESERVED_PREFETCH_BATCH_IOCTL, params)
+    saved_errno = ctypes.get_errno()
+    return _expert_reserved_prefetch_result_from_params(
+        params,
+        mode=mode,
+        ret=int(ret),
+        saved_errno=int(saved_errno),
+    )
+
+
+def _expert_reserved_prefetch_via_helper(
+    *,
+    mode: str | int,
+    mode_value: int,
+    entries: Sequence[dict[str, int]],
+    device: int,
+    async_: bool,
+) -> Optional[dict[str, object]]:
+    if _uvm_lib is None or not hasattr(
+        _uvm_lib, "uvm_driver_expert_reserved_prefetch_regions"
+    ):
+        return None
+
+    count = len(entries)
+    region_ids = (ctypes.c_uint64 * count)(
+        *[int(entry.get("region_id", 0)) for entry in entries]
+    )
+    pool_ids = (ctypes.c_uint32 * count)(
+        *[int(entry.get("pool_id", 0)) for entry in entries]
+    )
+    slot_ids = (ctypes.c_uint32 * count)(
+        *[int(entry.get("slot_id", index)) for index, entry in enumerate(entries)]
+    )
+    slot_offsets = (ctypes.c_uint64 * count)(
+        *[int(entry.get("slot_offset", 0)) for entry in entries]
+    )
+    bytes_overrides = (ctypes.c_uint64 * count)(
+        *[int(entry.get("bytes_override", 0)) for entry in entries]
+    )
+    flags = (ctypes.c_uint32 * count)(
+        *[int(entry.get("flags", 0)) for entry in entries]
+    )
+    stats = (ctypes.c_uint64 * _UVM_EXPERT_RESERVED_PREFETCH_STATS_COUNT)()
+    out_entries = (
+        _ExpertReservedPrefetchEntry *
+        _UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES
+    )()
+
+    try:
+        status = int(
+            _uvm_lib.uvm_driver_expert_reserved_prefetch_regions(
+                region_ids,
+                pool_ids,
+                slot_ids,
+                slot_offsets,
+                bytes_overrides,
+                flags,
+                ctypes.c_size_t(count),
+                ctypes.c_uint32(mode_value),
+                ctypes.c_int(device),
+                ctypes.c_uint32(1 if async_ else 0),
+                stats,
+                ctypes.c_size_t(_UVM_EXPERT_RESERVED_PREFETCH_STATS_COUNT),
+                out_entries,
+                ctypes.c_size_t(count),
+            )
+        )
+    except Exception:
+        logger.debug("Expert reserved prefetch helper failed", exc_info=True)
+        return None
+
+    params = _ExpertReservedPrefetchBatchParams()
+    params.mode = mode_value
+    params.count = count
+    params.async_ = 1 if async_ else 0
+    params.rmStatus = int(stats[0])
+    params.success_count = int(stats[1])
+    params.failure_count = int(stats[2])
+    params.requested_bytes = int(stats[3])
+    params.accepted_bytes = int(stats[4])
+    params.resolved_regions = int(stats[5])
+    params.assigned_slots = int(stats[6])
+    params.invalidated_slots = int(stats[7])
+    params.reserved_backing_bytes = int(stats[8])
+    params.ordinary_resident_bytes = int(stats[9])
+    params.pool_external_alloc_count = int(stats[10])
+    params.footprint_contract_broken = int(stats[11])
+    params.current_epoch = int(stats[12])
+    for index in range(count):
+        params.entries[index] = out_entries[index]
+
+    ret = 0 if status >= 0 else -1
+    saved_errno = int(stats[13]) if status == -6 else 0
+    result = _expert_reserved_prefetch_result_from_params(
+        params,
+        mode=mode,
+        ret=ret,
+        saved_errno=saved_errno,
+    )
+    result["helper_status"] = status
+    result["helper_path"] = True
+    return result
+
+
 def _expert_reserved_prefetch_result_from_params(
     params: _ExpertReservedPrefetchBatchParams,
     *,
@@ -2717,29 +2862,55 @@ def driver_expert_reserved_prefetch_regions(
         result["failure_count"] = len(normalized_entries)
         return result
 
-    params = _ExpertReservedPrefetchBatchParams()
-    _fill_expert_reserved_prefetch_params(
-        params,
+    helper_result = _expert_reserved_prefetch_via_helper(
+        mode=mode,
         mode_value=mode_value,
         entries=normalized_entries,
-        gpu_uuid=gpu_uuid,
+        device=device,
         async_=async_,
     )
+    if helper_result is not None:
+        return helper_result
 
     fd = -1
+    last_result: dict[str, object] | None = None
     try:
-        fd = _open_or_adopt_initialized_uvm_fd(prefer_existing=prefer_existing)
-        ctypes.set_errno(0)
-        ret = _libc_ioctl(fd, _UVM_EXPERT_RESERVED_PREFETCH_BATCH_IOCTL, params)
-        saved_errno = ctypes.get_errno()
-        return _expert_reserved_prefetch_result_from_params(
-            params,
+        if prefer_existing:
+            for candidate_fd in _iter_initialized_existing_uvm_fds():
+                try:
+                    result = _ioctl_expert_reserved_prefetch_on_fd(
+                        candidate_fd,
+                        mode=mode,
+                        mode_value=mode_value,
+                        entries=normalized_entries,
+                        gpu_uuid=gpu_uuid,
+                        async_=async_,
+                    )
+                finally:
+                    os.close(candidate_fd)
+
+                last_result = result
+                if result.get("ok") is True:
+                    return result
+
+                # A partial operation may have changed slot owner state. Return
+                # it directly instead of probing more VA spaces.
+                if int(result.get("success_count", 0) or 0) > 0:
+                    return result
+
+        fd = _open_initialized_uvm_fd()
+        return _ioctl_expert_reserved_prefetch_on_fd(
+            fd,
             mode=mode,
-            ret=int(ret),
-            saved_errno=int(saved_errno),
+            mode_value=mode_value,
+            entries=normalized_entries,
+            gpu_uuid=gpu_uuid,
+            async_=async_,
         )
     except Exception:
         logger.debug("Expert reserved prefetch ioctl failed", exc_info=True)
+        if last_result is not None:
+            return last_result
         result = _empty_expert_reserved_prefetch_result(mode=mode, ioctl_ret=-4)
         result["failure_count"] = len(normalized_entries)
         return result
@@ -2935,12 +3106,14 @@ def uvm_residency_tag_only_enabled() -> bool:
 def batch_prefetch_ranges_to_device(
     ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
     device: int = 0,
+    *,
+    allow_tag_only: bool = False,
 ) -> int:
     """Batch prefetch raw UVM ranges to a GPU or CPU device.
 
     Returns the number of CUDA prefetch calls accepted by the allocator shim.
     """
-    if uvm_residency_tag_only_enabled():
+    if uvm_residency_tag_only_enabled() and not allow_tag_only:
         return 0
     if _uvm_lib is None:
         return 0
@@ -2961,9 +3134,15 @@ def batch_prefetch_ranges_to_device(
 
 def batch_prefetch_ranges_to_cpu(
     ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    allow_tag_only: bool = False,
 ) -> int:
     """Batch prefetch raw UVM ranges to CPU memory."""
-    return batch_prefetch_ranges_to_device(ranges, device=-1)
+    return batch_prefetch_ranges_to_device(
+        ranges,
+        device=-1,
+        allow_tag_only=allow_tag_only,
+    )
 
 
 def advise_range_preferred_location(ptr: int, size: int, device: int) -> bool:
@@ -3248,13 +3427,16 @@ def driver_register_region(
     flags: int = 0,
 ) -> int:
     """Register a tagged managed range in the Phase F driver region table."""
-    if not _uvm_enabled or _uvm_lib is None:
+    try:
+        lib = ensure_uvm_runtime_library()
+    except Exception:
+        logger.debug("Failed to load UVM runtime library", exc_info=True)
         return -1
     if region_id <= 0 or ptr <= 0 or nbytes <= 0:
         return -2
     try:
         return int(
-            _uvm_lib.uvm_driver_phase_f_register_region(
+            lib.uvm_driver_phase_f_register_region(
                 ctypes.c_uint64(region_id),
                 ctypes.c_uint64(ptr),
                 ctypes.c_size_t(nbytes),
@@ -3272,13 +3454,16 @@ def driver_register_region(
 
 def driver_unregister_region(region_id: int) -> int:
     """Unregister a Phase F driver region by numeric region id."""
-    if not _uvm_enabled or _uvm_lib is None:
+    try:
+        lib = ensure_uvm_runtime_library()
+    except Exception:
+        logger.debug("Failed to load UVM runtime library", exc_info=True)
         return -1
     if region_id <= 0:
         return -2
     try:
         return int(
-            _uvm_lib.uvm_driver_phase_f_unregister_region(
+            lib.uvm_driver_phase_f_unregister_region(
                 ctypes.c_uint64(region_id)
             )
         )
@@ -3292,7 +3477,10 @@ def driver_batch_query_regions_residency(
     device: int = 0,
 ) -> int:
     """Query residency by Phase F registered region ids."""
-    if not _uvm_enabled or _uvm_lib is None:
+    try:
+        lib = ensure_uvm_runtime_library()
+    except Exception:
+        logger.debug("Failed to load UVM runtime library", exc_info=True)
         return -1
     valid_ids = [int(region_id) for region_id in region_ids if int(region_id) > 0]
     if not valid_ids:
@@ -3303,7 +3491,7 @@ def driver_batch_query_regions_residency(
         id_array = (ctypes.c_uint64 * len(chunk))(*chunk)
         try:
             result = int(
-                _uvm_lib.uvm_driver_batch_query_residency_regions(
+                lib.uvm_driver_batch_query_residency_regions(
                     id_array,
                     ctypes.c_size_t(len(chunk)),
                     ctypes.c_int(device),
@@ -3326,13 +3514,16 @@ def driver_register_query_region(
     device: int = 0,
 ) -> int:
     """Register, query, and unregister a region using the C++ smoke helper."""
-    if not _uvm_enabled or _uvm_lib is None:
+    try:
+        lib = ensure_uvm_runtime_library()
+    except Exception:
+        logger.debug("Failed to load UVM runtime library", exc_info=True)
         return -1
     if region_id <= 0 or ptr <= 0 or nbytes <= 0:
         return -2
     try:
         return int(
-            _uvm_lib.uvm_driver_phase_f_register_query_region(
+            lib.uvm_driver_phase_f_register_query_region(
                 ctypes.c_uint64(region_id),
                 ctypes.c_uint64(ptr),
                 ctypes.c_size_t(nbytes),
@@ -3623,8 +3814,12 @@ def driver_query_region_by_va(address: int) -> dict[str, int] | None:
 
 
 def has_driver_region_ioctl() -> bool:
-    return _uvm_enabled and _uvm_lib is not None and all(
-        hasattr(_uvm_lib, name)
+    try:
+        lib = ensure_uvm_runtime_library()
+    except Exception:
+        return False
+    return all(
+        hasattr(lib, name)
         for name in (
             "uvm_driver_phase_f_register_region",
             "uvm_driver_phase_f_unregister_region",

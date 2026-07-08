@@ -863,10 +863,17 @@ KV cache 高水位:
   等待对应 CUDA event
 
 否则:
-  invalidate old owner UVM residency metadata
+  invalidate old owner slot-backed PTE / UVM residency metadata
   copy new region into same reserved backing
-  install ordinary UVM PTE for new owner
+  Phase 2C 当前实现安装 readonly slot-backed GPU PTE for new owner
 ```
+
+注意：Phase 4 的当前接入目标是已经验证的 Phase 2C 路径，而不是后续
+Phase 3N/native residency 深改路径。因此 vLLM executor 调用
+`mode=reserved_prefetch` 后，driver 会安装 readonly slot-backed PTE，不会把
+reserved chunks 填入 `gpu_state->chunks[]`，也不会更新 ordinary
+`resident/read_duplicated_pages` metadata。文档中如果出现 ordinary UVM PTE，
+仅代表 Phase 3N 的长期目标；Phase 4S 先以 slot-backed readonly PTE 为准。
 
 async 语义：
 
@@ -878,6 +885,81 @@ async=true:
   ioctl 提交 copy + map push 后返回。
   map push 必须 acquire copy tracker。
   用户态在 compute 前通过 event/query/touch 或 stream 同步保证完成。
+```
+
+#### Phase 4S：vLLM 当前接入策略
+
+短期接入使用：
+
+```bash
+export VLLM_UVM_WEIGHT_PREFETCH_ENABLE=1
+export VLLM_UVM_WEIGHT_PREFETCH_MODE=prefetch
+export VLLM_UVM_WEIGHT_EXECUTOR=expert_reserved_regions_async
+export VLLM_UVM_EXPERT_RESERVED_SLOT_COUNT=6
+export VLLM_UVM_EXPERT_RESERVED_OFFLOADED_EXPERTS_PER_LAYER=3
+```
+
+如果需要显式指定被卸载的 expert：
+
+```bash
+export VLLM_UVM_EXPERT_RESERVED_OFFLOADED_EXPERT_IDS=1,7,9
+```
+
+或者通过已有 offload plan / region metadata 标记：
+
+```text
+placement = CPU_OFFLOADED_RESERVED
+cpu_offloaded_reserved = true
+```
+
+当前 vLLM 接入原则：
+
+```text
+每层 topk 后:
+  收集 active experts
+  仅筛选 CPU_OFFLOADED_RESERVED expert
+  默认每层最多选 2-3 个 offloaded expert
+  每个 expert 通常有 w13/w2 两个 weight region
+  当前 driver slot owner 是单 owner，因此以 region 为单位分配 slot
+  3 个 expert * 2 个 region = 6 个 reserved slots
+  调用 driver_expert_reserved_prefetch_regions(mode=reserved_prefetch)
+  MoE compute 继续使用原 managed expert pointer
+
+每层 compute 完成后:
+  记录当前 CUDA stream event
+  等待 event 完成
+  对本层使用过的 slot 调用 invalidate
+  清 slot-backed PTE
+  vLLM residency/cache 状态标回 CPU
+```
+
+新增 executor：
+
+```text
+workloads/vllm/vllm/vllm/device_allocator/uvm_expert_reserved_executor.py
+```
+
+它维护：
+
+```text
+pool_id / slot_count / slot_bytes
+slot_id -> current region/layer/expert/role
+slot_id -> last CUDA event
+layer step -> active slot ids
+driver region auto-register fallback
+reserved pool prealloc/query
+reserved_prefetch / invalidate ioctl
+```
+
+关键限制：
+
+```text
+只读 expert 权重。
+当前 slot 是 region 粒度，不是 expert 粒度，因为 driver slot owner metadata
+只有单 owner。
+cleanup 默认同步等待 compute event 后 invalidate，保证不会清掉仍被 kernel
+读取的 slot-backed PTE。
+真正的 ioctl async map-push overlap 仍属于后续优化。
 ```
 
 ### Phase 5：测试与性能评估

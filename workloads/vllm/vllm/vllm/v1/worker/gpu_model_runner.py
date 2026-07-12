@@ -58,6 +58,8 @@ from vllm.device_allocator.uvm import (
     batch_prepare_ranges_for_remote_read_with_executor,
     batch_prefetch_ranges_to_device,
     driver_batch_query_ranges_residency_bytes,
+    driver_expert_reserved_pool_prealloc,
+    driver_expert_reserved_pool_query,
     driver_moe_slot_pool_query,
     probe_driver_capable_range,
     uvm_allocation_phase,
@@ -66,6 +68,7 @@ from vllm.device_allocator.uvm import (
 from vllm.device_allocator.uvm_kv_init_probe import (
     record_kv_init_probe_event,
     synchronize_kv_init_probe_tensor,
+    write_uvm_trace_marker,
 )
 from vllm.device_allocator.uvm_pool_residency import (
     get_uvm_real_residency_snapshot,
@@ -3153,6 +3156,16 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            self._write_uvm_compute_start_trace_marker(
+                step_id=self._layer_timing_step_id,
+                phase=layer_timing_phase,
+                enabled_step_phase=enabled_step_phase,
+                num_reqs=int(num_reqs),
+                num_input_tokens=int(num_input_tokens),
+                total_num_scheduled_tokens=int(total_num_scheduled_tokens),
+                max_num_scheduled_tokens=int(max_num_scheduled_tokens),
+                cudagraph_runtime_mode=str(cudagraph_runtime_mode),
+            )
             with uvm_enabled_allocation_phase("enabled:model_forward"):
                 model_output = self._model_forward(
                     input_ids=input_ids,
@@ -4858,6 +4871,181 @@ class GPUModelRunner(
             )
         return records
 
+    def _record_uvm_active_expert_residency_probe(self, marker: str) -> int:
+        if os.environ.get(
+            "VLLM_UVM_ACTIVE_EXPERT_RESIDENCY_PROBE_ENABLE", "0"
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            return 0
+
+        model = getattr(self, "model", None)
+        if model is None:
+            return 0
+
+        records = 0
+        try:
+            for module in model.modules():
+                recorder = getattr(
+                    module,
+                    "record_uvm_active_expert_residency_probe",
+                    None,
+                )
+                if not callable(recorder):
+                    continue
+                result = recorder(marker)
+                if result is not None:
+                    records += 1
+        except Exception:
+            logger.debug(
+                "Failed to record active expert residency probe marker=%s",
+                marker,
+                exc_info=True,
+            )
+
+        if records:
+            logger.warning(
+                "UVM active expert residency probe marker=%s records=%d",
+                marker,
+                records,
+            )
+        return records
+
+    def _prepare_uvm_managed_expert_weights_for_request(
+        self,
+        marker: str,
+    ) -> dict[str, Any]:
+        if not self._env_flag_enabled(
+            "VLLM_UVM_EXPERT_WEIGHTS_MANAGED",
+            default=False,
+        ):
+            return {}
+
+        model = getattr(self, "model", None)
+        if model is None:
+            return {}
+
+        results: list[dict[str, Any]] = []
+        for module in model.modules():
+            prepare = getattr(
+                module,
+                "prepare_uvm_managed_expert_weights_for_request",
+                None,
+            )
+            if not callable(prepare):
+                continue
+            result = prepare(marker)
+            if isinstance(result, dict):
+                results.append(result)
+
+        if not results:
+            return {
+                "marker": marker,
+                "layer_records": 0,
+                "gpu_full": False,
+            }
+
+        summary: dict[str, Any] = {
+            "marker": marker,
+            "layer_records": len(results),
+            "gpu_full": all(bool(result.get("gpu_full")) for result in results),
+            "parameter_records": sum(
+                int(result.get("parameter_records") or 0) for result in results
+            ),
+            "managed_parameter_records": sum(
+                int(result.get("managed_parameter_records") or 0)
+                for result in results
+            ),
+            "non_managed_parameter_records": sum(
+                int(result.get("non_managed_parameter_records") or 0)
+                for result in results
+            ),
+            "managed_bytes": sum(
+                int(result.get("managed_bytes") or 0) for result in results
+            ),
+            "queried_bytes": sum(
+                int(result.get("queried_bytes") or 0) for result in results
+            ),
+            "gpu_bytes": sum(int(result.get("gpu_bytes") or 0) for result in results),
+            "cpu_bytes": sum(int(result.get("cpu_bytes") or 0) for result in results),
+            "unknown_bytes": sum(
+                int(result.get("unknown_bytes") or 0) for result in results
+            ),
+            "prefetch_successes": sum(
+                int(result.get("prefetch_successes") or 0) for result in results
+            ),
+            "non_full_gpu_layers": [
+                result.get("layer_id")
+                for result in results
+                if not bool(result.get("gpu_full"))
+            ],
+        }
+        logger.warning(
+            "UVM expert-only managed prepare marker=%s layers=%d "
+            "gpu_full=%s managed_bytes=%d queried_bytes=%d gpu_bytes=%d "
+            "cpu_bytes=%d unknown_bytes=%d",
+            marker,
+            summary["layer_records"],
+            summary["gpu_full"],
+            summary["managed_bytes"],
+            summary["queried_bytes"],
+            summary["gpu_bytes"],
+            summary["cpu_bytes"],
+            summary["unknown_bytes"],
+        )
+        return summary
+
+    def _record_uvm_post_offload_slot_use_probe(self, marker: str) -> int:
+        if os.environ.get(
+            "VLLM_UVM_POST_OFFLOAD_SLOT_USE_PROBE_ENABLE", "0"
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            return 0
+
+        model = getattr(self, "model", None)
+        if model is None:
+            return 0
+
+        records = 0
+        try:
+            for module in model.modules():
+                recorder = getattr(
+                    module,
+                    "record_uvm_post_offload_slot_use_probe",
+                    None,
+                )
+                if not callable(recorder):
+                    continue
+                result = recorder(marker)
+                if result is not None:
+                    records += 1
+        except Exception:
+            logger.debug(
+                "Failed to record post-offload slot use probe marker=%s",
+                marker,
+                exc_info=True,
+            )
+
+        if records:
+            logger.warning(
+                "UVM post-offload slot use probe marker=%s records=%d",
+                marker,
+                records,
+            )
+        return records
+
+    def _write_uvm_compute_start_trace_marker(self, **fields: object) -> None:
+        if os.environ.get(
+            "VLLM_UVM_COMPUTE_START_TRACE_MARKER_ENABLE", "0"
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            return
+
+        marker_fields = {"pid": os.getpid(), **fields}
+        try:
+            write_uvm_trace_marker("VLLM_UVM_COMPUTE_START", marker_fields)
+        except Exception:
+            logger.debug(
+                "Failed to write UVM compute start trace marker",
+                exc_info=True,
+            )
+
     def _log_kv_cache_addresses(self, kv_caches: dict[str, Any], phase: str) -> None:
         """
         记录 KV Cache (键值缓存) 的底层内存/显存地址信息。
@@ -5157,9 +5345,11 @@ class GPUModelRunner(
                     self.eplb_state.start_async_loop(rank_mapping=rank_mapping)
 
             self._materialize_fixed_weights_device_direct()
+            self._prepare_uvm_managed_expert_weights_for_request("after_load_model")
             # 记录模型权重的内存地址（通常用于调试或低级别内存管理验证）
             self._log_model_weight_addresses("load_model")
             self._record_uvm_init_weight_plan_residency("after_load_model")
+            self._record_uvm_active_expert_residency_probe("after_load_model")
 
             # 处理模型图编译加速
             # 1. 尝试使用原生的 PyTorch 图编译 (torch.compile)
@@ -5884,7 +6074,17 @@ class GPUModelRunner(
 
     def profile_run(self) -> None:
         with uvm_allocation_phase("enabled:warmup"):
-            self.run_uvm_init_time_weight_placement()
+            stage_m_stage = os.environ.get(
+                "VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE",
+                "pre_warmup",
+            ).strip().lower().replace("-", "_")
+            if stage_m_stage not in ("post_warmup", "after_warmup", "deferred"):
+                self.run_uvm_init_time_weight_placement()
+            else:
+                logger.info(
+                    "UVM controlled remap boundary: Stage M profile_run "
+                    "placement deferred until post warmup"
+                )
             # Profile with multimodal encoder & encoder cache.
             if self.supports_mm_inputs:
                 mm_config = self.model_config.multimodal_config
@@ -6000,6 +6200,7 @@ class GPUModelRunner(
         self._uvm_init_weight_placement_done = True
         model = self.get_model()
         self._record_uvm_init_weight_plan_residency("before_stage_m")
+        self._record_uvm_active_expert_residency_probe("before_stage_m")
         issued_modules = 0
         section_start = time.monotonic()
         logger.warning("UVM controlled remap debug: model_runner Stage M module loop begin")
@@ -6057,7 +6258,13 @@ class GPUModelRunner(
                 except Exception:
                     logger.debug("Failed to synchronize after Stage M slot PTE clear",
                                  exc_info=True)
+            self._maybe_prealloc_uvm_expert_reserved_slots_after_stage_m()
             self._record_uvm_init_weight_plan_residency("after_stage_m_clear")
+            self._record_uvm_active_expert_residency_probe("after_stage_m_clear")
+            self._record_uvm_post_offload_slot_use_probe("after_stage_m_clear")
+            self._record_uvm_active_expert_residency_probe(
+                "after_post_offload_slot_use_probe"
+            )
         if matched_issued:
             logger.info(
                 "Stage M matched CPU offload issued %d parameter ranges.",
@@ -6069,6 +6276,114 @@ class GPUModelRunner(
             issued_modules,
             matched_issued,
             time.monotonic() - debug_start,
+        )
+
+    def _append_uvm_expert_reserved_post_stage_m_prealloc_trace(
+        self,
+        record: dict[str, object],
+    ) -> None:
+        trace_file = os.environ.get(
+            "VLLM_UVM_EXPERT_RESERVED_POST_STAGE_M_PREALLOC_FILE",
+            "",
+        )
+        if not trace_file:
+            return
+        try:
+            os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
+            with open(trace_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError as exc:
+            logger.warning(
+                "Failed to write post-Stage-M reserved prealloc trace %s: %s",
+                trace_file,
+                exc,
+            )
+
+    def _maybe_prealloc_uvm_expert_reserved_slots_after_stage_m(self) -> None:
+        if not self._env_flag_enabled(
+            "VLLM_UVM_EXPERT_RESERVED_PREALLOC_AFTER_STAGE_M",
+            default=False,
+        ):
+            return
+
+        slot_count = self._env_int_value(
+            "VLLM_UVM_EXPERT_RESERVED_SLOT_COUNT",
+            default=0,
+        )
+        slot_bytes = self._env_int_value(
+            "VLLM_UVM_EXPERT_RESERVED_SLOT_BYTES",
+            default=0,
+        )
+        pool_id = self._env_int_value(
+            "VLLM_UVM_EXPERT_RESERVED_POOL_ID",
+            default=0,
+        )
+        if slot_count <= 0 or slot_bytes <= 0:
+            record = {
+                "action": "expert_reserved_post_stage_m_prealloc",
+                "ok": False,
+                "reason": "invalid_slot_config",
+                "pool_id": pool_id,
+                "slot_count": slot_count,
+                "slot_bytes": slot_bytes,
+                "timestamp": time.time(),
+            }
+            self._append_uvm_expert_reserved_post_stage_m_prealloc_trace(record)
+            logger.warning(
+                "UVM controlled remap debug: post-Stage-M reserved prealloc "
+                "skipped invalid config slot_count=%d slot_bytes=%d",
+                slot_count,
+                slot_bytes,
+            )
+            return
+
+        device = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
+        entries = [
+            {
+                "pool_id": pool_id,
+                "slot_id": slot_id,
+                "slot_bytes": slot_bytes,
+            }
+            for slot_id in range(slot_count)
+        ]
+
+        start = time.monotonic()
+        logger.warning(
+            "UVM controlled remap debug: post-Stage-M reserved prealloc begin "
+            "pool=%d slot_count=%d slot_bytes=%d",
+            pool_id,
+            slot_count,
+            slot_bytes,
+        )
+        query_before = driver_expert_reserved_pool_query(prefer_existing=True)
+        result = driver_expert_reserved_pool_prealloc(
+            entries,
+            device=device,
+            prefer_existing=True,
+        )
+        query_after = driver_expert_reserved_pool_query(prefer_existing=True)
+        elapsed = time.monotonic() - start
+        record = {
+            "action": "expert_reserved_post_stage_m_prealloc",
+            "device": device,
+            "pool_id": pool_id,
+            "slot_count": slot_count,
+            "slot_bytes": slot_bytes,
+            "elapsed_seconds": elapsed,
+            "timestamp": time.time(),
+            "query_before": query_before,
+            "result": result,
+            "query_after": query_after,
+        }
+        self._append_uvm_expert_reserved_post_stage_m_prealloc_trace(record)
+        logger.warning(
+            "UVM controlled remap debug: post-Stage-M reserved prealloc end "
+            "ok=%s success=%s failure=%s backing=%s elapsed=%.3fs",
+            result.get("ok"),
+            result.get("success_count"),
+            result.get("failure_count"),
+            result.get("reserved_backing_bytes"),
+            elapsed,
         )
 
     def _maybe_clear_uvm_init_time_slot_ptes_after_placement(self) -> None:

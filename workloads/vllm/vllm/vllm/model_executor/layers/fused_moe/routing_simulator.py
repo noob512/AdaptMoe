@@ -9,7 +9,9 @@ It supports routing logic customization and includes example implementations
 like uniform random routing.
 """
 
+import os
 from abc import ABC, abstractmethod
+import threading
 from typing import Any
 
 import torch
@@ -226,6 +228,171 @@ class DistributionBasedRouting(RoutingStrategy):
         }
 
 
+class FixedExpertsRouting(RoutingStrategy):
+    """Route every token to a fixed expert-id list for controlled experiments."""
+
+    def route_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        indices_type: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+        num_experts = router_logits.shape[-1]
+        if indices_type is None:
+            indices_type = torch.long
+
+        raw_ids = os.environ.get("VLLM_MOE_ROUTING_FIXED_EXPERT_IDS", "")
+        expert_ids: list[int] = []
+        for item in raw_ids.replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            expert_id = int(item)
+            if expert_id < 0 or expert_id >= num_experts:
+                raise ValueError(
+                    "VLLM_MOE_ROUTING_FIXED_EXPERT_IDS contains out-of-range "
+                    f"expert_id={expert_id}; num_experts={num_experts}"
+                )
+            expert_ids.append(expert_id)
+        if not expert_ids:
+            raise ValueError(
+                "VLLM_MOE_ROUTING_FIXED_EXPERT_IDS must contain at least one "
+                "expert id when using fixed_experts routing."
+            )
+
+        while len(expert_ids) < top_k:
+            expert_ids.extend(expert_ids)
+        expert_ids = expert_ids[:top_k]
+
+        ids = torch.tensor(expert_ids, dtype=indices_type, device=hidden_states.device)
+        topk_ids = ids.unsqueeze(0).expand(num_tokens, top_k).contiguous()
+        topk_weights = torch.full(
+            (num_tokens, top_k),
+            1.0 / max(1, top_k),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        return topk_weights, topk_ids
+
+
+class StaticTailHitRouting(RoutingStrategy):
+    """Mostly static routing with a controlled offloaded-tail hit rate."""
+
+    _counter_lock = threading.Lock()
+    _assignment_counter = 0
+
+    @staticmethod
+    def _parse_expert_ids(raw: str) -> list[int]:
+        expert_ids: list[int] = []
+        for item in raw.replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            expert_ids.append(int(item))
+        return expert_ids
+
+    @classmethod
+    def _next_assignment_offset(cls, count: int) -> int:
+        with cls._counter_lock:
+            offset = cls._assignment_counter
+            cls._assignment_counter += count
+            return offset
+
+    def route_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        indices_type: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+        num_experts = router_logits.shape[-1]
+        device = hidden_states.device
+        if indices_type is None:
+            indices_type = torch.long
+
+        tail_ids = self._parse_expert_ids(
+            os.environ.get("VLLM_MOE_ROUTING_STATIC_TAIL_EXPERT_IDS", "")
+        )
+        if not tail_ids:
+            tail_count = int(os.environ.get("VLLM_MOE_ROUTING_STATIC_TAIL_COUNT", "5"))
+            tail_start = max(0, num_experts - max(0, tail_count))
+            tail_ids = list(range(tail_start, num_experts))
+        for expert_id in tail_ids:
+            if expert_id < 0 or expert_id >= num_experts:
+                raise ValueError(
+                    "VLLM_MOE_ROUTING_STATIC_TAIL_EXPERT_IDS contains "
+                    f"out-of-range expert_id={expert_id}; "
+                    f"num_experts={num_experts}"
+                )
+
+        base_ids = self._parse_expert_ids(
+            os.environ.get("VLLM_MOE_ROUTING_STATIC_BASE_EXPERT_IDS", "")
+        )
+        if not base_ids:
+            tail_id_set = set(tail_ids)
+            base_ids = [
+                expert_id
+                for expert_id in range(num_experts)
+                if expert_id not in tail_id_set
+            ][:top_k]
+        if not base_ids:
+            raise ValueError("static_tail_hit routing has no base experts")
+        for expert_id in base_ids:
+            if expert_id < 0 or expert_id >= num_experts:
+                raise ValueError(
+                    "VLLM_MOE_ROUTING_STATIC_BASE_EXPERT_IDS contains "
+                    f"out-of-range expert_id={expert_id}; "
+                    f"num_experts={num_experts}"
+                )
+
+        while len(base_ids) < top_k:
+            base_ids.extend(base_ids)
+        base_ids = base_ids[:top_k]
+
+        ids = torch.tensor(base_ids, dtype=indices_type, device=device)
+        topk_ids = ids.unsqueeze(0).expand(num_tokens, top_k).clone()
+
+        hit_probability = float(
+            os.environ.get("VLLM_MOE_ROUTING_STATIC_TAIL_HIT_PROB", "0")
+        )
+        if hit_probability < 0.0 or hit_probability > 1.0:
+            raise ValueError(
+                "VLLM_MOE_ROUTING_STATIC_TAIL_HIT_PROB must be in [0, 1], "
+                f"got {hit_probability}"
+            )
+
+        total_assignments = num_tokens * top_k
+        if hit_probability > 0.0 and total_assignments > 0:
+            cycle = 10000
+            threshold = int(round(hit_probability * cycle))
+            seed = int(os.environ.get("VLLM_MOE_ROUTING_STATIC_SEED", "0"))
+            offset = self._next_assignment_offset(total_assignments)
+            assignment_ids = (
+                torch.arange(total_assignments, device=device, dtype=torch.long)
+                + offset
+            )
+            hashed = (
+                assignment_ids * 1103515245 + 12345 + seed
+            ).remainder(cycle)
+            hit_mask = hashed < threshold
+            if torch.any(hit_mask):
+                tail_tensor = torch.tensor(tail_ids, dtype=indices_type, device=device)
+                tail_indices = hashed.remainder(len(tail_ids)).to(dtype=torch.long)
+                flat_ids = topk_ids.reshape(-1)
+                flat_ids[hit_mask] = tail_tensor[tail_indices[hit_mask]]
+
+        topk_weights = torch.full(
+            (num_tokens, top_k),
+            1.0 / max(1, top_k),
+            dtype=torch.float32,
+            device=device,
+        )
+        return topk_weights, topk_ids
+
+
 class RoutingSimulator:
     """
     Token-to-Expert Routing Simulator.
@@ -244,6 +411,8 @@ class RoutingSimulator:
         "normal_routing": DistributionBasedRouting(
             distribution="normal", mean=0.0, std=1.0
         ),
+        "fixed_experts": FixedExpertsRouting(),
+        "static_tail_hit": StaticTailHitRouting(),
     }
 
     @classmethod

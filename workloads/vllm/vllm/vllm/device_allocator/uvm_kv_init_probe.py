@@ -122,12 +122,12 @@ def _find_trace_marker_path() -> str | None:
     return None
 
 
-def _write_trace_marker(fields: dict[str, Any]) -> None:
+def write_uvm_trace_marker(prefix: str, fields: dict[str, Any]) -> None:
     path = _find_trace_marker_path()
     if path is None:
         return
 
-    parts = ["VLLM_KV_INIT_PROBE"]
+    parts = [prefix]
     for key in sorted(fields):
         value = fields[key]
         if isinstance(value, (list, tuple)):
@@ -193,7 +193,7 @@ def record_kv_init_probe_event(
     ):
         if key in record:
             marker_fields[key] = record[key]
-    _write_trace_marker(marker_fields)
+    write_uvm_trace_marker("VLLM_KV_INIT_PROBE", marker_fields)
 
 
 def synchronize_kv_init_probe_tensor(

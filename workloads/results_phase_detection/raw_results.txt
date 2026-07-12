@@ -1,8 +1,0 @@
-A|||always_max+cycle_moe (baseline)
-N3|BENCH_FAIL|BENCH_FAIL|cooperative (radius=2)
-N3b|BENCH_FAIL|BENCH_FAIL|cooperative (radius=1)
-N2|FAILED|FAILED|reuse_dist (50ms, no XB)
-N2b|BENCH_FAIL|BENCH_FAIL|reuse_dist (20ms, no XB)
-TXB1|BENCH_FAIL|BENCH_FAIL|throttled XB (1ms, thresh=50)
-TXB2|BENCH_FAIL|BENCH_FAIL|throttled XB (5ms, thresh=20)
-TXB3|||throttled XB (10ms, thresh=10)

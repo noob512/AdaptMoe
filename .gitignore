@@ -76,3 +76,14 @@ workloads/vllm/results/uvm_kv_bench_single_process.log
 
 # UVM experiment outputs
 /results/
+
+# Generated benchmark/result artifacts
+/log/
+**/result/
+**/results/
+**/xcoord_results/
+**/results_phase_detection/
+/workloads/vllm/results*/
+/workloads/vllm/uvm/results-*/
+**/vllm_uvm_*.jsonl
+**/vllm_uvm_*.log

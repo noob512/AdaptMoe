@@ -1,37 +1,0 @@
-warning: `VIRTUAL_ENV=/home/yunwei37/workspace/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
-INFO 03-01 15:53:56 [__init__.py:216] Automatically detected platform cuda.
-Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x76e3dc8c51b0>, seed=0, num_prompts=30, dataset_name='sharegpt', no_stream=False, dataset_path='/home/yunwei37/workspace/gpu/gpu_ext/workloads/vllm/datasets/ShareGPT_V3_unfiltered_cleaned_split.json', no_oversample=False, custom_output_len=256, custom_skip_chat_template=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, blazedit_min_distance=0.0, blazedit_max_distance=1.0, random_input_len=1024, random_output_len=128, random_range_ratio=0.0, random_prefix_len=0, random_batch_size=1, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 0}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, label=None, backend='openai', endpoint_type=None, base_url='http://127.0.0.1:8080', host='127.0.0.1', port=8000, endpoint='/v1/completions', header=None, max_concurrency=4, model='gpt-oss-20b-mxfp4', tokenizer='Qwen/Qwen3-30B-A3B-FP8', use_beam_search=False, logprobs=None, request_rate=2.0, burstiness=1.0, trust_remote_code=False, disable_tqdm=False, profile=False, save_result=False, save_detailed=False, append_result=False, metadata=None, result_dir=None, result_filename=None, ignore_eos=False, percentile_metrics='ttft,tpot,itl', metric_percentiles='99', goodput=None, request_id_prefix='benchmark-serving', top_p=None, top_k=None, min_p=None, temperature=None, tokenizer_mode='auto', served_model_name=None, lora_modules=None, ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=600)
-Starting initial single prompt test run...
-Waiting for endpoint to become up in 600 seconds
- |          | 00:00 elapsed, ? remaining |          | 00:00 elapsed, 00:00 remaining |          | 00:00 elapsed, 11:22:39 remaining
-Initial test run completed. Starting main benchmark run...
-Traffic request rate: 2.0
-Burstiness factor: 1.0 (Poisson process)
-Maximum request concurrency: 4
-  0%|          | 0/30 [00:00<?, ?it/s]  3%|▎         | 1/30 [00:01<00:31,  1.09s/it]  7%|▋         | 2/30 [00:04<01:01,  2.18s/it] 10%|█         | 3/30 [00:06<00:57,  2.13s/it] 17%|█▋        | 5/30 [00:06<00:28,  1.15s/it] 20%|██        | 6/30 [00:07<00:21,  1.11it/s] 27%|██▋       | 8/30 [00:08<00:17,  1.24it/s] 30%|███       | 9/30 [00:09<00:15,  1.36it/s] 37%|███▋      | 11/30 [00:25<01:13,  3.87s/it] 40%|████      | 12/30 [00:26<00:55,  3.09s/it] 43%|████▎     | 13/30 [00:27<00:43,  2.58s/it] 47%|████▋     | 14/30 [00:27<00:32,  2.03s/it] 50%|█████     | 15/30 [00:28<00:25,  1.72s/it] 53%|█████▎    | 16/30 [00:29<00:19,  1.41s/it] 57%|█████▋    | 17/30 [00:29<00:14,  1.09s/it] 60%|██████    | 18/30 [00:31<00:14,  1.24s/it] 63%|██████▎   | 19/30 [00:32<00:13,  1.20s/it] 67%|██████▋   | 20/30 [00:33<00:11,  1.15s/it] 70%|███████   | 21/30 [00:33<00:08,  1.03it/s] 73%|███████▎  | 22/30 [00:34<00:06,  1.26it/s] 77%|███████▋  | 23/30 [00:34<00:04,  1.51it/s] 83%|████████▎ | 25/30 [00:36<00:03,  1.42it/s] 90%|█████████ | 27/30 [00:36<00:01,  1.75it/s] 93%|█████████▎| 28/30 [00:37<00:01,  1.89it/s] 97%|█████████▋| 29/30 [00:37<00:00,  1.82it/s]100%|██████████| 30/30 [00:38<00:00,  1.81it/s]100%|██████████| 30/30 [00:38<00:00,  1.28s/it]
-tip: install termplotlib and gnuplot to plot the metrics
-============ Serving Benchmark Result ============
-Successful requests:                     27        
-Maximum request concurrency:             4         
-Request rate configured (RPS):           2.00      
-Benchmark duration (s):                  38.31     
-Total input tokens:                      6088      
-Total generated tokens:                  6231      
-Request throughput (req/s):              0.70      
-Output token throughput (tok/s):         162.63    
-Peak output token throughput (tok/s):    339.00    
-Peak concurrent requests:                6.00      
-Total Token throughput (tok/s):          321.53    
----------------Time to First Token----------------
-Mean TTFT (ms):                          153.12    
-Median TTFT (ms):                        156.01    
-P99 TTFT (ms):                           340.91    
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          18.34     
-Median TPOT (ms):                        12.98     
-P99 TPOT (ms):                           54.27     
----------------Inter-token Latency----------------
-Mean ITL (ms):                           22.91     
-Median ITL (ms):                         11.78     
-P99 ITL (ms):                            389.67    
-==================================================

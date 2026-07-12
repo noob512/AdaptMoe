@@ -1,9 +1,0 @@
-# name pp_tok_s tg_tok_s
-A FAILED bench_exit_137
-N3 139.12 49.14
-N3b FAILED bench_exit_137
-N2 FAILED bench_exit_143
-N2b FAILED bpf_start
-TXB1 FAILED bpf_start
-TXB2 FAILED bpf_start
-TXB3 FAILED bpf_start

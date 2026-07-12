@@ -4,7 +4,7 @@
 
 import inspect
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 
 import torch
@@ -105,8 +105,19 @@ def process_weights_after_loading(
             # to be on the global target device. This scope is for the
             # case where cpu offloading is used, where we will move the
             # parameters onto device for processing and back off after.
+            allocation_scope_fn = getattr(
+                module,
+                "uvm_expert_weight_allocation_scope",
+                None,
+            )
+            allocation_scope = (
+                allocation_scope_fn()
+                if callable(allocation_scope_fn)
+                else nullcontext()
+            )
             with device_loading_context(module, target_device):
-                quant_method.process_weights_after_loading(module)
+                with allocation_scope:
+                    quant_method.process_weights_after_loading(module)
 
     # Initialize post-load attention weights for both Attention and MLA.
     # NOTE: Happens after other modules so we can easily decompress weights.

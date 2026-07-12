@@ -38,6 +38,7 @@ import atexit
 import ctypes
 import gc
 import os
+import threading
 import uuid as uuidlib
 from contextlib import contextmanager
 from collections.abc import Sequence
@@ -55,6 +56,7 @@ _uvm_lib: Optional[ctypes.CDLL] = None
 _uvm_log_close_registered = False
 _uvm_local_allocator = None
 _uvm_local_mem_pool = None
+_uvm_local_prefetch_stack: list[bool] = []
 _uvm_phase_stack: list[str] = []
 _UVM_DRIVER_BATCH_MAX_RANGES = 64
 _UVM_INITIALIZE_IOCTL = 0x30000001
@@ -437,6 +439,35 @@ class _ExpertReservedPrefetchBatchParams(ctypes.Structure):
         ),
         ("rmStatus", ctypes.c_uint32),
     ]
+
+
+class _ExpertReservedPrefetchHelperBuffers:
+    def __init__(self) -> None:
+        max_entries = _UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES
+        self.region_ids = (ctypes.c_uint64 * max_entries)()
+        self.pool_ids = (ctypes.c_uint32 * max_entries)()
+        self.slot_ids = (ctypes.c_uint32 * max_entries)()
+        self.slot_offsets = (ctypes.c_uint64 * max_entries)()
+        self.bytes_overrides = (ctypes.c_uint64 * max_entries)()
+        self.flags = (ctypes.c_uint32 * max_entries)()
+        self.stats = (ctypes.c_uint64 *
+                      _UVM_EXPERT_RESERVED_PREFETCH_STATS_COUNT)()
+        self.out_entries = (
+            _ExpertReservedPrefetchEntry *
+            _UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES
+        )()
+
+
+_expert_reserved_prefetch_tls = threading.local()
+
+
+def _expert_reserved_prefetch_helper_buffers(
+) -> _ExpertReservedPrefetchHelperBuffers:
+    buffers = getattr(_expert_reserved_prefetch_tls, "buffers", None)
+    if buffers is None:
+        buffers = _ExpertReservedPrefetchHelperBuffers()
+        _expert_reserved_prefetch_tls.buffers = buffers
+    return buffers
 
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -1030,8 +1061,8 @@ def ensure_uvm_runtime_library() -> ctypes.CDLL:
     global _uvm_lib
     if _uvm_lib is None:
         _uvm_lib = load_uvm_library()
-        _uvm_lib.uvm_set_prefetch(0)
-        _uvm_lib.uvm_set_verbose(0)
+    _uvm_lib.uvm_set_prefetch(1 if _uvm_local_prefetch_enabled() else 0)
+    _uvm_lib.uvm_set_verbose(0)
     return _uvm_lib
 
 
@@ -1045,7 +1076,7 @@ def cleanup_uvm_local_memory_pool() -> None:
     while CUDA and Python runtime state are still healthy avoids that teardown
     ordering hazard.
     """
-    global _uvm_local_allocator, _uvm_local_mem_pool
+    global _uvm_local_allocator, _uvm_local_mem_pool, _uvm_local_prefetch_stack
 
     try:
         if torch.cuda.is_available():
@@ -1056,6 +1087,7 @@ def cleanup_uvm_local_memory_pool() -> None:
 
     _uvm_local_mem_pool = None
     _uvm_local_allocator = None
+    _uvm_local_prefetch_stack.clear()
     gc.collect()
 
     try:
@@ -1065,30 +1097,52 @@ def cleanup_uvm_local_memory_pool() -> None:
         logger.debug("Failed to synchronize after UVM local pool cleanup", exc_info=True)
 
 
+def _uvm_local_prefetch_enabled() -> bool:
+    return _uvm_local_prefetch_stack[-1] if _uvm_local_prefetch_stack else False
+
+
 @contextmanager
-def uvm_local_memory_pool():
+def uvm_local_memory_pool(enable_prefetch: bool | None = None):
     """Temporarily allocate CUDA tensors from cudaMallocManaged.
 
     Unlike ``enable_uvm_allocator()``, this does not call
     ``change_current_allocator``. Only allocations inside this context use the
     UVM pluggable allocator, which lets CPU-offload experiments replace just
     the offloaded weight tensors.
+
+    If ``enable_prefetch`` is omitted, the current nested prefetch state is
+    inherited. This keeps outer pre-service UVM scopes intact even when helper
+    code opens its own local pool.
     """
     global _uvm_local_allocator, _uvm_local_mem_pool
-    ensure_uvm_runtime_library()
-    lib_path = find_uvm_allocator_library()
-    if lib_path is None:
-        raise RuntimeError("UVM allocator library not found")
+    if enable_prefetch is None:
+        enable_prefetch = _uvm_local_prefetch_enabled()
+    _uvm_local_prefetch_stack.append(bool(enable_prefetch))
+    try:
+        ensure_uvm_runtime_library()
+        lib_path = find_uvm_allocator_library()
+        if lib_path is None:
+            raise RuntimeError("UVM allocator library not found")
 
-    if _uvm_local_allocator is None or _uvm_local_mem_pool is None:
-        allocator = torch.cuda.memory.CUDAPluggableAllocator(
-            lib_path, "uvm_malloc", "uvm_free"
-        )
-        _uvm_local_allocator = allocator
-        _uvm_local_mem_pool = torch.cuda.memory.MemPool(allocator._allocator)
+        if _uvm_local_allocator is None or _uvm_local_mem_pool is None:
+            allocator = torch.cuda.memory.CUDAPluggableAllocator(
+                lib_path, "uvm_malloc", "uvm_free"
+            )
+            _uvm_local_allocator = allocator
+            _uvm_local_mem_pool = torch.cuda.memory.MemPool(allocator._allocator)
 
-    with torch.cuda.memory.use_mem_pool(_uvm_local_mem_pool):
-        yield
+        if _uvm_lib is not None:
+            _uvm_lib.uvm_set_prefetch(1 if enable_prefetch else 0)
+
+        with torch.cuda.memory.use_mem_pool(_uvm_local_mem_pool):
+            yield
+    finally:
+        if _uvm_local_prefetch_stack:
+            _uvm_local_prefetch_stack.pop()
+        if _uvm_lib is not None:
+            _uvm_lib.uvm_set_prefetch(
+                1 if _uvm_local_prefetch_enabled() else 0
+            )
 
 
 def enable_uvm_allocator(
@@ -2689,6 +2743,7 @@ def _expert_reserved_prefetch_via_helper(
     entries: Sequence[dict[str, int]],
     device: int,
     async_: bool,
+    return_entries: bool = True,
 ) -> Optional[dict[str, object]]:
     if _uvm_lib is None or not hasattr(
         _uvm_lib, "uvm_driver_expert_reserved_prefetch_regions"
@@ -2696,83 +2751,80 @@ def _expert_reserved_prefetch_via_helper(
         return None
 
     count = len(entries)
-    region_ids = (ctypes.c_uint64 * count)(
-        *[int(entry.get("region_id", 0)) for entry in entries]
-    )
-    pool_ids = (ctypes.c_uint32 * count)(
-        *[int(entry.get("pool_id", 0)) for entry in entries]
-    )
-    slot_ids = (ctypes.c_uint32 * count)(
-        *[int(entry.get("slot_id", index)) for index, entry in enumerate(entries)]
-    )
-    slot_offsets = (ctypes.c_uint64 * count)(
-        *[int(entry.get("slot_offset", 0)) for entry in entries]
-    )
-    bytes_overrides = (ctypes.c_uint64 * count)(
-        *[int(entry.get("bytes_override", 0)) for entry in entries]
-    )
-    flags = (ctypes.c_uint32 * count)(
-        *[int(entry.get("flags", 0)) for entry in entries]
-    )
-    stats = (ctypes.c_uint64 * _UVM_EXPERT_RESERVED_PREFETCH_STATS_COUNT)()
-    out_entries = (
-        _ExpertReservedPrefetchEntry *
-        _UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES
-    )()
+    buffers = _expert_reserved_prefetch_helper_buffers()
+    for index, entry in enumerate(entries):
+        buffers.region_ids[index] = int(entry.get("region_id", 0))
+        buffers.pool_ids[index] = int(entry.get("pool_id", 0))
+        buffers.slot_ids[index] = int(entry.get("slot_id", index))
+        buffers.slot_offsets[index] = int(entry.get("slot_offset", 0))
+        buffers.bytes_overrides[index] = int(entry.get("bytes_override", 0))
+        buffers.flags[index] = int(entry.get("flags", 0))
+
+    for index in range(_UVM_EXPERT_RESERVED_PREFETCH_STATS_COUNT):
+        buffers.stats[index] = 0
+
+    if return_entries:
+        for index in range(count):
+            buffers.out_entries[index] = _ExpertReservedPrefetchEntry()
 
     try:
         status = int(
             _uvm_lib.uvm_driver_expert_reserved_prefetch_regions(
-                region_ids,
-                pool_ids,
-                slot_ids,
-                slot_offsets,
-                bytes_overrides,
-                flags,
+                buffers.region_ids,
+                buffers.pool_ids,
+                buffers.slot_ids,
+                buffers.slot_offsets,
+                buffers.bytes_overrides,
+                buffers.flags,
                 ctypes.c_size_t(count),
                 ctypes.c_uint32(mode_value),
                 ctypes.c_int(device),
                 ctypes.c_uint32(1 if async_ else 0),
-                stats,
+                buffers.stats,
                 ctypes.c_size_t(_UVM_EXPERT_RESERVED_PREFETCH_STATS_COUNT),
-                out_entries,
-                ctypes.c_size_t(count),
+                buffers.out_entries,
+                ctypes.c_size_t(count if return_entries else 0),
             )
         )
     except Exception:
         logger.debug("Expert reserved prefetch helper failed", exc_info=True)
         return None
 
-    params = _ExpertReservedPrefetchBatchParams()
-    params.mode = mode_value
-    params.count = count
-    params.async_ = 1 if async_ else 0
-    params.rmStatus = int(stats[0])
-    params.success_count = int(stats[1])
-    params.failure_count = int(stats[2])
-    params.requested_bytes = int(stats[3])
-    params.accepted_bytes = int(stats[4])
-    params.resolved_regions = int(stats[5])
-    params.assigned_slots = int(stats[6])
-    params.invalidated_slots = int(stats[7])
-    params.reserved_backing_bytes = int(stats[8])
-    params.ordinary_resident_bytes = int(stats[9])
-    params.pool_external_alloc_count = int(stats[10])
-    params.footprint_contract_broken = int(stats[11])
-    params.current_epoch = int(stats[12])
-    for index in range(count):
-        params.entries[index] = out_entries[index]
-
     ret = 0 if status >= 0 else -1
-    saved_errno = int(stats[13]) if status == -6 else 0
-    result = _expert_reserved_prefetch_result_from_params(
-        params,
+    saved_errno = int(buffers.stats[13]) if status == -6 else 0
+    result = _empty_expert_reserved_prefetch_result(
         mode=mode,
-        ret=ret,
-        saved_errno=saved_errno,
+        ioctl_ret=ret,
+        rm_status=int(buffers.stats[0]),
     )
+    result.update({
+        "ok": int(ret) == 0 and int(buffers.stats[0]) == 0,
+        "errno": int(saved_errno),
+        "mode": int(mode_value),
+        "entry_count": int(count),
+        "success_count": int(buffers.stats[1]),
+        "failure_count": int(buffers.stats[2]),
+        "requested_bytes": int(buffers.stats[3]),
+        "accepted_bytes": int(buffers.stats[4]),
+        "resolved_regions": int(buffers.stats[5]),
+        "assigned_slots": int(buffers.stats[6]),
+        "invalidated_slots": int(buffers.stats[7]),
+        "reserved_backing_bytes": int(buffers.stats[8]),
+        "ordinary_resident_bytes": int(buffers.stats[9]),
+        "pool_external_alloc_count": int(buffers.stats[10]),
+        "footprint_contract_broken": int(buffers.stats[11]),
+        "current_epoch": int(buffers.stats[12]),
+    })
+    if return_entries:
+        result["entries"] = [
+            _expert_reserved_prefetch_entry_to_dict(buffers.out_entries[index])
+            for index in range(count)
+        ]
+    else:
+        result["entries"] = []
     result["helper_status"] = status
     result["helper_path"] = True
+    result["compact_result"] = not return_entries
     return result
 
 
@@ -2830,6 +2882,7 @@ def driver_expert_reserved_prefetch_regions(
     strict_footprint: bool = True,
     mode: str | int = "resolve",
     prefer_existing: bool = True,
+    return_entries: bool = True,
 ) -> dict[str, object]:
     """Bind Phase-F expert regions to Phase-1 reserved slots.
 
@@ -2868,6 +2921,7 @@ def driver_expert_reserved_prefetch_regions(
         entries=normalized_entries,
         device=device,
         async_=async_,
+        return_entries=return_entries,
     )
     if helper_result is not None:
         return helper_result
@@ -3315,7 +3369,10 @@ def driver_batch_query_ranges_residency(
     device: int = 0,
 ) -> int:
     """Try Phase F driver batch residency query. Returns successes or negative."""
-    if not _uvm_enabled or _uvm_lib is None:
+    try:
+        ensure_uvm_runtime_library()
+    except Exception:
+        logger.debug("Failed to load UVM runtime library", exc_info=True)
         return -1
     range_list = list(ranges)
     if not range_list:
@@ -3352,7 +3409,10 @@ def driver_batch_query_ranges_residency_bytes(
         "any_bytes": 0,
         "unknown_bytes": 0,
     }
-    if not _uvm_enabled or _uvm_lib is None:
+    try:
+        ensure_uvm_runtime_library()
+    except Exception:
+        logger.debug("Failed to load UVM runtime library", exc_info=True)
         return result
 
     range_list = list(ranges)

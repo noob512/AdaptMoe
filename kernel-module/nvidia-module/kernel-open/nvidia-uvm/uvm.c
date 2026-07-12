@@ -225,11 +225,26 @@ static NV_STATUS uvm_moe_slot_pool_finish_async_copy_locked(uvm_moe_slot_pool_sl
 
 static NV_STATUS uvm_moe_slot_pool_record_pte_range_locked(uvm_moe_slot_pool_slot_t *slot, NvU64 va_base, NvU64 bytes)
 {
+    NvU64 va_end = va_base + bytes;
+
     if (bytes == 0 || va_base + bytes <= va_base)
         return NV_ERR_INVALID_ARGUMENT;
 
     if (slot->pte_range_count >= UVM_MOE_SLOT_POOL_MAX_PTE_RANGES_PER_SLOT)
         return NV_ERR_INSUFFICIENT_RESOURCES;
+
+    uvm_phase_f_route_log("moe_pte_range action=record layer=%u expert=%u slot=%u role=%u va=0x%llx end=0x%llx bytes=%llu range_index=%u existing_ranges=%u mode=%u va_space=%px\n",
+                          slot->layer_id,
+                          slot->owner_expert_id,
+                          slot->slot_id,
+                          slot->last_role,
+                          va_base,
+                          va_end,
+                          bytes,
+                          slot->pte_range_count,
+                          slot->pte_range_count,
+                          slot->pte_mode,
+                          slot->pte_va_space);
 
     slot->pte_ranges[slot->pte_range_count].va_base = va_base;
     slot->pte_ranges[slot->pte_range_count].bytes = bytes;
@@ -596,6 +611,22 @@ static NV_STATUS uvm_expert_reserved_prefetch_resolve_entry_locked(uvm_va_space_
         params->requested_bytes += bytes;
         uvm_expert_reserved_prefetch_fill_entry_from_region(entry, region, bytes);
         ++params->resolved_regions;
+
+        uvm_phase_f_route_log("expert_reserved_resolve_region mode=%u region=%llu pool=%u slot=%u slot_offset=%llu base=0x%llx end=0x%llx region_length=%llu bytes=%llu layer=%u expert=%u role=%u flags=0x%x va_space=%px\n",
+                              params->mode,
+                              region->region_id,
+                              entry->pool_id,
+                              entry->slot_id,
+                              entry->slot_offset,
+                              region->base,
+                              region->base + bytes,
+                              region->length,
+                              bytes,
+                              region->layer_id,
+                              region->expert_id,
+                              region->role,
+                              region->flags,
+                              va_space);
     }
 
     mutex_lock(&g_uvm_expert_reserved_pool_lock);
@@ -623,6 +654,17 @@ static NV_STATUS uvm_expert_reserved_prefetch_resolve_entry_locked(uvm_va_space_
     entry->physical_bytes = slot->physical_bytes;
 
     if (params->mode == UVM_EXPERT_RESERVED_PREFETCH_MODE_INVALIDATE) {
+        uvm_phase_f_route_log("expert_reserved_resolve_invalidate_clear pool=%u slot=%u old_region=%llu old_va=0x%llx old_end=0x%llx old_bytes=%llu old_layer=%u old_expert=%u old_role=%u epoch=%llu\n",
+                              entry->pool_id,
+                              entry->slot_id,
+                              slot->owner_region_id,
+                              slot->owner_va_base,
+                              slot->owner_va_base + slot->owner_bytes,
+                              slot->owner_bytes,
+                              slot->owner_layer_id,
+                              slot->owner_expert_id,
+                              slot->owner_role,
+                              slot->epoch);
         uvm_expert_reserved_prefetch_clear_slot_owner(slot);
         slot->epoch = ++g_uvm_expert_reserved_pool_current_epoch;
         entry->slot_epoch = slot->epoch;
@@ -651,6 +693,20 @@ static NV_STATUS uvm_expert_reserved_prefetch_resolve_entry_locked(uvm_va_space_
         slot->epoch = ++g_uvm_expert_reserved_pool_current_epoch;
         slot->owner_epoch = slot->epoch;
         ++params->assigned_slots;
+
+        uvm_phase_f_route_log("expert_reserved_resolve_assign pool=%u slot=%u region=%llu va=0x%llx end=0x%llx bytes=%llu slot_offset=%llu layer=%u expert=%u role=%u physical=%llu epoch=%llu\n",
+                              entry->pool_id,
+                              entry->slot_id,
+                              region->region_id,
+                              region->base,
+                              region->base + bytes,
+                              bytes,
+                              entry->slot_offset,
+                              region->layer_id,
+                              region->expert_id,
+                              region->role,
+                              slot->physical_bytes,
+                              slot->epoch);
     }
 
     entry->slot_epoch = slot->epoch;
@@ -662,6 +718,19 @@ out:
         entry->status = UVM_EXPERT_RESERVED_PREFETCH_ENTRY_OK;
     else if (!entry_status_set)
         entry->status = uvm_expert_reserved_prefetch_entry_status_from_nv_status(status);
+
+    uvm_phase_f_route_log("expert_reserved_resolve_done mode=%u pool=%u slot=%u region=%llu va=0x%llx end=0x%llx bytes=%llu status=0x%x entry_status=%u slot_epoch=%llu physical=%llu\n",
+                          params->mode,
+                          entry->pool_id,
+                          entry->slot_id,
+                          entry->region_id,
+                          entry->resolved_base,
+                          entry->resolved_base + entry->resolved_bytes,
+                          entry->resolved_bytes,
+                          status,
+                          entry->status,
+                          entry->slot_epoch,
+                          entry->physical_bytes);
 
     mutex_unlock(&g_uvm_expert_reserved_pool_lock);
 
@@ -5714,6 +5783,17 @@ static NV_STATUS uvm_phase_f_execute_range(NvU32 action,
     }
 
     result->status = status;
+    uvm_phase_f_route_log("phase_f_range_action_end action=%u base=0x%llx end=0x%llx length=%llu status=0x%x gpu_bytes=%llu cpu_bytes=%llu any_bytes=%llu unknown_bytes=%llu async=%u\n",
+                          action,
+                          base,
+                          base + length,
+                          length,
+                          status,
+                          result->resident_gpu_bytes,
+                          result->resident_cpu_bytes,
+                          result->resident_any_bytes,
+                          result->resident_unknown_bytes,
+                          async);
     return status;
 }
 
@@ -6722,6 +6802,10 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
         uvm_phase_f_region_t *region;
         NvU64 base = 0;
         NvU64 length = 0;
+        NvU32 layer_id = 0;
+        NvU32 expert_id = 0;
+        NvU32 role = 0;
+        NvU32 pool = 0;
         NV_STATUS status = NV_OK;
 
         params->results[i].status = NV_OK;
@@ -6743,6 +6827,10 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
             if (region) {
                 base = region->base;
                 length = region->length;
+                layer_id = region->layer_id;
+                expert_id = region->expert_id;
+                role = region->role;
+                pool = region->pool;
             }
             uvm_va_space_up_read(va_space);
 
@@ -6751,6 +6839,18 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
         }
 
         if (status == NV_OK) {
+            uvm_phase_f_route_log("phase_f_policy_batch_region_entry index=%u action=%u region=%llu pool=%u layer=%u expert=%u role=%u base=0x%llx end=0x%llx length=%llu async=%u\n",
+                                  i,
+                                  params->action,
+                                  params->region_ids[i],
+                                  pool,
+                                  layer_id,
+                                  expert_id,
+                                  role,
+                                  base,
+                                  base + length,
+                                  length,
+                                  params->async);
             status = uvm_phase_f_execute_range(params->action,
                                                &params->gpu_uuid,
                                                params->async,
@@ -6954,6 +7054,28 @@ static NV_STATUS uvm_moe_slot_pool_release_pte_mapping_locked(uvm_moe_slot_pool_
                                                               struct mm_struct *mm)
 {
     NV_STATUS status = NV_OK;
+    NvU64 old_pte_va_base = slot->pte_va_base;
+    NvU64 old_pte_bytes = slot->pte_bytes;
+    NvU64 old_pte_end = old_pte_va_base + old_pte_bytes;
+    NvU32 old_pte_range_count = slot->pte_range_count;
+    NvU32 old_pte_mode = slot->pte_mode;
+
+    if (old_pte_bytes != 0 || slot->pte_range_vec || old_pte_range_count != 0) {
+        uvm_phase_f_route_log("moe_pte_range action=release_begin layer=%u expert=%u slot=%u role=%u va=0x%llx end=0x%llx bytes=%llu ranges=%u mode=%u va_space=%px locked_va_space=%px mm=%px gpu=%s\n",
+                              slot->layer_id,
+                              slot->owner_expert_id,
+                              slot->slot_id,
+                              slot->last_role,
+                              old_pte_va_base,
+                              old_pte_end,
+                              old_pte_bytes,
+                              old_pte_range_count,
+                              old_pte_mode,
+                              slot->pte_va_space,
+                              locked_va_space,
+                              mm,
+                              slot->pte_gpu ? uvm_gpu_name(slot->pte_gpu) : "unknown");
+    }
 
     if (slot->pte_range_vec) {
         uvm_membar_t tlb_membar = UVM_MEMBAR_SYS;
@@ -6962,7 +7084,27 @@ static NV_STATUS uvm_moe_slot_pool_release_pte_mapping_locked(uvm_moe_slot_pool_
             tlb_membar = uvm_hal_downgrade_membar_type(slot->pte_gpu,
                                                        uvm_mem_is_local_vidmem(slot->slot_mem, slot->pte_gpu));
 
+        uvm_phase_f_route_log("moe_pte_range action=clear_range_vec_begin layer=%u expert=%u slot=%u role=%u va=0x%llx end=0x%llx bytes=%llu ranges=%u mode=%u membar=%u\n",
+                              slot->layer_id,
+                              slot->owner_expert_id,
+                              slot->slot_id,
+                              slot->last_role,
+                              slot->pte_va_base,
+                              slot->pte_va_base + slot->pte_bytes,
+                              slot->pte_bytes,
+                              slot->pte_range_count,
+                              slot->pte_mode,
+                              tlb_membar);
         status = uvm_page_table_range_vec_clear_ptes(slot->pte_range_vec, tlb_membar);
+        uvm_phase_f_route_log("moe_pte_range action=clear_range_vec_end layer=%u expert=%u slot=%u role=%u va=0x%llx end=0x%llx bytes=%llu status=0x%x\n",
+                              slot->layer_id,
+                              slot->owner_expert_id,
+                              slot->slot_id,
+                              slot->last_role,
+                              slot->pte_va_base,
+                              slot->pte_va_base + slot->pte_bytes,
+                              slot->pte_bytes,
+                              status);
         if (status != NV_OK)
             UVM_ERR_PRINT("MoE slot PTE clear failed: %s, GPU %s, VA [0x%llx, 0x%llx)\n",
                           nvstatusToString(status),
@@ -7000,6 +7142,19 @@ static NV_STATUS uvm_moe_slot_pool_release_pte_mapping_locked(uvm_moe_slot_pool_
             if (range->bytes == 0)
                 continue;
 
+            uvm_phase_f_route_log("moe_pte_range action=clear_va_block_begin layer=%u expert=%u slot=%u role=%u range_index=%u va=0x%llx end=0x%llx bytes=%llu full_va=0x%llx full_end=0x%llx full_bytes=%llu mode=%u\n",
+                                  slot->layer_id,
+                                  slot->owner_expert_id,
+                                  slot->slot_id,
+                                  slot->last_role,
+                                  i,
+                                  range->va_base,
+                                  range->va_base + range->bytes,
+                                  range->bytes,
+                                  slot->pte_va_base,
+                                  slot->pte_va_base + slot->pte_bytes,
+                                  slot->pte_bytes,
+                                  slot->pte_mode);
             status = uvm_moe_slot_pool_uninstall_va_block_slot_mapping(locked_va_space,
                                                                        slot->pte_gpu,
                                                                        mm,
@@ -7007,6 +7162,18 @@ static NV_STATUS uvm_moe_slot_pool_release_pte_mapping_locked(uvm_moe_slot_pool_
                                                                        range->bytes,
                                                                        &range_block_unmap_count,
                                                                        &range_tracker_wait_count);
+            uvm_phase_f_route_log("moe_pte_range action=clear_va_block_end layer=%u expert=%u slot=%u role=%u range_index=%u va=0x%llx end=0x%llx bytes=%llu status=0x%x block_unmaps=%llu tracker_waits=%llu\n",
+                                  slot->layer_id,
+                                  slot->owner_expert_id,
+                                  slot->slot_id,
+                                  slot->last_role,
+                                  i,
+                                  range->va_base,
+                                  range->va_base + range->bytes,
+                                  range->bytes,
+                                  status,
+                                  range_block_unmap_count,
+                                  range_tracker_wait_count);
             if (status != NV_OK) {
                 UVM_ERR_PRINT("MoE slot VA-block PTE clear failed: %s, GPU %s, VA [0x%llx, 0x%llx)\n",
                               nvstatusToString(status),
@@ -7026,6 +7193,20 @@ static NV_STATUS uvm_moe_slot_pool_release_pte_mapping_locked(uvm_moe_slot_pool_
         g_uvm_moe_slot_pool_pte_block_tracker_wait_count += tracker_wait_count;
         ++slot->pte_clear_count;
         ++g_uvm_moe_slot_pool_pte_clear_count;
+    }
+
+    if (old_pte_bytes != 0 || old_pte_range_count != 0) {
+        uvm_phase_f_route_log("moe_pte_range action=release_end layer=%u expert=%u slot=%u role=%u old_va=0x%llx old_end=0x%llx old_bytes=%llu ranges=%u mode=%u status=0x%x\n",
+                              slot->layer_id,
+                              slot->owner_expert_id,
+                              slot->slot_id,
+                              slot->last_role,
+                              old_pte_va_base,
+                              old_pte_end,
+                              old_pte_bytes,
+                              old_pte_range_count,
+                              old_pte_mode,
+                              status);
     }
 
     if (slot->pte_gpu) {
@@ -7691,6 +7872,14 @@ static NV_STATUS uvm_moe_slot_pool_clear_range_mappings(uvm_va_space_t *va_space
     uvm_va_space_down_write(va_space);
     mutex_lock(&g_uvm_moe_slot_pool_lock);
 
+    uvm_phase_f_route_log("moe_pte_range action=clear_guard_scan_begin reason=%u guard_va=0x%llx guard_end=0x%llx guard_bytes=%llu va_space=%px mm=%px\n",
+                          reason,
+                          va_base,
+                          va_base + bytes,
+                          bytes,
+                          va_space,
+                          mm);
+
     for (i = 0; i < UVM_MOE_SLOT_POOL_MAX_SLOTS; ++i) {
         uvm_moe_slot_pool_slot_t *slot = &g_uvm_moe_slot_pool[i];
         NvU64 old_pte_va_base;
@@ -7705,14 +7894,16 @@ static NV_STATUS uvm_moe_slot_pool_clear_range_mappings(uvm_va_space_t *va_space
         status = uvm_moe_slot_pool_release_pte_mapping_locked(slot, va_space, mm);
         if (status == NV_OK) {
             uvm_moe_slot_pool_note_pte_clear_reason_locked(slot, reason);
-            uvm_phase_f_route_log("moe_slot_pte_clear_guard reason=%u layer=%u expert=%u slot=%u old_va=0x%llx old_bytes=%llu guard_va=0x%llx guard_bytes=%llu\n",
+            uvm_phase_f_route_log("moe_slot_pte_clear_guard reason=%u layer=%u expert=%u slot=%u old_va=0x%llx old_end=0x%llx old_bytes=%llu guard_va=0x%llx guard_end=0x%llx guard_bytes=%llu\n",
                                   reason,
                                   slot->layer_id,
                                   slot->owner_expert_id,
                                   slot->slot_id,
                                   old_pte_va_base,
+                                  old_pte_va_base + old_pte_bytes,
                                   old_pte_bytes,
                                   va_base,
+                                  va_base + bytes,
                                   bytes);
         }
         else {
@@ -7728,6 +7919,13 @@ static NV_STATUS uvm_moe_slot_pool_clear_range_mappings(uvm_va_space_t *va_space
                           old_pte_va_base + old_pte_bytes);
         }
     }
+
+    uvm_phase_f_route_log("moe_pte_range action=clear_guard_scan_end reason=%u guard_va=0x%llx guard_end=0x%llx guard_bytes=%llu status=0x%x\n",
+                          reason,
+                          va_base,
+                          va_base + bytes,
+                          bytes,
+                          first_error);
 
     mutex_unlock(&g_uvm_moe_slot_pool_lock);
     uvm_va_space_up_write(va_space);
@@ -7757,6 +7955,14 @@ static NV_STATUS uvm_moe_slot_pool_clear_range_mappings_locked(uvm_va_space_t *v
     uvm_assert_rwsem_locked_write(&va_space->lock);
     mutex_lock(&g_uvm_moe_slot_pool_lock);
 
+    uvm_phase_f_route_log("moe_pte_range action=clear_guard_locked_scan_begin reason=%u guard_va=0x%llx guard_end=0x%llx guard_bytes=%llu va_space=%px mm=%px\n",
+                          reason,
+                          va_base,
+                          va_base + bytes,
+                          bytes,
+                          va_space,
+                          mm);
+
     for (i = 0; i < UVM_MOE_SLOT_POOL_MAX_SLOTS; ++i) {
         uvm_moe_slot_pool_slot_t *slot = &g_uvm_moe_slot_pool[i];
         NvU64 old_pte_va_base;
@@ -7771,14 +7977,16 @@ static NV_STATUS uvm_moe_slot_pool_clear_range_mappings_locked(uvm_va_space_t *v
         status = uvm_moe_slot_pool_release_pte_mapping_locked(slot, va_space, mm);
         if (status == NV_OK) {
             uvm_moe_slot_pool_note_pte_clear_reason_locked(slot, reason);
-            uvm_phase_f_route_log("moe_slot_pte_clear_guard_locked reason=%u layer=%u expert=%u slot=%u old_va=0x%llx old_bytes=%llu guard_va=0x%llx guard_bytes=%llu\n",
+            uvm_phase_f_route_log("moe_slot_pte_clear_guard_locked reason=%u layer=%u expert=%u slot=%u old_va=0x%llx old_end=0x%llx old_bytes=%llu guard_va=0x%llx guard_end=0x%llx guard_bytes=%llu\n",
                                   reason,
                                   slot->layer_id,
                                   slot->owner_expert_id,
                                   slot->slot_id,
                                   old_pte_va_base,
+                                  old_pte_va_base + old_pte_bytes,
                                   old_pte_bytes,
                                   va_base,
+                                  va_base + bytes,
                                   bytes);
         }
         else {
@@ -7794,6 +8002,13 @@ static NV_STATUS uvm_moe_slot_pool_clear_range_mappings_locked(uvm_va_space_t *v
                           old_pte_va_base + old_pte_bytes);
         }
     }
+
+    uvm_phase_f_route_log("moe_pte_range action=clear_guard_locked_scan_end reason=%u guard_va=0x%llx guard_end=0x%llx guard_bytes=%llu status=0x%x\n",
+                          reason,
+                          va_base,
+                          va_base + bytes,
+                          bytes,
+                          first_error);
 
     mutex_unlock(&g_uvm_moe_slot_pool_lock);
 
@@ -7819,6 +8034,13 @@ static NV_STATUS uvm_moe_slot_pool_forget_range_mappings_locked(uvm_va_space_t *
     uvm_assert_rwsem_locked_write(&va_space->lock);
     mutex_lock(&g_uvm_moe_slot_pool_lock);
 
+    uvm_phase_f_route_log("moe_pte_range action=forget_guard_scan_begin reason=%u guard_va=0x%llx guard_end=0x%llx guard_bytes=%llu va_space=%px\n",
+                          reason,
+                          va_base,
+                          va_base + bytes,
+                          bytes,
+                          va_space);
+
     for (i = 0; i < UVM_MOE_SLOT_POOL_MAX_SLOTS; ++i) {
         uvm_moe_slot_pool_slot_t *slot = &g_uvm_moe_slot_pool[i];
         NvU64 old_pte_va_base;
@@ -7830,17 +8052,25 @@ static NV_STATUS uvm_moe_slot_pool_forget_range_mappings_locked(uvm_va_space_t *
         old_pte_va_base = slot->pte_va_base;
         old_pte_bytes = slot->pte_bytes;
         uvm_moe_slot_pool_note_pte_clear_reason_locked(slot, reason);
-        uvm_phase_f_route_log("moe_slot_pte_forget_guard reason=%u layer=%u expert=%u slot=%u old_va=0x%llx old_bytes=%llu guard_va=0x%llx guard_bytes=%llu\n",
+        uvm_phase_f_route_log("moe_slot_pte_forget_guard reason=%u layer=%u expert=%u slot=%u old_va=0x%llx old_end=0x%llx old_bytes=%llu guard_va=0x%llx guard_end=0x%llx guard_bytes=%llu\n",
                               reason,
                               slot->layer_id,
                               slot->owner_expert_id,
                               slot->slot_id,
                               old_pte_va_base,
+                              old_pte_va_base + old_pte_bytes,
                               old_pte_bytes,
                               va_base,
+                              va_base + bytes,
                               bytes);
         uvm_moe_slot_pool_forget_release_pte_mapping_locked(slot);
     }
+
+    uvm_phase_f_route_log("moe_pte_range action=forget_guard_scan_end reason=%u guard_va=0x%llx guard_end=0x%llx guard_bytes=%llu\n",
+                          reason,
+                          va_base,
+                          va_base + bytes,
+                          bytes);
 
     mutex_unlock(&g_uvm_moe_slot_pool_lock);
 
@@ -8595,9 +8825,34 @@ static NV_STATUS uvm_moe_slot_pool_install_pte_mapping_locked(uvm_va_space_t *va
         !IS_ALIGNED(entry->slot_offset, page_size))
         return NV_ERR_INVALID_ARGUMENT;
 
+    uvm_phase_f_route_log("moe_pte_range action=install_range_vec_begin layer=%u expert=%u slot=%u role=%u va=0x%llx end=0x%llx bytes=%llu slot_offset=%llu slot_end=%llu page_size=%llu mode=%u va_space=%px mm=%px gpu=%s\n",
+                          entry->layer_id,
+                          entry->expert_id,
+                          entry->slot_id,
+                          entry->role,
+                          entry->va_base,
+                          entry->va_base + entry->bytes,
+                          entry->bytes,
+                          entry->slot_offset,
+                          map_end,
+                          page_size,
+                          pte_mode,
+                          va_space,
+                          mm,
+                          uvm_gpu_name(gpu));
+
     status = uvm_moe_slot_pool_release_pte_mapping_locked(slot, va_space, mm);
-    if (status != NV_OK)
+    if (status != NV_OK) {
+        uvm_phase_f_route_log("moe_pte_range action=install_range_vec_release_failed layer=%u expert=%u slot=%u va=0x%llx end=0x%llx bytes=%llu status=0x%x\n",
+                              entry->layer_id,
+                              entry->expert_id,
+                              entry->slot_id,
+                              entry->va_base,
+                              entry->va_base + entry->bytes,
+                              entry->bytes,
+                              status);
         return status;
+    }
 
     status = uvm_page_table_range_vec_create(page_tables,
                                              entry->va_base,
@@ -8605,8 +8860,18 @@ static NV_STATUS uvm_moe_slot_pool_install_pte_mapping_locked(uvm_va_space_t *va
                                              page_size,
                                              UVM_PMM_ALLOC_FLAGS_EVICT,
                                              &range_vec);
-    if (status != NV_OK)
+    if (status != NV_OK) {
+        uvm_phase_f_route_log("moe_pte_range action=install_range_vec_create_failed layer=%u expert=%u slot=%u va=0x%llx end=0x%llx bytes=%llu page_size=%llu status=0x%x\n",
+                              entry->layer_id,
+                              entry->expert_id,
+                              entry->slot_id,
+                              entry->va_base,
+                              entry->va_base + entry->bytes,
+                              entry->bytes,
+                              page_size,
+                              status);
         return status;
+    }
 
     pte_maker_data.mem = slot->slot_mem;
     pte_maker_data.gpu = gpu;
@@ -8618,6 +8883,14 @@ static NV_STATUS uvm_moe_slot_pool_install_pte_mapping_locked(uvm_va_space_t *va
                                                  uvm_moe_slot_pte_maker,
                                                  &pte_maker_data);
     if (status != NV_OK) {
+        uvm_phase_f_route_log("moe_pte_range action=install_range_vec_write_failed layer=%u expert=%u slot=%u va=0x%llx end=0x%llx bytes=%llu status=0x%x\n",
+                              entry->layer_id,
+                              entry->expert_id,
+                              entry->slot_id,
+                              entry->va_base,
+                              entry->va_base + entry->bytes,
+                              entry->bytes,
+                              status);
         (void)uvm_page_table_range_vec_clear_ptes(range_vec, tlb_membar);
         uvm_page_table_range_vec_destroy(range_vec);
         return status;
@@ -8637,6 +8910,21 @@ static NV_STATUS uvm_moe_slot_pool_install_pte_mapping_locked(uvm_va_space_t *va
     slot->pte_remap_bytes += entry->bytes;
     ++g_uvm_moe_slot_pool_pte_remap_count;
     g_uvm_moe_slot_pool_pte_remap_bytes += entry->bytes;
+
+    uvm_phase_f_route_log("moe_pte_range action=install_range_vec_end layer=%u expert=%u slot=%u role=%u va=0x%llx end=0x%llx bytes=%llu slot_offset=%llu page_size=%llu mode=%u status=0x%x remap_count=%llu remap_bytes=%llu\n",
+                          entry->layer_id,
+                          entry->expert_id,
+                          entry->slot_id,
+                          entry->role,
+                          entry->va_base,
+                          entry->va_base + entry->bytes,
+                          entry->bytes,
+                          entry->slot_offset,
+                          page_size,
+                          pte_mode,
+                          status,
+                          slot->pte_remap_count,
+                          slot->pte_remap_bytes);
 
     return NV_OK;
 }
@@ -8837,6 +9125,19 @@ static NV_STATUS uvm_moe_slot_pool_install_va_block_slot_mapping(uvm_va_space_t 
     if (!block_context)
         return NV_ERR_NO_MEMORY;
 
+    uvm_phase_f_route_log("moe_pte_range action=install_va_block_begin layer=%u expert=%u slot=%u role=%u va=0x%llx end=0x%llx bytes=%llu slot_offset=%llu va_space=%px mm=%px gpu=%s\n",
+                          entry->layer_id,
+                          entry->expert_id,
+                          entry->slot_id,
+                          entry->role,
+                          entry->va_base,
+                          entry_end,
+                          entry->bytes,
+                          entry->slot_offset,
+                          va_space,
+                          mm,
+                          uvm_gpu_name(gpu));
+
     while (cursor < entry_end) {
         UVM_MOE_SLOT_REMAP_ENTRY slice = *entry;
         uvm_va_block_t *block = NULL;
@@ -8892,6 +9193,19 @@ static NV_STATUS uvm_moe_slot_pool_install_va_block_slot_mapping(uvm_va_space_t 
         slice.va_base = cursor;
         slice.bytes = slice_end - cursor;
         slice.slot_offset = entry->slot_offset + (cursor - entry->va_base);
+
+        uvm_phase_f_route_log("moe_pte_range action=install_va_block_slice_begin layer=%u expert=%u slot=%u role=%u slice_va=0x%llx slice_end=0x%llx slice_bytes=%llu slot_offset=%llu block_start=0x%llx block_end=0x%llx vma=%px\n",
+                              entry->layer_id,
+                              entry->expert_id,
+                              entry->slot_id,
+                              entry->role,
+                              slice.va_base,
+                              slice_end,
+                              slice.bytes,
+                              slice.slot_offset,
+                              block->start,
+                              block->end,
+                              block_context->hmm.vma);
 
         status = UVM_VA_BLOCK_LOCK_RETRY(block,
                                          &block_retry,
@@ -8951,6 +9265,17 @@ static NV_STATUS uvm_moe_slot_pool_install_va_block_slot_mapping(uvm_va_space_t 
         if (tracker_wait_count_out)
             ++*tracker_wait_count_out;
 
+        uvm_phase_f_route_log("moe_pte_range action=install_va_block_slice_end layer=%u expert=%u slot=%u role=%u slice_va=0x%llx slice_end=0x%llx slice_bytes=%llu installed_bytes=%llu status=0x%x\n",
+                              entry->layer_id,
+                              entry->expert_id,
+                              entry->slot_id,
+                              entry->role,
+                              slice.va_base,
+                              slice_end,
+                              slice.bytes,
+                              installed_bytes,
+                              status);
+
         cursor = slice_end;
     }
 
@@ -8984,6 +9309,17 @@ static NV_STATUS uvm_moe_slot_pool_install_va_block_slot_mapping(uvm_va_space_t 
         }
     }
 
+    uvm_phase_f_route_log("moe_pte_range action=install_va_block_end layer=%u expert=%u slot=%u role=%u va=0x%llx end=0x%llx bytes=%llu installed=%llu status=0x%x\n",
+                          entry->layer_id,
+                          entry->expert_id,
+                          entry->slot_id,
+                          entry->role,
+                          entry->va_base,
+                          entry_end,
+                          entry->bytes,
+                          installed_bytes,
+                          status);
+
     return status;
 }
 
@@ -9010,6 +9346,14 @@ static NV_STATUS uvm_moe_slot_pool_uninstall_va_block_slot_mapping(uvm_va_space_
 
     if (va_end <= va_base)
         return NV_ERR_INVALID_ARGUMENT;
+
+    uvm_phase_f_route_log("moe_pte_range action=uninstall_va_block_begin va=0x%llx end=0x%llx bytes=%llu va_space=%px mm=%px gpu=%s\n",
+                          va_base,
+                          va_end,
+                          bytes,
+                          va_space,
+                          mm,
+                          uvm_gpu_name(gpu));
 
     block_context = uvm_va_block_context_alloc(mm);
     if (!block_context)
@@ -9054,8 +9398,9 @@ static NV_STATUS uvm_moe_slot_pool_uninstall_va_block_slot_mapping(uvm_va_space_
             break;
         }
 
-        uvm_phase_f_route_log("expert_reserved_uninstall_slice begin block=0x%llx slice=0x%llx-0x%llx bytes=%llu mm=%px vma=%px\n",
+        uvm_phase_f_route_log("moe_pte_range action=uninstall_va_block_slice_begin block_start=0x%llx block_end=0x%llx slice_va=0x%llx slice_end=0x%llx bytes=%llu mm=%px vma=%px\n",
                               block->start,
+                              block->end,
                               cursor,
                               slice_end,
                               slice_end - cursor,
@@ -9069,8 +9414,9 @@ static NV_STATUS uvm_moe_slot_pool_uninstall_va_block_slot_mapping(uvm_va_space_
                                                                                       cursor,
                                                                                       slice_end - cursor,
                                                                                       gpu));
-        uvm_phase_f_route_log("expert_reserved_uninstall_slice end block=0x%llx slice=0x%llx-0x%llx status=0x%x\n",
+        uvm_phase_f_route_log("moe_pte_range action=uninstall_va_block_slice_end block_start=0x%llx block_end=0x%llx slice_va=0x%llx slice_end=0x%llx status=0x%x\n",
                               block->start,
+                              block->end,
                               cursor,
                               slice_end,
                               status);
@@ -9097,6 +9443,13 @@ static NV_STATUS uvm_moe_slot_pool_uninstall_va_block_slot_mapping(uvm_va_space_
     }
 
     uvm_va_block_context_free(block_context);
+    uvm_phase_f_route_log("moe_pte_range action=uninstall_va_block_end va=0x%llx end=0x%llx bytes=%llu status=0x%x block_unmaps=%llu tracker_waits=%llu\n",
+                          va_base,
+                          va_end,
+                          bytes,
+                          status,
+                          block_unmap_count_out ? *block_unmap_count_out : 0,
+                          tracker_wait_count_out ? *tracker_wait_count_out : 0);
     return status;
 }
 

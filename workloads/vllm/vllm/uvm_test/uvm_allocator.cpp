@@ -511,8 +511,12 @@ std::mutex g_phase_n_persistent_fd_mutex;
 int g_phase_n_persistent_fd = -1;
 std::mutex g_phase_f_batch_regions_fd_mutex;
 int g_phase_f_batch_regions_source_fd = -1;
+std::mutex g_expert_reserved_prefetch_fd_mutex;
+int g_expert_reserved_prefetch_source_fd = -1;
 std::mutex g_phase_f_region_cache_mutex;
 std::unordered_map<uint64_t, PhaseFRange> g_phase_f_region_cache;
+std::mutex g_cuda_device_uuid_cache_mutex;
+std::unordered_map<int, PhaseFUuid> g_cuda_device_uuid_cache;
 
 void cache_phase_f_region(uint64_t region_id, uintptr_t base, size_t length) {
     if (region_id == 0 || base == 0 || length == 0)
@@ -565,6 +569,17 @@ bool phase_f_adopt_cuda_uvm_fd_enabled() {
     return std::strcmp(mode, "new") != 0 &&
            std::strcmp(mode, "fresh") != 0 &&
            std::strcmp(mode, "open") != 0;
+}
+
+bool expert_reserved_prefetch_fd_cache_enabled() {
+    const char* mode = std::getenv("VLLM_UVM_EXPERT_RESERVED_FD_CACHE");
+    if (mode == nullptr || mode[0] == '\0') return true;
+
+    return std::strcmp(mode, "0") != 0 &&
+           std::strcmp(mode, "false") != 0 &&
+           std::strcmp(mode, "False") != 0 &&
+           std::strcmp(mode, "off") != 0 &&
+           std::strcmp(mode, "disabled") != 0;
 }
 
 bool phase_f_fd_link_is_uvm(const char* link_target) {
@@ -726,6 +741,59 @@ void clear_cached_phase_f_batch_regions_source_fd(const char* op_name, int sourc
     if (source_fd >= 0 && g_phase_f_batch_regions_source_fd == source_fd) {
         phase_f_debug_log("%s cached_fd_clear source_fd=%d", op_name, source_fd);
         g_phase_f_batch_regions_source_fd = -1;
+    }
+}
+
+int get_cached_expert_reserved_prefetch_fd(const char* op_name, int* source_fd_out) {
+    int source_fd;
+    int fd;
+
+    if (source_fd_out != nullptr)
+        *source_fd_out = -1;
+
+    {
+        std::lock_guard<std::mutex> lock(g_expert_reserved_prefetch_fd_mutex);
+        source_fd = g_expert_reserved_prefetch_source_fd;
+    }
+
+    if (source_fd < 0)
+        return -1;
+
+    fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 3);
+    if (fd < 0) {
+        phase_f_debug_log("%s cached_fd duplicate_failed source_fd=%d errno=%d",
+                          op_name,
+                          source_fd,
+                          errno);
+        std::lock_guard<std::mutex> lock(g_expert_reserved_prefetch_fd_mutex);
+        if (g_expert_reserved_prefetch_source_fd == source_fd)
+            g_expert_reserved_prefetch_source_fd = -1;
+        return -1;
+    }
+
+    if (source_fd_out != nullptr)
+        *source_fd_out = source_fd;
+    return fd;
+}
+
+void set_cached_expert_reserved_prefetch_source_fd(const char* op_name, int source_fd) {
+    std::lock_guard<std::mutex> lock(g_expert_reserved_prefetch_fd_mutex);
+
+    if (source_fd < 0)
+        return;
+
+    if (g_expert_reserved_prefetch_source_fd != source_fd) {
+        g_expert_reserved_prefetch_source_fd = source_fd;
+        phase_f_debug_log("%s cached_fd_set source_fd=%d", op_name, source_fd);
+    }
+}
+
+void clear_cached_expert_reserved_prefetch_source_fd(const char* op_name, int source_fd) {
+    std::lock_guard<std::mutex> lock(g_expert_reserved_prefetch_fd_mutex);
+
+    if (source_fd >= 0 && g_expert_reserved_prefetch_source_fd == source_fd) {
+        phase_f_debug_log("%s cached_fd_clear source_fd=%d", op_name, source_fd);
+        g_expert_reserved_prefetch_source_fd = -1;
     }
 }
 
@@ -898,6 +966,15 @@ bool get_cuda_device_uuid(int device, PhaseFUuid* uuid) {
         if (current_err != cudaSuccess) return false;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(g_cuda_device_uuid_cache_mutex);
+        auto it = g_cuda_device_uuid_cache.find(device);
+        if (it != g_cuda_device_uuid_cache.end()) {
+            *uuid = it->second;
+            return true;
+        }
+    }
+
     cudaDeviceProp prop;
     cudaError_t err = cudaGetDeviceProperties(&prop, device);
     if (err != cudaSuccess) return false;
@@ -906,6 +983,10 @@ bool get_cuda_device_uuid(int device, PhaseFUuid* uuid) {
     static_assert(sizeof(prop.uuid.bytes) == sizeof(uuid->uuid),
                   "Unexpected CUDA UUID size");
     memcpy(uuid->uuid, prop.uuid.bytes, sizeof(uuid->uuid));
+    {
+        std::lock_guard<std::mutex> lock(g_cuda_device_uuid_cache_mutex);
+        g_cuda_device_uuid_cache[device] = *uuid;
+    }
     return true;
 #else
     (void)prop;
@@ -1739,6 +1820,52 @@ int uvm_driver_expert_reserved_prefetch_regions_internal(const uint64_t* region_
         return -2;
 
     if (phase_f_adopt_cuda_uvm_fd_enabled()) {
+        bool fd_cache_enabled = expert_reserved_prefetch_fd_cache_enabled();
+
+        if (fd_cache_enabled) {
+            int cached_source_fd = -1;
+            int cached_fd = get_cached_expert_reserved_prefetch_fd("driver_expert_reserved_prefetch",
+                                                                   &cached_source_fd);
+            if (cached_fd >= 0) {
+                uint64_t stats[16] = {};
+                ExpertReservedPrefetchEntry entries[UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES] = {};
+                int result;
+
+                attempted = true;
+                phase_f_debug_log("driver_expert_reserved_prefetch fd_source=cached source_fd=%d fd=%d count=%zu mode=%u",
+                                  cached_source_fd,
+                                  cached_fd,
+                                  count,
+                                  mode);
+                result = uvm_driver_expert_reserved_prefetch_regions_fd(
+                    cached_fd,
+                    region_ids,
+                    pool_ids,
+                    slot_ids,
+                    slot_offsets,
+                    bytes_overrides,
+                    flags,
+                    count,
+                    mode,
+                    device,
+                    async,
+                    stats,
+                    16,
+                    entries,
+                    count);
+                close(cached_fd);
+
+                save_result(result, stats, entries);
+                if (result >= 0 || !expert_reserved_prefetch_result_is_safe_to_retry(result, stats, 16, entries, count)) {
+                    flush_result();
+                    return result;
+                }
+
+                clear_cached_expert_reserved_prefetch_source_fd("driver_expert_reserved_prefetch",
+                                                                cached_source_fd);
+            }
+        }
+
         std::vector<UvmFdCandidate> candidates =
             collect_existing_uvm_fd_candidates("driver_expert_reserved_prefetch");
 
@@ -1783,6 +1910,9 @@ int uvm_driver_expert_reserved_prefetch_regions_internal(const uint64_t* region_
 
             save_result(result, stats, entries);
             if (result >= 0 || !expert_reserved_prefetch_result_is_safe_to_retry(result, stats, 16, entries, count)) {
+                if (result >= 0 && fd_cache_enabled)
+                    set_cached_expert_reserved_prefetch_source_fd("driver_expert_reserved_prefetch",
+                                                                  candidate.source_fd);
                 flush_result();
                 return result;
             }

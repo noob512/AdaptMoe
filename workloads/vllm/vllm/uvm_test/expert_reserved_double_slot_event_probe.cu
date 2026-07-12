@@ -175,6 +175,22 @@ struct ExpertReservedPrefetchParams {
     unsigned int rmStatus = 0;
 };
 
+extern "C" int uvm_driver_expert_reserved_prefetch_regions(
+    const unsigned long long *region_ids,
+    const unsigned int *pool_ids,
+    const unsigned int *slot_ids,
+    const unsigned long long *slot_offsets,
+    const unsigned long long *bytes_overrides,
+    const unsigned int *flags,
+    size_t count,
+    unsigned int mode,
+    int device,
+    unsigned int async,
+    unsigned long long *stats_out,
+    size_t stats_count,
+    ExpertReservedPrefetchEntry *entries_out,
+    size_t entries_count);
+
 struct Args {
     int device = 0;
     int layers = 20;
@@ -189,6 +205,7 @@ struct Args {
     size_t slot_bytes = 4ull * 1024 * 1024;
     int spin_iters = 2000;
     bool quiet_layers = false;
+    bool use_helper = false;
 };
 
 struct RegionAlloc {
@@ -258,12 +275,14 @@ static Args parse_args(int argc, char **argv)
             args.spin_iters = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--quiet-layers") == 0)
             args.quiet_layers = true;
+        else if (std::strcmp(argv[i], "--use-helper") == 0)
+            args.use_helper = true;
         else {
             std::fprintf(stderr,
                          "usage: %s [--device N] [--layers 20] "
                          "[--offloaded-experts 3] [--bank-count 2] "
                          "[--slot-bytes 4194304] [--spin-iters N] "
-                         "[--quiet-layers]\n",
+                         "[--quiet-layers] [--use-helper]\n",
                          argv[0]);
             std::exit(2);
         }
@@ -565,7 +584,55 @@ static void invalidate_bank(int fd,
         invalidate.entries[down_index].flags = kStrictFootprint;
     }
 
-    IOCTL_CHECK(fd, kExpertReservedPrefetchIoctl, invalidate, "reserved_prefetch_invalidate_bank");
+    if (args.use_helper) {
+        const size_t count = invalidate.count;
+        std::vector<unsigned long long> region_ids(count, 0);
+        std::vector<unsigned int> pool_ids(count);
+        std::vector<unsigned int> slot_ids(count);
+        std::vector<unsigned long long> slot_offsets(count, 0);
+        std::vector<unsigned long long> bytes_overrides(count, 0);
+        std::vector<unsigned int> flags(count);
+        std::vector<ExpertReservedPrefetchEntry> entries(count);
+        unsigned long long stats[16] = {};
+
+        for (size_t i = 0; i < count; ++i) {
+            pool_ids[i] = invalidate.entries[i].pool_id;
+            slot_ids[i] = invalidate.entries[i].slot_id;
+            flags[i] = invalidate.entries[i].flags;
+        }
+
+        int result = uvm_driver_expert_reserved_prefetch_regions(
+            region_ids.data(),
+            pool_ids.data(),
+            slot_ids.data(),
+            slot_offsets.data(),
+            bytes_overrides.data(),
+            flags.data(),
+            count,
+            kReservedPrefetchModeInvalidate,
+            args.device,
+            0,
+            stats,
+            16,
+            entries.data(),
+            entries.size());
+
+        invalidate.rmStatus = (unsigned int)stats[0];
+        invalidate.success_count = (unsigned int)stats[1];
+        invalidate.failure_count = (unsigned int)stats[2];
+        invalidate.invalidated_slots = stats[7];
+        if (result < 0 || invalidate.rmStatus != 0) {
+            std::fprintf(stderr,
+                         "helper reserved_prefetch_invalidate_bank failed result=%d rmStatus=%u\n",
+                         result,
+                         invalidate.rmStatus);
+            std::exit(1);
+        }
+    }
+    else {
+        IOCTL_CHECK(fd, kExpertReservedPrefetchIoctl, invalidate, "reserved_prefetch_invalidate_bank");
+    }
+
     if (invalidate.success_count != invalidate.count ||
         invalidate.failure_count != 0 ||
         invalidate.invalidated_slots != invalidate.count) {
@@ -612,7 +679,60 @@ static void prefetch_layer_to_bank(int fd,
         prefetch.entries[down_entry].bytes_override = args.down_bytes;
     }
 
-    IOCTL_CHECK(fd, kExpertReservedPrefetchIoctl, prefetch, "reserved_prefetch_layer_bank");
+    if (args.use_helper) {
+        const size_t count = prefetch.count;
+        std::vector<unsigned long long> region_ids(count);
+        std::vector<unsigned int> pool_ids(count);
+        std::vector<unsigned int> slot_ids(count);
+        std::vector<unsigned long long> slot_offsets(count, 0);
+        std::vector<unsigned long long> bytes_overrides(count);
+        std::vector<unsigned int> flags(count);
+        std::vector<ExpertReservedPrefetchEntry> entries(count);
+        unsigned long long stats[16] = {};
+
+        for (size_t i = 0; i < count; ++i) {
+            region_ids[i] = prefetch.entries[i].region_id;
+            pool_ids[i] = prefetch.entries[i].pool_id;
+            slot_ids[i] = prefetch.entries[i].slot_id;
+            flags[i] = prefetch.entries[i].flags;
+            bytes_overrides[i] = prefetch.entries[i].bytes_override;
+        }
+
+        int result = uvm_driver_expert_reserved_prefetch_regions(
+            region_ids.data(),
+            pool_ids.data(),
+            slot_ids.data(),
+            slot_offsets.data(),
+            bytes_overrides.data(),
+            flags.data(),
+            count,
+            kReservedPrefetchModeReservedPrefetch,
+            args.device,
+            1,
+            stats,
+            16,
+            entries.data(),
+            entries.size());
+
+        prefetch.rmStatus = (unsigned int)stats[0];
+        prefetch.success_count = (unsigned int)stats[1];
+        prefetch.failure_count = (unsigned int)stats[2];
+        prefetch.accepted_bytes = stats[4];
+        prefetch.assigned_slots = stats[6];
+        prefetch.ordinary_resident_bytes = stats[9];
+        prefetch.pool_external_alloc_count = stats[10];
+        prefetch.footprint_contract_broken = stats[11];
+        if (result < 0 || prefetch.rmStatus != 0) {
+            std::fprintf(stderr,
+                         "helper reserved_prefetch_layer_bank failed result=%d rmStatus=%u\n",
+                         result,
+                         prefetch.rmStatus);
+            std::exit(1);
+        }
+    }
+    else {
+        IOCTL_CHECK(fd, kExpertReservedPrefetchIoctl, prefetch, "reserved_prefetch_layer_bank");
+    }
 
     unsigned long long expected_bytes =
         (unsigned long long)args.offloaded_experts *
@@ -667,7 +787,7 @@ int main(int argc, char **argv)
     std::printf("double_slot_event_probe_begin gpu=%s layers=%d offloaded_experts=%d "
                 "bank_count=%d slots_per_bank=%d total_slots=%d gate_bytes=%zu "
                 "down_bytes=%zu slot_bytes=%zu gate_offset=%zu down_offset=%zu "
-                "spin_iters=%d\n",
+                "spin_iters=%d use_helper=%u\n",
                 prop.name,
                 args.layers,
                 args.offloaded_experts,
@@ -679,7 +799,8 @@ int main(int argc, char **argv)
                 args.slot_bytes,
                 args.gate_offset,
                 args.down_offset,
-                args.spin_iters);
+                args.spin_iters,
+                args.use_helper ? 1u : 0u);
 
     std::vector<RegionAlloc> gate_regions;
     std::vector<RegionAlloc> down_regions;

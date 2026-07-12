@@ -20,7 +20,7 @@ void usage(const char *argv0)
 {
     std::fprintf(stderr,
                  "Usage: %s [--device N] [--alloc-mb N ...] [--touch-gpu 0|1] "
-                 "[--prefetch-gpu 0|1]\n",
+                 "[--prefetch-gpu 0|1] [--alloc-kind managed|device]\n",
                  argv0);
 }
 
@@ -64,6 +64,7 @@ int main(int argc, char **argv)
     int device = 0;
     bool do_touch_gpu = true;
     bool do_prefetch_gpu = false;
+    std::string alloc_kind = "managed";
     std::vector<size_t> alloc_bytes;
 
     for (int i = 1; i < argc; ++i) {
@@ -79,6 +80,13 @@ int main(int argc, char **argv)
         }
         else if (std::strcmp(argv[i], "--prefetch-gpu") == 0 && i + 1 < argc) {
             do_prefetch_gpu = std::atoi(argv[++i]) != 0;
+        }
+        else if (std::strcmp(argv[i], "--alloc-kind") == 0 && i + 1 < argc) {
+            alloc_kind = argv[++i];
+            if (alloc_kind != "managed" && alloc_kind != "device") {
+                usage(argv[0]);
+                return 2;
+            }
         }
         else if (std::strcmp(argv[i], "-h") == 0 ||
                  std::strcmp(argv[i], "--help") == 0) {
@@ -102,11 +110,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    std::printf("probe_begin device=%d alloc_count=%zu touch_gpu=%d prefetch_gpu=%d\n",
+    std::printf("probe_begin device=%d alloc_count=%zu touch_gpu=%d prefetch_gpu=%d alloc_kind=%s\n",
                 device,
                 alloc_bytes.size(),
                 do_touch_gpu ? 1 : 0,
-                do_prefetch_gpu ? 1 : 0);
+                do_prefetch_gpu ? 1 : 0,
+                alloc_kind.c_str());
     print_mem_info("begin");
 
     std::vector<void *> ptrs;
@@ -116,7 +125,10 @@ int main(int argc, char **argv)
         void *ptr = nullptr;
         const size_t bytes = alloc_bytes[i];
 
-        err = cudaMallocManaged(&ptr, bytes, cudaMemAttachGlobal);
+        if (alloc_kind == "device")
+            err = cudaMalloc(&ptr, bytes);
+        else
+            err = cudaMallocManaged(&ptr, bytes, cudaMemAttachGlobal);
         std::printf("probe_alloc index=%zu bytes=%zu mb=%.2f status=%s ptr=%p\n",
                     i,
                     bytes,

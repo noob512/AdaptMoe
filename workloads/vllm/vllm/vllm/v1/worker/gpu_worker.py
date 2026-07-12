@@ -222,6 +222,63 @@ class Worker(WorkerBase):
         else:
             return nullcontext()
 
+    def _maybe_get_pre_service_uvm_memory_pool_context(
+        self,
+    ) -> AbstractContextManager:
+        enabled = os.environ.get(
+            "VLLM_UVM_PRE_SERVICE_ALLOCATIONS_MANAGED",
+            "0",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if not enabled:
+            return nullcontext()
+        if self.vllm_config.model_config.enable_sleep_mode:
+            logger.warning(
+                "VLLM_UVM_PRE_SERVICE_ALLOCATIONS_MANAGED is ignored when "
+                "sleep mode is enabled."
+            )
+            return nullcontext()
+
+        from vllm.device_allocator.uvm import uvm_local_memory_pool
+
+        return uvm_local_memory_pool(enable_prefetch=True)
+
+    def _pre_service_uvm_allocations_enabled(self) -> bool:
+        return (
+            os.environ.get(
+                "VLLM_UVM_PRE_SERVICE_ALLOCATIONS_MANAGED",
+                "0",
+            ).strip().lower() in ("1", "true", "yes", "on")
+            and not self.vllm_config.model_config.enable_sleep_mode
+        )
+
+    def _maybe_get_kv_cache_uvm_memory_pool_context(
+        self,
+    ) -> AbstractContextManager:
+        enabled = os.environ.get(
+            "VLLM_UVM_KV_CACHE_MANAGED",
+            "0",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if not enabled:
+            return nullcontext()
+        if self.vllm_config.model_config.enable_sleep_mode:
+            logger.warning(
+                "VLLM_UVM_KV_CACHE_MANAGED is ignored when sleep mode is enabled."
+            )
+            return nullcontext()
+
+        from vllm.device_allocator.uvm import uvm_local_memory_pool
+
+        return uvm_local_memory_pool(enable_prefetch=True)
+
+    def _kv_cache_uvm_allocations_enabled(self) -> bool:
+        return (
+            os.environ.get(
+                "VLLM_UVM_KV_CACHE_MANAGED",
+                "0",
+            ).strip().lower() in ("1", "true", "yes", "on")
+            and not self.vllm_config.model_config.enable_sleep_mode
+        )
+
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         logger.warning(
             "UVM controlled remap debug: worker initialize_cache entered "
@@ -351,7 +408,10 @@ class Worker(WorkerBase):
         # 这里传入了 tag="weights"，意味着在这个 `with` 代码块内，
         # 所有的内存分配操作（即加载模型权重产生的 Tensor）都会被引导到
         # 专门为“模型权重”预留的内存池中，这有助于减少内存碎片，或者为了 CUDAGraph 的兼容性。
-        with self._maybe_get_memory_pool_context(tag="weights"):
+        with (
+            self._maybe_get_pre_service_uvm_memory_pool_context(),
+            self._maybe_get_memory_pool_context(tag="weights"),
+        ):
             # 真正的模型加载动作交由底层的 model_runner 去执行
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
 
@@ -394,7 +454,8 @@ class Worker(WorkerBase):
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
-            self.model_runner.profile_run()
+            with self._maybe_get_pre_service_uvm_memory_pool_context():
+                self.model_runner.profile_run()
 
             msg = (
                 f"Initial free memory {GiB(self.init_snapshot.free_memory):.2f} "
@@ -433,7 +494,8 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
-            self.model_runner.profile_run()
+            with self._maybe_get_pre_service_uvm_memory_pool_context():
+                self.model_runner.profile_run()
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
@@ -529,41 +591,55 @@ class Worker(WorkerBase):
 
         # 2. 判断是否启用了“休眠模式 (Sleep Mode)”
         # 休眠模式允许 vLLM 实例在闲置时释放物理计算资源，这是弹性计算（Elasticity）的重要特性。
-        if self.vllm_config.model_config.enable_sleep_mode:
-            # 如果启用了休眠模式，必须使用底层基于 CUDA Virtual Memory (cuMem) 的分配器。
-            # 为什么？因为常规的 PyTorch 缓存分配器无法轻易地将物理显存交还给操作系统同时保留虚拟地址。
-            # CuMem API 允许我们将虚拟显存地址与物理显存解绑（Unmap），这样在休眠时就能真正释放物理显存，
-            # 等唤醒时再重新分配物理显存并映射回原虚拟地址，上层 PyTorch 代码对此无感知。
-            from vllm.device_allocator.cumem import CuMemAllocator
+        with self._maybe_get_pre_service_uvm_memory_pool_context():
+            if self.vllm_config.model_config.enable_sleep_mode:
+                # 如果启用了休眠模式，必须使用底层基于 CUDA Virtual Memory (cuMem) 的分配器。
+                # 为什么？因为常规的 PyTorch 缓存分配器无法轻易地将物理显存交还给操作系统同时保留虚拟地址。
+                # CuMem API 允许我们将虚拟显存地址与物理显存解绑（Unmap），这样在休眠时就能真正释放物理显存，
+                # 等唤醒时再重新分配物理显存并映射回原虚拟地址，上层 PyTorch 代码对此无感知。
+                from vllm.device_allocator.cumem import CuMemAllocator
 
-            allocator = CuMemAllocator.get_instance()
-            
-            # 使用上下文管理器接管内存分配。
-            # 在这个 `with` 块内部，vLLM 分配的 KV Cache 张量会被打上 "kv_cache" 的标签，
-            # 并被路由到专门支持解绑/休眠的 CuMem 内存池中。
-            section_start = time.monotonic()
-            logger.warning(
-                "UVM controlled remap debug: initialize_kv_cache begin "
-                "allocator=cumem")
-            with allocator.use_memory_pool(tag="kv_cache"):
-                self.model_runner.initialize_kv_cache(kv_cache_config)
-            logger.warning(
-                "UVM controlled remap debug: initialize_kv_cache end "
-                "allocator=cumem elapsed=%.3fs",
-                time.monotonic() - section_start,
-            )
-        else:
-            # 如果没有启用休眠模式，则走常规的 PyTorch 默认内存分配路径分配 KV Cache。
-            section_start = time.monotonic()
-            logger.warning(
-                "UVM controlled remap debug: initialize_kv_cache begin "
-                "allocator=default")
-            self.model_runner.initialize_kv_cache(kv_cache_config)
-            logger.warning(
-                "UVM controlled remap debug: initialize_kv_cache end "
-                "allocator=default elapsed=%.3fs",
-                time.monotonic() - section_start,
-            )
+                allocator = CuMemAllocator.get_instance()
+
+                # 使用上下文管理器接管内存分配。
+                # 在这个 `with` 块内部，vLLM 分配的 KV Cache 张量会被打上 "kv_cache" 的标签，
+                # 并被路由到专门支持解绑/休眠的 CuMem 内存池中。
+                section_start = time.monotonic()
+                logger.warning(
+                    "UVM controlled remap debug: initialize_kv_cache begin "
+                    "allocator=cumem")
+                with allocator.use_memory_pool(tag="kv_cache"):
+                    self.model_runner.initialize_kv_cache(kv_cache_config)
+                logger.warning(
+                    "UVM controlled remap debug: initialize_kv_cache end "
+                    "allocator=cumem elapsed=%.3fs",
+                    time.monotonic() - section_start,
+                )
+            else:
+                # 如果没有启用休眠模式，则走常规的 PyTorch 默认内存分配路径分配 KV Cache。
+                section_start = time.monotonic()
+                allocator_name = (
+                    "pre_service_uvm"
+                    if self._pre_service_uvm_allocations_enabled()
+                    else (
+                        "kv_cache_uvm"
+                        if self._kv_cache_uvm_allocations_enabled()
+                        else "default"
+                    )
+                )
+                logger.warning(
+                    "UVM controlled remap debug: initialize_kv_cache begin "
+                    "allocator=%s",
+                    allocator_name,
+                )
+                with self._maybe_get_kv_cache_uvm_memory_pool_context():
+                    self.model_runner.initialize_kv_cache(kv_cache_config)
+                logger.warning(
+                    "UVM controlled remap debug: initialize_kv_cache end "
+                    "allocator=%s elapsed=%.3fs",
+                    allocator_name,
+                    time.monotonic() - section_start,
+                )
 
         # 3. eBPF 内存评分桥接机制 (Score Bridge) 接入
         # 当底层的物理/虚拟内存已经切切实实分配完毕后，我们需要告诉操作系统内核这块内存的存在。
@@ -592,20 +668,36 @@ class Worker(WorkerBase):
             logger.warning("UVM controlled remap debug: score_bridge skipped")
 
         # Stage M init-time placement must run on the UVM fast path too.
-        # determine_available_memory() skips profile_run() when UVM is enabled,
-        # so this is the first common point after model weights and KV cache
-        # metadata exist but before compile/kernel/sampler warmup touches MoE.
-        logger.info("UVM controlled remap boundary: Stage M init-time placement begin")
-        section_start = time.monotonic()
-        logger.warning(
-            "UVM controlled remap debug: run_uvm_init_time_weight_placement begin")
-        self.model_runner.run_uvm_init_time_weight_placement()
-        logger.warning(
-            "UVM controlled remap debug: run_uvm_init_time_weight_placement end "
-            "elapsed=%.3fs",
-            time.monotonic() - section_start,
-        )
-        logger.info("UVM controlled remap boundary: Stage M init-time placement end")
+        # determine_available_memory() skips profile_run() when UVM is enabled.
+        # By default keep the original pre-warmup placement point, but allow
+        # experiments to defer CPU migration until kernel/sampler warmup has
+        # finished so warmup/autotune does not see CPU-prefetched weights.
+        stage_m_stage = os.environ.get(
+            "VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE",
+            "pre_warmup",
+        ).strip().lower().replace("-", "_")
+        if os.environ.get(
+            "VLLM_UVM_EXPERT_RESERVED_ENABLE_AFTER_WARMUP", "0"
+        ).strip().lower() in ("1", "true", "yes", "on"):
+            os.environ["VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY"] = "0"
+        with self._maybe_get_pre_service_uvm_memory_pool_context():
+            if stage_m_stage not in ("post_warmup", "after_warmup", "deferred"):
+                logger.info("UVM controlled remap boundary: Stage M init-time placement begin")
+                section_start = time.monotonic()
+                logger.warning(
+                    "UVM controlled remap debug: run_uvm_init_time_weight_placement begin")
+                self.model_runner.run_uvm_init_time_weight_placement()
+                logger.warning(
+                    "UVM controlled remap debug: run_uvm_init_time_weight_placement end "
+                    "elapsed=%.3fs",
+                    time.monotonic() - section_start,
+                )
+                logger.info("UVM controlled remap boundary: Stage M init-time placement end")
+            else:
+                logger.info(
+                    "UVM controlled remap boundary: Stage M init-time placement "
+                    "deferred until post warmup"
+                )
         logger.warning(
             "UVM controlled remap debug: worker initialize_from_config returning "
             "elapsed=%.3fs",
@@ -645,7 +737,10 @@ class Worker(WorkerBase):
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
-            with uvm_allocation_phase(f"compile_warmup:size={size}"):
+            with (
+                self._maybe_get_pre_service_uvm_memory_pool_context(),
+                uvm_allocation_phase(f"compile_warmup:size={size}"),
+            ):
                 self.model_runner._dummy_run(
                     size,
                     skip_eplb=True,
@@ -656,14 +751,20 @@ class Worker(WorkerBase):
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
         logger.info("UVM controlled remap boundary: kernel_warmup begin")
-        with uvm_allocation_phase("kernel_warmup"):
+        with (
+            self._maybe_get_pre_service_uvm_memory_pool_context(),
+            uvm_allocation_phase("kernel_warmup"),
+        ):
             kernel_warmup(self)
         logger.info("UVM controlled remap boundary: kernel_warmup end")
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             logger.info("UVM controlled remap boundary: capture_model begin")
-            with uvm_allocation_phase("capture_model"):
+            with (
+                self._maybe_get_pre_service_uvm_memory_pool_context(),
+                uvm_allocation_phase("capture_model"),
+            ):
                 cuda_graph_memory_bytes = self.model_runner.capture_model()
             logger.info("UVM controlled remap boundary: capture_model end")
 
@@ -738,7 +839,10 @@ class Worker(WorkerBase):
             # We skip EPLB here since we don't want to record dummy metrics.
             # Keep this sampler warmup out of enabled:* serving phases.
             logger.info("UVM controlled remap boundary: sampler_warmup begin")
-            with uvm_allocation_phase("sampler_warmup"):
+            with (
+                self._maybe_get_pre_service_uvm_memory_pool_context(),
+                uvm_allocation_phase("sampler_warmup"),
+            ):
                 hidden_states, last_hidden_states = self.model_runner._dummy_run(
                     num_tokens=max_num_reqs,
                     skip_eplb=True,
@@ -753,6 +857,38 @@ class Worker(WorkerBase):
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
+        stage_m_stage = os.environ.get(
+            "VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE",
+            "pre_warmup",
+        ).strip().lower().replace("-", "_")
+        if stage_m_stage in ("post_warmup", "after_warmup", "deferred"):
+            with self._maybe_get_pre_service_uvm_memory_pool_context():
+                logger.info(
+                    "UVM controlled remap boundary: Stage M post-warmup placement begin"
+                )
+                section_start = time.monotonic()
+                logger.warning(
+                    "UVM controlled remap debug: post-warmup "
+                    "run_uvm_init_time_weight_placement begin"
+                )
+                self.model_runner.run_uvm_init_time_weight_placement()
+                logger.warning(
+                    "UVM controlled remap debug: post-warmup "
+                    "run_uvm_init_time_weight_placement end elapsed=%.3fs",
+                    time.monotonic() - section_start,
+                )
+                logger.info(
+                    "UVM controlled remap boundary: Stage M post-warmup placement end"
+                )
+            if os.environ.get(
+                "VLLM_UVM_EXPERT_RESERVED_ENABLE_AFTER_WARMUP", "0"
+            ).strip().lower() in ("1", "true", "yes", "on"):
+                os.environ["VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY"] = "1"
+                logger.info(
+                    "UVM controlled remap boundary: expert reserved runtime "
+                    "enabled after warmup"
+                )
+
         set_random_seed(self.model_config.seed)
         logger.info("UVM controlled remap boundary: compile_or_warm_up_model end")
 

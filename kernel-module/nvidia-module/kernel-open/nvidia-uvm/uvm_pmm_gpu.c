@@ -1606,6 +1606,61 @@ static NV_STATUS pick_and_evict_root_chunk_retry(uvm_pmm_gpu_t *pmm,
     return status;
 }
 
+NV_STATUS uvm_pmm_gpu_evict_root_chunk_to_free(uvm_pmm_gpu_t *pmm,
+                                               uvm_gpu_chunk_t *chunk,
+                                               NvU64 *released_bytes_out)
+{
+    uvm_gpu_root_chunk_t *root_chunk;
+    uvm_gpu_chunk_t *root;
+    NV_STATUS status = NV_OK;
+
+    if (released_bytes_out)
+        *released_bytes_out = 0;
+
+    if (!chunk)
+        return NV_OK;
+
+    if (!uvm_gpu_chunk_is_user(chunk))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    uvm_mutex_lock(&pmm->lock);
+
+    root_chunk = root_chunk_from_chunk(pmm, chunk);
+    root = &root_chunk->chunk;
+
+    if (!uvm_gpu_chunk_is_user(root)) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto unlock;
+    }
+
+    uvm_spin_lock(&pmm->list_lock);
+
+    if (!chunk_is_evictable(pmm, root)) {
+        status = NV_ERR_IN_USE;
+    }
+    else {
+        chunk_start_eviction(pmm, root);
+    }
+
+    uvm_spin_unlock(&pmm->list_lock);
+
+    if (status != NV_OK)
+        goto unlock;
+
+    status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT);
+
+unlock:
+    uvm_mutex_unlock(&pmm->lock);
+
+    if (status == NV_OK) {
+        uvm_pmm_gpu_free(pmm, &root_chunk->chunk, NULL);
+        if (released_bytes_out)
+            *released_bytes_out = UVM_CHUNK_SIZE_MAX;
+    }
+
+    return status;
+}
+
 static uvm_gpu_chunk_t *find_free_chunk_locked(uvm_pmm_gpu_t *pmm,
                                                uvm_pmm_gpu_memory_type_t type,
                                                uvm_chunk_size_t chunk_size,

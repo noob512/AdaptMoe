@@ -602,6 +602,11 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # Lifecycle state used by the UVM adaptive residency policy.
+    # never_used: the block has never been handed to a request.
+    # used_free: the block has been used before and is currently reusable.
+    # cpu_offloaded: the block is tracked as CPU-backed by later phases.
+    lifecycle_state: str = "never_used"
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:

@@ -249,6 +249,8 @@ class EngineCore:
             )
             logger.info("UVM controlled remap boundary: request_block_hasher end")
 
+        self._maybe_apply_pre_service_uvm_kv_dynamic_pool()
+
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
@@ -313,6 +315,161 @@ class EngineCore:
             scope="local",
         )
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
+
+    def _maybe_apply_pre_service_uvm_kv_dynamic_pool(self) -> None:
+        if os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_PRE_SERVICE_APPLY", "0") != "1":
+            return
+
+        target_text = (
+            os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_PRE_SERVICE_TARGET_BLOCKS", "")
+            or os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_POST_STAGE_M_TARGET_BLOCKS", "")
+            or os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_INITIAL_BLOCKS", "")
+        ).strip()
+        if not target_text:
+            logger.warning(
+                "UVM KV pre-service dynamic pool apply requested, but no target "
+                "blocks env was provided"
+            )
+            return
+
+        try:
+            target_blocks = int(target_text)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid UVM KV pre-service target blocks value: %r",
+                target_text,
+            )
+            return
+
+        kv_cache_manager = getattr(self.scheduler, "kv_cache_manager", None)
+        policy = getattr(kv_cache_manager, "uvm_kv_runtime_policy", None)
+        block_pool = getattr(kv_cache_manager, "block_pool", None)
+        if policy is None or block_pool is None:
+            logger.warning(
+                "UVM KV pre-service dynamic pool apply skipped: "
+                "policy or block pool unavailable"
+            )
+            return
+
+        logger.info(
+            "UVM controlled remap boundary: pre-service KV dynamic pool apply "
+            "begin target_blocks=%d",
+            target_blocks,
+        )
+        result = self._apply_uvm_kv_dynamic_pool_target(
+            target_blocks,
+            policy=policy,
+            block_pool=block_pool,
+            reason="pre_service_before_ready",
+            metadata={
+                "source": "engine_core_pre_ready",
+                "ready_handshake_sent": False,
+            },
+        )
+        logger.info(
+            "UVM controlled remap boundary: pre-service KV dynamic pool apply "
+            "end result=%s",
+            result,
+        )
+
+        grow_text = (
+            os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_PRE_SERVICE_GROW_TARGET_BLOCKS", "")
+            or os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_POST_STAGE_M_GROW_TARGET_BLOCKS", "")
+        ).strip()
+        if not grow_text:
+            return
+
+        try:
+            grow_target_blocks = int(grow_text)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid UVM KV pre-service grow target blocks value: %r",
+                grow_text,
+            )
+            return
+
+        if grow_target_blocks <= 0:
+            return
+
+        if grow_target_blocks == target_blocks:
+            return
+
+        logger.info(
+            "UVM controlled remap boundary: pre-service KV dynamic pool grow "
+            "begin target_blocks=%d",
+            grow_target_blocks,
+        )
+        grow_result = self._apply_uvm_kv_dynamic_pool_target(
+            grow_target_blocks,
+            policy=policy,
+            block_pool=block_pool,
+            reason="pre_service_before_ready_grow",
+            metadata={
+                "source": "engine_core_pre_ready_grow",
+                "ready_handshake_sent": False,
+                "previous_target_blocks": target_blocks,
+            },
+        )
+        logger.info(
+            "UVM controlled remap boundary: pre-service KV dynamic pool grow "
+            "end result=%s",
+            grow_result,
+        )
+
+    def _apply_uvm_kv_dynamic_pool_target(
+        self,
+        target_blocks: int,
+        *,
+        policy: Any,
+        block_pool: Any,
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return policy.apply_unified_kv_target_blocks(
+            target_blocks,
+            block_pool=block_pool,
+            reason=reason,
+            metadata=metadata,
+        )
+
+    def apply_uvm_kv_dynamic_pool_target(
+        self,
+        target_blocks: int,
+        reason: str = "manual_utility",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        kv_cache_manager = getattr(self.scheduler, "kv_cache_manager", None)
+        policy = getattr(kv_cache_manager, "uvm_kv_runtime_policy", None)
+        block_pool = getattr(kv_cache_manager, "block_pool", None)
+        if policy is None or block_pool is None:
+            return {
+                "ok": False,
+                "reason": "policy_or_block_pool_unavailable",
+                "requested_target_blocks": int(target_blocks),
+            }
+
+        logger.info(
+            "UVM controlled remap boundary: utility KV dynamic pool apply "
+            "begin target_blocks=%d reason=%s",
+            int(target_blocks),
+            reason,
+        )
+        result = self._apply_uvm_kv_dynamic_pool_target(
+            int(target_blocks),
+            policy=policy,
+            block_pool=block_pool,
+            reason=reason,
+            metadata={
+                "source": "engine_core_utility",
+                **(metadata or {}),
+            },
+        )
+        logger.info(
+            "UVM controlled remap boundary: utility KV dynamic pool apply "
+            "end result=%s",
+            result,
+        )
+        return result
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks

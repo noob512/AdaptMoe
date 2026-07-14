@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "description": "Minimal fixture for manual KV fault diagnosis",
+    "num_requests": 1
+  },
+  "requests": [
+    {
+      "max_tokens": 16,
+      "prompt": "Summarize why deterministic cache residency matters in one short paragraph.",
+      "request": 0
+    }
+  ]
+}

@@ -1693,7 +1693,7 @@ typedef struct
     NvU32 state;                           // OUT, UVM_EXPERT_RESERVED_POOL_SLOT_STATE
     NvU32 chunk_count;                     // OUT, number of PMM chunks backing the slot
     NvU64 slot_bytes NV_ALIGN_BYTES(8);    // IN/OUT, logical bytes requested for this slot
-    NvU64 physical_bytes NV_ALIGN_BYTES(8);// OUT, chunk_count * UVM_CHUNK_SIZE_MAX
+    NvU64 physical_bytes NV_ALIGN_BYTES(8);// OUT, chunk_count * PMM chunk size
     NvU64 epoch NV_ALIGN_BYTES(8);         // OUT, pool epoch when this slot was last updated
     NvU64 first_chunk_address NV_ALIGN_BYTES(8); // OUT, debug physical address of first chunk
     NvU64 last_chunk_address NV_ALIGN_BYTES(8);  // OUT, debug physical address of last chunk
@@ -1802,6 +1802,43 @@ typedef struct
     UVM_EXPERT_RESERVED_PREFETCH_ENTRY entries[UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES]; // IN/OUT
     NV_STATUS rmStatus;                              // OUT
 } UVM_EXPERT_RESERVED_PREFETCH_BATCH_PARAMS;
+
+//
+// UvmExpertOffloadRelease
+//
+// Experimental targeted offload+release path for MoE experts. The managed VA
+// range remains valid, but GPU PMM chunks backing the registered region are
+// evicted through normal VA-block eviction and returned to PMM free lists.
+//
+#define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT                (1U << 0)
+#define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_STRICT_2M_BLOCKS              (1U << 1)
+#define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K                  (1U << 2)
+
+#define UVM_EXPERT_OFFLOAD_RELEASE                                   UVM_IOCTL_BASE(100)
+typedef struct
+{
+    NvU64 region_id NV_ALIGN_BYTES(8);       // IN, phase_f registered region id
+    NvProcessorUuid gpu_uuid;                // IN, target GPU
+    NvU32 flags;                             // IN, UVM_EXPERT_OFFLOAD_RELEASE_FLAG_*
+    NvU32 max_blocks;                        // IN, 0 means no explicit cap
+    NvU32 pool;                              // OUT
+    NvU32 layer_id;                          // OUT
+    NvU32 expert_id;                         // OUT
+    NvU32 role;                              // OUT
+    NvU64 base NV_ALIGN_BYTES(8);            // OUT
+    NvU64 length NV_ALIGN_BYTES(8);          // OUT
+    NvU64 block_count NV_ALIGN_BYTES(8);     // OUT, existing VA blocks scanned
+    NvU32 attempted_blocks;                  // OUT
+    NvU32 success_blocks;                    // OUT
+    NvU32 failure_blocks;                    // OUT
+    NvU32 skipped_blocks;                    // OUT
+    NvU64 attempted_bytes NV_ALIGN_BYTES(8); // OUT
+    NvU64 released_bytes NV_ALIGN_BYTES(8);  // OUT, PMM root chunk bytes freed
+    NvU64 failed_bytes NV_ALIGN_BYTES(8);    // OUT
+    NvU64 first_failed_block NV_ALIGN_BYTES(8); // OUT
+    NV_STATUS first_error;                   // OUT
+    NV_STATUS rmStatus;                      // OUT
+} UVM_EXPERT_OFFLOAD_RELEASE_PARAMS;
 
 //
 // UvmDiscard

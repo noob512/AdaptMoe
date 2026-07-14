@@ -85,6 +85,7 @@ struct Config {
     int expert_regions = 5;
     int kv_regions = 2;
     int async = 0;
+    int low_rebalance = 0;
 };
 
 __global__ void fill_u4_kernel(uint4 *data, size_t count, unsigned int seed)
@@ -155,7 +156,8 @@ void usage(const char *argv0)
 {
     std::fprintf(stderr,
                  "Usage: %s [--device N] [--region-mib N] "
-                 "[--expert-regions N] [--kv-regions N] [--async 0|1]\n",
+                 "[--expert-regions N] [--kv-regions N] [--async 0|1] "
+                 "[--low-rebalance 0|1]\n",
                  argv0);
 }
 
@@ -307,6 +309,10 @@ int main(int argc, char **argv)
             if (!parse_int(argv[++i], &cfg.async))
                 return 2;
         }
+        else if (std::strcmp(argv[i], "--low-rebalance") == 0 && i + 1 < argc) {
+            if (!parse_int(argv[++i], &cfg.low_rebalance))
+                return 2;
+        }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -344,15 +350,19 @@ int main(int argc, char **argv)
 
     uint64_t dyn[8] = {};
     uint64_t dyn_after[8] = {};
+    uint64_t dyn_low[8] = {};
     uint64_t kv_pool_initial[kPoolValues] = {};
     uint64_t expert_pool_initial[kPoolValues] = {};
     uint64_t kv_pool_after[kPoolValues] = {};
     uint64_t expert_pool_after[kPoolValues] = {};
+    uint64_t kv_pool_low[kPoolValues] = {};
+    uint64_t expert_pool_low[kPoolValues] = {};
     uint64_t expert_victim_before[kQueryValues] = {};
     uint64_t expert_victim_after[kQueryValues] = {};
     uint64_t kv_tail_before[kQueryValues] = {};
     uint64_t kv_tail_after[kQueryValues] = {};
     uint64_t reclaim[kReclaimValues] = {};
+    uint64_t kv_reclaim_low[kReclaimValues] = {};
 
     std::printf("phase_n_3gb_begin device=%d region_mib=%zu expert_regions=%d kv_regions=%d total_budget=%llu\n",
                 cfg.device,
@@ -540,6 +550,43 @@ int main(int argc, char **argv)
     if (!failed)
         print_pool("after_rebalance", kv_pool_after, expert_pool_after);
 
+    if (!failed && cfg.low_rebalance) {
+        failed = run_step("set-low-budget",
+                          uvm_driver_phase_n_set_dynamic_budgets(0,
+                                                                 3,
+                                                                 total_budget,
+                                                                 0,
+                                                                 0,
+                                                                 kv_initial_budget,
+                                                                 expert_initial_budget,
+                                                                 0,
+                                                                 kModeEnforce,
+                                                                 0,
+                                                                 dyn_low,
+                                                                 8));
+    }
+
+    if (!failed && cfg.low_rebalance) {
+        failed = run_step("reclaim-kv-tail-low",
+                          uvm_driver_phase_n_reclaim_region(kKvRegionBase + 1,
+                                                            0,
+                                                            cfg.async ? 1 : 0,
+                                                            0,
+                                                            0,
+                                                            4,
+                                                            kv_reclaim_low,
+                                                            kReclaimValues));
+    }
+    if (!failed && cfg.low_rebalance)
+        print_reclaim("kv_tail_low", kv_reclaim_low);
+
+    if (!failed && cfg.low_rebalance)
+        failed = run_step("pool-kv-low", uvm_driver_phase_n_get_pool_state(kPoolKv, 0, kv_pool_low, kPoolValues));
+    if (!failed && cfg.low_rebalance)
+        failed = run_step("pool-expert-low", uvm_driver_phase_n_get_pool_state(kPoolExpert, 0, expert_pool_low, kPoolValues));
+    if (!failed && cfg.low_rebalance)
+        print_pool("low_rebalance", kv_pool_low, expert_pool_low);
+
     if (!failed) {
         float compute_ms = read_active(expert_base + region_bytes,
                                        expert_span - region_bytes,
@@ -593,6 +640,24 @@ int main(int argc, char **argv)
                     static_cast<unsigned long long>(kv_pool_after[1]),
                     static_cast<unsigned long long>(expert_pool_after[1]),
                     static_cast<unsigned long long>(kv_pool_after[1] + expert_pool_after[1]));
+        if (cfg.low_rebalance) {
+            const bool low_budget_ok = kv_pool_low[0] == kv_initial_budget &&
+                                       expert_pool_low[0] == expert_initial_budget;
+            const bool kv_low_after_ok = kv_pool_low[1] < kv_pool_after[1];
+            const bool u2_total_ok = total_ok && low_budget_ok && kv_low_after_ok;
+            std::printf("phase_n_3gb_u2_final low_budget_ok=%u kv_low_after_ok=%u total_ok=%u kv_resident_initial=%llu kv_resident_high=%llu kv_resident_low=%llu expert_resident_initial=%llu expert_resident_high=%llu expert_resident_low=%llu\n",
+                        low_budget_ok ? 1 : 0,
+                        kv_low_after_ok ? 1 : 0,
+                        u2_total_ok ? 1 : 0,
+                        static_cast<unsigned long long>(kv_pool_initial[1]),
+                        static_cast<unsigned long long>(kv_pool_after[1]),
+                        static_cast<unsigned long long>(kv_pool_low[1]),
+                        static_cast<unsigned long long>(expert_pool_initial[1]),
+                        static_cast<unsigned long long>(expert_pool_after[1]),
+                        static_cast<unsigned long long>(expert_pool_low[1]));
+            if (!u2_total_ok)
+                failed = 1;
+        }
         if (!total_ok)
             failed = 1;
     }

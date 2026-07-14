@@ -276,6 +276,25 @@ class ExpertReservedRegionsExecutor:
                     "bytes": item.bytes,
                 })
                 return 0
+            if (
+                item.metadata.get("stage")
+                in ("uvm_2mb_envelope", "uvm_chunk_envelope")
+                and queried_state.ptr == desired.ptr
+                and queried_state.bytes == desired.bytes
+            ):
+                self._registered_regions[int(item.driver_region_id)] = desired
+                item.metadata["driver_registered"] = True
+                item.metadata["driver_cpu_offloaded_reserved_registered"] = True
+                _append_debug_trace({
+                    "action": "reserved_debug_register_region_envelope_va_cached",
+                    "region_id": item.region_id,
+                    "driver_region_id": item.driver_region_id,
+                    "ptr": f"0x{item.ptr:x}",
+                    "bytes": item.bytes,
+                    "queried": queried,
+                    "desired": desired.__dict__,
+                })
+                return 0
 
         should_unregister = (
             bool(item.metadata.get("driver_registered"))
@@ -950,7 +969,7 @@ class ExpertReservedRegionsExecutor:
             strict_footprint=self.strict_footprint,
             mode="reserved_prefetch",
             prefer_existing=True,
-            return_entries=False,
+            return_entries=True,
         )
         _append_debug_trace({
             "action": "reserved_debug_prefetch_ioctl_exit",
@@ -1318,7 +1337,7 @@ class ExpertReservedRegionsExecutor:
 
 
 _EXECUTOR_LOCK = threading.Lock()
-_EXECUTORS: dict[tuple[int, int, int], ExpertReservedRegionsExecutor] = {}
+_EXECUTORS: dict[tuple[int, int, int, int], ExpertReservedRegionsExecutor] = {}
 
 
 def get_expert_reserved_regions_executor(
@@ -1370,7 +1389,12 @@ def get_expert_reserved_regions_executor(
         True,
     )
 
-    key = (int(device), resolved_pool_id, max(resolved_slot_count, 0))
+    key = (
+        int(device),
+        resolved_pool_id,
+        max(resolved_slot_count, 0),
+        max(resolved_slot_bytes, 0),
+    )
     with _EXECUTOR_LOCK:
         executor = _EXECUTORS.get(key)
         if executor is None:

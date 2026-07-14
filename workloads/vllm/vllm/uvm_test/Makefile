@@ -24,7 +24,7 @@ NVCCFLAGS = -Xcompiler -fPIC -O2 -std=c++17
 LDFLAGS = -shared -L$(CUDA_LIB) -lcudart -ldl
 
 # Targets
-all: uvm_allocator.so libcudamalloc_managed.so libuvm_managed_budget.so phase_f_smoke managed_pool_probe expert_reserved_fault_probe expert_reserved_double_slot_event_probe expert_reclaim_slot_smoke expert_offload_release_smoke expert_reserved_no_fault_probe
+all: uvm_allocator.so libcudamalloc_managed.so libuvm_managed_budget.so phase_f_smoke managed_pool_probe expert_reserved_fault_probe expert_reserved_double_slot_event_probe expert_reclaim_slot_smoke expert_offload_release_smoke expert_offload_slot_reuse_smoke expert_reserved_no_fault_probe manual_migration_fault_probe
 
 # PyTorch pluggable allocator (same as before)
 uvm: uvm_allocator.so
@@ -56,7 +56,13 @@ expert_reclaim_slot_smoke: expert_reclaim_slot_smoke.cu
 expert_offload_release_smoke: expert_offload_release_smoke.cu
 	$(NVCC) -O2 -std=c++17 -I$(CUDA_INCLUDE) -o $@ $< -L$(CUDA_LIB) -lcudart -ldl
 
+expert_offload_slot_reuse_smoke: expert_offload_slot_reuse_smoke.cu
+	$(NVCC) -O2 -std=c++17 -I$(CUDA_INCLUDE) -o $@ $< -L$(CUDA_LIB) -lcudart -ldl
+
 expert_reserved_no_fault_probe: expert_reserved_no_fault_probe.cu
+	$(NVCC) -O2 -std=c++17 -I$(CUDA_INCLUDE) -o $@ $< -L$(CUDA_LIB) -lcudart -ldl
+
+manual_migration_fault_probe: manual_migration_fault_probe.cu
 	$(NVCC) -O2 -std=c++17 -I$(CUDA_INCLUDE) -o $@ $< -L$(CUDA_LIB) -lcudart -ldl
 
 # LD_PRELOAD library to intercept all cudaMalloc calls
@@ -74,6 +80,6 @@ managed_pool_probe: managed_pool_probe.cu
 	$(NVCC) -O2 -std=c++17 -o $@ $< -lcudart
 
 clean:
-	rm -f uvm_allocator.so libcudamalloc_managed.so libuvm_managed_budget.so phase_f_smoke phase_n_operator_sim phase_n_object_mapping_smoke phase_n_3gb_rebalance_smoke managed_pool_probe expert_reserved_fault_probe expert_reserved_double_slot_event_probe expert_reclaim_slot_smoke expert_offload_release_smoke expert_reserved_no_fault_probe
+	rm -f uvm_allocator.so libcudamalloc_managed.so libuvm_managed_budget.so phase_f_smoke phase_n_operator_sim phase_n_object_mapping_smoke phase_n_3gb_rebalance_smoke managed_pool_probe expert_reserved_fault_probe expert_reserved_double_slot_event_probe expert_reclaim_slot_smoke expert_offload_release_smoke expert_offload_slot_reuse_smoke expert_reserved_no_fault_probe manual_migration_fault_probe
 
 .PHONY: all uvm preload budget clean

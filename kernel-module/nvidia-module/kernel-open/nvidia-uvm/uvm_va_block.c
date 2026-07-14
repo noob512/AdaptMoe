@@ -7142,6 +7142,7 @@ static void block_gpu_pte_write_moe_user_backing_4k(uvm_va_block_t *target_block
 
 static NV_STATUS reserved_slot_chunk_from_offset(uvm_gpu_chunk_t **slot_chunks,
                                                  NvU32 slot_chunk_count,
+                                                 NvU32 slot_chunk_size,
                                                  NvU64 slot_offset,
                                                  uvm_gpu_chunk_t **chunk_out,
                                                  NvU64 *chunk_offset_out)
@@ -7149,13 +7150,16 @@ static NV_STATUS reserved_slot_chunk_from_offset(uvm_gpu_chunk_t **slot_chunks,
     NvU64 chunk_index;
     NvU64 chunk_offset;
 
-    if (!slot_chunks || slot_chunk_count == 0)
+    if (!slot_chunks || slot_chunk_count == 0 || slot_chunk_size == 0)
         return NV_ERR_INVALID_ARGUMENT;
 
-    chunk_index = slot_offset / UVM_CHUNK_SIZE_MAX;
-    chunk_offset = slot_offset % UVM_CHUNK_SIZE_MAX;
+    if (!is_power_of_2(slot_chunk_size) || !IS_ALIGNED(slot_chunk_size, PAGE_SIZE))
+        return NV_ERR_INVALID_ARGUMENT;
 
-    if (chunk_index >= slot_chunk_count || chunk_offset + PAGE_SIZE > UVM_CHUNK_SIZE_MAX)
+    chunk_index = slot_offset / slot_chunk_size;
+    chunk_offset = slot_offset % slot_chunk_size;
+
+    if (chunk_index >= slot_chunk_count || chunk_offset + PAGE_SIZE > slot_chunk_size)
         return NV_ERR_INVALID_ARGUMENT;
 
     if (!slot_chunks[chunk_index])
@@ -7178,6 +7182,7 @@ static void block_gpu_pte_write_reserved_chunk_4k(uvm_va_block_t *block,
                                                   const uvm_page_mask_t *write_page_mask,
                                                   uvm_gpu_chunk_t **slot_chunks,
                                                   NvU32 slot_chunk_count,
+                                                  NvU32 slot_chunk_size,
                                                   NvU64 slot_offset,
                                                   uvm_pte_batch_t *pte_batch,
                                                   uvm_tlb_batch_t *tlb_batch)
@@ -7208,6 +7213,7 @@ static void block_gpu_pte_write_reserved_chunk_4k(uvm_va_block_t *block,
 
         if (reserved_slot_chunk_from_offset(slot_chunks,
                                             slot_chunk_count,
+                                            slot_chunk_size,
                                             page_slot_offset,
                                             &chunk,
                                             &chunk_offset) != NV_OK) {
@@ -10963,6 +10969,7 @@ static NV_STATUS block_copy_cpu_pages_to_reserved_locked(uvm_va_block_t *va_bloc
                                                          int cpu_nid,
                                                          uvm_gpu_chunk_t **slot_chunks,
                                                          NvU32 slot_chunk_count,
+                                                         NvU32 slot_chunk_size,
                                                          NvU64 slot_offset,
                                                          uvm_tracker_t *out_tracker,
                                                          NvU64 *copied_bytes_out)
@@ -10996,6 +11003,7 @@ static NV_STATUS block_copy_cpu_pages_to_reserved_locked(uvm_va_block_t *va_bloc
 
         status = reserved_slot_chunk_from_offset(slot_chunks,
                                                  slot_chunk_count,
+                                                 slot_chunk_size,
                                                  page_slot_offset,
                                                  &chunk,
                                                  &chunk_offset);
@@ -11037,6 +11045,7 @@ static NV_STATUS block_map_reserved_readonly_locked(uvm_va_block_t *va_block,
                                                     const uvm_page_mask_t *pages_to_map,
                                                     uvm_gpu_chunk_t **slot_chunks,
                                                     NvU32 slot_chunk_count,
+                                                    NvU32 slot_chunk_size,
                                                     NvU64 slot_offset,
                                                     uvm_tracker_t *out_tracker)
 {
@@ -11104,6 +11113,7 @@ static NV_STATUS block_map_reserved_readonly_locked(uvm_va_block_t *va_block,
                                           pages_to_map,
                                           slot_chunks,
                                           slot_chunk_count,
+                                          slot_chunk_size,
                                           slot_offset,
                                           pte_batch,
                                           tlb_batch);
@@ -11145,6 +11155,7 @@ NV_STATUS uvm_va_block_copy_and_map_reserved_readonly(uvm_va_block_t *va_block,
                                                      const uvm_page_mask_t *page_mask,
                                                      uvm_gpu_chunk_t **slot_chunks,
                                                      NvU32 slot_chunk_count,
+                                                     NvU32 slot_chunk_size,
                                                      NvU64 slot_offset,
                                                      NvU64 slot_bytes,
                                                      uvm_tracker_t *out_tracker,
@@ -11164,10 +11175,13 @@ NV_STATUS uvm_va_block_copy_and_map_reserved_readonly(uvm_va_block_t *va_block,
     if (copied_bytes_out)
         *copied_bytes_out = 0;
 
-    if (!gpu || !slot_chunks || slot_chunk_count == 0)
+    if (!gpu || !slot_chunks || slot_chunk_count == 0 || slot_chunk_size == 0)
         return NV_ERR_INVALID_STATE;
 
     if (!IS_ALIGNED(slot_offset, PAGE_SIZE))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    if (!is_power_of_2(slot_chunk_size) || !IS_ALIGNED(slot_chunk_size, PAGE_SIZE))
         return NV_ERR_INVALID_ARGUMENT;
 
     if (uvm_va_block_is_hmm(va_block) || g_uvm_global.conf_computing_enabled)
@@ -11201,6 +11215,7 @@ NV_STATUS uvm_va_block_copy_and_map_reserved_readonly(uvm_va_block_t *va_block,
                                                      cpu_nid,
                                                      slot_chunks,
                                                      slot_chunk_count,
+                                                     slot_chunk_size,
                                                      slot_offset,
                                                      out_tracker,
                                                      copied_bytes_out);
@@ -11213,6 +11228,7 @@ NV_STATUS uvm_va_block_copy_and_map_reserved_readonly(uvm_va_block_t *va_block,
                                               pages_to_map,
                                               slot_chunks,
                                               slot_chunk_count,
+                                              slot_chunk_size,
                                               slot_offset,
                                               out_tracker);
 }
@@ -17340,6 +17356,153 @@ done:
 static void block_add_eviction_mappings_entry(void *args)
 {
     UVM_ENTRY_VOID(block_add_eviction_mappings(args));
+}
+
+static bool block_regions_intersect(uvm_va_block_region_t a, uvm_va_block_region_t b)
+{
+    return a.first < b.outer && b.first < a.outer;
+}
+
+static NV_STATUS block_make_release_region_cpu_resident(uvm_va_block_t *va_block,
+                                                        struct mm_struct *mm,
+                                                        uvm_va_block_region_t region,
+                                                        uvm_tracker_t *tracker)
+{
+    NV_STATUS status;
+    uvm_service_block_context_t *service_context;
+
+    service_context = uvm_service_block_context_alloc(mm);
+    if (!service_context)
+        return NV_ERR_NO_MEMORY;
+
+    status = uvm_va_block_migrate_locked(va_block,
+                                         NULL,
+                                         service_context,
+                                         region,
+                                         UVM_ID_CPU,
+                                         UVM_MIGRATE_MODE_MAKE_RESIDENT_AND_MAP,
+                                         tracker);
+
+    uvm_service_block_context_free(service_context);
+    return status;
+}
+
+NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
+                                                    struct mm_struct *mm,
+                                                    uvm_gpu_t *gpu,
+                                                    uvm_va_block_region_t region,
+                                                    uvm_chunk_size_t release_chunk_size,
+                                                    uvm_tracker_t *tracker,
+                                                    NvU64 *released_bytes_out)
+{
+    NV_STATUS status;
+    NvU64 released_bytes = 0;
+    NvU32 i;
+    size_t num_gpu_chunks;
+    uvm_va_block_gpu_state_t *gpu_state;
+    uvm_va_block_region_t chunk_region;
+    uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
+
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    if (released_bytes_out)
+        *released_bytes_out = 0;
+
+    if (!gpu || !is_power_of_2(release_chunk_size) || !IS_ALIGNED(release_chunk_size, PAGE_SIZE))
+        return NV_ERR_INVALID_ARGUMENT;
+
+    if (uvm_va_block_is_hmm(va_block) || g_uvm_global.conf_computing_enabled)
+        return NV_ERR_NOT_SUPPORTED;
+
+    if (!uvm_va_block_region_contains_region(uvm_va_block_region_from_block(va_block), region) ||
+        uvm_va_block_region_size(region) == 0) {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    if (!(gpu->pmm.chunk_sizes[UVM_PMM_GPU_MEMORY_TYPE_USER] & release_chunk_size))
+        return NV_ERR_NOT_SUPPORTED;
+
+    status = UVM_VA_BLOCK_RETRY_LOCKED(va_block,
+                                       NULL,
+                                       block_make_release_region_cpu_resident(va_block,
+                                                                             mm,
+                                                                             region,
+                                                                             &local_tracker));
+    if (status != NV_OK)
+        goto out;
+
+    gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    if (!gpu_state || !gpu_state->chunks)
+        goto out;
+
+    if (!uvm_page_mask_region_full(&va_block->cpu.resident, region)) {
+        status = NV_WARN_MORE_PROCESSING_REQUIRED;
+        goto out;
+    }
+
+    if (!uvm_page_mask_region_empty(&gpu_state->resident, region) ||
+        !uvm_page_mask_region_empty(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ], region) ||
+        !uvm_page_mask_region_empty(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE], region) ||
+        !uvm_page_mask_region_empty(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_ATOMIC], region) ||
+        !uvm_page_mask_region_empty(&gpu_state->moe_slot_pte_bits, region)) {
+        status = NV_ERR_INVALID_STATE;
+        goto out;
+    }
+
+    num_gpu_chunks = block_num_gpu_chunks(va_block, gpu);
+    chunk_region.outer = 0;
+
+    for (i = 0; i < num_gpu_chunks; ++i) {
+        uvm_chunk_size_t chunk_size;
+        size_t chunk_index = block_gpu_chunk_index(va_block, gpu, chunk_region.outer, &chunk_size);
+        uvm_gpu_chunk_t *chunk;
+
+        UVM_ASSERT(chunk_index == i);
+
+        chunk_region.first = chunk_region.outer;
+        chunk_region.outer = chunk_region.first + chunk_size / PAGE_SIZE;
+
+        if (!block_regions_intersect(region, chunk_region))
+            continue;
+
+        if (!uvm_va_block_region_contains_region(region, chunk_region)) {
+            status = NV_ERR_NOT_SUPPORTED;
+            goto out;
+        }
+
+        if (chunk_size != release_chunk_size) {
+            status = NV_ERR_NOT_SUPPORTED;
+            goto out;
+        }
+
+        chunk = gpu_state->chunks[i];
+        if (!chunk)
+            continue;
+
+        uvm_mmu_chunk_unmap(chunk, &va_block->tracker);
+        gpu_state->chunks[i] = NULL;
+        uvm_pmm_gpu_free(&gpu->pmm, chunk, &va_block->tracker);
+        released_bytes += chunk_size;
+    }
+
+    if (released_bytes > 0)
+        uvm_processor_mask_clear(&va_block->ever_fully_resident, gpu->id);
+
+out:
+    if (status == NV_OK)
+        status = uvm_tracker_add_tracker_safe(&va_block->tracker, &local_tracker);
+    else
+        (void)uvm_tracker_add_tracker_safe(&va_block->tracker, &local_tracker);
+
+    if (tracker && tracker != &va_block->tracker && status == NV_OK)
+        status = uvm_tracker_add_tracker_safe(tracker, &local_tracker);
+
+    uvm_tracker_deinit(&local_tracker);
+
+    if (status == NV_OK && released_bytes_out)
+        *released_bytes_out = released_bytes;
+
+    return status;
 }
 
 NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,

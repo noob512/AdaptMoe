@@ -619,6 +619,86 @@ class UvmPoolResidencyManager:
             self._sync_driver_pool_budgets_locked(force=True)
             return dict(self._driver_pool_budget_status)
 
+    def set_driver_pool_budget(
+        self,
+        pool: str,
+        budget_bytes: int,
+        *,
+        gpu_id: int = 0,
+        mode: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        pool_name = _normalize_driver_pool_name(pool)
+        pool_id = DRIVER_POOL_IDS.get(pool_name)
+        budget = max(int(budget_bytes or 0), 0)
+        metadata = metadata or {}
+        if pool_id is None or pool_name == "unknown":
+            return {
+                "ok": False,
+                "pool": pool_name,
+                "budget_bytes": budget,
+                "status": -2,
+                "reason": "unknown_pool",
+            }
+        budget_mode = self.driver_pool_budget_mode if mode is None else max(int(mode), 0)
+
+        try:
+            from vllm.device_allocator.uvm import driver_set_pool_budget
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            result = {
+                "ok": False,
+                "pool": pool_name,
+                "pool_id": pool_id,
+                "budget_bytes": budget,
+                "gpu_id": max(int(gpu_id or 0), 0),
+                "mode": budget_mode,
+                "status": -3,
+                "reason": "import_failed",
+                "error": repr(exc),
+            }
+            with self._lock:
+                self._record_config_locked()
+                self._driver_pool_budget_status[pool_name] = -3
+                self._write_locked(
+                    {
+                        "action": "residency_driver_pool_budget_update",
+                        **result,
+                        "metadata": metadata,
+                    }
+                )
+            return result
+
+        status = driver_set_pool_budget(
+            pool=pool_id,
+            budget_bytes=budget,
+            gpu_id=max(int(gpu_id or 0), 0),
+            mode=budget_mode,
+        )
+        result = {
+            "ok": status >= 0,
+            "pool": pool_name,
+            "pool_id": pool_id,
+            "budget_bytes": budget,
+            "gpu_id": max(int(gpu_id or 0), 0),
+            "mode": budget_mode,
+            "status": status,
+            "reason": "updated" if status >= 0 else f"driver_set_failed:{status}",
+        }
+        with self._lock:
+            self._record_config_locked()
+            self.pool_budgets[pool_name] = budget
+            self.driver_pool_budget_overrides[pool_name] = budget
+            self._driver_pool_budget_status[pool_name] = status
+            self._write_locked(
+                {
+                    "action": "residency_driver_pool_budget_update",
+                    **result,
+                    "metadata": metadata,
+                }
+            )
+            self._record_summary_locked()
+        return result
+
     def driver_pool_state_snapshot(self, gpu_id: int = 0) -> dict[str, Any]:
         with self._lock:
             self._record_config_locked()
@@ -1129,22 +1209,14 @@ class UvmPoolResidencyManager:
             region = self._regions.get(region_id)
             if region is None:
                 return None
-            return {
-                "region_id": region.region_id,
-                "driver_region_id": region.driver_region_id,
-                "driver_registered": region.driver_registered,
-                "driver_register_status": region.driver_register_status,
-                "pool": region.pool,
-                "ptr": region.ptr,
-                "bytes": region.bytes,
-                "state": region.state,
-                "estimated_gpu_resident": region.estimated_gpu_resident,
-                "evictable": region.evictable,
-                "active": region.active,
-                "last_access_step": region.last_access_step,
-                "last_state_update_ts": region.last_state_update_ts,
-                "metadata": dict(region.metadata),
-            }
+            return self._region_snapshot_locked(region)
+
+    def regions_snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                self._region_snapshot_locked(region)
+                for region in self._regions.values()
+            ]
 
     def record_action(
         self,
@@ -1519,6 +1591,13 @@ class UvmPoolResidencyManager:
             self._summary["driver_tag_register_skips"] += 1
             record["reason"] = "moe_parent_skipped_for_expert_slices"
             return record
+        if bool(region.metadata.get("driver_tag_skip")):
+            self._summary["driver_tag_register_skips"] += 1
+            record["reason"] = (
+                region.metadata.get("driver_tag_skip_reason")
+                or "metadata_driver_tag_skip"
+            )
+            return record
         if (
             self.driver_tag_require_managed
             and region.metadata.get("driver_capable") is False
@@ -1841,6 +1920,27 @@ class UvmPoolResidencyManager:
             **self._summary,
         }
 
+    def _region_snapshot_locked(
+        self,
+        region: UvmResidencyRegion,
+    ) -> dict[str, Any]:
+        return {
+            "region_id": region.region_id,
+            "driver_region_id": region.driver_region_id,
+            "driver_registered": region.driver_registered,
+            "driver_register_status": region.driver_register_status,
+            "pool": region.pool,
+            "ptr": region.ptr,
+            "bytes": region.bytes,
+            "state": region.state,
+            "estimated_gpu_resident": region.estimated_gpu_resident,
+            "evictable": region.evictable,
+            "active": region.active,
+            "last_access_step": region.last_access_step,
+            "last_state_update_ts": region.last_state_update_ts,
+            "metadata": dict(region.metadata),
+        }
+
     def _global_estimated_bytes_locked(self) -> int:
         return sum(self._pool_estimated_bytes.values())
 
@@ -2095,6 +2195,23 @@ def sync_uvm_driver_pool_budgets() -> dict[str, int]:
     return get_uvm_pool_residency_manager().sync_driver_pool_budgets()
 
 
+def set_uvm_driver_pool_budget(
+    pool: str,
+    budget_bytes: int,
+    *,
+    gpu_id: int = 0,
+    mode: int | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return get_uvm_pool_residency_manager().set_driver_pool_budget(
+        pool,
+        budget_bytes,
+        gpu_id=gpu_id,
+        mode=mode,
+        metadata=metadata,
+    )
+
+
 def get_uvm_driver_pool_state_snapshot(gpu_id: int = 0) -> dict[str, Any]:
     return get_uvm_pool_residency_manager().driver_pool_state_snapshot(
         gpu_id=gpu_id
@@ -2128,6 +2245,10 @@ def get_uvm_real_residency_snapshot(trigger: str = "manual") -> dict[str, Any]:
 
 def get_uvm_residency_region_snapshot(region_id: str) -> dict[str, Any] | None:
     return get_uvm_pool_residency_manager().region_snapshot(region_id)
+
+
+def get_uvm_residency_regions_snapshot() -> list[dict[str, Any]]:
+    return get_uvm_pool_residency_manager().regions_snapshot()
 
 
 def record_uvm_residency_action(

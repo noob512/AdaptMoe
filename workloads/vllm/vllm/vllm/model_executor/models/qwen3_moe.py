@@ -90,6 +90,8 @@ logger = init_logger(__name__)
 
 _QWEN3_MOE_TRACE_LOCK = threading.Lock()
 _QWEN3_MOE_TRACE_STEP = 0
+_QWEN3_MOE_LAYER_TIMING_LOCK = threading.Lock()
+_QWEN3_MOE_ATTENTION_TIMING_LOCK = threading.Lock()
 
 
 def _qwen3_moe_trace_enabled() -> bool:
@@ -114,6 +116,177 @@ def _qwen3_moe_trace_next_step() -> int:
     with _QWEN3_MOE_TRACE_LOCK:
         _QWEN3_MOE_TRACE_STEP += 1
         return _QWEN3_MOE_TRACE_STEP
+
+
+def _qwen3_moe_layer_timing_enabled() -> bool:
+    return os.environ.get("VLLM_QWEN3_MOE_LAYER_TIMING_ENABLE",
+                          "0").lower() in ("1", "true", "yes", "on")
+
+
+def _qwen3_moe_layer_timing_file() -> str:
+    return os.environ.get("VLLM_QWEN3_MOE_LAYER_TIMING_FILE", "")
+
+
+def _qwen3_moe_layer_timing_start(
+    *,
+    layer_name: str,
+    layer_id: int | None,
+    num_tokens: int,
+    positions: torch.Tensor,
+    is_sparse_moe: bool,
+) -> dict[str, Any] | None:
+    trace_file = _qwen3_moe_layer_timing_file()
+    if (not _qwen3_moe_layer_timing_enabled() or not trace_file
+            or not torch.cuda.is_available()):
+        return None
+
+    try:
+        position_min = None
+        position_max = None
+        if positions.numel() > 0:
+            pos = positions.detach()
+            position_min = int(pos.min().item())
+            position_max = int(pos.max().item())
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(torch.cuda.current_stream())
+        return {
+            "event": start_event,
+            "timestamp": time.time(),
+            "pid": os.getpid(),
+            "layer_name": layer_name,
+            "layer_id": layer_id,
+            "num_tokens": int(num_tokens),
+            "position_min": position_min,
+            "position_max": position_max,
+            "is_sparse_moe": bool(is_sparse_moe),
+        }
+    except Exception:
+        logger.debug("Failed to record Qwen3-MoE layer timing start",
+                     exc_info=True)
+        return None
+
+
+def _qwen3_moe_layer_timing_finish(start_record: dict[str, Any] | None) -> None:
+    if start_record is None:
+        return
+
+    trace_file = _qwen3_moe_layer_timing_file()
+    if not trace_file:
+        return
+
+    try:
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record(torch.cuda.current_stream())
+        end_event.synchronize()
+        elapsed_ms = float(start_record["event"].elapsed_time(end_event))
+        position_max = start_record["position_max"]
+        record = {
+            "event": "qwen3_moe_layer_timing",
+            "timestamp": time.time(),
+            "pid": int(start_record["pid"]),
+            "layer_name": start_record["layer_name"],
+            "layer_id": start_record["layer_id"],
+            "num_tokens": start_record["num_tokens"],
+            "position_min": start_record["position_min"],
+            "position_max": position_max,
+            "kv_len_approx": int(position_max) + 1
+            if position_max is not None else None,
+            "is_sparse_moe": start_record["is_sparse_moe"],
+            "elapsed_ms": elapsed_ms,
+        }
+        os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
+        with _QWEN3_MOE_LAYER_TIMING_LOCK:
+            with open(trace_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception:
+        logger.debug("Failed to record Qwen3-MoE layer timing end",
+                     exc_info=True)
+
+
+def _qwen3_moe_attention_timing_enabled() -> bool:
+    return os.environ.get("VLLM_QWEN3_MOE_ATTENTION_TIMING_ENABLE",
+                          "0").lower() in ("1", "true", "yes", "on")
+
+
+def _qwen3_moe_attention_timing_file() -> str:
+    return os.environ.get("VLLM_QWEN3_MOE_ATTENTION_TIMING_FILE", "")
+
+
+def _qwen3_moe_attention_timing_start(
+    *,
+    layer_name: str,
+    layer_id: int | None,
+    num_tokens: int,
+    positions: torch.Tensor,
+) -> dict[str, Any] | None:
+    trace_file = _qwen3_moe_attention_timing_file()
+    if (not _qwen3_moe_attention_timing_enabled() or not trace_file
+            or not torch.cuda.is_available()):
+        return None
+
+    try:
+        position_min = None
+        position_max = None
+        if positions.numel() > 0:
+            pos = positions.detach()
+            position_min = int(pos.min().item())
+            position_max = int(pos.max().item())
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(torch.cuda.current_stream())
+        return {
+            "event": start_event,
+            "timestamp": time.time(),
+            "pid": os.getpid(),
+            "layer_name": layer_name,
+            "layer_id": layer_id,
+            "num_tokens": int(num_tokens),
+            "position_min": position_min,
+            "position_max": position_max,
+        }
+    except Exception:
+        logger.debug("Failed to record Qwen3-MoE attention timing start",
+                     exc_info=True)
+        return None
+
+
+def _qwen3_moe_attention_timing_finish(
+    start_record: dict[str, Any] | None,
+) -> None:
+    if start_record is None:
+        return
+
+    trace_file = _qwen3_moe_attention_timing_file()
+    if not trace_file:
+        return
+
+    try:
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record(torch.cuda.current_stream())
+        end_event.synchronize()
+        elapsed_ms = float(start_record["event"].elapsed_time(end_event))
+        position_max = start_record["position_max"]
+        record = {
+            "event": "qwen3_moe_attention_timing",
+            "timestamp": time.time(),
+            "pid": int(start_record["pid"]),
+            "layer_name": start_record["layer_name"],
+            "layer_id": start_record["layer_id"],
+            "num_tokens": start_record["num_tokens"],
+            "position_min": start_record["position_min"],
+            "position_max": position_max,
+            "kv_len_approx": int(position_max) + 1
+            if position_max is not None else None,
+            "elapsed_ms": elapsed_ms,
+        }
+        os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
+        with _QWEN3_MOE_ATTENTION_TIMING_LOCK:
+            with open(trace_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception:
+        logger.debug("Failed to record Qwen3-MoE attention timing end",
+                     exc_info=True)
 
 
 def _qwen3_moe_trace_active_experts(
@@ -529,6 +702,13 @@ class Qwen3MoeAttention(nn.Module):
             else {},
         )
 
+        self._uvm_attention_timing_layer_name = prefix
+        try:
+            self._uvm_attention_timing_layer_id: int | None = (
+                extract_layer_index(prefix)
+            )
+        except Exception:
+            self._uvm_attention_timing_layer_id = None
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -548,7 +728,14 @@ class Qwen3MoeAttention(nn.Module):
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
+        attention_timing = _qwen3_moe_attention_timing_start(
+            layer_name=self._uvm_attention_timing_layer_name,
+            layer_id=self._uvm_attention_timing_layer_id,
+            num_tokens=int(hidden_states.shape[0]),
+            positions=positions,
+        )
         attn_output = self.attn(q, k, v)
+        _qwen3_moe_attention_timing_finish(attention_timing)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -593,6 +780,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 vllm_config=vllm_config, prefix=f"{prefix}.mlp"
             )
             self._uvm_pre_expert_timing_layer_name = self.mlp.experts.layer_name
+            self._uvm_layer_timing_is_sparse_moe = True
         else:
             self.mlp = Qwen3MoeMLP(
                 hidden_size=config.hidden_size,
@@ -602,7 +790,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
             self._uvm_pre_expert_timing_layer_name = None
+            self._uvm_layer_timing_is_sparse_moe = False
         self._uvm_pre_expert_timing_layer_id = layer_idx
+        self._uvm_layer_timing_layer_name = prefix
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -614,6 +804,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        layer_timing = _qwen3_moe_layer_timing_start(
+            layer_name=self._uvm_layer_timing_layer_name,
+            layer_id=self._uvm_pre_expert_timing_layer_id,
+            num_tokens=int(hidden_states.shape[0]),
+            positions=positions,
+            is_sparse_moe=self._uvm_layer_timing_is_sparse_moe,
+        )
+
         # Self Attention
         if self._uvm_pre_expert_timing_layer_name is not None:
             record_uvm_pre_expert_timing_layer_start(
@@ -636,6 +834,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        _qwen3_moe_layer_timing_finish(layer_timing)
         return hidden_states, residual
 
 

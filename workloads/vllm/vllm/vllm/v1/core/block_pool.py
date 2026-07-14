@@ -317,6 +317,10 @@ class BlockPool:
                     self.free_block_queue.remove(block)
         if ret is None:
             ret = self.free_block_queue.popleft_n(num_blocks)
+        if len(ret) != num_blocks:
+            raise ValueError(
+                f"Cannot get {num_blocks} free blocks from the dynamic pool"
+            )
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -324,10 +328,12 @@ class BlockPool:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.lifecycle_state = "used_free"
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                block.lifecycle_state = "used_free"
         if self.uvm_kv_runtime_policy is not None:
             self.uvm_kv_runtime_policy.on_blocks_allocated(
                 blocks=ret,
@@ -417,6 +423,7 @@ class BlockPool:
                 if block.ref_cnt == 0 and not block.is_null:
                     self.free_block_queue.remove(block)
                 block.ref_cnt += 1
+                block.lifecycle_state = "used_free"
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
@@ -430,6 +437,8 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
+            if block.ref_cnt == 0 and not block.is_null:
+                block.lifecycle_state = "used_free"
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
@@ -448,7 +457,7 @@ class BlockPool:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
+        num_used_blocks = self.num_gpu_blocks - self.free_block_queue.num_free_blocks
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(
                 "Failed to reset prefix cache because some "
@@ -477,6 +486,11 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
+        if (
+            self.uvm_kv_runtime_policy is not None
+            and self.uvm_kv_runtime_policy.dynamic_pool_active()
+        ):
+            return self.uvm_kv_runtime_policy.get_num_allocatable_free_blocks(self)
         return self.free_block_queue.num_free_blocks
 
     def get_usage(self) -> float:
@@ -487,7 +501,15 @@ class BlockPool:
         """
 
         # Subtract 1 to account for null block.
-        total_gpu_blocks = self.num_gpu_blocks - 1
+        if (
+            self.uvm_kv_runtime_policy is not None
+            and self.uvm_kv_runtime_policy.dynamic_pool_active()
+        ):
+            total_gpu_blocks = (
+                self.uvm_kv_runtime_policy.get_effective_num_gpu_blocks(self)
+            )
+        else:
+            total_gpu_blocks = self.num_gpu_blocks - 1
         if not total_gpu_blocks:
             return 0
         return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)

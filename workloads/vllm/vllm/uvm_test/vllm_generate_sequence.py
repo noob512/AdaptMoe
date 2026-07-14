@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -93,6 +94,132 @@ def write_result(path: Path | None, result: dict[str, Any]) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+
+
+def _write_sysfs_param(
+    path: Path,
+    value: int,
+    *,
+    use_sudo: bool,
+) -> None:
+    if use_sudo:
+        subprocess.run(
+            ["sudo", "-n", "tee", str(path)],
+            input=f"{int(value)}\n",
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        return
+    path.write_text(f"{int(value)}\n", encoding="utf-8")
+
+
+def apply_pre_request_manual_fault_guard() -> dict[str, Any] | None:
+    mode_text = os.environ.get("VLLM_UVM_MANUAL_FAULT_BEFORE_REQUEST_MODE", "").strip()
+    if not mode_text:
+        return None
+
+    param_dir = Path(
+        os.environ.get(
+            "VLLM_UVM_MANUAL_FAULT_PARAM_DIR",
+            "/sys/module/nvidia_uvm/parameters",
+        )
+    )
+    use_sudo = os.environ.get("VLLM_UVM_MANUAL_FAULT_USE_SUDO", "1") != "0"
+    pool_mask_text = os.environ.get(
+        "VLLM_UVM_MANUAL_FAULT_BEFORE_REQUEST_POOL_MASK",
+        "0",
+    ).strip()
+    log_enable_text = os.environ.get(
+        "VLLM_UVM_MANUAL_FAULT_BEFORE_REQUEST_LOG_ENABLE",
+        "1",
+    ).strip()
+
+    mode = int(mode_text)
+    pool_mask = int(pool_mask_text)
+    log_enable = int(log_enable_text)
+
+    updates = [
+        ("uvm_manual_migration_fault_pool_mask", pool_mask),
+        ("uvm_manual_migration_fault_log_enable", log_enable),
+        ("uvm_manual_migration_fault_mode", mode),
+    ]
+    for name, value in updates:
+        _write_sysfs_param(param_dir / name, value, use_sudo=use_sudo)
+
+    observed: dict[str, str] = {}
+    for name, _value in updates:
+        path = param_dir / name
+        try:
+            observed[name] = path.read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            observed[name] = f"read_error:{exc!r}"
+
+    return {
+        "param_dir": str(param_dir),
+        "use_sudo": use_sudo,
+        "requested_mode": mode,
+        "requested_pool_mask": pool_mask,
+        "requested_log_enable": log_enable,
+        "observed": observed,
+    }
+
+
+def apply_engine_core_kv_dynamic_pool_target(
+    llm: Any,
+    target_blocks: int,
+    *,
+    reason: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    llm_engine = getattr(llm, "llm_engine", None)
+    engine_core = getattr(llm_engine, "engine_core", None)
+    if engine_core is None:
+        return {
+            "ok": False,
+            "reason": "engine_core_unavailable",
+            "requested_target_blocks": target_blocks,
+        }
+
+    if hasattr(engine_core, "call_utility"):
+        result = engine_core.call_utility(
+            "apply_uvm_kv_dynamic_pool_target",
+            int(target_blocks),
+            reason,
+            metadata,
+        )
+    elif hasattr(engine_core, "apply_uvm_kv_dynamic_pool_target"):
+        result = engine_core.apply_uvm_kv_dynamic_pool_target(
+            int(target_blocks),
+            reason,
+            metadata,
+        )
+    elif (
+        hasattr(engine_core, "engine_core")
+        and hasattr(engine_core.engine_core, "apply_uvm_kv_dynamic_pool_target")
+    ):
+        result = engine_core.engine_core.apply_uvm_kv_dynamic_pool_target(
+            int(target_blocks),
+            reason,
+            metadata,
+        )
+    else:
+        return {
+            "ok": False,
+            "reason": "apply_utility_unavailable",
+            "requested_target_blocks": target_blocks,
+            "engine_core_type": type(engine_core).__name__,
+        }
+
+    if isinstance(result, dict):
+        return result
+    return {
+        "ok": True,
+        "reason": "non_dict_result",
+        "requested_target_blocks": target_blocks,
+        "result": result,
+    }
 
 
 def latest_active_residency_record(
@@ -291,6 +418,12 @@ def main() -> int:
     parser.add_argument("--quantization", default=None)
     parser.add_argument("--sleep-between-requests", type=float, default=0.0)
     parser.add_argument("--sync-between-requests", action="store_true")
+    parser.add_argument("--kv-dynamic-pool-grow-after-request", type=int, default=-1)
+    parser.add_argument("--kv-dynamic-pool-grow-target-blocks", type=int, default=0)
+    parser.add_argument(
+        "--kv-dynamic-pool-grow-reason",
+        default="between_requests_manual_grow",
+    )
     parser.add_argument("--require-active-gpu-trace-jsonl", type=Path, default=None)
     parser.add_argument("--require-active-slot-trace-jsonl", type=Path, default=None)
     parser.add_argument(
@@ -427,6 +560,19 @@ def main() -> int:
             print(json.dumps(result, indent=2, sort_keys=True))
             return 4
 
+    manual_fault_guard = apply_pre_request_manual_fault_guard()
+    if manual_fault_guard is not None:
+        result["pre_request_manual_fault_guard"] = manual_fault_guard
+        write_result(args.output_json, result)
+        append_jsonl(
+            args.progress_jsonl,
+            {
+                "action": "pre_request_manual_fault_guard_applied",
+                "timestamp": time.time(),
+                **manual_fault_guard,
+            },
+        )
+
     request_results: list[dict[str, Any]] = []
     try:
         for request_index, request_spec in enumerate(request_specs):
@@ -489,6 +635,69 @@ def main() -> int:
                 },
             )
             if request_index + 1 < len(max_tokens_sequence):
+                if (
+                    args.kv_dynamic_pool_grow_after_request == request_index
+                    and args.kv_dynamic_pool_grow_target_blocks > 0
+                ):
+                    maintenance_started = time.time()
+                    append_jsonl(
+                        args.progress_jsonl,
+                        {
+                            "action": "between_requests_kv_dynamic_pool_grow_begin",
+                            "timestamp": maintenance_started,
+                            "request": request_index,
+                            "target_blocks": args.kv_dynamic_pool_grow_target_blocks,
+                            "reason": args.kv_dynamic_pool_grow_reason,
+                        },
+                    )
+                    import torch
+
+                    torch.cuda.synchronize()
+                    apply_result = apply_engine_core_kv_dynamic_pool_target(
+                        llm,
+                        args.kv_dynamic_pool_grow_target_blocks,
+                        reason=args.kv_dynamic_pool_grow_reason,
+                        metadata={
+                            "request_index": request_index,
+                            "completed_requests": len(request_results),
+                            "script": "vllm_generate_sequence",
+                        },
+                    )
+                    torch.cuda.synchronize()
+                    maintenance_finished = time.time()
+                    result["kv_dynamic_pool_between_requests_grow"] = {
+                        "request": request_index,
+                        "target_blocks": args.kv_dynamic_pool_grow_target_blocks,
+                        "elapsed_seconds": (
+                            maintenance_finished - maintenance_started
+                        ),
+                        "result": apply_result,
+                        "gpu_memory_after_grow": gpu_memory_snapshot(),
+                    }
+                    write_result(args.output_json, result)
+                    append_jsonl(
+                        args.progress_jsonl,
+                        {
+                            "action": "between_requests_kv_dynamic_pool_grow_end",
+                            "timestamp": maintenance_finished,
+                            "request": request_index,
+                            "target_blocks": args.kv_dynamic_pool_grow_target_blocks,
+                            "elapsed_seconds": (
+                                maintenance_finished - maintenance_started
+                            ),
+                            "result": apply_result,
+                            "gpu_memory_after_grow": result[
+                                "kv_dynamic_pool_between_requests_grow"
+                            ]["gpu_memory_after_grow"],
+                        },
+                    )
+                    if not apply_result.get("ok"):
+                        result["status"] = "kv_dynamic_pool_grow_failed"
+                        result["completed_requests"] = len(request_results)
+                        result["total_seconds"] = time.time() - started
+                        write_result(args.output_json, result)
+                        print(json.dumps(result, indent=2, sort_keys=True))
+                        return 5
                 if args.sync_between_requests:
                     sync_started = time.time()
                     append_jsonl(

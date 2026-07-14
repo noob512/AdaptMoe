@@ -4057,6 +4057,33 @@ class GPUModelRunner(
         if not manager.active:
             return
         register_expert_tensors = self._uvm_weight_map_register_expert_tensors()
+        expert_envelope_enable = (
+            os.environ.get(
+                "VLLM_UVM_EXPERT_ENVELOPE_ENABLE",
+                os.environ.get("VLLM_UVM_EXPERT_2MB_ENVELOPE_ENABLE", "0"),
+            )
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+        try:
+            expert_envelope_bytes = int(
+                os.environ.get(
+                    "VLLM_UVM_EXPERT_ENVELOPE_BYTES",
+                    os.environ.get(
+                        "VLLM_UVM_EXPERT_2MB_ENVELOPE_BYTES",
+                        "2097152",
+                    ),
+                )
+                or "2097152"
+            )
+        except ValueError:
+            expert_envelope_bytes = 2 * 1024 * 1024
+        expert_envelope_skip_reason = (
+            "logical_slice_covered_by_2mb_envelope"
+            if expert_envelope_bytes == 2 * 1024 * 1024
+            else f"logical_slice_covered_by_{expert_envelope_bytes}b_envelope"
+        )
         for record in records:
             if bool(record.get("is_alias")):
                 continue
@@ -4118,6 +4145,14 @@ class GPUModelRunner(
                     "driver_capable": driver_capable,
                     "driver_capability_reason": driver_reason,
                     "driver_probe_result": driver_probe_result,
+                    "driver_tag_skip": bool(
+                        is_moe_expert and expert_envelope_enable
+                    ),
+                    "driver_tag_skip_reason": (
+                        expert_envelope_skip_reason
+                        if is_moe_expert and expert_envelope_enable
+                        else None
+                    ),
                 },
             )
 
@@ -6258,6 +6293,9 @@ class GPUModelRunner(
                 except Exception:
                     logger.debug("Failed to synchronize after Stage M slot PTE clear",
                                  exc_info=True)
+            self._record_uvm_init_weight_plan_residency(
+                "after_stage_m_clear_before_prealloc"
+            )
             self._maybe_prealloc_uvm_expert_reserved_slots_after_stage_m()
             self._record_uvm_init_weight_plan_residency("after_stage_m_clear")
             self._record_uvm_active_expert_residency_probe("after_stage_m_clear")
@@ -6385,6 +6423,29 @@ class GPUModelRunner(
             result.get("reserved_backing_bytes"),
             elapsed,
         )
+        fail_fast = os.environ.get(
+            "VLLM_UVM_EXPERT_RESERVED_FAIL_FAST_ON_PREALLOC_FAILURE",
+            "0",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if fail_fast:
+            success_count = int(result.get("success_count") or 0)
+            backed_slots = int(query_after.get("backed_slots") or 0)
+            backing_bytes = int(query_after.get("reserved_backing_bytes") or 0)
+            required_backing = slot_count * slot_bytes
+            prealloc_ok = (
+                bool(result.get("ok"))
+                and success_count >= slot_count
+                and backed_slots >= slot_count
+                and backing_bytes >= required_backing
+            )
+            if not prealloc_ok:
+                raise RuntimeError(
+                    "post-Stage-M reserved prealloc failed: "
+                    f"slot_count={slot_count} slot_bytes={slot_bytes} "
+                    f"success={success_count} backed_slots={backed_slots} "
+                    f"backing={backing_bytes} required={required_backing} "
+                    f"rm_status={result.get('rm_status')}"
+                )
 
     def _maybe_clear_uvm_init_time_slot_ptes_after_placement(self) -> None:
         driver_mode = os.environ.get(

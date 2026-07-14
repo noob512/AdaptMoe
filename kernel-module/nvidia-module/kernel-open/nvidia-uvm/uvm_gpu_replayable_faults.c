@@ -142,6 +142,27 @@ module_param(uvm_phase_n_expert_fault_fastpath_enable, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_phase_n_expert_fault_fastpath_enable,
                  "Service eligible expert-tagged GPU read faults with a dedicated read-duplicate fast path. Default: 0.");
 
+#define UVM_MANUAL_MIGRATION_FAULT_MODE_OFF       0
+#define UVM_MANUAL_MIGRATION_FAULT_MODE_OBSERVE   1
+#define UVM_MANUAL_MIGRATION_FAULT_MODE_FAIL_FAST 2
+
+static unsigned uvm_manual_migration_fault_mode = UVM_MANUAL_MIGRATION_FAULT_MODE_OFF;
+module_param(uvm_manual_migration_fault_mode, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_manual_migration_fault_mode,
+                 "Manual migration fault mode for managed GPU replayable faults: "
+                 "0=normal UVM service, 1=observe/log and continue, 2=log and cancel instead of migrating. Default: 0.");
+
+static unsigned uvm_manual_migration_fault_pool_mask = 0;
+module_param(uvm_manual_migration_fault_pool_mask, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_manual_migration_fault_pool_mask,
+                 "Phase-N pool bitmask for manual migration fault mode. "
+                 "0 applies to all managed ranges; otherwise bit N applies to pool N. Default: 0.");
+
+static unsigned uvm_manual_migration_fault_log_enable = 1;
+module_param(uvm_manual_migration_fault_log_enable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_manual_migration_fault_log_enable,
+                 "Log manual migration GPU fault observations to phase_f_route_log. Default: 1.");
+
 static bool phase_n_range_tag_is_expert_weight(const uvm_phase_n_range_tag_t *tag)
 {
     return tag &&
@@ -156,6 +177,62 @@ static bool phase_n_range_tag_is_cpu_offloaded_reserved_expert(const uvm_phase_n
 {
     return phase_n_range_tag_is_expert_weight(tag) &&
            (tag->flags & UVM_PHASE_N_REGION_FLAG_CPU_OFFLOADED_RESERVED);
+}
+
+static bool manual_migration_fault_pool_matches(uvm_va_range_managed_t *managed_range)
+{
+    const uvm_phase_n_range_tag_t *tag;
+
+    if (!managed_range)
+        return false;
+
+    if (uvm_manual_migration_fault_pool_mask == 0)
+        return true;
+
+    tag = &managed_range->phase_n_tag;
+    if (!tag->valid || tag->mixed || tag->pool >= 32)
+        return false;
+
+    return (uvm_manual_migration_fault_pool_mask & (1U << tag->pool)) != 0;
+}
+
+static bool manual_migration_fault_mode_enabled(void)
+{
+    return uvm_manual_migration_fault_mode == UVM_MANUAL_MIGRATION_FAULT_MODE_OBSERVE ||
+           uvm_manual_migration_fault_mode == UVM_MANUAL_MIGRATION_FAULT_MODE_FAIL_FAST;
+}
+
+static bool manual_migration_fault_should_block(void)
+{
+    return uvm_manual_migration_fault_mode == UVM_MANUAL_MIGRATION_FAULT_MODE_FAIL_FAST;
+}
+
+static void manual_migration_fault_log(uvm_gpu_t *gpu,
+                                       uvm_va_range_managed_t *managed_range,
+                                       uvm_fault_buffer_entry_t *fault_entry,
+                                       bool block_fault)
+{
+    const uvm_phase_n_range_tag_t *tag = managed_range ? &managed_range->phase_n_tag : NULL;
+
+    if (!uvm_manual_migration_fault_log_enable)
+        return;
+
+    uvm_phase_f_route_log("manual_migration_fault mode=%u action=%s fault_addr=0x%llx access=%s gpu_id=%u pid=%d region_id=%llu allocation_id=%llu pool=%u role=%u flags=0x%x tag_valid=%u mixed=%u range_base=0x%llx range_len=%llu\n",
+                          uvm_manual_migration_fault_mode,
+                          block_fault ? "block" : "observe",
+                          fault_entry->fault_address,
+                          uvm_fault_access_type_string(fault_entry->fault_access_type),
+                          uvm_id_value(gpu->id),
+                          task_tgid_nr(current),
+                          tag ? tag->region_id : 0,
+                          tag ? tag->allocation_id : 0,
+                          tag ? tag->pool : 0,
+                          tag ? tag->role : 0,
+                          tag ? tag->flags : 0,
+                          tag ? tag->valid : 0,
+                          tag ? tag->mixed : 0,
+                          tag ? tag->base : 0,
+                          tag ? tag->length : 0);
 }
 
 static bool phase_n_expert_fault_readdup_allowed(uvm_va_block_t *va_block,
@@ -2477,8 +2554,25 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
 
     if (status == NV_OK) {
         uvm_va_range_managed_t *managed_range = uvm_va_range_to_managed_or_null(va_range);
+        bool block_manual_fault = false;
 
-        if (managed_range &&
+        if (manual_migration_fault_mode_enabled() && manual_migration_fault_pool_matches(managed_range)) {
+            block_manual_fault = manual_migration_fault_should_block();
+
+            manual_migration_fault_log(gpu, managed_range, current_entry, block_manual_fault);
+
+            if (block_manual_fault) {
+                service_fault_batch_fatal_notify(gpu,
+                                                 batch_context,
+                                                 fault_index,
+                                                 NV_ERR_INVALID_ACCESS_TYPE,
+                                                 UVM_FAULT_CANCEL_VA_MODE_ALL,
+                                                 block_faults);
+                status = NV_OK;
+            }
+        }
+        if (!block_manual_fault &&
+            managed_range &&
             phase_n_range_tag_is_cpu_offloaded_reserved_expert(&managed_range->phase_n_tag)) {
             ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_reserved_fault_policy_violations;
             ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_reserved_pool_external_alloc_attempts;
@@ -2490,12 +2584,14 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
                                              block_faults);
             status = NV_OK;
         }
-        else if (managed_range &&
+        else if (!block_manual_fault &&
+            managed_range &&
             phase_n_range_tag_is_expert_weight(&managed_range->phase_n_tag) &&
             phase_n_expert_prefetch_authorized_after_wait(gpu, va_block, batch_context, fault_index, block_faults)) {
             status = NV_OK;
         }
-        else if (phase_n_expert_fault_fastpath_candidate(va_block, managed_range, hmm_migratable)) {
+        else if (!block_manual_fault &&
+            phase_n_expert_fault_fastpath_candidate(va_block, managed_range, hmm_migratable)) {
             status = service_fault_batch_block_expert_readdup(gpu,
                                                               va_block,
                                                               batch_context,
@@ -2506,7 +2602,7 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
                 status = service_fault_batch_block(gpu, va_block, batch_context, fault_index, hmm_migratable, block_faults);
             }
         }
-        else {
+        else if (!block_manual_fault) {
             status = service_fault_batch_block(gpu, va_block, batch_context, fault_index, hmm_migratable, block_faults);
         }
 

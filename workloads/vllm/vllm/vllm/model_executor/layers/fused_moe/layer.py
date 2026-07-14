@@ -30,6 +30,7 @@ from vllm.device_allocator.uvm import (
     batch_prefetch_ranges_to_device,
     batch_prefetch_ranges_to_device_with_executor,
     driver_batch_query_ranges_residency_bytes,
+    driver_expert_offload_release_regions,
     driver_moe_slot_remap_batch,
     offload_range_to_cpu,
     prefetch_range_to_device,
@@ -132,6 +133,14 @@ logger = init_logger(__name__)
 
 _UVM_PRE_EXPERT_TIMING_LOCK = threading.Lock()
 _UVM_PRE_EXPERT_TIMING_STARTS: dict[str, dict[str, object]] = {}
+_UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES = (
+    "driver_release",
+    "driver_release_cpu",
+    "offload_release",
+    "release_cpu",
+)
+_UVM_EXPERT_512K_ENVELOPE_BYTES = 512 * 1024
+_UVM_EXPERT_2MB_ENVELOPE_BYTES = 2 * 1024 * 1024
 
 
 def _uvm_pre_expert_timing_enabled() -> bool:
@@ -258,6 +267,16 @@ def _env_int(env_name: str, default: int) -> int:
     except ValueError:
         logger.warning("Invalid integer for %s=%s; using %s", env_name, env_value, default)
         return default
+
+
+def _align_down(value: int, alignment: int) -> int:
+    alignment = max(int(alignment), 1)
+    return int(value) - (int(value) % alignment)
+
+
+def _align_up(value: int, alignment: int) -> int:
+    alignment = max(int(alignment), 1)
+    return ((int(value) + alignment - 1) // alignment) * alignment
 
 
 def _parse_int_set_env(env_name: str) -> set[int]:
@@ -1044,6 +1063,52 @@ class FusedMoE(CustomOp):
         )
         if self.uvm_expert_reserved_slot_bytes < 0:
             self.uvm_expert_reserved_slot_bytes = 0
+        legacy_2mb_envelope_enable = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_2MB_ENVELOPE_ENABLE",
+            default=False,
+        )
+        legacy_2mb_envelope_bytes = _env_int(
+            "VLLM_UVM_EXPERT_2MB_ENVELOPE_BYTES",
+            default=_UVM_EXPERT_2MB_ENVELOPE_BYTES,
+        )
+        if legacy_2mb_envelope_bytes <= 0:
+            legacy_2mb_envelope_bytes = _UVM_EXPERT_2MB_ENVELOPE_BYTES
+        legacy_2mb_envelope_bytes = _align_up(
+            legacy_2mb_envelope_bytes,
+            4096,
+        )
+        generic_envelope_env_present = (
+            "VLLM_UVM_EXPERT_ENVELOPE_ENABLE" in os.environ
+            or "VLLM_UVM_EXPERT_ENVELOPE_BYTES" in os.environ
+        )
+        self.uvm_expert_envelope_enable = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_ENVELOPE_ENABLE",
+            default=legacy_2mb_envelope_enable,
+        )
+        self.uvm_expert_envelope_bytes = _env_int(
+            "VLLM_UVM_EXPERT_ENVELOPE_BYTES",
+            default=(
+                _UVM_EXPERT_512K_ENVELOPE_BYTES
+                if generic_envelope_env_present
+                else legacy_2mb_envelope_bytes
+            ),
+        )
+        if self.uvm_expert_envelope_bytes <= 0:
+            self.uvm_expert_envelope_bytes = (
+                _UVM_EXPERT_512K_ENVELOPE_BYTES
+                if generic_envelope_env_present
+                else _UVM_EXPERT_2MB_ENVELOPE_BYTES
+            )
+        self.uvm_expert_envelope_bytes = _align_up(
+            self.uvm_expert_envelope_bytes,
+            4096,
+        )
+        self.uvm_expert_envelope_strict_logical_alignment = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_ENVELOPE_STRICT_LOGICAL_ALIGNMENT",
+            default=True,
+        )
+        self.uvm_expert_2mb_envelope_enable = self.uvm_expert_envelope_enable
+        self.uvm_expert_2mb_envelope_bytes = self.uvm_expert_envelope_bytes
         self.uvm_expert_reserved_offloaded_per_layer = _env_int(
             "VLLM_UVM_EXPERT_RESERVED_OFFLOADED_EXPERTS_PER_LAYER",
             default=3,
@@ -1182,6 +1247,7 @@ class FusedMoE(CustomOp):
             "advise_cpu",
             "prefetch_cpu",
             "offload_cpu",
+            *_UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES,
         ):
             logger.warning(
                 "Unknown VLLM_UVM_INIT_WEIGHT_OFFLOAD_MODE=%s; using trace_only",
@@ -3355,6 +3421,209 @@ class FusedMoE(CustomOp):
         layer_label = "unknown" if layer_id is None else str(layer_id)
         return f"weights:{layer_label}:{global_expert_id}:{role}"
 
+    def _uvm_expert_weight_envelope_region_id(
+        self,
+        layer_id: int | None,
+        role: str,
+        envelope_base: int,
+        envelope_bytes: int,
+    ) -> str:
+        layer_label = "unknown" if layer_id is None else str(layer_id)
+        if int(envelope_bytes) == _UVM_EXPERT_2MB_ENVELOPE_BYTES:
+            envelope_kind = "uvm2m"
+        else:
+            envelope_kind = f"uvmchunk:{int(envelope_bytes):x}"
+        return (
+            f"weights:{layer_label}:{envelope_kind}:{role}:"
+            f"{int(envelope_base):x}:{int(envelope_bytes):x}"
+        )
+
+    def _uvm_expert_envelope_stage(self) -> str:
+        if int(self.uvm_expert_envelope_bytes) == _UVM_EXPERT_2MB_ENVELOPE_BYTES:
+            return "uvm_2mb_envelope"
+        return "uvm_chunk_envelope"
+
+    def _uvm_expert_envelope_skip_reason(self) -> str:
+        if int(self.uvm_expert_envelope_bytes) == _UVM_EXPERT_2MB_ENVELOPE_BYTES:
+            return "logical_slice_covered_by_2mb_envelope"
+        return (
+            "logical_slice_covered_by_"
+            f"{int(self.uvm_expert_envelope_bytes)}b_envelope"
+        )
+
+    def _uvm_expert_release_uses_subchunk_64k(self) -> bool:
+        return (
+            bool(self.uvm_expert_envelope_enable)
+            and int(self.uvm_expert_envelope_bytes)
+            == _UVM_EXPERT_512K_ENVELOPE_BYTES
+        )
+
+    def _uvm_role_tensor_bounds(self, role: str) -> tuple[int, int] | None:
+        attr_name = None
+        if role == "moe_gate_up":
+            attr_name = "w13_weight"
+        elif role == "moe_down":
+            attr_name = "w2_weight"
+        if attr_name is None:
+            return None
+        tensor = getattr(self, attr_name, None)
+        if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+            return None
+        total_bytes = int(tensor.numel()) * int(tensor.element_size())
+        if total_bytes <= 0:
+            return None
+        base = int(tensor.data_ptr())
+        return base, base + total_bytes
+
+    def _uvm_build_2mb_envelope_records(
+        self,
+        *,
+        source_region_id: str,
+        layer_id: int | None,
+        global_expert_id: int,
+        local_expert_id: int,
+        role: str,
+        ptr: int,
+        size_bytes: int,
+        metadata: dict[str, object],
+        state: str,
+        source_action: str,
+    ) -> list[dict[str, object]]:
+        if not self.uvm_expert_envelope_enable:
+            return []
+        block_bytes = int(self.uvm_expert_envelope_bytes)
+        if block_bytes <= 0 or int(ptr) <= 0 or int(size_bytes) <= 0:
+            return []
+
+        slice_start = int(ptr)
+        slice_end = slice_start + int(size_bytes)
+        if (
+            self.uvm_expert_envelope_strict_logical_alignment
+            and (
+                slice_start % block_bytes != 0
+                or int(size_bytes) % block_bytes != 0
+            )
+        ):
+            self._append_uvm_init_weight_trace(
+                {
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "layer_name": self.layer_name,
+                    "action": "expert_chunk_envelope_unaligned_logical_slice",
+                    "source_action": source_action,
+                    "source_region_id": source_region_id,
+                    "role": role,
+                    "global_expert_id": global_expert_id,
+                    "local_expert_id": local_expert_id,
+                    "ptr": f"0x{int(ptr):x}",
+                    "bytes": int(size_bytes),
+                    "envelope_bytes": block_bytes,
+                    "strict_logical_alignment": True,
+                }
+            )
+            return []
+        envelope_start = _align_down(slice_start, block_bytes)
+        envelope_end = _align_up(slice_end, block_bytes)
+        tensor_bounds = self._uvm_role_tensor_bounds(role)
+        if tensor_bounds is not None:
+            tensor_base, tensor_end = tensor_bounds
+            # The release path requires complete envelopes. If a rounded
+            # envelope falls outside the tensor allocation, skip it instead of
+            # registering a partial range that the driver will reject.
+            if envelope_start < tensor_base or envelope_end > tensor_end:
+                self._append_uvm_init_weight_trace(
+                    {
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "layer_name": self.layer_name,
+                        "action": "expert_chunk_envelope_out_of_tensor_bounds",
+                        "source_action": source_action,
+                        "source_region_id": source_region_id,
+                        "role": role,
+                        "global_expert_id": global_expert_id,
+                        "local_expert_id": local_expert_id,
+                        "ptr": f"0x{int(ptr):x}",
+                        "bytes": int(size_bytes),
+                        "envelope_base": f"0x{envelope_start:x}",
+                        "envelope_bytes": envelope_end - envelope_start,
+                        "envelope_granularity_bytes": block_bytes,
+                        "tensor_base": f"0x{tensor_base:x}",
+                        "tensor_bytes": tensor_end - tensor_base,
+                    }
+                )
+                return []
+
+        records: list[dict[str, object]] = []
+        for envelope_base in range(envelope_start, envelope_end, block_bytes):
+            envelope_id = self._uvm_expert_weight_envelope_region_id(
+                layer_id,
+                role,
+                envelope_base,
+                block_bytes,
+            )
+            envelope_metadata = {
+                **metadata,
+                "source": source_action,
+                "stage": self._uvm_expert_envelope_stage(),
+                "driver_tag_skip": False,
+                "driver_tag_skip_reason": None,
+                "logical_region_id": source_region_id,
+                "logical_ptr": int(ptr),
+                "logical_bytes": int(size_bytes),
+                "envelope_region_id": envelope_id,
+                "envelope_base": int(envelope_base),
+                "envelope_bytes": int(block_bytes),
+                "envelope_granularity_bytes": block_bytes,
+                "envelope_policy": (
+                    "2mb_aligned"
+                    if block_bytes == _UVM_EXPERT_2MB_ENVELOPE_BYTES
+                    else "chunk_aligned"
+                ),
+                "envelope_role": role,
+                "envelope_global_expert_id": int(global_expert_id),
+                "envelope_local_expert_id": int(local_expert_id),
+                "driver_release_subchunk_64k": (
+                    block_bytes == _UVM_EXPERT_512K_ENVELOPE_BYTES
+                ),
+            }
+            existing = get_uvm_residency_region_snapshot(envelope_id)
+            if existing is not None and bool(existing.get("driver_registered")):
+                # The 2MiB envelope has a stable driver identity across
+                # Stage-M release and runtime restore. Keep that registration
+                # instead of forcing a CPU_OFFLOADED_RESERVED re-register that
+                # can collide with the same VA range in the driver tree.
+                envelope_metadata["driver_registered"] = True
+                envelope_metadata["driver_register_status"] = existing.get(
+                    "driver_register_status"
+                )
+                envelope_metadata["driver_cpu_offloaded_reserved_registered"] = True
+            registered = register_uvm_residency_region(
+                pool="weights",
+                region_id=envelope_id,
+                ptr=int(envelope_base),
+                bytes=int(block_bytes),
+                state=(
+                    str(existing.get("state"))
+                    if existing is not None
+                    else state
+                ),
+                evictable=True,
+                active=False,
+                metadata=envelope_metadata,
+            )
+            records.append(
+                {
+                    "region_id": envelope_id,
+                    "driver_region_id": int(
+                        getattr(registered, "driver_region_id", 0) or 0
+                    ),
+                    "ptr": int(envelope_base),
+                    "bytes": int(block_bytes),
+                    "metadata": envelope_metadata,
+                }
+            )
+        return records
+
     def _uvm_weight_expert_cache_key(
         self,
         layer_id: int | None,
@@ -3508,6 +3777,114 @@ class FusedMoE(CustomOp):
             },
         )
 
+    def _uvm_expand_reserved_items_to_2mb_envelopes(
+        self,
+        items: list[ReservedRegionItem],
+    ) -> tuple[list[ReservedRegionItem], dict[str, list[str]]]:
+        if not self.uvm_expert_envelope_enable:
+            return items, {}
+
+        expanded: list[ReservedRegionItem] = []
+        envelope_ids_by_logical: dict[str, list[str]] = {}
+        seen_envelopes: set[str] = set()
+        for item in items:
+            envelope_records = self._uvm_build_2mb_envelope_records(
+                source_region_id=item.region_id,
+                layer_id=item.layer_id,
+                global_expert_id=item.global_expert_id,
+                local_expert_id=item.local_expert_id,
+                role=item.role,
+                ptr=item.ptr,
+                size_bytes=item.bytes,
+                metadata=item.metadata,
+                state="cpu_offloaded_reserved",
+                source_action="reserved_prefetch_chunk_envelope",
+            )
+            if not envelope_records:
+                expanded.append(item)
+                continue
+
+            logical_envelope_ids: list[str] = []
+            for record in envelope_records:
+                envelope_region_id = str(record["region_id"])
+                logical_envelope_ids.append(envelope_region_id)
+                if envelope_region_id in seen_envelopes:
+                    continue
+                seen_envelopes.add(envelope_region_id)
+                envelope_metadata = cast(
+                    dict[str, object],
+                    record.get("metadata") or {},
+                )
+                expanded.append(
+                    ReservedRegionItem(
+                        region_id=envelope_region_id,
+                        driver_region_id=int(record.get("driver_region_id") or 0),
+                        ptr=int(record["ptr"]),
+                        bytes=int(record["bytes"]),
+                        layer_id=item.layer_id,
+                        global_expert_id=item.global_expert_id,
+                        local_expert_id=item.local_expert_id,
+                        role=item.role,
+                        metadata={
+                            **envelope_metadata,
+                            "logical_region_id": item.region_id,
+                            "logical_driver_region_id": int(item.driver_region_id),
+                        },
+                    )
+                )
+            envelope_ids_by_logical[item.region_id] = logical_envelope_ids
+
+        return expanded, envelope_ids_by_logical
+
+    @staticmethod
+    def _uvm_reduce_envelope_prefetch_result(
+        result: dict[str, object],
+        envelope_ids_by_logical: dict[str, list[str]],
+    ) -> dict[str, object]:
+        if not envelope_ids_by_logical:
+            return result
+
+        envelope_success = {
+            str(region_id) for region_id in (result.get("successful_region_ids") or [])
+        }
+        envelope_failed = {
+            str(region_id) for region_id in (result.get("failed_region_ids") or [])
+        }
+        logical_success: list[str] = []
+        logical_failed: list[str] = []
+        for logical_region_id, envelope_ids in envelope_ids_by_logical.items():
+            if envelope_ids and all(
+                envelope_id in envelope_success for envelope_id in envelope_ids
+            ):
+                logical_success.append(logical_region_id)
+            elif any(envelope_id in envelope_failed for envelope_id in envelope_ids):
+                logical_failed.append(logical_region_id)
+            elif envelope_ids:
+                logical_failed.append(logical_region_id)
+
+        reduced = dict(result)
+        reduced["envelope_successful_region_ids"] = sorted(envelope_success)
+        reduced["envelope_failed_region_ids"] = sorted(envelope_failed)
+        reduced["envelope_ids_by_logical_region"] = {
+            key: list(value) for key, value in envelope_ids_by_logical.items()
+        }
+        reduced["successful_region_ids"] = sorted(set(logical_success))
+        reduced["failed_region_ids"] = sorted(set(logical_failed))
+        reduced["success_count"] = len(set(logical_success))
+        reduced["failure_count"] = len(set(logical_failed))
+        flattened_envelope_ids = [
+            envelope_id
+            for envelope_ids in envelope_ids_by_logical.values()
+            for envelope_id in envelope_ids
+        ]
+        reduced["envelope_mode"] = (
+            "2mb"
+            if flattened_envelope_ids
+            and all(":uvm2m:" in envelope_id for envelope_id in flattened_envelope_ids)
+            else "chunk"
+        )
+        return reduced
+
     def _run_uvm_expert_reserved_prefetch_batch(
         self,
         *,
@@ -3547,6 +3924,10 @@ class FusedMoE(CustomOp):
                 continue
             reserved_items.append(region_item)
 
+        executor_items, envelope_ids_by_logical = (
+            self._uvm_expand_reserved_items_to_2mb_envelopes(reserved_items)
+        )
+
         executor = get_expert_reserved_regions_executor(
             device=device,
             pool_id=self.uvm_expert_reserved_pool_id,
@@ -3561,7 +3942,11 @@ class FusedMoE(CustomOp):
         result = executor.prefetch_for_layer(
             layer_name=self.layer_name,
             step=step,
-            items=reserved_items,
+            items=executor_items,
+        )
+        result = self._uvm_reduce_envelope_prefetch_result(
+            result,
+            envelope_ids_by_logical,
         )
         success_ids = set(result.get("successful_region_ids") or [])
         failed_ids = set(result.get("failed_region_ids") or [])
@@ -4290,8 +4675,16 @@ class FusedMoE(CustomOp):
                         active_this_step=False,
                         source_action="l2_cold_candidate",
                     )
+                    if self.uvm_expert_envelope_enable:
+                        metadata = {
+                            **metadata,
+                            "driver_tag_skip": True,
+                            "driver_tag_skip_reason": (
+                                self._uvm_expert_envelope_skip_reason()
+                            ),
+                        }
                     existing_region = get_uvm_residency_region_snapshot(region_id)
-                    register_uvm_residency_region(
+                    registered_region = register_uvm_residency_region(
                         pool="weights",
                         region_id=region_id,
                         ptr=ptr,
@@ -5047,6 +5440,12 @@ class FusedMoE(CustomOp):
                     **metadata,
                     "source": "post_offload_slot_use_probe",
                     "stage": "post_stage_m_slot_probe",
+                    "driver_tag_skip": bool(self.uvm_expert_envelope_enable),
+                    "driver_tag_skip_reason": (
+                        self._uvm_expert_envelope_skip_reason()
+                        if self.uvm_expert_envelope_enable
+                        else None
+                    ),
                     "pool_class": "cold",
                     "driver_subpool": "cold",
                     "init_cold": True,
@@ -5639,6 +6038,32 @@ class FusedMoE(CustomOp):
                     active_this_step=False,
                     source_action="stage_m_init_hot_register",
                 )
+                logical_driver_tag_skip = bool(
+                    self.uvm_expert_envelope_enable
+                    and self.uvm_init_weight_offload_mode
+                    in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                    and (layer_id, global_expert_id)
+                    in self.uvm_init_weight_offload_plan_keys
+                )
+                hot_metadata = {
+                    **metadata,
+                    "source": "stage_m",
+                    "stage": "stage_m",
+                    "driver_tag_skip": logical_driver_tag_skip,
+                    "driver_tag_skip_reason": (
+                        self._uvm_expert_envelope_skip_reason()
+                        if logical_driver_tag_skip
+                        else None
+                    ),
+                    "pool_class": "hot",
+                    "driver_subpool": "hot",
+                    "init_hot": True,
+                    "protected": True,
+                    "pinned": True,
+                    "prefetchable": True,
+                    "priority": 100,
+                    "plan_policy": self.uvm_init_weight_plan_policy,
+                }
                 register_uvm_residency_region(
                     pool="weights",
                     region_id=region_id,
@@ -5647,36 +6072,12 @@ class FusedMoE(CustomOp):
                     state="gpu",
                     evictable=False,
                     active=False,
-                    metadata={
-                        **metadata,
-                        "source": "stage_m",
-                        "stage": "stage_m",
-                        "pool_class": "hot",
-                        "driver_subpool": "hot",
-                        "init_hot": True,
-                        "protected": True,
-                        "pinned": True,
-                        "prefetchable": True,
-                        "priority": 100,
-                        "plan_policy": self.uvm_init_weight_plan_policy,
-                    },
+                    metadata=hot_metadata,
                 )
                 mark_uvm_residency_state(
                     region_id=region_id,
                     state="gpu",
-                    metadata={
-                        **metadata,
-                        "source": "stage_m",
-                        "stage": "stage_m",
-                        "pool_class": "hot",
-                        "driver_subpool": "hot",
-                        "init_hot": True,
-                        "protected": True,
-                        "pinned": True,
-                        "prefetchable": True,
-                        "priority": 100,
-                        "plan_policy": self.uvm_init_weight_plan_policy,
-                    },
+                    metadata=hot_metadata,
                 )
                 self._uvm_update_weight_expert_role_cache(
                     layer_id=layer_id,
@@ -5728,7 +6129,7 @@ class FusedMoE(CustomOp):
                         "device": self.uvm_init_weight_hot_prefetch_device,
                         "sync_prefetch": self.uvm_init_weight_hot_prefetch_sync,
                         "plan_policy": self.uvm_init_weight_plan_policy,
-                        "residency_metadata": metadata,
+                        "residency_metadata": hot_metadata,
                     }
                 )
 
@@ -5997,7 +6398,7 @@ class FusedMoE(CustomOp):
                         source_action="stage_m_init_offload",
                     )
                     existing_region = get_uvm_residency_region_snapshot(region_id)
-                    register_uvm_residency_region(
+                    registered_region = register_uvm_residency_region(
                         pool="weights",
                         region_id=region_id,
                         ptr=ptr,
@@ -6013,6 +6414,20 @@ class FusedMoE(CustomOp):
                             **residency_metadata,
                             "source": "stage_m",
                             "stage": "stage_m",
+                            "driver_tag_skip": bool(
+                                self.uvm_expert_envelope_enable
+                                and self.uvm_init_weight_offload_mode
+                                in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                            ),
+                            "driver_tag_skip_reason": (
+                                self._uvm_expert_envelope_skip_reason()
+                                if (
+                                    self.uvm_expert_envelope_enable
+                                    and self.uvm_init_weight_offload_mode
+                                    in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                                )
+                                else None
+                            ),
                             "pool_class": "cold",
                             "driver_subpool": "cold",
                             "init_cold": True,
@@ -6022,6 +6437,35 @@ class FusedMoE(CustomOp):
                             "plan_policy": self.uvm_init_weight_plan_policy,
                         },
                     )
+                    driver_region_id = int(
+                        getattr(registered_region, "driver_region_id", 0) or 0
+                    )
+                    envelope_records: list[dict[str, object]] = []
+                    if (
+                        self.uvm_init_weight_offload_mode
+                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                    ):
+                        envelope_records = self._uvm_build_2mb_envelope_records(
+                            source_region_id=region_id,
+                            layer_id=layer_id,
+                            global_expert_id=global_expert_id,
+                            local_expert_id=local_expert_id,
+                            role=role,
+                            ptr=ptr,
+                            size_bytes=size_bytes,
+                            metadata=residency_metadata,
+                            state=(
+                                str(existing_region.get("state"))
+                                if existing_region is not None
+                                else "gpu"
+                            ),
+                            source_action="stage_m_driver_release_chunk_envelope",
+                        )
+                    release_driver_region_ids = [
+                        int(record.get("driver_region_id") or 0)
+                        for record in envelope_records
+                        if int(record.get("driver_region_id") or 0) > 0
+                    ] or [driver_region_id]
 
                     attempted_bytes += size_bytes
                     if (
@@ -6039,6 +6483,21 @@ class FusedMoE(CustomOp):
                                 "mode": self.uvm_init_weight_offload_mode,
                                 "role": role,
                                 "residency_region_id": region_id,
+                                "driver_region_id": driver_region_id,
+                                "release_driver_region_ids": (
+                                    release_driver_region_ids
+                                ),
+                                "envelope_records": [
+                                    {
+                                        "region_id": str(record.get("region_id")),
+                                        "driver_region_id": int(
+                                            record.get("driver_region_id") or 0
+                                        ),
+                                        "ptr": f"0x{int(record.get('ptr') or 0):x}",
+                                        "bytes": int(record.get("bytes") or 0),
+                                    }
+                                    for record in envelope_records
+                                ],
                                 "global_expert_id": global_expert_id,
                                 "local_expert_id": local_expert_id,
                                 "ptr": f"0x{ptr:x}",
@@ -6055,7 +6514,12 @@ class FusedMoE(CustomOp):
                     if (
                         self.uvm_weight_batch_executor_enable
                         and self.uvm_init_weight_offload_mode
-                        in ("advise_cpu", "prefetch_cpu", "offload_cpu")
+                        in (
+                            "advise_cpu",
+                            "prefetch_cpu",
+                            "offload_cpu",
+                            *_UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES,
+                        )
                     ):
                         issued_records += 1
                         issued_bytes += size_bytes
@@ -6067,6 +6531,21 @@ class FusedMoE(CustomOp):
                                 "mode": self.uvm_init_weight_offload_mode,
                                 "role": role,
                                 "residency_region_id": region_id,
+                                "driver_region_id": driver_region_id,
+                                "release_driver_region_ids": (
+                                    release_driver_region_ids
+                                ),
+                                "envelope_records": [
+                                    {
+                                        "region_id": str(record.get("region_id")),
+                                        "driver_region_id": int(
+                                            record.get("driver_region_id") or 0
+                                        ),
+                                        "ptr": int(record.get("ptr") or 0),
+                                        "bytes": int(record.get("bytes") or 0),
+                                    }
+                                    for record in envelope_records
+                                ],
                                 "global_expert_id": global_expert_id,
                                 "local_expert_id": local_expert_id,
                                 "ptr": ptr,
@@ -6086,6 +6565,8 @@ class FusedMoE(CustomOp):
                     success = False
                     advise_success = False
                     prefetch_success = False
+                    driver_release_success = False
+                    driver_release_result: dict[str, object] | None = None
                     if self.uvm_init_weight_offload_mode == "advise_cpu":
                         success = advise_range_preferred_location(ptr, size_bytes, -1)
                         action = (
@@ -6113,6 +6594,45 @@ class FusedMoE(CustomOp):
                             )
                         else:
                             action = "init_weight_offload_skipped"
+                    elif (
+                        self.uvm_init_weight_offload_mode
+                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                    ):
+                        device = (
+                            int(torch.cuda.current_device())
+                            if torch.cuda.is_available()
+                            else 0
+                        )
+                        driver_release_result = (
+                            driver_expert_offload_release_regions(
+                                release_driver_region_ids,
+                                device=device,
+                                subchunk_64k=(
+                                    self._uvm_expert_release_uses_subchunk_64k()
+                                ),
+                                prefer_existing=True,
+                                return_entries=True,
+                            )
+                        )
+                        release_entries_by_id: dict[int, dict[str, object]] = {
+                            int(entry.get("region_id") or 0): entry
+                            for entry in (
+                                driver_release_result.get("entries") or []
+                            )
+                            if isinstance(entry, dict)
+                        }
+                        success = bool(driver_release_result.get("ok")) and all(
+                            bool(
+                                release_entries_by_id.get(driver_id, {}).get("ok")
+                            )
+                            for driver_id in release_driver_region_ids
+                        )
+                        driver_release_success = success
+                        action = (
+                            "init_weight_offload_driver_release_issued"
+                            if success
+                            else "init_weight_offload_skipped"
+                        )
 
                     if success:
                         issued_records += 1
@@ -6137,6 +6657,7 @@ class FusedMoE(CustomOp):
                                 "priority": 10,
                                 "plan_policy": self.uvm_init_weight_plan_policy,
                                 "sync_offload": self.uvm_init_weight_offload_sync,
+                                "driver_release": driver_release_success,
                             },
                         )
                         self._uvm_update_weight_expert_role_cache(
@@ -6159,6 +6680,19 @@ class FusedMoE(CustomOp):
                             "mode": self.uvm_init_weight_offload_mode,
                             "role": role,
                             "residency_region_id": region_id,
+                            "driver_region_id": driver_region_id,
+                            "release_driver_region_ids": release_driver_region_ids,
+                            "envelope_records": [
+                                {
+                                    "region_id": str(record.get("region_id")),
+                                    "driver_region_id": int(
+                                        record.get("driver_region_id") or 0
+                                    ),
+                                    "ptr": f"0x{int(record.get('ptr') or 0):x}",
+                                    "bytes": int(record.get("bytes") or 0),
+                                }
+                                for record in envelope_records
+                            ],
                             "global_expert_id": global_expert_id,
                             "local_expert_id": local_expert_id,
                             "ptr": f"0x{ptr:x}",
@@ -6171,8 +6705,8 @@ class FusedMoE(CustomOp):
                             "advise_cpu_success": (
                                 advise_success
                                 if self.uvm_init_weight_offload_mode
-                                in ("prefetch_cpu", "offload_cpu")
-                                else success
+                                in ("advise_cpu", "prefetch_cpu", "offload_cpu")
+                                else False
                             ),
                             "prefetch_cpu_success": (
                                 prefetch_success
@@ -6180,6 +6714,8 @@ class FusedMoE(CustomOp):
                                 in ("prefetch_cpu", "offload_cpu")
                                 else False
                             ),
+                            "driver_release_success": driver_release_success,
+                            "driver_release_result": driver_release_result,
                             "sync_offload": self.uvm_init_weight_offload_sync,
                             "plan_policy": self.uvm_init_weight_plan_policy,
                         }
@@ -6189,6 +6725,9 @@ class FusedMoE(CustomOp):
                 ranges = [
                     (int(item["ptr"]), int(item["bytes"])) for item in batch_items
                 ]
+                driver_release_result: dict[str, object] | None = None
+                driver_release_summary: dict[str, object] | None = None
+                driver_release_entries_by_region: dict[int, dict[str, object]] = {}
                 if self.uvm_init_weight_offload_mode == "advise_cpu":
                     (
                         batch_successes,
@@ -6199,6 +6738,57 @@ class FusedMoE(CustomOp):
                         executor=self.uvm_weight_executor,
                     )
                     driver_advise_result = driver_result
+                    driver_prefetch_result = 0
+                elif (
+                    self.uvm_init_weight_offload_mode
+                    in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                ):
+                    device = (
+                        int(torch.cuda.current_device())
+                        if torch.cuda.is_available()
+                        else 0
+                    )
+                    driver_region_ids = []
+                    seen_driver_region_ids: set[int] = set()
+                    for item in batch_items:
+                        release_ids = item.get("release_driver_region_ids")
+                        if not isinstance(release_ids, list) or not release_ids:
+                            release_ids = [int(item.get("driver_region_id") or 0)]
+                        for driver_id_value in release_ids:
+                            try:
+                                driver_id = int(driver_id_value)
+                            except (TypeError, ValueError):
+                                continue
+                            if driver_id <= 0 or driver_id in seen_driver_region_ids:
+                                continue
+                            seen_driver_region_ids.add(driver_id)
+                            driver_region_ids.append(driver_id)
+                    driver_release_result = (
+                        driver_expert_offload_release_regions(
+                            driver_region_ids,
+                            device=device,
+                            subchunk_64k=(
+                                self._uvm_expert_release_uses_subchunk_64k()
+                            ),
+                            prefer_existing=True,
+                            return_entries=True,
+                        )
+                    )
+                    driver_release_summary = {
+                        key: value
+                        for key, value in driver_release_result.items()
+                        if key != "entries"
+                    }
+                    for entry in driver_release_result.get("entries") or []:
+                        if isinstance(entry, dict):
+                            driver_release_entries_by_region[
+                                int(entry.get("region_id") or 0)
+                            ] = entry
+                    batch_successes = int(
+                        driver_release_result.get("success_count") or 0
+                    )
+                    executor_used = "driver_offload_release"
+                    driver_advise_result = 0
                     driver_prefetch_result = 0
                 else:
                     (
@@ -6212,7 +6802,43 @@ class FusedMoE(CustomOp):
                         executor=self.uvm_weight_executor,
                     )
                 for batch_index, item in enumerate(batch_items):
-                    success = batch_index < batch_successes
+                    driver_release_entry: dict[str, object] | None = None
+                    if (
+                        self.uvm_init_weight_offload_mode
+                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                    ):
+                        release_ids = item.get("release_driver_region_ids")
+                        if not isinstance(release_ids, list) or not release_ids:
+                            release_ids = [int(item.get("driver_region_id") or 0)]
+                        release_driver_ids: list[int] = []
+                        for driver_id_value in release_ids:
+                            try:
+                                driver_id = int(driver_id_value)
+                            except (TypeError, ValueError):
+                                continue
+                            if driver_id > 0:
+                                release_driver_ids.append(driver_id)
+                        release_entries = [
+                            driver_release_entries_by_region.get(driver_id)
+                            for driver_id in release_driver_ids
+                        ]
+                        success = bool(release_entries) and all(
+                            bool(entry and entry.get("ok"))
+                            for entry in release_entries
+                        )
+                        driver_release_entry = {
+                            "release_driver_region_ids": release_driver_ids,
+                            "entries": release_entries,
+                            "envelope_records": item.get("envelope_records"),
+                        }
+                    else:
+                        success = batch_index < batch_successes
+                    driver_release_success = (
+                        success
+                        if self.uvm_init_weight_offload_mode
+                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                        else False
+                    )
                     if self.uvm_init_weight_offload_mode == "advise_cpu":
                         action = (
                             "init_weight_offload_advise_cpu_issued"
@@ -6220,6 +6846,17 @@ class FusedMoE(CustomOp):
                             else "init_weight_offload_skipped"
                         )
                         advise_success = success
+                        prefetch_success = False
+                    elif (
+                        self.uvm_init_weight_offload_mode
+                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                    ):
+                        action = (
+                            "init_weight_offload_driver_release_issued"
+                            if success
+                            else "init_weight_offload_skipped"
+                        )
+                        advise_success = False
                         prefetch_success = False
                     else:
                         action = (
@@ -6253,6 +6890,7 @@ class FusedMoE(CustomOp):
                                 "plan_policy": self.uvm_init_weight_plan_policy,
                                 "sync_offload": self.uvm_init_weight_offload_sync,
                                 "executor": executor_used,
+                                "driver_release": driver_release_success,
                             },
                         )
                         self._uvm_update_weight_expert_role_cache(
@@ -6278,6 +6916,9 @@ class FusedMoE(CustomOp):
                             "requested_executor": self.uvm_weight_executor,
                             "driver_advise_result": driver_advise_result,
                             "driver_prefetch_result": driver_prefetch_result,
+                            "driver_release_success": driver_release_success,
+                            "driver_release_entry": driver_release_entry,
+                            "driver_release_result": driver_release_summary,
                             "batch_index": batch_index,
                             "batch_size": len(batch_items),
                             "batch_successes": batch_successes,
@@ -6323,8 +6964,24 @@ class FusedMoE(CustomOp):
                         ),
                     }
                 )
-        except Exception:
-            logger.debug("Failed to run Stage M init weight offload", exc_info=True)
+        except Exception as exc:
+            logger.warning("Failed to run Stage M init weight offload", exc_info=True)
+            try:
+                self._append_uvm_init_weight_trace(
+                    {
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "layer_name": self.layer_name,
+                        "action": "init_weight_offload_exception",
+                        "mode": self.uvm_init_weight_offload_mode,
+                        "plan_file": self.uvm_init_weight_offload_plan_file,
+                        "plan_policy": self.uvm_init_weight_plan_policy,
+                        "error_type": type(exc).__name__,
+                        "error": repr(exc),
+                    }
+                )
+            except Exception:
+                logger.debug("Failed to write Stage M exception trace", exc_info=True)
 
     def _append_uvm_cold_streaming_trace(self, record: dict[str, object]) -> None:
         if not self.uvm_cold_streaming_enable:
@@ -8249,6 +8906,14 @@ class FusedMoE(CustomOp):
                             **residency_metadata,
                             "placement": "CPU_OFFLOADED_RESERVED",
                             "cpu_offloaded_reserved": True,
+                            "driver_tag_skip": bool(
+                                self.uvm_expert_envelope_enable
+                            ),
+                            "driver_tag_skip_reason": (
+                                self._uvm_expert_envelope_skip_reason()
+                                if self.uvm_expert_envelope_enable
+                                else None
+                            ),
                             "driver_flags": (
                                 int(residency_metadata.get("driver_flags") or 0)
                                 | (1 << 14)

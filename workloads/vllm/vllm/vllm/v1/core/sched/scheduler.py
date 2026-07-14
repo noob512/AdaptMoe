@@ -22,6 +22,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.device_allocator.uvm_unified_residency_controller import (
+    record_unified_residency_snapshot,
+)
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (
@@ -726,6 +729,30 @@ class Scheduler(SchedulerInterface):
                 scheduler_output
             )
             scheduler_output.ec_connector_metadata = ec_meta
+
+        record_unified_residency_snapshot(
+            reason="scheduler_step",
+            scheduler_step=True,
+            kv_pressure={
+                "running_request_count": len(self.running),
+                "waiting_request_count": len(self.waiting),
+                "scheduled_request_count": len(num_scheduled_tokens),
+                "scheduled_new_request_count": len(scheduled_new_reqs),
+                "scheduled_resumed_request_count": len(scheduled_resumed_reqs),
+                "scheduled_running_request_count": len(scheduled_running_reqs),
+                "preempted_request_count": len(preempted_reqs),
+                "total_num_scheduled_tokens": total_num_scheduled_tokens,
+                "token_budget_total": self.max_num_scheduled_tokens,
+                "token_budget_remaining": token_budget,
+                "num_common_prefix_blocks": num_common_prefix_blocks,
+            },
+            routing_plan={
+                "scheduled_request_ids": list(num_scheduled_tokens.keys()),
+                "preempted_request_ids": [
+                    req.request_id for req in preempted_reqs
+                ],
+            },
+        )
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)

@@ -1,0 +1,8 @@
+{
+  "metadata": {
+    "description": "Empty placeholder plan for no_offload KV fault diagnosis",
+    "policy": "empty_no_offload"
+  },
+  "offload_plan": [],
+  "prefetch_plan": []
+}

@@ -880,6 +880,32 @@ class Worker(WorkerBase):
                 logger.info(
                     "UVM controlled remap boundary: Stage M post-warmup placement end"
                 )
+                post_stage_m_kv_target = os.environ.get(
+                    "VLLM_UVM_KV_DYNAMIC_POOL_POST_STAGE_M_TARGET_BLOCKS", ""
+                ).strip()
+                kv_control_file = os.environ.get(
+                    "VLLM_UVM_KV_DYNAMIC_POOL_CONTROL_FILE", ""
+                ).strip()
+                if post_stage_m_kv_target and kv_control_file:
+                    try:
+                        with open(kv_control_file, "w", encoding="utf-8") as handle:
+                            handle.write(
+                                f"target_blocks={int(post_stage_m_kv_target)}\n"
+                            )
+                        logger.info(
+                            "UVM controlled remap boundary: Stage M post-warmup "
+                            "KV dynamic pool target update target_blocks=%s "
+                            "control_file=%s",
+                            post_stage_m_kv_target,
+                            kv_control_file,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to write post-Stage-M KV dynamic pool "
+                            "target update target_blocks=%s control_file=%s",
+                            post_stage_m_kv_target,
+                            kv_control_file,
+                        )
             if os.environ.get(
                 "VLLM_UVM_EXPERT_RESERVED_ENABLE_AFTER_WARMUP", "0"
             ).strip().lower() in ("1", "true", "yes", "on"):

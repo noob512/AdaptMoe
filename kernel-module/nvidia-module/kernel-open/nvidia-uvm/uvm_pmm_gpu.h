@@ -549,6 +549,14 @@ void uvm_pmm_gpu_unpin_allocated(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm
 // before freeing or re-using the chunk.
 void uvm_pmm_gpu_free(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_tracker_t *tracker);
 
+// Experimental targeted eviction helper. The caller passes any user chunk in a
+// root chunk. On success the normal UVM eviction path has removed VA block
+// ownership for that root chunk, and the root chunk is returned to PMM free
+// lists while preserving the managed VA range itself.
+NV_STATUS uvm_pmm_gpu_evict_root_chunk_to_free(uvm_pmm_gpu_t *pmm,
+                                               uvm_gpu_chunk_t *chunk,
+                                               NvU64 *released_bytes_out);
+
 // Splits the input chunk in-place into smaller chunks of subchunk_size. No data
 // is moved, and the smaller chunks remain allocated.
 //

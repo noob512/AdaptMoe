@@ -1597,6 +1597,7 @@ NV_STATUS uvm_va_block_copy_and_map_reserved_readonly(uvm_va_block_t *va_block,
                                                      const uvm_page_mask_t *page_mask,
                                                      uvm_gpu_chunk_t **slot_chunks,
                                                      NvU32 slot_chunk_count,
+                                                     NvU32 slot_chunk_size,
                                                      NvU64 slot_offset,
                                                      NvU64 slot_bytes,
                                                      uvm_tracker_t *out_tracker,
@@ -1859,6 +1860,14 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                                     uvm_gpu_t *gpu,
                                     uvm_gpu_chunk_t *root_chunk,
                                     uvm_tracker_t *tracker);
+
+NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
+                                                    struct mm_struct *mm,
+                                                    uvm_gpu_t *gpu,
+                                                    uvm_va_block_region_t region,
+                                                    uvm_chunk_size_t release_chunk_size,
+                                                    uvm_tracker_t *tracker,
+                                                    NvU64 *released_bytes_out);
 
 NV_STATUS uvm_test_va_block_inject_error(UVM_TEST_VA_BLOCK_INJECT_ERROR_PARAMS *params, struct file *filp);
 NV_STATUS uvm_test_change_pte_mapping(UVM_TEST_CHANGE_PTE_MAPPING_PARAMS *params, struct file *filp);

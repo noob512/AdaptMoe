@@ -66,6 +66,7 @@ _UVM_MOE_SLOT_REMAP_BATCH_IOCTL = 91
 _UVM_MOE_SLOT_POOL_QUERY_IOCTL = 92
 _UVM_EXPERT_RESERVED_POOL_IOCTL = 98
 _UVM_EXPERT_RESERVED_PREFETCH_BATCH_IOCTL = 99
+_UVM_EXPERT_OFFLOAD_RELEASE_IOCTL = 100
 _UVM_MOE_SLOT_REMAP_MAX_ENTRIES = 128
 _UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES = 128
 _UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES = 128
@@ -178,6 +179,10 @@ UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_UNBACKED = 6
 UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_TOO_SMALL = 7
 UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_IN_USE = 8
 UVM_EXPERT_RESERVED_PREFETCH_ENTRY_NATIVE_POPULATE_UNSUPPORTED = 9
+
+UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT = 1 << 0
+UVM_EXPERT_OFFLOAD_RELEASE_FLAG_STRICT_2M_BLOCKS = 1 << 1
+UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K = 1 << 2
 
 
 class _UvmInitializeParams(ctypes.Structure):
@@ -437,6 +442,32 @@ class _ExpertReservedPrefetchBatchParams(ctypes.Structure):
             _ExpertReservedPrefetchEntry *
             _UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES,
         ),
+        ("rmStatus", ctypes.c_uint32),
+    ]
+
+
+class _ExpertOffloadReleaseParams(ctypes.Structure):
+    _fields_ = [
+        ("region_id", ctypes.c_uint64),
+        ("gpu_uuid", _PhaseFUuid),
+        ("flags", ctypes.c_uint32),
+        ("max_blocks", ctypes.c_uint32),
+        ("pool", ctypes.c_uint32),
+        ("layer_id", ctypes.c_uint32),
+        ("expert_id", ctypes.c_uint32),
+        ("role", ctypes.c_uint32),
+        ("base", ctypes.c_uint64),
+        ("length", ctypes.c_uint64),
+        ("block_count", ctypes.c_uint64),
+        ("attempted_blocks", ctypes.c_uint32),
+        ("success_blocks", ctypes.c_uint32),
+        ("failure_blocks", ctypes.c_uint32),
+        ("skipped_blocks", ctypes.c_uint32),
+        ("attempted_bytes", ctypes.c_uint64),
+        ("released_bytes", ctypes.c_uint64),
+        ("failed_bytes", ctypes.c_uint64),
+        ("first_failed_block", ctypes.c_uint64),
+        ("first_error", ctypes.c_uint32),
         ("rmStatus", ctypes.c_uint32),
     ]
 
@@ -1358,14 +1389,7 @@ def prefetch_range_to_device(ptr: int, size: int, device: int = 0) -> bool:
         return False
     if ptr <= 0 or size <= 0:
         return False
-    stream = torch.cuda.current_stream().cuda_stream
-    _uvm_lib.uvm_prefetch(
-        ctypes.c_void_p(ptr),
-        ctypes.c_size_t(size),
-        ctypes.c_int(device),
-        ctypes.c_void_p(stream),
-    )
-    return True
+    return batch_prefetch_ranges_to_device(((ptr, size),), device=device) == 1
 
 
 def prefetch_range_to_cpu(ptr: int, size: int) -> bool:
@@ -2549,6 +2573,244 @@ def driver_expert_reserved_pool_reset(
         max_entries=max_entries,
         prefer_existing=prefer_existing,
     )
+
+
+def _expert_offload_release_entry_to_dict(
+    params: _ExpertOffloadReleaseParams,
+    *,
+    ret: int,
+    saved_errno: int,
+    fd_source: str | None = None,
+) -> dict[str, object]:
+    raw_ok = int(ret) == 0 and int(params.rmStatus) == 0
+    effective_ok = raw_ok and (
+        int(params.block_count) > 0
+        or int(params.attempted_blocks) > 0
+        or int(params.skipped_blocks) > 0
+        or int(params.released_bytes) > 0
+    )
+    reason = None
+    if raw_ok and not effective_ok:
+        reason = "no_va_blocks"
+    elif not raw_ok:
+        reason = "ioctl_or_rm_error"
+    return {
+        "ok": effective_ok,
+        "raw_ok": raw_ok,
+        "reason": reason,
+        "fd_source": fd_source,
+        "ioctl_ret": int(ret),
+        "errno": int(saved_errno),
+        "rm_status": int(params.rmStatus),
+        "region_id": int(params.region_id),
+        "pool": int(params.pool),
+        "layer_id": int(params.layer_id),
+        "expert_id": int(params.expert_id),
+        "role": int(params.role),
+        "base": int(params.base),
+        "length": int(params.length),
+        "block_count": int(params.block_count),
+        "attempted_blocks": int(params.attempted_blocks),
+        "success_blocks": int(params.success_blocks),
+        "failure_blocks": int(params.failure_blocks),
+        "skipped_blocks": int(params.skipped_blocks),
+        "attempted_bytes": int(params.attempted_bytes),
+        "released_bytes": int(params.released_bytes),
+        "failed_bytes": int(params.failed_bytes),
+        "first_failed_block": int(params.first_failed_block),
+        "first_error": int(params.first_error),
+    }
+
+
+def driver_expert_offload_release_regions(
+    region_ids: Sequence[int],
+    *,
+    device: int = 0,
+    require_expert: bool = True,
+    strict_2m_blocks: bool = False,
+    subchunk_64k: bool = False,
+    max_blocks: int = 0,
+    prefer_existing: bool = True,
+    return_entries: bool = True,
+) -> dict[str, object]:
+    """Targeted offload registered expert regions and release GPU PMM chunks.
+
+    The region ids are Phase-F driver region ids, not Python residency keys.
+    The managed VA ranges remain allocated; only GPU physical backing is
+    evicted through the driver release path.
+    """
+    normalized: list[int] = []
+    for region_id in region_ids:
+        try:
+            value = int(region_id)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            normalized.append(value)
+    result: dict[str, object] = {
+        "ok": False,
+        "ioctl": _UVM_EXPERT_OFFLOAD_RELEASE_IOCTL,
+        "entry_count": len(normalized),
+        "success_count": 0,
+        "failure_count": 0,
+        "skipped_blocks": 0,
+        "attempted_blocks": 0,
+        "success_blocks": 0,
+        "failure_blocks": 0,
+        "attempted_bytes": 0,
+        "released_bytes": 0,
+        "failed_bytes": 0,
+        "first_error": 0,
+        "first_failed_region_id": 0,
+        "first_failed_block": 0,
+        "entries": [],
+    }
+    if not normalized:
+        result["ok"] = True
+        return result
+
+    flags = 0
+    if require_expert:
+        flags |= UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT
+    if strict_2m_blocks:
+        flags |= UVM_EXPERT_OFFLOAD_RELEASE_FLAG_STRICT_2M_BLOCKS
+    if subchunk_64k:
+        flags |= UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K
+
+    try:
+        gpu_uuid = _phase_f_gpu_uuid(device)
+    except Exception:
+        logger.debug("Failed to resolve CUDA UUID for expert offload release",
+                     exc_info=True)
+        result["failure_count"] = len(normalized)
+        result["first_error"] = -3
+        return result
+
+    def _run_release_on_fd(fd: int, fd_source: str) -> dict[str, object]:
+        candidate: dict[str, object] = {
+            "ok": False,
+            "ioctl": _UVM_EXPERT_OFFLOAD_RELEASE_IOCTL,
+            "entry_count": len(normalized),
+            "success_count": 0,
+            "failure_count": 0,
+            "skipped_blocks": 0,
+            "attempted_blocks": 0,
+            "success_blocks": 0,
+            "failure_blocks": 0,
+            "attempted_bytes": 0,
+            "released_bytes": 0,
+            "failed_bytes": 0,
+            "first_error": 0,
+            "first_failed_region_id": 0,
+            "first_failed_block": 0,
+            "fd_source": fd_source,
+            "entries": [],
+        }
+        entries: list[dict[str, object]] = []
+        for region_id in normalized:
+            params = _ExpertOffloadReleaseParams()
+            params.region_id = int(region_id)
+            params.gpu_uuid = gpu_uuid
+            params.flags = int(flags)
+            params.max_blocks = max(int(max_blocks or 0), 0)
+            ctypes.set_errno(0)
+            ret = _libc_ioctl(fd, _UVM_EXPERT_OFFLOAD_RELEASE_IOCTL, params)
+            saved_errno = ctypes.get_errno()
+            entry = _expert_offload_release_entry_to_dict(
+                params,
+                ret=int(ret),
+                saved_errno=int(saved_errno),
+                fd_source=fd_source,
+            )
+            if return_entries:
+                entries.append(entry)
+
+            ok = bool(entry["ok"])
+            candidate["success_count"] = int(candidate["success_count"]) + (1 if ok else 0)
+            candidate["failure_count"] = int(candidate["failure_count"]) + (0 if ok else 1)
+            for key in (
+                "attempted_blocks",
+                "success_blocks",
+                "failure_blocks",
+                "skipped_blocks",
+                "attempted_bytes",
+                "released_bytes",
+                "failed_bytes",
+            ):
+                candidate[key] = int(candidate[key]) + int(entry.get(key) or 0)
+            if not ok and int(candidate["first_error"]) == 0:
+                candidate["first_error"] = int(entry.get("rm_status") or 0) or int(
+                    entry.get("first_error") or 0
+                ) or -5
+                candidate["first_failed_region_id"] = int(region_id)
+                candidate["first_failed_block"] = int(
+                    entry.get("first_failed_block") or 0
+                )
+
+        candidate["ok"] = int(candidate["failure_count"]) == 0
+        candidate["entries"] = entries
+        return candidate
+
+    candidate_results: list[dict[str, object]] = []
+    try:
+        if prefer_existing:
+            for source_fd in _iter_existing_uvm_fd_sources():
+                fd = _initialize_duplicated_uvm_fd(source_fd)
+                if fd is None:
+                    continue
+                try:
+                    candidate = _run_release_on_fd(
+                        fd,
+                        f"existing:{source_fd}",
+                    )
+                finally:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                candidate_results.append(candidate)
+                if bool(candidate.get("ok")) or int(
+                    candidate.get("released_bytes") or 0
+                ) > 0 or int(candidate.get("attempted_blocks") or 0) > 0:
+                    return candidate
+
+        fd = _open_initialized_uvm_fd()
+        try:
+            candidate = _run_release_on_fd(fd, "new")
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        candidate_results.append(candidate)
+        if bool(candidate.get("ok")):
+            return candidate
+
+        if candidate_results:
+            best = max(
+                candidate_results,
+                key=lambda item: (
+                    int(item.get("released_bytes") or 0),
+                    int(item.get("attempted_blocks") or 0),
+                    int(item.get("success_count") or 0),
+                    -int(item.get("failure_count") or 0),
+                ),
+            )
+            best["attempted_fd_count"] = len(candidate_results)
+            return best
+
+        return result
+    except Exception:
+        logger.debug("Expert offload release ioctl failed", exc_info=True)
+        result["failure_count"] = len(normalized)
+        if int(result["first_error"]) == 0:
+            result["first_error"] = -4
+        result["entries"] = (
+            candidate_results[-1].get("entries", [])
+            if candidate_results
+            else []
+        )
+        return result
 
 
 def _expert_reserved_prefetch_mode_value(mode: str | int) -> int:

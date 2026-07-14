@@ -14,6 +14,8 @@ import threading
 import time
 from typing import Any
 
+import torch
+
 from vllm.logger import init_logger
 from vllm.device_allocator.uvm_pool_coordinator import (
     record_uvm_pool_pressure,
@@ -21,8 +23,12 @@ from vllm.device_allocator.uvm_pool_coordinator import (
 )
 from vllm.device_allocator.uvm_policy_runtime import get_uvm_policy_runtime
 from vllm.device_allocator.uvm import (
+    batch_prefetch_ranges_to_cpu,
+    batch_prefetch_ranges_to_device,
+    driver_batch_query_ranges_residency_bytes,
     prefetch_range_to_cpu,
     prefetch_range_to_device,
+    probe_driver_capable_range,
 )
 from vllm.device_allocator.uvm_pool_residency import (
     get_uvm_residency_region_snapshot,
@@ -32,6 +38,11 @@ from vllm.device_allocator.uvm_pool_residency import (
     record_uvm_residency_action,
     register_uvm_residency_region,
     request_uvm_gpu_residency,
+)
+from vllm.device_allocator.uvm_unified_residency_controller import (
+    get_uvm_unified_residency_controller,
+    record_unified_kv_target,
+    record_unified_residency_snapshot,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -54,6 +65,39 @@ def _read_int_env(name: str, default: int = 0) -> int:
     except ValueError:
         logger.warning("Ignoring invalid %s=%r; expected non-negative integer.", name, raw)
         return default
+
+
+def _maybe_sync_after_kv_physical_prefetch(device: int) -> dict[str, Any]:
+    if not _read_bool_env("VLLM_UVM_KV_PHYSICAL_PREFETCH_SYNC", False):
+        return {
+            "post_prefetch_sync_requested": False,
+            "post_prefetch_sync_success": None,
+            "post_prefetch_sync_elapsed_ms": None,
+            "post_prefetch_sync_error": None,
+        }
+    start_ns = time.monotonic_ns()
+    try:
+        if device >= 0:
+            torch.cuda.synchronize(device)
+        else:
+            torch.cuda.synchronize()
+    except Exception as exc:  # pragma: no cover - diagnostic path
+        return {
+            "post_prefetch_sync_requested": True,
+            "post_prefetch_sync_success": False,
+            "post_prefetch_sync_elapsed_ms": (
+                time.monotonic_ns() - start_ns
+            ) / 1_000_000.0,
+            "post_prefetch_sync_error": repr(exc),
+        }
+    return {
+        "post_prefetch_sync_requested": True,
+        "post_prefetch_sync_success": True,
+        "post_prefetch_sync_elapsed_ms": (
+            time.monotonic_ns() - start_ns
+        ) / 1_000_000.0,
+        "post_prefetch_sync_error": None,
+    }
 
 
 def _read_mode_env() -> str:
@@ -99,6 +143,18 @@ class UvmKvRuntimePolicy:
         self.enabled = _read_bool_env("VLLM_UVM_KV_RUNTIME_ENABLE", False)
         self.mode = _read_mode_env()
         self.trace_file = os.environ.get("VLLM_UVM_KV_RUNTIME_TRACE_FILE", "")
+        self.physical_trace_file = os.environ.get(
+            "VLLM_UVM_KV_PHYSICAL_TRACE_FILE", ""
+        )
+        self.physical_trace_fsync = _read_bool_env(
+            "VLLM_UVM_KV_PHYSICAL_TRACE_FSYNC", True
+        )
+        self.physical_trace_residency = _read_bool_env(
+            "VLLM_UVM_KV_PHYSICAL_TRACE_RESIDENCY", True
+        )
+        self.physical_trace_managed_probe = _read_bool_env(
+            "VLLM_UVM_KV_PHYSICAL_TRACE_MANAGED_PROBE", True
+        )
         self.policy = os.environ.get(
             "VLLM_UVM_KV_RUNTIME_EVICTION_POLICY", "lru_prefix_cache"
         ).strip().lower()
@@ -133,6 +189,10 @@ class UvmKvRuntimePolicy:
         )
         self.stage_n_allocator_kv_driver_tag_enable = _read_bool_env(
             "VLLM_UVM_DRIVER_KV_TAG_ENABLE",
+            False,
+        )
+        self.stage_l6_force_driver_tag = _read_bool_env(
+            "VLLM_UVM_RESIDENCY_KV_FORCE_DRIVER_TAG",
             False,
         )
         self.stage_l6_pointer_tag_granularity = _read_choice_env(
@@ -221,6 +281,29 @@ class UvmKvRuntimePolicy:
             self.budget_blocks = max(self.budget_bytes // self.bytes_per_block, 1)
         else:
             self.budget_blocks = 0
+        self.dynamic_pool_enable = (
+            self.enabled
+            and _read_bool_env("VLLM_UVM_KV_DYNAMIC_POOL_ENABLE", False)
+        )
+        self.dynamic_pool_control_file = os.environ.get(
+            "VLLM_UVM_KV_DYNAMIC_POOL_CONTROL_FILE", ""
+        )
+        self.dynamic_pool_initial_blocks = _read_int_env(
+            "VLLM_UVM_KV_DYNAMIC_POOL_INITIAL_BLOCKS", 0
+        )
+        self.dynamic_pool_target_blocks = self._clamp_dynamic_pool_target(
+            self.dynamic_pool_initial_blocks
+            if self.dynamic_pool_initial_blocks > 0
+            else self.total_blocks
+        )
+        # The residency ledger starts with all registered KV regions on GPU.
+        # Applying the target later lets the initial shrink be traced as a
+        # safe, explicit pool-size transition.
+        self._dynamic_pool_applied_target_blocks = self.total_blocks
+        self._dynamic_pool_control_mtime_ns: int | None = None
+        self._dynamic_pool_generation = 0
+        self._dynamic_pool_saved_lifecycle: dict[int, str] = {}
+        self._dynamic_pool_physical_cpu_regions: set[tuple[int, int]] = set()
         if self.policy not in ("lru_prefix_cache", "scheduler_aware"):
             logger.warning(
                 "Ignoring invalid VLLM_UVM_KV_RUNTIME_EVICTION_POLICY=%r; "
@@ -260,13 +343,35 @@ class UvmKvRuntimePolicy:
             "active_protect_fallback_records": 0,
             "active_protect_blocks": 0,
             "active_protect_bytes": 0,
+            "dynamic_pool_resize_records": 0,
+            "dynamic_pool_offload_blocks": 0,
+            "dynamic_pool_prefetch_blocks": 0,
+            "dynamic_pool_deferred_active_blocks": 0,
         }
+        self._unified_config_recorded = False
 
     @property
     def active(self) -> bool:
         return self.enabled and bool(self.trace_file)
 
     def record_config(self) -> None:
+        if not self._unified_config_recorded:
+            self._unified_config_recorded = True
+            record_unified_residency_snapshot(
+                reason="kv_runtime_config",
+                kv_pressure={
+                    "runtime_enabled": self.enabled,
+                    "runtime_mode": self.mode,
+                    "budget_bytes": self.budget_bytes,
+                    "budget_blocks": self.budget_blocks,
+                    "bytes_per_block": self.bytes_per_block,
+                    "total_bytes": self.total_bytes,
+                    "total_blocks": self.total_blocks,
+                    "dynamic_pool_enable": self.dynamic_pool_enable,
+                    "dynamic_pool_target_blocks": self.dynamic_pool_target_blocks,
+                    "num_kv_cache_groups": self.num_kv_cache_groups,
+                },
+            )
         if not self.active or self._config_recorded:
             return
         self._config_recorded = True
@@ -291,6 +396,7 @@ class UvmKvRuntimePolicy:
                 "stage_n_allocator_kv_driver_tag_enable": (
                     self.stage_n_allocator_kv_driver_tag_enable
                 ),
+                "stage_l6_force_driver_tag": self.stage_l6_force_driver_tag,
                 "stage_l6_pointer_tag_granularity": (
                     self.stage_l6_pointer_tag_granularity
                 ),
@@ -308,9 +414,195 @@ class UvmKvRuntimePolicy:
                 "prefer_gpu_resident_allow_cached": (
                     self.prefer_gpu_resident_allow_cached
                 ),
+                "dynamic_pool_enable": self.dynamic_pool_enable,
+                "dynamic_pool_control_file": self.dynamic_pool_control_file,
+                "dynamic_pool_initial_blocks": self.dynamic_pool_initial_blocks,
+                "dynamic_pool_target_blocks": self.dynamic_pool_target_blocks,
                 "num_kv_cache_groups": self.num_kv_cache_groups,
             }
         )
+
+    def dynamic_pool_active(self) -> bool:
+        return self.dynamic_pool_enable
+
+    def get_effective_num_gpu_blocks(self, block_pool: Any) -> int:
+        if not self.dynamic_pool_active():
+            return max(getattr(block_pool, "num_gpu_blocks", 0) - 1, 0)
+        self._refresh_dynamic_pool_target(
+            block_pool=block_pool,
+            reason="effective_num_gpu_blocks",
+        )
+        return self.dynamic_pool_target_blocks
+
+    def get_num_allocatable_free_blocks(self, block_pool: Any) -> int:
+        if not self.dynamic_pool_active():
+            return int(getattr(block_pool.free_block_queue, "num_free_blocks", 0))
+        self._refresh_dynamic_pool_target(
+            block_pool=block_pool,
+            reason="allocatable_free_blocks",
+        )
+        try:
+            free_blocks = block_pool.free_block_queue.get_all_free_blocks()
+        except Exception as exc:  # pragma: no cover - defensive trace path.
+            self._write(
+                {
+                    "action": "kv_dynamic_pool_free_count_failed",
+                    "reason": "free_queue_snapshot_failed",
+                    "error": repr(exc),
+                }
+            )
+            return 0
+        return sum(
+            1
+            for block in free_blocks
+            if self._dynamic_pool_block_allocatable(block)
+        )
+
+    def apply_unified_kv_target_blocks(
+        self,
+        target_blocks: int,
+        *,
+        block_pool: Any | None,
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        target = self._clamp_dynamic_pool_target(target_blocks)
+        metadata = metadata or {}
+        if not self.dynamic_pool_active():
+            return {
+                "ok": False,
+                "reason": "dynamic_pool_disabled",
+                "requested_target_blocks": max(int(target_blocks or 0), 0),
+                "target_blocks": target,
+            }
+        if block_pool is None:
+            return {
+                "ok": False,
+                "reason": "block_pool_unavailable",
+                "requested_target_blocks": max(int(target_blocks or 0), 0),
+                "target_blocks": target,
+            }
+
+        old_target = self.dynamic_pool_target_blocks
+        if target != old_target:
+            self.dynamic_pool_target_blocks = target
+            self._dynamic_pool_generation += 1
+            record_unified_kv_target(
+                target,
+                old_target_blocks=old_target,
+                reason=reason,
+                metadata={
+                    "source": "unified_control_file",
+                    "generation": self._dynamic_pool_generation,
+                    **metadata,
+                },
+            )
+            self._write(
+                {
+                    "action": "kv_dynamic_pool_target_update",
+                    "reason": reason,
+                    "source": "unified_control_file",
+                    "old_target_blocks": old_target,
+                    "new_target_blocks": target,
+                    "generation": self._dynamic_pool_generation,
+                    "metadata": metadata,
+                }
+            )
+        self._ensure_dynamic_pool_applied(
+            block_pool=block_pool,
+            reason=reason,
+        )
+        return {
+            "ok": True,
+            "reason": "applied",
+            "old_target_blocks": old_target,
+            "new_target_blocks": target,
+            "generation": self._dynamic_pool_generation,
+            "applied_target_blocks": self._dynamic_pool_applied_target_blocks,
+        }
+
+    def prefetch_kv_blocks_from_unified(
+        self,
+        block_specs: list[dict[str, int | None]],
+        *,
+        block_pool: Any | None,
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        metadata = metadata or {}
+        if not self.active:
+            return {
+                "ok": False,
+                "reason": "kv_runtime_inactive",
+                "requested_blocks": block_specs,
+            }
+        self.record_config()
+        self._maybe_load_stage_l6_pointer_map(reason="unified_control_prefetch")
+        records: list[dict[str, Any]] = []
+        for spec in block_specs:
+            block_id = int(spec.get("block_id") if spec.get("block_id") is not None else -1)
+            if block_id < 0:
+                continue
+            group_value = spec.get("group_id")
+            group_ids = (
+                [int(group_value)]
+                if group_value is not None
+                else list(range(self.num_kv_cache_groups))
+            )
+            ref_cnt = None
+            if block_pool is not None:
+                try:
+                    block = getattr(block_pool, "blocks", [])[block_id]
+                    ref_cnt = getattr(block, "ref_cnt", None)
+                    if getattr(block, "lifecycle_state", None) == "cpu_offloaded":
+                        block.lifecycle_state = "used_free"
+                except Exception:
+                    ref_cnt = None
+            for group_id in group_ids:
+                region_id = f"kv:{group_id}:{block_id}"
+                before = get_uvm_residency_region_snapshot(region_id) or {}
+                self._maybe_prefetch_back_region(
+                    region_id=region_id,
+                    block_id=block_id,
+                    group_id=group_id,
+                    reason=reason,
+                    ref_cnt=ref_cnt,
+                )
+                after = get_uvm_residency_region_snapshot(region_id) or {}
+                records.append(
+                    {
+                        "region_id": region_id,
+                        "group_id": group_id,
+                        "block_id": block_id,
+                        "before_state": before.get("state"),
+                        "after_state": after.get("state"),
+                        "bytes": int(after.get("bytes") or before.get("bytes") or 0),
+                        "metadata": metadata,
+                    }
+                )
+        issued = [
+            item for item in records
+            if item.get("before_state") in ("cpu", "prefetching_cpu")
+            and item.get("after_state") in ("gpu", "prefetching_gpu")
+        ]
+        self._write(
+            {
+                "action": "unified_prefetch_kv_blocks_result",
+                "reason": reason,
+                "requested_blocks": block_specs,
+                "attempted_regions": len(records),
+                "issued_regions": len(issued),
+                "records": records,
+                "metadata": metadata,
+            }
+        )
+        return {
+            "ok": True,
+            "requested_blocks": block_specs,
+            "attempted_regions": len(records),
+            "issued_regions": len(issued),
+            "records": records,
+        }
 
     def select_free_blocks_for_allocation(
         self,
@@ -324,8 +616,17 @@ class UvmKvRuntimePolicy:
         This only changes which free block IDs vLLM reuses. Correctness still
         relies on the normal active KV protect/prefetch path after allocation.
         """
-        if num_blocks <= 0 or not self.prefer_gpu_resident_free_blocks:
+        dynamic_active = self.dynamic_pool_active()
+        if (
+            num_blocks <= 0
+            or not self.prefer_gpu_resident_free_blocks
+            and not dynamic_active
+        ):
             return None
+        self._refresh_dynamic_pool_target(
+            block_pool=block_pool,
+            reason="select_free_blocks_for_allocation",
+        )
         try:
             free_blocks = block_pool.free_block_queue.get_all_free_blocks()
         except Exception as exc:  # pragma: no cover - defensive trace path.
@@ -340,12 +641,14 @@ class UvmKvRuntimePolicy:
             return None
 
         if len(free_blocks) < num_blocks:
-            return None
+            return [] if dynamic_active else None
 
-        gpu_blocks: list[Any] = []
+        gpu_fresh_blocks: list[Any] = []
+        gpu_warm_blocks: list[Any] = []
         unknown_blocks: list[Any] = []
         cpu_blocks: list[Any] = []
         skipped_cached = 0
+        skipped_dynamic_pool = 0
         skipped_unsafe = 0
 
         for block in free_blocks:
@@ -358,6 +661,9 @@ class UvmKvRuntimePolicy:
             if not safe:
                 skipped_unsafe += 1
                 continue
+            if dynamic_active and not self._dynamic_pool_block_id_allocatable(block_id):
+                skipped_dynamic_pool += 1
+                continue
             if (
                 enable_caching
                 and not self.prefer_gpu_resident_allow_cached
@@ -368,28 +674,40 @@ class UvmKvRuntimePolicy:
 
             state = self._kv_block_residency_class(block_id)
             if state == "gpu":
-                gpu_blocks.append(block)
+                lifecycle_state = self._kv_block_lifecycle_class(block)
+                if lifecycle_state == "never_used":
+                    gpu_fresh_blocks.append(block)
+                else:
+                    gpu_warm_blocks.append(block)
             elif state == "cpu":
                 cpu_blocks.append(block)
             else:
                 unknown_blocks.append(block)
 
-        selected = (gpu_blocks + unknown_blocks + cpu_blocks)[:num_blocks]
+        selected = (
+            gpu_fresh_blocks + gpu_warm_blocks + unknown_blocks + cpu_blocks
+        )[:num_blocks]
         if len(selected) != num_blocks:
             self._write(
                 {
                     "action": "gpu_resident_free_block_select_fallback",
                     "requested_blocks": num_blocks,
                     "free_blocks": len(free_blocks),
-                    "gpu_candidates": len(gpu_blocks),
+                    "gpu_candidates": len(gpu_fresh_blocks) + len(gpu_warm_blocks),
+                    "gpu_fresh_candidates": len(gpu_fresh_blocks),
+                    "gpu_warm_candidates": len(gpu_warm_blocks),
                     "unknown_candidates": len(unknown_blocks),
                     "cpu_candidates": len(cpu_blocks),
                     "skipped_cached": skipped_cached,
+                    "skipped_dynamic_pool": skipped_dynamic_pool,
                     "skipped_unsafe": skipped_unsafe,
                     "enable_caching": enable_caching,
+                    "dynamic_pool_target_blocks": (
+                        self.dynamic_pool_target_blocks if dynamic_active else None
+                    ),
                 }
             )
-            return None
+            return [] if dynamic_active else None
 
         selected_ids = [int(getattr(block, "block_id", -1)) for block in selected]
         self._write(
@@ -397,15 +715,607 @@ class UvmKvRuntimePolicy:
                 "action": "gpu_resident_free_block_select",
                 "requested_blocks": num_blocks,
                 "selected_block_ids": selected_ids,
-                "gpu_candidates": len(gpu_blocks),
+                "selected_lifecycle_states": [
+                    self._kv_block_lifecycle_class(block) for block in selected
+                ],
+                "gpu_candidates": len(gpu_fresh_blocks) + len(gpu_warm_blocks),
+                "gpu_fresh_candidates": len(gpu_fresh_blocks),
+                "gpu_warm_candidates": len(gpu_warm_blocks),
                 "unknown_candidates": len(unknown_blocks),
                 "cpu_candidates": len(cpu_blocks),
                 "skipped_cached": skipped_cached,
+                "skipped_dynamic_pool": skipped_dynamic_pool,
                 "skipped_unsafe": skipped_unsafe,
                 "enable_caching": enable_caching,
+                "dynamic_pool_target_blocks": (
+                    self.dynamic_pool_target_blocks if dynamic_active else None
+                ),
             }
         )
         return selected
+
+    def _clamp_dynamic_pool_target(self, target_blocks: int) -> int:
+        return min(max(int(target_blocks or 0), 0), self.total_blocks)
+
+    def _dynamic_pool_block_id_allocatable(self, block_id: int) -> bool:
+        if not self.dynamic_pool_active():
+            return True
+        return 0 < block_id <= self.dynamic_pool_target_blocks
+
+    def _dynamic_pool_block_allocatable(self, block: Any) -> bool:
+        block_id = int(getattr(block, "block_id", -1))
+        return (
+            block_id >= 0
+            and not bool(getattr(block, "is_null", False))
+            and getattr(block, "ref_cnt", None) == 0
+            and self._dynamic_pool_block_id_allocatable(block_id)
+        )
+
+    def _refresh_dynamic_pool_target(
+        self,
+        *,
+        block_pool: Any | None,
+        reason: str,
+    ) -> None:
+        get_uvm_unified_residency_controller().apply_control_file(
+            kv_runtime_policy=self,
+            block_pool=block_pool,
+            reason=reason,
+        )
+        if not self.dynamic_pool_active():
+            return
+        target = self.dynamic_pool_target_blocks
+        raw_value: str | None = None
+        if self.dynamic_pool_control_file:
+            try:
+                stat = os.stat(self.dynamic_pool_control_file)
+            except FileNotFoundError:
+                stat = None
+            except OSError as exc:  # pragma: no cover - diagnostic path.
+                self._write(
+                    {
+                        "action": "kv_dynamic_pool_control_read_failed",
+                        "control_file": self.dynamic_pool_control_file,
+                        "reason": reason,
+                        "error": repr(exc),
+                    }
+                )
+                stat = None
+            if stat is not None and stat.st_mtime_ns != self._dynamic_pool_control_mtime_ns:
+                self._dynamic_pool_control_mtime_ns = stat.st_mtime_ns
+                try:
+                    with open(
+                        self.dynamic_pool_control_file,
+                        "r",
+                        encoding="utf-8",
+                        errors="replace",
+                    ) as handle:
+                        raw_value = handle.read()
+                    parsed = self._parse_dynamic_pool_control(raw_value)
+                    if parsed is not None:
+                        target = self._clamp_dynamic_pool_target(parsed)
+                except Exception as exc:  # pragma: no cover - diagnostic path.
+                    self._write(
+                        {
+                            "action": "kv_dynamic_pool_control_read_failed",
+                            "control_file": self.dynamic_pool_control_file,
+                            "reason": reason,
+                            "error": repr(exc),
+                        }
+                    )
+        if target != self.dynamic_pool_target_blocks:
+            old_target = self.dynamic_pool_target_blocks
+            self.dynamic_pool_target_blocks = target
+            self._dynamic_pool_generation += 1
+            record_unified_kv_target(
+                target,
+                old_target_blocks=old_target,
+                reason=reason,
+                metadata={
+                    "source": "kv_dynamic_pool_target_update",
+                    "generation": self._dynamic_pool_generation,
+                    "control_file": self.dynamic_pool_control_file,
+                    "raw_value": raw_value,
+                },
+            )
+            self._write(
+                {
+                    "action": "kv_dynamic_pool_target_update",
+                    "reason": reason,
+                    "old_target_blocks": old_target,
+                    "new_target_blocks": target,
+                    "generation": self._dynamic_pool_generation,
+                    "control_file": self.dynamic_pool_control_file,
+                    "raw_value": raw_value,
+                }
+            )
+        self._ensure_dynamic_pool_applied(block_pool=block_pool, reason=reason)
+
+    def _parse_dynamic_pool_control(self, raw_value: str) -> int | None:
+        text = (raw_value or "").strip()
+        if not text:
+            return None
+        if text.startswith("{"):
+            data = json.loads(text)
+            for key in ("target_blocks", "blocks", "target_resident_blocks"):
+                if key in data:
+                    return int(data[key])
+            return None
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if "=" in line:
+                key, value = line.split("=", 1)
+                if key.strip() in (
+                    "target_blocks",
+                    "blocks",
+                    "target_resident_blocks",
+                ):
+                    return int(value.strip())
+                continue
+            return int(line)
+        return None
+
+    def _ensure_dynamic_pool_applied(
+        self,
+        *,
+        block_pool: Any | None,
+        reason: str,
+    ) -> None:
+        if not self.dynamic_pool_active() or block_pool is None:
+            return
+        target = self.dynamic_pool_target_blocks
+        old_target = self._dynamic_pool_applied_target_blocks
+        if old_target == target:
+            return
+        try:
+            free_blocks = block_pool.free_block_queue.get_all_free_blocks()
+        except Exception as exc:  # pragma: no cover - defensive trace path.
+            self._write(
+                {
+                    "action": "kv_dynamic_pool_resize_failed",
+                    "reason": "free_queue_snapshot_failed",
+                    "old_target_blocks": old_target,
+                    "new_target_blocks": target,
+                    "error": repr(exc),
+                }
+            )
+            return
+
+        direction = "grow" if target > old_target else "shrink"
+        offloaded = 0
+        prefetched = 0
+        skipped_active = 0
+        skipped_unsafe = 0
+
+        if direction == "shrink":
+            for block in free_blocks:
+                block_id = int(getattr(block, "block_id", -1))
+                if block_id <= target or block_id > old_target:
+                    continue
+                if not self._dynamic_pool_block_safe_for_resize(block):
+                    skipped_unsafe += 1
+                    continue
+                if self._mark_dynamic_pool_block_cpu(
+                    block=block,
+                    reason=reason,
+                    old_target=old_target,
+                    new_target=target,
+                ):
+                    offloaded += 1
+            for block in getattr(block_pool, "blocks", []):
+                block_id = int(getattr(block, "block_id", -1))
+                if target < block_id <= old_target and getattr(block, "ref_cnt", 0) > 0:
+                    skipped_active += 1
+        else:
+            for block in free_blocks:
+                block_id = int(getattr(block, "block_id", -1))
+                if not (old_target < block_id <= target):
+                    continue
+                if not self._dynamic_pool_block_safe_for_resize(block):
+                    skipped_unsafe += 1
+                    continue
+                if self._mark_dynamic_pool_block_gpu(
+                    block=block,
+                    reason=reason,
+                    old_target=old_target,
+                    new_target=target,
+                ):
+                    prefetched += 1
+            for block in getattr(block_pool, "blocks", []):
+                block_id = int(getattr(block, "block_id", -1))
+                if old_target < block_id <= target and getattr(block, "ref_cnt", 0) > 0:
+                    skipped_active += 1
+
+        self._dynamic_pool_applied_target_blocks = target
+        self._summary["dynamic_pool_resize_records"] += 1
+        self._summary["dynamic_pool_offload_blocks"] += offloaded
+        self._summary["dynamic_pool_prefetch_blocks"] += prefetched
+        self._summary["dynamic_pool_deferred_active_blocks"] += skipped_active
+        self._write(
+            {
+                "action": "kv_dynamic_pool_resize",
+                "reason": reason,
+                "direction": direction,
+                "old_target_blocks": old_target,
+                "new_target_blocks": target,
+                "offloaded_blocks": offloaded,
+                "prefetched_blocks": prefetched,
+                "deferred_active_blocks": skipped_active,
+                "skipped_unsafe_blocks": skipped_unsafe,
+                "generation": self._dynamic_pool_generation,
+            }
+        )
+        record_unified_residency_snapshot(
+            reason="kv_dynamic_pool_resize",
+            kv_pressure={
+                "direction": direction,
+                "old_target_blocks": old_target,
+                "new_target_blocks": target,
+                "offloaded_blocks": offloaded,
+                "prefetched_blocks": prefetched,
+                "deferred_active_blocks": skipped_active,
+                "skipped_unsafe_blocks": skipped_unsafe,
+                "generation": self._dynamic_pool_generation,
+                "source_reason": reason,
+            },
+        )
+
+    def _dynamic_pool_block_safe_for_resize(self, block: Any) -> bool:
+        return (
+            int(getattr(block, "block_id", -1)) > 0
+            and not bool(getattr(block, "is_null", False))
+            and getattr(block, "ref_cnt", None) == 0
+        )
+
+    def _mark_dynamic_pool_block_cpu(
+        self,
+        *,
+        block: Any,
+        reason: str,
+        old_target: int,
+        new_target: int,
+    ) -> bool:
+        block_id = int(getattr(block, "block_id", -1))
+        previous_lifecycle = self._kv_block_lifecycle_class(block)
+        if previous_lifecycle != "cpu_offloaded":
+            self._dynamic_pool_saved_lifecycle[block_id] = previous_lifecycle
+        block.lifecycle_state = "cpu_offloaded"
+        if self.stage_l6_data_offload_enable:
+            self._maybe_load_stage_l6_pointer_map(
+                reason="dynamic_pool_resize_shrink"
+            )
+        issued = False
+        for group_id in range(self.num_kv_cache_groups):
+            region_id = f"kv:{group_id}:{block_id}"
+            snapshot = get_uvm_residency_region_snapshot(region_id)
+            snapshot_metadata = dict((snapshot or {}).get("metadata") or {})
+            ranges = self._stage_l6_pointer_ranges.get(region_id) or []
+            state = str((snapshot or {}).get("state") or "unknown")
+            ptr = int(
+                (snapshot or {}).get("ptr")
+                or (ranges[0][0] if ranges else 0)
+            )
+            size_bytes = int(
+                (snapshot or {}).get("bytes")
+                or sum(range_bytes for _, range_bytes in ranges)
+                or self.bytes_per_group_block
+            )
+            if state == "cpu":
+                issued = True
+                continue
+            offload_capable = bool(snapshot_metadata.get("offload_capable")) and bool(
+                ranges
+            )
+            physical_requested = (
+                self.stage_l6_data_offload_enable
+                and self.stage_l6_data_offload_mode == "prefetch_cpu"
+            )
+            metadata = {
+                "stage": "stage_l6",
+                "source": "kv_dynamic_pool_resize",
+                "direction": "shrink",
+                "reason": reason,
+                "block_id": block_id,
+                "group_id": group_id,
+                "old_target_blocks": old_target,
+                "new_target_blocks": new_target,
+                "ref_cnt": getattr(block, "ref_cnt", None),
+                "previous_lifecycle_state": previous_lifecycle,
+                "previous_state": state,
+                "offload_capable": offload_capable,
+                "ptr_present": ptr > 0,
+                "range_count": len(ranges),
+                "requested_mode": (
+                    self.stage_l6_data_offload_mode
+                    if self.stage_l6_data_offload_enable
+                    else "logical_dynamic_pool"
+                ),
+                "physical_migration_requested": physical_requested,
+                "physical_migration_issued": False,
+                "metadata_only": True,
+            }
+            record_uvm_residency_action(
+                action="residency_kv_data_offload_attempt",
+                pool="kv",
+                region_id=region_id,
+                bytes=size_bytes,
+                metadata=metadata,
+            )
+            physical_issued = False
+            fallback_reason: str | None = None
+            if physical_requested and offload_capable:
+                mark_uvm_residency_state(
+                    region_id=region_id,
+                    state="prefetching_cpu",
+                    metadata=metadata,
+                )
+                self._record_physical_migration_boundary(
+                    phase="begin",
+                    direction="cpu",
+                    region_id=region_id,
+                    block_id=block_id,
+                    group_id=group_id,
+                    ranges=tuple(ranges),
+                    size_bytes=size_bytes,
+                    old_target=old_target,
+                    new_target=new_target,
+                    metadata=metadata,
+                )
+                start_ns = time.monotonic_ns()
+                accepted_ranges = batch_prefetch_ranges_to_cpu(tuple(ranges))
+                elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000.0
+                metadata = {
+                    **metadata,
+                    **_maybe_sync_after_kv_physical_prefetch(-1),
+                }
+                self._record_physical_migration_boundary(
+                    phase="end",
+                    direction="cpu",
+                    region_id=region_id,
+                    block_id=block_id,
+                    group_id=group_id,
+                    ranges=tuple(ranges),
+                    size_bytes=size_bytes,
+                    old_target=old_target,
+                    new_target=new_target,
+                    metadata=metadata,
+                    accepted_ranges=accepted_ranges,
+                    elapsed_ms=elapsed_ms,
+                )
+                physical_issued = accepted_ranges == len(ranges)
+                if not physical_issued:
+                    fallback_reason = "prefetch_cpu_not_issued"
+            elif physical_requested:
+                fallback_reason = "missing_ptr_or_not_offload_capable"
+            if fallback_reason:
+                record_uvm_residency_action(
+                    action="residency_kv_data_offload_fallback",
+                    pool="kv",
+                    region_id=region_id,
+                    bytes=size_bytes,
+                    fallback_reason=fallback_reason,
+                    metadata={
+                        **metadata,
+                        "fallback_reason": fallback_reason,
+                    },
+                )
+            final_metadata = {
+                **metadata,
+                "fallback_reason": fallback_reason,
+                "physical_migration_issued": physical_issued,
+                "metadata_only": not physical_issued,
+                "physical_migration_accepted_ranges": (
+                    accepted_ranges if physical_requested and offload_capable else 0
+                ),
+            }
+            if physical_issued:
+                self._dynamic_pool_physical_cpu_regions.add((block_id, group_id))
+            mark_uvm_residency_state(
+                region_id=region_id,
+                state="cpu",
+                metadata=final_metadata,
+            )
+            record_uvm_residency_action(
+                action="residency_kv_data_offload_issued",
+                pool="kv",
+                region_id=region_id,
+                bytes=size_bytes,
+                mode=(
+                    self.stage_l6_data_offload_mode
+                    if physical_issued
+                    else "logical_dynamic_pool"
+                ),
+                ptr=f"0x{ptr:x}" if ptr > 0 else None,
+                range_count=len(ranges),
+                metadata=final_metadata,
+            )
+            self._summary["stage_l6_data_offload_issued_records"] += 1
+            issued = True
+        return issued
+
+    def _mark_dynamic_pool_block_gpu(
+        self,
+        *,
+        block: Any,
+        reason: str,
+        old_target: int,
+        new_target: int,
+    ) -> bool:
+        block_id = int(getattr(block, "block_id", -1))
+        restored_lifecycle = self._dynamic_pool_saved_lifecycle.pop(
+            block_id,
+            "used_free",
+        )
+        if restored_lifecycle not in ("never_used", "used_free"):
+            restored_lifecycle = "used_free"
+        block.lifecycle_state = restored_lifecycle
+        if self.stage_l6_prefetch_back_enable:
+            self._maybe_load_stage_l6_pointer_map(
+                reason="dynamic_pool_resize_grow"
+            )
+        issued = False
+        for group_id in range(self.num_kv_cache_groups):
+            region_id = f"kv:{group_id}:{block_id}"
+            snapshot = get_uvm_residency_region_snapshot(region_id)
+            snapshot_metadata = dict((snapshot or {}).get("metadata") or {})
+            ranges = self._stage_l6_pointer_ranges.get(region_id) or []
+            state = str((snapshot or {}).get("state") or "unknown")
+            ptr = int(
+                (snapshot or {}).get("ptr")
+                or (ranges[0][0] if ranges else 0)
+            )
+            size_bytes = int(
+                (snapshot or {}).get("bytes")
+                or sum(range_bytes for _, range_bytes in ranges)
+                or self.bytes_per_group_block
+            )
+            physical_cpu_tracked = (
+                block_id,
+                group_id,
+            ) in self._dynamic_pool_physical_cpu_regions
+            if state == "gpu" and not physical_cpu_tracked:
+                issued = True
+                continue
+            offload_capable = bool(snapshot_metadata.get("offload_capable")) and bool(
+                ranges
+            )
+            physical_requested = (
+                self.stage_l6_prefetch_back_enable
+                and self.stage_l6_prefetch_back_mode == "prefetch"
+            )
+            metadata = {
+                "stage": "stage_l6",
+                "source": "kv_dynamic_pool_resize",
+                "direction": "grow",
+                "reason": reason,
+                "block_id": block_id,
+                "group_id": group_id,
+                "old_target_blocks": old_target,
+                "new_target_blocks": new_target,
+                "ref_cnt": getattr(block, "ref_cnt", None),
+                "restored_lifecycle_state": restored_lifecycle,
+                "previous_state": state,
+                "physical_cpu_tracked": physical_cpu_tracked,
+                "offload_capable": offload_capable,
+                "ptr_present": ptr > 0,
+                "range_count": len(ranges),
+                "requested_mode": (
+                    self.stage_l6_prefetch_back_mode
+                    if self.stage_l6_prefetch_back_enable
+                    else "logical_dynamic_pool"
+                ),
+                "physical_migration_requested": physical_requested,
+                "physical_migration_issued": False,
+                "metadata_only": True,
+            }
+            record_uvm_residency_action(
+                action="residency_kv_prefetch_back_attempt",
+                pool="kv",
+                region_id=region_id,
+                bytes=size_bytes,
+                metadata=metadata,
+            )
+            mark_uvm_residency_state(
+                region_id=region_id,
+                state="prefetching_gpu",
+                metadata=metadata,
+            )
+            physical_issued = False
+            fallback_reason: str | None = None
+            accepted_ranges = 0
+            if physical_requested and offload_capable:
+                self._record_physical_migration_boundary(
+                    phase="begin",
+                    direction="gpu",
+                    region_id=region_id,
+                    block_id=block_id,
+                    group_id=group_id,
+                    ranges=tuple(ranges),
+                    size_bytes=size_bytes,
+                    old_target=old_target,
+                    new_target=new_target,
+                    metadata=metadata,
+                )
+                start_ns = time.monotonic_ns()
+                accepted_ranges = batch_prefetch_ranges_to_device(
+                    tuple(ranges),
+                    device=self.stage_l6_device,
+                )
+                elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000.0
+                metadata = {
+                    **metadata,
+                    **_maybe_sync_after_kv_physical_prefetch(self.stage_l6_device),
+                }
+                self._record_physical_migration_boundary(
+                    phase="end",
+                    direction="gpu",
+                    region_id=region_id,
+                    block_id=block_id,
+                    group_id=group_id,
+                    ranges=tuple(ranges),
+                    size_bytes=size_bytes,
+                    old_target=old_target,
+                    new_target=new_target,
+                    metadata=metadata,
+                    accepted_ranges=accepted_ranges,
+                    elapsed_ms=elapsed_ms,
+                )
+                physical_issued = accepted_ranges == len(ranges)
+                if not physical_issued:
+                    fallback_reason = "prefetch_gpu_not_issued"
+            elif physical_requested:
+                fallback_reason = "missing_ptr_or_not_offload_capable"
+            if fallback_reason:
+                record_uvm_residency_action(
+                    action="residency_kv_prefetch_back_fallback",
+                    pool="kv",
+                    region_id=region_id,
+                    bytes=size_bytes,
+                    fallback_reason=fallback_reason,
+                    metadata={
+                        **metadata,
+                        "fallback_reason": fallback_reason,
+                    },
+                )
+            final_metadata = {
+                **metadata,
+                "fallback_reason": fallback_reason,
+                "physical_migration_issued": physical_issued,
+                "physical_migration_accepted_ranges": accepted_ranges,
+                "metadata_only": not physical_issued,
+            }
+            if physical_issued:
+                self._dynamic_pool_physical_cpu_regions.discard((block_id, group_id))
+            mark_uvm_residency_state(
+                region_id=region_id,
+                state="gpu",
+                metadata=final_metadata,
+            )
+            record_uvm_residency_action(
+                action="residency_kv_prefetch_back_issued",
+                pool="kv",
+                region_id=region_id,
+                bytes=size_bytes,
+                mode=(
+                    self.stage_l6_prefetch_back_mode
+                    if physical_issued
+                    else "logical_dynamic_pool"
+                ),
+                ptr=f"0x{ptr:x}" if ptr > 0 else None,
+                range_count=len(ranges),
+                metadata=final_metadata,
+            )
+            self._summary["stage_l6_prefetch_back_issued_records"] += 1
+            issued = True
+        return issued
+
+    def _kv_block_lifecycle_class(self, block: Any) -> str:
+        state = str(getattr(block, "lifecycle_state", "never_used") or "never_used")
+        if state in ("never_used", "used_free", "cpu_offloaded"):
+            return state
+        return "used_free"
 
     def _kv_block_residency_class(self, block_id: int) -> str:
         saw_unknown = False
@@ -452,6 +1362,10 @@ class UvmKvRuntimePolicy:
                         "block_id": block_id,
                         "bytes_per_block": bytes_per_region,
                         "ref_cnt": getattr(block, "ref_cnt", None),
+                        "lifecycle_state": self._kv_block_lifecycle_class(block),
+                        "ever_used": (
+                            self._kv_block_lifecycle_class(block) != "never_used"
+                        ),
                         "is_prefix_cache": getattr(block, "block_hash", None)
                         is not None,
                         "in_free_queue": True,
@@ -492,6 +1406,7 @@ class UvmKvRuntimePolicy:
             register_driver_regions = self.stage_l6_data_offload_enable
         allocator_driver_tag_skip = (
             self.stage_n_allocator_kv_driver_tag_enable
+            and not self.stage_l6_force_driver_tag
             and bool(register_driver_regions)
         )
         if allocator_driver_tag_skip:
@@ -543,6 +1458,7 @@ class UvmKvRuntimePolicy:
                 "allocator_kv_driver_tag_enable": (
                     self.stage_n_allocator_kv_driver_tag_enable
                 ),
+                "force_driver_tag": self.stage_l6_force_driver_tag,
                 "data_offload_capable": registered > 0,
                 "pointer_tag_enable": self.stage_l6_pointer_tag_enable,
                 "data_offload_enable": self.stage_l6_data_offload_enable,
@@ -682,6 +1598,7 @@ class UvmKvRuntimePolicy:
                 "allocator_kv_driver_tag_enable": (
                     self.stage_n_allocator_kv_driver_tag_enable
                 ),
+                "force_driver_tag": self.stage_l6_force_driver_tag,
                 "pointer_tag_granularity": self.stage_l6_pointer_tag_granularity,
                 "data_offload_enable": self.stage_l6_data_offload_enable,
             }
@@ -690,7 +1607,10 @@ class UvmKvRuntimePolicy:
             self._stage_l6_pointer_map_loaded = False
             return
         if pointer_map:
-            allocator_driver_tags = self.stage_n_allocator_kv_driver_tag_enable
+            allocator_driver_tags = (
+                self.stage_n_allocator_kv_driver_tag_enable
+                and not self.stage_l6_force_driver_tag
+            )
             self.register_stage_l6_kv_pointer_map(
                 pointer_map,
                 source="kv_pointer_map_contiguous_block",
@@ -744,6 +1664,7 @@ class UvmKvRuntimePolicy:
                             if allocator_driver_tags
                             else None
                         ),
+                        "force_driver_tag": self.stage_l6_force_driver_tag,
                         "range_count": len(ranges),
                     },
                 )
@@ -849,6 +1770,7 @@ class UvmKvRuntimePolicy:
                             else None
                         ),
                         "allocator_kv_driver_tag_enable": allocator_driver_tags,
+                        "force_driver_tag": self.stage_l6_force_driver_tag,
                         "data_offload_enable": self.stage_l6_data_offload_enable,
                     }
                 )
@@ -861,11 +1783,21 @@ class UvmKvRuntimePolicy:
         block_pool: Any,
     ) -> bool:
         """Trace pressure and decide whether new KV block admission is allowed."""
-        if not self.active or num_blocks_to_allocate <= 0:
+        if num_blocks_to_allocate <= 0:
             return True
         self.record_config()
-        self._maybe_load_stage_l6_pointer_map(reason="allocation_pressure")
         pressure = self._pressure_snapshot(block_pool, num_blocks_to_allocate)
+        record_unified_residency_snapshot(
+            reason="kv_allocation_pressure",
+            kv_pressure={
+                "request_id": request_id,
+                "num_blocks_to_allocate": num_blocks_to_allocate,
+                **pressure,
+            },
+        )
+        if not self.active:
+            return True
+        self._maybe_load_stage_l6_pointer_map(reason="allocation_pressure")
         over_budget = bool(pressure["over_budget"])
         record_uvm_pool_pressure(
             pool="kv",
@@ -1005,7 +1937,12 @@ class UvmKvRuntimePolicy:
     def _pressure_snapshot(
         self, block_pool: Any, num_blocks_to_allocate: int
     ) -> dict[str, Any]:
-        total_blocks = max(getattr(block_pool, "num_gpu_blocks", 0) - 1, 0)
+        physical_total_blocks = max(getattr(block_pool, "num_gpu_blocks", 0) - 1, 0)
+        total_blocks = (
+            self.get_effective_num_gpu_blocks(block_pool)
+            if self.dynamic_pool_active()
+            else physical_total_blocks
+        )
         free_blocks = max(block_pool.get_num_free_blocks(), 0)
         used_blocks = max(total_blocks - free_blocks, 0)
         projected_used_blocks = used_blocks + max(num_blocks_to_allocate, 0)
@@ -1020,6 +1957,13 @@ class UvmKvRuntimePolicy:
             "budget_bytes": self.budget_bytes,
             "bytes_per_block": self.bytes_per_block,
             "total_blocks": total_blocks,
+            "physical_total_blocks": physical_total_blocks,
+            "dynamic_pool_enable": self.dynamic_pool_active(),
+            "dynamic_pool_target_blocks": (
+                self.dynamic_pool_target_blocks
+                if self.dynamic_pool_active()
+                else None
+            ),
             "free_blocks": free_blocks,
             "used_blocks": used_blocks,
             "projected_used_blocks": projected_used_blocks,
@@ -1071,6 +2015,10 @@ class UvmKvRuntimePolicy:
                             "source": "free_queue_candidate_snapshot",
                             "candidate_index": index,
                             "ref_cnt": getattr(block, "ref_cnt", None),
+                            "lifecycle_state": self._kv_block_lifecycle_class(block),
+                            "ever_used": (
+                                self._kv_block_lifecycle_class(block) != "never_used"
+                            ),
                             "is_null": getattr(block, "is_null", None),
                             "is_prefix_cache": block_hash is not None,
                             "in_free_queue": True,
@@ -1095,6 +2043,8 @@ class UvmKvRuntimePolicy:
                     "candidate_index": index,
                     "block_id": getattr(block, "block_id", None),
                     "ref_cnt": getattr(block, "ref_cnt", None),
+                    "lifecycle_state": self._kv_block_lifecycle_class(block),
+                    "ever_used": self._kv_block_lifecycle_class(block) != "never_used",
                     "is_null": getattr(block, "is_null", None),
                     "has_block_hash": block_hash is not None,
                     "block_hash": _block_hash_to_text(block_hash),
@@ -1266,6 +2216,8 @@ class UvmKvRuntimePolicy:
                         "stage": "stage_l6" if self.stage_l6_data_offload_enable else "stage_l5",
                         "source": "block_free_lifecycle",
                         "ref_cnt": getattr(block, "ref_cnt", None),
+                        "lifecycle_state": self._kv_block_lifecycle_class(block),
+                        "ever_used": self._kv_block_lifecycle_class(block) != "never_used",
                         "is_null": getattr(block, "is_null", None),
                         "is_prefix_cache": getattr(block, "block_hash", None) is not None,
                         "in_free_queue": safe,
@@ -1580,11 +2532,41 @@ class UvmKvRuntimePolicy:
             metadata=prefetch_metadata,
         )
         issued = self.stage_l6_prefetch_back_mode == "trace_only"
+        accepted_ranges = 0
         if self.stage_l6_prefetch_back_mode == "prefetch":
-            issued = all(
-                prefetch_range_to_device(range_ptr, range_bytes, self.stage_l6_device)
-                for range_ptr, range_bytes in ranges
+            self._record_physical_migration_boundary(
+                phase="begin",
+                direction="gpu",
+                region_id=region_id,
+                block_id=block_id,
+                group_id=group_id,
+                ranges=tuple(ranges),
+                size_bytes=size_bytes,
+                old_target=0,
+                new_target=0,
+                metadata=prefetch_metadata,
             )
+            start_ns = time.monotonic_ns()
+            accepted_ranges = batch_prefetch_ranges_to_device(
+                tuple(ranges),
+                device=self.stage_l6_device,
+            )
+            elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000.0
+            self._record_physical_migration_boundary(
+                phase="end",
+                direction="gpu",
+                region_id=region_id,
+                block_id=block_id,
+                group_id=group_id,
+                ranges=tuple(ranges),
+                size_bytes=size_bytes,
+                old_target=0,
+                new_target=0,
+                metadata=prefetch_metadata,
+                accepted_ranges=accepted_ranges,
+                elapsed_ms=elapsed_ms,
+            )
+            issued = accepted_ranges == len(ranges)
         if issued:
             mark_uvm_residency_state(
                 region_id=region_id,
@@ -1602,7 +2584,10 @@ class UvmKvRuntimePolicy:
                 range_count=len(ranges),
                 coordinator_mode=coordinator_decision.mode,
                 coordinator_reason=coordinator_decision.reason,
-                metadata=prefetch_metadata,
+                metadata={
+                    **prefetch_metadata,
+                    "physical_migration_accepted_ranges": accepted_ranges,
+                },
             )
             return
         mark_uvm_residency_state(
@@ -1707,6 +2692,104 @@ class UvmKvRuntimePolicy:
             }
         )
 
+    def _record_physical_migration_boundary(
+        self,
+        *,
+        phase: str,
+        direction: str,
+        region_id: str,
+        block_id: int,
+        group_id: int,
+        ranges: tuple[tuple[int, int], ...],
+        size_bytes: int,
+        old_target: int,
+        new_target: int,
+        metadata: dict[str, Any],
+        accepted_ranges: int | None = None,
+        elapsed_ms: float | None = None,
+    ) -> None:
+        if not self.physical_trace_file:
+            return
+
+        managed_probe_count = 0
+        managed_probe_success_count = 0
+        managed_probe_first_failure: dict[str, Any] | None = None
+        if self.physical_trace_managed_probe:
+            for index, (ptr, nbytes) in enumerate(ranges):
+                ok, reason, raw = probe_driver_capable_range(ptr, nbytes)
+                managed_probe_count += 1
+                if ok:
+                    managed_probe_success_count += 1
+                elif managed_probe_first_failure is None:
+                    managed_probe_first_failure = {
+                        "index": index,
+                        "ptr": f"0x{int(ptr):x}",
+                        "bytes": int(nbytes),
+                        "reason": reason,
+                        "raw_result": int(raw),
+                    }
+
+        residency: dict[str, Any] = {}
+        if self.physical_trace_residency and ranges:
+            residency = dict(
+                driver_batch_query_ranges_residency_bytes(
+                    ranges,
+                    device=self.stage_l6_device,
+                )
+            )
+
+        self._write_physical_trace(
+            {
+                "action": "kv_physical_migration_boundary",
+                "phase": phase,
+                "direction": direction,
+                "region_id": region_id,
+                "block_id": int(block_id),
+                "group_id": int(group_id),
+                "range_count": len(ranges),
+                "bytes": int(size_bytes),
+                "old_target_blocks": int(old_target),
+                "new_target_blocks": int(new_target),
+                "accepted_ranges": accepted_ranges,
+                "elapsed_ms": elapsed_ms,
+                "requested_mode": metadata.get("requested_mode"),
+                "previous_state": metadata.get("previous_state"),
+                "ref_cnt": metadata.get("ref_cnt"),
+                "offload_capable": metadata.get("offload_capable"),
+                "ptr_present": metadata.get("ptr_present"),
+                "post_prefetch_sync_requested": metadata.get(
+                    "post_prefetch_sync_requested"
+                ),
+                "post_prefetch_sync_success": metadata.get(
+                    "post_prefetch_sync_success"
+                ),
+                "post_prefetch_sync_elapsed_ms": metadata.get(
+                    "post_prefetch_sync_elapsed_ms"
+                ),
+                "post_prefetch_sync_error": metadata.get(
+                    "post_prefetch_sync_error"
+                ),
+                "managed_probe_count": managed_probe_count,
+                "managed_probe_success_count": managed_probe_success_count,
+                "managed_probe_first_failure": managed_probe_first_failure,
+                "residency": residency,
+            }
+        )
+
+    def _write_physical_trace(self, record: dict[str, Any]) -> None:
+        if not self.physical_trace_file:
+            return
+        record.setdefault("ts", time.time())
+        record.setdefault("stage", "stage_l6")
+        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        with self._lock:
+            os.makedirs(os.path.dirname(self.physical_trace_file) or ".", exist_ok=True)
+            with open(self.physical_trace_file, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                handle.flush()
+                if self.physical_trace_fsync:
+                    os.fsync(handle.fileno())
+
     def _record_summary(self) -> None:
         if not self.active:
             return
@@ -1717,6 +2800,12 @@ class UvmKvRuntimePolicy:
                 "policy": self.policy,
                 "budget_blocks": self.budget_blocks,
                 "budget_bytes": self.budget_bytes,
+                "dynamic_pool_enable": self.dynamic_pool_active(),
+                "dynamic_pool_target_blocks": (
+                    self.dynamic_pool_target_blocks
+                    if self.dynamic_pool_active()
+                    else None
+                ),
                 "prefix_evict_enable": self.prefix_evict_enable,
                 "prefix_evict_max_blocks": self.prefix_evict_max_blocks,
                 **self._summary,
@@ -1733,3 +2822,4 @@ class UvmKvRuntimePolicy:
             os.makedirs(os.path.dirname(self.trace_file) or ".", exist_ok=True)
             with open(self.trace_file, "a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
+                handle.flush()

@@ -280,6 +280,7 @@ typedef struct
     NvU32 slot_id;
     NvU32 state;
     NvU32 chunk_count;
+    NvU32 chunk_size;
     NvU64 slot_bytes;
     NvU64 physical_bytes;
     NvU64 epoch;
@@ -519,8 +520,26 @@ static void uvm_expert_reserved_pool_collect_summary_locked(UVM_EXPERT_RESERVED_
 
 static void uvm_expert_reserved_pool_fill_common_out_locked(UVM_EXPERT_RESERVED_POOL_PARAMS *params)
 {
+    NvU32 common_chunk_size = 0;
+    NvU32 i;
+
     uvm_expert_reserved_pool_collect_summary_locked(params);
-    params->chunk_size = UVM_CHUNK_SIZE_MAX;
+
+    for (i = 0; i < UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES; ++i) {
+        uvm_expert_reserved_pool_slot_t *slot = &g_uvm_expert_reserved_pool[i];
+
+        if (!slot->valid || !slot->chunks)
+            continue;
+
+        if (common_chunk_size == 0)
+            common_chunk_size = slot->chunk_size;
+        else if (common_chunk_size != slot->chunk_size) {
+            common_chunk_size = 0;
+            break;
+        }
+    }
+
+    params->chunk_size = common_chunk_size;
     params->current_epoch = g_uvm_expert_reserved_pool_current_epoch;
     params->prealloc_count = g_uvm_expert_reserved_pool_prealloc_count;
     params->reset_count = g_uvm_expert_reserved_pool_reset_count;
@@ -773,6 +792,15 @@ static NV_STATUS uvm_expert_reserved_pool_validate_entry(const UVM_EXPERT_RESERV
     return NV_OK;
 }
 
+static uvm_chunk_size_t uvm_expert_reserved_pool_choose_chunk_size(uvm_gpu_t *gpu, NvU64 slot_bytes)
+{
+    if (slot_bytes <= UVM_CHUNK_SIZE_512K &&
+        (gpu->pmm.chunk_sizes[UVM_PMM_GPU_MEMORY_TYPE_USER] & UVM_CHUNK_SIZE_64K))
+        return UVM_CHUNK_SIZE_64K;
+
+    return UVM_CHUNK_SIZE_MAX;
+}
+
 static NV_STATUS uvm_expert_reserved_pool_query_locked(UVM_EXPERT_RESERVED_POOL_PARAMS *params,
                                                        NvU32 max_entries)
 {
@@ -806,19 +834,26 @@ static NV_STATUS uvm_expert_reserved_pool_prealloc_entry(UVM_EXPERT_RESERVED_POO
     NV_STATUS status;
     NvU64 physical_bytes = 0;
     NvU32 chunk_count = 0;
+    uvm_chunk_size_t chunk_size = UVM_CHUNK_SIZE_MAX;
     uvm_pmm_alloc_flags_t alloc_flags = UVM_PMM_ALLOC_FLAGS_NONE;
 
     status = uvm_expert_reserved_pool_validate_entry(entry);
     if (status != NV_OK)
         goto done;
 
-    physical_bytes = UVM_ALIGN_UP(entry->slot_bytes, UVM_CHUNK_SIZE_MAX);
-    if (physical_bytes / UVM_CHUNK_SIZE_MAX > NV_U32_MAX) {
+    chunk_size = uvm_expert_reserved_pool_choose_chunk_size(gpu, entry->slot_bytes);
+    if (!(gpu->pmm.chunk_sizes[UVM_PMM_GPU_MEMORY_TYPE_USER] & chunk_size)) {
         status = NV_ERR_INVALID_ARGUMENT;
         goto done;
     }
 
-    chunk_count = (NvU32)(physical_bytes / UVM_CHUNK_SIZE_MAX);
+    physical_bytes = UVM_ALIGN_UP(entry->slot_bytes, chunk_size);
+    if (physical_bytes / chunk_size > NV_U32_MAX) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto done;
+    }
+
+    chunk_count = (NvU32)(physical_bytes / chunk_size);
     if (chunk_count == 0) {
         status = NV_ERR_INVALID_ARGUMENT;
         goto done;
@@ -834,7 +869,7 @@ static NV_STATUS uvm_expert_reserved_pool_prealloc_entry(UVM_EXPERT_RESERVED_POO
             goto done;
         }
 
-        if (slot->physical_bytes >= physical_bytes) {
+        if (slot->chunk_size == chunk_size && slot->physical_bytes >= physical_bytes) {
             uvm_expert_reserved_pool_copy_query_entry(entry, slot);
             mutex_unlock(&g_uvm_expert_reserved_pool_lock);
             status = NV_OK;
@@ -866,7 +901,7 @@ static NV_STATUS uvm_expert_reserved_pool_prealloc_entry(UVM_EXPERT_RESERVED_POO
 
     status = uvm_pmm_gpu_alloc_user(&gpu->pmm,
                                     chunk_count,
-                                    UVM_CHUNK_SIZE_MAX,
+                                    chunk_size,
                                     alloc_flags,
                                     chunks,
                                     NULL);
@@ -900,6 +935,7 @@ static NV_STATUS uvm_expert_reserved_pool_prealloc_entry(UVM_EXPERT_RESERVED_POO
     slot->slot_id = entry->slot_id;
     slot->state = UVM_EXPERT_RESERVED_POOL_SLOT_RESERVED;
     slot->chunk_count = chunk_count;
+    slot->chunk_size = chunk_size;
     slot->slot_bytes = entry->slot_bytes;
     slot->physical_bytes = physical_bytes;
     slot->epoch = ++g_uvm_expert_reserved_pool_current_epoch;
@@ -9543,6 +9579,7 @@ static NV_STATUS uvm_expert_reserved_pool_map_va_block_reserved_locked(uvm_va_bl
                                                        page_mask,
                                                        slot->chunks,
                                                        slot->chunk_count,
+                                                       slot->chunk_size,
                                                        slot_offset,
                                                        slot->physical_bytes,
                                                        &block->tracker,
@@ -10999,6 +11036,359 @@ static NV_STATUS uvm_moe_slot_pool_retain_gpu_by_uuid(const NvProcessorUuid *gpu
                                   gpu_out);
 }
 
+static void uvm_expert_offload_release_zero(UVM_EXPERT_OFFLOAD_RELEASE_PARAMS *params)
+{
+    NvU64 region_id = params->region_id;
+    NvProcessorUuid gpu_uuid = params->gpu_uuid;
+    NvU32 flags = params->flags;
+    NvU32 max_blocks = params->max_blocks;
+
+    memset(params, 0, sizeof(*params));
+    params->region_id = region_id;
+    params->gpu_uuid = gpu_uuid;
+    params->flags = flags;
+    params->max_blocks = max_blocks;
+}
+
+static void uvm_expert_offload_release_finish_phase_n_block(uvm_va_space_t *va_space,
+                                                            uvm_va_block_t *block,
+                                                            const uvm_phase_f_region_t *region)
+{
+    uvm_phase_n_block_pool_t *block_pool;
+    unsigned long irq_flags;
+    NvU32 pool;
+
+    uvm_assert_rwsem_locked_write(&va_space->lock);
+
+    if (!block->phase_n.tag_valid ||
+        block->phase_n.region_id != region->region_id ||
+        !uvm_phase_n_valid_tagged_pool(block->phase_n.pool)) {
+        return;
+    }
+
+    pool = block->phase_n.pool;
+    block_pool = &va_space->phase_n_block_pools[pool];
+
+    spin_lock_irqsave(&va_space->phase_n_native_block_pool_locks[pool], irq_flags);
+
+    block->phase_n.in_reclaim = NV_FALSE;
+    block->phase_n.gpu_resident_pending = NV_FALSE;
+
+    if (block->phase_n.queued) {
+        list_del_init(&block->phase_n.queue_node);
+        block->phase_n.queued = NV_FALSE;
+    }
+
+    if (block->phase_n.gpu_resident) {
+        block->phase_n.gpu_resident = NV_FALSE;
+        block->phase_n.resident_epoch = 0;
+        if (block_pool->resident_blocks > 0)
+            --block_pool->resident_blocks;
+    }
+
+    uvm_phase_n_update_block_pressure(va_space, pool, block_pool);
+
+    spin_unlock_irqrestore(&va_space->phase_n_native_block_pool_locks[pool], irq_flags);
+}
+
+static NV_STATUS uvm_expert_offload_release_block(uvm_va_space_t *va_space,
+                                                  uvm_gpu_t *gpu,
+                                                  uvm_va_block_t *block,
+                                                  const uvm_phase_f_region_t *region,
+                                                  UVM_EXPERT_OFFLOAD_RELEASE_PARAMS *params)
+{
+    uvm_va_block_gpu_state_t *gpu_state;
+    uvm_gpu_chunk_t *chunk;
+    NvU64 released_bytes = 0;
+    NV_STATUS status;
+
+    if (uvm_va_block_size(block) != UVM_CHUNK_SIZE_MAX) {
+        ++params->failure_blocks;
+        params->failed_bytes += uvm_va_block_size(block);
+        if (params->first_error == NV_OK) {
+            params->first_error = NV_ERR_NOT_SUPPORTED;
+            params->first_failed_block = block->start;
+        }
+        return NV_ERR_NOT_SUPPORTED;
+    }
+
+    gpu_state = uvm_va_block_gpu_state_get(block, gpu->id);
+    if (!gpu_state || !gpu_state->chunks || !gpu_state->chunks[0])
+        return NV_WARN_NOTHING_TO_DO;
+
+    chunk = gpu_state->chunks[0];
+    if (uvm_gpu_chunk_get_size(chunk) != UVM_CHUNK_SIZE_MAX) {
+        ++params->failure_blocks;
+        params->failed_bytes += UVM_CHUNK_SIZE_MAX;
+        if (params->first_error == NV_OK) {
+            params->first_error = NV_ERR_NOT_SUPPORTED;
+            params->first_failed_block = block->start;
+        }
+        return NV_ERR_NOT_SUPPORTED;
+    }
+
+    ++params->attempted_blocks;
+    params->attempted_bytes += UVM_CHUNK_SIZE_MAX;
+
+    status = uvm_pmm_gpu_evict_root_chunk_to_free(&gpu->pmm, chunk, &released_bytes);
+    if (status == NV_OK) {
+        ++params->success_blocks;
+        params->released_bytes += released_bytes;
+        uvm_expert_offload_release_finish_phase_n_block(va_space, block, region);
+    }
+    else {
+        ++params->failure_blocks;
+        params->failed_bytes += UVM_CHUNK_SIZE_MAX;
+        if (params->first_error == NV_OK) {
+            params->first_error = status;
+            params->first_failed_block = block->start;
+        }
+    }
+
+    return status;
+}
+
+static NV_STATUS uvm_expert_offload_release_subchunk_block(uvm_va_space_t *va_space,
+                                                           struct mm_struct *mm,
+                                                           uvm_gpu_t *gpu,
+                                                           uvm_va_block_t *block,
+                                                           const uvm_phase_f_region_t *region,
+                                                           UVM_EXPERT_OFFLOAD_RELEASE_PARAMS *params)
+{
+    NvU64 region_end = uvm_phase_n_range_end(region->base, region->length);
+    NvU64 release_start = max(region->base, block->start);
+    NvU64 release_end = min(region_end, block->end);
+    uvm_va_block_region_t block_region;
+    NvU64 release_bytes;
+    NvU64 released_bytes = 0;
+    NV_STATUS status;
+
+    if (release_end < release_start)
+        return NV_WARN_NOTHING_TO_DO;
+
+    block_region = uvm_va_block_region_from_start_end(block, release_start, release_end);
+    release_bytes = uvm_va_block_region_size(block_region);
+
+    if (release_bytes == 0)
+        return NV_WARN_NOTHING_TO_DO;
+
+    ++params->attempted_blocks;
+    params->attempted_bytes += release_bytes;
+
+    status = uvm_va_block_release_gpu_subchunks_to_cpu(block,
+                                                       mm,
+                                                       gpu,
+                                                       block_region,
+                                                       UVM_CHUNK_SIZE_64K,
+                                                       &block->tracker,
+                                                       &released_bytes);
+    if (status == NV_OK) {
+        ++params->success_blocks;
+        params->released_bytes += released_bytes;
+        if (released_bytes > 0)
+            uvm_expert_offload_release_finish_phase_n_block(va_space, block, region);
+    }
+    else {
+        ++params->failure_blocks;
+        params->failed_bytes += release_bytes;
+        if (params->first_error == NV_OK) {
+            params->first_error = status;
+            params->first_failed_block = release_start;
+        }
+    }
+
+    return status;
+}
+
+static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAMS *params,
+                                                struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_gpu_t *gpu = NULL;
+    struct mm_struct *mm = NULL;
+    uvm_phase_f_region_t *region;
+    NvU64 region_end;
+    NvU64 addr;
+    NV_STATUS status = NV_OK;
+
+    if (params->flags & ~(UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT |
+                          UVM_EXPERT_OFFLOAD_RELEASE_FLAG_STRICT_2M_BLOCKS |
+                          UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K)) {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    if ((params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_STRICT_2M_BLOCKS) &&
+        (params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K)) {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    status = uvm_moe_slot_pool_retain_gpu_by_uuid(&params->gpu_uuid, &gpu);
+    if (status != NV_OK) {
+        uvm_expert_offload_release_zero(params);
+        params->rmStatus = status;
+        return status;
+    }
+
+    uvm_expert_offload_release_zero(params);
+
+    mm = uvm_va_space_mm_or_current_retain_lock(va_space);
+    uvm_va_space_down_write(va_space);
+
+    region = radix_tree_lookup(&va_space->phase_f_regions, params->region_id);
+    if (!region) {
+        status = NV_ERR_OBJECT_NOT_FOUND;
+        goto done_unlock;
+    }
+
+    if ((params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT) &&
+        !uvm_phase_f_registered_region_is_expert_weight(region)) {
+        status = NV_ERR_NOT_SUPPORTED;
+        goto done_unlock;
+    }
+
+    params->pool = region->pool;
+    params->layer_id = region->layer_id;
+    params->expert_id = region->expert_id;
+    params->role = region->role;
+    params->base = region->base;
+    params->length = region->length;
+
+    if (region->length == 0) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto done_unlock;
+    }
+
+    region_end = uvm_phase_n_range_end(region->base, region->length);
+    if (region_end < region->base) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto done_unlock;
+    }
+
+    if (params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K) {
+        if (region->length != UVM_CHUNK_SIZE_512K ||
+            !IS_ALIGNED(region->base, UVM_CHUNK_SIZE_512K)) {
+            status = NV_ERR_INVALID_ARGUMENT;
+            goto done_unlock;
+        }
+
+        uvm_phase_n_native_split_region_boundaries(va_space, region);
+    }
+
+    addr = region->base;
+    while (addr <= region_end) {
+        uvm_va_range_t *va_range = uvm_va_range_find(va_space, addr);
+        uvm_va_range_managed_t *managed_range;
+        size_t first_block_index;
+        size_t last_block_index;
+        size_t block_index;
+        NvU64 managed_start;
+        NvU64 managed_end;
+        NvU64 next;
+
+        if (!va_range)
+            break;
+
+        next = va_range->node.end == ULLONG_MAX ? ULLONG_MAX : va_range->node.end + 1;
+        managed_range = uvm_va_range_to_managed_or_null(va_range);
+        if (!managed_range)
+            goto next_range;
+
+        managed_start = max(region->base, managed_range->va_range.node.start);
+        managed_end = min(region_end, managed_range->va_range.node.end);
+        first_block_index = uvm_va_range_block_index(managed_range, managed_start);
+        last_block_index = uvm_va_range_block_index(managed_range, managed_end);
+
+        for (block_index = first_block_index; block_index <= last_block_index; ++block_index) {
+            uvm_va_block_t *block;
+            NV_STATUS block_status;
+
+            block_status = uvm_va_range_block_create(managed_range, block_index, &block);
+            if (block_status != NV_OK) {
+                ++params->failure_blocks;
+                if (params->first_error == NV_OK) {
+                    params->first_error = block_status;
+                    params->first_failed_block = managed_start;
+                }
+                break;
+            }
+
+            ++params->block_count;
+
+            if (params->max_blocks != 0 &&
+                params->attempted_blocks >= params->max_blocks) {
+                ++params->skipped_blocks;
+                continue;
+            }
+
+            if (params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K) {
+                block_status = uvm_expert_offload_release_subchunk_block(va_space,
+                                                                         mm,
+                                                                         gpu,
+                                                                         block,
+                                                                         region,
+                                                                         params);
+            }
+            else if ((params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_STRICT_2M_BLOCKS) &&
+                (block->start < region->base || block->end > region_end)) {
+                ++params->failure_blocks;
+                params->failed_bytes += UVM_CHUNK_SIZE_MAX;
+                if (params->first_error == NV_OK) {
+                    params->first_error = NV_ERR_NOT_SUPPORTED;
+                    params->first_failed_block = block->start;
+                }
+                continue;
+            }
+            else {
+                block_status = uvm_expert_offload_release_block(va_space,
+                                                                gpu,
+                                                                block,
+                                                                region,
+                                                                params);
+            }
+
+            if (block_status == NV_WARN_NOTHING_TO_DO) {
+                ++params->skipped_blocks;
+            }
+        }
+
+next_range:
+        if (next == ULLONG_MAX || next == 0)
+            break;
+        addr = next;
+    }
+
+done_unlock:
+    if (status == NV_OK && params->first_error != NV_OK)
+        status = params->first_error;
+
+    uvm_va_space_up_write(va_space);
+    uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+    uvm_gpu_release(gpu);
+
+    params->rmStatus = status;
+
+    uvm_phase_f_route_log("expert_offload_release region_id=%llu pool=%u layer=%u expert=%u role=%u base=0x%llx length=%llu blocks=%llu attempted=%u success=%u failure=%u skipped=%u attempted_bytes=%llu released_bytes=%llu failed_bytes=%llu first_failed=0x%llx status=0x%x\n",
+                          params->region_id,
+                          params->pool,
+                          params->layer_id,
+                          params->expert_id,
+                          params->role,
+                          params->base,
+                          params->length,
+                          params->block_count,
+                          params->attempted_blocks,
+                          params->success_blocks,
+                          params->failure_blocks,
+                          params->skipped_blocks,
+                          params->attempted_bytes,
+                          params->released_bytes,
+                          params->failed_bytes,
+                          params->first_failed_block,
+                          params->rmStatus);
+
+    return status;
+}
+
 static NV_STATUS uvm_api_expert_reserved_pool(UVM_EXPERT_RESERVED_POOL_PARAMS *params, struct file *filp)
 {
     uvm_va_space_t *va_space = NULL;
@@ -11063,13 +11453,14 @@ static NV_STATUS uvm_api_expert_reserved_pool(UVM_EXPERT_RESERVED_POOL_PARAMS *p
             if (entry_status != NV_OK && status == NV_OK)
                 status = entry_status;
 
-            uvm_phase_f_route_log("expert_reserved_pool_prealloc_entry index=%u pool=%u slot=%u slot_bytes=%llu physical_bytes=%llu chunk_count=%u flags=0x%x state=%u status=%u nv_status=0x%x\n",
+            uvm_phase_f_route_log("expert_reserved_pool_prealloc_entry index=%u pool=%u slot=%u slot_bytes=%llu physical_bytes=%llu chunk_count=%u chunk_size=%u flags=0x%x state=%u status=%u nv_status=0x%x\n",
                                   i,
                                   entry->pool_id,
                                   entry->slot_id,
                                   entry->slot_bytes,
                                   entry->physical_bytes,
                                   entry->chunk_count,
+                                  entry->chunk_count > 0 ? (NvU32)(entry->physical_bytes / entry->chunk_count) : 0,
                                   entry->flags,
                                   entry->state,
                                   entry->status,
@@ -11115,7 +11506,7 @@ done:
 
     params->rmStatus = status;
 
-    uvm_phase_f_route_log("expert_reserved_pool end mode=%u count=%u success=%u failure=%u returned=%u total=%u active=%u backed=%u logical_bytes=%llu backing_bytes=%llu epoch=%llu prealloc_count=%llu reset_count=%llu alloc_failed=%llu status=0x%x\n",
+    uvm_phase_f_route_log("expert_reserved_pool end mode=%u count=%u success=%u failure=%u returned=%u total=%u active=%u backed=%u chunk_size=%u logical_bytes=%llu backing_bytes=%llu epoch=%llu prealloc_count=%llu reset_count=%llu alloc_failed=%llu status=0x%x\n",
                           params->mode,
                           params->count,
                           params->success_count,
@@ -11124,6 +11515,7 @@ done:
                           params->total_slots,
                           params->active_slots,
                           params->backed_slots,
+                          params->chunk_size,
                           params->logical_slot_bytes,
                           params->reserved_backing_bytes,
                           params->current_epoch,
@@ -14104,6 +14496,7 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_HEAP_INIT_CHECK(UVM_PHASE_N_RECLAIM_REGION,            uvm_api_phase_n_reclaim_region);
         UVM_ROUTE_CMD_HEAP_INIT_CHECK(UVM_EXPERT_RESERVED_POOL,              uvm_api_expert_reserved_pool);
         UVM_ROUTE_CMD_HEAP_INIT_CHECK(UVM_EXPERT_RESERVED_PREFETCH_BATCH,    uvm_api_expert_reserved_prefetch_batch);
+        UVM_ROUTE_CMD_HEAP_INIT_CHECK(UVM_EXPERT_OFFLOAD_RELEASE,            uvm_api_expert_offload_release);
         UVM_ROUTE_CMD_ALLOC_INIT_CHECK(UVM_MOE_SLOT_REMAP_BATCH,            uvm_api_moe_slot_remap_batch);
         UVM_ROUTE_CMD_HEAP_INIT_CHECK(UVM_MOE_SLOT_POOL_QUERY,              uvm_api_moe_slot_pool_query);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_MOE_SLOT_POOL_READBACK,           uvm_api_moe_slot_pool_readback);

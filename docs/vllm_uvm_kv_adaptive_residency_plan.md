@@ -193,6 +193,15 @@ CPU-backed blocks 不是只在缺块时才被拉回 GPU，也不是只在回收�
 
 目标是让 KV GPU resident set 可以双向伸缩，而不是只会“缺块时回填”。
 
+当前这一阶段已经落地“运行时手动调整 KV pool size + Stage L6 物理 prefetch”的版本：
+
+- 通过 control file 或等价 runtime 配置更新 `target_resident_blocks`。
+- target 变小时，只对 `ref_cnt == 0` 的冷块触发 CPU 方向迁移；active request 不受影响。
+- target 变大时，只把 CPU-backed 的安全块 prefetch 回 GPU，重新进入可分配窗口。
+- 当 `VLLM_USE_UVM=1`、Stage L6 pointer map 可用，且 `VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE=prefetch_cpu` / `VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_MODE=prefetch` 时，动态 resize 会对 KV block 的 raw ranges 调用 `prefetch_range_to_cpu()` / `prefetch_range_to_device()`。
+- 当没有 UVM managed pointer、没有 pointer range，或 prefetch 调用不可发出时，保持 metadata-only 降级路径，trace 会写出 `physical_migration_issued=False` 和 fallback reason。
+- 验收脚本是 `workloads/vllm/check_kv_dynamic_pool_phase2_prefetch_real.py`，实验序列为 `target_blocks=2 -> 4 -> 1`。
+
 要做的事：
 
 - 复用 `kv_transfer/offloading_connector` 或 `CPUOffloadingSpec` 的 load/store 机制。
@@ -205,6 +214,9 @@ CPU-backed blocks 不是只在缺块时才被拉回 GPU，也不是只在回收�
 - 高压时，能看到 `residency_kv_prefetch_back_*` trace，且 GPU resident set 扩大。
 - 低压时，能看到 `residency_kv_data_offload_*` trace，且 GPU 端可用空间释放出来给其它池。
 - active request 不被打断。
+- 物理路径启用时，trace 里应出现 `physical_migration_issued=True`、`range_count > 0`；真实 UVM residency 快照应能看到 KV 的 GPU/CPU resident bytes 随 target 扩大/收缩。
+
+注意：KV tensor 的最大逻辑 allocation 仍然存在，因此 `torch.cuda.memory_allocated()` / `memory_reserved()` 不一定下降；判断物理驻留变化应优先看 residency trace、real residency snapshot 和 driver/page-level 统计。
 
 ### Phase 3: 双阈值 resident window 控制
 

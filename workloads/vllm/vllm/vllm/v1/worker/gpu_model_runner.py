@@ -158,6 +158,9 @@ from vllm.v1.outputs import (
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
+from vllm.v1.core.uvm_kv_runtime_policy import (
+    register_uvm_kv_cache_physical_ranges,
+)
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
@@ -199,6 +202,29 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 logger = init_logger(__name__)
+
+
+def _uvm_kv_tail_range_for_allocation(
+    *,
+    ptr: int,
+    size_bytes: int,
+    page_size: int,
+    total_blocks: int,
+    target_blocks: int,
+) -> tuple[int, int, int, int] | None:
+    """Return (ptr, bytes, first_block, last_block) for one KV CPU tail."""
+    if ptr <= 0 or size_bytes <= 0 or page_size <= 0 or total_blocks <= 0:
+        return None
+    clamped_target = min(max(int(target_blocks), 0), int(total_blocks))
+    allocation_blocks = int(size_bytes) // int(page_size)
+    max_block_id = min(int(total_blocks), allocation_blocks - 1)
+    first_cpu_block = clamped_target + 1
+    if first_cpu_block > max_block_id:
+        return None
+    tail_ptr = int(ptr) + first_cpu_block * int(page_size)
+    tail_bytes = (max_block_id - first_cpu_block + 1) * int(page_size)
+    return tail_ptr, tail_bytes, first_cpu_block, max_block_id
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -394,6 +420,7 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self._uvm_kv_caches_by_layer: dict[str, Any] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -3686,11 +3713,6 @@ class GPUModelRunner(
             "VLLM_UVM_WEIGHT_MAP_PROBE_MANAGED", default=True
         )
 
-    def _uvm_weight_map_register_expert_tensors(self) -> bool:
-        return self._env_flag_enabled(
-            "VLLM_UVM_WEIGHT_MAP_REGISTER_EXPERT_TENSORS", default=True
-        )
-
     def _uvm_weight_map_include_expert_slices(self) -> bool:
         return self._env_flag_enabled(
             "VLLM_UVM_WEIGHT_MAP_INCLUDE_EXPERT_SLICES", default=True
@@ -4056,39 +4078,14 @@ class GPUModelRunner(
         manager = get_uvm_pool_residency_manager()
         if not manager.active:
             return
-        register_expert_tensors = self._uvm_weight_map_register_expert_tensors()
-        expert_envelope_enable = (
-            os.environ.get(
-                "VLLM_UVM_EXPERT_ENVELOPE_ENABLE",
-                os.environ.get("VLLM_UVM_EXPERT_2MB_ENVELOPE_ENABLE", "0"),
-            )
-            .strip()
-            .lower()
-            in ("1", "true", "yes", "on")
-        )
-        try:
-            expert_envelope_bytes = int(
-                os.environ.get(
-                    "VLLM_UVM_EXPERT_ENVELOPE_BYTES",
-                    os.environ.get(
-                        "VLLM_UVM_EXPERT_2MB_ENVELOPE_BYTES",
-                        "2097152",
-                    ),
-                )
-                or "2097152"
-            )
-        except ValueError:
-            expert_envelope_bytes = 2 * 1024 * 1024
-        expert_envelope_skip_reason = (
-            "logical_slice_covered_by_2mb_envelope"
-            if expert_envelope_bytes == 2 * 1024 * 1024
-            else f"logical_slice_covered_by_{expert_envelope_bytes}b_envelope"
-        )
         for record in records:
             if bool(record.get("is_alias")):
                 continue
             is_moe_expert = bool(record.get("is_moe_expert"))
-            if is_moe_expert and not register_expert_tensors:
+            if is_moe_expert:
+                # FusedMoE owns expert residency at logical expert-slice
+                # granularity. Registering the parent shard here overlaps those
+                # regions and can add a second, stale source of truth.
                 continue
             ptr = int(record.get("start_int") or 0)
             size_bytes = int(record.get("size_bytes") or 0)
@@ -4145,14 +4142,6 @@ class GPUModelRunner(
                     "driver_capable": driver_capable,
                     "driver_capability_reason": driver_reason,
                     "driver_probe_result": driver_probe_result,
-                    "driver_tag_skip": bool(
-                        is_moe_expert and expert_envelope_enable
-                    ),
-                    "driver_tag_skip_reason": (
-                        expert_envelope_skip_reason
-                        if is_moe_expert and expert_envelope_enable
-                        else None
-                    ),
                 },
             )
 
@@ -5100,326 +5089,491 @@ class GPUModelRunner(
         # 这一步对于监控长文本生成时显存池的碎片化 (fragmentation) 或页面换入换出 (swapping) 非常关键。
         self._append_uvm_address_log(phase, rows)
 
-    def _write_stage_l6_kv_pointer_map(
+    def _register_uvm_kv_cache_physical_ranges(
         self,
         kv_cache_config: KVCacheConfig,
         kv_caches: dict[str, Any],
-    ) -> None:
-        """Write a conservative raw KV block pointer map for Stage L6.
+        phase: str,
+    ) -> dict[str, Any]:
+        records: list[dict[str, Any]] = []
+        skipped_non_tensor = 0
+        skipped_non_cuda = 0
+        skipped_noncontiguous = 0
+        skipped_invalid = 0
+        total_blocks = max(int(kv_cache_config.num_blocks) - 1, 0)
 
-        This first version only maps simple CUDA tensors by slicing each unique
-        backing allocation into equal logical KV block ranges. Complex layouts
-        remain safe because the runtime policy falls back unless a region has a
-        positive ptr and offload_capable=True.
-        """
-        pointer_map_file = os.environ.get("VLLM_UVM_RESIDENCY_KV_POINTER_MAP_FILE", "")
-        if not pointer_map_file:
-            return
-        if os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") != "stage_l6":
-            return
-        total_bytes = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
-        num_blocks = int(kv_cache_config.num_blocks or 0)
-        num_groups = max(len(kv_cache_config.kv_cache_groups), 1)
-        if total_bytes <= 0 or num_blocks <= 0:
-            return
-        bytes_per_block = total_bytes // num_blocks
-        if bytes_per_block <= 0:
-            return
-
-        unique_tensors: list[tuple[str, torch.Tensor]] = []
-        seen_ptrs: set[int] = set()
-
-        def add_tensor(name: str, tensor: torch.Tensor) -> None:
-            if not tensor.is_cuda:
-                return
-            if not tensor.is_contiguous():
-                return
-            ptr = int(tensor.data_ptr())
-            size_bytes = int(tensor.numel() * tensor.element_size())
-            if ptr <= 0 or size_bytes <= 0 or ptr in seen_ptrs:
-                return
-            seen_ptrs.add(ptr)
-            unique_tensors.append((name, tensor))
-
-        for layer_name, cache_tensor in kv_caches.items():
-            if isinstance(cache_tensor, torch.Tensor):
-                add_tensor(layer_name, cache_tensor)
-            elif isinstance(cache_tensor, list):
-                for idx, tensor in enumerate(cache_tensor):
-                    if isinstance(tensor, torch.Tensor):
-                        add_tensor(f"{layer_name}[{idx}]", tensor)
-        if isinstance(getattr(self, "cross_layers_kv_cache", None), torch.Tensor):
-            add_tensor("cross_layers_kv_cache", self.cross_layers_kv_cache)
-
-        page_size_by_group = [
-            int(group.kv_cache_spec.page_size_bytes)
-            for group in kv_cache_config.kv_cache_groups
-        ] or [bytes_per_block]
-        blocks: list[dict[str, Any]] = []
-        fallback_reasons: list[str] = []
-        max_block_id = max(num_blocks - 1, 0)
-        for group_id in range(num_groups):
-            page_size = page_size_by_group[group_id]
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            page_size = int(group.kv_cache_spec.page_size_bytes)
             if page_size <= 0:
-                fallback_reasons.append(f"group_{group_id}:invalid_page_size")
+                skipped_invalid += 1
                 continue
-            group_ranges_by_block: dict[int, list[dict[str, int | str]]] = {
-                block_id: [] for block_id in range(1, max_block_id + 1)
-            }
-            for name, tensor in unique_tensors:
-                ptr = int(tensor.data_ptr())
-                size_bytes = int(tensor.numel() * tensor.element_size())
-                available_blocks = min(max_block_id, size_bytes // page_size)
-                if available_blocks <= 0:
-                    continue
-                for block_id in range(1, available_blocks + 1):
-                    group_ranges_by_block[block_id].append(
+            for layer_name in group.layer_names:
+                cache_value = kv_caches.get(layer_name)
+                tensors = (
+                    cache_value if isinstance(cache_value, list) else [cache_value]
+                )
+                for tensor_index, tensor in enumerate(tensors):
+                    if not isinstance(tensor, torch.Tensor):
+                        skipped_non_tensor += 1
+                        continue
+                    if not tensor.is_cuda:
+                        skipped_non_cuda += 1
+                        continue
+                    if not tensor.is_contiguous():
+                        skipped_noncontiguous += 1
+                        continue
+                    ptr = int(tensor.data_ptr())
+                    size_bytes = int(tensor.numel() * tensor.element_size())
+                    if ptr <= 0 or size_bytes <= 0:
+                        skipped_invalid += 1
+                        continue
+                    allocation_blocks = size_bytes // page_size
+                    max_block_id = min(total_blocks, allocation_blocks - 1)
+                    if max_block_id <= 0:
+                        skipped_invalid += 1
+                        continue
+                    records.append(
                         {
-                            "ptr": ptr + block_id * page_size,
-                            "bytes": page_size,
-                            "tensor_name": name,
+                            "phase": phase,
+                            "source": "initialize_kv_cache",
+                            "group_id": group_id,
+                            "layer_name": layer_name,
+                            "tensor_index": tensor_index,
+                            "ptr": ptr,
+                            "size_bytes": size_bytes,
+                            "page_size": page_size,
+                            "total_blocks": total_blocks,
+                            "allocation_blocks": allocation_blocks,
+                            "max_block_id": max_block_id,
+                            "dtype": str(tensor.dtype),
+                            "shape": list(tensor.shape),
+                            "stride": list(tensor.stride()),
+                            "device": str(tensor.device),
                         }
                     )
-            for block_id, ranges in group_ranges_by_block.items():
-                if not ranges:
-                    continue
-                blocks.append(
-                    {
-                        "group_id": group_id,
-                        "block_id": block_id,
-                        "ptr": ranges[0]["ptr"],
-                        "bytes": sum(int(item["bytes"]) for item in ranges),
-                        "ranges": ranges,
-                    }
-                )
-        if not blocks:
-            fallback_reasons.append("no_simple_contiguous_tensor_ranges_mapped")
 
-        record = {
-            "action": "stage_l6_kv_pointer_map",
-            "stage": "stage_l6",
-            "pid": os.getpid(),
-            "ts": time.time(),
-            "num_blocks": num_blocks,
-            "num_kv_cache_groups": num_groups,
-            "bytes_per_block": bytes_per_block,
-            "page_size_by_group": page_size_by_group,
-            "unique_tensor_count": len(unique_tensors),
-            "mapped_blocks": len(blocks),
-            "fallback_reasons": fallback_reasons,
-            "blocks": blocks,
+        result = register_uvm_kv_cache_physical_ranges(
+            records,
+            clear_existing=True,
+        )
+        result.update(
+            {
+                "phase": phase,
+                "records": len(records),
+                "total_blocks": total_blocks,
+                "skipped_non_tensor": skipped_non_tensor,
+                "skipped_non_cuda": skipped_non_cuda,
+                "skipped_noncontiguous": skipped_noncontiguous,
+                "skipped_invalid": skipped_invalid,
+            }
+        )
+        logger.info(
+            "Registered UVM KV physical ranges phase=%s records=%d "
+            "registered=%d skipped_noncontiguous=%d skipped_invalid=%d",
+            phase,
+            len(records),
+            int(result.get("registered") or 0),
+            skipped_noncontiguous,
+            skipped_invalid,
+        )
+        return result
+
+    def _collect_uvm_post_warmup_kv_tail_ranges(
+        self,
+        target_blocks: int,
+    ) -> tuple[list[tuple[int, int]], dict[str, Any]]:
+        """Collect contiguous free KV tails beyond the resident block target."""
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        kv_caches = getattr(self, "_uvm_kv_caches_by_layer", {})
+        if kv_cache_config is None or not kv_caches:
+            return [], {
+                "ok": False,
+                "reason": "kv_cache_not_initialized",
+                "target_blocks": int(target_blocks),
+            }
+
+        total_blocks = max(int(kv_cache_config.num_blocks) - 1, 0)
+        clamped_target = min(max(int(target_blocks), 0), total_blocks)
+        ranges: list[tuple[int, int]] = []
+        range_records: list[dict[str, Any]] = []
+        seen_ranges: set[tuple[int, int]] = set()
+        skipped_non_tensor = 0
+        skipped_noncontiguous = 0
+
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            page_size = int(group.kv_cache_spec.page_size_bytes)
+            if page_size <= 0:
+                continue
+            for layer_name in group.layer_names:
+                cache_value = kv_caches.get(layer_name)
+                tensors = (
+                    cache_value if isinstance(cache_value, list) else [cache_value]
+                )
+                for tensor_index, tensor in enumerate(tensors):
+                    if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+                        skipped_non_tensor += 1
+                        continue
+                    if not tensor.is_contiguous():
+                        skipped_noncontiguous += 1
+                        continue
+                    ptr = int(tensor.data_ptr())
+                    size_bytes = int(tensor.numel() * tensor.element_size())
+                    tail_range = _uvm_kv_tail_range_for_allocation(
+                        ptr=ptr,
+                        size_bytes=size_bytes,
+                        page_size=page_size,
+                        total_blocks=total_blocks,
+                        target_blocks=clamped_target,
+                    )
+                    if tail_range is None:
+                        continue
+                    tail_ptr, tail_bytes, first_cpu_block, max_block_id = tail_range
+                    range_key = (tail_ptr, tail_bytes)
+                    if tail_bytes <= 0 or range_key in seen_ranges:
+                        continue
+                    seen_ranges.add(range_key)
+                    ranges.append(range_key)
+                    range_records.append(
+                        {
+                            "group_id": group_id,
+                            "layer_name": layer_name,
+                            "tensor_index": tensor_index,
+                            "ptr": f"0x{tail_ptr:x}",
+                            "bytes": tail_bytes,
+                            "page_size": page_size,
+                            "first_cpu_block": first_cpu_block,
+                            "last_cpu_block": max_block_id,
+                        }
+                    )
+
+        return ranges, {
+            "ok": True,
+            "reason": "ranges_collected" if ranges else "target_covers_all_ranges",
+            "requested_target_blocks": int(target_blocks),
+            "target_blocks": clamped_target,
+            "total_blocks": total_blocks,
+            "range_count": len(ranges),
+            "range_bytes": sum(size for _, size in ranges),
+            "skipped_non_tensor": skipped_non_tensor,
+            "skipped_noncontiguous": skipped_noncontiguous,
+            "ranges": range_records,
         }
+
+    def _append_uvm_post_warmup_rebalance_trace(
+        self,
+        record: dict[str, Any],
+    ) -> None:
+        trace_file = os.environ.get(
+            "VLLM_UVM_POST_WARMUP_REBALANCE_TRACE_FILE",
+            "",
+        )
+        if not trace_file:
+            return
         try:
-            os.makedirs(os.path.dirname(pointer_map_file) or ".", exist_ok=True)
-            with open(pointer_map_file, "a", encoding="utf-8") as handle:
+            os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
+            with open(trace_file, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
         except OSError as exc:
-            logger.warning("Failed to write Stage L6 KV pointer map %s: %s", pointer_map_file, exc)
+            logger.warning(
+                "Failed to write post-warmup UVM rebalance trace %s: %s",
+                trace_file,
+                exc,
+            )
+
+    def rebalance_uvm_kv_cache_after_warmup(
+        self,
+        target_blocks: int,
+    ) -> dict[str, Any]:
+        """Move KV tails past the scheduler target without freeing their tensors."""
+        ranges, collection = self._collect_uvm_post_warmup_kv_tail_ranges(target_blocks)
+        record: dict[str, Any] = {
+            "action": "post_warmup_kv_rebalance",
+            "timestamp": time.time(),
+            "pid": os.getpid(),
+            **collection,
+        }
+        if not collection.get("ok"):
+            self._append_uvm_post_warmup_rebalance_trace(record)
+            return record
+        if not ranges:
+            record["offload_successes"] = 0
+            record["offload_complete"] = True
+            self._append_uvm_post_warmup_rebalance_trace(record)
+            return record
+
+        executor = (
+            os.environ.get(
+                "VLLM_UVM_POST_WARMUP_KV_OFFLOAD_EXECUTOR",
+                "auto",
+            )
+            .strip()
+            .lower()
+        )
+        if executor not in ("cpp_batch", "driver_batch", "auto"):
+            logger.warning(
+                "Ignoring invalid VLLM_UVM_POST_WARMUP_KV_OFFLOAD_EXECUTOR=%r; "
+                "using auto",
+                executor,
+            )
+            executor = "auto"
+
+        start = time.monotonic()
+        successes, executor_used, advise_result, prefetch_result = (
+            batch_offload_ranges_to_cpu_with_executor(
+                ranges,
+                sync=True,
+                executor=executor,
+            )
+        )
+        record.update(
+            {
+                "offload_successes": successes,
+                "offload_complete": successes == len(ranges),
+                "executor": executor_used,
+                "requested_executor": executor,
+                "driver_advise_result": advise_result,
+                "driver_prefetch_result": prefetch_result,
+                "elapsed_seconds": time.monotonic() - start,
+            }
+        )
+
+        if self._env_flag_enabled(
+            "VLLM_UVM_POST_WARMUP_KV_RESIDENCY_QUERY_ENABLE",
+            default=False,
+        ):
+            try:
+                query_device = (
+                    int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
+                )
+                record["residency_after"] = driver_batch_query_ranges_residency_bytes(
+                    ranges,
+                    query_device,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to query KV residency after post-warmup rebalance",
+                    exc_info=True,
+                )
+
+        self._append_uvm_post_warmup_rebalance_trace(record)
+        logger.info(
+            "UVM post-warmup KV rebalance target_blocks=%d ranges=%d "
+            "bytes=%d successes=%d executor=%s elapsed=%.3fs",
+            int(collection["target_blocks"]),
+            len(ranges),
+            int(collection["range_bytes"]),
+            successes,
+            executor_used,
+            float(record["elapsed_seconds"]),
+        )
+        return record
 
     def load_model(self, eep_scale_up: bool = False) -> None:
-            """
-            Args:
-                eep_scale_up: 布尔值，指示此次模型加载是否是为了弹性专家并行 (Elastic Expert Parallelism, EEP) 扩容。
-            """
-            # 记录全局日志，提示开始加载特定的模型
-            logger.info_once(
-                "Starting to load model %s...",
-                self.model_config.model,
-                scope="global",
-            )
-            
-            # 如果是 EEP 扩容操作，则从 EplbState 获取当前的全局专家负载状态、旧的全局专家索引以及 rank 映射。
-            # 否则，初始化为 None。这对于在运行时动态调整专家模型的分布非常重要。
-            global_expert_loads, old_global_expert_indices_per_model, rank_mapping = (
-                EplbState.get_eep_state(self.parallel_config)
-                if eep_scale_up
-                else (None, None, None)
-            )
+        """
+        Args:
+            eep_scale_up: 布尔值，指示此次模型加载是否是为了弹性专家并行 (Elastic Expert Parallelism, EEP) 扩容。
+        """
+        # 记录全局日志，提示开始加载特定的模型
+        logger.info_once(
+            "Starting to load model %s...",
+            self.model_config.model,
+            scope="global",
+        )
 
-            # 检查是否启用了专家并行负载均衡 (Expert Parallelism Load Balancing, EPLB)
-            if self.parallel_config.enable_eplb:
-                self.eplb_state = EplbState(self.parallel_config, self.device)
-                eplb_models = 0 # 追踪应用了 EPLB 的模型数量（主模型 + 潜在的草稿模型）
-                
-            # 使用设备内存分析器作为上下文管理器，以精准统计加载模型所消耗的显存
-            with DeviceMemoryProfiler() as m:
-                time_before_load = time.perf_counter() # 记录加载开始时间
-                
-                # 获取当前配置对应的模型加载器
-                model_loader = get_model_loader(self.load_config)
-                
-                with uvm_allocation_phase("load_model"):
-                    # 实际执行主模型的权重加载
-                    self.model = model_loader.load_model(
-                        vllm_config=self.vllm_config, model_config=self.model_config
+        # 如果是 EEP 扩容操作，则从 EplbState 获取当前的全局专家负载状态、旧的全局专家索引以及 rank 映射。
+        # 否则，初始化为 None。这对于在运行时动态调整专家模型的分布非常重要。
+        global_expert_loads, old_global_expert_indices_per_model, rank_mapping = (
+            EplbState.get_eep_state(self.parallel_config)
+            if eep_scale_up
+            else (None, None, None)
+        )
+
+        # 检查是否启用了专家并行负载均衡 (Expert Parallelism Load Balancing, EPLB)
+        if self.parallel_config.enable_eplb:
+            self.eplb_state = EplbState(self.parallel_config, self.device)
+            eplb_models = 0  # 追踪应用了 EPLB 的模型数量（主模型 + 潜在的草稿模型）
+
+        # 使用设备内存分析器作为上下文管理器，以精准统计加载模型所消耗的显存
+        with DeviceMemoryProfiler() as m:
+            time_before_load = time.perf_counter()  # 记录加载开始时间
+
+            # 获取当前配置对应的模型加载器
+            model_loader = get_model_loader(self.load_config)
+
+            with uvm_allocation_phase("load_model"):
+                # 实际执行主模型的权重加载
+                self.model = model_loader.load_model(
+                    vllm_config=self.vllm_config, model_config=self.model_config
+                )
+
+                # 如果配置了 LoRA (Low-Rank Adaptation)，则将 LoRA 权重加载/合并到基础模型中
+                if self.lora_config:
+                    self.model = self.load_lora_model(
+                        self.model, self.vllm_config, self.device
                     )
-                    
-                    # 如果配置了 LoRA (Low-Rank Adaptation)，则将 LoRA 权重加载/合并到基础模型中
-                    if self.lora_config:
-                        self.model = self.load_lora_model(
-                            self.model, self.vllm_config, self.device
-                        )
-                        
-                    # 检查系统是否配置了用于投机解码 (Speculative Decoding) 的草稿模型 (drafter)
-                    if hasattr(self, "drafter"):
-                        logger.info_once("Loading drafter model...")
-                        self.drafter.load_model(self.model) # 加载草稿模型
-                        
-                        # 如果草稿模型是混合专家 (MoE) 架构，并且系统启用了 EPLB
-                        if (
-                            hasattr(self.drafter, "model")
-                            and is_mixture_of_experts(self.drafter.model)
-                            and self.parallel_config.enable_eplb
-                        ):
-                            # 获取投机解码的配置，验证草稿模型的配置有效性
-                            spec_config = self.vllm_config.speculative_config
-                            assert spec_config is not None
-                            assert spec_config.draft_model_config is not None
-                            logger.info_once(
-                                "EPLB is enabled for drafter model %s.",
-                                spec_config.draft_model_config.model,
-                            )
 
-                            # 为草稿模型提取对应的专家负载和旧索引信息
-                            global_expert_load = (
-                                global_expert_loads[eplb_models]
-                                if global_expert_loads
-                                else None
-                            )
-                            old_global_expert_indices = (
-                                old_global_expert_indices_per_model[eplb_models]
-                                if old_global_expert_indices_per_model
-                                else None
-                            )
-                            
-                            # 确保 EPLB 状态已初始化，并将草稿模型及其配置注册到 EPLB 状态管理中
-                            if self.eplb_state is None:
-                                self.eplb_state = EplbState(self.parallel_config, self.device)
-                            self.eplb_state.add_model(
-                                self.drafter.model,
-                                spec_config.draft_model_config,
-                                global_expert_load,
-                                old_global_expert_indices,
-                                rank_mapping,
-                            )
-                            eplb_models += 1 # 增加注册的 EPLB 模型计数
+                # 检查系统是否配置了用于投机解码 (Speculative Decoding) 的草稿模型 (drafter)
+                if hasattr(self, "drafter"):
+                    logger.info_once("Loading drafter model...")
+                    self.drafter.load_model(self.model)  # 加载草稿模型
 
-                # 处理 EAGLE3 接口所需的辅助隐藏状态输出
-                # EAGLE 是一种高效的投机解码/自回归生成加速技术，通常依赖特定的隐藏层状态
-                if self.use_aux_hidden_state_outputs:
-                    if not supports_eagle3(self.get_model()):
-                        raise RuntimeError(
-                            "Model does not support EAGLE3 interface but "
-                            "aux_hidden_state_outputs was requested"
+                    # 如果草稿模型是混合专家 (MoE) 架构，并且系统启用了 EPLB
+                    if (
+                        hasattr(self.drafter, "model")
+                        and is_mixture_of_experts(self.drafter.model)
+                        and self.parallel_config.enable_eplb
+                    ):
+                        # 获取投机解码的配置，验证草稿模型的配置有效性
+                        spec_config = self.vllm_config.speculative_config
+                        assert spec_config is not None
+                        assert spec_config.draft_model_config is not None
+                        logger.info_once(
+                            "EPLB is enabled for drafter model %s.",
+                            spec_config.draft_model_config.model,
                         )
 
-                    # 尝试从投机解码配置中获取需要提取隐藏状态的辅助层索引
-                    # 否则使用模型默认定义的层
-                    aux_layers = self._get_eagle3_aux_layers_from_config()
-                    if aux_layers:
-                        logger.info(
-                            "Using auxiliary layers from speculative config: %s",
-                            aux_layers,
+                        # 为草稿模型提取对应的专家负载和旧索引信息
+                        global_expert_load = (
+                            global_expert_loads[eplb_models]
+                            if global_expert_loads
+                            else None
                         )
-                    else:
-                        aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
+                        old_global_expert_indices = (
+                            old_global_expert_indices_per_model[eplb_models]
+                            if old_global_expert_indices_per_model
+                            else None
+                        )
 
-                    # 将获取到的辅助层配置应用到主模型
-                    self.model.set_aux_hidden_state_layers(aux_layers)
-                    
-                time_after_load = time.perf_counter() # 记录加载结束时间
-                
-            # 记录模型加载消耗的总显存和总耗时
-            self.model_memory_usage = m.consumed_memory
-            logger.info_once(
-                "Model loading took %.4f GiB memory and %.6f seconds",
-                self.model_memory_usage / GiB_bytes,
-                time_after_load - time_before_load,
-                scope="local",
-            )
-            
-            # 为分布式训练/推理准备通信缓冲区（例如为张量并行分配 All-Reduce 缓冲区）
-            prepare_communication_buffer_for_model(self.model)
-            self._setup_layer_timing_hooks()
-            # 如果存在草稿模型，同样为其准备通信缓冲区
-            if (drafter := getattr(self, "drafter", None)) and (
-                drafter_model := getattr(drafter, "model", None)
-            ):
-                prepare_communication_buffer_for_model(drafter_model)
-                
-            # 配置多模态剪枝 (Multimodal Pruning) 支持
-            mm_config = self.model_config.multimodal_config
-            self.is_multimodal_pruning_enabled = (
-                supports_multimodal_pruning(self.get_model())
-                and mm_config is not None
-                and mm_config.is_multimodal_pruning_enabled()
-            )
+                        # 确保 EPLB 状态已初始化，并将草稿模型及其配置注册到 EPLB 状态管理中
+                        if self.eplb_state is None:
+                            self.eplb_state = EplbState(
+                                self.parallel_config, self.device
+                            )
+                        self.eplb_state.add_model(
+                            self.drafter.model,
+                            spec_config.draft_model_config,
+                            global_expert_load,
+                            old_global_expert_indices,
+                            rank_mapping,
+                        )
+                        eplb_models += 1  # 增加注册的 EPLB 模型计数
 
-            # 针对主模型：如果是 MoE 架构且启用了 EPLB，则为其配置负载均衡
-            if is_mixture_of_experts(self.model) and self.parallel_config.enable_eplb:
-                logger.info_once("EPLB is enabled for model %s.", self.model_config.model)
-                global_expert_load = (
-                    global_expert_loads[eplb_models] if global_expert_loads else None
-                )
-                old_global_expert_indices = (
-                    old_global_expert_indices_per_model[eplb_models]
-                    if old_global_expert_indices_per_model
-                    else None
-                )
-                assert self.eplb_state is not None
-                # 将主模型注册到 EPLB 管理器中
-                self.eplb_state.add_model(
-                    self.model,
-                    self.model_config,
-                    global_expert_load,
-                    old_global_expert_indices,
-                    rank_mapping,
-                )
-                # 如果 EPLB 支持异步模式，则开启异步通信/更新循环
-                if self.eplb_state.is_async:
-                    self.eplb_state.start_async_loop(rank_mapping=rank_mapping)
+            # 处理 EAGLE3 接口所需的辅助隐藏状态输出
+            # EAGLE 是一种高效的投机解码/自回归生成加速技术，通常依赖特定的隐藏层状态
+            if self.use_aux_hidden_state_outputs:
+                if not supports_eagle3(self.get_model()):
+                    raise RuntimeError(
+                        "Model does not support EAGLE3 interface but "
+                        "aux_hidden_state_outputs was requested"
+                    )
 
-            self._materialize_fixed_weights_device_direct()
-            self._prepare_uvm_managed_expert_weights_for_request("after_load_model")
-            # 记录模型权重的内存地址（通常用于调试或低级别内存管理验证）
-            self._log_model_weight_addresses("load_model")
-            self._record_uvm_init_weight_plan_residency("after_load_model")
-            self._record_uvm_active_expert_residency_probe("after_load_model")
-
-            # 处理模型图编译加速
-            # 1. 尝试使用原生的 PyTorch 图编译 (torch.compile)
-            if (
-                self.vllm_config.compilation_config.mode
-                == CompilationMode.STOCK_TORCH_COMPILE
-                and supports_dynamo()
-            ):
-                backend = self.vllm_config.compilation_config.init_backend(self.vllm_config)
-                compilation_counter.stock_torch_compile_count += 1
-                # 开启 fullgraph 进行最大化优化编译
-                self.model.compile(fullgraph=True, backend=backend)
-                return
-                
-            # 注意：对于其他编译模式，CUDA Graph 的行为由 vllm 的 Wrapper 和 Dispatcher 控制
-
-            # 2. 根据编译配置，使用 CUDAGraphWrapper 或 UBatchWrapper 包装模型以提升推理性能
-            cudagraph_mode = self.compilation_config.cudagraph_mode
-            assert cudagraph_mode is not None
-            
-            # 如果启用了完整的 CUDA Graph 并且未启用 DBO (Dynamic Batch Optimization/动态批次优化)
-            if cudagraph_mode.has_full_cudagraphs() and not self.parallel_config.enable_dbo:
-                self.model = CUDAGraphWrapper(
-                    self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
-                )
-            # 如果启用了 DBO，则使用 UBatchWrapper（用于处理 micro-batches）包装模型
-            elif self.parallel_config.enable_dbo:
-                if cudagraph_mode.has_full_cudagraphs():
-                    self.model = UBatchWrapper(
-                        self.model, self.vllm_config, CUDAGraphMode.FULL, self.device
+                # 尝试从投机解码配置中获取需要提取隐藏状态的辅助层索引
+                # 否则使用模型默认定义的层
+                aux_layers = self._get_eagle3_aux_layers_from_config()
+                if aux_layers:
+                    logger.info(
+                        "Using auxiliary layers from speculative config: %s",
+                        aux_layers,
                     )
                 else:
-                    self.model = UBatchWrapper(
-                        self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
-                    )
+                    aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
+
+                # 将获取到的辅助层配置应用到主模型
+                self.model.set_aux_hidden_state_layers(aux_layers)
+
+            time_after_load = time.perf_counter()  # 记录加载结束时间
+
+        # 记录模型加载消耗的总显存和总耗时
+        self.model_memory_usage = m.consumed_memory
+        logger.info_once(
+            "Model loading took %.4f GiB memory and %.6f seconds",
+            self.model_memory_usage / GiB_bytes,
+            time_after_load - time_before_load,
+            scope="local",
+        )
+
+        # 为分布式训练/推理准备通信缓冲区（例如为张量并行分配 All-Reduce 缓冲区）
+        prepare_communication_buffer_for_model(self.model)
+        self._setup_layer_timing_hooks()
+        # 如果存在草稿模型，同样为其准备通信缓冲区
+        if (drafter := getattr(self, "drafter", None)) and (
+            drafter_model := getattr(drafter, "model", None)
+        ):
+            prepare_communication_buffer_for_model(drafter_model)
+
+        # 配置多模态剪枝 (Multimodal Pruning) 支持
+        mm_config = self.model_config.multimodal_config
+        self.is_multimodal_pruning_enabled = (
+            supports_multimodal_pruning(self.get_model())
+            and mm_config is not None
+            and mm_config.is_multimodal_pruning_enabled()
+        )
+
+        # 针对主模型：如果是 MoE 架构且启用了 EPLB，则为其配置负载均衡
+        if is_mixture_of_experts(self.model) and self.parallel_config.enable_eplb:
+            logger.info_once("EPLB is enabled for model %s.", self.model_config.model)
+            global_expert_load = (
+                global_expert_loads[eplb_models] if global_expert_loads else None
+            )
+            old_global_expert_indices = (
+                old_global_expert_indices_per_model[eplb_models]
+                if old_global_expert_indices_per_model
+                else None
+            )
+            assert self.eplb_state is not None
+            # 将主模型注册到 EPLB 管理器中
+            self.eplb_state.add_model(
+                self.model,
+                self.model_config,
+                global_expert_load,
+                old_global_expert_indices,
+                rank_mapping,
+            )
+            # 如果 EPLB 支持异步模式，则开启异步通信/更新循环
+            if self.eplb_state.is_async:
+                self.eplb_state.start_async_loop(rank_mapping=rank_mapping)
+
+        self._materialize_fixed_weights_device_direct()
+        self._prepare_uvm_managed_expert_weights_for_request("after_load_model")
+        # 记录模型权重的内存地址（通常用于调试或低级别内存管理验证）
+        self._log_model_weight_addresses("load_model")
+        self._record_uvm_init_weight_plan_residency("after_load_model")
+        self._record_uvm_active_expert_residency_probe("after_load_model")
+
+        # 处理模型图编译加速
+        # 1. 尝试使用原生的 PyTorch 图编译 (torch.compile)
+        if (
+            self.vllm_config.compilation_config.mode
+            == CompilationMode.STOCK_TORCH_COMPILE
+            and supports_dynamo()
+        ):
+            backend = self.vllm_config.compilation_config.init_backend(self.vllm_config)
+            compilation_counter.stock_torch_compile_count += 1
+            # 开启 fullgraph 进行最大化优化编译
+            self.model.compile(fullgraph=True, backend=backend)
+            return
+
+        # 注意：对于其他编译模式，CUDA Graph 的行为由 vllm 的 Wrapper 和 Dispatcher 控制
+
+        # 2. 根据编译配置，使用 CUDAGraphWrapper 或 UBatchWrapper 包装模型以提升推理性能
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        assert cudagraph_mode is not None
+
+        # 如果启用了完整的 CUDA Graph 并且未启用 DBO (Dynamic Batch Optimization/动态批次优化)
+        if cudagraph_mode.has_full_cudagraphs() and not self.parallel_config.enable_dbo:
+            self.model = CUDAGraphWrapper(
+                self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
+            )
+        # 如果启用了 DBO，则使用 UBatchWrapper（用于处理 micro-batches）包装模型
+        elif self.parallel_config.enable_dbo:
+            if cudagraph_mode.has_full_cudagraphs():
+                self.model = UBatchWrapper(
+                    self.model, self.vllm_config, CUDAGraphMode.FULL, self.device
+                )
+            else:
+                self.model = UBatchWrapper(
+                    self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
+                )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -6109,17 +6263,10 @@ class GPUModelRunner(
 
     def profile_run(self) -> None:
         with uvm_allocation_phase("enabled:warmup"):
-            stage_m_stage = os.environ.get(
-                "VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE",
-                "pre_warmup",
-            ).strip().lower().replace("-", "_")
-            if stage_m_stage not in ("post_warmup", "after_warmup", "deferred"):
-                self.run_uvm_init_time_weight_placement()
-            else:
-                logger.info(
-                    "UVM controlled remap boundary: Stage M profile_run "
-                    "placement deferred until post warmup"
-                )
+            logger.info(
+                "UVM controlled remap boundary: Stage M profile_run placement "
+                "disabled; final placement runs after KV initialization and warmup"
+            )
             # Profile with multimodal encoder & encoder cache.
             if self.supports_mm_inputs:
                 mm_config = self.model_config.multimodal_config
@@ -6207,8 +6354,17 @@ class GPUModelRunner(
             del hidden_states, output
             self.encoder_cache.clear()
             gc.collect()
+            if (
+                self._is_uvm_weight_map_enabled()
+                or self._is_uvm_address_logging_enabled()
+            ):
+                self._log_model_weight_addresses("after_profile_run")
 
-    def run_uvm_init_time_weight_placement(self) -> None:
+    def run_uvm_init_time_weight_placement(
+        self,
+        *,
+        prealloc_reserved: bool = True,
+    ) -> None:
         debug_start = time.monotonic()
         logger.warning("UVM controlled remap debug: model_runner Stage M placement entered")
         matched_issued = self._run_uvm_matched_cpu_offload_manifest()
@@ -6296,7 +6452,8 @@ class GPUModelRunner(
             self._record_uvm_init_weight_plan_residency(
                 "after_stage_m_clear_before_prealloc"
             )
-            self._maybe_prealloc_uvm_expert_reserved_slots_after_stage_m()
+            if prealloc_reserved:
+                self._maybe_prealloc_uvm_expert_reserved_slots_after_stage_m()
             self._record_uvm_init_weight_plan_residency("after_stage_m_clear")
             self._record_uvm_active_expert_residency_probe("after_stage_m_clear")
             self._record_uvm_post_offload_slot_use_probe("after_stage_m_clear")
@@ -6337,12 +6494,32 @@ class GPUModelRunner(
                 exc,
             )
 
-    def _maybe_prealloc_uvm_expert_reserved_slots_after_stage_m(self) -> None:
+    def _maybe_prealloc_uvm_expert_reserved_slots_after_stage_m(
+        self,
+    ) -> dict[str, Any]:
+        stage = (
+            os.environ.get(
+                "VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE",
+                "post_warmup",
+            )
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        default_enabled = (
+            stage in ("post_warmup", "after_warmup", "deferred")
+            and os.environ.get("VLLM_UVM_WEIGHT_EXECUTOR", "").strip().lower()
+            == "expert_reserved_regions_async"
+        )
         if not self._env_flag_enabled(
             "VLLM_UVM_EXPERT_RESERVED_PREALLOC_AFTER_STAGE_M",
-            default=False,
+            default=default_enabled,
         ):
-            return
+            return {
+                "requested": False,
+                "ok": True,
+                "reason": "disabled",
+            }
 
         slot_count = self._env_int_value(
             "VLLM_UVM_EXPERT_RESERVED_SLOT_COUNT",
@@ -6373,7 +6550,10 @@ class GPUModelRunner(
                 slot_count,
                 slot_bytes,
             )
-            return
+            return {
+                **record,
+                "requested": True,
+            }
 
         device = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
         entries = [
@@ -6401,8 +6581,20 @@ class GPUModelRunner(
         )
         query_after = driver_expert_reserved_pool_query(prefer_existing=True)
         elapsed = time.monotonic() - start
+        success_count = int(result.get("success_count") or 0)
+        backed_slots = int(query_after.get("backed_slots") or 0)
+        backing_bytes = int(query_after.get("reserved_backing_bytes") or 0)
+        required_backing = slot_count * slot_bytes
+        prealloc_ok = (
+            bool(result.get("ok"))
+            and success_count >= slot_count
+            and backed_slots >= slot_count
+            and backing_bytes >= required_backing
+        )
         record = {
             "action": "expert_reserved_post_stage_m_prealloc",
+            "requested": True,
+            "ok": prealloc_ok,
             "device": device,
             "pool_id": pool_id,
             "slot_count": slot_count,
@@ -6428,16 +6620,6 @@ class GPUModelRunner(
             "0",
         ).strip().lower() in ("1", "true", "yes", "on")
         if fail_fast:
-            success_count = int(result.get("success_count") or 0)
-            backed_slots = int(query_after.get("backed_slots") or 0)
-            backing_bytes = int(query_after.get("reserved_backing_bytes") or 0)
-            required_backing = slot_count * slot_bytes
-            prealloc_ok = (
-                bool(result.get("ok"))
-                and success_count >= slot_count
-                and backed_slots >= slot_count
-                and backing_bytes >= required_backing
-            )
             if not prealloc_ok:
                 raise RuntimeError(
                     "post-Stage-M reserved prealloc failed: "
@@ -6446,6 +6628,7 @@ class GPUModelRunner(
                     f"backing={backing_bytes} required={required_backing} "
                     f"rm_status={result.get('rm_status')}"
                 )
+        return record
 
     def _maybe_clear_uvm_init_time_slot_ptes_after_placement(self) -> None:
         driver_mode = os.environ.get(
@@ -7775,6 +7958,7 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+        self._uvm_kv_caches_by_layer = kv_caches
         logger.warning(
             "UVM controlled remap debug: model_runner kv cache sharing/bind end "
             "kv_caches=%d elapsed=%.3fs",
@@ -7790,11 +7974,19 @@ class GPUModelRunner(
             time.monotonic() - section_start,
         )
         section_start = time.monotonic()
-        logger.warning("UVM controlled remap debug: model_runner _write_stage_l6_kv_pointer_map begin")
-        self._write_stage_l6_kv_pointer_map(kv_cache_config, kv_caches)
         logger.warning(
-            "UVM controlled remap debug: model_runner _write_stage_l6_kv_pointer_map end "
-            "elapsed=%.3fs",
+            "UVM controlled remap debug: model_runner "
+            "_register_uvm_kv_cache_physical_ranges begin"
+        )
+        kv_physical_result = self._register_uvm_kv_cache_physical_ranges(
+            kv_cache_config,
+            kv_caches,
+            "initialize_kv_cache",
+        )
+        logger.warning(
+            "UVM controlled remap debug: model_runner "
+            "_register_uvm_kv_cache_physical_ranges end result=%s elapsed=%.3fs",
+            kv_physical_result,
             time.monotonic() - section_start,
         )
         logger.warning(

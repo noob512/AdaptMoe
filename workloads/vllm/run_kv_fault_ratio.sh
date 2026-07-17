@@ -167,12 +167,6 @@ UVM_WEIGHT_OFFLOAD_PLAN_FILE="${VLLM_UVM_WEIGHT_OFFLOAD_PLAN_FILE:-}"
 UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP="${VLLM_UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP:-67108864}"
 UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER="${VLLM_UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER:-1}"
 UVM_WEIGHT_OFFLOAD_TARGET_ROLES="${VLLM_UVM_WEIGHT_OFFLOAD_TARGET_ROLES:-moe_gate_up,moe_down}"
-UVM_INIT_KV_SIZING_ENABLE="${VLLM_UVM_INIT_KV_SIZING_ENABLE:-0}"
-UVM_INIT_KV_SIZING_POLICY="${VLLM_UVM_INIT_KV_SIZING_POLICY:-report_only}"
-UVM_INIT_KV_MAX_BYTES="${VLLM_UVM_INIT_KV_MAX_BYTES:-0}"
-UVM_INIT_KV_MAX_BLOCKS="${VLLM_UVM_INIT_KV_MAX_BLOCKS:-0}"
-UVM_INIT_KV_MIN_BLOCKS="${VLLM_UVM_INIT_KV_MIN_BLOCKS:-0}"
-UVM_INIT_KV_TRACE_FILE="${VLLM_UVM_INIT_KV_TRACE_FILE:-}"
 UVM_INIT_WEIGHT_OFFLOAD_ENABLE="${VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE:-0}"
 UVM_INIT_WEIGHT_OFFLOAD_MODE="${VLLM_UVM_INIT_WEIGHT_OFFLOAD_MODE:-trace_only}"
 UVM_INIT_WEIGHT_PLAN_FILE="${VLLM_UVM_INIT_WEIGHT_PLAN_FILE:-}"
@@ -219,9 +213,6 @@ UVM_RESIDENCY_SCRATCH_GPU_BYTES="${VLLM_UVM_RESIDENCY_SCRATCH_GPU_BYTES:-0}"
 UVM_RESIDENCY_SAFETY_MARGIN_BYTES="${VLLM_UVM_RESIDENCY_SAFETY_MARGIN_BYTES:-0}"
 UVM_RESIDENCY_SCRATCH_RESERVED_BYTES="${VLLM_UVM_RESIDENCY_SCRATCH_RESERVED_BYTES:-0}"
 UVM_RESIDENCY_SCRATCH_MARGIN_BYTES="${VLLM_UVM_RESIDENCY_SCRATCH_MARGIN_BYTES:-0}"
-UVM_RESIDENCY_KV_SIZING_ENABLE="${VLLM_UVM_RESIDENCY_KV_SIZING_ENABLE:-0}"
-UVM_RESIDENCY_KV_SIZING_POLICY="${VLLM_UVM_RESIDENCY_KV_SIZING_POLICY:-report_only}"
-UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS="${VLLM_UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS:-0}"
 UVM_RESIDENCY_KV_METADATA_ENABLE="${VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE:-0}"
 UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE="${VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE:-0}"
 UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE="${VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE:-trace_only}"
@@ -563,14 +554,6 @@ Options:
                              Stage G observed scratch peak.
   --uvm-residency-scratch-margin-bytes <n>
                              Stage L3 extra scratch margin for reports.
-  --uvm-residency-kv-sizing-enable <0|1>
-                             Stage L4 KV cache sizing report gate.
-  --uvm-residency-kv-sizing-policy <name>
-                             Stage L4 KV sizing policy:
-                             report_only|clamp|override.
-  --uvm-residency-kv-sizing-max-blocks <n>
-                             Stage L4 optional max block guard for override.
-                             0 means no extra guard.
   --uvm-residency-kv-metadata-enable <0|1>
                              Stage L5 KV block metadata-only residency gate.
   --uvm-residency-kv-data-offload-enable <0|1>
@@ -957,9 +940,6 @@ normalize_output_paths() {
   if [ -n "$UVM_COLD_SLOT_POOL_TRACE_FILE" ]; then
     UVM_COLD_SLOT_POOL_TRACE_FILE="$(abs_path_from_cwd "$UVM_COLD_SLOT_POOL_TRACE_FILE")"
   fi
-  if [ -n "$UVM_INIT_KV_TRACE_FILE" ]; then
-    UVM_INIT_KV_TRACE_FILE="$(abs_path_from_cwd "$UVM_INIT_KV_TRACE_FILE")"
-  fi
   if [ -n "$UVM_INIT_WEIGHT_TRACE_FILE" ]; then
     UVM_INIT_WEIGHT_TRACE_FILE="$(abs_path_from_cwd "$UVM_INIT_WEIGHT_TRACE_FILE")"
   fi
@@ -1032,9 +1012,6 @@ start_server() {
     fi
     if [ -z "$UVM_WEIGHT_PREFETCH_TRACE_FILE" ]; then
       UVM_WEIGHT_PREFETCH_TRACE_FILE="$uvm_stage_e_log_dir/vllm_uvm_weight_prefetch_stage_i.jsonl"
-    fi
-    if [ -z "$UVM_INIT_KV_TRACE_FILE" ]; then
-      UVM_INIT_KV_TRACE_FILE="$uvm_stage_e_log_dir/vllm_uvm_init_kv_sizing_stage_m.jsonl"
     fi
     if [ -z "$UVM_INIT_WEIGHT_PLAN_FILE" ]; then
       UVM_INIT_WEIGHT_PLAN_FILE="$UVM_WEIGHT_OFFLOAD_PLAN_FILE"
@@ -1162,12 +1139,6 @@ start_server() {
                 VLLM_UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP='$UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP' \
                 VLLM_UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER='$UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER' \
                 VLLM_UVM_WEIGHT_OFFLOAD_TARGET_ROLES='$UVM_WEIGHT_OFFLOAD_TARGET_ROLES' \
-                VLLM_UVM_INIT_KV_SIZING_ENABLE='$UVM_INIT_KV_SIZING_ENABLE' \
-                VLLM_UVM_INIT_KV_SIZING_POLICY='$UVM_INIT_KV_SIZING_POLICY' \
-                VLLM_UVM_INIT_KV_MAX_BYTES='$UVM_INIT_KV_MAX_BYTES' \
-                VLLM_UVM_INIT_KV_MAX_BLOCKS='$UVM_INIT_KV_MAX_BLOCKS' \
-                VLLM_UVM_INIT_KV_MIN_BLOCKS='$UVM_INIT_KV_MIN_BLOCKS' \
-                VLLM_UVM_INIT_KV_TRACE_FILE='$UVM_INIT_KV_TRACE_FILE' \
                 VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE='$UVM_INIT_WEIGHT_OFFLOAD_ENABLE' \
                 VLLM_UVM_INIT_WEIGHT_OFFLOAD_MODE='$UVM_INIT_WEIGHT_OFFLOAD_MODE' \
                 VLLM_UVM_INIT_WEIGHT_PLAN_FILE='$UVM_INIT_WEIGHT_PLAN_FILE' \
@@ -1214,9 +1185,6 @@ start_server() {
                 VLLM_UVM_RESIDENCY_SAFETY_MARGIN_BYTES='$UVM_RESIDENCY_SAFETY_MARGIN_BYTES' \
                 VLLM_UVM_RESIDENCY_SCRATCH_RESERVED_BYTES='$UVM_RESIDENCY_SCRATCH_RESERVED_BYTES' \
                 VLLM_UVM_RESIDENCY_SCRATCH_MARGIN_BYTES='$UVM_RESIDENCY_SCRATCH_MARGIN_BYTES' \
-                VLLM_UVM_RESIDENCY_KV_SIZING_ENABLE='$UVM_RESIDENCY_KV_SIZING_ENABLE' \
-                VLLM_UVM_RESIDENCY_KV_SIZING_POLICY='$UVM_RESIDENCY_KV_SIZING_POLICY' \
-                VLLM_UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS='$UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS' \
                 VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE='$UVM_RESIDENCY_KV_METADATA_ENABLE' \
                 VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE='$UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE' \
                 VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE='$UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE' \
@@ -1859,14 +1827,8 @@ parse_args() {
       --uvm-weight-offload-max-bytes-per-step) UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP="$2"; shift 2 ;; # Stage I 每层 cold offload 字节预算
       --uvm-weight-offload-max-experts-per-layer) UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;; # Stage I 每层最多 cold experts
       --uvm-weight-offload-target-roles) UVM_WEIGHT_OFFLOAD_TARGET_ROLES="$2"; shift 2 ;; # Stage I cold offload roles
-      --uvm-init-kv-sizing-enable) UVM_INIT_KV_SIZING_ENABLE="$2"; shift 2 ;; # Stage M init-time KV sizing gate
-      --uvm-init-kv-sizing-policy) UVM_INIT_KV_SIZING_POLICY="$2"; shift 2 ;; # Stage M KV sizing policy report_only/clamp/override
-      --uvm-init-kv-max-bytes) UVM_INIT_KV_MAX_BYTES="$2"; shift 2 ;; # Stage M KV max bytes before cache allocation
-      --uvm-init-kv-max-blocks) UVM_INIT_KV_MAX_BLOCKS="$2"; shift 2 ;; # Stage M KV max blocks before cache allocation
-      --uvm-init-kv-min-blocks) UVM_INIT_KV_MIN_BLOCKS="$2"; shift 2 ;; # Stage M KV min block guard
-      --uvm-init-kv-trace-file) UVM_INIT_KV_TRACE_FILE="$2"; shift 2 ;; # Stage M KV sizing JSONL trace
       --uvm-init-weight-offload-enable) UVM_INIT_WEIGHT_OFFLOAD_ENABLE="$2"; shift 2 ;; # Stage M cold expert pre-offload gate
-      --uvm-init-weight-offload-mode) UVM_INIT_WEIGHT_OFFLOAD_MODE="$2"; shift 2 ;; # Stage M trace_only/advise_cpu/prefetch_cpu/offload_cpu
+      --uvm-init-weight-offload-mode) UVM_INIT_WEIGHT_OFFLOAD_MODE="$2"; shift 2 ;; # Stage M trace_only/driver_release/offload_release
       --uvm-init-weight-plan-file) UVM_INIT_WEIGHT_PLAN_FILE="$2"; shift 2 ;; # Stage M offload_plan JSON
       --uvm-init-weight-target-roles) UVM_INIT_WEIGHT_TARGET_ROLES="$2"; shift 2 ;; # Stage M expert weight roles
       --uvm-init-weight-max-bytes) UVM_INIT_WEIGHT_MAX_BYTES="$2"; shift 2 ;; # Stage M total pre-offload byte cap
@@ -1911,9 +1873,6 @@ parse_args() {
       --uvm-residency-safety-margin-bytes) UVM_RESIDENCY_SAFETY_MARGIN_BYTES="$2"; shift 2 ;; # Stage L0 global safety margin
       --uvm-residency-scratch-reserved-bytes) UVM_RESIDENCY_SCRATCH_RESERVED_BYTES="$2"; shift 2 ;; # Stage L3 scratch reserve report
       --uvm-residency-scratch-margin-bytes) UVM_RESIDENCY_SCRATCH_MARGIN_BYTES="$2"; shift 2 ;; # Stage L3 scratch reserve margin
-      --uvm-residency-kv-sizing-enable) UVM_RESIDENCY_KV_SIZING_ENABLE="$2"; shift 2 ;; # Stage L4 KV sizing report gate
-      --uvm-residency-kv-sizing-policy) UVM_RESIDENCY_KV_SIZING_POLICY="$2"; shift 2 ;; # Stage L4 KV sizing policy label
-      --uvm-residency-kv-sizing-max-blocks) UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS="$2"; shift 2 ;; # Stage L4 override max block guard
       --uvm-residency-kv-metadata-enable) UVM_RESIDENCY_KV_METADATA_ENABLE="$2"; shift 2 ;; # Stage L5 KV metadata-only residency
       --uvm-residency-kv-data-offload-enable) UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE="$2"; shift 2 ;; # Stage L6 safe KV offload gate
       --uvm-residency-kv-data-offload-mode) UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE="$2"; shift 2 ;; # Stage L6 offload mode trace_only/prefetch_cpu
@@ -2162,13 +2121,8 @@ validate_inputs() {
     [[ "$UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP" =~ ^[0-9]+$ ]] || die "--uvm-weight-offload-max-bytes-per-step must be a non-negative integer"
     [[ "$UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-weight-offload-max-experts-per-layer must be a non-negative integer"
     [ -n "$UVM_WEIGHT_OFFLOAD_TARGET_ROLES" ] || die "--uvm-weight-offload-target-roles must not be empty"
-    [[ "$UVM_INIT_KV_SIZING_ENABLE" =~ ^[01]$ ]] || die "--uvm-init-kv-sizing-enable must be 0 or 1"
-    [[ "$UVM_INIT_KV_SIZING_POLICY" =~ ^(report_only|clamp|override)$ ]] || die "--uvm-init-kv-sizing-policy must be report_only, clamp, or override"
-    [[ "$UVM_INIT_KV_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-init-kv-max-bytes must be a non-negative integer"
-    [[ "$UVM_INIT_KV_MAX_BLOCKS" =~ ^[0-9]+$ ]] || die "--uvm-init-kv-max-blocks must be a non-negative integer"
-    [[ "$UVM_INIT_KV_MIN_BLOCKS" =~ ^[0-9]+$ ]] || die "--uvm-init-kv-min-blocks must be a non-negative integer"
     [[ "$UVM_INIT_WEIGHT_OFFLOAD_ENABLE" =~ ^[01]$ ]] || die "--uvm-init-weight-offload-enable must be 0 or 1"
-    [[ "$UVM_INIT_WEIGHT_OFFLOAD_MODE" =~ ^(trace_only|advise_cpu|prefetch_cpu|offload_cpu)$ ]] || die "--uvm-init-weight-offload-mode must be trace_only, advise_cpu, prefetch_cpu, or offload_cpu"
+    [[ "$UVM_INIT_WEIGHT_OFFLOAD_MODE" =~ ^(trace_only|driver_release|driver_release_cpu|offload_release|release_cpu)$ ]] || die "--uvm-init-weight-offload-mode must be trace_only, driver_release, driver_release_cpu, offload_release, or release_cpu"
     [ -n "$UVM_INIT_WEIGHT_TARGET_ROLES" ] || die "--uvm-init-weight-target-roles must not be empty"
     [[ "$UVM_INIT_WEIGHT_MAX_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-init-weight-max-bytes must be a non-negative integer"
     [[ "$UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER" =~ ^[0-9]+$ ]] || die "--uvm-init-weight-max-experts-per-layer must be a non-negative integer"
@@ -2206,9 +2160,6 @@ validate_inputs() {
     [[ "$UVM_RESIDENCY_SAFETY_MARGIN_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-residency-safety-margin-bytes must be a non-negative integer"
     [[ "$UVM_RESIDENCY_SCRATCH_RESERVED_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-residency-scratch-reserved-bytes must be a non-negative integer"
     [[ "$UVM_RESIDENCY_SCRATCH_MARGIN_BYTES" =~ ^[0-9]+$ ]] || die "--uvm-residency-scratch-margin-bytes must be a non-negative integer"
-    [[ "$UVM_RESIDENCY_KV_SIZING_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-kv-sizing-enable must be 0 or 1"
-    [[ "$UVM_RESIDENCY_KV_SIZING_POLICY" =~ ^(report_only|clamp|override)$ ]] || die "--uvm-residency-kv-sizing-policy must be report_only, clamp, or override"
-    [[ "$UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS" =~ ^[0-9]+$ ]] || die "--uvm-residency-kv-sizing-max-blocks must be a non-negative integer"
     [[ "$UVM_RESIDENCY_KV_METADATA_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-kv-metadata-enable must be 0 or 1"
     [[ "$UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE" =~ ^[01]$ ]] || die "--uvm-residency-kv-data-offload-enable must be 0 or 1"
     [[ "$UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE" =~ ^(trace_only|prefetch_cpu)$ ]] || die "--uvm-residency-kv-data-offload-mode must be trace_only or prefetch_cpu"

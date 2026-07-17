@@ -466,26 +466,17 @@ class UvmPoolResidencyManager:
         self.scratch_margin_bytes = _read_int_env(
             "VLLM_UVM_RESIDENCY_SCRATCH_MARGIN_BYTES", 0
         )
-        self.kv_sizing_enable = _read_bool_env(
-            "VLLM_UVM_RESIDENCY_KV_SIZING_ENABLE", False
-        )
-        self.kv_sizing_policy = os.environ.get(
-            "VLLM_UVM_RESIDENCY_KV_SIZING_POLICY", "report_only"
-        ).strip().lower()
-        self.kv_sizing_max_blocks = _read_int_env(
-            "VLLM_UVM_RESIDENCY_KV_SIZING_MAX_BLOCKS", 0
-        )
         self.kv_metadata_enable = _read_bool_env(
             "VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE",
-            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") in ("stage_l5", "stage_l6"),
+            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l5",
         )
         self.kv_data_offload_enable = _read_bool_env(
             "VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE",
-            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l6",
+            False,
         )
         self.kv_prefetch_back_enable = _read_bool_env(
             "VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_ENABLE",
-            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l6",
+            False,
         )
         self.priority = os.environ.get(
             "VLLM_UVM_RESIDENCY_PRIORITY", "kv,scratch,weights"
@@ -554,25 +545,6 @@ class UvmPoolResidencyManager:
             "scratch_eviction_records": 0,
             "scratch_stage_g_summary_present": False,
         }
-        self._kv_sizing_summary: dict[str, Any] = {
-            "kv_sizing_records": 0,
-            "kv_sizing_config_present": False,
-            "kv_sizing_policy": self.kv_sizing_policy,
-            "kv_sizing_max_blocks": self.kv_sizing_max_blocks,
-            "kv_sizing_mode": "explicit" if self.pool_budgets["kv"] > 0 else "derived",
-            "kv_sizing_applied": False,
-            "kv_sizing_report_only": True,
-            "kv_sizing_fallback_reason": None,
-            "kv_sizing_explicit_budget_bytes": self.pool_budgets["kv"],
-            "kv_sizing_derived_budget_bytes": 0,
-            "kv_sizing_budget_bytes": 0,
-            "kv_sizing_budget_blocks": 0,
-            "kv_sizing_bytes_per_block": 0,
-            "kv_sizing_original_num_gpu_blocks": 0,
-            "kv_sizing_final_num_gpu_blocks": 0,
-            "kv_sizing_original_kv_bytes": 0,
-            "kv_sizing_final_kv_bytes": 0,
-        }
         self._summary = {
             "register_region_records": 0,
             "requests": 0,
@@ -584,7 +556,6 @@ class UvmPoolResidencyManager:
             "would_evict_candidates": 0,
             "real_action_records": 0,
             "scratch_summary_records": 0,
-            "kv_sizing_records": 0,
             "kv_metadata_records": 0,
             "kv_safe_candidate_records": 0,
             "kv_unsafe_candidate_records": 0,
@@ -1341,101 +1312,6 @@ class UvmPoolResidencyManager:
             )
             self._record_summary_locked()
 
-    def record_kv_sizing(
-        self,
-        *,
-        bytes_per_block: int,
-        original_num_gpu_blocks: int,
-        final_num_gpu_blocks: int | None = None,
-        original_kv_bytes: int | None = None,
-        final_kv_bytes: int | None = None,
-        explicit_kv_budget_bytes: int | None = None,
-        applied: bool | None = None,
-        policy: str | None = None,
-        max_blocks: int | None = None,
-        fallback_reason: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        if not self.active:
-            return
-        metadata = metadata or {}
-        bytes_per_block = max(int(bytes_per_block or 0), 0)
-        original_num_gpu_blocks = max(int(original_num_gpu_blocks or 0), 0)
-        if final_num_gpu_blocks is None:
-            final_num_gpu_blocks = original_num_gpu_blocks
-        final_num_gpu_blocks = max(int(final_num_gpu_blocks or 0), 0)
-        if original_kv_bytes is None:
-            original_kv_bytes = bytes_per_block * original_num_gpu_blocks
-        if final_kv_bytes is None:
-            final_kv_bytes = bytes_per_block * final_num_gpu_blocks
-        original_kv_bytes = max(int(original_kv_bytes or 0), 0)
-        final_kv_bytes = max(int(final_kv_bytes or 0), 0)
-        if explicit_kv_budget_bytes is None:
-            explicit_kv_budget_bytes = self.pool_budgets["kv"]
-        explicit_kv_budget_bytes = max(int(explicit_kv_budget_bytes or 0), 0)
-        policy = (policy or self.kv_sizing_policy).strip().lower()
-        if max_blocks is None:
-            max_blocks = self.kv_sizing_max_blocks
-        max_blocks = max(int(max_blocks or 0), 0)
-        if applied is None:
-            applied = final_num_gpu_blocks != original_num_gpu_blocks
-
-        derived_budget = max(
-            self.global_budget_bytes
-            - self.pool_budgets["weights"]
-            - self.pool_budgets["scratch"]
-            - self.safety_margin_bytes,
-            0,
-        )
-        if explicit_kv_budget_bytes > 0:
-            budget_mode = "explicit"
-            kv_budget_bytes = explicit_kv_budget_bytes
-        else:
-            budget_mode = "derived"
-            kv_budget_bytes = derived_budget
-        kv_budget_blocks = (
-            kv_budget_bytes // bytes_per_block if bytes_per_block > 0 else 0
-        )
-        kv_sizing_summary = {
-            "kv_sizing_config_present": True,
-            "kv_sizing_policy": policy,
-            "kv_sizing_max_blocks": max_blocks,
-            "kv_sizing_mode": budget_mode,
-            "kv_sizing_applied": bool(applied),
-            "kv_sizing_report_only": policy == "report_only",
-            "kv_sizing_fallback_reason": fallback_reason,
-            "kv_sizing_explicit_budget_bytes": explicit_kv_budget_bytes,
-            "kv_sizing_derived_budget_bytes": derived_budget,
-            "kv_sizing_budget_bytes": kv_budget_bytes,
-            "kv_sizing_budget_blocks": kv_budget_blocks,
-            "kv_sizing_bytes_per_block": bytes_per_block,
-            "kv_sizing_original_num_gpu_blocks": original_num_gpu_blocks,
-            "kv_sizing_final_num_gpu_blocks": final_num_gpu_blocks,
-            "kv_sizing_original_kv_bytes": original_kv_bytes,
-            "kv_sizing_final_kv_bytes": final_kv_bytes,
-        }
-        with self._lock:
-            self._record_config_locked()
-            self._sync_driver_pool_budgets_locked()
-            self._kv_sizing_summary.update(kv_sizing_summary)
-            self._kv_sizing_summary["kv_sizing_records"] = (
-                int(self._kv_sizing_summary.get("kv_sizing_records") or 0) + 1
-            )
-            self._summary["kv_sizing_records"] += 1
-            self._write_locked(
-                {
-                    "action": "residency_kv_sizing",
-                    "pool": "kv",
-                    **kv_sizing_summary,
-                    "weight_gpu_budget_bytes": self.pool_budgets["weights"],
-                    "scratch_gpu_budget_bytes": self.pool_budgets["scratch"],
-                    "safety_margin_bytes": self.safety_margin_bytes,
-                    "global_gpu_budget_bytes": self.global_budget_bytes,
-                    "metadata": metadata,
-                }
-            )
-            self._record_summary_locked()
-
     def record_kv_metadata_candidate(
         self,
         *,
@@ -1860,9 +1736,6 @@ class UvmPoolResidencyManager:
                 "weight_victim_policy": self.weight_victim_policy,
                 "scratch_reserved_bytes": self.scratch_reserved_bytes,
                 "scratch_margin_bytes": self.scratch_margin_bytes,
-                "kv_sizing_enable": self.kv_sizing_enable,
-                "kv_sizing_policy": self.kv_sizing_policy,
-                "kv_sizing_max_blocks": self.kv_sizing_max_blocks,
                 "kv_metadata_enable": self.kv_metadata_enable,
                 "kv_data_offload_enable": self.kv_data_offload_enable,
                 "kv_prefetch_back_enable": self.kv_prefetch_back_enable,
@@ -1916,7 +1789,6 @@ class UvmPoolResidencyManager:
             "real_residency_errors": self._real_residency_errors,
             "real_residency_last": self._last_real_residency,
             **self._scratch_summary,
-            **self._kv_sizing_summary,
             **self._summary,
         }
 
@@ -2299,35 +2171,6 @@ def record_uvm_residency_scratch_summary(
         scratch_budget_over_records=scratch_budget_over_records,
         scratch_budget_reject_records=scratch_budget_reject_records,
         scratch_eviction_records=scratch_eviction_records,
-        metadata=metadata,
-    )
-
-
-def record_uvm_residency_kv_sizing(
-    *,
-    bytes_per_block: int,
-    original_num_gpu_blocks: int,
-    final_num_gpu_blocks: int | None = None,
-    original_kv_bytes: int | None = None,
-    final_kv_bytes: int | None = None,
-    explicit_kv_budget_bytes: int | None = None,
-    applied: bool | None = None,
-    policy: str | None = None,
-    max_blocks: int | None = None,
-    fallback_reason: str | None = None,
-    metadata: dict[str, Any] | None = None,
-) -> None:
-    get_uvm_pool_residency_manager().record_kv_sizing(
-        bytes_per_block=bytes_per_block,
-        original_num_gpu_blocks=original_num_gpu_blocks,
-        final_num_gpu_blocks=final_num_gpu_blocks,
-        original_kv_bytes=original_kv_bytes,
-        final_kv_bytes=final_kv_bytes,
-        explicit_kv_budget_bytes=explicit_kv_budget_bytes,
-        applied=applied,
-        policy=policy,
-        max_blocks=max_blocks,
-        fallback_reason=fallback_reason,
         metadata=metadata,
     )
 

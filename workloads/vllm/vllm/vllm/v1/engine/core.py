@@ -317,11 +317,33 @@ class EngineCore:
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
 
     def _maybe_apply_pre_service_uvm_kv_dynamic_pool(self) -> None:
-        if os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_PRE_SERVICE_APPLY", "0") != "1":
+        stage = (
+            os.environ.get(
+                "VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE",
+                "post_warmup",
+            )
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        post_warmup_target = (
+            os.environ.get("VLLM_UVM_KV_POST_WARMUP_TARGET_BLOCKS", "")
+            or os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_POST_STAGE_M_TARGET_BLOCKS", "")
+        ).strip()
+        explicit_apply = (
+            os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_PRE_SERVICE_APPLY", "0") == "1"
+        )
+        automatic_post_warmup_apply = bool(post_warmup_target) and stage in (
+            "post_warmup",
+            "after_warmup",
+            "deferred",
+        )
+        if not (explicit_apply or automatic_post_warmup_apply):
             return
 
         target_text = (
             os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_PRE_SERVICE_TARGET_BLOCKS", "")
+            or os.environ.get("VLLM_UVM_KV_POST_WARMUP_TARGET_BLOCKS", "")
             or os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_POST_STAGE_M_TARGET_BLOCKS", "")
             or os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_INITIAL_BLOCKS", "")
         ).strip()

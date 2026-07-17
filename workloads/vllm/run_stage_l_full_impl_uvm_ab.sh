@@ -70,7 +70,6 @@ WEIGHT_ACTIVE_EVICT_ENABLE="${WEIGHT_ACTIVE_EVICT_ENABLE:-0}"
 WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER="${WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER:-0}"
 WEIGHT_EVICT_PROTECT_RECENT_STEPS="${WEIGHT_EVICT_PROTECT_RECENT_STEPS:-8}"
 WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE="${WEIGHT_BUDGET_CPU_OFFLOAD_ENABLE:-0}"
-INIT_KV_MIN_BLOCKS="${INIT_KV_MIN_BLOCKS:-128}"
 INIT_WEIGHT_MAX_BYTES="${INIT_WEIGHT_MAX_BYTES:-8589934592}"
 INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="${INIT_WEIGHT_MAX_EXPERTS_PER_LAYER:-16}"
 INIT_WEIGHT_HOT_PREFETCH_ENABLE="${INIT_WEIGHT_HOT_PREFETCH_ENABLE:-0}"
@@ -177,7 +176,6 @@ Runtime enforcement controls:
   --uvm-enable-builtin-tests <0|1>       keep UVM test ioctl enabled across
                                          counter-reset reloads (default: 0)
   --no-reset-counters                    do not reload nvidia_uvm between runs
-  --init-kv-min-blocks <n>               default: 128
   --init-weight-max-bytes <n>            default: 8GiB
   --init-weight-max-experts-per-layer <n> default: 16
   --weight-max-victims-per-step <n>      default: 16
@@ -257,7 +255,6 @@ while [ $# -gt 0 ]; do
     --weight-prefetch-hit-max-regions-per-step) WEIGHT_PREFETCH_HIT_MAX_REGIONS_PER_STEP="$2"; shift 2 ;;
     --uvm-enable-builtin-tests) UVM_ENABLE_BUILTIN_TESTS="$2"; shift 2 ;;
     --no-reset-counters) RESET_COUNTERS=0; shift ;;
-    --init-kv-min-blocks) INIT_KV_MIN_BLOCKS="$2"; shift 2 ;;
     --init-weight-max-bytes) INIT_WEIGHT_MAX_BYTES="$2"; shift 2 ;;
     --init-weight-max-experts-per-layer) INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="$2"; shift 2 ;;
     --init-weight-hot-prefetch-enable) INIT_WEIGHT_HOT_PREFETCH_ENABLE="$2"; shift 2 ;;
@@ -457,7 +454,6 @@ echo " weight_batch_executor_enable: ${WEIGHT_BATCH_EXECUTOR_ENABLE:-1}"
 echo " weight_executor: $WEIGHT_EXECUTOR"
 echo " uvm_enable_builtin_tests: $UVM_ENABLE_BUILTIN_TESTS"
 echo " reset_counters: $RESET_COUNTERS"
-echo " init_kv_min_blocks: $INIT_KV_MIN_BLOCKS"
 echo " init_weight_max_bytes: $INIT_WEIGHT_MAX_BYTES"
 echo " init_weight_max_experts_per_layer: $INIT_WEIGHT_MAX_EXPERTS_PER_LAYER"
 echo " init_weight_hot_prefetch_enable: $INIT_WEIGHT_HOT_PREFETCH_ENABLE"
@@ -686,13 +682,8 @@ run_one() {
         --uvm-weight-offload-max-bytes-per-step "$WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP"
         --uvm-weight-offload-max-experts-per-layer "$WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER"
         --uvm-weight-offload-target-roles moe_gate_up,moe_down
-        --uvm-init-kv-sizing-enable 1
-        --uvm-init-kv-sizing-policy clamp
-        --uvm-init-kv-max-bytes "$KV_GPU_BYTES"
-        --uvm-init-kv-min-blocks "$INIT_KV_MIN_BLOCKS"
-        --uvm-init-kv-trace-file "$run_dir/vllm_uvm_init_kv_sizing_${label}.jsonl"
         --uvm-init-weight-offload-enable "$INIT_WEIGHT_OFFLOAD_ENABLE"
-        --uvm-init-weight-offload-mode offload_cpu
+        --uvm-init-weight-offload-mode driver_release
         --uvm-init-weight-plan-file "$plan_json"
         --uvm-init-weight-target-roles moe_gate_up,moe_down
         --uvm-init-weight-max-bytes "$INIT_WEIGHT_MAX_BYTES"
@@ -909,7 +900,6 @@ for run_dir in sorted(runs_dir.glob("*_rep*")):
     residency_path = next(run_dir.glob("vllm_uvm_pool_residency_*.jsonl"), None)
     runtime_path = next(run_dir.glob("vllm_uvm_kv_runtime_*.jsonl"), None)
     weight_path = next(run_dir.glob("vllm_uvm_weight_prefetch_*.jsonl"), None)
-    init_kv_path = next(run_dir.glob("vllm_uvm_init_kv_sizing_*.jsonl"), None)
     init_weight_path = next(run_dir.glob("vllm_uvm_init_weight_offload_*.jsonl"), None)
     coord_path = next(run_dir.glob("vllm_uvm_pool_coordinator_*.jsonl"), None)
     residency_counts = count_actions(read_jsonl(residency_path)) if residency_path else {}
@@ -920,7 +910,6 @@ for run_dir in sorted(runs_dir.glob("*_rep*")):
     weight_step_summaries = [
         item for item in weight_records if item.get("action") == "step_summary"
     ]
-    init_kv_records = read_jsonl(init_kv_path) if init_kv_path else []
     init_weight_records = read_jsonl(init_weight_path) if init_weight_path else []
     init_weight_counts = count_actions(init_weight_records)
     coord_counts = count_actions(read_jsonl(coord_path)) if coord_path else {}
@@ -928,15 +917,6 @@ for run_dir in sorted(runs_dir.glob("*_rep*")):
     for record in residency_records:
         if record.get("action") == "residency_summary":
             final_residency_summary = record
-    init_kv_record = init_kv_records[-1] if init_kv_records else {}
-    init_kv_workers = init_kv_record.get("workers") if isinstance(init_kv_record, dict) else []
-    init_kv_worker0 = (
-        init_kv_workers[0]
-        if isinstance(init_kv_workers, list)
-        and init_kv_workers
-        and isinstance(init_kv_workers[0], dict)
-        else {}
-    )
     server_log = read_text(run_dir / f"vllm_server_{label}.log")
     bench_log = read_text(run_dir / f"vllm_bench_{label}.log")
     oom = "out of memory" in server_log.lower() or "out of memory" in bench_log.lower()
@@ -1011,17 +991,13 @@ for run_dir in sorted(runs_dir.glob("*_rep*")):
         "weight_prefetch_oracle_trace_missing_records": sum(int(item.get("oracle_trace_missing_records") or 0) for item in weight_step_summaries),
         "weight_prefetch_oracle_future_missing_records": sum(int(item.get("oracle_future_missing_records") or 0) for item in weight_step_summaries),
         "weight_prefetch_oracle_candidate_experts": sum(int(item.get("oracle_candidate_expert_records") or 0) for item in weight_step_summaries),
-        "init_kv_sizing_records": len(init_kv_records),
-        "init_kv_applied_worker0": init_kv_worker0.get("applied"),
-        "init_kv_original_bytes_worker0": init_kv_worker0.get("original_bytes"),
-        "init_kv_final_bytes_worker0": init_kv_worker0.get("final_bytes"),
-        "init_kv_original_blocks_worker0": init_kv_worker0.get("original_num_blocks"),
-        "init_kv_final_blocks_worker0": init_kv_worker0.get("final_num_blocks"),
         "init_weight_offload_prefetch_cpu_issued": init_weight_counts.get("init_weight_offload_prefetch_cpu_issued", 0),
         "init_weight_offload_offload_cpu_issued": init_weight_counts.get("init_weight_offload_offload_cpu_issued", 0),
+        "init_weight_offload_driver_release_issued": init_weight_counts.get("init_weight_offload_driver_release_issued", 0),
         "init_weight_offload_cpu_issued_total": (
             init_weight_counts.get("init_weight_offload_prefetch_cpu_issued", 0)
             + init_weight_counts.get("init_weight_offload_offload_cpu_issued", 0)
+            + init_weight_counts.get("init_weight_offload_driver_release_issued", 0)
         ),
         "init_weight_hot_prefetch_issued": init_weight_counts.get("init_weight_hot_prefetch_issued", 0),
         "init_weight_hot_prefetch_skipped": init_weight_counts.get("init_weight_hot_prefetch_skipped", 0),
@@ -1133,9 +1109,9 @@ for variant, items in by_variant.items():
         "allocator_weight_budget_cpu_offload_allocations_median": median([item.get("allocator_weight_budget_cpu_offload_allocations") for item in items]),
         "allocator_weight_budget_cpu_offload_bytes_median": median([item.get("allocator_weight_budget_cpu_offload_bytes") for item in items]),
         "allocator_weight_budget_cpu_offload_failures_median": median([item.get("allocator_weight_budget_cpu_offload_failures") for item in items]),
-        "init_kv_final_bytes_worker0_median": median([item.get("init_kv_final_bytes_worker0") for item in items]),
         "init_weight_offload_prefetch_cpu_issued_median": median([item.get("init_weight_offload_prefetch_cpu_issued") for item in items]),
         "init_weight_offload_offload_cpu_issued_median": median([item.get("init_weight_offload_offload_cpu_issued") for item in items]),
+        "init_weight_offload_driver_release_issued_median": median([item.get("init_weight_offload_driver_release_issued") for item in items]),
         "init_weight_offload_cpu_issued_total_median": median([item.get("init_weight_offload_cpu_issued_total") for item in items]),
         "init_weight_hot_prefetch_issued_median": median([item.get("init_weight_hot_prefetch_issued") for item in items]),
         "init_weight_hot_prefetch_summary_issued_records_median": median([item.get("init_weight_hot_prefetch_summary_issued_records") for item in items]),

@@ -22,30 +22,19 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.device_allocator.uvm import (
-    advise_range_preferred_location,
-    batch_advise_ranges_preferred_location,
-    batch_advise_ranges_cpu_with_executor,
-    batch_offload_ranges_to_cpu,
-    batch_offload_ranges_to_cpu_with_executor,
     batch_prefetch_ranges_to_device,
     batch_prefetch_ranges_to_device_with_executor,
     driver_batch_query_ranges_residency_bytes,
     driver_expert_offload_release_regions,
-    driver_moe_slot_remap_batch,
-    offload_range_to_cpu,
-    prefetch_range_to_device,
     probe_driver_capable_range,
     uvm_enabled_allocation_phase,
     uvm_local_memory_pool,
 )
-from vllm.device_allocator.uvm_pool_coordinator import request_uvm_pool_action
 from vllm.device_allocator.uvm_pool_residency import (
     get_uvm_residency_region_snapshot,
     mark_uvm_residency_state,
-    record_uvm_residency_action,
     record_uvm_residency_access,
     register_uvm_residency_region,
-    request_uvm_gpu_residency,
 )
 from vllm.device_allocator.uvm_expert_reserved_executor import (
     ReservedRegionItem,
@@ -927,34 +916,13 @@ class FusedMoE(CustomOp):
             default=False,
         )
         self._uvm_moe_stream_trace_marker_disabled = False
-        self.uvm_weight_prefetch_max_bytes_per_step = _env_int(
-            "VLLM_UVM_WEIGHT_PREFETCH_MAX_BYTES_PER_STEP",
-            default=64 * 1024 * 1024,
-        )
         self.uvm_weight_router_topk_every_n_steps = _env_int(
             "VLLM_UVM_WEIGHT_ROUTER_TOPK_EVERY_N_STEPS",
             default=1,
         )
         if self.uvm_weight_router_topk_every_n_steps <= 0:
             self.uvm_weight_router_topk_every_n_steps = 1
-        self.uvm_weight_prefetch_max_experts_per_layer = _env_int(
-            "VLLM_UVM_WEIGHT_PREFETCH_MAX_EXPERTS_PER_LAYER",
-            default=2,
-        )
-        self.uvm_weight_prefetch_skip_resident = _env_flag_enabled(
-            "VLLM_UVM_WEIGHT_PREFETCH_SKIP_RESIDENT",
-            default=True,
-        )
-        self.uvm_weight_prefetch_region_cooldown_steps = _env_int(
-            "VLLM_UVM_WEIGHT_PREFETCH_REGION_COOLDOWN_STEPS",
-            default=8,
-        )
-        if self.uvm_weight_prefetch_region_cooldown_steps < 0:
-            self.uvm_weight_prefetch_region_cooldown_steps = 0
-        self._uvm_weight_last_prefetch_step: dict[str, int] = {}
         self._uvm_weight_prefetch_issue_info: dict[str, dict[str, object]] = {}
-        self._uvm_weight_recent_active_region_steps: dict[str, int] = {}
-        self._uvm_weight_recent_active_expert_steps: dict[tuple[str, int], int] = {}
         self.uvm_weight_prefetch_expert_cache_enabled = _env_flag_enabled(
             "VLLM_UVM_WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE",
             default=True,
@@ -977,36 +945,6 @@ class FusedMoE(CustomOp):
             "VLLM_UVM_WEIGHT_PREFETCH_PLAN_FILE",
             "",
         )
-        self.uvm_weight_prefetch_require_plan = _env_flag_enabled(
-            "VLLM_UVM_WEIGHT_PREFETCH_REQUIRE_PLAN",
-            default=False,
-        )
-        self.uvm_weight_prefetch_source = os.environ.get(
-            "VLLM_UVM_WEIGHT_PREFETCH_SOURCE",
-            "router_topk",
-        )
-        if self.uvm_weight_prefetch_source not in (
-            "router_topk",
-            "plan_intersection",
-            "oracle_replay",
-        ):
-            logger.warning(
-                "Unknown VLLM_UVM_WEIGHT_PREFETCH_SOURCE=%s; using router_topk",
-                self.uvm_weight_prefetch_source,
-            )
-            self.uvm_weight_prefetch_source = "router_topk"
-        self.uvm_oracle_expert_trace_file = os.environ.get(
-            "VLLM_UVM_ORACLE_EXPERT_TRACE_FILE",
-            "",
-        )
-        self.uvm_oracle_prefetch_lookahead_steps = _env_int(
-            "VLLM_UVM_ORACLE_PREFETCH_LOOKAHEAD_STEPS",
-            default=1,
-        )
-        if self.uvm_oracle_prefetch_lookahead_steps < 0:
-            self.uvm_oracle_prefetch_lookahead_steps = 0
-        self._uvm_oracle_experts_by_layer: dict[str, list[set[int]]] | None = None
-        self._uvm_oracle_layer_positions: dict[str, int] = {}
         self.uvm_weight_prefetch_hit_trace_enabled = _env_flag_enabled(
             "VLLM_UVM_WEIGHT_PREFETCH_HIT_TRACE_ENABLE",
             default=False,
@@ -1170,7 +1108,17 @@ class FusedMoE(CustomOp):
         )
         self.uvm_expert_reserved_enable_after_warmup = _env_flag_enabled(
             "VLLM_UVM_EXPERT_RESERVED_ENABLE_AFTER_WARMUP",
-            default=False,
+            default=(
+                self.uvm_expert_reserved_enable
+                and os.environ.get(
+                    "VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE",
+                    "post_warmup",
+                )
+                .strip()
+                .lower()
+                .replace("-", "_")
+                in ("post_warmup", "after_warmup", "deferred")
+            ),
         )
         self.uvm_expert_reserved_coverage_trace_enabled = _env_flag_enabled(
             "VLLM_UVM_EXPERT_RESERVED_COVERAGE_TRACE_ENABLE",
@@ -1189,45 +1137,14 @@ class FusedMoE(CustomOp):
             default=0,
         )
         self._uvm_expert_reserved_active_steps: set[int] = set()
-        self.uvm_weight_offload_enable = _env_flag_enabled(
-            "VLLM_UVM_WEIGHT_OFFLOAD_ENABLE",
-            default=False,
-        )
-        self.uvm_weight_offload_mode = os.environ.get(
-            "VLLM_UVM_WEIGHT_OFFLOAD_MODE",
-            "trace_only",
-        )
-        if self.uvm_weight_offload_mode not in ("trace_only", "advise_cpu", "prefetch_cpu"):
-            logger.warning(
-                "Unknown VLLM_UVM_WEIGHT_OFFLOAD_MODE=%s; using trace_only",
-                self.uvm_weight_offload_mode,
-            )
-            self.uvm_weight_offload_mode = "trace_only"
         self.uvm_weight_offload_plan_file = os.environ.get(
             "VLLM_UVM_WEIGHT_OFFLOAD_PLAN_FILE",
             self.uvm_weight_prefetch_plan_file,
         )
-        self.uvm_weight_offload_max_bytes_per_step = _env_int(
-            "VLLM_UVM_WEIGHT_OFFLOAD_MAX_BYTES_PER_STEP",
-            default=64 * 1024 * 1024,
-        )
-        self.uvm_weight_offload_max_experts_per_layer = _env_int(
-            "VLLM_UVM_WEIGHT_OFFLOAD_MAX_EXPERTS_PER_LAYER",
-            default=1,
-        )
-        self.uvm_weight_offload_target_roles = {
-            role.strip()
-            for role in os.environ.get(
-                "VLLM_UVM_WEIGHT_OFFLOAD_TARGET_ROLES",
-                ",".join(sorted(self.uvm_weight_prefetch_target_roles)),
-            ).split(",")
-            if role.strip()
-        }
         self.uvm_weight_offload_plan_keys = _parse_plan_expert_keys(
             self.uvm_weight_offload_plan_file,
             "offload_plan",
         )
-        self._uvm_weight_offload_completed_keys: set[tuple[int, int]] = set()
         self._uvm_weight_prefetch_plan_loaded = bool(
             self.uvm_weight_prefetch_plan_keys
         )
@@ -1244,9 +1161,6 @@ class FusedMoE(CustomOp):
         )
         if self.uvm_init_weight_offload_mode not in (
             "trace_only",
-            "advise_cpu",
-            "prefetch_cpu",
-            "offload_cpu",
             *_UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES,
         ):
             logger.warning(
@@ -1266,7 +1180,7 @@ class FusedMoE(CustomOp):
             role.strip()
             for role in os.environ.get(
                 "VLLM_UVM_INIT_WEIGHT_TARGET_ROLES",
-                ",".join(sorted(self.uvm_weight_offload_target_roles)),
+                ",".join(sorted(self.uvm_weight_prefetch_target_roles)),
             ).split(",")
             if role.strip()
         }
@@ -1342,11 +1256,24 @@ class FusedMoE(CustomOp):
             self.uvm_init_weight_offload_plan_keys
             or self.uvm_init_weight_hot_plan_keys
         )
-        self._uvm_plan_expert_bitmask_width = int(self.global_num_experts)
-        self.uvm_weight_prefetch_plan_mask_by_layer = _build_plan_expert_bitmask(
-            self.uvm_weight_prefetch_plan_keys,
-            self._uvm_plan_expert_bitmask_width,
+        register_all_default = (
+            self.uvm_expert_reserved_enable
+            or self.uvm_init_weight_offload_enable
+            or self.uvm_init_weight_hot_prefetch_enable
         )
+        self.uvm_init_weight_register_all_local_experts = _env_flag_enabled(
+            "VLLM_UVM_INIT_WEIGHT_REGISTER_ALL_LOCAL_EXPERTS",
+            default=register_all_default,
+        )
+        self.uvm_init_weight_complete_expert_plan = _env_flag_enabled(
+            "VLLM_UVM_INIT_WEIGHT_COMPLETE_EXPERT_PLAN",
+            default=self.uvm_init_weight_register_all_local_experts,
+        )
+        self.uvm_init_weight_complete_plan_ignore_limits = _env_flag_enabled(
+            "VLLM_UVM_INIT_WEIGHT_COMPLETE_PLAN_IGNORE_LIMITS",
+            default=self.uvm_init_weight_complete_expert_plan,
+        )
+        self._uvm_plan_expert_bitmask_width = int(self.global_num_experts)
         self.uvm_weight_offload_plan_mask_by_layer = _build_plan_expert_bitmask(
             self.uvm_weight_offload_plan_keys,
             self._uvm_plan_expert_bitmask_width,
@@ -1369,9 +1296,6 @@ class FusedMoE(CustomOp):
             tuple[int | None, str, int], torch.Tensor
         ] = {}
         self._uvm_init_weight_offload_done = False
-        self.uvm_residency_mode = os.environ.get(
-            "VLLM_UVM_RESIDENCY_MODE", "trace_only"
-        )
         self.uvm_residency_weight_initial_state = os.environ.get(
             "VLLM_UVM_RESIDENCY_WEIGHT_INITIAL_STATE", "cpu"
         )
@@ -1385,222 +1309,6 @@ class FusedMoE(CustomOp):
                 self.uvm_residency_weight_initial_state,
             )
             self.uvm_residency_weight_initial_state = "cpu"
-        self.uvm_residency_weight_enforce_hot_set = _env_flag_enabled(
-            "VLLM_UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET",
-            default=False,
-        )
-        self.uvm_residency_weight_sync_offload = _env_flag_enabled(
-            "VLLM_UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD",
-            default=True,
-        )
-        self.uvm_residency_weight_max_victims_per_step = _env_int(
-            "VLLM_UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP",
-            default=0,
-        )
-        self.uvm_residency_weight_victim_policy = os.environ.get(
-            "VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_POLICY",
-            "cold_plan_lru",
-        )
-        self.uvm_residency_weight_victim_action = os.environ.get(
-            "VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_ACTION",
-            "offload_cpu",
-        )
-        if self.uvm_residency_weight_victim_action not in (
-            "advise_cpu",
-            "prefetch_cpu",
-            "offload_cpu",
-        ):
-            logger.warning(
-                "Unknown VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_ACTION=%s; "
-                "using offload_cpu",
-                self.uvm_residency_weight_victim_action,
-            )
-            self.uvm_residency_weight_victim_action = "offload_cpu"
-        self.uvm_residency_weight_active_evict_enable = _env_flag_enabled(
-            "VLLM_UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_ENABLE",
-            default=False,
-        )
-        self.uvm_residency_weight_active_evict_max_experts_per_layer = _env_int(
-            "VLLM_UVM_RESIDENCY_WEIGHT_ACTIVE_EVICT_MAX_EXPERTS_PER_LAYER",
-            default=0,
-        )
-        self.uvm_residency_weight_evict_protect_recent_steps = _env_int(
-            "VLLM_UVM_RESIDENCY_WEIGHT_EVICT_PROTECT_RECENT_STEPS",
-            default=8,
-        )
-        if self.uvm_residency_weight_evict_protect_recent_steps < 0:
-            self.uvm_residency_weight_evict_protect_recent_steps = 0
-        self.uvm_cold_streaming_enable = _env_flag_enabled(
-            "VLLM_UVM_COLD_STREAMING_ENABLE",
-            default=False,
-        )
-        self.uvm_cold_streaming_trace_only = _env_flag_enabled(
-            "VLLM_UVM_COLD_STREAMING_TRACE_ONLY",
-            default=False,
-        )
-        self.uvm_cold_streaming_hot_plan_enable = _env_flag_enabled(
-            "VLLM_UVM_COLD_STREAMING_HOT_PLAN_ENABLE",
-            default=True,
-        )
-        self.uvm_cold_streaming_budget_bytes = _env_int(
-            "VLLM_UVM_COLD_STREAMING_BUDGET_BYTES",
-            default=0,
-        )
-        if self.uvm_cold_streaming_budget_bytes < 0:
-            self.uvm_cold_streaming_budget_bytes = 0
-        self.uvm_cold_streaming_ttl_steps = _env_int(
-            "VLLM_UVM_COLD_STREAMING_TTL_STEPS",
-            default=64,
-        )
-        if self.uvm_cold_streaming_ttl_steps < 0:
-            self.uvm_cold_streaming_ttl_steps = 0
-        self.uvm_cold_streaming_max_bytes_per_step = _env_int(
-            "VLLM_UVM_COLD_STREAMING_MAX_BYTES_PER_STEP",
-            default=256 * 1024 * 1024,
-        )
-        if self.uvm_cold_streaming_max_bytes_per_step < 0:
-            self.uvm_cold_streaming_max_bytes_per_step = 0
-        self.uvm_cold_streaming_max_experts_per_layer = _env_int(
-            "VLLM_UVM_COLD_STREAMING_MAX_EXPERTS_PER_LAYER",
-            default=0,
-        )
-        if self.uvm_cold_streaming_max_experts_per_layer < 0:
-            self.uvm_cold_streaming_max_experts_per_layer = 0
-        self.uvm_cold_streaming_evict_policy = os.environ.get(
-            "VLLM_UVM_COLD_STREAMING_EVICT_POLICY",
-            "ttl_lru",
-        )
-        if self.uvm_cold_streaming_evict_policy not in ("lru", "ttl_lru"):
-            logger.warning(
-                "Unknown VLLM_UVM_COLD_STREAMING_EVICT_POLICY=%s; using ttl_lru",
-                self.uvm_cold_streaming_evict_policy,
-            )
-            self.uvm_cold_streaming_evict_policy = "ttl_lru"
-        self.uvm_cold_streaming_evict_enable = _env_flag_enabled(
-            "VLLM_UVM_COLD_STREAMING_EVICT_ENABLE",
-            default=True,
-        )
-        self.uvm_cold_streaming_trace_file = os.environ.get(
-            "VLLM_UVM_COLD_STREAMING_TRACE_FILE",
-            "vllm_uvm_cold_streaming_stage_m.jsonl",
-        ) or "vllm_uvm_cold_streaming_stage_m.jsonl"
-        self.uvm_cold_streaming_device = _env_int(
-            "VLLM_UVM_COLD_STREAMING_DEVICE",
-            default=-1,
-        )
-        self.uvm_cold_streaming_sync_prefetch = _env_flag_enabled(
-            "VLLM_UVM_COLD_STREAMING_SYNC_PREFETCH",
-            default=False,
-        )
-        self.uvm_cold_streaming_sync_evict = _env_flag_enabled(
-            "VLLM_UVM_COLD_STREAMING_SYNC_EVICT",
-            default=True,
-        )
-        self.uvm_cold_streaming_real_query_enable = _env_flag_enabled(
-            "VLLM_UVM_COLD_STREAMING_REAL_QUERY_ENABLE",
-            default=False,
-        )
-        self.uvm_cold_slot_pool_enable = _env_flag_enabled(
-            "VLLM_UVM_COLD_SLOT_POOL_ENABLE",
-            default=False,
-        )
-        self.uvm_cold_slot_pool_trace_only = _env_flag_enabled(
-            "VLLM_UVM_COLD_SLOT_POOL_TRACE_ONLY",
-            default=True,
-        )
-        self.uvm_cold_slot_pool_backend = os.environ.get(
-            "VLLM_UVM_COLD_SLOT_POOL_BACKEND",
-            "trace_only",
-        )
-        if self.uvm_cold_slot_pool_backend not in (
-            "trace_only",
-            "legacy_prefetch",
-            "driver_slot_remap",
-        ):
-            logger.warning(
-                "Unknown VLLM_UVM_COLD_SLOT_POOL_BACKEND=%s; using trace_only",
-                self.uvm_cold_slot_pool_backend,
-            )
-            self.uvm_cold_slot_pool_backend = "trace_only"
-        if self.uvm_cold_slot_pool_trace_only:
-            self.uvm_cold_slot_pool_backend = "trace_only"
-        self.uvm_cold_slot_pool_slots_per_layer = _env_int(
-            "VLLM_UVM_COLD_SLOT_POOL_SLOTS_PER_LAYER",
-            default=40,
-        )
-        if self.uvm_cold_slot_pool_slots_per_layer < 0:
-            self.uvm_cold_slot_pool_slots_per_layer = 0
-        self.uvm_cold_slot_pool_trace_file = os.environ.get(
-            "VLLM_UVM_COLD_SLOT_POOL_TRACE_FILE",
-            "vllm_uvm_cold_slot_pool_stage_m.jsonl",
-        ) or "vllm_uvm_cold_slot_pool_stage_m.jsonl"
-        self.uvm_cold_slot_pool_overflow_mode = os.environ.get(
-            "VLLM_UVM_COLD_SLOT_POOL_OVERFLOW_MODE",
-            "trace_only",
-        )
-        if self.uvm_cold_slot_pool_overflow_mode not in (
-            "trace_only",
-            "fallback_streaming",
-        ):
-            logger.warning(
-                "Unknown VLLM_UVM_COLD_SLOT_POOL_OVERFLOW_MODE=%s; using trace_only",
-                self.uvm_cold_slot_pool_overflow_mode,
-            )
-            self.uvm_cold_slot_pool_overflow_mode = "trace_only"
-        self.uvm_cold_slot_pool_trace_assignments_limit = _env_int(
-            "VLLM_UVM_COLD_SLOT_POOL_TRACE_ASSIGNMENTS_LIMIT",
-            default=128,
-        )
-        if self.uvm_cold_slot_pool_trace_assignments_limit < 0:
-            self.uvm_cold_slot_pool_trace_assignments_limit = 0
-        self.uvm_cold_slot_pool_sync_migration = _env_flag_enabled(
-            "VLLM_UVM_COLD_SLOT_POOL_SYNC_MIGRATION",
-            default=False,
-        )
-        self.uvm_cold_slot_pool_driver_mode = os.environ.get(
-            "VLLM_UVM_COLD_SLOT_POOL_DRIVER_MODE",
-            "dry_run",
-        ).strip().lower().replace("-", "_")
-        if self.uvm_cold_slot_pool_driver_mode not in (
-            "dry_run",
-            "validate",
-            "remap",
-            "copy_only",
-            "gpu_copy_only",
-            "slot_pte_remap",
-            "slot_va_block_remap",
-        ):
-            logger.warning(
-                "Unknown VLLM_UVM_COLD_SLOT_POOL_DRIVER_MODE=%s; using dry_run",
-                self.uvm_cold_slot_pool_driver_mode,
-            )
-            self.uvm_cold_slot_pool_driver_mode = "dry_run"
-        self.uvm_cold_slot_pool_driver_validate_managed = _env_flag_enabled(
-            "VLLM_UVM_COLD_SLOT_POOL_DRIVER_VALIDATE_MANAGED",
-            default=False,
-        )
-        self.uvm_cold_slot_pool_clear_slot_ptes_after_remap = os.environ.get(
-            "VLLM_UVM_COLD_SLOT_POOL_CLEAR_SLOT_PTES_AFTER_REMAP",
-            "auto",
-        ).strip().lower()
-        if self.uvm_cold_slot_pool_clear_slot_ptes_after_remap not in (
-            "auto",
-            "0",
-            "1",
-            "false",
-            "true",
-            "no",
-            "yes",
-            "off",
-            "on",
-        ):
-            logger.warning(
-                "Unknown VLLM_UVM_COLD_SLOT_POOL_CLEAR_SLOT_PTES_AFTER_REMAP=%s; "
-                "using auto",
-                self.uvm_cold_slot_pool_clear_slot_ptes_after_remap,
-            )
-            self.uvm_cold_slot_pool_clear_slot_ptes_after_remap = "auto"
-
         self.uvm_expert_weights_managed = _env_flag_enabled(
             "VLLM_UVM_EXPERT_WEIGHTS_MANAGED",
             default=False,
@@ -2953,7 +2661,7 @@ class FusedMoE(CustomOp):
                         )
                     )
                     if reserved_expert_pairs:
-                        self._maybe_prefetch_uvm_expert_weights(
+                        self._maybe_restore_uvm_reserved_expert_weights(
                             topk_ids,
                             layer_id=reserved_layer_id,
                             active_expert_pairs=active_expert_pairs,
@@ -2969,7 +2677,7 @@ class FusedMoE(CustomOp):
                             "layer_name": self.layer_name,
                             "step": self._uvm_moe_trace_step,
                             "mode": self.uvm_weight_prefetch_mode,
-                            "prefetch_source": self.uvm_weight_prefetch_source,
+                            "prefetch_source": "reserved_fast_gate",
                             "action": "reserved_prefetch_no_offloaded_active",
                             "active_global_experts": [],
                             "candidate_expert_records": 0,
@@ -2978,10 +2686,6 @@ class FusedMoE(CustomOp):
                             "gpu_mask_gate": True,
                         }
                     )
-        else:
-            self._maybe_prefetch_uvm_expert_weights(topk_ids)
-        self._maybe_stream_uvm_cold_expert_weights(topk_ids)
-        self._maybe_offload_uvm_cold_expert_weights(topk_ids)
         self._uvm_moe_trace_step += 1
         return topk_weights, topk_ids, zero_expert_result
 
@@ -3127,6 +2831,167 @@ class FusedMoE(CustomOp):
                 expert_pairs.append((global_expert_id, local_expert_id))
         return sorted(set(expert_pairs))
 
+    def _uvm_all_local_expert_pairs(self) -> list[tuple[int, int]]:
+        expert_pairs: set[tuple[int, int]] = set()
+        mapped_local_ids: set[int] = set()
+        for global_expert_id in range(max(int(self.global_num_experts), 0)):
+            local_expert_id = self._uvm_global_to_local_expert(global_expert_id)
+            if 0 <= local_expert_id < int(self.local_num_experts):
+                expert_pairs.add((global_expert_id, local_expert_id))
+                mapped_local_ids.add(local_expert_id)
+
+        for local_expert_id in range(max(int(self.local_num_experts), 0)):
+            if local_expert_id in mapped_local_ids:
+                continue
+            if local_expert_id < int(self.global_num_experts):
+                expert_pairs.add((local_expert_id, local_expert_id))
+        return sorted(expert_pairs)
+
+    def _uvm_init_weight_expert_is_hot(
+        self,
+        layer_id: int | None,
+        global_expert_id: int,
+    ) -> bool:
+        if layer_id is None:
+            return False
+        return (
+            (layer_id, global_expert_id) in self.uvm_init_weight_hot_plan_keys
+            or (layer_id, global_expert_id) in self.uvm_weight_prefetch_plan_keys
+        )
+
+    def _uvm_init_weight_reserved_quota_global_ids(
+        self,
+        layer_id: int | None,
+        expert_pairs: list[tuple[int, int]],
+    ) -> set[int]:
+        if not self.uvm_expert_reserved_enable:
+            return set()
+        reserved_ids = {
+            global_expert_id
+            for global_expert_id, _ in expert_pairs
+            if self._uvm_expert_in_reserved_offload_mask(
+                layer_id,
+                global_expert_id,
+            )
+        }
+        cold_candidates = [
+            global_expert_id
+            for global_expert_id, _ in expert_pairs
+            if (
+                global_expert_id not in reserved_ids
+                and not self._uvm_init_weight_expert_is_hot(
+                    layer_id,
+                    global_expert_id,
+                )
+            )
+        ]
+        max_reserved = int(self.uvm_expert_reserved_offloaded_per_layer)
+        if max_reserved > 0:
+            remaining = max(max_reserved - len(reserved_ids), 0)
+            reserved_ids.update(cold_candidates[:remaining])
+        elif not reserved_ids:
+            reserved_ids.update(cold_candidates)
+        return reserved_ids
+
+    def _uvm_init_weight_expert_class(
+        self,
+        *,
+        layer_id: int | None,
+        global_expert_id: int,
+        reserved_quota_global_ids: set[int],
+    ) -> str:
+        if self._uvm_init_weight_expert_is_hot(layer_id, global_expert_id):
+            return "hot"
+        if (
+            global_expert_id in reserved_quota_global_ids
+            or self._uvm_expert_in_reserved_offload_mask(
+                layer_id,
+                global_expert_id,
+            )
+        ):
+            return "cold_reserved"
+        return "cold_regular"
+
+    def _uvm_init_weight_class_metadata(
+        self,
+        *,
+        metadata: dict[str, object],
+        expert_class: str,
+        driver_tag_skip: bool = False,
+        cpu_offload_placement: bool = True,
+    ) -> dict[str, object]:
+        class_metadata = {
+            **metadata,
+            "source": "stage_m",
+            "stage": "stage_m",
+            "expert_init_class": expert_class,
+            "plan_policy": self.uvm_init_weight_plan_policy,
+            "driver_tag_skip": bool(driver_tag_skip),
+            "driver_tag_skip_reason": (
+                self._uvm_expert_envelope_skip_reason()
+                if driver_tag_skip
+                else None
+            ),
+        }
+        if expert_class == "hot":
+            return {
+                **class_metadata,
+                "pool_class": "hot",
+                "driver_subpool": "hot",
+                "placement": "GPU_RESIDENT",
+                "target_placement": "GPU_RESIDENT",
+                "init_hot": True,
+                "init_cold": False,
+                "protected": True,
+                "pinned": True,
+                "prefetchable": True,
+                "priority": 100,
+            }
+        if expert_class == "cold_reserved":
+            reserved_metadata = {
+                **class_metadata,
+                "pool_class": "cold_reserved",
+                "driver_subpool": "cold_reserved",
+                "target_placement": "CPU_OFFLOADED_RESERVED",
+                "cpu_offloaded_reserved": False,
+                "reserved_prefetch_eligible": False,
+                "init_hot": False,
+                "init_cold": True,
+                "protected": False,
+                "pinned": False,
+                "prefetchable": True,
+                "priority": 20,
+            }
+            if cpu_offload_placement:
+                reserved_metadata.update(
+                    {
+                        "placement": "CPU_OFFLOADED_RESERVED",
+                        "cpu_offloaded_reserved": True,
+                        "reserved_prefetch_eligible": True,
+                    }
+                )
+            else:
+                reserved_metadata["placement"] = "GPU_RESIDENT"
+            return reserved_metadata
+        regular_metadata = {
+            **class_metadata,
+            "pool_class": "cold_regular",
+            "driver_subpool": "cold_regular",
+            "target_placement": "CPU_OFFLOADED",
+            "cpu_offloaded_reserved": False,
+            "reserved_prefetch_eligible": False,
+            "init_hot": False,
+            "init_cold": True,
+            "protected": False,
+            "pinned": False,
+            "prefetchable": True,
+            "priority": 10,
+        }
+        regular_metadata["placement"] = (
+            "CPU_OFFLOADED" if cpu_offload_placement else "GPU_RESIDENT"
+        )
+        return regular_metadata
+
     def _uvm_expert_in_reserved_offload_mask(
         self,
         layer_id: int | None,
@@ -3239,82 +3104,6 @@ class FusedMoE(CustomOp):
             )
         ]
 
-    def _load_uvm_oracle_expert_trace(self) -> dict[str, list[set[int]]]:
-        if self._uvm_oracle_experts_by_layer is not None:
-            return self._uvm_oracle_experts_by_layer
-        by_layer: dict[str, list[set[int]]] = {}
-        trace_file = self.uvm_oracle_expert_trace_file
-        if trace_file and os.path.isfile(trace_file):
-            try:
-                with open(trace_file, "r", encoding="utf-8") as handle:
-                    for line in handle:
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        layer_name = record.get("layer_name")
-                        active_experts = record.get("active_experts")
-                        if not isinstance(layer_name, str):
-                            continue
-                        if not isinstance(active_experts, list):
-                            continue
-                        experts: set[int] = set()
-                        for expert_id in active_experts:
-                            try:
-                                experts.add(int(expert_id))
-                            except (TypeError, ValueError):
-                                continue
-                        by_layer.setdefault(layer_name, []).append(experts)
-            except OSError:
-                logger.debug("Failed to load UVM oracle expert trace", exc_info=True)
-        self._uvm_oracle_experts_by_layer = by_layer
-        return by_layer
-
-    def _uvm_oracle_replay_expert_pairs(
-        self,
-        actual_pairs: list[tuple[int, int]],
-    ) -> tuple[list[tuple[int, int]], dict[str, object]]:
-        by_layer = self._load_uvm_oracle_expert_trace()
-        records = by_layer.get(self.layer_name, [])
-        position = self._uvm_oracle_layer_positions.get(self.layer_name, 0)
-        self._uvm_oracle_layer_positions[self.layer_name] = position + 1
-        target_position = position + self.uvm_oracle_prefetch_lookahead_steps
-        actual_experts = {global_expert_id for global_expert_id, _ in actual_pairs}
-        expected_experts = records[position] if position < len(records) else None
-        future_experts = (
-            records[target_position] if target_position < len(records) else set()
-        )
-        oracle_pairs: list[tuple[int, int]] = []
-        for global_expert_id in sorted(future_experts):
-            local_expert_id = self._uvm_global_to_local_expert(global_expert_id)
-            if 0 <= local_expert_id < int(self.local_num_experts):
-                oracle_pairs.append((global_expert_id, local_expert_id))
-        match = expected_experts is not None and actual_experts == expected_experts
-        stats = {
-            "oracle_replay_records": 1,
-            "oracle_trace_file": self.uvm_oracle_expert_trace_file,
-            "oracle_layer_position": position,
-            "oracle_target_position": target_position,
-            "oracle_prefetch_lookahead_steps": (
-                self.uvm_oracle_prefetch_lookahead_steps
-            ),
-            "oracle_trace_missing_records": 0 if expected_experts is not None else 1,
-            "oracle_match_records": 1 if match else 0,
-            "oracle_mismatch_records": (
-                1 if expected_experts is not None and not match else 0
-            ),
-            "oracle_future_missing_records": (
-                0 if target_position < len(records) else 1
-            ),
-            "oracle_expected_experts": (
-                sorted(expected_experts) if expected_experts is not None else []
-            ),
-            "oracle_actual_experts": sorted(actual_experts),
-            "oracle_future_experts": sorted(future_experts),
-            "oracle_candidate_expert_records": len(oracle_pairs),
-        }
-        return oracle_pairs, stats
-
     def _refresh_uvm_weight_action_plans(self) -> None:
         rebuilt_reserved_offload_mask = False
         if (
@@ -3325,12 +3114,6 @@ class FusedMoE(CustomOp):
             self.uvm_weight_prefetch_plan_keys = _parse_plan_expert_keys(
                 self.uvm_weight_prefetch_plan_file,
                 "prefetch_plan",
-            )
-            self.uvm_weight_prefetch_plan_mask_by_layer = (
-                _build_plan_expert_bitmask(
-                    self.uvm_weight_prefetch_plan_keys,
-                    self._uvm_plan_expert_bitmask_width,
-                )
             )
             self._uvm_weight_prefetch_plan_loaded = True
         if (
@@ -3475,7 +3258,7 @@ class FusedMoE(CustomOp):
         base = int(tensor.data_ptr())
         return base, base + total_bytes
 
-    def _uvm_build_2mb_envelope_records(
+    def _uvm_build_expert_chunk_envelope_records(
         self,
         *,
         source_region_id: str,
@@ -3588,7 +3371,7 @@ class FusedMoE(CustomOp):
             }
             existing = get_uvm_residency_region_snapshot(envelope_id)
             if existing is not None and bool(existing.get("driver_registered")):
-                # The 2MiB envelope has a stable driver identity across
+                # The chunk envelope has a stable driver identity across
                 # Stage-M release and runtime restore. Keep that registration
                 # instead of forcing a CPU_OFFLOADED_RESERVED re-register that
                 # can collide with the same VA range in the driver tree.
@@ -3631,27 +3414,6 @@ class FusedMoE(CustomOp):
     ) -> tuple[str, int]:
         layer_label = self.layer_name if layer_id is None else str(layer_id)
         return (layer_label, int(global_expert_id))
-
-    def _uvm_record_recent_active_expert(
-        self,
-        layer_id: int | None,
-        global_expert_id: int,
-    ) -> None:
-        self._uvm_weight_recent_active_expert_steps[
-            self._uvm_weight_expert_cache_key(layer_id, global_expert_id)
-        ] = self._uvm_moe_trace_step
-
-    def _uvm_weight_expert_cached_gpu(
-        self,
-        layer_id: int | None,
-        global_expert_id: int,
-    ) -> bool:
-        if not self.uvm_weight_prefetch_expert_cache_enabled:
-            return False
-        return (
-            self._uvm_weight_expert_cache_key(layer_id, global_expert_id)
-            in self._uvm_weight_full_gpu_experts
-        )
 
     def _uvm_update_weight_expert_role_cache(
         self,
@@ -3777,7 +3539,7 @@ class FusedMoE(CustomOp):
             },
         )
 
-    def _uvm_expand_reserved_items_to_2mb_envelopes(
+    def _uvm_expand_reserved_items_to_chunk_envelopes(
         self,
         items: list[ReservedRegionItem],
     ) -> tuple[list[ReservedRegionItem], dict[str, list[str]]]:
@@ -3788,7 +3550,7 @@ class FusedMoE(CustomOp):
         envelope_ids_by_logical: dict[str, list[str]] = {}
         seen_envelopes: set[str] = set()
         for item in items:
-            envelope_records = self._uvm_build_2mb_envelope_records(
+            envelope_records = self._uvm_build_expert_chunk_envelope_records(
                 source_region_id=item.region_id,
                 layer_id=item.layer_id,
                 global_expert_id=item.global_expert_id,
@@ -3925,7 +3687,7 @@ class FusedMoE(CustomOp):
             reserved_items.append(region_item)
 
         executor_items, envelope_ids_by_logical = (
-            self._uvm_expand_reserved_items_to_2mb_envelopes(reserved_items)
+            self._uvm_expand_reserved_items_to_chunk_envelopes(reserved_items)
         )
 
         executor = get_expert_reserved_regions_executor(
@@ -4133,7 +3895,7 @@ class FusedMoE(CustomOp):
                             self.uvm_expert_reserved_cleanup_delay_steps
                         ),
                         "mode": "reserved_cleanup",
-                        "prefetch_source": self.uvm_weight_prefetch_source,
+                        "prefetch_source": "reserved_fast_gate",
                         "action": "reserved_layer_done_cleanup",
                         "executor": "expert_reserved_regions_async",
                         "success": bool(result.get("ok")),
@@ -4169,10 +3931,6 @@ class FusedMoE(CustomOp):
             ),
         }
 
-    def _uvm_weight_region_is_estimated_gpu(self, region_id: str) -> bool:
-        snapshot = get_uvm_residency_region_snapshot(region_id)
-        return bool(snapshot and snapshot.get("estimated_gpu_resident"))
-
     def _record_uvm_weight_prefetch_issue(
         self,
         *,
@@ -4198,7 +3956,7 @@ class FusedMoE(CustomOp):
             "bytes": size_bytes,
             "device": device,
             "executor": executor or self.uvm_weight_executor,
-            "prefetch_source": self.uvm_weight_prefetch_source,
+            "prefetch_source": "reserved_fast_gate",
         }
 
     def _probe_uvm_weight_prefetch_hit_before_access(
@@ -4378,28 +4136,13 @@ class FusedMoE(CustomOp):
                     "layer_name": self.layer_name,
                     "step": self._uvm_moe_trace_step,
                     "mode": self.uvm_weight_prefetch_mode,
-                    "prefetch_source": self.uvm_weight_prefetch_source,
+                    "prefetch_source": "reserved_fast_gate",
                     "action": "prefetch_hit_before_access_probe",
                     **stats,
                     "sample_records": sample_records,
                 }
             )
         return stats
-
-    def _execute_uvm_weight_cpu_offload(
-        self,
-        *,
-        ptr: int,
-        size_bytes: int,
-        mode: str,
-        sync: bool,
-    ) -> bool:
-        if mode == "advise_cpu":
-            return advise_range_preferred_location(ptr, size_bytes, -1)
-        # prefetch_cpu historically meant "move to CPU"; for weight budget
-        # enforcement it must also set preferred location to prevent immediate
-        # drift back into the GPU working set.
-        return offload_range_to_cpu(ptr, size_bytes, sync=sync)
 
     def _uvm_hot_residency_query_device(self) -> int:
         device = self.uvm_hot_residency_stage_device
@@ -4630,481 +4373,6 @@ class FusedMoE(CustomOp):
 
         self._append_uvm_init_weight_trace(summary)
         return summary
-
-    def _register_uvm_residency_cold_weight_candidates(
-        self,
-        *,
-        layer_id: int | None,
-        active_global_experts: set[int],
-        active_region_ids: set[str],
-    ) -> int:
-        if layer_id is None or not self.uvm_weight_offload_plan_keys:
-            return 0
-        registered_records = 0
-        try:
-            expert_pairs = [
-                (global_expert_id, local_expert_id)
-                for global_expert_id, local_expert_id in self._uvm_plan_local_experts(
-                    self.uvm_weight_offload_plan_keys
-                )
-                if global_expert_id not in active_global_experts
-            ]
-            if self.uvm_weight_offload_max_experts_per_layer > 0:
-                expert_pairs = expert_pairs[
-                    : self.uvm_weight_offload_max_experts_per_layer
-                ]
-            for global_expert_id, local_expert_id in expert_pairs:
-                for role, ptr, size_bytes in self._uvm_expert_weight_slices(
-                    local_expert_id,
-                    self.uvm_weight_offload_target_roles,
-                ):
-                    region_id = self._uvm_expert_weight_region_id(
-                        layer_id,
-                        global_expert_id,
-                        role,
-                    )
-                    if region_id in active_region_ids:
-                        continue
-                    metadata = self._uvm_expert_weight_residency_metadata(
-                        layer_id=layer_id,
-                        global_expert_id=global_expert_id,
-                        local_expert_id=local_expert_id,
-                        role=role,
-                        ptr=ptr,
-                        size_bytes=size_bytes,
-                        active_this_step=False,
-                        source_action="l2_cold_candidate",
-                    )
-                    if self.uvm_expert_envelope_enable:
-                        metadata = {
-                            **metadata,
-                            "driver_tag_skip": True,
-                            "driver_tag_skip_reason": (
-                                self._uvm_expert_envelope_skip_reason()
-                            ),
-                        }
-                    existing_region = get_uvm_residency_region_snapshot(region_id)
-                    registered_region = register_uvm_residency_region(
-                        pool="weights",
-                        region_id=region_id,
-                        ptr=ptr,
-                        bytes=size_bytes,
-                        state=(
-                            str(existing_region.get("state"))
-                            if existing_region is not None
-                            else "gpu"
-                        ),
-                        evictable=True,
-                        active=False,
-                        metadata=metadata,
-                    )
-                    registered_records += 1
-        except Exception:
-            logger.debug("Failed to register Stage L2 cold candidates", exc_info=True)
-        return registered_records
-
-    def _offload_uvm_residency_weight_victims(
-        self,
-        *,
-        victims: tuple[str, ...],
-        active_region_ids: set[str],
-        reason_region_id: str,
-        scope_key: str,
-    ) -> int:
-        if not victims:
-            return 0
-        max_victims = self.uvm_residency_weight_max_victims_per_step
-        selected_victims = list(victims)
-        if max_victims > 0:
-            selected_victims = selected_victims[:max_victims]
-
-        issued = 0
-        for victim_region_id in selected_victims:
-            if victim_region_id in active_region_ids:
-                record_uvm_residency_action(
-                    action="residency_weight_victim_skip_active",
-                    pool="weights",
-                    region_id=victim_region_id,
-                    metadata={
-                        "stage": "stage_l2",
-                        "reason_region_id": reason_region_id,
-                        "scope_key": scope_key,
-                    },
-                )
-                continue
-            snapshot = get_uvm_residency_region_snapshot(victim_region_id)
-            if not snapshot:
-                continue
-            snapshot_metadata = snapshot.get("metadata")
-            if not isinstance(snapshot_metadata, dict):
-                snapshot_metadata = {}
-            if (
-                snapshot.get("active") is True
-                or snapshot_metadata.get("active_this_step") is True
-            ):
-                record_uvm_residency_action(
-                    action="residency_weight_victim_skip_active",
-                    pool="weights",
-                    region_id=victim_region_id,
-                    bytes=int(snapshot.get("bytes") or 0),
-                    metadata={
-                        "stage": "stage_l2",
-                        "reason_region_id": reason_region_id,
-                        "scope_key": scope_key,
-                        "snapshot_active": snapshot.get("active") is True,
-                        "snapshot_active_this_step": (
-                            snapshot_metadata.get("active_this_step") is True
-                        ),
-                    },
-                )
-                continue
-            last_access_step = snapshot.get("last_access_step")
-            recent_step = self._uvm_weight_recent_active_region_steps.get(
-                victim_region_id
-            )
-            if isinstance(recent_step, int) and (
-                not isinstance(last_access_step, int)
-                or recent_step > last_access_step
-            ):
-                last_access_step = recent_step
-            if (
-                self.uvm_residency_weight_evict_protect_recent_steps > 0
-                and isinstance(last_access_step, int)
-                and self._uvm_moe_trace_step - last_access_step
-                <= self.uvm_residency_weight_evict_protect_recent_steps
-            ):
-                record_uvm_residency_action(
-                    action="residency_weight_victim_skip_recent",
-                    pool="weights",
-                    region_id=victim_region_id,
-                    bytes=int(snapshot.get("bytes") or 0),
-                    metadata={
-                        "stage": "stage_l2",
-                        "reason_region_id": reason_region_id,
-                        "scope_key": scope_key,
-                        "last_access_step": last_access_step,
-                        "protect_recent_steps": (
-                            self.uvm_residency_weight_evict_protect_recent_steps
-                        ),
-                    },
-                )
-                continue
-            ptr = snapshot.get("ptr")
-            size_bytes = int(snapshot.get("bytes") or 0)
-            if not isinstance(ptr, int) or size_bytes <= 0:
-                record_uvm_residency_action(
-                    action="residency_weight_victim_skip_no_ptr",
-                    pool="weights",
-                    region_id=victim_region_id,
-                    bytes=size_bytes,
-                    metadata={
-                        "stage": "stage_l2",
-                        "reason_region_id": reason_region_id,
-                        "scope_key": scope_key,
-                    },
-                )
-                continue
-
-            success = False
-            success = self._execute_uvm_weight_cpu_offload(
-                ptr=ptr,
-                size_bytes=size_bytes,
-                mode=self.uvm_residency_weight_victim_action,
-                sync=self.uvm_residency_weight_sync_offload,
-            )
-            if success:
-                issued += 1
-                next_state = (
-                    "cpu"
-                    if self.uvm_residency_weight_sync_offload
-                    else "prefetching_cpu"
-                )
-                mark_uvm_residency_state(
-                    region_id=victim_region_id,
-                    state=next_state,
-                    metadata={
-                        "stage": "stage_l2",
-                        "reason_region_id": reason_region_id,
-                        "scope_key": scope_key,
-                        "victim_action": self.uvm_residency_weight_victim_action,
-                        "last_evict_step": self._uvm_moe_trace_step,
-                    },
-                )
-                snapshot_layer_id = snapshot_metadata.get("layer_id")
-                snapshot_global_expert_id = snapshot_metadata.get("global_expert_id")
-                snapshot_role = snapshot_metadata.get("role")
-                if isinstance(snapshot_global_expert_id, int) and isinstance(
-                    snapshot_role, str
-                ):
-                    self._uvm_update_weight_expert_role_cache(
-                        layer_id=(
-                            snapshot_layer_id
-                            if isinstance(snapshot_layer_id, int)
-                            else None
-                        ),
-                        global_expert_id=snapshot_global_expert_id,
-                        role=snapshot_role,
-                        state=next_state,
-                        estimated_gpu_resident=False,
-                    )
-            record_uvm_residency_action(
-                action=(
-                    "residency_weight_victim_offload_issued"
-                    if success
-                    else "residency_weight_victim_offload_failed"
-                ),
-                pool="weights",
-                region_id=victim_region_id,
-                bytes=size_bytes,
-                metadata={
-                    "stage": "stage_l2",
-                    "reason_region_id": reason_region_id,
-                    "scope_key": scope_key,
-                    "victim_action": self.uvm_residency_weight_victim_action,
-                    "sync_offload": self.uvm_residency_weight_sync_offload,
-                },
-                success=success,
-            )
-        return issued
-
-    def _evict_uvm_non_active_expert_weights(
-        self,
-        *,
-        layer_id: int | None,
-        active_global_experts: set[int],
-        active_region_ids: set[str],
-        scope_key: str,
-    ) -> int:
-        if not self.uvm_residency_weight_active_evict_enable:
-            return 0
-        if layer_id is None:
-            return 0
-
-        candidate_pairs = [
-            (global_expert_id, self._uvm_global_to_local_expert(global_expert_id))
-            for global_expert_id in range(int(self.global_num_experts))
-            if global_expert_id not in active_global_experts
-        ]
-        candidate_pairs = [
-            (global_expert_id, local_expert_id)
-            for global_expert_id, local_expert_id in candidate_pairs
-            if 0 <= local_expert_id < int(self.local_num_experts)
-        ]
-        max_experts = self.uvm_residency_weight_active_evict_max_experts_per_layer
-        if max_experts > 0:
-            candidate_pairs = candidate_pairs[:max_experts]
-
-        batch_items: list[dict[str, object]] = []
-        skipped_active = 0
-        skipped_cpu = 0
-        skipped_recent = 0
-        skipped_recent_experts = 0
-        skipped_prefetching = 0
-        for global_expert_id, local_expert_id in candidate_pairs:
-            recent_expert_step = self._uvm_weight_recent_active_expert_steps.get(
-                self._uvm_weight_expert_cache_key(layer_id, global_expert_id)
-            )
-            if (
-                self.uvm_residency_weight_evict_protect_recent_steps > 0
-                and isinstance(recent_expert_step, int)
-                and self._uvm_moe_trace_step - recent_expert_step
-                <= self.uvm_residency_weight_evict_protect_recent_steps
-            ):
-                skipped_recent_experts += 1
-                continue
-            for role, ptr, size_bytes in self._uvm_expert_weight_slices(
-                local_expert_id,
-                self.uvm_weight_offload_target_roles,
-            ):
-                region_id = self._uvm_expert_weight_region_id(
-                    layer_id,
-                    global_expert_id,
-                    role,
-                )
-                if region_id in active_region_ids:
-                    skipped_active += 1
-                    continue
-                snapshot = get_uvm_residency_region_snapshot(region_id)
-                snapshot_state = (
-                    str(snapshot.get("state")) if snapshot is not None else ""
-                )
-                if snapshot_state == "prefetching_gpu":
-                    skipped_prefetching += 1
-                    continue
-                last_access_step = (
-                    snapshot.get("last_access_step")
-                    if snapshot is not None
-                    else None
-                )
-                recent_step = self._uvm_weight_recent_active_region_steps.get(
-                    region_id
-                )
-                if isinstance(recent_step, int) and (
-                    not isinstance(last_access_step, int)
-                    or recent_step > last_access_step
-                ):
-                    last_access_step = recent_step
-                protect_recent_steps = (
-                    self.uvm_residency_weight_evict_protect_recent_steps
-                )
-                if (
-                    protect_recent_steps > 0
-                    and isinstance(last_access_step, int)
-                    and self._uvm_moe_trace_step - last_access_step
-                    <= protect_recent_steps
-                ):
-                    skipped_recent += 1
-                    continue
-                metadata = self._uvm_expert_weight_residency_metadata(
-                    layer_id=layer_id,
-                    global_expert_id=global_expert_id,
-                    local_expert_id=local_expert_id,
-                    role=role,
-                    ptr=ptr,
-                    size_bytes=size_bytes,
-                    active_this_step=False,
-                    source_action="active_set_evict",
-                )
-                register_uvm_residency_region(
-                    pool="weights",
-                    region_id=region_id,
-                    ptr=ptr,
-                    bytes=size_bytes,
-                    state=(
-                        str(snapshot.get("state"))
-                        if snapshot is not None
-                        else self.uvm_residency_weight_initial_state
-                    ),
-                    evictable=True,
-                    active=False,
-                    metadata=metadata,
-                )
-                if self._uvm_weight_region_is_estimated_gpu(region_id) is False:
-                    skipped_cpu += 1
-                    continue
-                batch_items.append(
-                    {
-                        "region_id": region_id,
-                        "ptr": ptr,
-                        "bytes": size_bytes,
-                        "metadata": metadata,
-                    }
-                )
-
-        if not batch_items:
-            record_uvm_residency_action(
-                action="residency_weight_active_evict_noop",
-                pool="weights",
-                metadata={
-                    "stage": "stage_l2_active_evict",
-                    "layer_id": layer_id,
-                    "scope_key": scope_key,
-                    "active_experts": sorted(active_global_experts),
-                    "candidate_experts": len(candidate_pairs),
-                    "skipped_active_records": skipped_active,
-                    "skipped_cpu_records": skipped_cpu,
-                    "skipped_recent_expert_records": skipped_recent_experts,
-                    "skipped_recent_records": skipped_recent,
-                    "skipped_prefetching_records": skipped_prefetching,
-                },
-            )
-            return 0
-
-        ranges = [
-            (int(item["ptr"]), int(item["bytes"]))
-            for item in batch_items
-        ]
-        (
-            batch_successes,
-            executor_used,
-            driver_advise_result,
-            driver_prefetch_result,
-        ) = batch_offload_ranges_to_cpu_with_executor(
-            ranges,
-            sync=self.uvm_residency_weight_sync_offload,
-            executor=self.uvm_weight_executor,
-        )
-
-        issued = 0
-        for batch_index, item in enumerate(batch_items):
-            success = batch_index < batch_successes
-            region_id = str(item["region_id"])
-            if success:
-                issued += 1
-                next_state = (
-                    "cpu"
-                    if self.uvm_residency_weight_sync_offload
-                    else "prefetching_cpu"
-                )
-                mark_uvm_residency_state(
-                    region_id=region_id,
-                    state=next_state,
-                    metadata={
-                        **cast(dict[str, object], item["metadata"]),
-                        "stage": "stage_l2_active_evict",
-                        "scope_key": scope_key,
-                        "executor": executor_used,
-                        "last_evict_step": self._uvm_moe_trace_step,
-                    },
-                )
-                item_metadata = cast(dict[str, object], item["metadata"])
-                self._uvm_update_weight_expert_role_cache(
-                    layer_id=layer_id,
-                    global_expert_id=int(item_metadata["global_expert_id"]),
-                    role=str(item_metadata["role"]),
-                    state=next_state,
-                    estimated_gpu_resident=False,
-                )
-            record_uvm_residency_action(
-                action=(
-                    "residency_weight_active_evict_issued"
-                    if success
-                    else "residency_weight_active_evict_failed"
-                ),
-                pool="weights",
-                region_id=region_id,
-                bytes=int(item["bytes"]),
-                metadata={
-                    **cast(dict[str, object], item["metadata"]),
-                    "stage": "stage_l2_active_evict",
-                    "scope_key": scope_key,
-                    "executor": executor_used,
-                    "requested_executor": self.uvm_weight_executor,
-                    "batch_index": batch_index,
-                    "batch_size": len(batch_items),
-                    "batch_successes": batch_successes,
-                    "driver_advise_result": driver_advise_result,
-                    "driver_prefetch_result": driver_prefetch_result,
-                    "sync_offload": self.uvm_residency_weight_sync_offload,
-                },
-                success=success,
-            )
-
-        self._append_uvm_weight_prefetch_trace(
-            {
-                "timestamp": time.time(),
-                "pid": os.getpid(),
-                "layer_name": self.layer_name,
-                "step": self._uvm_moe_trace_step,
-                "mode": "active_set_evict",
-                "prefetch_source": self.uvm_weight_prefetch_source,
-                "action": "active_set_evict_summary",
-                "active_global_experts": sorted(active_global_experts),
-                "candidate_experts": len(candidate_pairs),
-                "attempted_records": len(batch_items),
-                "issued_records": issued,
-                "executor": executor_used,
-                "requested_executor": self.uvm_weight_executor,
-                "driver_advise_result": driver_advise_result,
-                "driver_prefetch_result": driver_prefetch_result,
-                "skipped_active_records": skipped_active,
-                "skipped_cpu_records": skipped_cpu,
-                "skipped_recent_expert_records": skipped_recent_experts,
-                "skipped_recent_records": skipped_recent,
-                "skipped_prefetching_records": skipped_prefetching,
-            }
-        )
-        return issued
 
     def _append_uvm_weight_prefetch_trace(self, record: dict[str, object]) -> None:
         if not self.uvm_weight_prefetch_trace_enabled:
@@ -5865,7 +5133,7 @@ class FusedMoE(CustomOp):
                 "layer_name": self.layer_name,
                 "step": self._uvm_moe_trace_step,
                 "mode": "reserved_debug",
-                "prefetch_source": self.uvm_weight_prefetch_source,
+                "prefetch_source": "reserved_fast_gate",
                 "executor": "expert_reserved_regions_async",
                 "action": action,
                 **fields,
@@ -6008,8 +5276,172 @@ class FusedMoE(CustomOp):
         except OSError:
             logger.debug("Failed to write Stage M weight offload trace", exc_info=True)
 
+    def _register_uvm_init_all_local_weight_regions(
+        self,
+        layer_id: int,
+    ) -> dict[str, object]:
+        if not self.uvm_init_weight_register_all_local_experts:
+            return {
+                "all_local_preregister_enabled": False,
+                "all_local_experts": 0,
+                "all_local_registered_records": 0,
+            }
+
+        expert_pairs = self._uvm_all_local_expert_pairs()
+        reserved_quota_global_ids = self._uvm_init_weight_reserved_quota_global_ids(
+            layer_id,
+            expert_pairs,
+        )
+        expert_class_by_global = {
+            global_expert_id: self._uvm_init_weight_expert_class(
+                layer_id=layer_id,
+                global_expert_id=global_expert_id,
+                reserved_quota_global_ids=reserved_quota_global_ids,
+            )
+            for global_expert_id, _ in expert_pairs
+        }
+        expert_counts = {
+            "hot": 0,
+            "cold_reserved": 0,
+            "cold_regular": 0,
+        }
+        for expert_class in expert_class_by_global.values():
+            expert_counts[expert_class] = expert_counts.get(expert_class, 0) + 1
+
+        registered_records = 0
+        registered_bytes = 0
+        records_by_class = {
+            "hot": 0,
+            "cold_reserved": 0,
+            "cold_regular": 0,
+        }
+        bytes_by_class = {
+            "hot": 0,
+            "cold_reserved": 0,
+            "cold_regular": 0,
+        }
+        for global_expert_id, local_expert_id in expert_pairs:
+            expert_class = expert_class_by_global[global_expert_id]
+            logical_driver_tag_skip = bool(
+                expert_class != "hot"
+                and self.uvm_expert_envelope_enable
+                and self.uvm_init_weight_offload_mode
+                in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+            )
+            for role, ptr, size_bytes in self._uvm_expert_weight_slices(
+                local_expert_id,
+                self.uvm_init_weight_offload_target_roles,
+            ):
+                region_id = self._uvm_expert_weight_region_id(
+                    layer_id,
+                    global_expert_id,
+                    role,
+                )
+                base_metadata = self._uvm_expert_weight_residency_metadata(
+                    layer_id=layer_id,
+                    global_expert_id=global_expert_id,
+                    local_expert_id=local_expert_id,
+                    role=role,
+                    ptr=ptr,
+                    size_bytes=size_bytes,
+                    active_this_step=False,
+                    source_action="stage_m_all_local_preregister",
+                )
+                metadata = self._uvm_init_weight_class_metadata(
+                    metadata=base_metadata,
+                    expert_class=expert_class,
+                    driver_tag_skip=logical_driver_tag_skip,
+                    cpu_offload_placement=(
+                        self.uvm_init_weight_offload_enable
+                        and self.uvm_init_weight_offload_mode != "trace_only"
+                    ),
+                )
+                existing_region = get_uvm_residency_region_snapshot(region_id)
+                state = (
+                    str(existing_region.get("state"))
+                    if existing_region is not None
+                    else "gpu"
+                )
+                register_uvm_residency_region(
+                    pool="weights",
+                    region_id=region_id,
+                    ptr=ptr,
+                    bytes=size_bytes,
+                    state=state,
+                    evictable=expert_class != "hot",
+                    active=False,
+                    metadata=metadata,
+                )
+                self._uvm_update_weight_expert_role_cache(
+                    layer_id=layer_id,
+                    global_expert_id=global_expert_id,
+                    role=role,
+                    state="gpu" if expert_class == "hot" else state,
+                    estimated_gpu_resident=(expert_class == "hot"),
+                )
+                registered_records += 1
+                registered_bytes += size_bytes
+                records_by_class[expert_class] = (
+                    records_by_class.get(expert_class, 0) + 1
+                )
+                bytes_by_class[expert_class] = (
+                    bytes_by_class.get(expert_class, 0) + size_bytes
+                )
+
+        stats: dict[str, object] = {
+            "all_local_preregister_enabled": True,
+            "all_local_experts": len(expert_pairs),
+            "all_local_registered_records": registered_records,
+            "all_local_registered_bytes": registered_bytes,
+            "all_local_hot_experts": expert_counts.get("hot", 0),
+            "all_local_cold_reserved_experts": expert_counts.get(
+                "cold_reserved", 0
+            ),
+            "all_local_cold_regular_experts": expert_counts.get(
+                "cold_regular", 0
+            ),
+            "all_local_hot_records": records_by_class.get("hot", 0),
+            "all_local_cold_reserved_records": records_by_class.get(
+                "cold_reserved", 0
+            ),
+            "all_local_cold_regular_records": records_by_class.get(
+                "cold_regular", 0
+            ),
+            "all_local_hot_bytes": bytes_by_class.get("hot", 0),
+            "all_local_cold_reserved_bytes": bytes_by_class.get(
+                "cold_reserved", 0
+            ),
+            "all_local_cold_regular_bytes": bytes_by_class.get(
+                "cold_regular", 0
+            ),
+            "all_local_reserved_quota_global_ids": sorted(reserved_quota_global_ids),
+            "complete_expert_plan": self.uvm_init_weight_complete_expert_plan,
+            "complete_plan_ignore_limits": (
+                self.uvm_init_weight_complete_plan_ignore_limits
+            ),
+        }
+        if registered_records:
+            self._append_uvm_init_weight_trace(
+                {
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "layer_name": self.layer_name,
+                    "layer_id": layer_id,
+                    "action": "init_weight_all_local_preregister_summary",
+                    **stats,
+                    "plan_policy": self.uvm_init_weight_plan_policy,
+                }
+            )
+        return stats
+
     def _register_uvm_init_hot_weight_regions(self, layer_id: int) -> dict[str, object]:
         """Register routing-plan hot experts as GPU/protected before offload."""
+        prefetch_device = self.uvm_init_weight_hot_prefetch_device
+        if prefetch_device < 0:
+            try:
+                prefetch_device = int(torch.cuda.current_device())
+            except Exception:
+                prefetch_device = 0
         hot_pairs = self._uvm_plan_local_experts(self.uvm_init_weight_hot_plan_keys)
         registered_records = 0
         prefetch_items: list[dict[str, object]] = []
@@ -6057,7 +5489,11 @@ class FusedMoE(CustomOp):
                     ),
                     "pool_class": "hot",
                     "driver_subpool": "hot",
+                    "expert_init_class": "hot",
+                    "placement": "GPU_RESIDENT",
+                    "target_placement": "GPU_RESIDENT",
                     "init_hot": True,
+                    "init_cold": False,
                     "protected": True,
                     "pinned": True,
                     "prefetchable": True,
@@ -6126,7 +5562,7 @@ class FusedMoE(CustomOp):
                         "local_expert_id": local_expert_id,
                         "ptr": ptr,
                         "bytes": size_bytes,
-                        "device": self.uvm_init_weight_hot_prefetch_device,
+                        "device": prefetch_device,
                         "sync_prefetch": self.uvm_init_weight_hot_prefetch_sync,
                         "plan_policy": self.uvm_init_weight_plan_policy,
                         "residency_metadata": hot_metadata,
@@ -6153,7 +5589,7 @@ class FusedMoE(CustomOp):
                 driver_result,
             ) = batch_prefetch_ranges_to_device_with_executor(
                 ranges,
-                self.uvm_init_weight_hot_prefetch_device,
+                prefetch_device,
                 executor=self.uvm_weight_executor,
             )
             if self.uvm_init_weight_hot_prefetch_sync and batch_successes > 0:
@@ -6169,12 +5605,7 @@ class FusedMoE(CustomOp):
                 and batch_successes > 0
             ):
                 successful_ranges = ranges[:batch_successes]
-                query_device = self.uvm_init_weight_hot_prefetch_device
-                if query_device < 0:
-                    try:
-                        query_device = torch.cuda.current_device()
-                    except Exception:
-                        query_device = 0
+                query_device = prefetch_device
                 try:
                     real_result = driver_batch_query_ranges_residency_bytes(
                         successful_ranges,
@@ -6242,7 +5673,11 @@ class FusedMoE(CustomOp):
                             "stage": "stage_m",
                             "pool_class": "hot",
                             "driver_subpool": "hot",
+                            "expert_init_class": "hot",
+                            "placement": "GPU_RESIDENT",
+                            "target_placement": "GPU_RESIDENT",
                             "init_hot": True,
+                            "init_cold": False,
                             "protected": True,
                             "pinned": True,
                             "prefetchable": True,
@@ -6308,6 +5743,7 @@ class FusedMoE(CustomOp):
         if not (
             self.uvm_init_weight_offload_enable
             or self.uvm_init_weight_hot_prefetch_enable
+            or self.uvm_init_weight_register_all_local_experts
         ):
             return
         if self._uvm_init_weight_offload_done:
@@ -6348,9 +5784,16 @@ class FusedMoE(CustomOp):
                     "action": "init_weight_offload_no_plan",
                     "mode": self.uvm_init_weight_offload_mode,
                     "plan_file": self.uvm_init_weight_offload_plan_file,
+                    "register_all_local_experts": (
+                        self.uvm_init_weight_register_all_local_experts
+                    ),
+                    "complete_expert_plan": (
+                        self.uvm_init_weight_complete_expert_plan
+                    ),
                 }
             )
-            return
+            if not self.uvm_init_weight_register_all_local_experts:
+                return
 
         try:
             layer_id = self._uvm_layer_id()
@@ -6359,15 +5802,52 @@ class FusedMoE(CustomOp):
             self._record_uvm_moe_address_map(
                 marker="stage_m_init_offload_begin",
             )
+            preregister_stats = self._register_uvm_init_all_local_weight_regions(
+                layer_id
+            )
             hot_stats = self._register_uvm_init_hot_weight_regions(
                 layer_id
             )
+            all_local_pairs = self._uvm_all_local_expert_pairs()
+            reserved_quota_global_ids = (
+                self._uvm_init_weight_reserved_quota_global_ids(
+                    layer_id,
+                    all_local_pairs,
+                )
+            )
             expert_pairs: list[tuple[int, int]] = []
             if self.uvm_init_weight_offload_enable:
-                expert_pairs = self._uvm_plan_local_experts(
-                    self.uvm_init_weight_offload_plan_keys
-                )
-                if self.uvm_init_weight_offload_max_experts_per_layer > 0:
+                if self.uvm_init_weight_complete_expert_plan:
+                    expert_pairs = [
+                        (global_expert_id, local_expert_id)
+                        for global_expert_id, local_expert_id in all_local_pairs
+                        if self._uvm_init_weight_expert_class(
+                            layer_id=layer_id,
+                            global_expert_id=global_expert_id,
+                            reserved_quota_global_ids=reserved_quota_global_ids,
+                        )
+                        != "hot"
+                    ]
+                else:
+                    expert_pairs = [
+                        (global_expert_id, local_expert_id)
+                        for global_expert_id, local_expert_id in (
+                            self._uvm_plan_local_experts(
+                                self.uvm_init_weight_offload_plan_keys
+                            )
+                        )
+                        if not self._uvm_init_weight_expert_is_hot(
+                            layer_id,
+                            global_expert_id,
+                        )
+                    ]
+                if (
+                    self.uvm_init_weight_offload_max_experts_per_layer > 0
+                    and not (
+                        self.uvm_init_weight_complete_expert_plan
+                        and self.uvm_init_weight_complete_plan_ignore_limits
+                    )
+                ):
                     expert_pairs = expert_pairs[
                         : self.uvm_init_weight_offload_max_experts_per_layer
                     ]
@@ -6397,6 +5877,24 @@ class FusedMoE(CustomOp):
                         active_this_step=False,
                         source_action="stage_m_init_offload",
                     )
+                    expert_class = self._uvm_init_weight_expert_class(
+                        layer_id=layer_id,
+                        global_expert_id=global_expert_id,
+                        reserved_quota_global_ids=reserved_quota_global_ids,
+                    )
+                    logical_driver_tag_skip = bool(
+                        self.uvm_expert_envelope_enable
+                        and self.uvm_init_weight_offload_mode
+                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                    )
+                    offload_metadata = self._uvm_init_weight_class_metadata(
+                        metadata=residency_metadata,
+                        expert_class=expert_class,
+                        driver_tag_skip=logical_driver_tag_skip,
+                        cpu_offload_placement=(
+                            self.uvm_init_weight_offload_mode != "trace_only"
+                        ),
+                    )
                     existing_region = get_uvm_residency_region_snapshot(region_id)
                     registered_region = register_uvm_residency_region(
                         pool="weights",
@@ -6410,32 +5908,7 @@ class FusedMoE(CustomOp):
                         ),
                         evictable=True,
                         active=False,
-                        metadata={
-                            **residency_metadata,
-                            "source": "stage_m",
-                            "stage": "stage_m",
-                            "driver_tag_skip": bool(
-                                self.uvm_expert_envelope_enable
-                                and self.uvm_init_weight_offload_mode
-                                in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
-                            ),
-                            "driver_tag_skip_reason": (
-                                self._uvm_expert_envelope_skip_reason()
-                                if (
-                                    self.uvm_expert_envelope_enable
-                                    and self.uvm_init_weight_offload_mode
-                                    in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
-                                )
-                                else None
-                            ),
-                            "pool_class": "cold",
-                            "driver_subpool": "cold",
-                            "init_cold": True,
-                            "protected": False,
-                            "prefetchable": True,
-                            "priority": 10,
-                            "plan_policy": self.uvm_init_weight_plan_policy,
-                        },
+                        metadata=offload_metadata,
                     )
                     driver_region_id = int(
                         getattr(registered_region, "driver_region_id", 0) or 0
@@ -6445,21 +5918,25 @@ class FusedMoE(CustomOp):
                         self.uvm_init_weight_offload_mode
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                     ):
-                        envelope_records = self._uvm_build_2mb_envelope_records(
-                            source_region_id=region_id,
-                            layer_id=layer_id,
-                            global_expert_id=global_expert_id,
-                            local_expert_id=local_expert_id,
-                            role=role,
-                            ptr=ptr,
-                            size_bytes=size_bytes,
-                            metadata=residency_metadata,
-                            state=(
-                                str(existing_region.get("state"))
-                                if existing_region is not None
-                                else "gpu"
-                            ),
-                            source_action="stage_m_driver_release_chunk_envelope",
+                        envelope_records = (
+                            self._uvm_build_expert_chunk_envelope_records(
+                                source_region_id=region_id,
+                                layer_id=layer_id,
+                                global_expert_id=global_expert_id,
+                                local_expert_id=local_expert_id,
+                                role=role,
+                                ptr=ptr,
+                                size_bytes=size_bytes,
+                                metadata=offload_metadata,
+                                state=(
+                                    str(existing_region.get("state"))
+                                    if existing_region is not None
+                                    else "gpu"
+                                ),
+                                source_action=(
+                                    "stage_m_driver_release_chunk_envelope"
+                                ),
+                            )
                         )
                     release_driver_region_ids = [
                         int(record.get("driver_region_id") or 0)
@@ -6470,6 +5947,10 @@ class FusedMoE(CustomOp):
                     attempted_bytes += size_bytes
                     if (
                         self.uvm_init_weight_offload_max_bytes > 0
+                        and not (
+                            self.uvm_init_weight_complete_expert_plan
+                            and self.uvm_init_weight_complete_plan_ignore_limits
+                        )
                         and issued_bytes + size_bytes
                         > self.uvm_init_weight_offload_max_bytes
                     ):
@@ -6500,6 +5981,7 @@ class FusedMoE(CustomOp):
                                 ],
                                 "global_expert_id": global_expert_id,
                                 "local_expert_id": local_expert_id,
+                                "expert_init_class": expert_class,
                                 "ptr": f"0x{ptr:x}",
                                 "bytes": size_bytes,
                                 **self._uvm_driver_capability_trace_fields(
@@ -6514,12 +5996,7 @@ class FusedMoE(CustomOp):
                     if (
                         self.uvm_weight_batch_executor_enable
                         and self.uvm_init_weight_offload_mode
-                        in (
-                            "advise_cpu",
-                            "prefetch_cpu",
-                            "offload_cpu",
-                            *_UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES,
-                        )
+                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                     ):
                         issued_records += 1
                         issued_bytes += size_bytes
@@ -6556,7 +6033,8 @@ class FusedMoE(CustomOp):
                                 "device": -1,
                                 "sync_offload": self.uvm_init_weight_offload_sync,
                                 "plan_policy": self.uvm_init_weight_plan_policy,
-                                "residency_metadata": residency_metadata,
+                                "expert_init_class": expert_class,
+                                "residency_metadata": offload_metadata,
                             }
                         )
                         continue
@@ -6567,34 +6045,7 @@ class FusedMoE(CustomOp):
                     prefetch_success = False
                     driver_release_success = False
                     driver_release_result: dict[str, object] | None = None
-                    if self.uvm_init_weight_offload_mode == "advise_cpu":
-                        success = advise_range_preferred_location(ptr, size_bytes, -1)
-                        action = (
-                            "init_weight_offload_advise_cpu_issued"
-                            if success
-                            else "init_weight_offload_skipped"
-                        )
-                    elif self.uvm_init_weight_offload_mode in (
-                        "prefetch_cpu",
-                        "offload_cpu",
-                    ):
-                        success = offload_range_to_cpu(
-                            ptr,
-                            size_bytes,
-                            sync=self.uvm_init_weight_offload_sync,
-                        )
-                        advise_success = success
-                        prefetch_success = success
-                        if success:
-                            action = (
-                                "init_weight_offload_offload_cpu_issued"
-                                if self.uvm_init_weight_offload_mode
-                                == "offload_cpu"
-                                else "init_weight_offload_prefetch_cpu_issued"
-                            )
-                        else:
-                            action = "init_weight_offload_skipped"
-                    elif (
+                    if (
                         self.uvm_init_weight_offload_mode
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                     ):
@@ -6646,16 +6097,7 @@ class FusedMoE(CustomOp):
                             region_id=region_id,
                             state=next_state,
                             metadata={
-                                **residency_metadata,
-                                "source": "stage_m",
-                                "stage": "stage_m",
-                                "pool_class": "cold",
-                                "driver_subpool": "cold",
-                                "init_cold": True,
-                                "protected": False,
-                                "prefetchable": True,
-                                "priority": 10,
-                                "plan_policy": self.uvm_init_weight_plan_policy,
+                                **offload_metadata,
                                 "sync_offload": self.uvm_init_weight_offload_sync,
                                 "driver_release": driver_release_success,
                             },
@@ -6695,6 +6137,7 @@ class FusedMoE(CustomOp):
                             ],
                             "global_expert_id": global_expert_id,
                             "local_expert_id": local_expert_id,
+                            "expert_init_class": expert_class,
                             "ptr": f"0x{ptr:x}",
                             "bytes": size_bytes,
                             **self._uvm_driver_capability_trace_fields(
@@ -6728,18 +6171,9 @@ class FusedMoE(CustomOp):
                 driver_release_result: dict[str, object] | None = None
                 driver_release_summary: dict[str, object] | None = None
                 driver_release_entries_by_region: dict[int, dict[str, object]] = {}
-                if self.uvm_init_weight_offload_mode == "advise_cpu":
-                    (
-                        batch_successes,
-                        executor_used,
-                        driver_result,
-                    ) = batch_advise_ranges_cpu_with_executor(
-                        ranges,
-                        executor=self.uvm_weight_executor,
-                    )
-                    driver_advise_result = driver_result
-                    driver_prefetch_result = 0
-                elif (
+                driver_advise_result = 0
+                driver_prefetch_result = 0
+                if (
                     self.uvm_init_weight_offload_mode
                     in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                 ):
@@ -6788,19 +6222,9 @@ class FusedMoE(CustomOp):
                         driver_release_result.get("success_count") or 0
                     )
                     executor_used = "driver_offload_release"
-                    driver_advise_result = 0
-                    driver_prefetch_result = 0
                 else:
-                    (
-                        batch_successes,
-                        executor_used,
-                        driver_advise_result,
-                        driver_prefetch_result,
-                    ) = batch_offload_ranges_to_cpu_with_executor(
-                        ranges,
-                        sync=self.uvm_init_weight_offload_sync,
-                        executor=self.uvm_weight_executor,
-                    )
+                    batch_successes = 0
+                    executor_used = "unsupported_init_weight_offload_mode"
                 for batch_index, item in enumerate(batch_items):
                     driver_release_entry: dict[str, object] | None = None
                     if (
@@ -6839,15 +6263,7 @@ class FusedMoE(CustomOp):
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                         else False
                     )
-                    if self.uvm_init_weight_offload_mode == "advise_cpu":
-                        action = (
-                            "init_weight_offload_advise_cpu_issued"
-                            if success
-                            else "init_weight_offload_skipped"
-                        )
-                        advise_success = success
-                        prefetch_success = False
-                    elif (
+                    if (
                         self.uvm_init_weight_offload_mode
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                     ):
@@ -6859,15 +6275,9 @@ class FusedMoE(CustomOp):
                         advise_success = False
                         prefetch_success = False
                     else:
-                        action = (
-                            "init_weight_offload_offload_cpu_issued"
-                            if self.uvm_init_weight_offload_mode == "offload_cpu"
-                            else "init_weight_offload_prefetch_cpu_issued"
-                        )
-                        if not success:
-                            action = "init_weight_offload_skipped"
-                        advise_success = success
-                        prefetch_success = success
+                        action = "init_weight_offload_skipped"
+                        advise_success = False
+                        prefetch_success = False
                     if success:
                         next_state = (
                             "cpu"
@@ -6879,15 +6289,6 @@ class FusedMoE(CustomOp):
                             state=next_state,
                             metadata={
                                 **cast(dict[str, object], item["residency_metadata"]),
-                                "source": "stage_m",
-                                "stage": "stage_m",
-                                "pool_class": "cold",
-                                "driver_subpool": "cold",
-                                "init_cold": True,
-                                "protected": False,
-                                "prefetchable": True,
-                                "priority": 10,
-                                "plan_policy": self.uvm_init_weight_plan_policy,
                                 "sync_offload": self.uvm_init_weight_offload_sync,
                                 "executor": executor_used,
                                 "driver_release": driver_release_success,
@@ -6930,6 +6331,7 @@ class FusedMoE(CustomOp):
                 or rejected_records
                 or hot_stats.get("hot_registered_records")
                 or hot_stats.get("hot_prefetch_candidate_records")
+                or preregister_stats.get("all_local_registered_records")
             ):
                 stage_stats: dict[str, int | float] = {}
                 if self.uvm_hot_residency_stage_trace_enable:
@@ -6947,7 +6349,16 @@ class FusedMoE(CustomOp):
                             global_expert_id
                             for global_expert_id, _ in expert_pairs
                         ],
+                        "planned_expert_classes": {
+                            str(global_expert_id): self._uvm_init_weight_expert_class(
+                                layer_id=layer_id,
+                                global_expert_id=global_expert_id,
+                                reserved_quota_global_ids=reserved_quota_global_ids,
+                            )
+                            for global_expert_id, _ in expert_pairs
+                        },
                         "hot_plan_records": len(self.uvm_init_weight_hot_plan_keys),
+                        **preregister_stats,
                         **hot_stats,
                         **{
                             f"after_cold_offload_{key}": value
@@ -6961,6 +6372,12 @@ class FusedMoE(CustomOp):
                         "max_bytes": self.uvm_init_weight_offload_max_bytes,
                         "max_experts_per_layer": (
                             self.uvm_init_weight_offload_max_experts_per_layer
+                        ),
+                        "complete_expert_plan": (
+                            self.uvm_init_weight_complete_expert_plan
+                        ),
+                        "complete_plan_ignore_limits": (
+                            self.uvm_init_weight_complete_plan_ignore_limits
                         ),
                     }
                 )
@@ -6983,1622 +6400,7 @@ class FusedMoE(CustomOp):
             except Exception:
                 logger.debug("Failed to write Stage M exception trace", exc_info=True)
 
-    def _append_uvm_cold_streaming_trace(self, record: dict[str, object]) -> None:
-        if not self.uvm_cold_streaming_enable:
-            return
-        try:
-            trace_dir = os.path.dirname(self.uvm_cold_streaming_trace_file)
-            if trace_dir:
-                os.makedirs(trace_dir, exist_ok=True)
-            with open(
-                self.uvm_cold_streaming_trace_file,
-                "a",
-                encoding="utf-8",
-            ) as handle:
-                handle.write(json.dumps(record, sort_keys=True) + "\n")
-        except OSError:
-            logger.debug("Failed to write UVM cold streaming trace", exc_info=True)
-
-    def _append_uvm_cold_slot_pool_trace(self, record: dict[str, object]) -> None:
-        if not self.uvm_cold_slot_pool_enable:
-            return
-        try:
-            trace_dir = os.path.dirname(self.uvm_cold_slot_pool_trace_file)
-            if trace_dir:
-                os.makedirs(trace_dir, exist_ok=True)
-            with open(
-                self.uvm_cold_slot_pool_trace_file,
-                "a",
-                encoding="utf-8",
-            ) as handle:
-                handle.write(json.dumps(record, sort_keys=True) + "\n")
-        except OSError:
-            logger.debug("Failed to write UVM cold slot pool trace", exc_info=True)
-
-    def _uvm_cold_slot_pool_allocate_batch(
-        self,
-        *,
-        layer_id: int,
-        active_cold_expert_ids: list[int],
-        step: int,
-    ) -> dict[str, object]:
-        start_ns = time.perf_counter_ns()
-        capacity = self.uvm_cold_slot_pool_slots_per_layer
-        active_ids: list[int] = []
-        seen_active: set[int] = set()
-        for expert_id in active_cold_expert_ids:
-            expert_id = int(expert_id)
-            if expert_id in seen_active:
-                continue
-            seen_active.add(expert_id)
-            active_ids.append(expert_id)
-
-        with _UVM_COLD_SLOT_POOL_LOCK:
-            layer_state = _UVM_COLD_SLOT_POOL_LAYERS.get(layer_id)
-            if (
-                layer_state is None
-                or int(layer_state.get("capacity", -1)) != capacity
-            ):
-                slots = [
-                    {
-                        "slot_id": slot_id,
-                        "owner_layer": None,
-                        "owner_expert": None,
-                        "state": "FREE",
-                        "epoch": 0,
-                        "last_access_step": -1,
-                        "ready_event_step": -1,
-                        "release_event_step": step,
-                    }
-                    for slot_id in range(capacity)
-                ]
-                layer_state = {
-                    "capacity": capacity,
-                    "free_cursor": 0,
-                    "slots": slots,
-                    "expert_to_slot": {},
-                }
-                _UVM_COLD_SLOT_POOL_LAYERS[layer_id] = layer_state
-
-            slots = cast(list[dict[str, object]], layer_state["slots"])
-            expert_to_slot = cast(dict[int, int], layer_state["expert_to_slot"])
-
-            released_slots = 0
-            for slot in slots:
-                if str(slot.get("state") or "FREE") in (
-                    "RESERVED",
-                    "LOADING",
-                    "IN_USE",
-                ):
-                    slot["state"] = "READY"
-                    slot["release_event_step"] = step
-                    released_slots += 1
-
-            slot_hits: list[dict[str, int]] = []
-            missing_expert_ids: list[int] = []
-            protected_slot_ids: set[int] = set()
-            stale_mappings = 0
-            for expert_id in active_ids:
-                raw_slot_id = expert_to_slot.get(expert_id)
-                if raw_slot_id is None:
-                    missing_expert_ids.append(expert_id)
-                    continue
-                try:
-                    slot_id = int(raw_slot_id)
-                except (TypeError, ValueError):
-                    expert_to_slot.pop(expert_id, None)
-                    missing_expert_ids.append(expert_id)
-                    stale_mappings += 1
-                    continue
-                if slot_id < 0 or slot_id >= len(slots):
-                    expert_to_slot.pop(expert_id, None)
-                    missing_expert_ids.append(expert_id)
-                    stale_mappings += 1
-                    continue
-                slot = slots[slot_id]
-                state = str(slot.get("state") or "FREE")
-                owner_expert = slot.get("owner_expert")
-                try:
-                    owner_expert_id = int(owner_expert)
-                except (TypeError, ValueError):
-                    owner_expert_id = -1
-                if (
-                    state in ("READY", "IN_USE")
-                    and owner_expert_id == expert_id
-                ):
-                    slot["state"] = "IN_USE"
-                    slot["last_access_step"] = step
-                    protected_slot_ids.add(slot_id)
-                    slot_hits.append(
-                        {
-                            "expert_id": expert_id,
-                            "slot_id": slot_id,
-                        }
-                    )
-                    continue
-                expert_to_slot.pop(expert_id, None)
-                missing_expert_ids.append(expert_id)
-                stale_mappings += 1
-
-            assignments: list[dict[str, object]] = []
-            overflow_experts: list[int] = []
-            used_slot_ids = set(protected_slot_ids)
-            reusable_probe_count = 0
-            cursor = int(layer_state.get("free_cursor") or 0)
-
-            def choose_slot() -> int | None:
-                nonlocal reusable_probe_count
-                if capacity <= 0:
-                    return None
-                for offset in range(capacity):
-                    slot_id = (cursor + offset) % capacity
-                    reusable_probe_count += 1
-                    if slot_id in used_slot_ids:
-                        continue
-                    state = str(slots[slot_id].get("state") or "FREE")
-                    if state in ("RESERVED", "LOADING", "IN_USE"):
-                        continue
-                    return slot_id
-                return None
-
-            for expert_id in missing_expert_ids:
-                slot_id = choose_slot()
-                if slot_id is None:
-                    overflow_experts.append(expert_id)
-                    continue
-                slot = slots[slot_id]
-                old_owner_expert = slot.get("owner_expert")
-                if old_owner_expert is not None:
-                    try:
-                        old_expert_id = int(old_owner_expert)
-                    except (TypeError, ValueError):
-                        old_expert_id = -1
-                    if expert_to_slot.get(old_expert_id) == slot_id:
-                        expert_to_slot.pop(old_expert_id, None)
-                epoch = int(slot.get("epoch") or 0) + 1
-                slot.update(
-                    {
-                        "owner_layer": layer_id,
-                        "owner_expert": expert_id,
-                        "state": "IN_USE",
-                        "epoch": epoch,
-                        "last_access_step": step,
-                        "ready_event_step": step,
-                        "release_event_step": -1,
-                    }
-                )
-                expert_to_slot[expert_id] = slot_id
-                used_slot_ids.add(slot_id)
-                assignments.append(
-                    {
-                        "expert_id": expert_id,
-                        "slot_id": slot_id,
-                        "old_owner_expert": old_owner_expert,
-                        "epoch": epoch,
-                    }
-                )
-                cursor = (slot_id + 1) % capacity if capacity > 0 else 0
-
-            layer_state["free_cursor"] = cursor
-
-            assignment_slot_ids = [
-                int(assignment["slot_id"]) for assignment in assignments
-            ]
-            slot_id_conflicts = (
-                len(assignment_slot_ids) - len(set(assignment_slot_ids))
-            )
-            protected_slot_conflicts = len(
-                set(assignment_slot_ids).intersection(protected_slot_ids)
-            )
-            state_counts: dict[str, int] = {}
-            for slot in slots:
-                state = str(slot.get("state") or "FREE")
-                state_counts[state] = state_counts.get(state, 0) + 1
-
-            limit = self.uvm_cold_slot_pool_trace_assignments_limit
-            traced_assignments = assignments[:limit] if limit else []
-
-        allocation_us = (time.perf_counter_ns() - start_ns) / 1000.0
-        return {
-            "slot_capacity": capacity,
-            "slot_hits": len(slot_hits),
-            "slot_misses": len(missing_expert_ids),
-            "slot_hit_experts": [
-                int(record["expert_id"]) for record in slot_hits
-            ],
-            "slot_miss_experts": missing_expert_ids,
-            "slot_assignments": traced_assignments,
-            "slot_assignments_omitted": max(
-                len(assignments) - len(traced_assignments),
-                0,
-            ),
-            "slot_assignment_count": len(assignments),
-            "assignment_count": len(assignments),
-            "assignment_slot_ids": assignment_slot_ids,
-            "slot_id_conflicts": slot_id_conflicts,
-            "protected_slot_conflicts": protected_slot_conflicts,
-            "overflow_count": len(overflow_experts),
-            "overflow_experts": overflow_experts,
-            "released_slots": released_slots,
-            "protected_current_batch_slots": sorted(protected_slot_ids),
-            "reusable_probe_count": reusable_probe_count,
-            "stale_mapping_count": stale_mappings,
-            "slot_state_counts": state_counts,
-            "free_cursor": cursor,
-            "allocation_us": allocation_us,
-            "stale_read_detected": bool(
-                slot_id_conflicts or protected_slot_conflicts
-            ),
-            }
-
-    def _uvm_cold_slot_pool_forget_layer(self, layer_id: int) -> int:
-        with _UVM_COLD_SLOT_POOL_LOCK:
-            layer_state = _UVM_COLD_SLOT_POOL_LAYERS.get(layer_id)
-            if not layer_state:
-                return 0
-            slots = cast(list[dict[str, object]], layer_state.get("slots") or [])
-            released = 0
-            for slot in slots:
-                if str(slot.get("state") or "FREE") != "FREE":
-                    released += 1
-                slot.update({
-                    "owner_layer": None,
-                    "owner_expert": None,
-                    "state": "FREE",
-                    "last_access_step": -1,
-                    "release_event_step": self._uvm_moe_trace_step,
-                })
-            expert_to_slot = cast(
-                dict[int, int],
-                layer_state.get("expert_to_slot") or {},
-            )
-            expert_to_slot.clear()
-            layer_state["expert_to_slot"] = expert_to_slot
-            layer_state["free_cursor"] = 0
-            return released
-
-    def _uvm_cold_slot_pool_legacy_prefetch_backend(
-        self,
-        *,
-        layer_id: int,
-        allocation: dict[str, object],
-        expert_local_ids: dict[int, int],
-    ) -> dict[str, object]:
-        start_ns = time.perf_counter_ns()
-        ranges: list[tuple[int, int]] = []
-        assignment_experts: set[int] = set()
-        assignment_count = int(allocation.get("assignment_count") or 0)
-        miss_experts = allocation.get("slot_miss_experts")
-        slot_ids = allocation.get("assignment_slot_ids")
-        if not isinstance(miss_experts, list):
-            miss_experts = []
-        if not isinstance(slot_ids, list):
-            slot_ids = []
-        for index, expert_item in enumerate(miss_experts[: len(slot_ids)]):
-            try:
-                expert_id = int(expert_item)
-            except (TypeError, ValueError):
-                continue
-            local_expert_id = expert_local_ids.get(expert_id)
-            if local_expert_id is None:
-                continue
-            assignment_experts.add(expert_id)
-            try:
-                slot_id = int(slot_ids[index])
-            except (TypeError, ValueError):
-                slot_id = -1
-            for _, ptr, size_bytes in self._uvm_expert_weight_slices(
-                local_expert_id,
-                self.uvm_weight_prefetch_target_roles,
-            ):
-                ranges.append((int(ptr), int(size_bytes)))
-
-        if not ranges:
-            return {
-                "backend": "legacy_prefetch",
-                "backend_status": "no_ranges",
-                "backend_success": True,
-                "backend_error": "",
-                "parallel_copy_count": 0,
-                "batch_copy_us": 0.0,
-                "backend_migration_us": 0.0,
-                "migration_range_count": 0,
-                "migration_expert_count": 0,
-                "migration_bytes": 0,
-                "migration_issued_records": 0,
-                "migration_failed_records": 0,
-                "migration_issued_bytes": 0,
-                "remap_count": 0,
-                "tlb_invalidate_count": 0,
-                "planned_remap_count": 0,
-                "planned_tlb_invalidate_count": 0,
-                "executor": "",
-                "driver_result": None,
-            }
-
-        batch_successes = 0
-        executor = ""
-        driver_result: object = None
-        backend_status = "ok"
-        backend_error = ""
-        try:
-            (
-                batch_successes,
-                executor,
-                driver_result,
-            ) = batch_prefetch_ranges_to_device_with_executor(
-                ranges,
-                self._uvm_cold_streaming_device_id(),
-                executor=self.uvm_weight_executor,
-            )
-            if self.uvm_cold_slot_pool_sync_migration and batch_successes > 0:
-                try:
-                    torch.cuda.synchronize()
-                except Exception as exc:
-                    backend_status = "sync_failed"
-                    backend_error = str(exc)
-        except Exception as exc:
-            logger.debug("Failed to run cold slot pool legacy prefetch backend", exc_info=True)
-            backend_status = "prefetch_failed"
-            backend_error = str(exc)
-            batch_successes = 0
-
-        migration_us = (time.perf_counter_ns() - start_ns) / 1000.0
-        issued_ranges = ranges[:batch_successes]
-        issued_bytes = sum(size_bytes for _, size_bytes in issued_ranges)
-        total_bytes = sum(size_bytes for _, size_bytes in ranges)
-        return {
-            "backend": "legacy_prefetch",
-            "backend_status": backend_status,
-            "backend_success": backend_status in ("ok", "sync_failed"),
-            "backend_error": backend_error,
-            "parallel_copy_count": len(assignment_experts),
-            "batch_copy_us": migration_us,
-            "backend_migration_us": migration_us,
-            "migration_range_count": len(ranges),
-            "migration_expert_count": len(assignment_experts),
-            "assigned_slot_count": len(slot_ids),
-            "migration_bytes": total_bytes,
-            "migration_issued_records": batch_successes,
-            "migration_failed_records": max(len(ranges) - batch_successes, 0),
-            "migration_issued_bytes": issued_bytes,
-            "remap_count": 0,
-            "tlb_invalidate_count": 0,
-            "planned_remap_count": 1 if assignment_count else 0,
-            "planned_tlb_invalidate_count": 1 if assignment_count else 0,
-            "executor": executor,
-            "driver_result": driver_result,
-            "sync_migration": self.uvm_cold_slot_pool_sync_migration,
-        }
-
-    def _uvm_cold_slot_pool_driver_remap_backend(
-        self,
-        *,
-        layer_id: int,
-        allocation: dict[str, object],
-        expert_local_ids: dict[int, int],
-    ) -> dict[str, object]:
-        start_ns = time.perf_counter_ns()
-        entries: list[dict[str, object]] = []
-        assignment_experts: set[int] = set()
-        assignment_count = int(allocation.get("assignment_count") or 0)
-        miss_experts = allocation.get("slot_miss_experts")
-        slot_ids = allocation.get("assignment_slot_ids")
-        if not isinstance(miss_experts, list):
-            miss_experts = []
-        if not isinstance(slot_ids, list):
-            slot_ids = []
-
-        for index, expert_item in enumerate(miss_experts[: len(slot_ids)]):
-            try:
-                expert_id = int(expert_item)
-                slot_id = int(slot_ids[index])
-            except (TypeError, ValueError):
-                continue
-            local_expert_id = expert_local_ids.get(expert_id)
-            if local_expert_id is None:
-                continue
-            assignment_experts.add(expert_id)
-            slot_offset = 0
-            page_size = os.sysconf("SC_PAGE_SIZE")
-            for role, ptr, size_bytes in self._uvm_expert_weight_slices(
-                local_expert_id,
-                self.uvm_weight_prefetch_target_roles,
-            ):
-                ptr_int = int(ptr)
-                size_int = int(size_bytes)
-                rounded_base = ptr_int - (ptr_int % page_size)
-                rounded_end = (
-                    ((ptr_int + size_int + page_size - 1) // page_size)
-                    * page_size
-                )
-                rounded_bytes = max(rounded_end - rounded_base, 0)
-                entries.append(
-                    {
-                        "layer_id": int(layer_id),
-                        "expert_id": expert_id,
-                        "slot_id": slot_id,
-                        "role": role,
-                        "va_base": ptr_int,
-                        "bytes": size_int,
-                        "slot_offset": slot_offset,
-                    }
-                )
-                slot_offset += rounded_bytes
-
-        if not entries:
-            return {
-                "backend": "driver_slot_remap",
-                "backend_status": "no_ranges",
-                "backend_success": True,
-                "backend_error": "",
-                "parallel_copy_count": 0,
-                "batch_copy_us": 0.0,
-                "backend_migration_us": 0.0,
-                "migration_range_count": 0,
-                "migration_expert_count": 0,
-                "assigned_slot_count": len(slot_ids),
-                "migration_bytes": 0,
-                "migration_issued_records": 0,
-                "migration_failed_records": 0,
-                "migration_issued_bytes": 0,
-                "remap_count": 0,
-                "tlb_invalidate_count": 0,
-                "planned_remap_count": 1 if assignment_count else 0,
-                "planned_tlb_invalidate_count": 1 if assignment_count else 0,
-                "executor": "driver_slot_remap",
-                "driver_result": None,
-                "driver_slot_remap_mode": self.uvm_cold_slot_pool_driver_mode,
-                "driver_slot_remap_validate_managed": (
-                    self.uvm_cold_slot_pool_driver_validate_managed
-                ),
-            }
-
-        backend_status = "ok"
-        backend_error = ""
-        driver_result: dict[str, object] | None = None
-        driver_prefill_result: dict[str, object] | None = None
-        slot_pte_modes = ("slot_pte_remap", "slot_va_block_remap")
-        clear_setting = self.uvm_cold_slot_pool_clear_slot_ptes_after_remap
-        if clear_setting in ("1", "true", "yes", "on"):
-            reset_after_remap = True
-        elif clear_setting in ("0", "false", "no", "off"):
-            reset_after_remap = False
-        else:
-            reset_after_remap = self.uvm_cold_slot_pool_driver_mode in slot_pte_modes
-        driver_prefill_staging = "none"
-        driver_prefill_staging_bytes = 0
-        driver_prefill_staging_entries = 0
-        driver_slot_pool_python_forget_count = 0
-        driver_prefill_buffers: list[mmap.mmap] = []
-        managed_probe_samples: list[dict[str, object]] = []
-        managed_probe_failed_count = 0
-        try:
-            if self.uvm_cold_slot_pool_driver_mode in slot_pte_modes:
-                for entry in entries:
-                    ptr_int = int(entry.get("va_base") or 0)
-                    size_int = int(entry.get("bytes") or 0)
-                    capable, reason, code = probe_driver_capable_range(
-                        ptr_int,
-                        size_int,
-                    )
-                    if len(managed_probe_samples) < 8:
-                        managed_probe_samples.append(
-                            {
-                                "layer_id": int(entry.get("layer_id") or 0),
-                                "expert_id": int(entry.get("expert_id") or 0),
-                                "slot_id": int(entry.get("slot_id") or 0),
-                                "role": str(entry.get("role") or ""),
-                                "ptr": f"0x{ptr_int:x}",
-                                "bytes": size_int,
-                                "driver_capable": bool(capable),
-                                "driver_capability_reason": reason,
-                                "driver_capability_code": int(code),
-                            }
-                        )
-                    if not capable:
-                        managed_probe_failed_count += 1
-
-                if managed_probe_failed_count:
-                    backend_status = "driver_non_managed_target"
-                    backend_error = (
-                        "non_managed_target_ranges="
-                        f"{managed_probe_failed_count}"
-                    )
-                    raise RuntimeError(backend_error)
-
-            if self.uvm_cold_slot_pool_driver_mode in slot_pte_modes:
-                prefill_entries: list[dict[str, object]] = []
-                page_size = os.sysconf("SC_PAGE_SIZE")
-                for entry in entries:
-                    src = int(entry.get("va_base") or 0)
-                    size_bytes = int(entry.get("bytes") or 0)
-                    if src <= 0 or size_bytes <= 0:
-                        continue
-
-                    rounded_base = src - (src % page_size)
-                    rounded_end = (
-                        ((src + size_bytes + page_size - 1) // page_size)
-                        * page_size
-                    )
-                    rounded_bytes = max(rounded_end - rounded_base, 0)
-                    if rounded_bytes <= 0:
-                        continue
-
-                    host_buffer = mmap.mmap(-1, rounded_bytes)
-                    host_addr = ctypes.addressof(ctypes.c_char.from_buffer(host_buffer))
-                    if host_addr % page_size != 0:
-                        host_buffer.close()
-                        raise RuntimeError(
-                            "host staging mmap for MoE slot prefill is not page-aligned"
-                        )
-
-                    ctypes.memmove(host_addr, rounded_base, rounded_bytes)
-                    driver_prefill_buffers.append(host_buffer)
-                    driver_prefill_staging_bytes += rounded_bytes
-                    driver_prefill_staging_entries += 1
-                    prefill_entries.append(
-                        {
-                            "layer_id": int(entry.get("layer_id") or 0),
-                            "expert_id": int(entry.get("expert_id") or 0),
-                            "slot_id": int(entry.get("slot_id") or 0),
-                            "role": entry.get("role"),
-                            "va_base": host_addr,
-                            "bytes": rounded_bytes,
-                            "slot_offset": int(entry.get("slot_offset") or 0),
-                        }
-                    )
-
-                if len(prefill_entries) != len(entries):
-                    backend_status = "driver_prefill_staging_failed"
-                    backend_error = (
-                        "prefill_staged_entries="
-                        f"{len(prefill_entries)} expected={len(entries)}"
-                    )
-                    raise RuntimeError(backend_error)
-
-                driver_prefill_staging = "host_mmap"
-                driver_prefill_result = driver_moe_slot_remap_batch(
-                    prefill_entries,
-                    mode="gpu_copy_only",
-                    device=self._uvm_cold_streaming_device_id(),
-                    validate_managed=False,
-                    round_to_pages=False,
-                    fd_target_entries=entries,
-                    fd_target_round_to_pages=True,
-                )
-                if driver_prefill_result.get("ok") is not True:
-                    rm_status = int(driver_prefill_result.get("rm_status") or 0)
-                    ioctl_ret = int(driver_prefill_result.get("ioctl_ret") or 0)
-                    backend_status = "driver_prefill_failed"
-                    backend_error = (
-                        f"prefill_rm_status={rm_status} "
-                        f"prefill_ioctl_ret={ioctl_ret}"
-                    )
-                    driver_result = driver_prefill_result
-                    raise RuntimeError(backend_error)
-
-            driver_result = driver_moe_slot_remap_batch(
-                entries,
-                mode=self.uvm_cold_slot_pool_driver_mode,
-                device=self._uvm_cold_streaming_device_id(),
-                validate_managed=self.uvm_cold_slot_pool_driver_validate_managed,
-                round_to_pages=True,
-                reset_slot_pool_after=reset_after_remap,
-            )
-            if driver_result.get("ok") is not True:
-                rm_status = int(driver_result.get("rm_status") or 0)
-                ioctl_ret = int(driver_result.get("ioctl_ret") or 0)
-                if driver_result.get("reset_after_remap_failed"):
-                    backend_status = "driver_reset_after_remap_failed"
-                elif self.uvm_cold_slot_pool_driver_mode == "remap":
-                    backend_status = "remap_not_supported"
-                elif rm_status or ioctl_ret:
-                    backend_status = "driver_failed"
-                else:
-                    backend_status = "driver_rejected"
-                reset_result = driver_result.get("slot_pool_reset_after_remap")
-                reset_error = (
-                    f" reset_after_remap={reset_result}"
-                    if reset_result is not None
-                    else ""
-                )
-                backend_error = (
-                    f"rm_status={rm_status} ioctl_ret={ioctl_ret}"
-                    f"{reset_error}"
-                )
-            elif self.uvm_cold_slot_pool_driver_mode in (
-                "dry_run",
-                "validate",
-                "copy_only",
-                "gpu_copy_only",
-            ):
-                backend_status = f"{self.uvm_cold_slot_pool_driver_mode}_ok"
-            if (
-                reset_after_remap
-                and isinstance(driver_result, dict)
-                and driver_result.get("ok") is True
-                and isinstance(driver_result.get("slot_pool_reset_after_remap"), dict)
-                and driver_result["slot_pool_reset_after_remap"].get("ok") is True
-            ):
-                driver_slot_pool_python_forget_count = (
-                    self._uvm_cold_slot_pool_forget_layer(layer_id)
-                )
-        except Exception as exc:
-            logger.debug("Failed to run cold slot pool driver remap backend", exc_info=True)
-            if backend_status == "ok":
-                backend_status = "driver_exception"
-                backend_error = str(exc)
-                driver_result = None
-        finally:
-            for host_buffer in driver_prefill_buffers:
-                try:
-                    host_buffer.close()
-                except BufferError:
-                    logger.debug(
-                        "Failed to close MoE slot prefill staging buffer",
-                        exc_info=True,
-                    )
-
-        migration_us = (time.perf_counter_ns() - start_ns) / 1000.0
-        success_records = (
-            int(driver_result.get("success_count") or 0)
-            if isinstance(driver_result, dict)
-            else 0
-        )
-        failure_records = (
-            int(driver_result.get("failure_count") or 0)
-            if isinstance(driver_result, dict)
-            else len(entries)
-        )
-        requested_bytes = (
-            int(driver_result.get("requested_bytes") or 0)
-            if isinstance(driver_result, dict)
-            else sum(int(entry["bytes"]) for entry in entries)
-        )
-        accepted_bytes = (
-            int(driver_result.get("accepted_bytes") or 0)
-            if isinstance(driver_result, dict)
-            else 0
-        )
-        real_remap_count = (
-            int(driver_result.get("remap_count") or 0)
-            if isinstance(driver_result, dict)
-            else 0
-        )
-        real_tlb_count = (
-            int(driver_result.get("tlb_invalidate_count") or 0)
-            if isinstance(driver_result, dict)
-            else 0
-        )
-        copy_count = (
-            int(driver_result.get("copy_count") or 0)
-            if isinstance(driver_result, dict)
-            else 0
-        )
-        if isinstance(driver_prefill_result, dict):
-            copy_count += int(driver_prefill_result.get("copy_count") or 0)
-        copy_bytes = (
-            int(driver_result.get("copy_bytes") or 0)
-            if isinstance(driver_result, dict)
-            else 0
-        )
-        if isinstance(driver_prefill_result, dict):
-            copy_bytes += int(driver_prefill_result.get("copy_bytes") or 0)
-        copy_failed_count = (
-            int(driver_result.get("copy_failed_count") or 0)
-            if isinstance(driver_result, dict)
-            else 0
-        )
-        if isinstance(driver_prefill_result, dict):
-            copy_failed_count += int(driver_prefill_result.get("copy_failed_count") or 0)
-        is_success = backend_status in (
-            "dry_run_ok",
-            "validate_ok",
-            "copy_only_ok",
-            "gpu_copy_only_ok",
-            "ok",
-        )
-
-        return {
-            "backend": "driver_slot_remap",
-            "backend_status": backend_status,
-            "backend_success": is_success,
-            "backend_error": backend_error,
-            "parallel_copy_count": len(assignment_experts),
-            "batch_copy_us": migration_us,
-            "backend_migration_us": migration_us,
-            "migration_range_count": len(entries),
-            "migration_expert_count": len(assignment_experts),
-            "assigned_slot_count": len(slot_ids),
-            "migration_bytes": requested_bytes,
-            "migration_issued_records": success_records,
-            "migration_failed_records": failure_records,
-            "migration_issued_bytes": accepted_bytes,
-            "remap_count": real_remap_count,
-            "tlb_invalidate_count": real_tlb_count,
-            "planned_remap_count": 1 if assignment_count else 0,
-            "planned_tlb_invalidate_count": 1 if assignment_count else 0,
-            "executor": "driver_slot_remap",
-            "driver_result": driver_result,
-            "driver_prefill_result": driver_prefill_result,
-            "driver_slot_remap_mode": self.uvm_cold_slot_pool_driver_mode,
-            "driver_slot_remap_validate_managed": (
-                self.uvm_cold_slot_pool_driver_validate_managed
-            ),
-            "driver_slot_remap_entry_count": len(entries),
-            "driver_slot_remap_success_count": success_records,
-            "driver_slot_remap_failure_count": failure_records,
-            "driver_slot_remap_copy_count": copy_count,
-            "driver_slot_remap_copy_bytes": copy_bytes,
-            "driver_slot_remap_copy_failed_count": copy_failed_count,
-            "driver_slot_remap_conflict_count": (
-                int(driver_result.get("conflict_count") or 0)
-                if isinstance(driver_result, dict)
-                else 0
-            ),
-            "driver_prefill_staging": driver_prefill_staging,
-            "driver_prefill_staging_entries": driver_prefill_staging_entries,
-            "driver_prefill_staging_bytes": driver_prefill_staging_bytes,
-            "driver_slot_remap_reset_after_remap": reset_after_remap,
-            "driver_slot_remap_reset_after_remap_result": (
-                driver_result.get("slot_pool_reset_after_remap")
-                if isinstance(driver_result, dict)
-                else None
-            ),
-            "driver_slot_pool_python_forget_count": (
-                driver_slot_pool_python_forget_count
-            ),
-            "driver_slot_remap_requested_bytes": requested_bytes,
-            "driver_slot_remap_accepted_bytes": accepted_bytes,
-            "driver_slot_remap_managed_probe_failed_count": (
-                managed_probe_failed_count
-            ),
-            "driver_slot_remap_managed_probe_samples": managed_probe_samples,
-        }
-
-    def _uvm_cold_slot_pool_backend_result(
-        self,
-        *,
-        layer_id: int,
-        allocation: dict[str, object],
-        expert_local_ids: dict[int, int],
-    ) -> dict[str, object]:
-        assignment_count = int(allocation.get("assignment_count") or 0)
-        if self.uvm_cold_slot_pool_backend == "legacy_prefetch":
-            return self._uvm_cold_slot_pool_legacy_prefetch_backend(
-                layer_id=layer_id,
-                allocation=allocation,
-                expert_local_ids=expert_local_ids,
-            )
-        if self.uvm_cold_slot_pool_backend == "driver_slot_remap":
-            return self._uvm_cold_slot_pool_driver_remap_backend(
-                layer_id=layer_id,
-                allocation=allocation,
-                expert_local_ids=expert_local_ids,
-            )
-        return {
-            "backend": "trace_only",
-            "backend_status": "planned",
-            "backend_success": True,
-            "backend_error": "",
-            "parallel_copy_count": assignment_count,
-            "batch_copy_us": 0.0,
-            "backend_migration_us": 0.0,
-            "migration_range_count": 0,
-            "migration_expert_count": 0,
-            "migration_bytes": 0,
-            "migration_issued_records": 0,
-            "migration_failed_records": 0,
-            "migration_issued_bytes": 0,
-            "remap_count": 0,
-            "tlb_invalidate_count": 0,
-            "planned_remap_count": 1 if assignment_count else 0,
-            "planned_tlb_invalidate_count": 1 if assignment_count else 0,
-            "executor": "",
-            "driver_result": None,
-        }
-
-    def _run_uvm_cold_slot_pool_step(
-        self,
-        *,
-        layer_id: int,
-        num_tokens: int,
-        topk_shape: list[int],
-        active_pairs: list[tuple[int, int]],
-        cold_candidate_pairs: list[tuple[int, int]],
-        hot_active_experts: int,
-    ) -> None:
-        active_cold_expert_ids = [
-            global_expert_id for global_expert_id, _ in cold_candidate_pairs
-        ]
-        expert_local_ids = {
-            int(global_expert_id): int(local_expert_id)
-            for global_expert_id, local_expert_id in cold_candidate_pairs
-        }
-        allocation = self._uvm_cold_slot_pool_allocate_batch(
-            layer_id=layer_id,
-            active_cold_expert_ids=active_cold_expert_ids,
-            step=self._uvm_moe_trace_step,
-        )
-        backend = self._uvm_cold_slot_pool_backend_result(
-            layer_id=layer_id,
-            allocation=allocation,
-            expert_local_ids=expert_local_ids,
-        )
-        self._append_uvm_cold_slot_pool_trace(
-            {
-                "timestamp": time.time(),
-                "pid": os.getpid(),
-                "layer_name": self.layer_name,
-                "layer_id": layer_id,
-                "step": self._uvm_moe_trace_step,
-                "action": "cold_slot_pool_step_summary",
-                "mode": "slot_pool_backend_v1",
-                "fence_model": "release_previous_batch_at_next_layer_call",
-                "num_tokens": num_tokens,
-                "topk_shape": topk_shape,
-                "active_expert_records": len(active_pairs),
-                "active_hot_experts": hot_active_experts,
-                "active_cold_experts": len(active_cold_expert_ids),
-                "overflow_mode": self.uvm_cold_slot_pool_overflow_mode,
-                "trace_only": self.uvm_cold_slot_pool_trace_only,
-                "slot_hit": allocation.get("slot_hits", 0),
-                "slot_miss": allocation.get("slot_misses", 0),
-                **allocation,
-                **backend,
-            }
-        )
-
-    def _uvm_cold_streaming_is_hot(
-        self,
-        layer_id: int | None,
-        global_expert_id: int,
-    ) -> bool:
-        if not self.uvm_cold_streaming_hot_plan_enable:
-            return False
-        if layer_id is None:
-            return False
-        return (
-            (layer_id, global_expert_id) in self.uvm_init_weight_hot_plan_keys
-            or (layer_id, global_expert_id) in self.uvm_weight_prefetch_plan_keys
-        )
-
-    def _uvm_cold_streaming_device_id(self) -> int:
-        if self.uvm_cold_streaming_device >= 0:
-            return self.uvm_cold_streaming_device
-        try:
-            return int(torch.cuda.current_device())
-        except Exception:
-            return 0
-
-    def _uvm_cold_streaming_live_snapshot(self) -> tuple[int, int]:
-        with _UVM_COLD_STREAMING_LOCK:
-            return (
-                int(_UVM_COLD_STREAMING_BYTES),
-                len(_UVM_COLD_STREAMING_REGIONS),
-            )
-
-    def _uvm_cold_streaming_touch_live_region(
-        self,
-        *,
-        region_id: str,
-        step: int,
-    ) -> bool:
-        with _UVM_COLD_STREAMING_LOCK:
-            entry = _UVM_COLD_STREAMING_REGIONS.get(region_id)
-            if entry is None:
-                return False
-            entry["last_access_step"] = step
-            if self.uvm_cold_streaming_ttl_steps > 0:
-                entry["ttl_deadline_step"] = (
-                    step + self.uvm_cold_streaming_ttl_steps
-                )
-            return bool(entry.get("estimated_gpu_resident", False))
-
-    def _uvm_cold_streaming_add_live_region(
-        self,
-        *,
-        region_id: str,
-        ptr: int,
-        size_bytes: int,
-        step: int,
-        metadata: dict[str, object],
-    ) -> None:
-        global _UVM_COLD_STREAMING_BYTES
-        ttl_deadline = (
-            step + self.uvm_cold_streaming_ttl_steps
-            if self.uvm_cold_streaming_ttl_steps > 0
-            else 0
-        )
-        with _UVM_COLD_STREAMING_LOCK:
-            old_entry = _UVM_COLD_STREAMING_REGIONS.get(region_id)
-            old_bytes = int(old_entry.get("bytes") or 0) if old_entry else 0
-            _UVM_COLD_STREAMING_REGIONS[region_id] = {
-                "region_id": region_id,
-                "ptr": ptr,
-                "bytes": size_bytes,
-                "last_access_step": step,
-                "last_prefetch_step": step,
-                "ttl_deadline_step": ttl_deadline,
-                "estimated_gpu_resident": True,
-                "metadata": dict(metadata),
-            }
-            _UVM_COLD_STREAMING_BYTES = max(
-                _UVM_COLD_STREAMING_BYTES - old_bytes + size_bytes,
-                0,
-            )
-
-    def _uvm_cold_streaming_remove_live_region(
-        self,
-        region_id: str,
-    ) -> None:
-        global _UVM_COLD_STREAMING_BYTES
-        with _UVM_COLD_STREAMING_LOCK:
-            old_entry = _UVM_COLD_STREAMING_REGIONS.pop(region_id, None)
-            if old_entry is not None:
-                _UVM_COLD_STREAMING_BYTES = max(
-                    _UVM_COLD_STREAMING_BYTES
-                    - int(old_entry.get("bytes") or 0),
-                    0,
-                )
-
-    def _uvm_cold_streaming_select_victims(
-        self,
-        *,
-        required_bytes: int,
-        active_region_ids: set[str],
-        step: int,
-    ) -> list[dict[str, object]]:
-        if required_bytes <= 0:
-            return []
-        with _UVM_COLD_STREAMING_LOCK:
-            candidates: list[dict[str, object]] = []
-            for entry in _UVM_COLD_STREAMING_REGIONS.values():
-                region_id = str(entry.get("region_id") or "")
-                metadata = entry.get("metadata")
-                if not isinstance(metadata, dict):
-                    metadata = {}
-                if not region_id or region_id in active_region_ids:
-                    continue
-                if metadata.get("init_hot") is True or metadata.get("protected") is True:
-                    continue
-                if metadata.get("pool_class") != "streaming":
-                    continue
-                candidates.append(dict(entry))
-
-            def victim_key(entry: dict[str, object]) -> tuple[int, int, int, str]:
-                ttl_deadline = int(entry.get("ttl_deadline_step") or 0)
-                last_access = int(entry.get("last_access_step") or -1)
-                size_bytes = int(entry.get("bytes") or 0)
-                region_id = str(entry.get("region_id") or "")
-                expired_rank = 1
-                if (
-                    self.uvm_cold_streaming_evict_policy == "ttl_lru"
-                    and ttl_deadline > 0
-                    and ttl_deadline <= step
-                ):
-                    expired_rank = 0
-                return (expired_rank, last_access, -size_bytes, region_id)
-
-            candidates.sort(key=victim_key)
-            victims: list[dict[str, object]] = []
-            reclaimed = 0
-            for entry in candidates:
-                victims.append(entry)
-                reclaimed += int(entry.get("bytes") or 0)
-                if reclaimed >= required_bytes:
-                    break
-            return victims
-
-    def _uvm_cold_streaming_offload_victims(
-        self,
-        *,
-        victims: list[dict[str, object]],
-        scope_key: str,
-    ) -> tuple[int, int, int, int, object, object]:
-        if not victims:
-            return 0, 0, 0, 0, None, None
-        ranges = [
-            (int(victim["ptr"]), int(victim["bytes"]))
-            for victim in victims
-            if int(victim.get("ptr") or 0) > 0 and int(victim.get("bytes") or 0) > 0
-        ]
-        if not ranges:
-            return 0, 0, 0, 0, None, None
-        (
-            batch_successes,
-            executor_used,
-            driver_advise_result,
-            driver_prefetch_result,
-        ) = batch_offload_ranges_to_cpu_with_executor(
-            ranges,
-            sync=self.uvm_cold_streaming_sync_evict,
-            executor=self.uvm_weight_executor,
-        )
-        issued = 0
-        issued_bytes = 0
-        hot_evicted = 0
-        for batch_index, victim in enumerate(victims[: len(ranges)]):
-            region_id = str(victim.get("region_id") or "")
-            size_bytes = int(victim.get("bytes") or 0)
-            metadata = victim.get("metadata")
-            if not isinstance(metadata, dict):
-                metadata = {}
-            if metadata.get("init_hot") is True or metadata.get("protected") is True:
-                hot_evicted += 1
-            success = batch_index < batch_successes
-            if success:
-                issued += 1
-                issued_bytes += size_bytes
-                self._uvm_cold_streaming_remove_live_region(region_id)
-                next_state = (
-                    "cpu" if self.uvm_cold_streaming_sync_evict else "prefetching_cpu"
-                )
-                mark_uvm_residency_state(
-                    region_id=region_id,
-                    state=next_state,
-                    metadata={
-                        **cast(dict[str, object], metadata),
-                        "stage": "stage_m_cold_streaming",
-                        "pool_class": "streaming",
-                        "last_streaming_evict_step": self._uvm_moe_trace_step,
-                        "scope_key": scope_key,
-                        "executor": executor_used,
-                        "active": False,
-                        "evictable": True,
-                    },
-                )
-                layer_id = metadata.get("layer_id")
-                global_expert_id = metadata.get("global_expert_id")
-                role = metadata.get("role")
-                if isinstance(global_expert_id, int) and isinstance(role, str):
-                    self._uvm_update_weight_expert_role_cache(
-                        layer_id=layer_id if isinstance(layer_id, int) else None,
-                        global_expert_id=global_expert_id,
-                        role=role,
-                        state=next_state,
-                        estimated_gpu_resident=False,
-                    )
-            record_uvm_residency_action(
-                action=(
-                    "cold_streaming_evict_issued"
-                    if success
-                    else "cold_streaming_evict_failed"
-                ),
-                pool="weights",
-                region_id=region_id,
-                bytes=size_bytes,
-                metadata={
-                    **cast(dict[str, object], metadata),
-                    "stage": "stage_m_cold_streaming",
-                    "scope_key": scope_key,
-                    "executor": executor_used,
-                    "requested_executor": self.uvm_weight_executor,
-                    "batch_index": batch_index,
-                    "batch_size": len(ranges),
-                    "batch_successes": batch_successes,
-                    "driver_advise_result": driver_advise_result,
-                    "driver_prefetch_result": driver_prefetch_result,
-                    "sync_evict": self.uvm_cold_streaming_sync_evict,
-                },
-                success=success,
-            )
-        return (
-            issued,
-            issued_bytes,
-            len(ranges),
-            hot_evicted,
-            driver_advise_result,
-            driver_prefetch_result,
-        )
-
-    def _maybe_stream_uvm_cold_expert_weights(self, topk_ids: torch.Tensor) -> None:
-        if not self.uvm_cold_streaming_enable:
-            return
-        if (
-            self.uvm_weight_router_topk_every_n_steps > 1
-            and (self._uvm_moe_trace_step % self.uvm_weight_router_topk_every_n_steps) != 0
-        ):
-            return
-        if (
-            self.uvm_expert_reserved_enable
-            and self.uvm_expert_reserved_skip_active_topk
-        ):
-            return
-        try:
-            self._refresh_uvm_weight_action_plans()
-            layer_id = self._uvm_layer_id()
-            if layer_id is None:
-                return
-            num_tokens = int(topk_ids.shape[0]) if topk_ids.ndim > 0 else 1
-            topk_shape = [int(dim) for dim in topk_ids.shape]
-            active_pairs = self._uvm_active_expert_pairs(topk_ids)
-            if not active_pairs:
-                return
-            device = self._uvm_cold_streaming_device_id()
-            scope_key = f"cold_streaming:{os.getpid()}:{self._uvm_moe_trace_step}"
-            if self.uvm_cold_slot_pool_enable and self.uvm_cold_slot_pool_trace_only:
-                active_region_ids: set[str] = set()
-            else:
-                active_region_ids = {
-                    self._uvm_expert_weight_region_id(
-                        layer_id,
-                        global_expert_id,
-                        role,
-                    )
-                    for global_expert_id, local_expert_id in active_pairs
-                    for role, _, _ in self._uvm_expert_weight_slices(
-                        local_expert_id,
-                        self.uvm_weight_prefetch_target_roles,
-                    )
-                }
-
-            hot_active_experts = 0
-            cold_active_pairs: list[tuple[int, int]] = []
-            hot_active_region_records = 0
-            hot_missing_region_records = 0
-            for global_expert_id, local_expert_id in active_pairs:
-                if self._uvm_cold_streaming_is_hot(layer_id, global_expert_id):
-                    hot_active_experts += 1
-                    for role, ptr, size_bytes in self._uvm_expert_weight_slices(
-                        local_expert_id,
-                        self.uvm_weight_prefetch_target_roles,
-                    ):
-                        region_id = self._uvm_expert_weight_region_id(
-                            layer_id,
-                            global_expert_id,
-                            role,
-                        )
-                        metadata = self._uvm_expert_weight_residency_metadata(
-                            layer_id=layer_id,
-                            global_expert_id=global_expert_id,
-                            local_expert_id=local_expert_id,
-                            role=role,
-                            ptr=ptr,
-                            size_bytes=size_bytes,
-                            active_this_step=True,
-                            source_action="cold_streaming_hot_access",
-                        )
-                        existing = get_uvm_residency_region_snapshot(region_id)
-                        if existing is None:
-                            hot_missing_region_records += 1
-                            register_uvm_residency_region(
-                                pool="weights",
-                                region_id=region_id,
-                                ptr=ptr,
-                                bytes=size_bytes,
-                                state="gpu",
-                                evictable=False,
-                                active=False,
-                                metadata={
-                                    **metadata,
-                                    "stage": "stage_m_cold_streaming",
-                                    "pool_class": "hot",
-                                    "driver_subpool": "hot",
-                                    "init_hot": True,
-                                    "protected": True,
-                                    "pinned": True,
-                                    "prefetchable": True,
-                                    "priority": 100,
-                                },
-                            )
-                        record_uvm_residency_access(
-                            region_id=region_id,
-                            step=self._uvm_moe_trace_step,
-                            metadata={
-                                **metadata,
-                                "stage": "stage_m_cold_streaming",
-                                "pool_class": "hot",
-                                "driver_subpool": "hot",
-                                "init_hot": True,
-                                "protected": True,
-                                "pinned": True,
-                                "prefetchable": True,
-                                "priority": 100,
-                            },
-                        )
-                        hot_active_region_records += 1
-                    continue
-                cold_active_pairs.append((global_expert_id, local_expert_id))
-
-            cold_candidate_pairs = cold_active_pairs
-            if self.uvm_cold_streaming_max_experts_per_layer > 0:
-                cold_candidate_pairs = cold_candidate_pairs[
-                    : self.uvm_cold_streaming_max_experts_per_layer
-                ]
-            if self.uvm_cold_slot_pool_enable:
-                self._run_uvm_cold_slot_pool_step(
-                    layer_id=layer_id,
-                    num_tokens=num_tokens,
-                    topk_shape=topk_shape,
-                    active_pairs=active_pairs,
-                    cold_candidate_pairs=cold_candidate_pairs,
-                    hot_active_experts=hot_active_experts,
-                )
-                return
-
-            candidate_items: list[dict[str, object]] = []
-            cold_hit_region_records = 0
-            cold_miss_region_records = 0
-            cold_miss_experts: set[int] = set()
-            budget_reject_records = 0
-            budget_reject_bytes = 0
-            candidate_bytes = 0
-            protected_collision_records = 0
-
-            for global_expert_id, local_expert_id in cold_candidate_pairs:
-                expert_had_miss = False
-                for role, ptr, size_bytes in self._uvm_expert_weight_slices(
-                    local_expert_id,
-                    self.uvm_weight_prefetch_target_roles,
-                ):
-                    region_id = self._uvm_expert_weight_region_id(
-                        layer_id,
-                        global_expert_id,
-                        role,
-                    )
-                    metadata = self._uvm_expert_weight_residency_metadata(
-                        layer_id=layer_id,
-                        global_expert_id=global_expert_id,
-                        local_expert_id=local_expert_id,
-                        role=role,
-                        ptr=ptr,
-                        size_bytes=size_bytes,
-                        active_this_step=True,
-                        source_action="cold_streaming",
-                    )
-                    metadata = {
-                        **metadata,
-                        "stage": "stage_m_cold_streaming",
-                        "pool_class": "streaming",
-                        "driver_subpool": "streaming",
-                        "streaming": True,
-                        "init_cold": False,
-                        "protected": False,
-                        "prefetchable": True,
-                        "transient": True,
-                        "priority": 20,
-                    }
-                    existing = get_uvm_residency_region_snapshot(region_id)
-                    existing_metadata = (
-                        existing.get("metadata") if existing is not None else {}
-                    )
-                    if not isinstance(existing_metadata, dict):
-                        existing_metadata = {}
-                    if (
-                        existing_metadata.get("init_hot") is True
-                        or existing_metadata.get("protected") is True
-                    ):
-                        protected_collision_records += 1
-                        continue
-                    existing_state = (
-                        str(existing.get("state"))
-                        if existing is not None
-                        else self.uvm_residency_weight_initial_state
-                    )
-                    register_uvm_residency_region(
-                        pool="weights",
-                        region_id=region_id,
-                        ptr=ptr,
-                        bytes=size_bytes,
-                        state=existing_state,
-                        evictable=True,
-                        active=False,
-                        metadata=metadata,
-                    )
-                    record_uvm_residency_access(
-                        region_id=region_id,
-                        step=self._uvm_moe_trace_step,
-                        metadata=metadata,
-                    )
-                    self._uvm_weight_recent_active_region_steps[region_id] = (
-                        self._uvm_moe_trace_step
-                    )
-                    if self._uvm_cold_streaming_touch_live_region(
-                        region_id=region_id,
-                        step=self._uvm_moe_trace_step,
-                    ):
-                        cold_hit_region_records += 1
-                        continue
-                    if (
-                        self.uvm_cold_streaming_max_bytes_per_step > 0
-                        and candidate_bytes + size_bytes
-                        > self.uvm_cold_streaming_max_bytes_per_step
-                    ):
-                        budget_reject_records += 1
-                        budget_reject_bytes += size_bytes
-                        continue
-                    expert_had_miss = True
-                    cold_miss_region_records += 1
-                    candidate_bytes += size_bytes
-                    candidate_items.append(
-                        {
-                            "region_id": region_id,
-                            "ptr": ptr,
-                            "bytes": size_bytes,
-                            "role": role,
-                            "layer_id": layer_id,
-                            "global_expert_id": global_expert_id,
-                            "local_expert_id": local_expert_id,
-                            "metadata": metadata,
-                        }
-                    )
-                if expert_had_miss:
-                    cold_miss_experts.add(global_expert_id)
-
-            live_bytes_before, live_records_before = (
-                self._uvm_cold_streaming_live_snapshot()
-            )
-            streaming_budget_reject_records = 0
-            streaming_budget_reject_bytes = 0
-            selected_victim_bytes = 0
-            selected_victims: list[dict[str, object]] = []
-            if (
-                self.uvm_cold_streaming_budget_bytes > 0
-                and candidate_items
-                and self.uvm_cold_streaming_evict_enable
-                and not self.uvm_cold_streaming_trace_only
-            ):
-                free_bytes = max(
-                    self.uvm_cold_streaming_budget_bytes - live_bytes_before,
-                    0,
-                )
-                need_evict_bytes = max(candidate_bytes - free_bytes, 0)
-                selected_victims = self._uvm_cold_streaming_select_victims(
-                    required_bytes=need_evict_bytes,
-                    active_region_ids=active_region_ids,
-                    step=self._uvm_moe_trace_step,
-                )
-                selected_victim_bytes = sum(
-                    int(victim.get("bytes") or 0) for victim in selected_victims
-                )
-                allowed_new_bytes = free_bytes + selected_victim_bytes
-                if candidate_bytes > allowed_new_bytes:
-                    kept_items: list[dict[str, object]] = []
-                    kept_bytes = 0
-                    for item in candidate_items:
-                        item_bytes = int(item.get("bytes") or 0)
-                        if kept_bytes + item_bytes > allowed_new_bytes:
-                            streaming_budget_reject_records += 1
-                            streaming_budget_reject_bytes += item_bytes
-                            continue
-                        kept_items.append(item)
-                        kept_bytes += item_bytes
-                candidate_items = kept_items
-                candidate_bytes = kept_bytes
-
-            evict_issued_records = 0
-            evict_issued_bytes = 0
-            evict_candidate_records = len(selected_victims)
-            hot_evicted_by_cold_count = 0
-            evict_driver_advise_result: object = None
-            evict_driver_prefetch_result: object = None
-            if selected_victims and not self.uvm_cold_streaming_trace_only:
-                (
-                    evict_issued_records,
-                    evict_issued_bytes,
-                    evict_candidate_records,
-                    hot_evicted_by_cold_count,
-                    evict_driver_advise_result,
-                    evict_driver_prefetch_result,
-                ) = self._uvm_cold_streaming_offload_victims(
-                    victims=selected_victims,
-                    scope_key=scope_key,
-                )
-
-            prefetch_issued_records = 0
-            prefetch_issued_bytes = 0
-            prefetch_failed_records = 0
-            prefetch_executor = ""
-            prefetch_driver_result: object = None
-            real_query_records = 0
-            real_queried_bytes = 0
-            real_gpu_bytes = 0
-            real_gpu_ratio: float | None = None
-            if candidate_items and not self.uvm_cold_streaming_trace_only:
-                ranges = [
-                    (int(item["ptr"]), int(item["bytes"]))
-                    for item in candidate_items
-                ]
-                (
-                    batch_successes,
-                    prefetch_executor,
-                    prefetch_driver_result,
-                ) = batch_prefetch_ranges_to_device_with_executor(
-                    ranges,
-                    device,
-                    executor=self.uvm_weight_executor,
-                )
-                if self.uvm_cold_streaming_sync_prefetch and batch_successes > 0:
-                    try:
-                        torch.cuda.synchronize()
-                    except Exception:
-                        logger.debug(
-                            "Failed to synchronize after cold streaming prefetch",
-                            exc_info=True,
-                        )
-                successful_ranges = ranges[:batch_successes]
-                if self.uvm_cold_streaming_real_query_enable and successful_ranges:
-                    try:
-                        real_result = driver_batch_query_ranges_residency_bytes(
-                            successful_ranges,
-                            device,
-                        )
-                    except Exception:
-                        logger.debug(
-                            "Failed to query cold streaming residency",
-                            exc_info=True,
-                        )
-                        real_result = {
-                            "queried_bytes": 0,
-                            "gpu_bytes": 0,
-                        }
-                    real_query_records = 1
-                    real_queried_bytes = int(real_result.get("queried_bytes") or 0)
-                    real_gpu_bytes = int(real_result.get("gpu_bytes") or 0)
-                    real_gpu_ratio = (
-                        real_gpu_bytes / real_queried_bytes
-                        if real_queried_bytes
-                        else 0.0
-                    )
-                for batch_index, item in enumerate(candidate_items):
-                    success = batch_index < batch_successes
-                    region_id = str(item["region_id"])
-                    size_bytes = int(item["bytes"])
-                    metadata = cast(dict[str, object], item["metadata"])
-                    if success:
-                        prefetch_issued_records += 1
-                        prefetch_issued_bytes += size_bytes
-                        state = (
-                            "gpu"
-                            if self.uvm_cold_streaming_sync_prefetch
-                            else "prefetching_gpu"
-                        )
-                        mark_uvm_residency_state(
-                            region_id=region_id,
-                            state=state,
-                            metadata={
-                                **metadata,
-                                "last_streaming_prefetch_step": (
-                                    self._uvm_moe_trace_step
-                                ),
-                                "executor": prefetch_executor,
-                                "active": False,
-                                "evictable": True,
-                            },
-                        )
-                        self._uvm_cold_streaming_add_live_region(
-                            region_id=region_id,
-                            ptr=int(item["ptr"]),
-                            size_bytes=size_bytes,
-                            step=self._uvm_moe_trace_step,
-                            metadata={
-                                **metadata,
-                                "executor": prefetch_executor,
-                            },
-                        )
-                        self._uvm_update_weight_expert_role_cache(
-                            layer_id=layer_id,
-                            global_expert_id=int(item["global_expert_id"]),
-                            role=str(item["role"]),
-                            state=state,
-                            estimated_gpu_resident=True,
-                        )
-                    else:
-                        prefetch_failed_records += 1
-                    record_uvm_residency_action(
-                        action=(
-                            "cold_streaming_prefetch_issued"
-                            if success
-                            else "cold_streaming_prefetch_failed"
-                        ),
-                        pool="weights",
-                        region_id=region_id,
-                        bytes=size_bytes,
-                        metadata={
-                            **metadata,
-                            "scope_key": scope_key,
-                            "executor": prefetch_executor,
-                            "requested_executor": self.uvm_weight_executor,
-                            "batch_index": batch_index,
-                            "batch_size": len(candidate_items),
-                            "batch_successes": batch_successes,
-                            "driver_result": prefetch_driver_result,
-                            "device": device,
-                            "sync_prefetch": self.uvm_cold_streaming_sync_prefetch,
-                        },
-                        success=success,
-                    )
-
-            live_bytes_after, live_records_after = (
-                self._uvm_cold_streaming_live_snapshot()
-            )
-            if (
-                hot_active_experts
-                or cold_active_pairs
-                or cold_miss_region_records
-                or cold_hit_region_records
-                or prefetch_issued_records
-                or evict_issued_records
-                or budget_reject_records
-                or streaming_budget_reject_records
-            ):
-                self._append_uvm_cold_streaming_trace(
-                    {
-                        "timestamp": time.time(),
-                        "pid": os.getpid(),
-                        "layer_name": self.layer_name,
-                        "layer_id": layer_id,
-                        "step": self._uvm_moe_trace_step,
-                        "action": "cold_streaming_step_summary",
-                        "num_tokens": num_tokens,
-                        "topk_shape": topk_shape,
-                        "active_expert_records": len(active_pairs),
-                        "active_region_records": len(active_region_ids),
-                        "active_hot_experts": hot_active_experts,
-                        "active_cold_experts": len(cold_active_pairs),
-                        "candidate_cold_experts": len(cold_candidate_pairs),
-                        "hot_active_region_records": hot_active_region_records,
-                        "hot_missing_region_records": hot_missing_region_records,
-                        "cold_hit_region_records": cold_hit_region_records,
-                        "cold_miss_experts": len(cold_miss_experts),
-                        "cold_miss_region_records": cold_miss_region_records,
-                        "cold_miss_bytes": (
-                            candidate_bytes + streaming_budget_reject_bytes
-                        ),
-                        "prefetch_candidate_records": len(candidate_items),
-                        "prefetch_candidate_bytes": candidate_bytes,
-                        "streaming_prefetch_issued_records": (
-                            prefetch_issued_records
-                        ),
-                        "streaming_prefetch_issued_bytes": prefetch_issued_bytes,
-                        "streaming_prefetch_failed_records": (
-                            prefetch_failed_records
-                        ),
-                        "streaming_eviction_candidate_records": (
-                            evict_candidate_records
-                        ),
-                        "streaming_eviction_candidate_bytes": (
-                            selected_victim_bytes
-                        ),
-                        "streaming_eviction_count": evict_issued_records,
-                        "streaming_eviction_bytes": evict_issued_bytes,
-                        "hot_evicted_by_cold_count": hot_evicted_by_cold_count,
-                        "protected_collision_records": protected_collision_records,
-                        "max_bytes_per_step_reject_records": budget_reject_records,
-                        "max_bytes_per_step_reject_bytes": budget_reject_bytes,
-                        "streaming_budget_reject_records": (
-                            streaming_budget_reject_records
-                        ),
-                        "streaming_budget_reject_bytes": (
-                            streaming_budget_reject_bytes
-                        ),
-                        "streaming_budget_bytes": (
-                            self.uvm_cold_streaming_budget_bytes
-                        ),
-                        "streaming_live_bytes_before": live_bytes_before,
-                        "streaming_live_records_before": live_records_before,
-                        "streaming_live_bytes_after": live_bytes_after,
-                        "streaming_live_records_after": live_records_after,
-                        "ttl_steps": self.uvm_cold_streaming_ttl_steps,
-                        "evict_policy": self.uvm_cold_streaming_evict_policy,
-                        "device": device,
-                        "executor": prefetch_executor,
-                        "requested_executor": self.uvm_weight_executor,
-                        "prefetch_driver_result": prefetch_driver_result,
-                        "evict_driver_advise_result": evict_driver_advise_result,
-                        "evict_driver_prefetch_result": evict_driver_prefetch_result,
-                        "real_query_records": real_query_records,
-                        "real_queried_bytes": real_queried_bytes,
-                        "real_gpu_bytes": real_gpu_bytes,
-                        "real_gpu_ratio": real_gpu_ratio,
-                    }
-                )
-        except Exception:
-            logger.debug("Failed to run UVM cold streaming", exc_info=True)
-
-    def _maybe_prefetch_uvm_expert_weights(
+    def _maybe_restore_uvm_reserved_expert_weights(
         self,
         topk_ids: torch.Tensor,
         *,
@@ -8610,9 +6412,10 @@ class FusedMoE(CustomOp):
     ) -> None:
         if not self.uvm_weight_prefetch_enabled:
             return
+        if not self.uvm_expert_reserved_enable:
+            return
         if (
-            self.uvm_expert_reserved_enable
-            and self.uvm_expert_reserved_enable_after_warmup
+            self.uvm_expert_reserved_enable_after_warmup
             and os.environ.get("VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY", "0")
             != "1"
         ):
@@ -8624,14 +6427,13 @@ class FusedMoE(CustomOp):
                         "layer_name": self.layer_name,
                         "step": self._uvm_moe_trace_step,
                         "mode": self.uvm_weight_prefetch_mode,
-                        "prefetch_source": self.uvm_weight_prefetch_source,
+                        "prefetch_source": "reserved_fast_gate",
                         "action": "reserved_prefetch_deferred_until_after_warmup",
                     }
                 )
             return
         if (
-            self.uvm_expert_reserved_enable
-            and self.uvm_expert_reserved_cleanup_delay_steps > 0
+            self.uvm_expert_reserved_cleanup_delay_steps > 0
             and self._uvm_expert_reserved_active_steps
             and not cleanup_already_done
         ):
@@ -8641,11 +6443,10 @@ class FusedMoE(CustomOp):
                     - self.uvm_expert_reserved_cleanup_delay_steps
                 )
             )
-        if (
-            self.uvm_weight_router_topk_every_n_steps > 1
-            and (self._uvm_moe_trace_step % self.uvm_weight_router_topk_every_n_steps) != 0
-        ):
+        every_n_steps = self.uvm_weight_router_topk_every_n_steps
+        if every_n_steps > 1 and self._uvm_moe_trace_step % every_n_steps != 0:
             return
+
         try:
             if not plans_refreshed:
                 self._refresh_uvm_weight_action_plans()
@@ -8660,128 +6461,33 @@ class FusedMoE(CustomOp):
                 global_expert_id
                 for global_expert_id, _ in all_active_expert_pairs
             }
-            for global_expert_id in all_active_global_experts:
-                self._uvm_record_recent_active_expert(layer_id, global_expert_id)
-            expert_pairs = all_active_expert_pairs
-            oracle_stats: dict[str, object] = {}
-            if self.uvm_expert_reserved_enable:
-                expert_pairs = (
-                    reserved_expert_pairs
-                    if reserved_expert_pairs is not None
-                    else self._uvm_active_reserved_offload_expert_pairs(
-                        layer_id,
-                        all_active_expert_pairs,
-                    )
+            expert_pairs = (
+                reserved_expert_pairs
+                if reserved_expert_pairs is not None
+                else self._uvm_active_reserved_offload_expert_pairs(
+                    layer_id,
+                    all_active_expert_pairs,
                 )
-                if not expert_pairs:
-                    self._append_uvm_weight_prefetch_trace(
-                        {
-                            "timestamp": time.time(),
-                            "pid": os.getpid(),
-                            "layer_name": self.layer_name,
-                            "step": self._uvm_moe_trace_step,
-                            "mode": self.uvm_weight_prefetch_mode,
-                            "prefetch_source": self.uvm_weight_prefetch_source,
-                            "action": "reserved_prefetch_no_offloaded_active",
-                            "active_global_experts": sorted(
-                                all_active_global_experts
-                            ),
-                            "candidate_expert_records": 0,
-                            "reserved_offload_mask_hit_records": 0,
-                        }
-                    )
-                    return
-            else:
-                if (
-                    self.uvm_weight_prefetch_source == "plan_intersection"
-                    and self.uvm_weight_prefetch_plan_keys
-                ):
-                    expert_pairs = [
-                        (global_expert_id, local_expert_id)
-                        for global_expert_id, local_expert_id in expert_pairs
-                        if _plan_expert_bitmask_contains(
-                            self.uvm_weight_prefetch_plan_mask_by_layer,
-                            layer_id,
-                            global_expert_id,
-                        )
-                    ]
-                elif (
-                    self.uvm_weight_prefetch_source == "plan_intersection"
-                    and self.uvm_weight_prefetch_require_plan
-                ):
-                    expert_pairs = []
-                elif self.uvm_weight_prefetch_source == "oracle_replay":
-                    expert_pairs, oracle_stats = self._uvm_oracle_replay_expert_pairs(
-                        all_active_expert_pairs
-                    )
-            if (
-                self.uvm_weight_prefetch_max_experts_per_layer > 0
-                and self.uvm_weight_executor != "expert_reserved_regions_async"
-            ):
-                expert_pairs = expert_pairs[
-                    : self.uvm_weight_prefetch_max_experts_per_layer
-                ]
-            active_region_ids: set[str] | None = None
-            active_region_ids_build_records = 0
-            active_region_id_records = 0
-            cold_candidate_register_calls = 0
-            cold_candidate_register_records = 0
-            cold_candidates_registered = False
-
-            def get_active_region_ids() -> set[str]:
-                nonlocal active_region_ids
-                nonlocal active_region_ids_build_records
-                nonlocal active_region_id_records
-                if active_region_ids is None:
-                    active_region_ids = {
-                        self._uvm_expert_weight_region_id(
-                            layer_id,
-                            global_expert_id,
-                            role,
-                        )
-                        for global_expert_id, local_expert_id in all_active_expert_pairs
-                        for role, _, _ in self._uvm_expert_weight_slices(
-                            local_expert_id,
-                            self.uvm_weight_prefetch_target_roles,
-                        )
+            )
+            if not expert_pairs:
+                self._append_uvm_weight_prefetch_trace(
+                    {
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "layer_name": self.layer_name,
+                        "step": self._uvm_moe_trace_step,
+                        "mode": self.uvm_weight_prefetch_mode,
+                        "prefetch_source": "reserved_fast_gate",
+                        "action": "reserved_prefetch_no_offloaded_active",
+                        "active_global_experts": sorted(
+                            all_active_global_experts
+                        ),
+                        "candidate_expert_records": 0,
+                        "reserved_offload_mask_hit_records": 0,
                     }
-                    active_region_ids_build_records += 1
-                    active_region_id_records = len(active_region_ids)
-                return active_region_ids
-
-            def ensure_cold_candidates_registered() -> None:
-                nonlocal cold_candidate_register_calls
-                nonlocal cold_candidate_register_records
-                nonlocal cold_candidates_registered
-                if (
-                    cold_candidates_registered
-                    or not self.uvm_residency_weight_enforce_hot_set
-                ):
-                    return
-                cold_candidate_register_calls += 1
-                cold_candidate_register_records += (
-                    self._register_uvm_residency_cold_weight_candidates(
-                        layer_id=layer_id,
-                        active_global_experts=all_active_global_experts,
-                        active_region_ids=get_active_region_ids(),
-                    )
                 )
-                cold_candidates_registered = True
+                return
 
-            issued_records = 0
-            attempted_bytes = 0
-            issued_bytes = 0
-            rejected_records = 0
-            candidate_expert_records = 0
-            expert_resident_skip_records = 0
-            expert_expanded_records = 0
-            candidate_region_records = 0
-            resident_skip_records = 0
-            cooldown_skip_records = 0
-            cpu_unknown_region_records = 0
-            reaccess_after_evict_records = 0
-            coordinator_reject_records = 0
-            batch_prefetch_items: list[dict[str, object]] = []
             device = (
                 int(torch.cuda.current_device())
                 if self.uvm_weight_prefetch_device < 0
@@ -8793,31 +6499,27 @@ class FusedMoE(CustomOp):
                 device=device,
             )
 
+            issued_records = 0
+            issued_bytes = 0
+            attempted_bytes = 0
+            candidate_expert_records = 0
+            candidate_region_records = 0
+            trace_candidate_records = 0
+            batch_prefetch_items: list[dict[str, object]] = []
+
             for global_expert_id, local_expert_id in expert_pairs:
                 candidate_expert_records += 1
-                expert_reserved_planned = self._uvm_expert_reserved_candidate(
-                    layer_id=layer_id,
-                    global_expert_id=global_expert_id,
-                    metadata={},
-                    existing_state="",
-                )
-                if (
-                    self._uvm_weight_expert_cached_gpu(layer_id, global_expert_id)
-                    and not expert_reserved_planned
-                ):
-                    expert_resident_skip_records += 1
-                    continue
-                expert_expanded_records += 1
                 for role, ptr, size_bytes in self._uvm_expert_weight_slices(
                     local_expert_id,
                     self.uvm_weight_prefetch_target_roles,
                 ):
+                    candidate_region_records += 1
+                    attempted_bytes += size_bytes
                     region_id = self._uvm_expert_weight_region_id(
                         layer_id,
                         global_expert_id,
                         role,
                     )
-                    candidate_region_records += 1
                     existing_region = get_uvm_residency_region_snapshot(region_id)
                     existing_state = (
                         str(existing_region.get("state"))
@@ -8835,98 +6537,32 @@ class FusedMoE(CustomOp):
                         state=existing_state,
                         estimated_gpu_resident=existing_estimated_gpu,
                     )
-                    existing_metadata = (
-                        existing_region.get("metadata")
-                        if existing_region is not None
-                        else {}
-                    )
-                    if not isinstance(existing_metadata, dict):
-                        existing_metadata = {}
-                    reserved_existing_candidate = self._uvm_expert_reserved_candidate(
+                    residency_metadata = self._uvm_expert_weight_residency_metadata(
                         layer_id=layer_id,
                         global_expert_id=global_expert_id,
-                        metadata=existing_metadata,
-                        existing_state=existing_state,
+                        local_expert_id=local_expert_id,
+                        role=role,
+                        ptr=ptr,
+                        size_bytes=size_bytes,
+                        active_this_step=True,
+                        source_action="reserved_fast_gate_restore",
                     )
-                    last_evict_step = existing_metadata.get("last_evict_step")
-                    if (
-                        isinstance(last_evict_step, int)
-                        and self._uvm_moe_trace_step >= last_evict_step
-                        and (
-                            self.uvm_residency_weight_evict_protect_recent_steps <= 0
-                            or self._uvm_moe_trace_step - last_evict_step
-                            <= self.uvm_residency_weight_evict_protect_recent_steps
-                        )
-                    ):
-                        reaccess_after_evict_records += 1
-                    self._uvm_weight_recent_active_region_steps[region_id] = (
-                        self._uvm_moe_trace_step
-                    )
-                    already_resident = (
-                        existing_estimated_gpu
-                        or existing_state in ("gpu", "prefetching_gpu")
-                    )
-                    if (
-                        self.uvm_weight_prefetch_skip_resident
-                        and already_resident
-                        and not reserved_existing_candidate
-                    ):
-                        resident_skip_records += 1
-                        continue
-                    if existing_state in ("cpu", "unknown", "evicted_cpu"):
-                        cpu_unknown_region_records += 1
-                    cooldown_steps = self.uvm_weight_prefetch_region_cooldown_steps
-                    last_prefetch_step = self._uvm_weight_last_prefetch_step.get(
-                        region_id
-                    )
-                    if (
-                        cooldown_steps > 0
-                        and last_prefetch_step is not None
-                        and self._uvm_moe_trace_step - last_prefetch_step
-                        <= cooldown_steps
-                        and not reserved_existing_candidate
-                    ):
-                        cooldown_skip_records += 1
-                        continue
-                    residency_metadata = (
-                        self._uvm_expert_weight_residency_metadata(
-                            layer_id=layer_id,
-                            global_expert_id=global_expert_id,
-                            local_expert_id=local_expert_id,
-                            role=role,
-                            ptr=ptr,
-                            size_bytes=size_bytes,
-                            active_this_step=True,
-                            source_action="prefetch",
-                        )
-                    )
-                    reserved_candidate = reserved_existing_candidate
-                    if reserved_candidate:
-                        residency_metadata = {
-                            **residency_metadata,
-                            "placement": "CPU_OFFLOADED_RESERVED",
-                            "cpu_offloaded_reserved": True,
-                            "driver_tag_skip": bool(
-                                self.uvm_expert_envelope_enable
-                            ),
-                            "driver_tag_skip_reason": (
-                                self._uvm_expert_envelope_skip_reason()
-                                if self.uvm_expert_envelope_enable
-                                else None
-                            ),
-                            "driver_flags": (
-                                int(residency_metadata.get("driver_flags") or 0)
-                                | (1 << 14)
-                            ),
-                            "existing_state": existing_state,
-                        }
-                    else:
-                        residency_metadata = {
-                            **residency_metadata,
-                            "placement": "GPU_RESIDENT",
-                            "existing_state": existing_state,
-                        }
-                    ensure_cold_candidates_registered()
+                    residency_metadata = {
+                        **residency_metadata,
+                        "placement": "CPU_OFFLOADED_RESERVED",
+                        "cpu_offloaded_reserved": True,
+                        "driver_tag_skip": bool(self.uvm_expert_envelope_enable),
+                        "driver_tag_skip_reason": (
+                            self._uvm_expert_envelope_skip_reason()
+                            if self.uvm_expert_envelope_enable
+                            else None
+                        ),
+                        "driver_flags": (
+                            int(residency_metadata.get("driver_flags") or 0)
+                            | (1 << 14)
+                        ),
+                        "existing_state": existing_state,
+                    }
                     register_uvm_residency_region(
                         pool="weights",
                         region_id=region_id,
@@ -8942,316 +6578,48 @@ class FusedMoE(CustomOp):
                         step=self._uvm_moe_trace_step,
                         metadata=residency_metadata,
                     )
-                    residency_decision = request_uvm_gpu_residency(
-                        pool="weights",
-                        region_id=region_id,
-                        bytes=size_bytes,
-                        scope_key=(
-                            f"moe_step:{os.getpid()}:"
-                            f"{self._uvm_moe_trace_step}"
-                        ),
-                        active_region_ids=get_active_region_ids(),
-                        metadata=residency_metadata,
-                    )
-                    if (
-                        self.uvm_residency_weight_enforce_hot_set
-                        and not residency_decision.allowed
-                    ):
-                        self._offload_uvm_residency_weight_victims(
-                            victims=residency_decision.victims,
-                            active_region_ids=get_active_region_ids(),
-                            reason_region_id=region_id,
-                            scope_key=residency_decision.scope_key,
-                        )
-                        residency_decision = request_uvm_gpu_residency(
-                            pool="weights",
-                            region_id=region_id,
-                            bytes=size_bytes,
-                            scope_key=(
-                                f"moe_step:{os.getpid()}:"
-                                f"{self._uvm_moe_trace_step}:retry"
-                            ),
-                            active_region_ids=get_active_region_ids(),
-                            metadata={
-                                **residency_metadata,
-                                "retry_after_victim_offload": True,
-                            },
-                        )
-                    if (
-                        self.uvm_residency_weight_enforce_hot_set
-                        and not residency_decision.allowed
-                    ):
-                        rejected_records += 1
-                        record_uvm_residency_action(
-                            action="residency_weight_hot_prefetch_skipped",
-                            pool="weights",
-                            region_id=region_id,
-                            bytes=size_bytes,
-                            metadata={
-                                **residency_metadata,
-                                "reason": residency_decision.reason,
-                            },
-                            would_deny=residency_decision.would_deny,
-                            victims=list(residency_decision.victims),
-                        )
-                        self._append_uvm_weight_prefetch_trace(
-                            {
-                                "timestamp": time.time(),
-                                "pid": os.getpid(),
-                                "layer_name": self.layer_name,
-                                "step": self._uvm_moe_trace_step,
-                            "mode": self.uvm_weight_prefetch_mode,
-                            "prefetch_source": self.uvm_weight_prefetch_source,
-                            "action": "residency_deny_skip_prefetch",
-                                "role": role,
-                                "residency_region_id": region_id,
-                                "residency_allowed": residency_decision.allowed,
-                                "residency_would_deny": (
-                                    residency_decision.would_deny
-                                ),
-                                "residency_reason": residency_decision.reason,
-                                "residency_victims": list(
-                                    residency_decision.victims
-                                ),
-                                "global_expert_id": global_expert_id,
-                                "local_expert_id": local_expert_id,
-                                "ptr": f"0x{ptr:x}",
-                                "bytes": size_bytes,
-                                **self._uvm_driver_capability_trace_fields(
-                                    residency_metadata
-                                ),
-                            }
-                        )
-                        continue
-                    if (
-                        self.uvm_weight_prefetch_skip_resident
-                        and residency_decision.reason
-                        == "already_estimated_gpu_resident"
-                    ):
-                        resident_skip_records += 1
-                        continue
-                    attempted_bytes += size_bytes
-                    if (
-                        self.uvm_weight_prefetch_max_bytes_per_step > 0
-                        and issued_bytes + size_bytes
-                        > self.uvm_weight_prefetch_max_bytes_per_step
-                    ):
-                        rejected_records += 1
-                        self._append_uvm_weight_prefetch_trace(
-                            {
-                                "timestamp": time.time(),
-                                "pid": os.getpid(),
-                                "layer_name": self.layer_name,
-                                "step": self._uvm_moe_trace_step,
-                            "mode": self.uvm_weight_prefetch_mode,
-                            "prefetch_source": self.uvm_weight_prefetch_source,
-                            "action": "budget_reject",
-                                "role": role,
-                                "residency_region_id": region_id,
-                                "residency_allowed": residency_decision.allowed,
-                                "residency_would_deny": (
-                                    residency_decision.would_deny
-                                ),
-                                "residency_reason": residency_decision.reason,
-                                "residency_victims": list(
-                                    residency_decision.victims
-                                ),
-                                "global_expert_id": global_expert_id,
-                                "local_expert_id": local_expert_id,
-                                "ptr": f"0x{ptr:x}",
-                                "bytes": size_bytes,
-                                **self._uvm_driver_capability_trace_fields(
-                                    residency_metadata
-                                ),
-                                "issued_bytes_before": issued_bytes,
-                                "max_bytes_per_step": (
-                                    self.uvm_weight_prefetch_max_bytes_per_step
-                                ),
-                            }
-                        )
-                        continue
 
-                    action = "trace_prefetch_candidate"
-                    success = False
-                    coordinator_decision = request_uvm_pool_action(
-                        pool="weights",
-                        action="expert_prefetch_gpu",
-                        requested_bytes=size_bytes,
-                        scope_key=f"moe_step:{os.getpid()}:{self._uvm_moe_trace_step}",
-                        metadata={
-                            "stage": "stage_i",
-                            "stage_l1_residency_region_id": region_id,
-                            "layer_name": self.layer_name,
-                            "role": role,
-                            "global_expert_id": global_expert_id,
-                            "local_expert_id": local_expert_id,
-                            "mode": self.uvm_weight_prefetch_mode,
-                            "prefetch_source": self.uvm_weight_prefetch_source,
-                        },
-                    )
-                    if not coordinator_decision.allowed:
-                        rejected_records += 1
-                        coordinator_reject_records += 1
-                        self._append_uvm_weight_prefetch_trace(
-                            {
-                                "timestamp": time.time(),
-                                "pid": os.getpid(),
-                                "layer_name": self.layer_name,
-                                "step": self._uvm_moe_trace_step,
-                                "mode": self.uvm_weight_prefetch_mode,
-                                "prefetch_source": self.uvm_weight_prefetch_source,
-                                "action": "coordinator_reject",
-                                "role": role,
-                                "residency_region_id": region_id,
-                                "residency_allowed": residency_decision.allowed,
-                                "residency_would_deny": (
-                                    residency_decision.would_deny
-                                ),
-                                "residency_reason": residency_decision.reason,
-                                "residency_victims": list(
-                                    residency_decision.victims
-                                ),
-                                "global_expert_id": global_expert_id,
-                                "local_expert_id": local_expert_id,
-                                "ptr": f"0x{ptr:x}",
-                                "bytes": size_bytes,
-                                **self._uvm_driver_capability_trace_fields(
-                                    residency_metadata
-                                ),
-                                "pool": coordinator_decision.pool,
-                                "coordinator_mode": coordinator_decision.mode,
-                                "coordinator_reason": coordinator_decision.reason,
-                            }
-                        )
-                        continue
-                    if (
-                        self.uvm_weight_batch_executor_enable
-                        and self.uvm_weight_prefetch_mode == "prefetch"
-                    ):
+                    item = {
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "layer_name": self.layer_name,
+                        "step": self._uvm_moe_trace_step,
+                        "mode": self.uvm_weight_prefetch_mode,
+                        "prefetch_source": "reserved_fast_gate",
+                        "role": role,
+                        "layer_id": layer_id,
+                        "residency_region_id": region_id,
+                        "global_expert_id": global_expert_id,
+                        "local_expert_id": local_expert_id,
+                        "ptr": ptr,
+                        "bytes": size_bytes,
+                        **self._uvm_driver_capability_trace_fields(
+                            residency_metadata
+                        ),
+                        "device": device,
+                        "residency_metadata": residency_metadata,
+                    }
+                    if self.uvm_weight_prefetch_mode == "prefetch":
                         issued_records += 1
                         issued_bytes += size_bytes
-                        self._uvm_weight_last_prefetch_step[region_id] = (
-                            self._uvm_moe_trace_step
-                        )
-                        batch_prefetch_items.append(
+                        batch_prefetch_items.append(item)
+                    else:
+                        trace_candidate_records += 1
+                        self._append_uvm_weight_prefetch_trace(
                             {
-                                "timestamp": time.time(),
-                                "pid": os.getpid(),
-                                "layer_name": self.layer_name,
-                                "step": self._uvm_moe_trace_step,
-                                "mode": self.uvm_weight_prefetch_mode,
-                                "prefetch_source": (
-                                    self.uvm_weight_prefetch_source
-                                ),
-                                "role": role,
-                                "layer_id": layer_id,
-                                "residency_region_id": region_id,
-                                "residency_allowed": (
-                                    residency_decision.allowed
-                                ),
-                                "residency_would_deny": (
-                                    residency_decision.would_deny
-                                ),
-                                "residency_reason": (
-                                    residency_decision.reason
-                                ),
-                                "residency_victims": list(
-                                    residency_decision.victims
-                                ),
-                                "global_expert_id": global_expert_id,
-                                "local_expert_id": local_expert_id,
-                                "ptr": ptr,
-                                "bytes": size_bytes,
-                                **self._uvm_driver_capability_trace_fields(
-                                    residency_metadata
-                                ),
-                                "device": device,
-                                "coordinator_allowed": (
-                                    coordinator_decision.allowed
-                                ),
-                                "coordinator_would_deny": (
-                                    coordinator_decision.would_deny
-                                ),
-                                "coordinator_reason": (
-                                    coordinator_decision.reason
-                                ),
-                                "residency_metadata": residency_metadata,
+                                **{
+                                    key: value
+                                    for key, value in item.items()
+                                    if key != "residency_metadata"
+                                },
+                                "ptr": f"0x{ptr:x}",
+                                "action": "reserved_prefetch_trace_candidate",
+                                "success": False,
                             }
                         )
-                        continue
-                    if self.uvm_weight_prefetch_mode == "prefetch":
-                        success = prefetch_range_to_device(ptr, size_bytes, device)
-                        action = "prefetch_issued" if success else "prefetch_skipped"
-                        if success:
-                            mark_uvm_residency_state(
-                                region_id=region_id,
-                                state="prefetching_gpu",
-                                metadata=residency_metadata,
-                            )
-                            self._uvm_update_weight_expert_role_cache(
-                                layer_id=layer_id,
-                                global_expert_id=global_expert_id,
-                                role=role,
-                                state="prefetching_gpu",
-                                estimated_gpu_resident=True,
-                            )
-                            self._record_uvm_weight_prefetch_issue(
-                                region_id=region_id,
-                                layer_id=layer_id,
-                                global_expert_id=global_expert_id,
-                                local_expert_id=local_expert_id,
-                                role=role,
-                                ptr=ptr,
-                                size_bytes=size_bytes,
-                                device=device,
-                            )
-
-                    issued_records += 1
-                    issued_bytes += size_bytes
-                    self._uvm_weight_last_prefetch_step[region_id] = (
-                        self._uvm_moe_trace_step
-                    )
-                    self._append_uvm_weight_prefetch_trace(
-                        {
-                            "timestamp": time.time(),
-                            "pid": os.getpid(),
-                            "layer_name": self.layer_name,
-                            "step": self._uvm_moe_trace_step,
-                            "mode": self.uvm_weight_prefetch_mode,
-                            "prefetch_source": self.uvm_weight_prefetch_source,
-                            "action": action,
-                            "role": role,
-                            "residency_region_id": region_id,
-                            "residency_allowed": residency_decision.allowed,
-                            "residency_would_deny": (
-                                residency_decision.would_deny
-                            ),
-                            "residency_reason": residency_decision.reason,
-                            "residency_victims": list(
-                                residency_decision.victims
-                            ),
-                            "global_expert_id": global_expert_id,
-                            "local_expert_id": local_expert_id,
-                            "ptr": f"0x{ptr:x}",
-                            "bytes": size_bytes,
-                            **self._uvm_driver_capability_trace_fields(
-                                residency_metadata
-                            ),
-                            "device": device,
-                            "success": success,
-                            "coordinator_allowed": coordinator_decision.allowed,
-                            "coordinator_would_deny": (
-                                coordinator_decision.would_deny
-                            ),
-                            "coordinator_reason": coordinator_decision.reason,
-                        }
-                    )
 
             reserved_batch_stats: dict[str, object] = {}
-            if (
-                batch_prefetch_items
-                and self.uvm_weight_executor == "expert_reserved_regions_async"
-            ):
+            if batch_prefetch_items:
                 reserved_batch_stats = self._run_uvm_expert_reserved_prefetch_batch(
                     batch_prefetch_items=batch_prefetch_items,
                     device=device,
@@ -9264,83 +6632,12 @@ class FusedMoE(CustomOp):
                     reserved_batch_stats=reserved_batch_stats,
                     batch_prefetch_items=batch_prefetch_items,
                 )
-            elif batch_prefetch_items:
-                ranges = [
-                    (int(item["ptr"]), int(item["bytes"]))
-                    for item in batch_prefetch_items
-                ]
-                (
-                    batch_successes,
-                    executor_used,
-                    driver_result,
-                ) = batch_prefetch_ranges_to_device_with_executor(
-                    ranges,
-                    device,
-                    executor=self.uvm_weight_executor,
-                )
-                for batch_index, item in enumerate(batch_prefetch_items):
-                    success = batch_index < batch_successes
-                    action = "prefetch_issued" if success else "prefetch_skipped"
-                    if success:
-                        mark_uvm_residency_state(
-                            region_id=str(item["residency_region_id"]),
-                            state="prefetching_gpu",
-                            metadata={
-                                **cast(dict[str, object], item["residency_metadata"]),
-                                "executor": executor_used,
-                            },
-                        )
-                        self._uvm_update_weight_expert_role_cache(
-                            layer_id=cast(int | None, item.get("layer_id")),
-                            global_expert_id=int(item["global_expert_id"]),
-                            role=str(item["role"]),
-                            state="prefetching_gpu",
-                            estimated_gpu_resident=True,
-                        )
-                        self._record_uvm_weight_prefetch_issue(
-                            region_id=str(item["residency_region_id"]),
-                            layer_id=cast(int | None, item.get("layer_id")),
-                            global_expert_id=int(item["global_expert_id"]),
-                            local_expert_id=int(item["local_expert_id"]),
-                            role=str(item["role"]),
-                            ptr=int(item["ptr"]),
-                            size_bytes=int(item["bytes"]),
-                            device=device,
-                            executor=executor_used,
-                        )
-                    self._append_uvm_weight_prefetch_trace(
-                        {
-                            **{
-                                key: value
-                                for key, value in item.items()
-                                if key != "residency_metadata"
-                            },
-                            "action": action,
-                            "ptr": f"0x{int(item['ptr']):x}",
-                            "success": success,
-                            "executor": executor_used,
-                            "requested_executor": self.uvm_weight_executor,
-                            "driver_result": driver_result,
-                            "batch_index": batch_index,
-                            "batch_size": len(batch_prefetch_items),
-                            "batch_successes": batch_successes,
-                        }
-                    )
 
-            evict_active_region_ids = (
-                get_active_region_ids()
-                if self.uvm_residency_weight_active_evict_enable
-                else set()
-            )
             if (
                 issued_records
-                or rejected_records
+                or trace_candidate_records
                 or candidate_expert_records
-                or expert_resident_skip_records
                 or candidate_region_records
-                or resident_skip_records
-                or cooldown_skip_records
-                or oracle_stats
                 or prefetch_hit_stats
             ):
                 self._append_uvm_weight_prefetch_trace(
@@ -9350,312 +6647,35 @@ class FusedMoE(CustomOp):
                         "layer_name": self.layer_name,
                         "step": self._uvm_moe_trace_step,
                         "mode": self.uvm_weight_prefetch_mode,
-                        "prefetch_source": self.uvm_weight_prefetch_source,
-                        "action": "step_summary",
-                        "active_global_experts": [
-                            global_expert_id for global_expert_id, _ in expert_pairs
+                        "prefetch_source": "reserved_fast_gate",
+                        "action": "reserved_fast_gate_step_summary",
+                        "active_global_experts": sorted(
+                            all_active_global_experts
+                        ),
+                        "requested_reserved_global_experts": [
+                            global_expert_id
+                            for global_expert_id, _ in expert_pairs
                         ],
-                        "active_local_experts": [
+                        "requested_reserved_local_experts": [
                             local_expert_id for _, local_expert_id in expert_pairs
                         ],
                         "issued_records": issued_records,
                         "issued_bytes": issued_bytes,
                         "attempted_bytes": attempted_bytes,
-                        "budget_reject_records": rejected_records,
+                        "trace_candidate_records": trace_candidate_records,
                         "candidate_expert_records": candidate_expert_records,
-                        "expert_resident_skip_records": (
-                            expert_resident_skip_records
-                        ),
-                        "expert_expanded_records": expert_expanded_records,
                         "candidate_region_records": candidate_region_records,
-                        "resident_skip_records": resident_skip_records,
-                        "cooldown_skip_records": cooldown_skip_records,
-                        "cpu_unknown_region_records": cpu_unknown_region_records,
-                        "coordinator_reject_records": coordinator_reject_records,
-                        "reaccess_after_evict_records": (
-                            reaccess_after_evict_records
-                        ),
-                        "active_region_ids_build_records": (
-                            active_region_ids_build_records
-                        ),
-                        "active_region_id_records": active_region_id_records,
-                        "cold_candidate_register_calls": (
-                            cold_candidate_register_calls
-                        ),
-                        "cold_candidate_register_records": (
-                            cold_candidate_register_records
-                        ),
                         **reserved_batch_stats,
                         **prefetch_hit_stats,
-                        **oracle_stats,
-                        "max_bytes_per_step": (
-                            self.uvm_weight_prefetch_max_bytes_per_step
-                        ),
                     }
                 )
-            self._evict_uvm_non_active_expert_weights(
-                layer_id=layer_id,
-                active_global_experts=all_active_global_experts,
-                active_region_ids=evict_active_region_ids,
-                scope_key=f"moe_step:{os.getpid()}:{self._uvm_moe_trace_step}",
-            )
         except Exception:
-            logger.debug("Failed to run UVM expert prefetch", exc_info=True)
+            logger.debug("Failed to run UVM reserved expert restore", exc_info=True)
             if (
                 self.uvm_expert_reserved_enable
                 and self.uvm_expert_reserved_fail_fast
             ):
                 raise
-
-    def _maybe_offload_uvm_cold_expert_weights(self, topk_ids: torch.Tensor) -> None:
-        if not self.uvm_weight_offload_enable:
-            return
-        if (
-            self.uvm_weight_router_topk_every_n_steps > 1
-            and (self._uvm_moe_trace_step % self.uvm_weight_router_topk_every_n_steps) != 0
-        ):
-            return
-        self._refresh_uvm_weight_action_plans()
-        if not self.uvm_weight_offload_plan_keys:
-            return
-        try:
-            layer_id = self._uvm_layer_id()
-            if layer_id is None:
-                return
-            active_global_experts = {
-                global_expert_id
-                for global_expert_id, _ in self._uvm_active_expert_pairs(topk_ids)
-            }
-            expert_pairs = [
-                (global_expert_id, local_expert_id)
-                for global_expert_id, local_expert_id in self._uvm_plan_local_experts(
-                    self.uvm_weight_offload_plan_keys
-                )
-                if (layer_id, global_expert_id)
-                not in self._uvm_weight_offload_completed_keys
-                and global_expert_id not in active_global_experts
-            ]
-            if self.uvm_weight_offload_max_experts_per_layer > 0:
-                expert_pairs = expert_pairs[
-                    : self.uvm_weight_offload_max_experts_per_layer
-                ]
-            if not expert_pairs:
-                return
-
-            issued_records = 0
-            attempted_bytes = 0
-            issued_bytes = 0
-            rejected_records = 0
-
-            for global_expert_id, local_expert_id in expert_pairs:
-                expert_issued = False
-                for role, ptr, size_bytes in self._uvm_expert_weight_slices(
-                    local_expert_id,
-                    self.uvm_weight_offload_target_roles,
-                ):
-                    region_id = self._uvm_expert_weight_region_id(
-                        layer_id,
-                        global_expert_id,
-                        role,
-                    )
-                    residency_metadata = (
-                        self._uvm_expert_weight_residency_metadata(
-                            layer_id=layer_id,
-                            global_expert_id=global_expert_id,
-                            local_expert_id=local_expert_id,
-                            role=role,
-                            ptr=ptr,
-                            size_bytes=size_bytes,
-                            active_this_step=False,
-                            source_action="offload",
-                        )
-                    )
-                    existing_region = get_uvm_residency_region_snapshot(region_id)
-                    register_uvm_residency_region(
-                        pool="weights",
-                        region_id=region_id,
-                        ptr=ptr,
-                        bytes=size_bytes,
-                        state=(
-                            str(existing_region.get("state"))
-                            if existing_region is not None
-                            else "gpu"
-                        ),
-                        evictable=True,
-                        active=False,
-                        metadata=residency_metadata,
-                    )
-                    attempted_bytes += size_bytes
-                    if (
-                        self.uvm_weight_offload_max_bytes_per_step > 0
-                        and issued_bytes + size_bytes
-                        > self.uvm_weight_offload_max_bytes_per_step
-                    ):
-                        rejected_records += 1
-                        self._append_uvm_weight_prefetch_trace(
-                            {
-                                "timestamp": time.time(),
-                                "pid": os.getpid(),
-                                "layer_name": self.layer_name,
-                                "step": self._uvm_moe_trace_step,
-                                "mode": self.uvm_weight_offload_mode,
-                                "action": "offload_budget_reject",
-                                "role": role,
-                                "residency_region_id": region_id,
-                                "global_expert_id": global_expert_id,
-                                "local_expert_id": local_expert_id,
-                                "ptr": f"0x{ptr:x}",
-                                "bytes": size_bytes,
-                                **self._uvm_driver_capability_trace_fields(
-                                    residency_metadata
-                                ),
-                                "issued_bytes_before": issued_bytes,
-                                "max_bytes_per_step": (
-                                    self.uvm_weight_offload_max_bytes_per_step
-                                ),
-                            }
-                        )
-                        continue
-
-                    action = "trace_offload_candidate"
-                    success = False
-                    coordinator_decision = request_uvm_pool_action(
-                        pool="weights",
-                        action=f"expert_{self.uvm_weight_offload_mode}",
-                        requested_bytes=size_bytes,
-                        scope_key=f"moe_step:{os.getpid()}:{self._uvm_moe_trace_step}",
-                        metadata={
-                            "stage": "stage_i",
-                            "stage_l1_residency_region_id": region_id,
-                            "layer_name": self.layer_name,
-                            "role": role,
-                            "global_expert_id": global_expert_id,
-                            "local_expert_id": local_expert_id,
-                            "mode": self.uvm_weight_offload_mode,
-                        },
-                    )
-                    if not coordinator_decision.allowed:
-                        rejected_records += 1
-                        self._append_uvm_weight_prefetch_trace(
-                            {
-                                "timestamp": time.time(),
-                                "pid": os.getpid(),
-                                "layer_name": self.layer_name,
-                                "step": self._uvm_moe_trace_step,
-                                "mode": self.uvm_weight_offload_mode,
-                                "action": "offload_coordinator_reject",
-                                "role": role,
-                                "residency_region_id": region_id,
-                                "global_expert_id": global_expert_id,
-                                "local_expert_id": local_expert_id,
-                                "ptr": f"0x{ptr:x}",
-                                "bytes": size_bytes,
-                                **self._uvm_driver_capability_trace_fields(
-                                    residency_metadata
-                                ),
-                                "pool": coordinator_decision.pool,
-                                "coordinator_mode": coordinator_decision.mode,
-                                "coordinator_reason": coordinator_decision.reason,
-                            }
-                        )
-                        continue
-                    if self.uvm_weight_offload_mode == "advise_cpu":
-                        success = advise_range_preferred_location(ptr, size_bytes, -1)
-                        action = (
-                            "offload_advise_cpu_issued"
-                            if success
-                            else "offload_skipped"
-                        )
-                    elif self.uvm_weight_offload_mode == "prefetch_cpu":
-                        success = offload_range_to_cpu(
-                            ptr,
-                            size_bytes,
-                            sync=False,
-                        )
-                        action = (
-                            "offload_prefetch_cpu_issued"
-                            if success
-                            else "offload_skipped"
-                        )
-                    if success:
-                        next_state = (
-                            "cpu"
-                            if self.uvm_residency_weight_sync_offload
-                            else "prefetching_cpu"
-                        )
-                        mark_uvm_residency_state(
-                            region_id=region_id,
-                            state=next_state,
-                            metadata=residency_metadata,
-                        )
-                        self._uvm_update_weight_expert_role_cache(
-                            layer_id=layer_id,
-                            global_expert_id=global_expert_id,
-                            role=role,
-                            state=next_state,
-                            estimated_gpu_resident=False,
-                        )
-
-                    issued_records += 1
-                    issued_bytes += size_bytes
-                    expert_issued = True
-                    self._append_uvm_weight_prefetch_trace(
-                        {
-                            "timestamp": time.time(),
-                            "pid": os.getpid(),
-                            "layer_name": self.layer_name,
-                            "step": self._uvm_moe_trace_step,
-                            "mode": self.uvm_weight_offload_mode,
-                            "action": action,
-                            "role": role,
-                            "residency_region_id": region_id,
-                            "global_expert_id": global_expert_id,
-                            "local_expert_id": local_expert_id,
-                            "ptr": f"0x{ptr:x}",
-                            "bytes": size_bytes,
-                            **self._uvm_driver_capability_trace_fields(
-                                residency_metadata
-                            ),
-                            "device": -1,
-                            "success": success,
-                            "coordinator_allowed": coordinator_decision.allowed,
-                            "coordinator_would_deny": (
-                                coordinator_decision.would_deny
-                            ),
-                            "coordinator_reason": coordinator_decision.reason,
-                        }
-                    )
-                if expert_issued:
-                    self._uvm_weight_offload_completed_keys.add(
-                        (layer_id, global_expert_id)
-                    )
-
-            if issued_records or rejected_records:
-                self._append_uvm_weight_prefetch_trace(
-                    {
-                        "timestamp": time.time(),
-                        "pid": os.getpid(),
-                        "layer_name": self.layer_name,
-                        "step": self._uvm_moe_trace_step,
-                        "mode": self.uvm_weight_offload_mode,
-                        "action": "offload_step_summary",
-                        "offload_global_experts": [
-                            global_expert_id for global_expert_id, _ in expert_pairs
-                        ],
-                        "offload_local_experts": [
-                            local_expert_id for _, local_expert_id in expert_pairs
-                        ],
-                        "issued_records": issued_records,
-                        "issued_bytes": issued_bytes,
-                        "attempted_bytes": attempted_bytes,
-                        "budget_reject_records": rejected_records,
-                        "max_bytes_per_step": (
-                            self.uvm_weight_offload_max_bytes_per_step
-                        ),
-                    }
-                )
-        except Exception:
-            logger.debug("Failed to run UVM expert offload", exc_info=True)
 
     def must_reduce_shared_expert_outputs(self) -> bool:
         """

@@ -14,22 +14,16 @@ import threading
 import time
 from typing import Any
 
-import torch
-
 from vllm.logger import init_logger
 from vllm.device_allocator.uvm_pool_coordinator import (
     record_uvm_pool_pressure,
     request_uvm_pool_action,
 )
-from vllm.device_allocator.uvm_policy_runtime import get_uvm_policy_runtime
 from vllm.device_allocator.uvm import (
-    batch_prefetch_ranges_to_cpu,
-    batch_prefetch_ranges_to_device,
-    driver_batch_query_ranges_residency_bytes,
-    prefetch_range_to_cpu,
-    prefetch_range_to_device,
-    probe_driver_capable_range,
+    batch_offload_ranges_to_cpu_with_executor,
+    batch_prefetch_ranges_to_device_with_executor,
 )
+from vllm.device_allocator.uvm_policy_runtime import get_uvm_policy_runtime
 from vllm.device_allocator.uvm_pool_residency import (
     get_uvm_residency_region_snapshot,
     get_uvm_pool_residency_manager,
@@ -48,6 +42,188 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
 
+_KV_PHYSICAL_RANGE_LOCK = threading.Lock()
+_KV_PHYSICAL_RANGE_RECORDS: dict[tuple[int, str, int, int], dict[str, Any]] = {}
+
+
+def _coalesce_block_ids(block_ids: list[int]) -> list[tuple[int, int]]:
+    ids = sorted({int(block_id) for block_id in block_ids if int(block_id) > 0})
+    if not ids:
+        return []
+    ranges: list[tuple[int, int]] = []
+    start = prev = ids[0]
+    for block_id in ids[1:]:
+        if block_id == prev + 1:
+            prev = block_id
+            continue
+        ranges.append((start, prev))
+        start = prev = block_id
+    ranges.append((start, prev))
+    return ranges
+
+
+def register_uvm_kv_cache_physical_ranges(
+    records: list[dict[str, Any]],
+    *,
+    clear_existing: bool = False,
+) -> dict[str, Any]:
+    """Register physical KV tensor spans used to derive block VA ranges."""
+    valid_records: list[dict[str, Any]] = []
+    skipped = 0
+    for record in records:
+        try:
+            group_id = int(record.get("group_id", -1))
+            tensor_index = int(record.get("tensor_index", 0))
+            ptr = int(record.get("ptr") or 0)
+            size_bytes = int(record.get("size_bytes") or 0)
+            page_size = int(record.get("page_size") or 0)
+            total_blocks = int(record.get("total_blocks") or 0)
+            layer_name = str(record.get("layer_name") or "")
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if (
+            group_id < 0
+            or not layer_name
+            or ptr <= 0
+            or size_bytes <= 0
+            or page_size <= 0
+            or total_blocks <= 0
+        ):
+            skipped += 1
+            continue
+        allocation_blocks = size_bytes // page_size
+        max_block_id = min(total_blocks, allocation_blocks - 1)
+        if max_block_id <= 0:
+            skipped += 1
+            continue
+        valid = {
+            **record,
+            "group_id": group_id,
+            "layer_name": layer_name,
+            "tensor_index": tensor_index,
+            "ptr": ptr,
+            "size_bytes": size_bytes,
+            "page_size": page_size,
+            "total_blocks": total_blocks,
+            "allocation_blocks": allocation_blocks,
+            "max_block_id": max_block_id,
+        }
+        valid_records.append(valid)
+
+    with _KV_PHYSICAL_RANGE_LOCK:
+        if clear_existing:
+            _KV_PHYSICAL_RANGE_RECORDS.clear()
+        for record in valid_records:
+            key = (
+                int(record["group_id"]),
+                str(record["layer_name"]),
+                int(record["tensor_index"]),
+                int(record["ptr"]),
+            )
+            _KV_PHYSICAL_RANGE_RECORDS[key] = record
+
+    manager = get_uvm_pool_residency_manager()
+    if manager.active:
+        for record in valid_records:
+            region_id = (
+                f"kv_phys:{record['group_id']}:{record['layer_name']}:"
+                f"{record['tensor_index']}"
+            )
+            register_uvm_residency_region(
+                pool="kv",
+                region_id=region_id,
+                ptr=int(record["ptr"]),
+                bytes=int(record["size_bytes"]),
+                state="gpu",
+                evictable=True,
+                active=False,
+                metadata={
+                    "stage": "stage_l5_physical",
+                    "source": "kv_cache_physical_range_map",
+                    "group_id": int(record["group_id"]),
+                    "layer_name": str(record["layer_name"]),
+                    "tensor_index": int(record["tensor_index"]),
+                    "page_size": int(record["page_size"]),
+                    "total_blocks": int(record["total_blocks"]),
+                    "max_block_id": int(record["max_block_id"]),
+                    "block_addressable": True,
+                    "metadata_only": False,
+                },
+            )
+
+    return {
+        "registered": len(valid_records),
+        "skipped": skipped,
+        "clear_existing": bool(clear_existing),
+    }
+
+
+def collect_uvm_kv_cache_physical_ranges_for_blocks(
+    block_ids: list[int],
+) -> dict[str, Any]:
+    """Collect deduplicated physical ranges covering the given KV block ids."""
+    intervals = _coalesce_block_ids(block_ids)
+    if not intervals:
+        return {
+            "ok": True,
+            "reason": "no_blocks",
+            "ranges": [],
+            "range_records": [],
+            "registered_spans": 0,
+        }
+
+    with _KV_PHYSICAL_RANGE_LOCK:
+        records = list(_KV_PHYSICAL_RANGE_RECORDS.values())
+
+    ranges: list[tuple[int, int]] = []
+    range_records: list[dict[str, Any]] = []
+    seen_ranges: set[tuple[int, int]] = set()
+    for record in records:
+        ptr = int(record["ptr"])
+        page_size = int(record["page_size"])
+        max_block_id = int(record["max_block_id"])
+        for first_block, last_block in intervals:
+            first = max(int(first_block), 1)
+            last = min(int(last_block), max_block_id)
+            if first > last:
+                continue
+            range_ptr = ptr + first * page_size
+            range_bytes = (last - first + 1) * page_size
+            range_key = (range_ptr, range_bytes)
+            if range_key in seen_ranges:
+                continue
+            seen_ranges.add(range_key)
+            ranges.append(range_key)
+            range_records.append(
+                {
+                    "group_id": int(record["group_id"]),
+                    "layer_name": str(record["layer_name"]),
+                    "tensor_index": int(record["tensor_index"]),
+                    "ptr": f"0x{range_ptr:x}",
+                    "ptr_int": range_ptr,
+                    "bytes": range_bytes,
+                    "page_size": page_size,
+                    "first_block": first,
+                    "last_block": last,
+                }
+            )
+
+    return {
+        "ok": True,
+        "reason": "ranges_collected" if ranges else "no_registered_ranges",
+        "requested_block_count": len({int(block_id) for block_id in block_ids}),
+        "block_intervals": [
+            {"first_block": first, "last_block": last}
+            for first, last in intervals
+        ],
+        "registered_spans": len(records),
+        "range_count": len(ranges),
+        "range_bytes": sum(size for _, size in ranges),
+        "ranges": ranges,
+        "range_records": range_records,
+    }
+
 
 def _read_bool_env(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -65,39 +241,6 @@ def _read_int_env(name: str, default: int = 0) -> int:
     except ValueError:
         logger.warning("Ignoring invalid %s=%r; expected non-negative integer.", name, raw)
         return default
-
-
-def _maybe_sync_after_kv_physical_prefetch(device: int) -> dict[str, Any]:
-    if not _read_bool_env("VLLM_UVM_KV_PHYSICAL_PREFETCH_SYNC", False):
-        return {
-            "post_prefetch_sync_requested": False,
-            "post_prefetch_sync_success": None,
-            "post_prefetch_sync_elapsed_ms": None,
-            "post_prefetch_sync_error": None,
-        }
-    start_ns = time.monotonic_ns()
-    try:
-        if device >= 0:
-            torch.cuda.synchronize(device)
-        else:
-            torch.cuda.synchronize()
-    except Exception as exc:  # pragma: no cover - diagnostic path
-        return {
-            "post_prefetch_sync_requested": True,
-            "post_prefetch_sync_success": False,
-            "post_prefetch_sync_elapsed_ms": (
-                time.monotonic_ns() - start_ns
-            ) / 1_000_000.0,
-            "post_prefetch_sync_error": repr(exc),
-        }
-    return {
-        "post_prefetch_sync_requested": True,
-        "post_prefetch_sync_success": True,
-        "post_prefetch_sync_elapsed_ms": (
-            time.monotonic_ns() - start_ns
-        ) / 1_000_000.0,
-        "post_prefetch_sync_error": None,
-    }
 
 
 def _read_mode_env() -> str:
@@ -120,14 +263,6 @@ def _read_action_mode_env(name: str, default: str, choices: set[str]) -> str:
     return mode
 
 
-def _read_choice_env(name: str, default: str, choices: set[str]) -> str:
-    value = os.environ.get(name, default).strip().lower()
-    if value not in choices:
-        logger.warning("Ignoring invalid %s=%r; using %s.", name, value, default)
-        return default
-    return value
-
-
 def _block_hash_to_text(block_hash: Any) -> str | None:
     if block_hash is None:
         return None
@@ -140,21 +275,30 @@ class UvmKvRuntimePolicy:
     """Trace-only or soft-admission Stage J policy for KV block pressure."""
 
     def __init__(self, kv_cache_config: KVCacheConfig) -> None:
-        self.enabled = _read_bool_env("VLLM_UVM_KV_RUNTIME_ENABLE", False)
+        post_warmup_target = (
+            os.environ.get("VLLM_UVM_KV_POST_WARMUP_TARGET_BLOCKS", "")
+            or os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_POST_STAGE_M_TARGET_BLOCKS", "")
+        ).strip()
+        placement_stage = (
+            os.environ.get(
+                "VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE",
+                "post_warmup",
+            )
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        automatic_post_warmup_pool = bool(post_warmup_target) and placement_stage in (
+            "post_warmup",
+            "after_warmup",
+            "deferred",
+        )
+        self.enabled = _read_bool_env(
+            "VLLM_UVM_KV_RUNTIME_ENABLE",
+            automatic_post_warmup_pool,
+        )
         self.mode = _read_mode_env()
         self.trace_file = os.environ.get("VLLM_UVM_KV_RUNTIME_TRACE_FILE", "")
-        self.physical_trace_file = os.environ.get(
-            "VLLM_UVM_KV_PHYSICAL_TRACE_FILE", ""
-        )
-        self.physical_trace_fsync = _read_bool_env(
-            "VLLM_UVM_KV_PHYSICAL_TRACE_FSYNC", True
-        )
-        self.physical_trace_residency = _read_bool_env(
-            "VLLM_UVM_KV_PHYSICAL_TRACE_RESIDENCY", True
-        )
-        self.physical_trace_managed_probe = _read_bool_env(
-            "VLLM_UVM_KV_PHYSICAL_TRACE_MANAGED_PROBE", True
-        )
         self.policy = os.environ.get(
             "VLLM_UVM_KV_RUNTIME_EVICTION_POLICY", "lru_prefix_cache"
         ).strip().lower()
@@ -169,46 +313,7 @@ class UvmKvRuntimePolicy:
         )
         self.stage_l5_metadata_enable = _read_bool_env(
             "VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE",
-            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") in ("stage_l5", "stage_l6"),
-        )
-        self.stage_l6_data_offload_enable = _read_bool_env(
-            "VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE",
-            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l6",
-        )
-        self.stage_l6_prefetch_back_enable = _read_bool_env(
-            "VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_ENABLE",
-            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l6",
-        )
-        self.stage_l6_pointer_tag_enable = _read_bool_env(
-            "VLLM_UVM_RESIDENCY_KV_POINTER_TAG_ENABLE",
-            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l6"
-            and (
-                _read_bool_env("VLLM_UVM_RESIDENCY_TAG_ONLY", False)
-                or _read_bool_env("VLLM_UVM_DRIVER_TAG_ENABLE", False)
-            ),
-        )
-        self.stage_n_allocator_kv_driver_tag_enable = _read_bool_env(
-            "VLLM_UVM_DRIVER_KV_TAG_ENABLE",
-            False,
-        )
-        self.stage_l6_force_driver_tag = _read_bool_env(
-            "VLLM_UVM_RESIDENCY_KV_FORCE_DRIVER_TAG",
-            False,
-        )
-        self.stage_l6_pointer_tag_granularity = _read_choice_env(
-            "VLLM_UVM_RESIDENCY_KV_POINTER_TAG_GRANULARITY",
-            "tensor",
-            {"tensor", "range"},
-        )
-        self.stage_l6_data_offload_mode = _read_action_mode_env(
-            "VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_MODE",
-            "trace_only",
-            {"trace_only", "prefetch_cpu"},
-        )
-        self.stage_l6_prefetch_back_mode = _read_action_mode_env(
-            "VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_MODE",
-            "trace_only",
-            {"trace_only", "prefetch"},
+            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l5",
         )
         self.active_protect_enable = _read_bool_env(
             "VLLM_UVM_KV_ACTIVE_PROTECT_ENABLE",
@@ -223,31 +328,15 @@ class UvmKvRuntimePolicy:
             "VLLM_UVM_KV_ACTIVE_PROTECT_MAX_BLOCKS", 0
         )
         try:
-            self.stage_l6_device = int(
-                os.environ.get("VLLM_UVM_RESIDENCY_KV_PREFETCH_DEVICE", "0") or 0
-            )
-        except ValueError:
-            logger.warning(
-                "Ignoring invalid VLLM_UVM_RESIDENCY_KV_PREFETCH_DEVICE; using 0."
-            )
-            self.stage_l6_device = 0
-        try:
             self.active_protect_device = int(
                 os.environ.get("VLLM_UVM_KV_ACTIVE_PROTECT_DEVICE",
-                               str(self.stage_l6_device)) or self.stage_l6_device
+                               "0") or 0
             )
         except ValueError:
             logger.warning(
-                "Ignoring invalid VLLM_UVM_KV_ACTIVE_PROTECT_DEVICE; using %d.",
-                self.stage_l6_device,
+                "Ignoring invalid VLLM_UVM_KV_ACTIVE_PROTECT_DEVICE; using 0."
             )
-            self.active_protect_device = self.stage_l6_device
-        self.stage_l6_max_offload_blocks = _read_int_env(
-            "VLLM_UVM_RESIDENCY_KV_MAX_OFFLOAD_BLOCKS_PER_STEP", 0
-        )
-        self.stage_l6_pointer_map_file = os.environ.get(
-            "VLLM_UVM_RESIDENCY_KV_POINTER_MAP_FILE", ""
-        )
+            self.active_protect_device = 0
         self.prefer_gpu_resident_free_blocks = _read_bool_env(
             "VLLM_UVM_KV_PREFER_GPU_RESIDENT_FREE_BLOCKS",
             False,
@@ -256,8 +345,6 @@ class UvmKvRuntimePolicy:
             "VLLM_UVM_KV_PREFER_GPU_RESIDENT_ALLOW_CACHED",
             False,
         )
-        self._stage_l6_pointer_map_loaded = False
-        self._stage_l6_pointer_ranges: dict[str, list[tuple[int, int]]] = {}
         self.budget_bytes = _read_int_env("VLLM_UVM_KV_RUNTIME_BUDGET_BYTES", 0)
         budget_blocks_override = _read_int_env(
             "VLLM_UVM_KV_RUNTIME_BUDGET_BLOCKS", 0
@@ -283,7 +370,10 @@ class UvmKvRuntimePolicy:
             self.budget_blocks = 0
         self.dynamic_pool_enable = (
             self.enabled
-            and _read_bool_env("VLLM_UVM_KV_DYNAMIC_POOL_ENABLE", False)
+            and _read_bool_env(
+                "VLLM_UVM_KV_DYNAMIC_POOL_ENABLE",
+                automatic_post_warmup_pool,
+            )
         )
         self.dynamic_pool_control_file = os.environ.get(
             "VLLM_UVM_KV_DYNAMIC_POOL_CONTROL_FILE", ""
@@ -296,6 +386,47 @@ class UvmKvRuntimePolicy:
             if self.dynamic_pool_initial_blocks > 0
             else self.total_blocks
         )
+        self.dynamic_pool_physical_migration_enable = (
+            self.dynamic_pool_enable
+            and _read_bool_env(
+                "VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_ENABLE",
+                self.dynamic_pool_enable,
+            )
+        )
+        self.dynamic_pool_physical_migration_executor = os.environ.get(
+            "VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_EXECUTOR",
+            "auto",
+        ).strip().lower()
+        if self.dynamic_pool_physical_migration_executor not in (
+            "auto",
+            "cpp_batch",
+            "driver_batch",
+        ):
+            logger.warning(
+                "Ignoring invalid "
+                "VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_EXECUTOR=%r; "
+                "using auto.",
+                self.dynamic_pool_physical_migration_executor,
+            )
+            self.dynamic_pool_physical_migration_executor = "auto"
+        self.dynamic_pool_physical_migration_sync = _read_bool_env(
+            "VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_SYNC",
+            True,
+        )
+        try:
+            self.dynamic_pool_physical_migration_device = int(
+                os.environ.get(
+                    "VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_DEVICE",
+                    "0",
+                )
+                or 0
+            )
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid "
+                "VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_DEVICE; using 0."
+            )
+            self.dynamic_pool_physical_migration_device = 0
         # The residency ledger starts with all registered KV regions on GPU.
         # Applying the target later lets the initial shrink be traced as a
         # safe, explicit pool-size transition.
@@ -303,7 +434,6 @@ class UvmKvRuntimePolicy:
         self._dynamic_pool_control_mtime_ns: int | None = None
         self._dynamic_pool_generation = 0
         self._dynamic_pool_saved_lifecycle: dict[int, str] = {}
-        self._dynamic_pool_physical_cpu_regions: set[tuple[int, int]] = set()
         if self.policy not in ("lru_prefix_cache", "scheduler_aware"):
             logger.warning(
                 "Ignoring invalid VLLM_UVM_KV_RUNTIME_EVICTION_POLICY=%r; "
@@ -332,12 +462,6 @@ class UvmKvRuntimePolicy:
             "stage_l5_safe_candidate_records": 0,
             "stage_l5_unsafe_candidate_records": 0,
             "stage_l5_data_offload_records": 0,
-            "stage_l6_data_offload_attempt_records": 0,
-            "stage_l6_data_offload_issued_records": 0,
-            "stage_l6_data_offload_fallback_records": 0,
-            "stage_l6_prefetch_back_issued_records": 0,
-            "stage_l6_prefetch_back_fallback_records": 0,
-            "stage_l6_unsafe_offload_records": 0,
             "active_protect_attempt_records": 0,
             "active_protect_issued_records": 0,
             "active_protect_fallback_records": 0,
@@ -347,6 +471,10 @@ class UvmKvRuntimePolicy:
             "dynamic_pool_offload_blocks": 0,
             "dynamic_pool_prefetch_blocks": 0,
             "dynamic_pool_deferred_active_blocks": 0,
+            "dynamic_pool_physical_migration_records": 0,
+            "dynamic_pool_physical_migration_ranges": 0,
+            "dynamic_pool_physical_migration_bytes": 0,
+            "dynamic_pool_physical_migration_successes": 0,
         }
         self._unified_config_recorded = False
 
@@ -369,6 +497,18 @@ class UvmKvRuntimePolicy:
                     "total_blocks": self.total_blocks,
                     "dynamic_pool_enable": self.dynamic_pool_enable,
                     "dynamic_pool_target_blocks": self.dynamic_pool_target_blocks,
+                    "dynamic_pool_physical_migration_enable": (
+                        self.dynamic_pool_physical_migration_enable
+                    ),
+                    "dynamic_pool_physical_migration_executor": (
+                        self.dynamic_pool_physical_migration_executor
+                    ),
+                    "dynamic_pool_physical_migration_sync": (
+                        self.dynamic_pool_physical_migration_sync
+                    ),
+                    "dynamic_pool_physical_migration_device": (
+                        self.dynamic_pool_physical_migration_device
+                    ),
                     "num_kv_cache_groups": self.num_kv_cache_groups,
                 },
             )
@@ -390,24 +530,10 @@ class UvmKvRuntimePolicy:
                 "prefix_evict_enable": self.prefix_evict_enable,
                 "prefix_evict_max_blocks": self.prefix_evict_max_blocks,
                 "stage_l5_metadata_enable": self.stage_l5_metadata_enable,
-                "stage_l6_data_offload_enable": self.stage_l6_data_offload_enable,
-                "stage_l6_prefetch_back_enable": self.stage_l6_prefetch_back_enable,
-                "stage_l6_pointer_tag_enable": self.stage_l6_pointer_tag_enable,
-                "stage_n_allocator_kv_driver_tag_enable": (
-                    self.stage_n_allocator_kv_driver_tag_enable
-                ),
-                "stage_l6_force_driver_tag": self.stage_l6_force_driver_tag,
-                "stage_l6_pointer_tag_granularity": (
-                    self.stage_l6_pointer_tag_granularity
-                ),
-                "stage_l6_data_offload_mode": self.stage_l6_data_offload_mode,
-                "stage_l6_prefetch_back_mode": self.stage_l6_prefetch_back_mode,
                 "active_protect_enable": self.active_protect_enable,
                 "active_protect_mode": self.active_protect_mode,
                 "active_protect_device": self.active_protect_device,
                 "active_protect_max_blocks": self.active_protect_max_blocks,
-                "stage_l6_max_offload_blocks": self.stage_l6_max_offload_blocks,
-                "stage_l6_pointer_map_file": self.stage_l6_pointer_map_file,
                 "prefer_gpu_resident_free_blocks": (
                     self.prefer_gpu_resident_free_blocks
                 ),
@@ -418,6 +544,18 @@ class UvmKvRuntimePolicy:
                 "dynamic_pool_control_file": self.dynamic_pool_control_file,
                 "dynamic_pool_initial_blocks": self.dynamic_pool_initial_blocks,
                 "dynamic_pool_target_blocks": self.dynamic_pool_target_blocks,
+                "dynamic_pool_physical_migration_enable": (
+                    self.dynamic_pool_physical_migration_enable
+                ),
+                "dynamic_pool_physical_migration_executor": (
+                    self.dynamic_pool_physical_migration_executor
+                ),
+                "dynamic_pool_physical_migration_sync": (
+                    self.dynamic_pool_physical_migration_sync
+                ),
+                "dynamic_pool_physical_migration_device": (
+                    self.dynamic_pool_physical_migration_device
+                ),
                 "num_kv_cache_groups": self.num_kv_cache_groups,
             }
         )
@@ -537,7 +675,6 @@ class UvmKvRuntimePolicy:
                 "requested_blocks": block_specs,
             }
         self.record_config()
-        self._maybe_load_stage_l6_pointer_map(reason="unified_control_prefetch")
         records: list[dict[str, Any]] = []
         for spec in block_specs:
             block_id = int(spec.get("block_id") if spec.get("block_id") is not None else -1)
@@ -561,12 +698,19 @@ class UvmKvRuntimePolicy:
             for group_id in group_ids:
                 region_id = f"kv:{group_id}:{block_id}"
                 before = get_uvm_residency_region_snapshot(region_id) or {}
-                self._maybe_prefetch_back_region(
+                mark_uvm_residency_state(
                     region_id=region_id,
-                    block_id=block_id,
-                    group_id=group_id,
-                    reason=reason,
-                    ref_cnt=ref_cnt,
+                    state="gpu",
+                    metadata={
+                        **dict(before.get("metadata") or {}),
+                        "stage": "stage_j",
+                        "source": "unified_control_prefetch",
+                        "reason": reason,
+                        "block_id": block_id,
+                        "group_id": group_id,
+                        "ref_cnt": ref_cnt,
+                        "metadata_only": True,
+                    },
                 )
                 after = get_uvm_residency_region_snapshot(region_id) or {}
                 records.append(
@@ -857,6 +1001,185 @@ class UvmKvRuntimePolicy:
             return int(line)
         return None
 
+    def _migrate_dynamic_pool_physical_blocks(
+        self,
+        *,
+        block_ids: list[int],
+        direction: str,
+        reason: str,
+        old_target: int,
+        new_target: int,
+    ) -> dict[str, Any]:
+        unique_block_ids = sorted(
+            {int(block_id) for block_id in block_ids if block_id > 0}
+        )
+        if not unique_block_ids:
+            return {
+                "ok": True,
+                "reason": "no_blocks",
+                "direction": direction,
+                "block_count": 0,
+            }
+        if not self.dynamic_pool_physical_migration_enable:
+            result = {
+                "ok": False,
+                "reason": "physical_migration_disabled",
+                "direction": direction,
+                "block_count": len(unique_block_ids),
+            }
+            self._write(
+                {
+                    "action": "kv_dynamic_pool_physical_migration_skipped",
+                    **result,
+                    "old_target_blocks": old_target,
+                    "new_target_blocks": new_target,
+                    "source_reason": reason,
+                }
+            )
+            return result
+
+        collection = collect_uvm_kv_cache_physical_ranges_for_blocks(unique_block_ids)
+        ranges = list(collection.get("ranges") or [])
+        if not ranges:
+            result = {
+                "ok": False,
+                "reason": str(collection.get("reason") or "no_registered_ranges"),
+                "direction": direction,
+                "block_count": len(unique_block_ids),
+                "registered_spans": int(collection.get("registered_spans") or 0),
+            }
+            self._write(
+                {
+                    "action": "kv_dynamic_pool_physical_migration_skipped",
+                    **result,
+                    "old_target_blocks": old_target,
+                    "new_target_blocks": new_target,
+                    "source_reason": reason,
+                    "collection": {
+                        key: value
+                        for key, value in collection.items()
+                        if key != "ranges"
+                    },
+                }
+            )
+            return result
+
+        start = time.monotonic()
+        if direction == "shrink":
+            successes, executor_used, advise_result, prefetch_result = (
+                batch_offload_ranges_to_cpu_with_executor(
+                    ranges,
+                    sync=self.dynamic_pool_physical_migration_sync,
+                    executor=self.dynamic_pool_physical_migration_executor,
+                )
+            )
+            driver_result = {
+                "advise_result": advise_result,
+                "prefetch_result": prefetch_result,
+            }
+            state = "cpu"
+            action = "kv_dynamic_pool_physical_offload"
+        else:
+            successes, executor_used, prefetch_result = (
+                batch_prefetch_ranges_to_device_with_executor(
+                    ranges,
+                    self.dynamic_pool_physical_migration_device,
+                    executor=self.dynamic_pool_physical_migration_executor,
+                )
+            )
+            driver_result = {"prefetch_result": prefetch_result}
+            state = "gpu"
+            action = "kv_dynamic_pool_physical_prefetch"
+
+        elapsed = time.monotonic() - start
+        complete = int(successes) == len(ranges)
+        metadata = {
+            "stage": "stage_j",
+            "source": "kv_dynamic_pool_resize",
+            "direction": direction,
+            "reason": reason,
+            "old_target_blocks": old_target,
+            "new_target_blocks": new_target,
+            "physical_migration_requested": True,
+            "physical_migration_issued": int(successes) > 0,
+            "physical_migration_complete": complete,
+            "physical_migration_executor": executor_used,
+            "physical_migration_sync": self.dynamic_pool_physical_migration_sync,
+            "physical_migration_device": (
+                -1
+                if direction == "shrink"
+                else self.dynamic_pool_physical_migration_device
+            ),
+            "range_count": len(ranges),
+            "range_bytes": int(collection.get("range_bytes") or 0),
+            "successes": int(successes),
+            **driver_result,
+        }
+        for block_id in unique_block_ids:
+            for group_id in range(self.num_kv_cache_groups):
+                mark_uvm_residency_state(
+                    region_id=f"kv:{group_id}:{block_id}",
+                    state=state,
+                    metadata={
+                        **metadata,
+                        "group_id": group_id,
+                        "block_id": block_id,
+                    },
+                )
+
+        self._summary["dynamic_pool_physical_migration_records"] += 1
+        self._summary["dynamic_pool_physical_migration_ranges"] += len(ranges)
+        self._summary["dynamic_pool_physical_migration_bytes"] += int(
+            collection.get("range_bytes") or 0
+        )
+        self._summary["dynamic_pool_physical_migration_successes"] += int(successes)
+        record_uvm_residency_action(
+            action=action,
+            pool="kv",
+            region_id=f"kv:dynamic_pool:{direction}:{old_target}:{new_target}",
+            bytes=int(collection.get("range_bytes") or 0),
+            mode=executor_used,
+            range_count=len(ranges),
+            metadata={
+                **metadata,
+                "block_count": len(unique_block_ids),
+                "block_intervals": collection.get("block_intervals"),
+                "range_records": collection.get("range_records"),
+                "elapsed_seconds": elapsed,
+            },
+        )
+        record_unified_residency_snapshot(
+            reason="kv_dynamic_pool_physical_migration",
+            kv_pressure={
+                **metadata,
+                "block_count": len(unique_block_ids),
+                "elapsed_seconds": elapsed,
+            },
+        )
+        result = {
+            "ok": complete,
+            "reason": "complete" if complete else "partial",
+            "direction": direction,
+            "block_count": len(unique_block_ids),
+            "range_count": len(ranges),
+            "range_bytes": int(collection.get("range_bytes") or 0),
+            "successes": int(successes),
+            "executor": executor_used,
+            "elapsed_seconds": elapsed,
+            **driver_result,
+        }
+        self._write(
+            {
+                "action": "kv_dynamic_pool_physical_migration",
+                **result,
+                "old_target_blocks": old_target,
+                "new_target_blocks": new_target,
+                "source_reason": reason,
+                "range_records": collection.get("range_records"),
+            }
+        )
+        return result
+
     def _ensure_dynamic_pool_applied(
         self,
         *,
@@ -888,6 +1211,8 @@ class UvmKvRuntimePolicy:
         prefetched = 0
         skipped_active = 0
         skipped_unsafe = 0
+        physical_offload_block_ids: list[int] = []
+        physical_prefetch_block_ids: list[int] = []
 
         if direction == "shrink":
             for block in free_blocks:
@@ -904,10 +1229,21 @@ class UvmKvRuntimePolicy:
                     new_target=target,
                 ):
                     offloaded += 1
+                    physical_offload_block_ids.append(block_id)
             for block in getattr(block_pool, "blocks", []):
                 block_id = int(getattr(block, "block_id", -1))
-                if target < block_id <= old_target and getattr(block, "ref_cnt", 0) > 0:
+                if (
+                    target < block_id <= old_target
+                    and getattr(block, "ref_cnt", 0) > 0
+                ):
                     skipped_active += 1
+            physical_result = self._migrate_dynamic_pool_physical_blocks(
+                block_ids=physical_offload_block_ids,
+                direction="shrink",
+                reason=reason,
+                old_target=old_target,
+                new_target=target,
+            )
         else:
             for block in free_blocks:
                 block_id = int(getattr(block, "block_id", -1))
@@ -923,10 +1259,21 @@ class UvmKvRuntimePolicy:
                     new_target=target,
                 ):
                     prefetched += 1
+                    physical_prefetch_block_ids.append(block_id)
             for block in getattr(block_pool, "blocks", []):
                 block_id = int(getattr(block, "block_id", -1))
-                if old_target < block_id <= target and getattr(block, "ref_cnt", 0) > 0:
+                if (
+                    old_target < block_id <= target
+                    and getattr(block, "ref_cnt", 0) > 0
+                ):
                     skipped_active += 1
+            physical_result = self._migrate_dynamic_pool_physical_blocks(
+                block_ids=physical_prefetch_block_ids,
+                direction="grow",
+                reason=reason,
+                old_target=old_target,
+                new_target=target,
+            )
 
         self._dynamic_pool_applied_target_blocks = target
         self._summary["dynamic_pool_resize_records"] += 1
@@ -945,6 +1292,7 @@ class UvmKvRuntimePolicy:
                 "deferred_active_blocks": skipped_active,
                 "skipped_unsafe_blocks": skipped_unsafe,
                 "generation": self._dynamic_pool_generation,
+                "physical_migration": physical_result,
             }
         )
         record_unified_residency_snapshot(
@@ -959,6 +1307,7 @@ class UvmKvRuntimePolicy:
                 "skipped_unsafe_blocks": skipped_unsafe,
                 "generation": self._dynamic_pool_generation,
                 "source_reason": reason,
+                "physical_migration": physical_result,
             },
         )
 
@@ -982,38 +1331,22 @@ class UvmKvRuntimePolicy:
         if previous_lifecycle != "cpu_offloaded":
             self._dynamic_pool_saved_lifecycle[block_id] = previous_lifecycle
         block.lifecycle_state = "cpu_offloaded"
-        if self.stage_l6_data_offload_enable:
-            self._maybe_load_stage_l6_pointer_map(
-                reason="dynamic_pool_resize_shrink"
-            )
         issued = False
         for group_id in range(self.num_kv_cache_groups):
             region_id = f"kv:{group_id}:{block_id}"
             snapshot = get_uvm_residency_region_snapshot(region_id)
             snapshot_metadata = dict((snapshot or {}).get("metadata") or {})
-            ranges = self._stage_l6_pointer_ranges.get(region_id) or []
             state = str((snapshot or {}).get("state") or "unknown")
-            ptr = int(
-                (snapshot or {}).get("ptr")
-                or (ranges[0][0] if ranges else 0)
-            )
             size_bytes = int(
                 (snapshot or {}).get("bytes")
-                or sum(range_bytes for _, range_bytes in ranges)
                 or self.bytes_per_group_block
             )
             if state == "cpu":
                 issued = True
                 continue
-            offload_capable = bool(snapshot_metadata.get("offload_capable")) and bool(
-                ranges
-            )
-            physical_requested = (
-                self.stage_l6_data_offload_enable
-                and self.stage_l6_data_offload_mode == "prefetch_cpu"
-            )
             metadata = {
-                "stage": "stage_l6",
+                **snapshot_metadata,
+                "stage": "stage_j",
                 "source": "kv_dynamic_pool_resize",
                 "direction": "shrink",
                 "reason": reason,
@@ -1024,15 +1357,10 @@ class UvmKvRuntimePolicy:
                 "ref_cnt": getattr(block, "ref_cnt", None),
                 "previous_lifecycle_state": previous_lifecycle,
                 "previous_state": state,
-                "offload_capable": offload_capable,
-                "ptr_present": ptr > 0,
-                "range_count": len(ranges),
-                "requested_mode": (
-                    self.stage_l6_data_offload_mode
-                    if self.stage_l6_data_offload_enable
-                    else "logical_dynamic_pool"
+                "requested_mode": "logical_dynamic_pool",
+                "physical_migration_requested": (
+                    self.dynamic_pool_physical_migration_enable
                 ),
-                "physical_migration_requested": physical_requested,
                 "physical_migration_issued": False,
                 "metadata_only": True,
             }
@@ -1043,95 +1371,22 @@ class UvmKvRuntimePolicy:
                 bytes=size_bytes,
                 metadata=metadata,
             )
-            physical_issued = False
-            fallback_reason: str | None = None
-            if physical_requested and offload_capable:
-                mark_uvm_residency_state(
-                    region_id=region_id,
-                    state="prefetching_cpu",
-                    metadata=metadata,
-                )
-                self._record_physical_migration_boundary(
-                    phase="begin",
-                    direction="cpu",
-                    region_id=region_id,
-                    block_id=block_id,
-                    group_id=group_id,
-                    ranges=tuple(ranges),
-                    size_bytes=size_bytes,
-                    old_target=old_target,
-                    new_target=new_target,
-                    metadata=metadata,
-                )
-                start_ns = time.monotonic_ns()
-                accepted_ranges = batch_prefetch_ranges_to_cpu(tuple(ranges))
-                elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000.0
-                metadata = {
-                    **metadata,
-                    **_maybe_sync_after_kv_physical_prefetch(-1),
-                }
-                self._record_physical_migration_boundary(
-                    phase="end",
-                    direction="cpu",
-                    region_id=region_id,
-                    block_id=block_id,
-                    group_id=group_id,
-                    ranges=tuple(ranges),
-                    size_bytes=size_bytes,
-                    old_target=old_target,
-                    new_target=new_target,
-                    metadata=metadata,
-                    accepted_ranges=accepted_ranges,
-                    elapsed_ms=elapsed_ms,
-                )
-                physical_issued = accepted_ranges == len(ranges)
-                if not physical_issued:
-                    fallback_reason = "prefetch_cpu_not_issued"
-            elif physical_requested:
-                fallback_reason = "missing_ptr_or_not_offload_capable"
-            if fallback_reason:
-                record_uvm_residency_action(
-                    action="residency_kv_data_offload_fallback",
-                    pool="kv",
-                    region_id=region_id,
-                    bytes=size_bytes,
-                    fallback_reason=fallback_reason,
-                    metadata={
-                        **metadata,
-                        "fallback_reason": fallback_reason,
-                    },
-                )
-            final_metadata = {
-                **metadata,
-                "fallback_reason": fallback_reason,
-                "physical_migration_issued": physical_issued,
-                "metadata_only": not physical_issued,
-                "physical_migration_accepted_ranges": (
-                    accepted_ranges if physical_requested and offload_capable else 0
-                ),
-            }
-            if physical_issued:
-                self._dynamic_pool_physical_cpu_regions.add((block_id, group_id))
             mark_uvm_residency_state(
                 region_id=region_id,
                 state="cpu",
-                metadata=final_metadata,
+                metadata=metadata,
             )
             record_uvm_residency_action(
                 action="residency_kv_data_offload_issued",
                 pool="kv",
                 region_id=region_id,
                 bytes=size_bytes,
-                mode=(
-                    self.stage_l6_data_offload_mode
-                    if physical_issued
-                    else "logical_dynamic_pool"
-                ),
-                ptr=f"0x{ptr:x}" if ptr > 0 else None,
-                range_count=len(ranges),
-                metadata=final_metadata,
+                mode="logical_dynamic_pool",
+                ptr=None,
+                range_count=0,
+                metadata=metadata,
             )
-            self._summary["stage_l6_data_offload_issued_records"] += 1
+            self._summary["stage_l5_data_offload_records"] += 1
             issued = True
         return issued
 
@@ -1151,42 +1406,22 @@ class UvmKvRuntimePolicy:
         if restored_lifecycle not in ("never_used", "used_free"):
             restored_lifecycle = "used_free"
         block.lifecycle_state = restored_lifecycle
-        if self.stage_l6_prefetch_back_enable:
-            self._maybe_load_stage_l6_pointer_map(
-                reason="dynamic_pool_resize_grow"
-            )
         issued = False
         for group_id in range(self.num_kv_cache_groups):
             region_id = f"kv:{group_id}:{block_id}"
             snapshot = get_uvm_residency_region_snapshot(region_id)
             snapshot_metadata = dict((snapshot or {}).get("metadata") or {})
-            ranges = self._stage_l6_pointer_ranges.get(region_id) or []
             state = str((snapshot or {}).get("state") or "unknown")
-            ptr = int(
-                (snapshot or {}).get("ptr")
-                or (ranges[0][0] if ranges else 0)
-            )
             size_bytes = int(
                 (snapshot or {}).get("bytes")
-                or sum(range_bytes for _, range_bytes in ranges)
                 or self.bytes_per_group_block
             )
-            physical_cpu_tracked = (
-                block_id,
-                group_id,
-            ) in self._dynamic_pool_physical_cpu_regions
-            if state == "gpu" and not physical_cpu_tracked:
+            if state == "gpu":
                 issued = True
                 continue
-            offload_capable = bool(snapshot_metadata.get("offload_capable")) and bool(
-                ranges
-            )
-            physical_requested = (
-                self.stage_l6_prefetch_back_enable
-                and self.stage_l6_prefetch_back_mode == "prefetch"
-            )
             metadata = {
-                "stage": "stage_l6",
+                **snapshot_metadata,
+                "stage": "stage_j",
                 "source": "kv_dynamic_pool_resize",
                 "direction": "grow",
                 "reason": reason,
@@ -1197,16 +1432,10 @@ class UvmKvRuntimePolicy:
                 "ref_cnt": getattr(block, "ref_cnt", None),
                 "restored_lifecycle_state": restored_lifecycle,
                 "previous_state": state,
-                "physical_cpu_tracked": physical_cpu_tracked,
-                "offload_capable": offload_capable,
-                "ptr_present": ptr > 0,
-                "range_count": len(ranges),
-                "requested_mode": (
-                    self.stage_l6_prefetch_back_mode
-                    if self.stage_l6_prefetch_back_enable
-                    else "logical_dynamic_pool"
+                "requested_mode": "logical_dynamic_pool",
+                "physical_migration_requested": (
+                    self.dynamic_pool_physical_migration_enable
                 ),
-                "physical_migration_requested": physical_requested,
                 "physical_migration_issued": False,
                 "metadata_only": True,
             }
@@ -1222,92 +1451,21 @@ class UvmKvRuntimePolicy:
                 state="prefetching_gpu",
                 metadata=metadata,
             )
-            physical_issued = False
-            fallback_reason: str | None = None
-            accepted_ranges = 0
-            if physical_requested and offload_capable:
-                self._record_physical_migration_boundary(
-                    phase="begin",
-                    direction="gpu",
-                    region_id=region_id,
-                    block_id=block_id,
-                    group_id=group_id,
-                    ranges=tuple(ranges),
-                    size_bytes=size_bytes,
-                    old_target=old_target,
-                    new_target=new_target,
-                    metadata=metadata,
-                )
-                start_ns = time.monotonic_ns()
-                accepted_ranges = batch_prefetch_ranges_to_device(
-                    tuple(ranges),
-                    device=self.stage_l6_device,
-                )
-                elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000.0
-                metadata = {
-                    **metadata,
-                    **_maybe_sync_after_kv_physical_prefetch(self.stage_l6_device),
-                }
-                self._record_physical_migration_boundary(
-                    phase="end",
-                    direction="gpu",
-                    region_id=region_id,
-                    block_id=block_id,
-                    group_id=group_id,
-                    ranges=tuple(ranges),
-                    size_bytes=size_bytes,
-                    old_target=old_target,
-                    new_target=new_target,
-                    metadata=metadata,
-                    accepted_ranges=accepted_ranges,
-                    elapsed_ms=elapsed_ms,
-                )
-                physical_issued = accepted_ranges == len(ranges)
-                if not physical_issued:
-                    fallback_reason = "prefetch_gpu_not_issued"
-            elif physical_requested:
-                fallback_reason = "missing_ptr_or_not_offload_capable"
-            if fallback_reason:
-                record_uvm_residency_action(
-                    action="residency_kv_prefetch_back_fallback",
-                    pool="kv",
-                    region_id=region_id,
-                    bytes=size_bytes,
-                    fallback_reason=fallback_reason,
-                    metadata={
-                        **metadata,
-                        "fallback_reason": fallback_reason,
-                    },
-                )
-            final_metadata = {
-                **metadata,
-                "fallback_reason": fallback_reason,
-                "physical_migration_issued": physical_issued,
-                "physical_migration_accepted_ranges": accepted_ranges,
-                "metadata_only": not physical_issued,
-            }
-            if physical_issued:
-                self._dynamic_pool_physical_cpu_regions.discard((block_id, group_id))
             mark_uvm_residency_state(
                 region_id=region_id,
                 state="gpu",
-                metadata=final_metadata,
+                metadata=metadata,
             )
             record_uvm_residency_action(
                 action="residency_kv_prefetch_back_issued",
                 pool="kv",
                 region_id=region_id,
                 bytes=size_bytes,
-                mode=(
-                    self.stage_l6_prefetch_back_mode
-                    if physical_issued
-                    else "logical_dynamic_pool"
-                ),
-                ptr=f"0x{ptr:x}" if ptr > 0 else None,
-                range_count=len(ranges),
-                metadata=final_metadata,
+                mode="logical_dynamic_pool",
+                ptr=None,
+                range_count=0,
+                metadata=metadata,
             )
-            self._summary["stage_l6_prefetch_back_issued_records"] += 1
             issued = True
         return issued
 
@@ -1331,8 +1489,8 @@ class UvmKvRuntimePolicy:
     def register_stage_l5_kv_blocks(self, block_pool: Any) -> None:
         """Register KV block metadata in Stage L residency.
 
-        L6 reuses the same block metadata registration and upgrades individual
-        regions to offload_capable later if raw KV pointers become available.
+        The post-warmup path handles physical KV migration directly from the
+        model runner; the runtime policy keeps only scheduler-side metadata.
         """
         if not self.active or not self.stage_l5_metadata_enable:
             return
@@ -1373,7 +1531,7 @@ class UvmKvRuntimePolicy:
                             getattr(block, "block_hash", None)
                         ),
                         "offload_capable": False,
-                        "metadata_only": not self.stage_l6_data_offload_enable,
+                        "metadata_only": True,
                     },
                 )
                 total_registered += 1
@@ -1388,392 +1546,6 @@ class UvmKvRuntimePolicy:
                 "data_offload_issued": False,
             }
         )
-        self._maybe_load_stage_l6_pointer_map(reason="after_stage_l5_metadata")
-
-    def register_stage_l6_kv_pointer_map(
-        self,
-        kv_pointer_map: dict[tuple[int, int], tuple[int, int]],
-        *,
-        source: str = "kv_pointer_map",
-        register_driver_regions: bool | None = None,
-    ) -> None:
-        """Upgrade registered KV regions with raw pointer ranges when available."""
-        if not self.active:
-            return
-        if not get_uvm_pool_residency_manager().active:
-            return
-        if register_driver_regions is None:
-            register_driver_regions = self.stage_l6_data_offload_enable
-        allocator_driver_tag_skip = (
-            self.stage_n_allocator_kv_driver_tag_enable
-            and not self.stage_l6_force_driver_tag
-            and bool(register_driver_regions)
-        )
-        if allocator_driver_tag_skip:
-            register_driver_regions = False
-        registered = 0
-        driver_regions_skipped = 0
-        for (group_id, block_id), (ptr, size_bytes) in kv_pointer_map.items():
-            if ptr <= 0 or size_bytes <= 0:
-                continue
-            self._stage_l6_pointer_ranges[f"kv:{group_id}:{block_id}"] = [
-                (int(ptr), int(size_bytes))
-            ]
-            if not register_driver_regions:
-                if allocator_driver_tag_skip:
-                    driver_regions_skipped += 1
-                registered += 1
-                continue
-            register_uvm_residency_region(
-                pool="kv",
-                region_id=f"kv:{group_id}:{block_id}",
-                ptr=int(ptr),
-                bytes=int(size_bytes),
-                state="gpu",
-                evictable=True,
-                active=False,
-                metadata={
-                    "stage": "stage_l6",
-                    "source": source,
-                    "group_id": group_id,
-                    "block_id": block_id,
-                    "bytes_per_block": int(size_bytes),
-                    "offload_capable": True,
-                    "metadata_only": False,
-                    "range_count": 1,
-                },
-            )
-            registered += 1
-        self._write(
-            {
-                "action": "stage_l6_kv_pointer_map_registered",
-                "registered_regions": registered,
-                "driver_region_records": registered if register_driver_regions else 0,
-                "driver_pointer_tags_skipped": driver_regions_skipped,
-                "driver_pointer_tag_skip_reason": (
-                    "allocator_kv_driver_tag_enable"
-                    if allocator_driver_tag_skip
-                    else None
-                ),
-                "allocator_kv_driver_tag_enable": (
-                    self.stage_n_allocator_kv_driver_tag_enable
-                ),
-                "force_driver_tag": self.stage_l6_force_driver_tag,
-                "data_offload_capable": registered > 0,
-                "pointer_tag_enable": self.stage_l6_pointer_tag_enable,
-                "data_offload_enable": self.stage_l6_data_offload_enable,
-            }
-        )
-
-    def _maybe_load_stage_l6_pointer_map(self, *, reason: str = "unspecified") -> None:
-        if self._stage_l6_pointer_map_loaded:
-            return
-        self._stage_l6_pointer_map_loaded = True
-        if (
-            not self.enabled
-            or not (
-                self.stage_l6_pointer_tag_enable
-                or self.stage_l6_data_offload_enable
-                or (
-                    self.active_protect_enable
-                    and self.active_protect_mode != "trace_only"
-                )
-            )
-            or not self.stage_l6_pointer_map_file
-        ):
-            return
-        path = self.stage_l6_pointer_map_file
-        if not os.path.exists(path):
-            self._stage_l6_pointer_map_loaded = False
-            self._write(
-                {
-                    "action": "stage_l6_kv_pointer_map_load_deferred",
-                    "path": path,
-                    "reason": reason,
-                    "deferred_reason": "file_not_found",
-                }
-            )
-            return
-        pointer_map: dict[tuple[int, int], tuple[int, int]] = {}
-        range_map: dict[str, list[tuple[int, int]]] = {}
-        bytes_map: dict[str, int] = {}
-        range_metadata_map: dict[str, list[dict[str, Any]]] = {}
-        tensor_spans: dict[str, dict[str, Any]] = {}
-        records_seen = 0
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                for line in handle:
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if record.get("action") != "stage_l6_kv_pointer_map":
-                        continue
-                    records_seen += 1
-                    for item in record.get("blocks") or []:
-                        try:
-                            group_id = int(item["group_id"])
-                            block_id = int(item["block_id"])
-                            size_bytes = int(item["bytes"])
-                        except (KeyError, TypeError, ValueError):
-                            continue
-                        ranges: list[tuple[int, int]] = []
-                        range_metadata: list[dict[str, Any]] = []
-                        for raw_range in item.get("ranges") or []:
-                            try:
-                                ptr = int(raw_range["ptr"])
-                                range_bytes = int(raw_range["bytes"])
-                            except (KeyError, TypeError, ValueError):
-                                continue
-                            if ptr > 0 and range_bytes > 0:
-                                ranges.append((ptr, range_bytes))
-                                tensor_name = raw_range.get("tensor_name")
-                                range_metadata.append(
-                                    {
-                                        "ptr": ptr,
-                                        "bytes": range_bytes,
-                                        "tensor_name": tensor_name,
-                                    }
-                                )
-                                if tensor_name:
-                                    span = tensor_spans.setdefault(
-                                        str(tensor_name),
-                                        {
-                                            "start": ptr,
-                                            "end": ptr + range_bytes,
-                                            "range_count": 0,
-                                            "bytes_sum": 0,
-                                        },
-                                    )
-                                    span["start"] = min(int(span["start"]), ptr)
-                                    span["end"] = max(
-                                        int(span["end"]),
-                                        ptr + range_bytes,
-                                    )
-                                    span["range_count"] = int(span["range_count"]) + 1
-                                    span["bytes_sum"] = int(span["bytes_sum"]) + range_bytes
-                        if not ranges:
-                            try:
-                                ptr = int(item["ptr"])
-                            except (KeyError, TypeError, ValueError):
-                                ptr = 0
-                            if ptr > 0 and size_bytes > 0:
-                                ranges.append((ptr, size_bytes))
-                                range_metadata.append(
-                                    {
-                                        "ptr": ptr,
-                                        "bytes": size_bytes,
-                                        "tensor_name": item.get("tensor_name"),
-                                    }
-                                )
-                        if group_id >= 0 and block_id >= 0 and ranges:
-                            region_id = f"kv:{group_id}:{block_id}"
-                            first_ptr = ranges[0][0]
-                            total_bytes = sum(size for _, size in ranges)
-                            pointer_map[(group_id, block_id)] = (first_ptr, total_bytes)
-                            range_map[region_id] = ranges
-                            bytes_map[region_id] = total_bytes
-                            range_metadata_map[region_id] = range_metadata
-        except OSError as exc:
-            self._stage_l6_pointer_map_loaded = False
-            self._write(
-                {
-                    "action": "stage_l6_kv_pointer_map_load_failed",
-                    "path": path,
-                    "reason": reason,
-                    "error": repr(exc),
-                }
-            )
-            return
-        self._write(
-            {
-                "action": "stage_l6_kv_pointer_map_loaded",
-                "path": path,
-                "reason": reason,
-                "records_seen": records_seen,
-                "entries": len(pointer_map),
-                "range_entries": sum(len(ranges) for ranges in range_map.values()),
-                "tensor_span_entries": len(tensor_spans),
-                "pointer_tag_enable": self.stage_l6_pointer_tag_enable,
-                "allocator_kv_driver_tag_enable": (
-                    self.stage_n_allocator_kv_driver_tag_enable
-                ),
-                "force_driver_tag": self.stage_l6_force_driver_tag,
-                "pointer_tag_granularity": self.stage_l6_pointer_tag_granularity,
-                "data_offload_enable": self.stage_l6_data_offload_enable,
-            }
-        )
-        if not pointer_map:
-            self._stage_l6_pointer_map_loaded = False
-            return
-        if pointer_map:
-            allocator_driver_tags = (
-                self.stage_n_allocator_kv_driver_tag_enable
-                and not self.stage_l6_force_driver_tag
-            )
-            self.register_stage_l6_kv_pointer_map(
-                pointer_map,
-                source="kv_pointer_map_contiguous_block",
-                register_driver_regions=(
-                    self.stage_l6_data_offload_enable
-                    and not allocator_driver_tags
-                ),
-            )
-            self._stage_l6_pointer_ranges.update(range_map)
-            driver_range_regions = 0
-            skipped_driver_pointer_regions = 0
-            for region_id, ranges in range_map.items():
-                try:
-                    _, group_id_text, block_id_text = region_id.split(":", 2)
-                    group_id = int(group_id_text)
-                    block_id = int(block_id_text)
-                except ValueError:
-                    continue
-                first_ptr = ranges[0][0]
-                total_bytes = bytes_map.get(region_id, sum(size for _, size in ranges))
-                register_uvm_residency_region(
-                    pool="kv",
-                    region_id=region_id,
-                    ptr=(
-                        first_ptr
-                        if (
-                            self.stage_l6_data_offload_enable
-                            and not allocator_driver_tags
-                        )
-                        else None
-                    ),
-                    bytes=total_bytes,
-                    state="gpu",
-                    evictable=True,
-                    active=False,
-                    metadata={
-                        "stage": "stage_l6",
-                        "source": "kv_pointer_map_logical_block",
-                        "group_id": group_id,
-                        "block_id": block_id,
-                        "bytes_per_block": total_bytes,
-                        "offload_capable": True,
-                        "metadata_only": (
-                            not self.stage_l6_data_offload_enable
-                            or allocator_driver_tags
-                        ),
-                        "driver_range_children": self.stage_l6_pointer_tag_enable,
-                        "allocator_kv_driver_tag": allocator_driver_tags,
-                        "driver_tag_skipped": (
-                            "allocator_kv_driver_tag_enable"
-                            if allocator_driver_tags
-                            else None
-                        ),
-                        "force_driver_tag": self.stage_l6_force_driver_tag,
-                        "range_count": len(ranges),
-                    },
-                )
-                if (
-                    not self.stage_l6_pointer_tag_enable
-                    or self.stage_l6_pointer_tag_granularity != "range"
-                    or allocator_driver_tags
-                ):
-                    if (
-                        allocator_driver_tags
-                        and self.stage_l6_pointer_tag_enable
-                        and self.stage_l6_pointer_tag_granularity == "range"
-                    ):
-                        skipped_driver_pointer_regions += len(ranges)
-                    continue
-                range_metadata = range_metadata_map.get(region_id) or []
-                for range_index, (ptr, range_bytes) in enumerate(ranges):
-                    if ptr <= 0 or range_bytes <= 0:
-                        continue
-                    range_meta = (
-                        range_metadata[range_index]
-                        if range_index < len(range_metadata)
-                        else {}
-                    )
-                    register_uvm_residency_region(
-                        pool="kv",
-                        region_id=f"{region_id}:range:{range_index}",
-                        ptr=int(ptr),
-                        bytes=int(range_bytes),
-                        state="gpu",
-                        evictable=True,
-                        active=False,
-                        metadata={
-                            "stage": "stage_l6",
-                            "source": "kv_pointer_map_range",
-                            "parent_region_id": region_id,
-                            "group_id": group_id,
-                            "block_id": block_id,
-                            "range_index": range_index,
-                            "tensor_name": range_meta.get("tensor_name"),
-                            "bytes_per_block": int(range_bytes),
-                            "logical_block_bytes": total_bytes,
-                            "offload_capable": False,
-                            "metadata_only": False,
-                            "driver_range_child": True,
-                        },
-                    )
-                    driver_range_regions += 1
-            driver_tensor_regions = 0
-            if (
-                self.stage_l6_pointer_tag_enable
-                and self.stage_l6_pointer_tag_granularity == "tensor"
-                and not allocator_driver_tags
-            ):
-                for tensor_index, (tensor_name, span) in enumerate(
-                    sorted(tensor_spans.items())
-                ):
-                    start = int(span.get("start") or 0)
-                    end = int(span.get("end") or 0)
-                    if start <= 0 or end <= start:
-                        continue
-                    register_uvm_residency_region(
-                        pool="kv",
-                        region_id=f"kv:tensor:{tensor_index}",
-                        ptr=start,
-                        bytes=end - start,
-                        state="gpu",
-                        evictable=True,
-                        active=False,
-                        metadata={
-                            "stage": "stage_l6",
-                            "source": "kv_pointer_map_tensor_span",
-                            "tensor_name": tensor_name,
-                            "tensor_index": tensor_index,
-                            "range_count": int(span.get("range_count") or 0),
-                            "bytes_sum": int(span.get("bytes_sum") or 0),
-                            "offload_capable": False,
-                            "metadata_only": False,
-                            "driver_tensor_span": True,
-                        },
-                    )
-                    driver_tensor_regions += 1
-            elif (
-                allocator_driver_tags
-                and self.stage_l6_pointer_tag_enable
-                and self.stage_l6_pointer_tag_granularity == "tensor"
-            ):
-                skipped_driver_pointer_regions += len(tensor_spans)
-            if self.stage_l6_pointer_tag_enable:
-                self._write(
-                    {
-                        "action": "stage_l6_kv_pointer_driver_tags_registered",
-                        "logical_regions": len(range_map),
-                        "granularity": self.stage_l6_pointer_tag_granularity,
-                        "driver_tensor_regions": driver_tensor_regions,
-                        "driver_range_regions": driver_range_regions,
-                        "driver_pointer_tags_skipped": (
-                            skipped_driver_pointer_regions
-                        ),
-                        "driver_pointer_tag_skip_reason": (
-                            "allocator_kv_driver_tag_enable"
-                            if allocator_driver_tags
-                            else None
-                        ),
-                        "allocator_kv_driver_tag_enable": allocator_driver_tags,
-                        "force_driver_tag": self.stage_l6_force_driver_tag,
-                        "data_offload_enable": self.stage_l6_data_offload_enable,
-                    }
-                )
 
     def should_allow_allocation(
         self,
@@ -1797,7 +1569,6 @@ class UvmKvRuntimePolicy:
         )
         if not self.active:
             return True
-        self._maybe_load_stage_l6_pointer_map(reason="allocation_pressure")
         over_budget = bool(pressure["over_budget"])
         record_uvm_pool_pressure(
             pool="kv",
@@ -1849,12 +1620,6 @@ class UvmKvRuntimePolicy:
             self._trace_candidates(
                 request_id=request_id,
                 block_pool=block_pool,
-                reason="runtime_budget_pressure",
-            )
-            self._maybe_execute_stage_l6_safe_offload(
-                request_id=request_id,
-                block_pool=block_pool,
-                pressure=pressure,
                 reason="runtime_budget_pressure",
             )
             self._maybe_execute_prefix_eviction(
@@ -2026,7 +1791,7 @@ class UvmKvRuntimePolicy:
                             "offload_capable": self._kv_region_offload_capable(
                                 group_id, block_id
                             ),
-                            "metadata_only": not self.stage_l6_data_offload_enable,
+                            "metadata_only": True,
                         },
                     )
                     if safe:
@@ -2059,21 +1824,8 @@ class UvmKvRuntimePolicy:
         blocks: list[Any],
         reason: str,
     ) -> None:
-        """Prefetch CPU-resident KV blocks before they are reused."""
-        if not self.active or not self.stage_l6_prefetch_back_enable:
-            return
-        for block in blocks:
-            block_id = int(getattr(block, "block_id", -1))
-            if block_id < 0 or bool(getattr(block, "is_null", False)):
-                continue
-            for group_id in range(self.num_kv_cache_groups):
-                self._maybe_prefetch_back_region(
-                    region_id=f"kv:{group_id}:{block_id}",
-                    block_id=block_id,
-                    group_id=group_id,
-                    reason=reason,
-                    ref_cnt=getattr(block, "ref_cnt", None),
-                )
+        """Keep the block-pool hook for compatibility."""
+        return
 
     def protect_active_blocks(
         self,
@@ -2086,8 +1838,6 @@ class UvmKvRuntimePolicy:
         if not self.active or not self.active_protect_enable:
             return
         self.record_config()
-        if self.active_protect_mode != "trace_only":
-            self._maybe_load_stage_l6_pointer_map()
 
         runtime = get_uvm_policy_runtime()
         if not runtime.active:
@@ -2131,10 +1881,8 @@ class UvmKvRuntimePolicy:
         issued_bytes = 0
         for group_id, block_id, block, region_id in candidates:
             snapshot = get_uvm_residency_region_snapshot(region_id)
-            ranges = self._stage_l6_pointer_ranges.get(region_id)
             size_bytes = int(
                 (snapshot or {}).get("bytes")
-                or sum(size for _, size in (ranges or ()))
                 or self.bytes_per_group_block
             )
             metadata = dict((snapshot or {}).get("metadata") or {})
@@ -2149,14 +1897,14 @@ class UvmKvRuntimePolicy:
                 "ref_cnt": getattr(block, "ref_cnt", None),
                 "is_prefix_cache": getattr(block, "block_hash", None) is not None,
                 "block_hash": _block_hash_to_text(getattr(block, "block_hash", None)),
-                "metadata_only": not bool(ranges),
+                "metadata_only": True,
             }
             result = runtime.protect_kv_region(
                 region_id=region_id,
                 block_id=block_id,
                 group_id=group_id,
                 bytes=size_bytes,
-                ranges=ranges,
+                ranges=None,
                 mode=self.active_protect_mode,
                 device=self.active_protect_device,
                 scope_key=f"kv_active:{request_id}",
@@ -2213,7 +1961,7 @@ class UvmKvRuntimePolicy:
                     safe=safe,
                     reason=reason,
                     metadata={
-                        "stage": "stage_l6" if self.stage_l6_data_offload_enable else "stage_l5",
+                        "stage": "stage_l5",
                         "source": "block_free_lifecycle",
                         "ref_cnt": getattr(block, "ref_cnt", None),
                         "lifecycle_state": self._kv_block_lifecycle_class(block),
@@ -2223,7 +1971,7 @@ class UvmKvRuntimePolicy:
                         "in_free_queue": safe,
                         "block_hash": _block_hash_to_text(getattr(block, "block_hash", None)),
                         "offload_capable": self._kv_region_offload_capable(group_id, block_id),
-                        "metadata_only": not self.stage_l6_data_offload_enable,
+                        "metadata_only": True,
                     },
                 )
 
@@ -2233,377 +1981,6 @@ class UvmKvRuntimePolicy:
             return False
         metadata = snapshot.get("metadata") or {}
         return bool(snapshot.get("ptr")) and bool(metadata.get("offload_capable"))
-
-    def _maybe_execute_stage_l6_safe_offload(
-        self,
-        *,
-        request_id: str,
-        block_pool: Any,
-        pressure: dict[str, Any],
-        reason: str,
-    ) -> None:
-        if not self.stage_l6_data_offload_enable:
-            return
-        self._maybe_load_stage_l6_pointer_map()
-        try:
-            free_blocks = block_pool.free_block_queue.get_all_free_blocks()
-        except Exception as exc:  # pragma: no cover - defensive trace path.
-            self._write(
-                {
-                    "action": "stage_l6_kv_safe_offload_snapshot_failed",
-                    "request_id": request_id,
-                    "reason": reason,
-                    "error": repr(exc),
-                }
-            )
-            return
-        pressure_blocks = int(pressure.get("pressure_blocks") or 0)
-        max_blocks = self.stage_l6_max_offload_blocks or pressure_blocks
-        if max_blocks <= 0:
-            max_blocks = self.candidate_limit
-        attempted_blocks = 0
-        issued_blocks = 0
-        for block in free_blocks:
-            if attempted_blocks >= max_blocks:
-                break
-            block_id = int(getattr(block, "block_id", -1))
-            safe = (
-                block_id >= 0
-                and not bool(getattr(block, "is_null", False))
-                and getattr(block, "ref_cnt", None) == 0
-            )
-            for group_id in range(self.num_kv_cache_groups):
-                if attempted_blocks >= max_blocks:
-                    break
-                attempted_blocks += 1
-                did_issue = self._maybe_offload_region(
-                    region_id=f"kv:{group_id}:{block_id}",
-                    block_id=block_id,
-                    group_id=group_id,
-                    safe=safe,
-                    request_id=request_id,
-                    reason=reason,
-                    block=block,
-                    pressure=pressure,
-                )
-                if did_issue:
-                    issued_blocks += 1
-
-    def _maybe_offload_region(
-        self,
-        *,
-        region_id: str,
-        block_id: int,
-        group_id: int,
-        safe: bool,
-        request_id: str,
-        reason: str,
-        block: Any,
-        pressure: dict[str, Any],
-    ) -> bool:
-        snapshot = get_uvm_residency_region_snapshot(region_id)
-        metadata = dict((snapshot or {}).get("metadata") or {})
-        ptr = int((snapshot or {}).get("ptr") or 0)
-        size_bytes = int((snapshot or {}).get("bytes") or self.bytes_per_group_block)
-        state = str((snapshot or {}).get("state") or "unknown")
-        ranges = self._stage_l6_pointer_ranges.get(region_id)
-        offload_capable = bool(metadata.get("offload_capable")) and bool(ranges)
-        attempt_metadata = {
-            "stage": "stage_l6",
-            "source": "kv_safe_block_offload",
-            "request_id": request_id,
-            "reason": reason,
-            "block_id": block_id,
-            "group_id": group_id,
-            "ref_cnt": getattr(block, "ref_cnt", None),
-            "is_null": getattr(block, "is_null", None),
-            "is_prefix_cache": getattr(block, "block_hash", None) is not None,
-            "in_free_queue": True,
-            "block_hash": _block_hash_to_text(getattr(block, "block_hash", None)),
-            "safe": safe,
-            "offload_capable": offload_capable,
-            "ptr_present": ptr > 0,
-            "range_count": len(ranges or ()),
-            **pressure,
-        }
-        self._summary["stage_l6_data_offload_attempt_records"] += 1
-        record_uvm_residency_action(
-            action="residency_kv_data_offload_attempt",
-            pool="kv",
-            region_id=region_id,
-            bytes=size_bytes,
-            metadata=attempt_metadata,
-        )
-        if not safe:
-            self._summary["stage_l6_unsafe_offload_records"] += 1
-            self._summary["stage_l6_data_offload_fallback_records"] += 1
-            record_uvm_residency_action(
-                action="residency_kv_data_offload_fallback",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                fallback_reason="unsafe_block",
-                metadata=attempt_metadata,
-            )
-            return False
-        if state == "cpu":
-            return True
-        if not offload_capable:
-            self._summary["stage_l6_data_offload_fallback_records"] += 1
-            record_uvm_residency_action(
-                action="residency_kv_data_offload_fallback",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                fallback_reason="missing_ptr_or_not_offload_capable",
-                metadata=attempt_metadata,
-            )
-            return False
-        coordinator_decision = request_uvm_pool_action(
-            pool="kv",
-            action="kv_safe_block_prefetch_cpu",
-            requested_bytes=size_bytes,
-            scope_key=f"kv_request:{request_id}",
-            metadata={
-                "stage": "stage_l7",
-                "source": "kv_safe_block_offload",
-                "request_id": request_id,
-                "region_id": region_id,
-                "block_id": block_id,
-                "group_id": group_id,
-                "range_count": len(ranges or ()),
-                "mode": self.stage_l6_data_offload_mode,
-            },
-        )
-        if not coordinator_decision.allowed:
-            self._summary["stage_l6_data_offload_fallback_records"] += 1
-            record_uvm_residency_action(
-                action="residency_kv_data_offload_fallback",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                fallback_reason="stage_k_coordinator_reject",
-                coordinator_mode=coordinator_decision.mode,
-                coordinator_reason=coordinator_decision.reason,
-                metadata=attempt_metadata,
-            )
-            self._write(
-                {
-                    "action": "stage_l7_kv_offload_coordinator_reject",
-                    "request_id": request_id,
-                    "region_id": region_id,
-                    "requested_bytes": size_bytes,
-                    "coordinator_mode": coordinator_decision.mode,
-                    "coordinator_reason": coordinator_decision.reason,
-                    "scope_key": coordinator_decision.scope_key,
-                }
-            )
-            return False
-        mark_uvm_residency_state(
-            region_id=region_id,
-            state="prefetching_cpu",
-            metadata=attempt_metadata,
-        )
-        issued = self.stage_l6_data_offload_mode == "trace_only"
-        if self.stage_l6_data_offload_mode == "prefetch_cpu":
-            issued = all(
-                prefetch_range_to_cpu(range_ptr, range_bytes)
-                for range_ptr, range_bytes in (ranges or ())
-            )
-        if issued:
-            mark_uvm_residency_state(
-                region_id=region_id,
-                state="cpu",
-                metadata=attempt_metadata,
-            )
-            self._summary["stage_l6_data_offload_issued_records"] += 1
-            record_uvm_residency_action(
-                action="residency_kv_data_offload_issued",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                mode=self.stage_l6_data_offload_mode,
-                ptr=f"0x{ptr:x}",
-                range_count=len(ranges or ()),
-                coordinator_mode=coordinator_decision.mode,
-                coordinator_reason=coordinator_decision.reason,
-                metadata=attempt_metadata,
-            )
-            return True
-        mark_uvm_residency_state(
-            region_id=region_id,
-            state="gpu",
-            metadata=attempt_metadata,
-        )
-        self._summary["stage_l6_data_offload_fallback_records"] += 1
-        record_uvm_residency_action(
-            action="residency_kv_data_offload_fallback",
-            pool="kv",
-            region_id=region_id,
-            bytes=size_bytes,
-            fallback_reason="prefetch_cpu_not_issued",
-            metadata=attempt_metadata,
-        )
-        return False
-
-    def _maybe_prefetch_back_region(
-        self,
-        *,
-        region_id: str,
-        block_id: int,
-        group_id: int,
-        reason: str,
-        ref_cnt: Any,
-    ) -> None:
-        snapshot = get_uvm_residency_region_snapshot(region_id)
-        if not snapshot:
-            return
-        state = str(snapshot.get("state") or "unknown")
-        if state not in ("cpu", "prefetching_cpu"):
-            return
-        ptr = int(snapshot.get("ptr") or 0)
-        size_bytes = int(snapshot.get("bytes") or self.bytes_per_group_block)
-        metadata = dict(snapshot.get("metadata") or {})
-        ranges = self._stage_l6_pointer_ranges.get(region_id)
-        prefetch_metadata = {
-            "stage": "stage_l6",
-            "source": "kv_prefetch_back_before_reuse",
-            "reason": reason,
-            "block_id": block_id,
-            "group_id": group_id,
-            "ref_cnt": ref_cnt,
-            "previous_state": state,
-            "offload_capable": bool(metadata.get("offload_capable")),
-            "ptr_present": ptr > 0,
-            "range_count": len(ranges or ()),
-        }
-        if not ranges or not bool(metadata.get("offload_capable")):
-            self._summary["stage_l6_prefetch_back_fallback_records"] += 1
-            record_uvm_residency_action(
-                action="residency_kv_prefetch_back_fallback",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                fallback_reason="missing_ptr_or_not_offload_capable",
-                metadata=prefetch_metadata,
-            )
-            return
-        coordinator_decision = request_uvm_pool_action(
-            pool="kv",
-            action="kv_block_prefetch_gpu",
-            requested_bytes=size_bytes,
-            scope_key=f"kv_prefetch_back:{region_id}",
-            metadata={
-                "stage": "stage_l7",
-                "source": "kv_prefetch_back_before_reuse",
-                "region_id": region_id,
-                "block_id": block_id,
-                "group_id": group_id,
-                "range_count": len(ranges),
-                "mode": self.stage_l6_prefetch_back_mode,
-            },
-        )
-        if not coordinator_decision.allowed:
-            self._summary["stage_l6_prefetch_back_fallback_records"] += 1
-            record_uvm_residency_action(
-                action="residency_kv_prefetch_back_fallback",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                fallback_reason="stage_k_coordinator_reject",
-                coordinator_mode=coordinator_decision.mode,
-                coordinator_reason=coordinator_decision.reason,
-                metadata=prefetch_metadata,
-            )
-            self._write(
-                {
-                    "action": "stage_l7_kv_prefetch_back_coordinator_reject",
-                    "region_id": region_id,
-                    "requested_bytes": size_bytes,
-                    "coordinator_mode": coordinator_decision.mode,
-                    "coordinator_reason": coordinator_decision.reason,
-                    "scope_key": coordinator_decision.scope_key,
-                }
-            )
-            return
-        mark_uvm_residency_state(
-            region_id=region_id,
-            state="prefetching_gpu",
-            metadata=prefetch_metadata,
-        )
-        issued = self.stage_l6_prefetch_back_mode == "trace_only"
-        accepted_ranges = 0
-        if self.stage_l6_prefetch_back_mode == "prefetch":
-            self._record_physical_migration_boundary(
-                phase="begin",
-                direction="gpu",
-                region_id=region_id,
-                block_id=block_id,
-                group_id=group_id,
-                ranges=tuple(ranges),
-                size_bytes=size_bytes,
-                old_target=0,
-                new_target=0,
-                metadata=prefetch_metadata,
-            )
-            start_ns = time.monotonic_ns()
-            accepted_ranges = batch_prefetch_ranges_to_device(
-                tuple(ranges),
-                device=self.stage_l6_device,
-            )
-            elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000.0
-            self._record_physical_migration_boundary(
-                phase="end",
-                direction="gpu",
-                region_id=region_id,
-                block_id=block_id,
-                group_id=group_id,
-                ranges=tuple(ranges),
-                size_bytes=size_bytes,
-                old_target=0,
-                new_target=0,
-                metadata=prefetch_metadata,
-                accepted_ranges=accepted_ranges,
-                elapsed_ms=elapsed_ms,
-            )
-            issued = accepted_ranges == len(ranges)
-        if issued:
-            mark_uvm_residency_state(
-                region_id=region_id,
-                state="gpu",
-                metadata=prefetch_metadata,
-            )
-            self._summary["stage_l6_prefetch_back_issued_records"] += 1
-            record_uvm_residency_action(
-                action="residency_kv_prefetch_back_issued",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                mode=self.stage_l6_prefetch_back_mode,
-                ptr=f"0x{ptr:x}",
-                range_count=len(ranges),
-                coordinator_mode=coordinator_decision.mode,
-                coordinator_reason=coordinator_decision.reason,
-                metadata={
-                    **prefetch_metadata,
-                    "physical_migration_accepted_ranges": accepted_ranges,
-                },
-            )
-            return
-        mark_uvm_residency_state(
-            region_id=region_id,
-            state="cpu",
-            metadata=prefetch_metadata,
-        )
-        self._summary["stage_l6_prefetch_back_fallback_records"] += 1
-        record_uvm_residency_action(
-            action="residency_kv_prefetch_back_fallback",
-            pool="kv",
-            region_id=region_id,
-            bytes=size_bytes,
-            fallback_reason="prefetch_gpu_not_issued",
-            metadata=prefetch_metadata,
-        )
 
     def _maybe_execute_prefix_eviction(
         self,
@@ -2691,104 +2068,6 @@ class UvmKvRuntimePolicy:
                 **pressure,
             }
         )
-
-    def _record_physical_migration_boundary(
-        self,
-        *,
-        phase: str,
-        direction: str,
-        region_id: str,
-        block_id: int,
-        group_id: int,
-        ranges: tuple[tuple[int, int], ...],
-        size_bytes: int,
-        old_target: int,
-        new_target: int,
-        metadata: dict[str, Any],
-        accepted_ranges: int | None = None,
-        elapsed_ms: float | None = None,
-    ) -> None:
-        if not self.physical_trace_file:
-            return
-
-        managed_probe_count = 0
-        managed_probe_success_count = 0
-        managed_probe_first_failure: dict[str, Any] | None = None
-        if self.physical_trace_managed_probe:
-            for index, (ptr, nbytes) in enumerate(ranges):
-                ok, reason, raw = probe_driver_capable_range(ptr, nbytes)
-                managed_probe_count += 1
-                if ok:
-                    managed_probe_success_count += 1
-                elif managed_probe_first_failure is None:
-                    managed_probe_first_failure = {
-                        "index": index,
-                        "ptr": f"0x{int(ptr):x}",
-                        "bytes": int(nbytes),
-                        "reason": reason,
-                        "raw_result": int(raw),
-                    }
-
-        residency: dict[str, Any] = {}
-        if self.physical_trace_residency and ranges:
-            residency = dict(
-                driver_batch_query_ranges_residency_bytes(
-                    ranges,
-                    device=self.stage_l6_device,
-                )
-            )
-
-        self._write_physical_trace(
-            {
-                "action": "kv_physical_migration_boundary",
-                "phase": phase,
-                "direction": direction,
-                "region_id": region_id,
-                "block_id": int(block_id),
-                "group_id": int(group_id),
-                "range_count": len(ranges),
-                "bytes": int(size_bytes),
-                "old_target_blocks": int(old_target),
-                "new_target_blocks": int(new_target),
-                "accepted_ranges": accepted_ranges,
-                "elapsed_ms": elapsed_ms,
-                "requested_mode": metadata.get("requested_mode"),
-                "previous_state": metadata.get("previous_state"),
-                "ref_cnt": metadata.get("ref_cnt"),
-                "offload_capable": metadata.get("offload_capable"),
-                "ptr_present": metadata.get("ptr_present"),
-                "post_prefetch_sync_requested": metadata.get(
-                    "post_prefetch_sync_requested"
-                ),
-                "post_prefetch_sync_success": metadata.get(
-                    "post_prefetch_sync_success"
-                ),
-                "post_prefetch_sync_elapsed_ms": metadata.get(
-                    "post_prefetch_sync_elapsed_ms"
-                ),
-                "post_prefetch_sync_error": metadata.get(
-                    "post_prefetch_sync_error"
-                ),
-                "managed_probe_count": managed_probe_count,
-                "managed_probe_success_count": managed_probe_success_count,
-                "managed_probe_first_failure": managed_probe_first_failure,
-                "residency": residency,
-            }
-        )
-
-    def _write_physical_trace(self, record: dict[str, Any]) -> None:
-        if not self.physical_trace_file:
-            return
-        record.setdefault("ts", time.time())
-        record.setdefault("stage", "stage_l6")
-        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        with self._lock:
-            os.makedirs(os.path.dirname(self.physical_trace_file) or ".", exist_ok=True)
-            with open(self.physical_trace_file, "a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-                handle.flush()
-                if self.physical_trace_fsync:
-                    os.fsync(handle.fileno())
 
     def _record_summary(self) -> None:
         if not self.active:

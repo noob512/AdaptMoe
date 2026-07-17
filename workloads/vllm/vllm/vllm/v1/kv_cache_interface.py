@@ -402,39 +402,3 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
     kv_cache_groups: list[KVCacheGroupSpec]
-    uvm_kv_budget_bytes: int | None = None
-    """Stage D2: per-worker KV budget applied to this config, if any."""
-    uvm_kv_budget_mode: str | None = None
-    """Stage D2: KV budget mode observed while generating this config."""
-    uvm_kv_budget_enforced: bool = False
-    """Stage D2: whether vLLM semantic KV budget enforcement changed this config."""
-    uvm_kv_budget_original_num_blocks: int | None = None
-    """Stage D2: num_blocks before semantic budget enforcement."""
-    uvm_kv_budget_original_bytes: int | None = None
-    """Stage D2: total KV tensor bytes before semantic budget enforcement."""
-    uvm_kv_budget_final_bytes: int | None = None
-    """Stage D2: total KV tensor bytes after semantic budget enforcement."""
-    uvm_residency_kv_sizing_enabled: bool = False
-    """Stage L4: whether residency KV sizing considered this config."""
-    uvm_residency_kv_sizing_policy: str | None = None
-    """Stage L4: report_only, clamp, or override."""
-    uvm_residency_kv_sizing_applied: bool = False
-    """Stage L4: whether residency sizing changed num_blocks."""
-    uvm_residency_kv_sizing_fallback_reason: str | None = None
-    """Stage L4: fallback reason when sizing could not be applied."""
-    uvm_residency_kv_sizing_original_num_blocks: int | None = None
-    """Stage L4: num_blocks before residency sizing."""
-    uvm_residency_kv_sizing_final_num_blocks: int | None = None
-    """Stage L4: num_blocks after residency sizing."""
-    uvm_residency_kv_sizing_original_bytes: int | None = None
-    """Stage L4: total KV tensor bytes before residency sizing."""
-    uvm_residency_kv_sizing_final_bytes: int | None = None
-    """Stage L4: total KV tensor bytes after residency sizing."""
-    uvm_residency_kv_sizing_budget_bytes: int | None = None
-    """Stage L4: effective KV budget used for block sizing."""
-    uvm_residency_kv_sizing_budget_blocks: int | None = None
-    """Stage L4: budget-derived target block count."""
-    uvm_residency_kv_sizing_bytes_per_block: int | None = None
-    """Stage L4: total KV bytes per block used for sizing."""
-    uvm_residency_kv_sizing_max_blocks: int | None = None
-    """Stage L4: optional max block guard applied to override policy."""

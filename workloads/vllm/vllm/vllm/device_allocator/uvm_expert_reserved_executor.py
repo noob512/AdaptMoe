@@ -28,7 +28,6 @@ from vllm.device_allocator.uvm import (
     UVM_REGION_ROLE_MOE_EXPERT_W2,
     batch_offload_ranges_to_cpu_with_executor,
     batch_prefetch_ranges_to_cpu,
-    driver_expert_reserved_pool_prealloc,
     driver_expert_reserved_pool_query,
     driver_expert_reserved_prefetch_regions,
     driver_query_region,
@@ -332,7 +331,7 @@ class ExpertReservedRegionsExecutor:
             self._registered_regions.pop(int(item.driver_region_id), None)
         return int(status)
 
-    def _ensure_prealloc_locked(self, required_slot_bytes: int) -> dict[str, Any]:
+    def _ensure_preallocated_locked(self, required_slot_bytes: int) -> dict[str, Any]:
         required_slot_bytes = max(int(required_slot_bytes), self.configured_slot_bytes)
         required_slot_bytes = _align_up(required_slot_bytes, _page_size())
         if self.slot_count <= 0 or required_slot_bytes <= 0:
@@ -366,61 +365,31 @@ class ExpertReservedRegionsExecutor:
             if 0 <= slot_id < self.slot_count and slot_bytes >= required_slot_bytes:
                 existing_slots.add(slot_id)
 
-        missing = [
-            {
-                "pool_id": self.pool_id,
-                "slot_id": slot_id,
-                "slot_bytes": required_slot_bytes,
-            }
+        missing_slot_ids = [
+            slot_id
             for slot_id in range(self.slot_count)
             if slot_id not in existing_slots
         ]
-        prealloc_result: dict[str, Any] | None = None
-        if missing:
-            prealloc_result = driver_expert_reserved_pool_prealloc(
-                missing,
-                device=self.device,
-                prefer_existing=True,
-            )
-            if prealloc_result.get("ok") is not True:
-                retry_query = driver_expert_reserved_pool_query(prefer_existing=True)
-                backed = 0
-                for entry in retry_query.get("entries") or []:
-                    try:
-                        if int(entry.get("pool_id", -1)) != self.pool_id:
-                            continue
-                        slot_id = int(entry.get("slot_id", -1))
-                        slot_bytes = int(
-                            entry.get(
-                                "slot_bytes",
-                                entry.get("logical_slot_bytes", 0),
-                            )
-                            or 0
-                        )
-                    except (TypeError, ValueError, AttributeError):
-                        continue
-                    if 0 <= slot_id < self.slot_count and slot_bytes >= required_slot_bytes:
-                        backed += 1
-                if backed < self.slot_count:
-                    return {
-                        "ok": False,
-                        "reason": "prealloc_failed",
-                        "slot_count": self.slot_count,
-                        "slot_bytes": required_slot_bytes,
-                        "query": query,
-                        "prealloc": prealloc_result,
-                        "backed_slots": backed,
-                    }
+        if missing_slot_ids:
+            return {
+                "ok": False,
+                "reason": "slots_not_preallocated",
+                "slot_count": self.slot_count,
+                "slot_bytes": required_slot_bytes,
+                "query": query,
+                "backed_slots": len(existing_slots),
+                "missing_slot_ids": missing_slot_ids,
+                "runtime_lazy_prealloc_enabled": False,
+            }
 
         self.slot_bytes = required_slot_bytes
         self._prealloc_done = True
         return {
             "ok": True,
-            "reason": "preallocated",
+            "reason": "preallocated_verified",
             "slot_count": self.slot_count,
             "slot_bytes": self.slot_bytes,
             "query": query,
-            "prealloc": prealloc_result,
         }
 
     def _wait_for_slot_locked(self, slot: _SlotState) -> bool:
@@ -676,29 +645,29 @@ class ExpertReservedRegionsExecutor:
         bank_reuse_result: dict[str, Any] | None = None
 
         with self._lock:
-            prealloc_start_ns = time.perf_counter_ns()
+            slot_check_start_ns = time.perf_counter_ns()
             _append_debug_trace({
-                "action": "reserved_debug_prealloc_enter",
+                "action": "reserved_debug_preallocated_slot_check_enter",
                 "layer_name": layer_name,
                 "step": int(step),
                 "required_slot_bytes": required_slot_bytes,
                 "slot_count": self.slot_count,
                 "pool_id": self.pool_id,
             })
-            prealloc = self._ensure_prealloc_locked(required_slot_bytes)
+            slot_check = self._ensure_preallocated_locked(required_slot_bytes)
             _append_debug_trace({
-                "action": "reserved_debug_prealloc_exit",
+                "action": "reserved_debug_preallocated_slot_check_exit",
                 "layer_name": layer_name,
                 "step": int(step),
-                "ok": prealloc.get("ok") is True,
-                "reason": prealloc.get("reason"),
+                "ok": slot_check.get("ok") is True,
+                "reason": slot_check.get("reason"),
                 "slot_bytes": self.slot_bytes,
-                "elapsed_us": (time.perf_counter_ns() - prealloc_start_ns) / 1000.0,
+                "elapsed_us": (time.perf_counter_ns() - slot_check_start_ns) / 1000.0,
             })
-            if prealloc.get("ok") is not True:
+            if slot_check.get("ok") is not True:
                 return {
                     "ok": False,
-                    "status": "prealloc_failed",
+                    "status": "preallocated_slot_check_failed",
                     "executor": "expert_reserved_regions_async",
                     "success_count": 0,
                     "failure_count": len(valid_items),
@@ -706,7 +675,8 @@ class ExpertReservedRegionsExecutor:
                     "successful_region_ids": [],
                     "failed_region_ids": [item.region_id for item in valid_items],
                     "driver_result": None,
-                    "prealloc_result": prealloc,
+                    "prealloc_result": slot_check,
+                    "preallocated_slot_check": slot_check,
                     "elapsed_us": (time.perf_counter_ns() - start_ns) / 1000.0,
                 }
 

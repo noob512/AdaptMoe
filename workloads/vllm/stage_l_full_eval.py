@@ -32,7 +32,6 @@ CHECK_SCRIPTS = {
     "l1": "check_stage_l1_success.py",
     "l2": "check_stage_l2_success.py",
     "l3": "check_stage_l3_success.py",
-    "l4": "check_stage_l4_success.py",
     "l5": "check_stage_l5_success.py",
     "l6": "check_stage_l6_success.py",
     "l7": "check_stage_l7_success.py",
@@ -44,7 +43,6 @@ PY_COMPILE_FILES = [
     "check_stage_l1_success.py",
     "check_stage_l2_success.py",
     "check_stage_l3_success.py",
-    "check_stage_l4_success.py",
     "check_stage_l5_success.py",
     "check_stage_l6_success.py",
     "check_stage_l7_success.py",
@@ -109,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-bytes-per-step-list", default="256MiB,512MiB,1GiB")
     parser.add_argument(
         "--gpu-stages",
-        default="l1,l2,l3,l4,l5,l6,l7,l7_cross",
+        default="l1,l2,l3,l5,l6,l7,l7_cross",
         help="Comma-separated stages for gpu-functional.",
     )
     parser.add_argument(
@@ -260,7 +258,7 @@ def build_smoke_variants(run_root: Path, args: argparse.Namespace) -> list[Varia
             kind="static",
         )
     )
-    for stage in ("l0", "l1", "l2", "l3", "l4", "l5", "l6"):
+    for stage in ("l0", "l1", "l2", "l3", "l5", "l6"):
         variants.append(checker_variant(suite="smoke", stage=stage, run_root=run_root, args=args))
     for stage in ("l7", "l7_cross"):
         script = CHECK_SCRIPTS[stage]
@@ -289,8 +287,6 @@ def build_gpu_functional_variants(
             extra = ["--mode", "enforce"]
         elif stage == "l3":
             extra = ["--mode", "enforce", "--scratch-pool-mode", "enforce"]
-        elif stage == "l4":
-            extra = ["--mode", "trace_only", "--kv-sizing-policy", "report_only"]
         elif stage == "l6":
             extra = [
                 "--mode",

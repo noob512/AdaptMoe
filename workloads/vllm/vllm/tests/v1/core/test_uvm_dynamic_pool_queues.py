@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import Any
+
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    make_block_hash_with_group_id,
+)
+
+
+class _FakeDynamicPolicy:
+    def __init__(self, applied_target: int) -> None:
+        self.applied_target = applied_target
+        self.refresh_reasons: list[str] = []
+
+    def dynamic_pool_active(self) -> bool:
+        return True
+
+    def is_block_id_allocatable(self, block_id: int) -> bool:
+        return 0 < block_id <= self.applied_target
+
+    def refresh_dynamic_pool_target(self, block_pool: Any, reason: str) -> None:
+        self.refresh_reasons.append(reason)
+
+    def register_stage_l5_kv_blocks(self, block_pool: Any) -> None:
+        return
+
+    def on_blocks_allocated(self, *, blocks: list[Any], reason: str) -> None:
+        return
+
+    def on_blocks_freed(self, *, blocks: list[Any], reason: str) -> None:
+        return
+
+
+def _ids(queue: Any) -> list[int]:
+    return [block.block_id for block in queue.get_all_free_blocks()]
+
+
+def test_dynamic_pool_partitions_gpu_and_offline_free_queues() -> None:
+    policy = _FakeDynamicPolicy(applied_target=16)
+    pool = BlockPool(
+        num_gpu_blocks=17,
+        enable_caching=False,
+        hash_block_size=16,
+        uvm_kv_runtime_policy=policy,  # type: ignore[arg-type]
+    )
+
+    transition = pool.apply_uvm_dynamic_pool_target(
+        8,
+        old_target_blocks=16,
+    )
+    policy.applied_target = 8
+
+    assert transition["moved_offline"] == 8
+    assert _ids(pool.free_block_queue) == list(range(1, 9))
+    assert _ids(pool.offline_block_queue) == list(range(9, 17))
+    assert pool.get_num_free_blocks() == 8
+
+    block = pool.get_new_blocks(1)[0]
+    assert block.block_id == 1
+    assert block.free_queue_kind is None
+
+    pool.free_blocks([block])
+    assert _ids(pool.free_block_queue) == list(range(2, 9)) + [1]
+    assert _ids(pool.offline_block_queue) == list(range(9, 17))
+
+
+def test_dynamic_pool_grow_promotes_new_gpu_blocks_before_warm_blocks() -> None:
+    policy = _FakeDynamicPolicy(applied_target=16)
+    pool = BlockPool(
+        num_gpu_blocks=17,
+        enable_caching=False,
+        hash_block_size=16,
+        uvm_kv_runtime_policy=policy,  # type: ignore[arg-type]
+    )
+    pool.apply_uvm_dynamic_pool_target(8, old_target_blocks=16)
+    policy.applied_target = 8
+
+    block = pool.get_new_blocks(1)[0]
+    pool.free_blocks([block])
+    assert _ids(pool.free_block_queue)[-1] == 1
+
+    transition = pool.apply_uvm_dynamic_pool_target(10, old_target_blocks=8)
+    policy.applied_target = 10
+
+    assert transition["moved_gpu"] == 2
+    assert _ids(pool.free_block_queue)[:2] == [9, 10]
+    assert pool.blocks[9].lifecycle_state == "never_used"
+    assert pool.blocks[10].lifecycle_state == "never_used"
+    assert _ids(pool.offline_block_queue) == list(range(11, 17))
+
+
+def test_prefix_cache_does_not_return_offline_block() -> None:
+    policy = _FakeDynamicPolicy(applied_target=16)
+    pool = BlockPool(
+        num_gpu_blocks=17,
+        enable_caching=True,
+        hash_block_size=16,
+        uvm_kv_runtime_policy=policy,  # type: ignore[arg-type]
+    )
+    block_hash = BlockHash(b"cached-prefix")
+    cache_key = make_block_hash_with_group_id(block_hash, 0)
+    block = pool.blocks[9]
+    block.block_hash = cache_key
+    pool.cached_block_hash_to_block.insert(cache_key, block)
+
+    pool.apply_uvm_dynamic_pool_target(8, old_target_blocks=16)
+    policy.applied_target = 8
+
+    assert pool.get_cached_block(block_hash, [0]) is None
+
+    pool.apply_uvm_dynamic_pool_target(10, old_target_blocks=8)
+    policy.applied_target = 10
+    assert pool.get_cached_block(block_hash, [0]) == [block]
+    assert policy.refresh_reasons == [
+        "prefix_cache_lookup",
+        "prefix_cache_lookup",
+    ]
+
+
+def test_active_block_freed_after_shrink_enters_offline_queue() -> None:
+    policy = _FakeDynamicPolicy(applied_target=16)
+    pool = BlockPool(
+        num_gpu_blocks=17,
+        enable_caching=False,
+        hash_block_size=16,
+        uvm_kv_runtime_policy=policy,  # type: ignore[arg-type]
+    )
+
+    allocated = pool.get_new_blocks(9)
+    active_tail = allocated[-1]
+    assert active_tail.block_id == 9
+
+    transition = pool.apply_uvm_dynamic_pool_target(8, old_target_blocks=16)
+    policy.applied_target = 8
+
+    assert transition["deferred_active"] == 1
+    assert active_tail.free_queue_kind is None
+    pool.free_blocks([active_tail])
+    assert active_tail.free_queue_kind == "offline"
+    assert _ids(pool.offline_block_queue)[-1] == 9

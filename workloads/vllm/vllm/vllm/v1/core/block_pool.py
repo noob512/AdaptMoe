@@ -163,6 +163,7 @@ class BlockPool:
         # list of free blocks (including eviction candidates when caching is
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.offline_block_queue = FreeKVCacheBlockQueue([])
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -172,6 +173,9 @@ class BlockPool:
         # avoid freeing it.
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
+        self.null_block.free_queue_kind = None
+        for block in self.blocks[1:]:
+            block.free_queue_kind = "gpu"
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
@@ -193,6 +197,14 @@ class BlockPool:
         Returns:
             The cached blocks if exists, or None.
         """
+        if (
+            self.uvm_kv_runtime_policy is not None
+            and self.uvm_kv_runtime_policy.dynamic_pool_active()
+        ):
+            self.uvm_kv_runtime_policy.refresh_dynamic_pool_target(
+                self,
+                "prefix_cache_lookup",
+            )
         cached_blocks = []
         for group_id in kv_cache_group_ids:
             block_hash_with_group_id = make_block_hash_with_group_id(
@@ -202,6 +214,16 @@ class BlockPool:
                 block_hash_with_group_id
             )
             if not block:
+                return None
+            if (
+                self.uvm_kv_runtime_policy is not None
+                and self.uvm_kv_runtime_policy.dynamic_pool_active()
+                and not self.uvm_kv_runtime_policy.is_block_id_allocatable(
+                    block.block_id
+                )
+            ):
+                return None
+            if block.ref_cnt == 0 and block.free_queue_kind != "gpu":
                 return None
             cached_blocks.append(block)
         return cached_blocks
@@ -305,8 +327,16 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        dynamic_pool_active = (
+            self.uvm_kv_runtime_policy is not None
+            and self.uvm_kv_runtime_policy.dynamic_pool_active()
+        )
         ret: list[KVCacheBlock] | None = None
-        if self.uvm_kv_runtime_policy is not None:
+        if dynamic_pool_active:
+            ret = self.free_block_queue.popleft_n(num_blocks)
+            for block in ret:
+                block.free_queue_kind = None
+        elif self.uvm_kv_runtime_policy is not None:
             ret = self.uvm_kv_runtime_policy.select_free_blocks_for_allocation(
                 block_pool=self,
                 num_blocks=num_blocks,
@@ -315,8 +345,11 @@ class BlockPool:
             if ret is not None:
                 for block in ret:
                     self.free_block_queue.remove(block)
+                    block.free_queue_kind = None
         if ret is None:
             ret = self.free_block_queue.popleft_n(num_blocks)
+            for block in ret:
+                block.free_queue_kind = None
         if len(ret) != num_blocks:
             raise ValueError(
                 f"Cannot get {num_blocks} free blocks from the dynamic pool"
@@ -421,7 +454,7 @@ class BlockPool:
                 # ref_cnt=0 means this block is in the free list (i.e. eviction
                 # candidate), so remove it.
                 if block.ref_cnt == 0 and not block.is_null:
-                    self.free_block_queue.remove(block)
+                    self._remove_from_current_free_queue(block)
                 block.ref_cnt += 1
                 block.lifecycle_state = "used_free"
 
@@ -439,9 +472,32 @@ class BlockPool:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
                 block.lifecycle_state = "used_free"
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
+        released = [
+            block
+            for block in blocks_list
+            if block.ref_cnt == 0 and not block.is_null
+        ]
+        gpu_blocks: list[KVCacheBlock] = []
+        offline_blocks: list[KVCacheBlock] = []
+        dynamic_pool_active = (
+            self.uvm_kv_runtime_policy is not None
+            and self.uvm_kv_runtime_policy.dynamic_pool_active()
         )
+        for block in released:
+            if (
+                dynamic_pool_active
+                and not self.uvm_kv_runtime_policy.is_block_id_allocatable(
+                    block.block_id
+                )
+            ):
+                block.lifecycle_state = "cpu_offloaded"
+                block.free_queue_kind = "offline"
+                offline_blocks.append(block)
+            else:
+                block.free_queue_kind = "gpu"
+                gpu_blocks.append(block)
+        self.free_block_queue.append_n(gpu_blocks)
+        self.offline_block_queue.append_n(offline_blocks)
         if self.uvm_kv_runtime_policy is not None:
             self.uvm_kv_runtime_policy.on_blocks_freed(
                 blocks=blocks_list,
@@ -457,7 +513,10 @@ class BlockPool:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        num_used_blocks = self.num_gpu_blocks - self.free_block_queue.num_free_blocks
+        num_used_blocks = self.num_gpu_blocks - (
+            self.free_block_queue.num_free_blocks
+            + self.offline_block_queue.num_free_blocks
+        )
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(
                 "Failed to reset prefix cache because some "
@@ -490,8 +549,71 @@ class BlockPool:
             self.uvm_kv_runtime_policy is not None
             and self.uvm_kv_runtime_policy.dynamic_pool_active()
         ):
-            return self.uvm_kv_runtime_policy.get_num_allocatable_free_blocks(self)
+            self.uvm_kv_runtime_policy.refresh_dynamic_pool_target(
+                self,
+                "block_pool_free_count",
+            )
         return self.free_block_queue.num_free_blocks
+
+    def _remove_from_current_free_queue(self, block: KVCacheBlock) -> None:
+        if block.free_queue_kind == "gpu":
+            self.free_block_queue.remove(block)
+        elif block.free_queue_kind == "offline":
+            self.offline_block_queue.remove(block)
+        else:
+            raise RuntimeError(
+                f"Free block {block.block_id} has no queue membership"
+            )
+        block.free_queue_kind = None
+
+    def apply_uvm_dynamic_pool_target(
+        self,
+        target_blocks: int,
+        *,
+        old_target_blocks: int,
+    ) -> dict[str, int]:
+        """Move free block metadata between GPU and CPU-offline queues."""
+        target = min(max(int(target_blocks), 0), self.num_gpu_blocks - 1)
+        old_target = min(
+            max(int(old_target_blocks), 0), self.num_gpu_blocks - 1
+        )
+        moved_gpu = 0
+        moved_offline = 0
+        deferred_active = 0
+
+        if target < old_target:
+            for block_id in range(target + 1, old_target + 1):
+                block = self.blocks[block_id]
+                if block.ref_cnt != 0:
+                    deferred_active += 1
+                    continue
+                if block.free_queue_kind == "gpu":
+                    self.free_block_queue.remove(block)
+                    block.free_queue_kind = "offline"
+                    self.offline_block_queue.append(block)
+                    moved_offline += 1
+        elif target > old_target:
+            promoted: list[KVCacheBlock] = []
+            for block_id in range(old_target + 1, target + 1):
+                block = self.blocks[block_id]
+                if block.ref_cnt != 0:
+                    deferred_active += 1
+                    continue
+                if block.free_queue_kind == "offline":
+                    self.offline_block_queue.remove(block)
+                    block.free_queue_kind = "gpu"
+                    promoted.append(block)
+                    moved_gpu += 1
+            # Newly GPU-resident blocks are fresh allocation candidates.
+            self.free_block_queue.prepend_n(promoted)
+
+        return {
+            "moved_gpu": moved_gpu,
+            "moved_offline": moved_offline,
+            "deferred_active": deferred_active,
+            "gpu_free_blocks": self.free_block_queue.num_free_blocks,
+            "offline_free_blocks": self.offline_block_queue.num_free_blocks,
+        }
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

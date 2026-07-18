@@ -57,6 +57,7 @@ from vllm.device_allocator.uvm import (
     batch_prepare_ranges_for_native_remote_access_with_executor,
     batch_prepare_ranges_for_remote_read_with_executor,
     batch_prefetch_ranges_to_device,
+    batch_prefetch_ranges_to_device_with_executor,
     driver_batch_query_ranges_residency_bytes,
     driver_expert_reserved_pool_prealloc,
     driver_expert_reserved_pool_query,
@@ -73,6 +74,7 @@ from vllm.device_allocator.uvm_kv_init_probe import (
 from vllm.device_allocator.uvm_pool_residency import (
     get_uvm_real_residency_snapshot,
     get_uvm_pool_residency_manager,
+    mark_uvm_residency_state,
     register_uvm_residency_region,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -159,6 +161,7 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.core.uvm_kv_runtime_policy import (
+    collect_uvm_kv_cache_physical_ranges_for_blocks,
     register_uvm_kv_cache_physical_ranges,
 )
 from vllm.v1.pool.metadata import PoolingMetadata
@@ -5368,6 +5371,116 @@ class GPUModelRunner(
         )
         return record
 
+    def resize_uvm_kv_cache_target(
+        self,
+        old_target_blocks: int,
+        new_target_blocks: int,
+        reason: str = "adaptive_runtime",
+    ) -> dict[str, Any]:
+        """Physically migrate a KV target delta in the worker process."""
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        if kv_cache_config is None:
+            return {"ok": False, "reason": "kv_cache_not_initialized"}
+        total_blocks = max(int(kv_cache_config.num_blocks) - 1, 0)
+        old_target = min(max(int(old_target_blocks), 0), total_blocks)
+        new_target = min(max(int(new_target_blocks), 0), total_blocks)
+        if old_target == new_target:
+            return {
+                "ok": True,
+                "reason": "already_at_target",
+                "old_target_blocks": old_target,
+                "new_target_blocks": new_target,
+            }
+
+        direction = "grow" if new_target > old_target else "shrink"
+        first_block = min(old_target, new_target) + 1
+        last_block = max(old_target, new_target)
+        block_ids = list(range(first_block, last_block + 1))
+        collection = collect_uvm_kv_cache_physical_ranges_for_blocks(block_ids)
+        ranges = list(collection.get("ranges") or [])
+        if not ranges:
+            return {
+                "ok": False,
+                "reason": str(collection.get("reason") or "no_registered_ranges"),
+                "direction": direction,
+                "old_target_blocks": old_target,
+                "new_target_blocks": new_target,
+                "block_count": len(block_ids),
+            }
+
+        executor = os.environ.get(
+            "VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_EXECUTOR",
+            "auto",
+        ).strip().lower()
+        start = time.monotonic()
+        if direction == "grow":
+            device = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
+            successes, executor_used, driver_result = (
+                batch_prefetch_ranges_to_device_with_executor(
+                    ranges,
+                    device,
+                    executor=executor,
+                )
+            )
+            if os.environ.get(
+                "VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_SYNC", "1"
+            ).strip().lower() in ("1", "true", "yes", "on"):
+                torch.cuda.synchronize(device)
+            state = "gpu"
+            result_fields: dict[str, Any] = {"driver_result": driver_result}
+        else:
+            successes, executor_used, advise_result, prefetch_result = (
+                batch_offload_ranges_to_cpu_with_executor(
+                    ranges,
+                    sync=True,
+                    executor=executor,
+                )
+            )
+            state = "cpu"
+            result_fields = {
+                "driver_advise_result": advise_result,
+                "driver_prefetch_result": prefetch_result,
+            }
+
+        complete = int(successes) == len(ranges)
+        if complete:
+            for block_id in block_ids:
+                for group_id in range(len(kv_cache_config.kv_cache_groups)):
+                    mark_uvm_residency_state(
+                        region_id=f"kv:{group_id}:{block_id}",
+                        state=state,
+                        metadata={
+                            "source": "worker_adaptive_kv_resize",
+                            "reason": reason,
+                            "direction": direction,
+                            "old_target_blocks": old_target,
+                            "new_target_blocks": new_target,
+                        },
+                    )
+        result = {
+            "ok": complete,
+            "reason": "complete" if complete else "partial",
+            "direction": direction,
+            "old_target_blocks": old_target,
+            "new_target_blocks": new_target,
+            "block_count": len(block_ids),
+            "range_count": len(ranges),
+            "range_bytes": int(collection.get("range_bytes") or 0),
+            "successes": int(successes),
+            "executor": executor_used,
+            "elapsed_seconds": time.monotonic() - start,
+            **result_fields,
+        }
+        self._append_uvm_post_warmup_rebalance_trace(
+            {
+                "action": "adaptive_kv_target_resize",
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                **result,
+            }
+        )
+        return result
+
     def load_model(self, eep_scale_up: bool = False) -> None:
         """
         Args:
@@ -6494,6 +6607,185 @@ class GPUModelRunner(
                 exc,
             )
 
+    @staticmethod
+    def _uvm_incremental_expert_layer_key(module: Any) -> str:
+        layer_name = str(getattr(module, "layer_name", "") or "")
+        if layer_name:
+            return layer_name
+        layer_id_fn = getattr(module, "_uvm_layer_id", None)
+        layer_id = layer_id_fn() if callable(layer_id_fn) else None
+        return f"layer:{layer_id}"
+
+    def get_uvm_incremental_expert_offload_candidates(
+        self,
+        expert_class: str,
+    ) -> dict[str, Any]:
+        """Return one capacity-safe local candidate for each MoE layer."""
+        normalized_class = str(expert_class).strip().lower()
+        if normalized_class not in ("cold", "warm"):
+            return {
+                "ok": False,
+                "reason": "invalid_expert_class",
+                "expert_class": normalized_class,
+                "candidates": {},
+            }
+        candidates: dict[str, dict[str, Any]] = {}
+        for module in self.get_model().modules():
+            next_candidate = getattr(
+                module,
+                "uvm_next_incremental_expert",
+                None,
+            )
+            if not callable(next_candidate):
+                continue
+            global_expert_id = next_candidate(normalized_class)
+            if global_expert_id is None:
+                continue
+            layer_key = self._uvm_incremental_expert_layer_key(module)
+            layer_id_fn = getattr(module, "_uvm_layer_id", None)
+            candidates[layer_key] = {
+                "layer_name": str(getattr(module, "layer_name", "") or ""),
+                "layer_id": (
+                    layer_id_fn() if callable(layer_id_fn) else None
+                ),
+                "global_expert_id": int(global_expert_id),
+            }
+        return {
+            "ok": True,
+            "reason": "candidates_collected",
+            "expert_class": normalized_class,
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+        }
+
+    def run_uvm_incremental_expert_offload(
+        self,
+        allow_warm: bool | None = None,
+        selected_experts_by_layer: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """Release the EngineCore-selected expert in each local MoE layer."""
+        if not self._env_flag_enabled(
+            "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE",
+            default=False,
+        ):
+            return {"ok": True, "reason": "disabled", "released_count": 0}
+
+        modules = [
+            module
+            for module in self.get_model().modules()
+            if callable(
+                getattr(module, "run_uvm_incremental_weight_offload", None)
+            )
+        ]
+        has_cold = any(
+            bool(module.has_remaining_uvm_incremental_experts("cold"))
+            for module in modules
+        )
+        effective_allow_warm = (
+            not has_cold if allow_warm is None else bool(allow_warm)
+        )
+        results: list[dict[str, object]] = []
+        with uvm_enabled_allocation_phase("enabled:incremental_weight_offload"):
+            for module in modules:
+                selected_global_expert_id: int | None = None
+                if selected_experts_by_layer is not None:
+                    layer_key = self._uvm_incremental_expert_layer_key(module)
+                    selected_value = selected_experts_by_layer.get(layer_key)
+                    if selected_value is None:
+                        continue
+                    selected_global_expert_id = int(selected_value)
+                result = module.run_uvm_incremental_weight_offload(
+                    allow_warm=effective_allow_warm,
+                    selected_global_expert_id=selected_global_expert_id,
+                )
+                results.append(
+                    {
+                        **result,
+                        "layer_key": self._uvm_incremental_expert_layer_key(
+                            module
+                        ),
+                    }
+                )
+        if os.environ.get("VLLM_UVM_INIT_WEIGHT_SYNC", "1") == "1":
+            torch.cuda.synchronize()
+        released_count = sum(
+            int(result.get("released_count") or 0) for result in results
+        )
+        return {
+            "ok": all(bool(result.get("ok", True)) for result in results),
+            "reason": "warm_wave" if effective_allow_warm else "cold_wave",
+            "allow_warm": effective_allow_warm,
+            "visited_layers": len(modules),
+            "selected_layers": len(selected_experts_by_layer or {}),
+            "selected_experts_by_layer": selected_experts_by_layer or {},
+            "released_count": released_count,
+            "results": results,
+        }
+
+    def _configure_uvm_incremental_reserved_slot_capacity(self) -> dict[str, int]:
+        if not self._env_flag_enabled(
+            "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE",
+            default=False,
+        ):
+            return {"configured_slots": 0, "required_slots": 0}
+        modules = [
+            module
+            for module in self.get_model().modules()
+            if callable(
+                getattr(module, "uvm_incremental_reserved_slot_requirement", None)
+            )
+        ]
+        required_slots = max(
+            (
+                int(module.uvm_incremental_reserved_slot_requirement())
+                for module in modules
+            ),
+            default=0,
+        )
+        configured_slots = self._env_int_value(
+            "VLLM_UVM_EXPERT_RESERVED_SLOT_COUNT",
+            default=0,
+        )
+        auto_slot_budget = self._env_int_value(
+            "VLLM_UVM_INCREMENTAL_RESERVED_SLOT_BUDGET",
+            default=128,
+        )
+        effective_slots = max(
+            configured_slots,
+            required_slots,
+            min(max(auto_slot_budget, 0), 128),
+        )
+        if effective_slots > 128:
+            raise RuntimeError(
+                "Incremental expert restore requires more slots than the "
+                f"driver ABI supports: required={effective_slots} max=128"
+            )
+        if effective_slots > 0:
+            os.environ["VLLM_UVM_EXPERT_RESERVED_SLOT_COUNT"] = str(effective_slots)
+            for module in modules:
+                module.uvm_expert_reserved_slot_count = effective_slots
+
+        configured_bytes = self._env_int_value(
+            "VLLM_UVM_EXPERT_RESERVED_SLOT_BYTES",
+            default=0,
+        )
+        if configured_bytes <= 0 and modules:
+            configured_bytes = max(
+                int(module.uvm_expert_envelope_bytes) for module in modules
+            )
+            os.environ["VLLM_UVM_EXPERT_RESERVED_SLOT_BYTES"] = str(
+                configured_bytes
+            )
+            for module in modules:
+                module.uvm_expert_reserved_slot_bytes = configured_bytes
+        return {
+            "configured_slots": configured_slots,
+            "required_slots": required_slots,
+            "effective_slots": effective_slots,
+            "auto_slot_budget": auto_slot_budget,
+            "slot_bytes": configured_bytes,
+        }
+
     def _maybe_prealloc_uvm_expert_reserved_slots_after_stage_m(
         self,
     ) -> dict[str, Any]:
@@ -6521,6 +6813,7 @@ class GPUModelRunner(
                 "reason": "disabled",
             }
 
+        capacity = self._configure_uvm_incremental_reserved_slot_capacity()
         slot_count = self._env_int_value(
             "VLLM_UVM_EXPERT_RESERVED_SLOT_COUNT",
             default=0,
@@ -6604,6 +6897,7 @@ class GPUModelRunner(
             "query_before": query_before,
             "result": result,
             "query_after": query_after,
+            "incremental_capacity": capacity,
         }
         self._append_uvm_expert_reserved_post_stage_m_prealloc_trace(record)
         logger.warning(

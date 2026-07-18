@@ -229,6 +229,8 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.info("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        self._uvm_pending_kv_grow_target_blocks: int | None = None
+        self._uvm_pending_kv_grow_reason = ""
 
         self.is_ec_producer = (
             vllm_config.ec_transfer_config is not None
@@ -330,14 +332,16 @@ class EngineCore:
             os.environ.get("VLLM_UVM_KV_POST_WARMUP_TARGET_BLOCKS", "")
             or os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_POST_STAGE_M_TARGET_BLOCKS", "")
         ).strip()
+        initial_target = os.environ.get(
+            "VLLM_UVM_KV_DYNAMIC_POOL_INITIAL_BLOCKS",
+            "",
+        ).strip()
         explicit_apply = (
             os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_PRE_SERVICE_APPLY", "0") == "1"
         )
-        automatic_post_warmup_apply = bool(post_warmup_target) and stage in (
-            "post_warmup",
-            "after_warmup",
-            "deferred",
-        )
+        automatic_post_warmup_apply = bool(
+            post_warmup_target or initial_target
+        ) and stage in ("post_warmup", "after_warmup", "deferred")
         if not (explicit_apply or automatic_post_warmup_apply):
             return
 
@@ -386,6 +390,7 @@ class EngineCore:
             metadata={
                 "source": "engine_core_pre_ready",
                 "ready_handshake_sent": False,
+                "physical_migration_complete": True,
             },
         )
         logger.info(
@@ -421,16 +426,10 @@ class EngineCore:
             "begin target_blocks=%d",
             grow_target_blocks,
         )
-        grow_result = self._apply_uvm_kv_dynamic_pool_target(
+        grow_result = self._resize_uvm_kv_target_with_workers(
             grow_target_blocks,
-            policy=policy,
-            block_pool=block_pool,
             reason="pre_service_before_ready_grow",
-            metadata={
-                "source": "engine_core_pre_ready_grow",
-                "ready_handshake_sent": False,
-                "previous_target_blocks": target_blocks,
-            },
+            release_expert_wave=False,
         )
         logger.info(
             "UVM controlled remap boundary: pre-service KV dynamic pool grow "
@@ -454,6 +453,336 @@ class EngineCore:
             metadata=metadata,
         )
 
+    @staticmethod
+    def _uvm_env_flag(name: str, default: bool = False) -> bool:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        return value.strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _uvm_env_int(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, str(default)) or default)
+        except ValueError:
+            return default
+
+    def _uvm_dynamic_pool_components(self) -> tuple[Any, Any] | None:
+        kv_cache_manager = getattr(self.scheduler, "kv_cache_manager", None)
+        policy = getattr(kv_cache_manager, "uvm_kv_runtime_policy", None)
+        block_pool = getattr(kv_cache_manager, "block_pool", None)
+        if policy is None or block_pool is None or not policy.dynamic_pool_active():
+            return None
+        return policy, block_pool
+
+    def _resize_uvm_kv_target_with_workers(
+        self,
+        target_blocks: int,
+        *,
+        reason: str,
+        release_expert_wave: bool,
+    ) -> dict[str, Any]:
+        components = self._uvm_dynamic_pool_components()
+        if components is None:
+            return {"ok": False, "reason": "dynamic_pool_unavailable"}
+        policy, block_pool = components
+        old_target = int(policy._dynamic_pool_applied_target_blocks)
+        target = min(max(int(target_blocks), 0), int(policy.total_blocks))
+        if target == old_target:
+            return {
+                "ok": True,
+                "reason": "already_at_target",
+                "applied_target_blocks": old_target,
+            }
+        if target < old_target and self.scheduler.has_unfinished_requests():
+            return {
+                "ok": False,
+                "reason": "shrink_requires_idle_scheduler",
+                "old_target_blocks": old_target,
+                "new_target_blocks": target,
+            }
+
+        expert_results: list[Any] = []
+        expert_candidate_results: dict[str, list[Any]] = {}
+        selected_experts_by_layer: dict[str, int] = {}
+        selected_expert_class: str | None = None
+        expert_release_missing_layers: list[str] = []
+        if release_expert_wave and target > old_target:
+            selected_expert_class = "cold"
+            candidate_results = self.collective_rpc(
+                "get_uvm_incremental_expert_offload_candidates",
+                args=(selected_expert_class,),
+            )
+            expert_candidate_results[selected_expert_class] = candidate_results
+            candidate_query_ok = bool(candidate_results) and all(
+                isinstance(result, dict) and bool(result.get("ok"))
+                for result in candidate_results
+            )
+            if candidate_query_ok:
+                selected_experts_by_layer = (
+                    self._select_uvm_incremental_experts_by_layer(
+                        candidate_results
+                    )
+                )
+            if candidate_query_ok and not selected_experts_by_layer:
+                selected_expert_class = "warm"
+                candidate_results = self.collective_rpc(
+                    "get_uvm_incremental_expert_offload_candidates",
+                    args=(selected_expert_class,),
+                )
+                expert_candidate_results[selected_expert_class] = candidate_results
+                candidate_query_ok = bool(candidate_results) and all(
+                    isinstance(result, dict) and bool(result.get("ok"))
+                    for result in candidate_results
+                )
+                if candidate_query_ok:
+                    selected_experts_by_layer = (
+                        self._select_uvm_incremental_experts_by_layer(
+                            candidate_results
+                        )
+                    )
+            if candidate_query_ok and selected_experts_by_layer:
+                expert_results = self.collective_rpc(
+                    "run_uvm_incremental_expert_offload",
+                    args=(
+                        selected_expert_class == "warm",
+                        selected_experts_by_layer,
+                    ),
+                )
+                expert_release_missing_layers = (
+                    self._uvm_incremental_release_missing_layers(
+                        selected_experts_by_layer,
+                        expert_results,
+                    )
+                )
+            expert_execution_ok = bool(expert_results) and all(
+                isinstance(result, dict) and bool(result.get("ok"))
+                for result in expert_results
+            )
+            expert_wave_ok = candidate_query_ok and (
+                not selected_experts_by_layer
+                or (expert_execution_ok and not expert_release_missing_layers)
+            )
+            if not expert_wave_ok:
+                result = {
+                    "ok": False,
+                    "reason": "incremental_expert_wave_failed",
+                    "old_target_blocks": old_target,
+                    "new_target_blocks": target,
+                    "expert_candidate_results": expert_candidate_results,
+                    "selected_expert_class": selected_expert_class,
+                    "selected_experts_by_layer": selected_experts_by_layer,
+                    "expert_release_missing_layers": (
+                        expert_release_missing_layers
+                    ),
+                    "expert_results": expert_results,
+                }
+                if self._uvm_env_flag(
+                    "VLLM_UVM_KV_ADAPTIVE_FAIL_FAST",
+                    default=True,
+                ):
+                    raise RuntimeError(
+                        f"Adaptive expert offload wave failed: {result!r}"
+                    )
+                logger.error("Adaptive expert offload wave failed: %s", result)
+                return result
+
+        worker_results = self.collective_rpc(
+            "resize_uvm_kv_cache_target",
+            args=(old_target, target, reason),
+        )
+        physical_ok = bool(worker_results) and all(
+            isinstance(result, dict) and bool(result.get("ok"))
+            for result in worker_results
+        )
+        if not physical_ok:
+            result = {
+                "ok": False,
+                "reason": "worker_physical_migration_failed",
+                "old_target_blocks": old_target,
+                "new_target_blocks": target,
+                "worker_results": worker_results,
+                "expert_candidate_results": expert_candidate_results,
+                "selected_expert_class": selected_expert_class,
+                "selected_experts_by_layer": selected_experts_by_layer,
+                "expert_release_missing_layers": expert_release_missing_layers,
+                "expert_results": expert_results,
+            }
+            if self._uvm_env_flag(
+                "VLLM_UVM_KV_ADAPTIVE_FAIL_FAST",
+                default=True,
+            ):
+                raise RuntimeError(f"Adaptive KV resize failed: {result!r}")
+            logger.error("Adaptive KV resize failed: %s", result)
+            return result
+
+        apply_result = self._apply_uvm_kv_dynamic_pool_target(
+            target,
+            policy=policy,
+            block_pool=block_pool,
+            reason=reason,
+            metadata={
+                "source": "engine_core_worker_coordinated_resize",
+                "physical_migration_complete": True,
+                "worker_results": worker_results,
+            },
+        )
+        return {
+            **apply_result,
+            "worker_results": worker_results,
+            "expert_candidate_results": expert_candidate_results,
+            "selected_expert_class": selected_expert_class,
+            "selected_experts_by_layer": selected_experts_by_layer,
+            "expert_release_missing_layers": expert_release_missing_layers,
+            "expert_results": expert_results,
+        }
+
+    @staticmethod
+    def _select_uvm_incremental_experts_by_layer(
+        candidate_results: list[Any],
+    ) -> dict[str, int]:
+        """Choose one deterministic global expert id per logical layer."""
+        selected: dict[str, int] = {}
+        for result in candidate_results:
+            if not isinstance(result, dict):
+                continue
+            candidates = result.get("candidates")
+            if not isinstance(candidates, dict):
+                continue
+            for layer_key, candidate in candidates.items():
+                if not isinstance(candidate, dict):
+                    continue
+                try:
+                    global_expert_id = int(candidate["global_expert_id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                normalized_key = str(layer_key)
+                previous = selected.get(normalized_key)
+                if previous is None or global_expert_id < previous:
+                    selected[normalized_key] = global_expert_id
+        return selected
+
+    @staticmethod
+    def _uvm_incremental_release_missing_layers(
+        selected_experts_by_layer: dict[str, int],
+        worker_results: list[Any],
+    ) -> list[str]:
+        released_layers: set[str] = set()
+        for worker_result in worker_results:
+            if not isinstance(worker_result, dict):
+                continue
+            layer_results = worker_result.get("results")
+            if not isinstance(layer_results, list):
+                continue
+            for layer_result in layer_results:
+                if not isinstance(layer_result, dict):
+                    continue
+                layer_key = str(layer_result.get("layer_key") or "")
+                selected_expert = selected_experts_by_layer.get(layer_key)
+                if selected_expert is None:
+                    continue
+                released_experts = layer_result.get("released_experts")
+                if not isinstance(released_experts, list):
+                    continue
+                try:
+                    released_ids = {int(value) for value in released_experts}
+                except (TypeError, ValueError):
+                    continue
+                if selected_expert in released_ids:
+                    released_layers.add(layer_key)
+        return sorted(set(selected_experts_by_layer) - released_layers)
+
+    def _maybe_handle_uvm_kv_preemption_pressure(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        if not self._uvm_env_flag(
+            "VLLM_UVM_KV_ADAPTIVE_PRESSURE_ENABLE",
+            default=False,
+        ):
+            return
+        if not scheduler_output.preempted_req_ids:
+            return
+        components = self._uvm_dynamic_pool_components()
+        if components is None:
+            return
+        policy, _ = components
+        old_target = int(policy._dynamic_pool_applied_target_blocks)
+        grow_blocks = max(
+            self._uvm_env_int(
+                "VLLM_UVM_KV_ADAPTIVE_GROW_BLOCKS_PER_PREEMPTION",
+                128,
+            ),
+            1,
+        )
+        preemption_count = max(len(scheduler_output.preempted_req_ids), 1)
+        new_target = min(
+            old_target + grow_blocks * preemption_count,
+            int(policy.total_blocks),
+        )
+        if new_target <= old_target:
+            logger.warning(
+                "KV preemption pressure detected at maximum target=%d",
+                old_target,
+            )
+            return
+        batch_queue = getattr(self, "batch_queue", None)
+        if batch_queue is not None and batch_queue:
+            pending_target = int(
+                getattr(self, "_uvm_pending_kv_grow_target_blocks", 0) or 0
+            )
+            self._uvm_pending_kv_grow_target_blocks = max(
+                pending_target,
+                new_target,
+            )
+            self._uvm_pending_kv_grow_reason = (
+                "scheduler_preemption_pressure_after_batch_queue_drain"
+            )
+            logger.info(
+                "Deferring UVM KV grow until %d in-flight batches drain: "
+                "old_target=%d pending_target=%d preemptions=%d",
+                len(batch_queue),
+                old_target,
+                self._uvm_pending_kv_grow_target_blocks,
+                preemption_count,
+            )
+            return
+        self._resize_uvm_kv_target_with_workers(
+            new_target,
+            reason="scheduler_preemption_pressure",
+            release_expert_wave=self._uvm_env_flag(
+                "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE",
+                default=False,
+            ),
+        )
+
+    def _apply_pending_uvm_kv_growth_if_ready(self) -> dict[str, Any] | None:
+        target = getattr(self, "_uvm_pending_kv_grow_target_blocks", None)
+        if target is None:
+            return None
+        batch_queue = getattr(self, "batch_queue", None)
+        if batch_queue is not None and batch_queue:
+            return None
+
+        reason = (
+            getattr(self, "_uvm_pending_kv_grow_reason", "")
+            or "scheduler_preemption_pressure_after_batch_queue_drain"
+        )
+        self._uvm_pending_kv_grow_target_blocks = None
+        self._uvm_pending_kv_grow_reason = ""
+        result = self._resize_uvm_kv_target_with_workers(
+            int(target),
+            reason=reason,
+            release_expert_wave=self._uvm_env_flag(
+                "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE",
+                default=False,
+            ),
+        )
+        if not bool(result.get("ok")):
+            self._uvm_pending_kv_grow_target_blocks = int(target)
+            self._uvm_pending_kv_grow_reason = reason
+        return result
+
     def apply_uvm_kv_dynamic_pool_target(
         self,
         target_blocks: int,
@@ -476,15 +805,12 @@ class EngineCore:
             int(target_blocks),
             reason,
         )
-        result = self._apply_uvm_kv_dynamic_pool_target(
+        result = self._resize_uvm_kv_target_with_workers(
             int(target_blocks),
-            policy=policy,
-            block_pool=block_pool,
             reason=reason,
-            metadata={
-                "source": "engine_core_utility",
-                **(metadata or {}),
-            },
+            release_expert_wave=bool(
+                (metadata or {}).get("release_expert_wave", False)
+            ),
         )
         logger.info(
             "UVM controlled remap boundary: utility KV dynamic pool apply "
@@ -575,6 +901,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        self._maybe_handle_uvm_kv_preemption_pressure(scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
@@ -616,6 +943,7 @@ class EngineCore:
         """
         batch_queue = self.batch_queue
         assert batch_queue is not None
+        self._apply_pending_uvm_kv_growth_if_ready()
 
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
@@ -624,8 +952,12 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        if (
+            self.scheduler.has_requests()
+            and self._uvm_pending_kv_grow_target_blocks is None
+        ):
             scheduler_output = self.scheduler.schedule()
+            self._maybe_handle_uvm_kv_preemption_pressure(scheduler_output)
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
@@ -691,6 +1023,8 @@ class EngineCore:
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output))
 
+        self._apply_pending_uvm_kv_growth_if_ready()
+
         return engine_core_outputs, model_executed
 
     def shutdown(self):
@@ -722,6 +1056,36 @@ class EngineCore:
         self.scheduler.reset_prefix_cache()
 
     def sleep(self, level: int = 1):
+        if self._uvm_env_flag(
+            "VLLM_UVM_KV_ADAPTIVE_SHRINK_ON_SLEEP",
+            default=False,
+        ):
+            components = self._uvm_dynamic_pool_components()
+            if components is not None:
+                policy, _ = components
+                if self.scheduler.has_unfinished_requests():
+                    raise RuntimeError(
+                        "Cannot shrink the UVM KV pool for sleep while requests "
+                        "are still active"
+                    )
+                default_sleep_target = (
+                    int(policy.dynamic_pool_initial_blocks)
+                    if int(policy.dynamic_pool_initial_blocks) > 0
+                    else int(policy._dynamic_pool_applied_target_blocks)
+                )
+                sleep_target = max(
+                    self._uvm_env_int(
+                        "VLLM_UVM_KV_ADAPTIVE_SLEEP_TARGET_BLOCKS",
+                        default_sleep_target,
+                    ),
+                    0,
+                )
+                if sleep_target < int(policy._dynamic_pool_applied_target_blocks):
+                    self._resize_uvm_kv_target_with_workers(
+                        sleep_target,
+                        reason="engine_sleep_shrink",
+                        release_expert_wave=False,
+                    )
         self.model_executor.sleep(level)
 
     def wake_up(self, tags: list[str] | None = None):

@@ -454,6 +454,36 @@ class Worker(WorkerBase):
 
         return int(self.available_kv_cache_memory_bytes)
 
+    def resize_uvm_kv_cache_target(
+        self,
+        old_target_blocks: int,
+        new_target_blocks: int,
+        reason: str = "adaptive_runtime",
+    ) -> dict[str, Any]:
+        return self.model_runner.resize_uvm_kv_cache_target(
+            old_target_blocks,
+            new_target_blocks,
+            reason,
+        )
+
+    def get_uvm_incremental_expert_offload_candidates(
+        self,
+        expert_class: str,
+    ) -> dict[str, Any]:
+        return self.model_runner.get_uvm_incremental_expert_offload_candidates(
+            expert_class
+        )
+
+    def run_uvm_incremental_expert_offload(
+        self,
+        allow_warm: bool | None = None,
+        selected_experts_by_layer: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        return self.model_runner.run_uvm_incremental_expert_offload(
+            allow_warm,
+            selected_experts_by_layer,
+        )
+
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""
 

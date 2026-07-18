@@ -8,12 +8,13 @@ their original managed VAs are remapped to readonly slot-backed GPU PTEs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 import os
 import threading
 import time
-from typing import Any, Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 
@@ -24,8 +25,8 @@ from vllm.device_allocator.uvm import (
     UVM_REGION_FLAG_PROTECTED,
     UVM_REGION_POOL_WEIGHT,
     UVM_REGION_ROLE_DENSE_WEIGHT,
-    UVM_REGION_ROLE_MOE_EXPERT_W13,
     UVM_REGION_ROLE_MOE_EXPERT_W2,
+    UVM_REGION_ROLE_MOE_EXPERT_W13,
     batch_offload_ranges_to_cpu_with_executor,
     batch_prefetch_ranges_to_cpu,
     driver_expert_reserved_pool_query,
@@ -591,8 +592,16 @@ class ExpertReservedRegionsExecutor:
         layer_name: str,
         step: int,
         items: Sequence[ReservedRegionItem],
+        async_: bool | None = None,
+        sync_before_compute: bool | None = None,
     ) -> dict[str, Any]:
         start_ns = time.perf_counter_ns()
+        effective_async = self.async_ if async_ is None else bool(async_)
+        effective_sync_before_compute = (
+            self.sync_before_compute
+            if sync_before_compute is None
+            else bool(sync_before_compute)
+        )
         _append_debug_trace({
             "action": "reserved_debug_prefetch_enter",
             "layer_name": layer_name,
@@ -601,7 +610,8 @@ class ExpertReservedRegionsExecutor:
             "pool_id": self.pool_id,
             "slot_count": self.slot_count,
             "configured_slot_bytes": self.configured_slot_bytes,
-            "async": self.async_,
+            "async": effective_async,
+            "sync_before_compute": effective_sync_before_compute,
             "prefetch_cpu_source": self.prefetch_cpu_source,
             "slot_policy": self.slot_policy,
             "bank_count": self.bank_count,
@@ -643,6 +653,10 @@ class ExpertReservedRegionsExecutor:
         current_layer_id = valid_items[0].layer_id
         bank_slot_ids = self._bank_slot_ids_for_layer(current_layer_id)
         bank_reuse_result: dict[str, Any] | None = None
+        items_to_load = list(valid_items)
+        reused_items: list[ReservedRegionItem] = []
+        reused_slot_records: list[dict[str, Any]] = []
+        reused_slot_ids: set[int] = set()
 
         with self._lock:
             slot_check_start_ns = time.perf_counter_ns()
@@ -704,8 +718,57 @@ class ExpertReservedRegionsExecutor:
                     for slot_id in bank_slot_ids
                     if slot_id in self._slots
                 ]
+                desired_by_driver_id = {
+                    int(item.driver_region_id): item for item in valid_items
+                }
+                for slot in bank_slots:
+                    if len(slot.owner_regions) != 1:
+                        continue
+                    existing_item = slot.owner_regions[0]
+                    desired_item = desired_by_driver_id.get(
+                        int(existing_item.driver_region_id)
+                    )
+                    if desired_item is None:
+                        continue
+                    if (
+                        int(existing_item.ptr) != int(desired_item.ptr)
+                        or int(existing_item.bytes) != int(desired_item.bytes)
+                    ):
+                        continue
+                    reused_items.append(desired_item)
+                    reused_slot_ids.add(slot.slot_id)
+                    slot.owner_regions = [desired_item]
+                    slot.owner_layer_name = layer_name
+                    slot.owner_step = int(step)
+                    slot.owner_layer_id = desired_item.layer_id
+                    slot.owner_expert_id = desired_item.global_expert_id
+                    reused_slot_records.append(
+                        {
+                            "slot_id": slot.slot_id,
+                            "layer_id": desired_item.layer_id,
+                            "expert_id": desired_item.global_expert_id,
+                            "role": desired_item.role,
+                            "region_id": desired_item.region_id,
+                            "region_count": 1,
+                            "bytes": int(desired_item.bytes),
+                            "slot_epoch": slot.epoch,
+                            "reused": True,
+                        }
+                    )
+                reused_driver_ids = {
+                    int(item.driver_region_id) for item in reused_items
+                }
+                items_to_load = [
+                    item
+                    for item in valid_items
+                    if int(item.driver_region_id) not in reused_driver_ids
+                ]
                 bank_reuse_result = self._invalidate_slots_for_reuse_locked(
-                    slots=bank_slots,
+                    slots=[
+                        slot
+                        for slot in bank_slots
+                        if slot.slot_id not in reused_slot_ids
+                    ],
                     layer_name=layer_name,
                     step=int(step),
                     reason="layer_mod_bank_reuse",
@@ -730,14 +793,14 @@ class ExpertReservedRegionsExecutor:
                         ) / 1000.0,
                     }
 
-            used_slots: set[int] = set()
+            used_slots: set[int] = set(reused_slot_ids)
             assignments: list[dict[str, Any]] = []
             slot_records: list[dict[str, Any]] = []
             source_ranges: list[tuple[int, int]] = []
             wait_count = 0
             register_failures: list[dict[str, Any]] = []
 
-            for item in valid_items:
+            for item in items_to_load:
                 _append_debug_trace({
                     "action": "reserved_debug_assign_item_enter",
                     "layer_name": layer_name,
@@ -813,7 +876,7 @@ class ExpertReservedRegionsExecutor:
                     }
                 )
 
-        if not assignments:
+        if not assignments and not reused_items:
             elapsed_us = (time.perf_counter_ns() - start_ns) / 1000.0
             _append_debug_trace({
                 "action": "reserved_debug_prefetch_no_assignments",
@@ -837,7 +900,7 @@ class ExpertReservedRegionsExecutor:
             }
 
         source_offload_result: dict[str, Any] | None = None
-        if self.prefetch_cpu_source:
+        if assignments and self.prefetch_cpu_source:
             source_start_ns = time.perf_counter_ns()
             _append_debug_trace({
                 "action": "reserved_debug_source_offload_enter",
@@ -922,38 +985,54 @@ class ExpertReservedRegionsExecutor:
                 "range_count": len(source_ranges),
             }
 
-        ioctl_start_ns = time.perf_counter_ns()
-        _append_debug_trace({
-            "action": "reserved_debug_prefetch_ioctl_enter",
-            "layer_name": layer_name,
-            "step": int(step),
-            "assignment_count": len(assignments),
-            "assigned_slots": [record["slot_id"] for record in slot_records],
-            "requested_bytes": sum(int(item["bytes_override"]) for item in assignments),
-            "mode": "reserved_prefetch",
-        })
-        driver_result = driver_expert_reserved_prefetch_regions(
-            assignments=assignments,
-            device=self.device,
-            async_=self.async_,
-            strict_footprint=self.strict_footprint,
-            mode="reserved_prefetch",
-            prefer_existing=True,
-            return_entries=True,
-        )
-        _append_debug_trace({
-            "action": "reserved_debug_prefetch_ioctl_exit",
-            "layer_name": layer_name,
-            "step": int(step),
-            "ok": driver_result.get("ok") is True,
-            "rm_status": driver_result.get("rm_status"),
-            "success_count": driver_result.get("success_count"),
-            "failure_count": driver_result.get("failure_count"),
-            "accepted_bytes": driver_result.get("accepted_bytes"),
-            "elapsed_us": (time.perf_counter_ns() - ioctl_start_ns) / 1000.0,
-        })
+        if assignments:
+            ioctl_start_ns = time.perf_counter_ns()
+            _append_debug_trace({
+                "action": "reserved_debug_prefetch_ioctl_enter",
+                "layer_name": layer_name,
+                "step": int(step),
+                "assignment_count": len(assignments),
+                "assigned_slots": [record["slot_id"] for record in slot_records],
+                "requested_bytes": sum(
+                    int(item["bytes_override"]) for item in assignments
+                ),
+                "mode": "reserved_prefetch",
+            })
+            driver_result = driver_expert_reserved_prefetch_regions(
+                assignments=assignments,
+                device=self.device,
+                async_=effective_async,
+                strict_footprint=self.strict_footprint,
+                mode="reserved_prefetch",
+                prefer_existing=True,
+                return_entries=True,
+            )
+            _append_debug_trace({
+                "action": "reserved_debug_prefetch_ioctl_exit",
+                "layer_name": layer_name,
+                "step": int(step),
+                "ok": driver_result.get("ok") is True,
+                "rm_status": driver_result.get("rm_status"),
+                "success_count": driver_result.get("success_count"),
+                "failure_count": driver_result.get("failure_count"),
+                "accepted_bytes": driver_result.get("accepted_bytes"),
+                "elapsed_us": (time.perf_counter_ns() - ioctl_start_ns) / 1000.0,
+            })
+        else:
+            driver_result = {
+                "ok": True,
+                "status": "slot_cache_hit",
+                "compact_result": True,
+                "success_count": 0,
+                "failure_count": 0,
+                "entries": [],
+            }
 
-        if self.async_ and self.sync_before_compute and driver_result.get("ok") is True:
+        if (
+            effective_sync_before_compute
+            and (effective_async or reused_items)
+            and driver_result.get("ok") is True
+        ):
             try:
                 sync_start_ns = time.perf_counter_ns()
                 _append_debug_trace({
@@ -978,12 +1057,14 @@ class ExpertReservedRegionsExecutor:
                     exc_info=True,
                 )
 
-        successful_driver_ids: set[int] = set()
+        successful_driver_ids: set[int] = {
+            int(item.driver_region_id) for item in reused_items
+        }
         failed_driver_ids: set[int] = set()
         if driver_result.get("compact_result") and driver_result.get("ok") is True:
-            successful_driver_ids = {
+            successful_driver_ids.update(
                 int(assignment["region_id"]) for assignment in assignments
-            }
+            )
         else:
             for entry in driver_result.get("entries") or []:
                 try:
@@ -1014,11 +1095,18 @@ class ExpertReservedRegionsExecutor:
                 if item.region_id not in successful_region_ids
             ]
         if register_failures:
-            failed_region_ids.extend(str(item["region_id"]) for item in register_failures)
+            failed_region_ids.extend(
+                str(item["region_id"]) for item in register_failures
+            )
 
         layer_key = (str(layer_name), int(step))
         with self._lock:
             active_slots = self._active_layer_slots.setdefault(layer_key, set())
+            active_slots.update(reused_slot_ids)
+            for slot_id in reused_slot_ids:
+                slot = self._slots.get(slot_id)
+                if slot is not None:
+                    slot.state = "IN_USE"
             for record in slot_records:
                 slot_id = int(record["slot_id"])
                 slot = self._slots.get(slot_id)
@@ -1048,7 +1136,7 @@ class ExpertReservedRegionsExecutor:
             "executor": "expert_reserved_regions_async",
             "success_count": len(successful_region_ids),
             "failure_count": len(failed_region_ids),
-            "assigned_slots": slot_records,
+            "assigned_slots": reused_slot_records + slot_records,
             "successful_region_ids": successful_region_ids,
             "failed_region_ids": failed_region_ids,
             "register_failures": register_failures,
@@ -1059,13 +1147,15 @@ class ExpertReservedRegionsExecutor:
             "slot_count": self.slot_count,
             "slot_bytes": self.slot_bytes,
             "pool_id": self.pool_id,
-            "async": self.async_,
-            "sync_before_compute": self.sync_before_compute,
+            "async": effective_async,
+            "sync_before_compute": effective_sync_before_compute,
             "prefetch_cpu_source": self.prefetch_cpu_source,
             "slot_policy": self.slot_policy,
             "bank_count": self.bank_count,
             "bank_slot_ids": bank_slot_ids,
             "bank_reuse_result": bank_reuse_result,
+            "reused_slot_count": len(reused_slot_ids),
+            "reused_region_ids": [item.region_id for item in reused_items],
         }
 
     def cleanup_layer(
@@ -1088,7 +1178,11 @@ class ExpertReservedRegionsExecutor:
         })
         with self._lock:
             slot_ids = sorted(self._active_layer_slots.pop(layer_key, set()))
-            slots = [self._slots[slot_id] for slot_id in slot_ids if slot_id in self._slots]
+            slots = [
+                self._slots[slot_id]
+                for slot_id in slot_ids
+                if slot_id in self._slots
+            ]
 
         if not slots:
             _append_debug_trace({

@@ -128,6 +128,10 @@ class KVCacheBlock:
     # used_free: the block has been used before and is currently reusable.
     # cpu_offloaded: the block is tracked as CPU-backed by later phases.
     lifecycle_state: str = "never_used"
+    # Free-queue membership for the UVM dynamic pool. A block can be in the
+    # GPU-allocatable queue, the CPU-offline queue, or no free queue while it
+    # is referenced by a request.
+    free_queue_kind: str | None = None
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -346,6 +350,23 @@ class FreeKVCacheBlockQueue:
         last_block.next_free_block = self.fake_free_list_tail
         self.fake_free_list_tail.prev_free_block = last_block
 
+        self.num_free_blocks += len(blocks)
+
+    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Put blocks at the front while preserving their input order."""
+        if not blocks:
+            return
+
+        first_existing = self.fake_free_list_head.next_free_block
+        assert first_existing is not None
+        previous = self.fake_free_list_head
+        for block in blocks:
+            block.prev_free_block = previous
+            previous.next_free_block = block
+            previous = block
+
+        previous.next_free_block = first_existing
+        first_existing.prev_free_block = previous
         self.num_free_blocks += len(blocks)
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:

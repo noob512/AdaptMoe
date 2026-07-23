@@ -72,6 +72,7 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     is_flashinfer_supporting_global_sf,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import (
     aux_stream,
@@ -268,6 +269,42 @@ def _env_int(env_name: str, default: int) -> int:
             default,
         )
         return default
+
+
+@triton.jit
+def _uvm_topk_mask_hit_kernel(
+    topk_ids_ptr,
+    mask_ptr,
+    hit_flag_ptr,
+    topk_numel,
+    width: tl.constexpr,
+    ASSUME_VALID: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    active = offsets < topk_numel
+    expert_ids = tl.load(topk_ids_ptr + offsets, mask=active, other=0)
+
+    if ASSUME_VALID:
+        mask_offsets = expert_ids.to(tl.int64)
+        mask_values = tl.load(mask_ptr + mask_offsets, mask=active, other=0)
+    else:
+        valid = active & (expert_ids >= 0) & (expert_ids < width)
+        safe_ids = tl.where(valid, expert_ids, 0).to(tl.int64)
+        mask_values = tl.load(mask_ptr + safe_ids, mask=valid, other=0)
+
+    hit = tl.sum(mask_values.to(tl.int32), axis=0) > 0
+    tl.store(hit_flag_ptr, hit.to(tl.int32))
+
+
+@triton.jit
+def _uvm_topk_mask_simple_kernel(hit_flag_ptr):
+    tl.store(hit_flag_ptr, tl.full((), 0, tl.int32))
+
+
+def _uvm_next_power_of_2(value: int) -> int:
+    value = max(int(value), 1)
+    return 1 << (value - 1).bit_length()
 
 
 def _align_down(value: int, alignment: int) -> int:
@@ -878,6 +915,68 @@ class FusedMoE(CustomOp):
             default=False,
         )
         self._uvm_moe_stream_trace_marker_disabled = False
+        self.uvm_moe_topk_item_probe_mode = os.environ.get(
+            "VLLM_UVM_MOE_TOPK_ITEM_PROBE_MODE",
+            "off",
+        ).strip().lower()
+        if self.uvm_moe_topk_item_probe_mode == "gpu_only":
+            self.uvm_moe_topk_item_probe_mode = "any"
+        elif self.uvm_moe_topk_item_probe_mode == "with_item":
+            self.uvm_moe_topk_item_probe_mode = "item"
+        if self.uvm_moe_topk_item_probe_mode not in (
+            "off",
+            "cast",
+            "valid",
+            "clamp",
+            "gather",
+            "and",
+            "any",
+            "item",
+            "kernel",
+            "kernel_item",
+        ):
+            logger.warning(
+                "Unknown VLLM_UVM_MOE_TOPK_ITEM_PROBE_MODE=%s; using off",
+                self.uvm_moe_topk_item_probe_mode,
+            )
+            self.uvm_moe_topk_item_probe_mode = "off"
+        self.uvm_moe_topk_item_probe_width = max(
+            _env_int("VLLM_UVM_MOE_TOPK_ITEM_PROBE_WIDTH", default=0),
+            0,
+        )
+        self._uvm_moe_topk_item_probe_mask_cache: dict[
+            tuple[str, int, int], torch.Tensor
+        ] = {}
+        self._uvm_moe_topk_item_probe_last: torch.Tensor | None = None
+        self._uvm_moe_topk_item_probe_last_item = False
+        self.uvm_expert_reserved_topk_gate_impl = os.environ.get(
+            "VLLM_UVM_EXPERT_RESERVED_TOPK_GATE_IMPL",
+            "triton",
+        ).strip().lower()
+        if self.uvm_expert_reserved_topk_gate_impl not in (
+            "triton",
+            "triton_async",
+            "torch",
+            "none",
+            "simple",
+            "fused_select",
+        ):
+            logger.warning(
+                "Unknown VLLM_UVM_EXPERT_RESERVED_TOPK_GATE_IMPL=%s; using triton",
+                self.uvm_expert_reserved_topk_gate_impl,
+            )
+            self.uvm_expert_reserved_topk_gate_impl = "triton"
+        self.uvm_expert_reserved_topk_gate_assume_valid = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_RESERVED_TOPK_GATE_ASSUME_VALID",
+            default=True,
+        )
+        self.uvm_expert_reserved_topk_gate_max_block = max(
+            _env_int(
+                "VLLM_UVM_EXPERT_RESERVED_TOPK_GATE_MAX_BLOCK",
+                default=65536,
+            ),
+            1,
+        )
         self.uvm_weight_router_topk_every_n_steps = _env_int(
             "VLLM_UVM_WEIGHT_ROUTER_TOPK_EVERY_N_STEPS",
             default=1,
@@ -1121,10 +1220,12 @@ class FusedMoE(CustomOp):
             "offload_plan",
         )
         self._uvm_weight_prefetch_plan_loaded = bool(
-            self.uvm_weight_prefetch_plan_keys
+            self.uvm_weight_prefetch_plan_file
+            and os.path.isfile(self.uvm_weight_prefetch_plan_file)
         )
         self._uvm_weight_offload_plan_loaded = bool(
-            self.uvm_weight_offload_plan_keys
+            self.uvm_weight_offload_plan_file
+            and os.path.isfile(self.uvm_weight_offload_plan_file)
         )
         self.uvm_init_weight_offload_enable = _env_flag_enabled(
             "VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE",
@@ -1220,15 +1321,15 @@ class FusedMoE(CustomOp):
             self.uvm_init_weight_offload_plan_file,
             "offload_plan",
         )
-        self.uvm_init_weight_hot_plan_keys = (
+        self.uvm_init_weight_hot_plan_keys = _parse_plan_expert_keys(
+            self.uvm_init_weight_offload_plan_file,
+            "hot_plan",
+        ) | (
             _parse_plan_expert_keys(
-                self.uvm_init_weight_offload_plan_file,
-                "hot_plan",
-            )
-            | _parse_plan_expert_keys(
                 self.uvm_init_weight_offload_plan_file,
                 "prefetch_plan",
             )
+            - self.uvm_init_weight_offload_plan_keys
         )
         self.uvm_init_weight_warm_plan_keys = _parse_plan_expert_keys(
             self.uvm_init_weight_offload_plan_file,
@@ -1238,9 +1339,8 @@ class FusedMoE(CustomOp):
             self.uvm_init_weight_offload_plan_file,
         )
         self._uvm_init_weight_offload_plan_loaded = bool(
-            self.uvm_init_weight_offload_plan_keys
-            or self.uvm_init_weight_hot_plan_keys
-            or self.uvm_init_weight_warm_plan_keys
+            self.uvm_init_weight_offload_plan_file
+            and os.path.isfile(self.uvm_init_weight_offload_plan_file)
         )
         register_all_default = (
             self.uvm_expert_reserved_enable
@@ -1280,6 +1380,12 @@ class FusedMoE(CustomOp):
         self._uvm_plan_expert_bitmask_width = int(self.global_num_experts)
         self._uvm_reserved_offload_mask_tensor_cache: dict[
             tuple[int | None, str, int], torch.Tensor
+        ] = {}
+        self._uvm_reserved_offload_mask_values_cache: tuple[
+            frozenset[int], int, list[bool]
+        ] | None = None
+        self._uvm_topk_gate_hit_flag_cache: dict[
+            tuple[str, int], torch.Tensor
         ] = {}
         self._uvm_slot_managed_global_expert_ids: set[int] = set()
         self._uvm_offloaded_warm_global_expert_ids: set[int] = set()
@@ -2506,9 +2612,52 @@ class FusedMoE(CustomOp):
                 )
 
         indices_type = self.quant_method.topk_indices_dtype
+        routing_strategy = envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY
+        fused_select_plans_refreshed = False
+        fused_select_mask: torch.Tensor | None = None
+        fused_select_hit_flag: torch.Tensor | None = None
+        self._uvm_fused_select_hit_flag = None
+        self._uvm_fused_select_hit_layer_id = None
+        run_reserved_topk_gate = (
+            self.uvm_expert_reserved_enable
+            and self.uvm_weight_prefetch_enabled
+            and not self.uvm_expert_reserved_skip_active_topk
+            and (
+                self.uvm_weight_router_topk_every_n_steps <= 1
+                or (
+                    self._uvm_moe_trace_step
+                    % self.uvm_weight_router_topk_every_n_steps
+                )
+                == 0
+            )
+        )
+        if (
+            run_reserved_topk_gate
+            and self.uvm_expert_reserved_topk_gate_impl == "fused_select"
+            and not self.enable_eplb
+            and routing_strategy == ""
+            and not self.use_grouped_topk
+            and self.e_score_correction_bias is None
+            and self.custom_routing_function is None
+            and router_logits.is_cuda
+        ):
+            self._refresh_uvm_weight_action_plans()
+            fused_select_plans_refreshed = True
+            fused_layer_id = self._uvm_layer_id()
+            mask_values = self._uvm_reserved_offload_mask_for_layer(fused_layer_id)
+            if mask_values:
+                fused_select_mask = self._uvm_reserved_offload_mask_tensor(
+                    layer_id=fused_layer_id,
+                    device=router_logits.device,
+                    mask_values=mask_values,
+                )
+                fused_select_hit_flag = self._uvm_topk_gate_hit_flag_tensor(
+                    router_logits.device
+                )
+                self._uvm_fused_select_hit_flag = fused_select_hit_flag
+                self._uvm_fused_select_hit_layer_id = fused_layer_id
 
         # Check if we should use a routing simulation strategy
-        routing_strategy = envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY
         if routing_strategy != "":
             topk_weights, topk_ids = RoutingSimulator.simulate_routing(
                 hidden_states=hidden_states,
@@ -2560,6 +2709,8 @@ class FusedMoE(CustomOp):
                 topk=self.top_k,
                 renormalize=self.renormalize,
                 indices_type=indices_type,
+                expert_mask=fused_select_mask,
+                hit_flag=fused_select_hit_flag,
             )
         else:
             topk_weights, topk_ids = self.custom_routing_function(
@@ -2617,6 +2768,7 @@ class FusedMoE(CustomOp):
                 "topk_weights": topk_weights,
             },
         )
+        self._run_uvm_moe_topk_item_probe(topk_ids)
         if self.uvm_expert_reserved_enable:
             if (
                 self.uvm_weight_prefetch_enabled
@@ -2629,19 +2781,9 @@ class FusedMoE(CustomOp):
                         - self.uvm_expert_reserved_cleanup_delay_steps
                     )
                 )
-            if (
-                self.uvm_weight_prefetch_enabled
-                and not self.uvm_expert_reserved_skip_active_topk
-                and (
-                    self.uvm_weight_router_topk_every_n_steps <= 1
-                    or (
-                        self._uvm_moe_trace_step
-                        % self.uvm_weight_router_topk_every_n_steps
-                    )
-                    == 0
-                )
-            ):
-                self._refresh_uvm_weight_action_plans()
+            if run_reserved_topk_gate:
+                if not fused_select_plans_refreshed:
+                    self._refresh_uvm_weight_action_plans()
                 reserved_layer_id = self._uvm_layer_id()
                 if self._uvm_topk_has_reserved_offloaded_expert(
                     topk_ids,
@@ -2887,9 +3029,12 @@ class FusedMoE(CustomOp):
     ) -> bool:
         if layer_id is None:
             return False
+        plan_key = (layer_id, global_expert_id)
+        if plan_key in self.uvm_init_weight_offload_plan_keys:
+            return False
         return (
-            (layer_id, global_expert_id) in self.uvm_init_weight_hot_plan_keys
-            or (layer_id, global_expert_id) in self.uvm_weight_prefetch_plan_keys
+            plan_key in self.uvm_init_weight_hot_plan_keys
+            or plan_key in self.uvm_weight_prefetch_plan_keys
         )
 
     def _uvm_init_weight_expert_class(
@@ -3081,6 +3226,7 @@ class FusedMoE(CustomOp):
             self._uvm_offloaded_warm_global_expert_ids.add(
                 int(global_expert_id)
             )
+        self._uvm_reserved_offload_mask_values_cache = None
         self._uvm_reserved_offload_mask_tensor_cache.clear()
 
     def _uvm_init_weight_class_metadata(
@@ -3167,6 +3313,7 @@ class FusedMoE(CustomOp):
         )
         if not managed_ids:
             return None
+        frozen_ids = frozenset(int(expert_id) for expert_id in managed_ids)
         max_global_id = max(managed_ids, default=-1)
         width = max(
             self._uvm_plan_expert_bitmask_width,
@@ -3174,10 +3321,14 @@ class FusedMoE(CustomOp):
         )
         if width <= 0:
             return None
+        cached = self._uvm_reserved_offload_mask_values_cache
+        if cached is not None and cached[0] == frozen_ids and cached[1] == width:
+            return cached[2]
         mask = [False] * width
-        for expert_id in managed_ids:
+        for expert_id in frozen_ids:
             if 0 <= expert_id < width:
                 mask[expert_id] = True
+        self._uvm_reserved_offload_mask_values_cache = (frozen_ids, width, mask)
         return mask
 
     def _uvm_reserved_offload_mask_tensor(
@@ -3196,6 +3347,132 @@ class FusedMoE(CustomOp):
         self._uvm_reserved_offload_mask_tensor_cache[cache_key] = mask_tensor
         return mask_tensor
 
+    def _uvm_topk_gate_hit_flag_tensor(self, device: torch.device) -> torch.Tensor:
+        device_index = -1 if device.index is None else int(device.index)
+        cache_key = (device.type, device_index)
+        cached = self._uvm_topk_gate_hit_flag_cache.get(cache_key)
+        if cached is not None and cached.device == device:
+            return cached
+        flag_tensor = torch.zeros((), dtype=torch.int32, device=device)
+        self._uvm_topk_gate_hit_flag_cache[cache_key] = flag_tensor
+        return flag_tensor
+
+    def _uvm_topk_mask_hit_triton(
+        self,
+        *,
+        ids: torch.Tensor,
+        mask_tensor: torch.Tensor,
+        width: int,
+        assume_valid: bool,
+        sync: bool = True,
+    ) -> bool | torch.Tensor | None:
+        if not HAS_TRITON or not ids.is_cuda or not ids.is_contiguous():
+            return None
+        topk_numel = int(ids.numel())
+        if topk_numel <= 0 or topk_numel > self.uvm_expert_reserved_topk_gate_max_block:
+            return None
+        block_size = _uvm_next_power_of_2(topk_numel)
+        if block_size > self.uvm_expert_reserved_topk_gate_max_block:
+            return None
+        hit_flag = self._uvm_topk_gate_hit_flag_tensor(ids.device)
+        _uvm_topk_mask_hit_kernel[(1,)](
+            ids,
+            mask_tensor,
+            hit_flag,
+            topk_numel,
+            width=width,
+            ASSUME_VALID=bool(assume_valid),
+            BLOCK_SIZE=block_size,
+        )
+        if not sync:
+            return hit_flag
+        return bool(hit_flag.item())
+
+    def _uvm_topk_mask_simple_triton(
+        self,
+        *,
+        ids: torch.Tensor,
+        sync: bool = True,
+    ) -> bool | torch.Tensor | None:
+        if not HAS_TRITON or not ids.is_cuda:
+            return None
+        hit_flag = self._uvm_topk_gate_hit_flag_tensor(ids.device)
+        _uvm_topk_mask_simple_kernel[(1,)](hit_flag)
+        if not sync:
+            return hit_flag
+        return bool(hit_flag.item())
+
+    def _run_uvm_moe_topk_item_probe(self, topk_ids: torch.Tensor) -> None:
+        mode = self.uvm_moe_topk_item_probe_mode
+        if mode == "off":
+            return
+
+        ids = topk_ids.detach()
+        if ids.numel() == 0 or not ids.is_cuda:
+            return
+
+        width = self.uvm_moe_topk_item_probe_width
+        if width <= 0:
+            width = max(
+                int(self.global_num_experts or 0),
+                int(self.logical_num_experts or 0),
+                1,
+            )
+
+        device = ids.device
+        device_index = -1 if device.index is None else int(device.index)
+        cache_key = (device.type, device_index, width)
+        mask_tensor = self._uvm_moe_topk_item_probe_mask_cache.get(cache_key)
+        if mask_tensor is None or mask_tensor.device != device:
+            mask_tensor = torch.zeros(width, dtype=torch.bool, device=device)
+            self._uvm_moe_topk_item_probe_mask_cache[cache_key] = mask_tensor
+
+        if mode in ("kernel", "kernel_item"):
+            hit = self._uvm_topk_mask_hit_triton(
+                ids=ids,
+                mask_tensor=mask_tensor,
+                width=width,
+                assume_valid=self.uvm_expert_reserved_topk_gate_assume_valid,
+                sync=mode == "kernel_item",
+            )
+            if hit is not None:
+                if isinstance(hit, torch.Tensor):
+                    self._uvm_moe_topk_item_probe_last = hit
+                else:
+                    self._uvm_moe_topk_item_probe_last_item = bool(hit)
+                return
+
+        index_ids = ids.to(dtype=torch.long)
+        if mode == "cast":
+            self._uvm_moe_topk_item_probe_last = index_ids
+            return
+
+        valid = (index_ids >= 0) & (index_ids < width)
+        if mode == "valid":
+            self._uvm_moe_topk_item_probe_last = valid
+            return
+
+        clamped_ids = index_ids.clamp(min=0, max=width - 1)
+        if mode == "clamp":
+            self._uvm_moe_topk_item_probe_last = clamped_ids
+            return
+
+        hits = mask_tensor[clamped_ids]
+        if mode == "gather":
+            self._uvm_moe_topk_item_probe_last = hits
+            return
+
+        hits = hits & valid
+        if mode == "and":
+            self._uvm_moe_topk_item_probe_last = hits
+            return
+
+        has_hit = hits.any()
+        if mode == "item":
+            self._uvm_moe_topk_item_probe_last_item = bool(has_hit.item())
+        else:
+            self._uvm_moe_topk_item_probe_last = has_hit
+
     def _uvm_topk_has_reserved_offloaded_expert(
         self,
         topk_ids: torch.Tensor,
@@ -3205,7 +3482,7 @@ class FusedMoE(CustomOp):
         if not mask_values:
             return False
         width = len(mask_values)
-        if width <= 0 or not any(mask_values):
+        if width <= 0:
             return False
 
         ids = topk_ids.detach()
@@ -3218,12 +3495,52 @@ class FusedMoE(CustomOp):
                 device=ids.device,
                 mask_values=mask_values,
             )
+            if self.uvm_expert_reserved_topk_gate_impl == "none":
+                return False
+            if self.uvm_expert_reserved_topk_gate_impl == "fused_select":
+                fused_flag = getattr(self, "_uvm_fused_select_hit_flag", None)
+                fused_layer_id = getattr(
+                    self, "_uvm_fused_select_hit_layer_id", None
+                )
+                if fused_flag is not None and fused_layer_id == layer_id:
+                    hit = bool(fused_flag.item())
+                    if hit:
+                        fused_flag.zero_()
+                    return hit
+            if self.uvm_expert_reserved_topk_gate_impl == "simple":
+                simple_result = self._uvm_topk_mask_simple_triton(ids=ids)
+                if simple_result is not None:
+                    return bool(simple_result)
+                return False
+            if self.uvm_expert_reserved_topk_gate_impl == "triton_async":
+                self._uvm_topk_mask_hit_triton(
+                    ids=ids,
+                    mask_tensor=mask_tensor,
+                    width=width,
+                    assume_valid=self.uvm_expert_reserved_topk_gate_assume_valid,
+                    sync=False,
+                )
+                return False
+            if self.uvm_expert_reserved_topk_gate_impl == "triton":
+                triton_result = self._uvm_topk_mask_hit_triton(
+                    ids=ids,
+                    mask_tensor=mask_tensor,
+                    width=width,
+                    assume_valid=self.uvm_expert_reserved_topk_gate_assume_valid,
+                )
+                if triton_result is not None:
+                    return bool(triton_result)
             index_ids = ids.to(dtype=torch.long)
-            valid = (index_ids >= 0) & (index_ids < width)
-            hits = mask_tensor[index_ids.clamp(min=0, max=width - 1)] & valid
+            if self.uvm_expert_reserved_topk_gate_assume_valid:
+                hits = mask_tensor[index_ids]
+            else:
+                valid = (index_ids >= 0) & (index_ids < width)
+                hits = mask_tensor[index_ids.clamp(min=0, max=width - 1)] & valid
             return bool(hits.any().item())
 
         flat_ids = ids.flatten().to(dtype=torch.long).tolist()
+        if self.uvm_expert_reserved_topk_gate_assume_valid:
+            return any(mask_values[int(expert_id)] for expert_id in flat_ids)
         return any(
             0 <= int(expert_id) < width and mask_values[int(expert_id)]
             for expert_id in flat_ids
@@ -3273,15 +3590,15 @@ class FusedMoE(CustomOp):
                 self.uvm_init_weight_offload_plan_file,
                 "offload_plan",
             )
-            self.uvm_init_weight_hot_plan_keys = (
+            self.uvm_init_weight_hot_plan_keys = _parse_plan_expert_keys(
+                self.uvm_init_weight_offload_plan_file,
+                "hot_plan",
+            ) | (
                 _parse_plan_expert_keys(
-                    self.uvm_init_weight_offload_plan_file,
-                    "hot_plan",
-                )
-                | _parse_plan_expert_keys(
                     self.uvm_init_weight_offload_plan_file,
                     "prefetch_plan",
                 )
+                - self.uvm_init_weight_offload_plan_keys
             )
             self.uvm_init_weight_warm_plan_keys = _parse_plan_expert_keys(
                 self.uvm_init_weight_offload_plan_file,
@@ -3290,11 +3607,7 @@ class FusedMoE(CustomOp):
             self.uvm_init_weight_plan_policy = _uvm_weight_plan_policy(
                 self.uvm_init_weight_offload_plan_file,
             )
-            self._uvm_init_weight_offload_plan_loaded = bool(
-                self.uvm_init_weight_offload_plan_keys
-                or self.uvm_init_weight_hot_plan_keys
-                or self.uvm_init_weight_warm_plan_keys
-            )
+            self._uvm_init_weight_offload_plan_loaded = True
 
     def _uvm_expert_weight_slices(
         self,
@@ -3323,6 +3636,66 @@ class FusedMoE(CustomOp):
             ptr = tensor.data_ptr() + local_expert_id * slice_bytes
             slices.append((role, ptr, slice_bytes))
         return slices
+
+    def _uvm_stage_m_expert_weight_slices(
+        self,
+        *,
+        layer_id: int,
+        global_expert_id: int,
+        local_expert_id: int,
+    ) -> list[tuple[str, int, int, dict[str, object] | None]]:
+        """Resolve Stage-M slices from the logical registry when possible."""
+        resolved: list[tuple[str, int, int, dict[str, object] | None]] = []
+        missing_roles: list[str] = []
+        roles = self.uvm_init_weight_offload_target_roles
+
+        for role in ("moe_gate_up", "moe_down"):
+            if role not in roles:
+                continue
+            region_id = self._uvm_expert_weight_region_id(
+                layer_id,
+                global_expert_id,
+                role,
+            )
+            existing = get_uvm_residency_region_snapshot(region_id)
+            if existing is None:
+                missing_roles.append(role)
+                continue
+            ptr = int(existing.get("ptr") or 0)
+            size_bytes = int(existing.get("bytes") or 0)
+            if ptr <= 0 or size_bytes <= 0:
+                raise RuntimeError(
+                    "Stage-M logical weight region has invalid geometry: "
+                    f"region_id={region_id}, ptr={ptr}, bytes={size_bytes}"
+                )
+            resolved.append((role, ptr, size_bytes, existing))
+
+        if not missing_roles:
+            return resolved
+        if self.uvm_init_weight_register_all_local_experts:
+            raise RuntimeError(
+                "Stage-M all-local logical preregistration is incomplete: "
+                f"layer_id={layer_id}, global_expert_id={global_expert_id}, "
+                f"missing_roles={','.join(missing_roles)}"
+            )
+
+        tensor_slices = {
+            role: (ptr, size_bytes)
+            for role, ptr, size_bytes in self._uvm_expert_weight_slices(
+                local_expert_id,
+                set(missing_roles),
+            )
+        }
+        for role in missing_roles:
+            geometry = tensor_slices.get(role)
+            if geometry is None:
+                continue
+            ptr, size_bytes = geometry
+            resolved.append((role, ptr, size_bytes, None))
+
+        role_order = {"moe_gate_up": 0, "moe_down": 1}
+        resolved.sort(key=lambda item: role_order.get(item[0], len(role_order)))
+        return resolved
 
     def _uvm_expert_weight_region_id(
         self,
@@ -3477,6 +3850,7 @@ class FusedMoE(CustomOp):
                 **metadata,
                 "source": source_action,
                 "stage": self._uvm_expert_envelope_stage(),
+                "expert_envelope": True,
                 "driver_tag_skip": False,
                 "driver_tag_skip_reason": None,
                 "logical_region_id": source_region_id,
@@ -3523,6 +3897,19 @@ class FusedMoE(CustomOp):
                 active=False,
                 metadata=envelope_metadata,
             )
+            driver_registered = bool(
+                getattr(registered, "driver_registered", False)
+            )
+            driver_register_status = getattr(
+                registered,
+                "driver_register_status",
+                None,
+            )
+            envelope_metadata = {
+                **envelope_metadata,
+                "driver_registered": driver_registered,
+                "driver_register_status": driver_register_status,
+            }
             records.append(
                 {
                     "region_id": envelope_id,
@@ -3532,6 +3919,8 @@ class FusedMoE(CustomOp):
                     "ptr": int(envelope_base),
                     "bytes": int(block_bytes),
                     "metadata": envelope_metadata,
+                    "driver_registered": driver_registered,
+                    "driver_register_status": driver_register_status,
                 }
             )
         return records
@@ -5637,12 +6026,7 @@ class FusedMoE(CustomOp):
         }
         for global_expert_id, local_expert_id in expert_pairs:
             expert_class = expert_class_by_global[global_expert_id]
-            logical_driver_tag_skip = bool(
-                expert_class != "hot"
-                and self.uvm_expert_envelope_enable
-                and self.uvm_init_weight_offload_mode
-                in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
-            )
+            logical_driver_tag_skip = bool(self.uvm_expert_envelope_enable)
             for role, ptr, size_bytes in self._uvm_expert_weight_slices(
                 local_expert_id,
                 self.uvm_init_weight_offload_target_roles,
@@ -5674,16 +6058,26 @@ class FusedMoE(CustomOp):
                     if existing_region is not None
                     else "gpu"
                 )
-                register_uvm_residency_region(
-                    pool="weights",
-                    region_id=region_id,
-                    ptr=ptr,
-                    bytes=size_bytes,
-                    state=state,
-                    evictable=expert_class != "hot",
-                    active=False,
-                    metadata=metadata,
-                )
+                if existing_region is None:
+                    register_uvm_residency_region(
+                        pool="weights",
+                        region_id=region_id,
+                        ptr=ptr,
+                        bytes=size_bytes,
+                        state=state,
+                        evictable=expert_class != "hot",
+                        active=False,
+                        metadata=metadata,
+                    )
+                else:
+                    mark_uvm_residency_state(
+                        region_id=region_id,
+                        state=state,
+                        metadata={
+                            **metadata,
+                            "evictable": expert_class != "hot",
+                        },
+                    )
                 self._uvm_update_weight_expert_role_cache(
                     layer_id=layer_id,
                     global_expert_id=global_expert_id,
@@ -5750,9 +6144,12 @@ class FusedMoE(CustomOp):
         prefetch_attempted_bytes = 0
         prefetch_requested_bytes = 0
         for global_expert_id, local_expert_id in hot_pairs:
-            for role, ptr, size_bytes in self._uvm_expert_weight_slices(
-                local_expert_id,
-                self.uvm_init_weight_offload_target_roles,
+            for role, ptr, size_bytes, existing_region in (
+                self._uvm_stage_m_expert_weight_slices(
+                    layer_id=layer_id,
+                    global_expert_id=global_expert_id,
+                    local_expert_id=local_expert_id,
+                )
             ):
                 region_id = self._uvm_expert_weight_region_id(
                     layer_id,
@@ -5769,13 +6166,7 @@ class FusedMoE(CustomOp):
                     active_this_step=False,
                     source_action="stage_m_init_hot_register",
                 )
-                logical_driver_tag_skip = bool(
-                    self.uvm_expert_envelope_enable
-                    and self.uvm_init_weight_offload_mode
-                    in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
-                    and (layer_id, global_expert_id)
-                    in self.uvm_init_weight_offload_plan_keys
-                )
+                logical_driver_tag_skip = bool(self.uvm_expert_envelope_enable)
                 hot_metadata = {
                     **metadata,
                     "source": "stage_m",
@@ -5799,16 +6190,17 @@ class FusedMoE(CustomOp):
                     "priority": 100,
                     "plan_policy": self.uvm_init_weight_plan_policy,
                 }
-                register_uvm_residency_region(
-                    pool="weights",
-                    region_id=region_id,
-                    ptr=ptr,
-                    bytes=size_bytes,
-                    state="gpu",
-                    evictable=False,
-                    active=False,
-                    metadata=hot_metadata,
-                )
+                if existing_region is None:
+                    register_uvm_residency_region(
+                        pool="weights",
+                        region_id=region_id,
+                        ptr=ptr,
+                        bytes=size_bytes,
+                        state="gpu",
+                        evictable=False,
+                        active=False,
+                        metadata=hot_metadata,
+                    )
                 mark_uvm_residency_state(
                     region_id=region_id,
                     state="gpu",
@@ -6183,9 +6575,12 @@ class FusedMoE(CustomOp):
                 for global_expert_id, local_expert_id in expert_pairs:
                     expert_bytes = sum(
                         size_bytes
-                        for _, _, size_bytes in self._uvm_expert_weight_slices(
-                            local_expert_id,
-                            self.uvm_init_weight_offload_target_roles,
+                        for _, _, size_bytes, _ in (
+                            self._uvm_stage_m_expert_weight_slices(
+                                layer_id=layer_id,
+                                global_expert_id=global_expert_id,
+                                local_expert_id=local_expert_id,
+                            )
                         )
                     )
                     if (
@@ -6202,12 +6597,16 @@ class FusedMoE(CustomOp):
             attempted_bytes = 0
             issued_bytes = 0
             issued_records = 0
+            scheduled_bytes = 0
             rejected_records = 0
             batch_items: list[dict[str, object]] = []
             for global_expert_id, local_expert_id in expert_pairs:
-                for role, ptr, size_bytes in self._uvm_expert_weight_slices(
-                    local_expert_id,
-                    self.uvm_init_weight_offload_target_roles,
+                for role, ptr, size_bytes, existing_region in (
+                    self._uvm_stage_m_expert_weight_slices(
+                        layer_id=layer_id,
+                        global_expert_id=global_expert_id,
+                        local_expert_id=local_expert_id,
+                    )
                 ):
                     region_id = self._uvm_expert_weight_region_id(
                         layer_id,
@@ -6228,11 +6627,7 @@ class FusedMoE(CustomOp):
                         layer_id=layer_id,
                         global_expert_id=global_expert_id,
                     )
-                    logical_driver_tag_skip = bool(
-                        self.uvm_expert_envelope_enable
-                        and self.uvm_init_weight_offload_mode
-                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
-                    )
+                    logical_driver_tag_skip = bool(self.uvm_expert_envelope_enable)
                     offload_metadata = self._uvm_init_weight_class_metadata(
                         metadata=residency_metadata,
                         expert_class=expert_class,
@@ -6241,24 +6636,29 @@ class FusedMoE(CustomOp):
                             self.uvm_init_weight_offload_mode != "trace_only"
                         ),
                     )
-                    existing_region = get_uvm_residency_region_snapshot(region_id)
-                    registered_region = register_uvm_residency_region(
-                        pool="weights",
-                        region_id=region_id,
-                        ptr=ptr,
-                        bytes=size_bytes,
-                        state=(
-                            str(existing_region.get("state"))
-                            if existing_region is not None
-                            else "gpu"
-                        ),
-                        evictable=True,
-                        active=False,
-                        metadata=offload_metadata,
-                    )
-                    driver_region_id = int(
-                        getattr(registered_region, "driver_region_id", 0) or 0
-                    )
+                    if existing_region is None:
+                        registered_region = register_uvm_residency_region(
+                            pool="weights",
+                            region_id=region_id,
+                            ptr=ptr,
+                            bytes=size_bytes,
+                            state="gpu",
+                            evictable=True,
+                            active=False,
+                            metadata=offload_metadata,
+                        )
+                        driver_region_id = int(
+                            getattr(registered_region, "driver_region_id", 0) or 0
+                        )
+                    else:
+                        driver_region_id = int(
+                            existing_region.get("driver_region_id") or 0
+                        )
+                        mark_uvm_residency_state(
+                            region_id=region_id,
+                            state=str(existing_region.get("state") or "gpu"),
+                            metadata=offload_metadata,
+                        )
                     envelope_records: list[dict[str, object]] = []
                     if (
                         self.uvm_init_weight_offload_mode
@@ -6297,7 +6697,30 @@ class FusedMoE(CustomOp):
                         int(record.get("driver_region_id") or 0)
                         for record in envelope_records
                         if int(record.get("driver_region_id") or 0) > 0
-                    ] or [driver_region_id]
+                        and bool(
+                            cast(dict[str, object], record.get("metadata") or {}).get(
+                                "driver_registered"
+                            )
+                        )
+                    ]
+                    if (
+                        self.uvm_expert_envelope_enable
+                        and self.uvm_init_weight_offload_mode
+                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                        and (
+                            not envelope_records
+                            or len(release_driver_region_ids)
+                            != len(envelope_records)
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Stage-M envelope driver registration is incomplete "
+                            f"for {region_id}: registered="
+                            f"{len(release_driver_region_ids)}/"
+                            f"{len(envelope_records)}"
+                        )
+                    if not release_driver_region_ids and driver_region_id > 0:
+                        release_driver_region_ids = [driver_region_id]
 
                     attempted_bytes += size_bytes
                     if (
@@ -6306,7 +6729,7 @@ class FusedMoE(CustomOp):
                             self.uvm_init_weight_complete_expert_plan
                             and self.uvm_init_weight_complete_plan_ignore_limits
                         )
-                        and issued_bytes + size_bytes
+                        and issued_bytes + scheduled_bytes + size_bytes
                         > self.uvm_init_weight_offload_max_bytes
                     ):
                         rejected_records += 1
@@ -6353,8 +6776,7 @@ class FusedMoE(CustomOp):
                         and self.uvm_init_weight_offload_mode
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                     ):
-                        issued_records += 1
-                        issued_bytes += size_bytes
+                        scheduled_bytes += size_bytes
                         batch_items.append(
                             {
                                 "timestamp": time.time(),
@@ -6635,6 +7057,8 @@ class FusedMoE(CustomOp):
                         advise_success = False
                         prefetch_success = False
                     if success:
+                        issued_records += 1
+                        issued_bytes += int(item["bytes"])
                         next_state = (
                             "cpu"
                             if self.uvm_init_weight_offload_sync

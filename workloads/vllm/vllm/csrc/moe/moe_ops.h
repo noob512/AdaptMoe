@@ -6,6 +6,11 @@ void topk_softmax(torch::Tensor& topk_weights, torch::Tensor& topk_indices,
                   torch::Tensor& token_expert_indices,
                   torch::Tensor& gating_output, bool renormalize);
 
+void topk_softmax_with_hit(
+    torch::Tensor& topk_weights, torch::Tensor& topk_indices,
+    torch::Tensor& token_expert_indices, torch::Tensor& gating_output,
+    torch::Tensor& expert_mask, torch::Tensor& hit_flag, bool renormalize);
+
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,

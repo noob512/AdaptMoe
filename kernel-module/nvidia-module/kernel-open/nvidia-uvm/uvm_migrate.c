@@ -140,6 +140,9 @@ static bool phase_n_migrate_range_has_cpu_offloaded_reserved_expert(uvm_va_space
     if (length == 0)
         return false;
 
+    if (uvm_va_space_range_has_cpu_offloaded_reserved_expert(va_space, base, length))
+        return true;
+
     end = base + length - 1;
     uvm_for_each_va_range_managed_in(managed_range, va_space, base, end) {
         if (phase_n_migrate_tag_is_cpu_offloaded_reserved_expert(&managed_range->phase_n_tag))

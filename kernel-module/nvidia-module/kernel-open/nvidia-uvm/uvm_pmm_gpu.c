@@ -1419,11 +1419,20 @@ static void chunk_start_eviction(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 
 static void root_chunk_update_eviction_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_pmm_alloc_list_t alloc_list)
 {
+    uvm_gpu_root_chunk_t *root_chunk;
+
+    if (!chunk)
+        return;
+
+    root_chunk = root_chunk_from_chunk(pmm, chunk);
+    chunk = &root_chunk->chunk;
+
     uvm_spin_lock(&pmm->list_lock);
 
     UVM_ASSERT(uvm_gpu_chunk_get_size(chunk) == UVM_CHUNK_SIZE_MAX);
     UVM_ASSERT(uvm_gpu_chunk_is_user(chunk));
-    UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED ||
+    UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT ||
+               chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED ||
                chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
 
     if (!chunk_is_root_chunk_pinned(pmm, chunk) && !chunk_is_in_eviction(pmm, chunk)) {

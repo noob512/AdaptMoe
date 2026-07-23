@@ -735,6 +735,9 @@ static size_t block_gpu_chunk_index(uvm_va_block_t *block,
                                     uvm_gpu_t *gpu,
                                     uvm_page_index_t page_index,
                                     uvm_chunk_size_t *out_chunk_size);
+static NV_STATUS block_convert_gpu_chunks_to_fixed_size(uvm_va_block_t *block,
+                                                        uvm_gpu_t *gpu,
+                                                        uvm_chunk_size_t max_chunk_size);
 
 uvm_va_space_t *uvm_va_block_get_va_space_maybe_dead(uvm_va_block_t *va_block)
 {
@@ -1785,7 +1788,15 @@ static size_t block_gpu_chunk_index(uvm_va_block_t *block,
     uvm_gpu_chunk_t *chunk;
     size_t index;
 
-    index = block_gpu_chunk_index_range(block, block->start, uvm_va_block_size(block), gpu, page_index, &size);
+    if (gpu_state && gpu_state->fixed_chunk_size != 0) {
+        size = gpu_state->fixed_chunk_size;
+        UVM_ASSERT(IS_ALIGNED(block->start, size));
+        UVM_ASSERT(IS_ALIGNED(uvm_va_block_size(block), size));
+        index = (page_index * PAGE_SIZE) / size;
+    }
+    else {
+        index = block_gpu_chunk_index_range(block, block->start, uvm_va_block_size(block), gpu, page_index, &size);
+    }
 
     UVM_ASSERT(size >= PAGE_SIZE);
 
@@ -1810,6 +1821,7 @@ static size_t block_gpu_chunk_index(uvm_va_block_t *block,
 // Compute the size of the chunk known to start at start_page_index
 static uvm_chunk_size_t block_gpu_chunk_size(uvm_va_block_t *block, uvm_gpu_t *gpu, uvm_page_index_t start_page_index)
 {
+    uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(block, gpu->id);
     uvm_chunk_sizes_mask_t chunk_sizes = gpu->parent->mmu_user_chunk_sizes;
     uvm_chunk_sizes_mask_t start_alignments, pow2_leq_size, allowed_sizes;
     NvU64 start = uvm_va_block_cpu_page_address(block, start_page_index);
@@ -1817,6 +1829,9 @@ static uvm_chunk_size_t block_gpu_chunk_size(uvm_va_block_t *block, uvm_gpu_t *g
 
     if (uvm_va_block_is_hmm(block))
         return PAGE_SIZE;
+
+    if (gpu_state && gpu_state->fixed_chunk_size != 0)
+        return gpu_state->fixed_chunk_size;
 
     // Create a mask of all sizes for which start is aligned. x ^ (x-1) yields a
     // mask of the rightmost 1 bit in x, as well as all trailing 0 bits in x.
@@ -1842,6 +1857,40 @@ static uvm_chunk_size_t block_gpu_chunk_size(uvm_va_block_t *block, uvm_gpu_t *g
 static size_t block_num_gpu_chunks(uvm_va_block_t *block, uvm_gpu_t *gpu)
 {
     return block_gpu_chunk_index(block, gpu, uvm_va_block_cpu_page_index(block, block->end), NULL) + 1;
+}
+
+typedef enum
+{
+    BLOCK_PMM_ROOT_USED,
+    BLOCK_PMM_ROOT_UNUSED,
+    BLOCK_PMM_ROOT_DISCARDED,
+} block_pmm_root_state_t;
+
+static void block_mark_gpu_roots(uvm_va_block_t *block,
+                                 uvm_gpu_t *gpu,
+                                 block_pmm_root_state_t state)
+{
+    uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(block, gpu->id);
+    size_t num_chunks;
+    size_t i;
+
+    if (!gpu_state || !gpu_state->chunks)
+        return;
+
+    num_chunks = block_num_gpu_chunks(block, gpu);
+    for (i = 0; i < num_chunks; ++i) {
+        uvm_gpu_chunk_t *chunk = gpu_state->chunks[i];
+
+        if (!chunk)
+            continue;
+
+        if (state == BLOCK_PMM_ROOT_USED)
+            uvm_pmm_gpu_mark_root_chunk_used(&gpu->pmm, chunk);
+        else if (state == BLOCK_PMM_ROOT_UNUSED)
+            uvm_pmm_gpu_mark_root_chunk_unused(&gpu->pmm, chunk);
+        else
+            uvm_pmm_gpu_mark_root_chunk_discarded(&gpu->pmm, chunk);
+    }
 }
 
 static size_t block_num_gpu_chunks_range(uvm_va_block_t *block, NvU64 start, NvU64 size, uvm_gpu_t *gpu)
@@ -4269,7 +4318,7 @@ static void block_mark_memory_used(uvm_va_block_t *block, uvm_processor_id_t id)
     if (!uvm_va_block_is_hmm(block) && uvm_va_block_size(block) == UVM_CHUNK_SIZE_MAX) {
         // The chunk has to be there if this GPU is resident
         UVM_ASSERT(uvm_processor_mask_test(&block->resident, id));
-        uvm_pmm_gpu_mark_root_chunk_used(&gpu->pmm, uvm_va_block_gpu_state_get(block, gpu->id)->chunks[0]);
+        block_mark_gpu_roots(block, gpu, BLOCK_PMM_ROOT_USED);
     }
 }
 
@@ -4301,9 +4350,7 @@ static void block_clear_resident_processor(uvm_va_block_t *block, uvm_processor_
     // HMM always allocates PAGE_SIZE GPU chunks so skip HMM va_blocks.
     if (!uvm_va_block_is_hmm(block) && uvm_va_block_size(block) == UVM_CHUNK_SIZE_MAX) {
         // The chunk may not be there any more when residency is cleared.
-        uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(block, gpu->id);
-        if (gpu_state && gpu_state->chunks[0])
-            uvm_pmm_gpu_mark_root_chunk_unused(&gpu->pmm, gpu_state->chunks[0]);
+        block_mark_gpu_roots(block, gpu, BLOCK_PMM_ROOT_UNUSED);
     }
 }
 
@@ -6700,7 +6747,8 @@ static bool block_check_mappings_ptes(uvm_va_block_t *block, uvm_va_block_contex
             if (UVM_ID_IS_GPU(resident_id)) {
                 resident_gpu_state = uvm_va_block_gpu_state_get(block, resident_id);
                 UVM_ASSERT(resident_gpu_state);
-                UVM_ASSERT(uvm_gpu_chunk_get_size(resident_gpu_state->chunks[0]) == UVM_CHUNK_SIZE_2M);
+                if (resident_gpu_state->fixed_chunk_size == 0)
+                    UVM_ASSERT(uvm_gpu_chunk_get_size(resident_gpu_state->chunks[0]) == UVM_CHUNK_SIZE_2M);
             }
             else {
                 uvm_cpu_chunk_t *chunk = uvm_cpu_chunk_get_chunk_for_page_resident(block, 0);
@@ -9575,10 +9623,7 @@ static NV_STATUS block_map_gpu_to(uvm_va_block_t *va_block,
     if (uvm_page_mask_and(&block_context->discard.scratch_page_mask, &va_block->discarded_pages, pages_to_map) &&
         !uvm_va_block_is_hmm(va_block) &&
         uvm_va_block_size(va_block) == UVM_CHUNK_SIZE_MAX) {
-        uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
-
-        if (gpu_state && gpu_state->chunks[0])
-            uvm_pmm_gpu_mark_root_chunk_discarded(&gpu->pmm, gpu_state->chunks[0]);
+        block_mark_gpu_roots(va_block, gpu, BLOCK_PMM_ROOT_DISCARDED);
     }
 
     // If we are mapping a HMM va_block, do not update maybe_mapped_pages.
@@ -13707,6 +13752,12 @@ static NV_STATUS block_presplit_gpu_chunks(uvm_va_block_t *existing, uvm_va_bloc
     NV_STATUS status;
     block_gpu_chunk_split_state_t existing_before_state, existing_after_state, new_state;
 
+    if (existing_gpu_state->fixed_chunk_size != 0) {
+        if (!IS_ALIGNED(new->start, existing_gpu_state->fixed_chunk_size))
+            return block_convert_gpu_chunks_to_fixed_size(existing, gpu, PAGE_SIZE);
+        return NV_OK;
+    }
+
     block_gpu_chunk_get_split_state(existing,
                                     &existing_before_state,
                                     existing->start,
@@ -13791,6 +13842,30 @@ error:
     uvm_pmm_gpu_merge_chunk(&gpu->pmm, original_chunk);
 
     return status;
+}
+
+static NV_STATUS block_init_fixed_gpu_chunks(uvm_va_block_t *block,
+                                             uvm_gpu_t *gpu,
+                                             uvm_chunk_size_t fixed_chunk_size)
+{
+    uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(block, gpu->id);
+    uvm_gpu_chunk_t **chunks;
+    size_t num_chunks;
+
+    UVM_ASSERT(gpu_state);
+    UVM_ASSERT(gpu_state->fixed_chunk_size == 0);
+    UVM_ASSERT(IS_ALIGNED(block->start, fixed_chunk_size));
+    UVM_ASSERT(IS_ALIGNED(uvm_va_block_size(block), fixed_chunk_size));
+
+    num_chunks = uvm_va_block_size(block) / fixed_chunk_size;
+    chunks = uvm_kvmalloc_zero(sizeof(*chunks) * num_chunks);
+    if (!chunks)
+        return NV_ERR_NO_MEMORY;
+
+    uvm_kvfree(gpu_state->chunks);
+    gpu_state->chunks = chunks;
+    gpu_state->fixed_chunk_size = fixed_chunk_size;
+    return NV_OK;
 }
 
 static NV_STATUS block_split_cpu_chunk_to_64k(uvm_va_block_t *block, int nid)
@@ -14120,6 +14195,15 @@ static NV_STATUS block_split_preallocate_no_retry(uvm_va_block_t *existing, uvm_
             status = NV_ERR_NO_MEMORY;
             goto error;
         }
+
+        if (uvm_va_block_gpu_state_get(existing, id)->fixed_chunk_size != 0) {
+            status = block_init_fixed_gpu_chunks(
+                new,
+                gpu,
+                uvm_va_block_gpu_state_get(existing, id)->fixed_chunk_size);
+            if (status != NV_OK)
+                goto error;
+        }
     }
 
     block_test = uvm_va_block_get_test(existing);
@@ -14323,6 +14407,31 @@ static void block_copy_split_gpu_chunks(uvm_va_block_t *existing, uvm_va_block_t
     size_t num_pre_chunks, num_post_chunks, num_split_chunks_existing, num_split_chunks_new;
     uvm_page_index_t split_page_index = uvm_va_block_cpu_page_index(existing, new->start);
     size_t i;
+
+    if (existing_gpu_state->fixed_chunk_size != 0) {
+        uvm_chunk_size_t fixed_chunk_size = existing_gpu_state->fixed_chunk_size;
+        size_t existing_chunk_count = (new->start - existing->start) / fixed_chunk_size;
+        size_t new_chunk_count = uvm_va_block_size(new) / fixed_chunk_size;
+
+        UVM_ASSERT(new_gpu_state->fixed_chunk_size == fixed_chunk_size);
+        memcpy(new_gpu_state->chunks,
+               &existing_gpu_state->chunks[existing_chunk_count],
+               new_chunk_count * sizeof(new_gpu_state->chunks[0]));
+        memset(&existing_gpu_state->chunks[existing_chunk_count],
+               0,
+               new_chunk_count * sizeof(existing_gpu_state->chunks[0]));
+
+        uvm_spin_lock(&gpu->pmm.list_lock);
+        for (i = 0; i < new_chunk_count; ++i) {
+            if (!new_gpu_state->chunks[i])
+                continue;
+            new_gpu_state->chunks[i]->va_block = new;
+            new_gpu_state->chunks[i]->va_block_page_index =
+                i * (fixed_chunk_size / PAGE_SIZE);
+        }
+        uvm_spin_unlock(&gpu->pmm.list_lock);
+        return;
+    }
 
     block_gpu_chunk_get_split_state(existing,
                                     &existing_before_state,
@@ -16267,7 +16376,7 @@ NV_STATUS uvm_va_block_service_finish(uvm_processor_id_t processor_id,
         uvm_gpu_t *gpu = uvm_gpu_get(processor_id);
 
         if (!uvm_va_block_is_hmm(va_block) && uvm_va_block_size(va_block) == UVM_CHUNK_SIZE_MAX) {
-            uvm_pmm_gpu_mark_root_chunk_discarded(&gpu->pmm, uvm_va_block_gpu_state_get(va_block, gpu->id)->chunks[0]);
+            block_mark_gpu_roots(va_block, gpu, BLOCK_PMM_ROOT_DISCARDED);
         }
     }
 
@@ -16560,12 +16669,10 @@ static NV_STATUS va_block_discard_locked(uvm_va_block_t *va_block,
 
         gpu = uvm_gpu_get(id);
         if (all_pages_discarded && uvm_va_block_size(va_block) == UVM_CHUNK_SIZE_MAX) {
-            if (gpu_state->chunks[0]) {
-                if (uvm_processor_mask_empty(&va_block->resident))
-                    uvm_pmm_gpu_mark_root_chunk_unused(&gpu->pmm, gpu_state->chunks[0]);
-                else
-                    uvm_pmm_gpu_mark_root_chunk_discarded(&gpu->pmm, gpu_state->chunks[0]);
-            }
+            if (uvm_processor_mask_empty(&va_block->resident))
+                block_mark_gpu_roots(va_block, gpu, BLOCK_PMM_ROOT_UNUSED);
+            else
+                block_mark_gpu_roots(va_block, gpu, BLOCK_PMM_ROOT_DISCARDED);
         }
     }
 
@@ -17363,6 +17470,123 @@ static bool block_regions_intersect(uvm_va_block_region_t a, uvm_va_block_region
     return a.first < b.outer && b.first < a.outer;
 }
 
+static NV_STATUS block_convert_gpu_chunks_to_fixed_size(uvm_va_block_t *block,
+                                                        uvm_gpu_t *gpu,
+                                                        uvm_chunk_size_t max_chunk_size)
+{
+    uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(block, gpu->id);
+    uvm_gpu_chunk_t **new_chunks = NULL;
+    uvm_gpu_chunk_t **split_parents = NULL;
+    uvm_va_block_region_t chunk_region;
+    uvm_chunk_size_t fixed_size = max_chunk_size;
+    size_t old_num_chunks;
+    size_t new_num_chunks;
+    size_t split_count = 0;
+    size_t i;
+    NV_STATUS status = NV_OK;
+
+    uvm_assert_mutex_locked(&block->lock);
+
+    if (!gpu_state || !gpu_state->chunks)
+        return NV_WARN_NOTHING_TO_DO;
+
+    if (uvm_va_block_is_hmm(block) || !is_power_of_2(max_chunk_size) ||
+        !(gpu->pmm.chunk_sizes[UVM_PMM_GPU_MEMORY_TYPE_USER] & max_chunk_size)) {
+        return NV_ERR_NOT_SUPPORTED;
+    }
+
+    if (!IS_ALIGNED(block->start, fixed_size) ||
+        !IS_ALIGNED(uvm_va_block_size(block), fixed_size)) {
+        fixed_size = PAGE_SIZE;
+    }
+
+    old_num_chunks = block_num_gpu_chunks(block, gpu);
+    chunk_region.outer = 0;
+    for (i = 0; i < old_num_chunks; ++i) {
+        uvm_chunk_size_t chunk_size;
+        size_t chunk_index = block_gpu_chunk_index(block, gpu, chunk_region.outer, &chunk_size);
+        uvm_gpu_chunk_t *chunk = gpu_state->chunks[i];
+
+        UVM_ASSERT(chunk_index == i);
+        chunk_region.first = chunk_region.outer;
+        chunk_region.outer = chunk_region.first + chunk_size / PAGE_SIZE;
+        if (chunk && chunk_size < fixed_size)
+            fixed_size = chunk_size;
+    }
+
+    if (gpu_state->fixed_chunk_size != 0 && gpu_state->fixed_chunk_size == fixed_size)
+        return NV_OK;
+
+    if (!IS_ALIGNED(block->start, fixed_size) ||
+        !IS_ALIGNED(uvm_va_block_size(block), fixed_size)) {
+        return NV_ERR_NOT_SUPPORTED;
+    }
+
+    new_num_chunks = uvm_va_block_size(block) / fixed_size;
+    new_chunks = uvm_kvmalloc_zero(sizeof(*new_chunks) * new_num_chunks);
+    split_parents = uvm_kvmalloc_zero(sizeof(*split_parents) * old_num_chunks);
+    if (!new_chunks || !split_parents) {
+        status = NV_ERR_NO_MEMORY;
+        goto out;
+    }
+
+    chunk_region.outer = 0;
+    for (i = 0; i < old_num_chunks; ++i) {
+        uvm_chunk_size_t chunk_size;
+        size_t chunk_index = block_gpu_chunk_index(block, gpu, chunk_region.outer, &chunk_size);
+        size_t new_index;
+        size_t child_count;
+        uvm_gpu_chunk_t *chunk = gpu_state->chunks[i];
+
+        UVM_ASSERT(chunk_index == i);
+        chunk_region.first = chunk_region.outer;
+        chunk_region.outer = chunk_region.first + chunk_size / PAGE_SIZE;
+        if (!chunk)
+            continue;
+
+        UVM_ASSERT(chunk_size >= fixed_size);
+        new_index = (chunk_region.first * PAGE_SIZE) / fixed_size;
+        child_count = chunk_size / fixed_size;
+        if (chunk_size == fixed_size) {
+            new_chunks[new_index] = chunk;
+            continue;
+        }
+
+        status = uvm_pmm_gpu_split_chunk(&gpu->pmm,
+                                         chunk,
+                                         fixed_size,
+                                         &new_chunks[new_index]);
+        if (status != NV_OK)
+            goto rollback;
+        split_parents[split_count++] = chunk;
+        UVM_ASSERT(child_count > 1);
+    }
+
+    uvm_spin_lock(&gpu->pmm.list_lock);
+    for (i = 0; i < new_num_chunks; ++i) {
+        if (!new_chunks[i])
+            continue;
+        new_chunks[i]->va_block = block;
+        new_chunks[i]->va_block_page_index = i * (fixed_size / PAGE_SIZE);
+    }
+    uvm_spin_unlock(&gpu->pmm.list_lock);
+
+    uvm_kvfree(gpu_state->chunks);
+    gpu_state->chunks = new_chunks;
+    gpu_state->fixed_chunk_size = fixed_size;
+    new_chunks = NULL;
+    goto out;
+
+rollback:
+    while (split_count > 0)
+        uvm_pmm_gpu_merge_chunk(&gpu->pmm, split_parents[--split_count]);
+
+out:
+    uvm_kvfree(split_parents);
+    uvm_kvfree(new_chunks);
+    return status;
+}
+
 static NV_STATUS block_make_release_region_cpu_resident(uvm_va_block_t *va_block,
                                                         struct mm_struct *mm,
                                                         uvm_va_block_region_t region,
@@ -17449,6 +17673,16 @@ NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
         goto out;
     }
 
+    status = block_convert_gpu_chunks_to_fixed_size(va_block,
+                                                    gpu,
+                                                    release_chunk_size);
+    if (status == NV_WARN_NOTHING_TO_DO) {
+        status = NV_OK;
+        goto out;
+    }
+    if (status != NV_OK)
+        goto out;
+
     num_gpu_chunks = block_num_gpu_chunks(va_block, gpu);
     chunk_region.outer = 0;
 
@@ -17470,7 +17704,7 @@ NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
             goto out;
         }
 
-        if (chunk_size != release_chunk_size) {
+        if (chunk_size > release_chunk_size) {
             status = NV_ERR_NOT_SUPPORTED;
             goto out;
         }

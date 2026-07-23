@@ -21,6 +21,7 @@ import torch
 from vllm.device_allocator.uvm import (
     UVM_REGION_FLAG_ACTIVE,
     UVM_REGION_FLAG_CPU_OFFLOADED_RESERVED,
+    UVM_REGION_FLAG_EXPERT_ENVELOPE,
     UVM_REGION_FLAG_PREFETCHABLE,
     UVM_REGION_FLAG_PROTECTED,
     UVM_REGION_POOL_WEIGHT,
@@ -233,6 +234,8 @@ class ExpertReservedRegionsExecutor:
             | UVM_REGION_FLAG_PROTECTED
             | UVM_REGION_FLAG_ACTIVE
         )
+        if bool(item.metadata.get("expert_envelope")):
+            flags |= UVM_REGION_FLAG_EXPERT_ENVELOPE
         desired = _RegisteredRegionState(
             ptr=int(item.ptr),
             bytes=int(item.bytes),

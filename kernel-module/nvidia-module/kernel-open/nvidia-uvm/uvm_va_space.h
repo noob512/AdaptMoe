@@ -968,6 +968,13 @@ bool uvm_va_space_pageable_mem_access_supported(uvm_va_space_t *va_space);
 
 bool uvm_va_space_pageable_mem_access_enabled(uvm_va_space_t *va_space);
 
+// Returns true when any registered driver-visible expert envelope overlapping
+// the range is managed through reserved-slot restore. The caller must hold the
+// VA space lock in at least read mode.
+bool uvm_va_space_range_has_cpu_offloaded_reserved_expert(uvm_va_space_t *va_space,
+                                                          NvU64 base,
+                                                          NvU64 length);
+
 NV_STATUS uvm_test_get_pageable_mem_access_type(UVM_TEST_GET_PAGEABLE_MEM_ACCESS_TYPE_PARAMS *params,
                                                  struct file *filp);
 NV_STATUS uvm_test_enable_static_peer_access(UVM_TEST_ENABLE_STATIC_PEER_ACCESS_PARAMS *params, struct file *filp);

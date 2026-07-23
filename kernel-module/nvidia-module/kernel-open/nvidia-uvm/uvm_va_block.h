@@ -142,6 +142,12 @@ typedef struct
     // block_gpu_chunk_index.
     uvm_gpu_chunk_t **chunks;
 
+    // Non-zero after targeted expert release has converted this block's GPU
+    // backing into uniformly-sized PMM leaves. The chunks array remains the
+    // sole owner table, but indexes fixed_chunk_size units instead of the
+    // default largest-naturally-aligned layout.
+    uvm_chunk_size_t fixed_chunk_size;
+
     // These page table ranges are not necessarily all used at the same time.
     // The block might also be too small or not aligned properly to use the
     // larger ranges, in which case they're never allocated.

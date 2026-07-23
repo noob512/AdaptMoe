@@ -59,6 +59,7 @@ DRIVER_FLAG_HOT_SUBPOOL = 1 << 11
 DRIVER_FLAG_STREAMING_SUBPOOL = 1 << 12
 DRIVER_FLAG_COLD_SUBPOOL = 1 << 13
 DRIVER_FLAG_CPU_OFFLOADED_RESERVED = 1 << 14
+DRIVER_FLAG_EXPERT_ENVELOPE = 1 << 15
 DRIVER_FLAG_MASK = (
     DRIVER_FLAG_EVICTABLE
     | DRIVER_FLAG_PROTECTED
@@ -70,6 +71,7 @@ DRIVER_FLAG_MASK = (
     | DRIVER_FLAG_STREAMING_SUBPOOL
     | DRIVER_FLAG_COLD_SUBPOOL
     | DRIVER_FLAG_CPU_OFFLOADED_RESERVED
+    | DRIVER_FLAG_EXPERT_ENVELOPE
 )
 
 DRIVER_REGION_STATES = {
@@ -330,6 +332,8 @@ def _driver_flags(
             | DRIVER_FLAG_PREFETCHABLE
             | DRIVER_FLAG_PROTECTED
         )
+    if bool(metadata.get("expert_envelope")):
+        flags |= DRIVER_FLAG_EXPERT_ENVELOPE
     if state == "gpu" and pool == "weights" and not evictable:
         flags |= DRIVER_FLAG_PROTECTED
     return flags
@@ -1062,6 +1066,9 @@ class UvmPoolResidencyManager:
             if "evictable" in metadata:
                 region.evictable = bool(metadata.get("evictable"))
             region.last_state_update_ts = time.time()
+            driver_tag_record = None
+            if "driver_tag_skip" in metadata:
+                driver_tag_record = self._sync_driver_region_tag_locked(region)
             driver_state_record = self._sync_driver_region_state_locked(region)
             self._summary["state_updates"] += 1
             self._write_locked(
@@ -1080,6 +1087,7 @@ class UvmPoolResidencyManager:
                     "global_estimated_gpu_resident_bytes_after": (
                         self._global_estimated_bytes_locked()
                     ),
+                    "driver_tag": driver_tag_record,
                     "driver_state": driver_state_record,
                     "metadata": metadata,
                 }
@@ -1419,6 +1427,31 @@ class UvmPoolResidencyManager:
         if not self.driver_tag_enable:
             record["reason"] = "driver_tag_disabled"
             return record
+        if bool(region.metadata.get("driver_tag_skip")):
+            if region.driver_registered:
+                try:
+                    from vllm.device_allocator.uvm import driver_unregister_region
+                except Exception as exc:  # pragma: no cover - diagnostic path
+                    self._summary["driver_tag_register_failures"] += 1
+                    record["reason"] = "driver_tag_skip_unregister_import_failed"
+                    record["error"] = repr(exc)
+                    return record
+                unregister_status = driver_unregister_region(region.driver_region_id)
+                record["driver_tag_skip_unregister_status"] = unregister_status
+                if unregister_status < 0:
+                    self._summary["driver_tag_register_failures"] += 1
+                    record["reason"] = "driver_tag_skip_unregister_failed"
+                    record["status"] = unregister_status
+                    return record
+                region.driver_registered = False
+                region.driver_register_status = unregister_status
+                record["registered"] = False
+            self._summary["driver_tag_register_skips"] += 1
+            record["reason"] = (
+                region.metadata.get("driver_tag_skip_reason")
+                or "metadata_driver_tag_skip"
+            )
+            return record
         if region.driver_registered:
             if not (
                 _metadata_requests_cpu_offloaded_reserved(region.metadata)
@@ -1466,13 +1499,6 @@ class UvmPoolResidencyManager:
         if _skip_moe_parent_driver_tag(region.metadata):
             self._summary["driver_tag_register_skips"] += 1
             record["reason"] = "moe_parent_skipped_for_expert_slices"
-            return record
-        if bool(region.metadata.get("driver_tag_skip")):
-            self._summary["driver_tag_register_skips"] += 1
-            record["reason"] = (
-                region.metadata.get("driver_tag_skip_reason")
-                or "metadata_driver_tag_skip"
-            )
             return record
         if (
             self.driver_tag_require_managed

@@ -6738,8 +6738,10 @@ static NV_STATUS uvm_api_phase_f_register_region(UVM_PHASE_F_REGISTER_REGION_PAR
         if (status != NV_OK)
             uvm_range_tree_remove(&va_space->phase_f_region_ranges, &region->va_node);
     }
-    if (status == NV_OK)
+    if (status == NV_OK &&
+        !(region->flags & UVM_PHASE_N_REGION_FLAG_EXPERT_ENVELOPE)) {
         uvm_phase_n_native_attach_region(va_space, region);
+    }
     uvm_va_space_up_write(va_space);
 
     if (status != NV_OK) {
@@ -6782,7 +6784,8 @@ static NV_STATUS uvm_api_phase_f_unregister_region(UVM_PHASE_F_UNREGISTER_REGION
     uvm_va_space_down_write(va_space);
     region = radix_tree_delete(&va_space->phase_f_regions, params->region_id);
     if (region) {
-        uvm_phase_n_native_detach_region(va_space, region);
+        if (!(region->flags & UVM_PHASE_N_REGION_FLAG_EXPERT_ENVELOPE))
+            uvm_phase_n_native_detach_region(va_space, region);
         uvm_range_tree_remove(&va_space->phase_f_region_ranges, &region->va_node);
     }
     uvm_va_space_up_write(va_space);
@@ -11270,8 +11273,6 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
             status = NV_ERR_INVALID_ARGUMENT;
             goto done_unlock;
         }
-
-        uvm_phase_n_native_split_region_boundaries(va_space, region);
     }
 
     addr = region->base;

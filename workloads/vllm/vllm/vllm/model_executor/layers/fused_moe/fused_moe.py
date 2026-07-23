@@ -1268,14 +1268,27 @@ def vllm_topk_softmax(
     token_expert_indices: torch.Tensor,
     gating_output: torch.Tensor,
     renormalize: bool,
+    expert_mask: torch.Tensor | None = None,
+    hit_flag: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    ops.topk_softmax(
-        topk_weights,
-        topk_indices,
-        token_expert_indices,
-        gating_output,
-        renormalize,
-    )
+    if expert_mask is not None and hit_flag is not None:
+        ops.topk_softmax_with_hit(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            expert_mask,
+            hit_flag,
+            renormalize,
+        )
+    else:
+        ops.topk_softmax(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+        )
 
     return topk_weights, topk_indices
 
@@ -1294,6 +1307,8 @@ def fused_topk(
     topk: int,
     renormalize: bool,
     indices_type: torch.dtype | None = None,
+    expert_mask: torch.Tensor | None = None,
+    hit_flag: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
 
@@ -1312,7 +1327,21 @@ def fused_topk(
         M, topk, dtype=torch.int32, device=hidden_states.device
     )
 
-    topk_func = dispatch_topk_func(use_rocm_aiter=rocm_aiter_ops.is_fused_moe_enabled())
+    use_rocm_aiter = rocm_aiter_ops.is_fused_moe_enabled()
+    topk_func = dispatch_topk_func(use_rocm_aiter=use_rocm_aiter)
+    if expert_mask is not None or hit_flag is not None:
+        assert expert_mask is not None and hit_flag is not None
+        assert not use_rocm_aiter, "fused top-k hit flag is only supported by the CUDA op"
+        topk_weights, topk_ids = vllm_topk_softmax(
+            topk_weights,
+            topk_ids,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+            expert_mask,
+            hit_flag,
+        )
+        return topk_weights, topk_ids, token_expert_indices
     topk_weights, topk_ids = topk_func(
         topk_weights, topk_ids, token_expert_indices, gating_output, renormalize
     )

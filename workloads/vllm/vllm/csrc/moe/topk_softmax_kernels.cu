@@ -132,6 +132,8 @@ __launch_bounds__(TPB) __global__ void moeTopK(
     float* output,
     IndType* indices,
     int* source_rows,
+    const bool* expert_mask,
+    int* hit_flag,
     const int num_experts,
     const int k,
     const int start_expert,
@@ -190,6 +192,10 @@ __launch_bounds__(TPB) __global__ void moeTopK(
             indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
             assert(indices[idx] >= 0);
             source_rows[idx] = k_idx * num_rows + block_row;
+            if (should_process_row && expert_mask != nullptr &&
+                expert_mask[expert] && hit_flag != nullptr) {
+                atomicExch(hit_flag, 1);
+            }
             if (renormalize) {
                 selected_sum += result_kvp.value;
             }
@@ -228,7 +234,8 @@ __launch_bounds__(TPB) __global__ void moeTopK(
 template <int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG, int WARP_SIZE_PARAM, typename IndType, typename InputType = float>
 __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     void topkGatingSoftmax(const InputType* input, const bool* finished, float* output, const int num_rows, IndType* indices,
-        int* source_rows, const int k, const int start_expert, const int end_expert, const bool renormalize)
+        int* source_rows, const bool* expert_mask, int* hit_flag, const int k,
+        const int start_expert, const int end_expert, const bool renormalize)
 {
     static_assert(std::is_same_v<InputType, float> || std::is_same_v<InputType, __nv_bfloat16> ||
                       std::is_same_v<InputType, __half>,
@@ -458,6 +465,10 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
             output[idx] = max_val;
             indices[idx] = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
             source_rows[idx] = k_idx * num_rows + thread_row;
+            if (should_process_row && expert_mask != nullptr &&
+                expert_mask[expert] && hit_flag != nullptr) {
+                atomicExch(hit_flag, 1);
+            }
             if (renormalize) {
                 selected_sum += max_val;
             }
@@ -510,8 +521,9 @@ struct TopkConstants
 
 template <int EXPERTS, int WARPS_PER_TB, int WARP_SIZE_PARAM, int MAX_BYTES_PER_LDG, typename IndType, typename InputType>
 void topkGatingSoftmaxLauncherHelper(const InputType* input, const bool* finished, float* output, IndType* indices,
-    int* source_row, const int num_rows, const int k, const int start_expert, const int end_expert, const bool renormalize,
-    cudaStream_t stream)
+    int* source_row, const bool* expert_mask, int* hit_flag,
+    const int num_rows, const int k, const int start_expert,
+    const int end_expert, const bool renormalize, cudaStream_t stream)
 {
     static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(InputType) * EXPERTS);
     using Constants = detail::TopkConstants<EXPERTS, BYTES_PER_LDG, WARP_SIZE_PARAM, InputType>;
@@ -522,7 +534,8 @@ void topkGatingSoftmaxLauncherHelper(const InputType* input, const bool* finishe
 
     dim3 block_dim(WARP_SIZE_PARAM, WARPS_PER_TB);
     topkGatingSoftmax<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, WARP_SIZE_PARAM, IndType, InputType><<<num_blocks, block_dim, 0, stream>>>(
-        input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert, renormalize);
+        input, finished, output, num_rows, indices, source_row, expert_mask,
+        hit_flag, k, start_expert, end_expert, renormalize);
 }
 
 #ifndef USE_ROCM
@@ -531,17 +544,17 @@ void topkGatingSoftmaxLauncherHelper(const InputType* input, const bool* finishe
                   "Unsupported warp size. Only 32 is supported for CUDA");            \
     topkGatingSoftmaxLauncherHelper<NUM_EXPERTS, WARPS_PER_TB, WARP_SIZE, MAX_BYTES>( \
         gating_output, nullptr, topk_weights, topk_indices, token_expert_indices,     \
-        num_tokens, topk, 0, num_experts, renormalize, stream);
+        expert_mask, hit_flag, num_tokens, topk, 0, num_experts, renormalize, stream);
 #else
 #define LAUNCH_SOFTMAX(NUM_EXPERTS, WARPS_PER_TB, MAX_BYTES)                             \
     if (WARP_SIZE == 64) {                                                               \
         topkGatingSoftmaxLauncherHelper<NUM_EXPERTS, WARPS_PER_TB, 64, MAX_BYTES>(       \
             gating_output, nullptr, topk_weights, topk_indices, token_expert_indices,    \
-            num_tokens, topk, 0, num_experts, renormalize, stream);                      \
+            expert_mask, hit_flag, num_tokens, topk, 0, num_experts, renormalize, stream); \
     } else if (WARP_SIZE == 32) {                                                        \
         topkGatingSoftmaxLauncherHelper<NUM_EXPERTS, WARPS_PER_TB, 32, MAX_BYTES>(       \
             gating_output, nullptr, topk_weights, topk_indices, token_expert_indices,    \
-            num_tokens, topk, 0, num_experts, renormalize, stream);                      \
+            expert_mask, hit_flag, num_tokens, topk, 0, num_experts, renormalize, stream); \
     } else {                                                                             \
         assert(false && "Unsupported warp size. Only 32 and 64 are supported for ROCm"); \
     }
@@ -554,6 +567,8 @@ void topkGatingSoftmaxKernelLauncher(
     IndType* topk_indices,
     int* token_expert_indices,
     float* softmax_workspace,
+    const bool* expert_mask,
+    int* hit_flag,
     const int num_tokens,
     const int num_experts,
     const int topk,
@@ -626,7 +641,8 @@ void topkGatingSoftmaxKernelLauncher(
                 gating_output, nullptr, softmax_workspace, num_experts);
             moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
                 softmax_workspace, nullptr, topk_weights, topk_indices, token_expert_indices,
-                num_experts, topk, 0, num_experts, renormalize);
+                expert_mask, hit_flag, num_experts, topk, 0, num_experts,
+                renormalize);
         }
     }
 }
@@ -642,6 +658,8 @@ void dispatch_topk_softmax_launch(
     torch::Tensor& topk_indices,
     torch::Tensor& token_expert_indices,
     torch::Tensor& softmax_workspace,
+    const bool* expert_mask,
+    int* hit_flag,
     int num_tokens, int num_experts, int topk, bool renormalize, cudaStream_t stream)
 {
     if (topk_indices.scalar_type() == at::ScalarType::Int) {
@@ -651,6 +669,7 @@ void dispatch_topk_softmax_launch(
             topk_indices.data_ptr<int>(),
             token_expert_indices.data_ptr<int>(),
             softmax_workspace.data_ptr<float>(),
+            expert_mask, hit_flag,
             num_tokens, num_experts, topk, renormalize, stream);
     } else if (topk_indices.scalar_type() == at::ScalarType::UInt32) {
         vllm::moe::topkGatingSoftmaxKernelLauncher<uint32_t, ComputeType>(
@@ -659,6 +678,7 @@ void dispatch_topk_softmax_launch(
             topk_indices.data_ptr<uint32_t>(),
             token_expert_indices.data_ptr<int>(),
             softmax_workspace.data_ptr<float>(),
+            expert_mask, hit_flag,
             num_tokens, num_experts, topk, renormalize, stream);
     } else {
         TORCH_CHECK(topk_indices.scalar_type() == at::ScalarType::Long);
@@ -668,15 +688,18 @@ void dispatch_topk_softmax_launch(
             topk_indices.data_ptr<int64_t>(),
             token_expert_indices.data_ptr<int>(),
             softmax_workspace.data_ptr<float>(),
+            expert_mask, hit_flag,
             num_tokens, num_experts, topk, renormalize, stream);
     }
 }
 
-void topk_softmax(
+void topk_softmax_impl(
     torch::Tensor& topk_weights,                // [num_tokens, topk]
     torch::Tensor& topk_indices,                // [num_tokens, topk]
     torch::Tensor& token_expert_indices,        // [num_tokens, topk]
     torch::Tensor& gating_output,               // [num_tokens, num_experts]
+    const bool* expert_mask,
+    int* hit_flag,
     bool renormalize)
 {
     const int num_experts = gating_output.size(-1);
@@ -694,14 +717,51 @@ void topk_softmax(
 
     if (gating_output.scalar_type() == at::ScalarType::Float) {
         dispatch_topk_softmax_launch<float>(gating_output, topk_weights, topk_indices, 
-            token_expert_indices, softmax_workspace, num_tokens, num_experts, topk, renormalize, stream);
+            token_expert_indices, softmax_workspace, expert_mask, hit_flag,
+            num_tokens, num_experts, topk, renormalize, stream);
     } else if (gating_output.scalar_type() == at::ScalarType::Half) {
         dispatch_topk_softmax_launch<__half>(gating_output, topk_weights, topk_indices, 
-            token_expert_indices, softmax_workspace, num_tokens, num_experts, topk, renormalize, stream);
+            token_expert_indices, softmax_workspace, expert_mask, hit_flag,
+            num_tokens, num_experts, topk, renormalize, stream);
     } else if (gating_output.scalar_type() == at::ScalarType::BFloat16) {
         dispatch_topk_softmax_launch<__nv_bfloat16>(gating_output, topk_weights, topk_indices, 
-            token_expert_indices, softmax_workspace, num_tokens, num_experts, topk, renormalize, stream);
+            token_expert_indices, softmax_workspace, expert_mask, hit_flag,
+            num_tokens, num_experts, topk, renormalize, stream);
     } else {
         TORCH_CHECK(false, "Unsupported gating_output data type: ", gating_output.scalar_type());
     }
+}
+
+void topk_softmax(
+    torch::Tensor& topk_weights, torch::Tensor& topk_indices,
+    torch::Tensor& token_expert_indices, torch::Tensor& gating_output,
+    bool renormalize)
+{
+    topk_softmax_impl(topk_weights, topk_indices, token_expert_indices,
+                      gating_output, nullptr, nullptr, renormalize);
+}
+
+void topk_softmax_with_hit(
+    torch::Tensor& topk_weights, torch::Tensor& topk_indices,
+    torch::Tensor& token_expert_indices, torch::Tensor& gating_output,
+    torch::Tensor& expert_mask, torch::Tensor& hit_flag, bool renormalize)
+{
+    TORCH_CHECK(expert_mask.is_cuda() && expert_mask.is_contiguous(),
+                "expert_mask must be a contiguous CUDA tensor");
+    TORCH_CHECK(expert_mask.scalar_type() == at::ScalarType::Bool,
+                "expert_mask must have bool dtype");
+    TORCH_CHECK(expert_mask.numel() >= gating_output.size(-1),
+                "expert_mask must cover every expert");
+    TORCH_CHECK(hit_flag.is_cuda() && hit_flag.is_contiguous(),
+                "hit_flag must be a contiguous CUDA tensor");
+    TORCH_CHECK(hit_flag.scalar_type() == at::ScalarType::Int &&
+                    hit_flag.numel() == 1,
+                "hit_flag must be a scalar int32 tensor");
+    TORCH_CHECK(expert_mask.get_device() == gating_output.get_device() &&
+                    hit_flag.get_device() == gating_output.get_device(),
+                "expert_mask, hit_flag, and gating_output must share a device");
+
+    topk_softmax_impl(topk_weights, topk_indices, token_expert_indices,
+                      gating_output, expert_mask.data_ptr<bool>(),
+                      hit_flag.data_ptr<int>(), renormalize);
 }

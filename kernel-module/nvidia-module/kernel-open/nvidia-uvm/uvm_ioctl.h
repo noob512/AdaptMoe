@@ -1383,6 +1383,7 @@ typedef enum
 #define UVM_PHASE_N_REGION_FLAG_STREAMING_SUBPOOL                    (1U << 12)
 #define UVM_PHASE_N_REGION_FLAG_COLD_SUBPOOL                         (1U << 13)
 #define UVM_PHASE_N_REGION_FLAG_CPU_OFFLOADED_RESERVED               (1U << 14)
+#define UVM_PHASE_N_REGION_FLAG_EXPERT_ENVELOPE                      (1U << 15)
 
 #define UVM_PHASE_N_TRACE_VICTIM_MAX                                 8
 

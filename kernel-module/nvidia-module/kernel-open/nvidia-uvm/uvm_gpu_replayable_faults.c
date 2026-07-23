@@ -2573,7 +2573,10 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
         }
         if (!block_manual_fault &&
             managed_range &&
-            phase_n_range_tag_is_cpu_offloaded_reserved_expert(&managed_range->phase_n_tag)) {
+            (phase_n_range_tag_is_cpu_offloaded_reserved_expert(&managed_range->phase_n_tag) ||
+             uvm_va_space_range_has_cpu_offloaded_reserved_expert(va_space,
+                                                                  fault_address,
+                                                                  1))) {
             ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_reserved_fault_policy_violations;
             ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_reserved_pool_external_alloc_attempts;
             service_fault_batch_fatal_notify(gpu,

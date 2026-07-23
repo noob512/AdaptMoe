@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -9,8 +11,50 @@ from vllm.device_allocator.uvm_expert_reserved_executor import (
     ExpertReservedRegionsExecutor,
     ReservedRegionItem,
 )
+from vllm.model_executor.layers.fused_moe import layer as layer_module
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+
+def test_empty_weight_plan_is_loaded_only_once(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    plan_file = tmp_path / "empty-plan.json"
+    plan_file.write_text(json.dumps({"policy": "routing_heatmap_v1"}))
+
+    layer = object.__new__(FusedMoE)
+    layer.uvm_weight_prefetch_plan_file = str(plan_file)
+    layer.uvm_weight_offload_plan_file = str(plan_file)
+    layer.uvm_init_weight_offload_plan_file = str(plan_file)
+    layer.uvm_weight_prefetch_plan_keys = set()
+    layer.uvm_weight_offload_plan_keys = set()
+    layer.uvm_init_weight_offload_plan_keys = set()
+    layer.uvm_init_weight_hot_plan_keys = set()
+    layer.uvm_init_weight_warm_plan_keys = set()
+    layer.uvm_init_weight_plan_policy = ""
+    layer._uvm_weight_prefetch_plan_loaded = False
+    layer._uvm_weight_offload_plan_loaded = False
+    layer._uvm_init_weight_offload_plan_loaded = False
+
+    parse_calls: list[tuple[str, str]] = []
+    real_parse = layer_module._parse_plan_expert_keys
+
+    def record_parse(path: str, plan_key: str) -> set[tuple[int, int]]:
+        parse_calls.append((path, plan_key))
+        return real_parse(path, plan_key)
+
+    monkeypatch.setattr(layer_module, "_parse_plan_expert_keys", record_parse)
+
+    layer._refresh_uvm_weight_action_plans()
+    first_refresh_calls = list(parse_calls)
+    layer._refresh_uvm_weight_action_plans()
+
+    assert first_refresh_calls
+    assert parse_calls == first_refresh_calls
+    assert layer._uvm_weight_prefetch_plan_loaded is True
+    assert layer._uvm_weight_offload_plan_loaded is True
+    assert layer._uvm_init_weight_offload_plan_loaded is True
 
 
 def test_stage_m_orders_cold_before_warm_and_excludes_hot() -> None:
@@ -56,6 +100,14 @@ def test_stage_m_orders_cold_before_warm_and_excludes_hot() -> None:
         layer_id=7,
         global_expert_id=2,
     ) == "warm"
+
+    # Runtime prefetch may intentionally target the same experts Stage M
+    # released. The explicit offload plan must win for initial placement.
+    layer.uvm_weight_prefetch_plan_keys = {(7, 3)}
+    assert layer._uvm_init_weight_expert_class(
+        layer_id=7,
+        global_expert_id=3,
+    ) == "cold"
 
 
 def test_slot_managed_mask_only_tracks_released_experts() -> None:
@@ -164,6 +216,108 @@ def test_stage_m_envelope_cache_is_reused_by_runtime_restore(
     assert runtime_items[0].metadata["driver_registered"] is True
     assert runtime_items[0].metadata["source"] == ("reserved_prefetch_chunk_envelope")
     assert "caller_mutation" not in runtime_items[0].metadata
+
+
+def test_stage_m_weight_slices_reuse_preregistered_logical_regions(
+    monkeypatch: Any,
+) -> None:
+    layer = object.__new__(FusedMoE)
+    layer.uvm_init_weight_offload_target_roles = {
+        "moe_gate_up",
+        "moe_down",
+    }
+    layer.uvm_init_weight_register_all_local_experts = True
+    snapshots = {
+        "weights:12:6:moe_gate_up": {
+            "ptr": 0x700000600000,
+            "bytes": 1024 * 1024,
+            "state": "gpu",
+            "driver_region_id": 101,
+        },
+        "weights:12:6:moe_down": {
+            "ptr": 0x710000300000,
+            "bytes": 512 * 1024,
+            "state": "gpu",
+            "driver_region_id": 102,
+        },
+    }
+    monkeypatch.setattr(
+        layer_module,
+        "get_uvm_residency_region_snapshot",
+        snapshots.get,
+    )
+    monkeypatch.setattr(
+        layer,
+        "_uvm_expert_weight_slices",
+        lambda *_args, **_kwargs: pytest.fail("tensor slices must not be rebuilt"),
+    )
+
+    resolved = layer._uvm_stage_m_expert_weight_slices(
+        layer_id=12,
+        global_expert_id=6,
+        local_expert_id=6,
+    )
+
+    assert [(role, ptr, size) for role, ptr, size, _ in resolved] == [
+        ("moe_gate_up", 0x700000600000, 1024 * 1024),
+        ("moe_down", 0x710000300000, 512 * 1024),
+    ]
+    assert [snapshot["driver_region_id"] for *_, snapshot in resolved] == [
+        101,
+        102,
+    ]
+
+
+def test_stage_m_weight_slices_fail_closed_when_preregister_is_incomplete(
+    monkeypatch: Any,
+) -> None:
+    layer = object.__new__(FusedMoE)
+    layer.uvm_init_weight_offload_target_roles = {
+        "moe_gate_up",
+        "moe_down",
+    }
+    layer.uvm_init_weight_register_all_local_experts = True
+    monkeypatch.setattr(
+        layer_module,
+        "get_uvm_residency_region_snapshot",
+        lambda _region_id: None,
+    )
+
+    with pytest.raises(RuntimeError, match="preregistration is incomplete"):
+        layer._uvm_stage_m_expert_weight_slices(
+            layer_id=12,
+            global_expert_id=6,
+            local_expert_id=6,
+        )
+
+
+def test_reserved_executor_fallback_register_preserves_envelope_flag(
+    monkeypatch: Any,
+) -> None:
+    executor = object.__new__(ExpertReservedRegionsExecutor)
+    executor._registered_regions = {}
+    register_calls: list[dict[str, int]] = []
+    monkeypatch.setattr(reserved_module, "driver_query_region", lambda _region_id: None)
+    monkeypatch.setattr(
+        reserved_module,
+        "driver_register_region",
+        lambda **kwargs: register_calls.append(kwargs) or 0,
+    )
+    item = ReservedRegionItem(
+        region_id="weights:12:uvmchunk:80000:moe_gate_up:700000600000:80000",
+        driver_region_id=101,
+        ptr=0x700000600000,
+        bytes=512 * 1024,
+        layer_id=12,
+        global_expert_id=6,
+        local_expert_id=6,
+        role="moe_gate_up",
+        metadata={"expert_envelope": True},
+    )
+
+    assert executor._ensure_driver_region(item) == 0
+    assert len(register_calls) == 1
+    assert register_calls[0]["flags"] & reserved_module.UVM_REGION_FLAG_EXPERT_ENVELOPE
 
 
 def test_stage_m_rejects_release_without_runtime_slot_restore() -> None:

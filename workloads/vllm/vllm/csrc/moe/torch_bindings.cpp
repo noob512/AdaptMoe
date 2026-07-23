@@ -7,6 +7,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
       "token_expert_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
+  m.def(
+      "topk_softmax_with_hit(Tensor! topk_weights, Tensor! topk_indices, "
+      "Tensor! token_expert_indices, Tensor gating_output, Tensor expert_mask, "
+      "Tensor! hit_flag, bool renormalize) -> ()");
+  m.impl("topk_softmax_with_hit", torch::kCUDA, &topk_softmax_with_hit);
 
   // Calculate the result of moe by summing up the partial results
   // from all selected experts.

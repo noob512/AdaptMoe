@@ -5,7 +5,7 @@ Usage:
     uv run python configs/gnn.py --nodes 5000000 --output results/gnn_normal_5M.json
     uv run python configs/gnn.py --nodes 10000000 --uvm --output results/gnn_uvm_10M.json
 
-Same script works with or without eBPF kernel module loaded.
+The script supports native CUDA and UVM allocator modes.
 """
 import argparse
 import json

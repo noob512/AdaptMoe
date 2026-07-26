@@ -2,7 +2,7 @@
 
 本文档汇总当前对 vLLM UVM memory pool 演进链路的主要修改，覆盖 Stage C2、Stage D/D2、Stage E0/E1/E2/E3。它面向后续接手该项目的开发者，目标是帮助读者理解“为什么要改、改了哪里、怎么验证、下一步还能怎么做”。
 
-本文档不展开早期 eBPF / replayable fault 底层采集实现，只关注本轮围绕 vLLM、UVM allocator、runner、summary/check 脚本和文档的修改。
+本文档只关注本轮围绕 vLLM、UVM allocator、runner、summary/check 脚本和文档的修改。
 
 ## 1. 总目标
 
@@ -864,4 +864,3 @@ cd /home/ubuntu/nvidia-uvm-gpu/workloads/vllm
 6. 最后再考虑 runtime eviction/offload 执行器。
 
 这样能保持每个阶段都有明确实验信号，也能避免 allocator 在不了解 vLLM 语义时做危险决策。
-

@@ -1,7 +1,7 @@
 # llama.cpp Expert Offloading Benchmark (Experiment 1)
 
-Benchmarks llama.cpp with GPT-OSS-120B MoE model (~59 GiB) on a 32GB GPU, comparing
-framework CPU offloading vs UVM with gpu_ext eBPF policies.
+Benchmarks llama.cpp with the GPT-OSS-120B MoE model (~59 GiB) on a 32GB GPU,
+comparing framework CPU offloading with UVM oversubscription.
 
 - **Paper**: Figure 6 (RQ1), MoE expert offloading
 - **Model**: GPT-OSS-120B MXFP4 MoE (116.83B params, 59.02 GiB)
@@ -44,7 +44,7 @@ GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 ./build/bin/llama-bench -m $MODEL_120B -r 1
 - Without NO_VMM, the memory pool tries VMM first, which fails on RTX 5090 (VMM: no)
 - Uses GCC-12 for CUDA 12.9 compatibility
 
-**UVM changes** in this fork (`eunomia-bpf/llama.cpp`):
+**UVM changes** in the bundled llama.cpp fork:
 - `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` switches allocations to `cudaMallocManaged`
 - First allocation sets `cudaMemAdviseSetPreferredLocation = CPU` (data stays in RAM,
   avoids OOM during model loading since 59 GiB > 32 GB VRAM)
@@ -63,21 +63,9 @@ MODEL=~/.cache/llama.cpp/ggml-org_gpt-oss-120b-GGUF_gpt-oss-120b-mxfp4-00001-of-
 # Config 2: Framework CPU offload (ncmoe=32)
 ./build/bin/llama-bench -ncmoe 32 -m $MODEL 2>&1 | tee results/ncmoe32.log
 
-# Config 3: UVM baseline (no eBPF policy)
+# Config 3: UVM baseline
 GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 ./build/bin/llama-bench -m $MODEL \
   2>&1 | tee results/uvm_baseline.log
-
-# Config 4: UVM + gpu_ext eBPF (stride prefetch + LFU eviction)
-sudo bpftool struct_ops register ../../extension/.output/prefetch_stride.bpf.o
-sudo bpftool struct_ops register ../../extension/.output/eviction_lfu.bpf.o
-GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 ./build/bin/llama-bench -m $MODEL \
-  2>&1 | tee results/uvm_ebpf.log
-```
-
-Or use the one-click script:
-```bash
-bash run_exp1_expert_offload.sh
-# Saves full logs + summary to results/exp1_expert_offload/<timestamp>/
 ```
 
 ## Verified Results (2026-02-16, RTX 5090)
@@ -103,7 +91,6 @@ bash run_exp1_expert_offload.sh
 | ncmoe=32 (framework offload) | 260.14 | 18.18 |
 | UVM baseline | 238.48 | 7.72 |
 | UVM + user hint | 144.00 | 49.31 |
-| **UVM + gpu_ext eBPF** | **229.67** | **86.89** |
 
 ## Directory Structure
 
@@ -113,14 +100,11 @@ llama.cpp/
 ├── Makefile                  # Build targets + benchmark shortcuts
 ├── pyproject.toml            # uv dependencies
 ├── uv.lock                   # Locked dependency versions
-├── llama.cpp/                # [submodule] eunomia-bpf/llama.cpp (with UVM patches)
+├── llama.cpp/                # llama.cpp source with local UVM patches
 ├── download_models.sh        # One-click model downloader (20b/120b/all)
 ├── download_sharegpt.py      # ShareGPT dataset for server benchmarks
-├── run_exp1_expert_offload.sh  # One-click experiment (Figure 6)
 ├── run_exp5_two_tenant.sh    # Co-location experiment (Figure 12)
-├── uvm/                      # UVM test scripts & visualization
-│   ├── visbasic.py           # Figure generation
-│   └── plot_colocated_results.py
+├── uvm/                      # UVM test scripts
 ├── docs/                     # Analysis & investigation notes
 └── results/                  # Benchmark output logs
 ```

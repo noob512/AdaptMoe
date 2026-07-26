@@ -138,6 +138,58 @@ def test_slot_managed_mask_only_tracks_released_experts() -> None:
     ]
 
 
+def test_remote_read_experts_do_not_enter_reserved_restore_mask() -> None:
+    layer = object.__new__(FusedMoE)
+    layer.uvm_expert_offload_access_mode = "remote_read"
+    layer.uvm_init_weight_offload_mode = "driver_release_cpu"
+    layer.uvm_init_weight_offload_sync = False
+    layer.uvm_init_weight_plan_policy = "exact_used_oracle_v1"
+    layer._uvm_slot_managed_global_expert_ids = set()
+    layer._uvm_remote_read_global_expert_ids = set()
+    layer._uvm_offloaded_warm_global_expert_ids = set()
+    layer._uvm_reserved_offload_mask_values_cache = None
+    layer._uvm_reserved_offload_mask_tensor_cache = {}
+    layer.uvm_expert_reserved_offloaded_ids = set()
+    layer._uvm_plan_expert_bitmask_width = 8
+
+    metadata = layer._uvm_init_weight_class_metadata(
+        metadata={},
+        expert_class="cold",
+        cpu_offload_placement=True,
+    )
+    layer._uvm_mark_remote_read_expert(5)
+
+    assert layer._uvm_stage_m_uses_remote_read() is True
+    assert layer._uvm_stage_m_sync_enabled() is True
+    assert metadata["placement"] == "CPU_REMOTE_READ"
+    assert metadata["target_placement"] == "CPU_REMOTE_READ"
+    assert metadata["cpu_remote_read"] is True
+    assert metadata["cpu_offloaded_reserved"] is False
+    assert metadata["reserved_prefetch_eligible"] is False
+    assert layer._uvm_remote_read_global_expert_ids == {5}
+    assert layer._uvm_reserved_offload_mask_for_layer(7) is None
+
+
+def test_restore_mode_keeps_reserved_restore_metadata() -> None:
+    layer = object.__new__(FusedMoE)
+    layer.uvm_expert_offload_access_mode = "restore"
+    layer.uvm_init_weight_offload_mode = "driver_release_cpu"
+    layer.uvm_init_weight_offload_sync = False
+    layer.uvm_init_weight_plan_policy = "exact_used_oracle_v1"
+
+    metadata = layer._uvm_init_weight_class_metadata(
+        metadata={},
+        expert_class="cold",
+        cpu_offload_placement=True,
+    )
+
+    assert layer._uvm_stage_m_uses_remote_read() is False
+    assert layer._uvm_stage_m_sync_enabled() is False
+    assert metadata["placement"] == "CPU_OFFLOADED_RESERVED"
+    assert metadata["cpu_offloaded_reserved"] is True
+    assert metadata["reserved_prefetch_eligible"] is True
+
+
 def test_stage_m_envelope_cache_is_reused_by_runtime_restore(
     monkeypatch: Any,
 ) -> None:
@@ -370,6 +422,47 @@ def test_incremental_offload_wrapper_reopens_one_stage_m_wave(
     assert result["released_count"] == 1
     assert layer._uvm_incremental_offload_in_progress is False
     assert layer._uvm_incremental_selected_global_expert_id is None
+
+
+def test_incremental_remote_read_tracks_prepared_expert(
+    monkeypatch: Any,
+) -> None:
+    layer = object.__new__(FusedMoE)
+    layer.uvm_incremental_expert_offload_enable = True
+    layer.uvm_expert_offload_access_mode = "remote_read"
+    layer.uvm_init_weight_offload_mode = "driver_release_cpu"
+    layer._uvm_slot_managed_global_expert_ids = set()
+    layer._uvm_remote_read_global_expert_ids = set()
+    layer._uvm_init_weight_offload_done = True
+    layer._uvm_incremental_offload_in_progress = False
+    layer._uvm_incremental_allow_warm = False
+    layer.layer_name = "model.layers.7.mlp.experts"
+
+    def fake_stage_m() -> None:
+        selected = layer._uvm_incremental_selected_global_expert_id
+        assert selected is not None
+        layer._uvm_remote_read_global_expert_ids.add(selected)
+
+    monkeypatch.setattr(layer, "run_uvm_init_weight_offload", fake_stage_m)
+
+    result = layer.run_uvm_incremental_weight_offload(
+        allow_warm=False,
+        selected_global_expert_id=6,
+    )
+
+    assert result["released_experts"] == [6]
+    assert result["released_count"] == 1
+    assert result["access_mode"] == "remote_read"
+    assert layer._uvm_slot_managed_global_expert_ids == set()
+
+
+def test_incremental_remote_read_does_not_require_reserved_capacity() -> None:
+    layer = object.__new__(FusedMoE)
+    layer.uvm_expert_offload_access_mode = "remote_read"
+    layer.uvm_init_weight_offload_mode = "driver_release_cpu"
+    layer.uvm_expert_reserved_slot_count = 0
+
+    assert layer._uvm_incremental_slot_capacity_allows(6) is True
 
 
 def test_incremental_slot_requirement_counts_aligned_envelopes(

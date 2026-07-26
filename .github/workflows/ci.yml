@@ -12,26 +12,6 @@ env:
   KERNEL_HEADERS_URL: https://kernel.ubuntu.com/mainline/v6.15.11/amd64
 
 jobs:
-  extension-build:
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install extension build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang llvm \
-            libelf1 libelf-dev zlib1g-dev libclang-dev \
-            pkg-config
-
-      - name: Build extension
-        run: make build
-
   kernel-module-build:
     runs-on: ubuntu-24.04
 

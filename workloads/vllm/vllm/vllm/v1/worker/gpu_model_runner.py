@@ -5934,6 +5934,10 @@ class GPUModelRunner(
         remove_lora: bool = True,
         activate_lora: bool = False,
         is_graph_capturing: bool = False,
+        forward_timing_events: (
+            tuple[torch.cuda.Event, torch.cuda.Event] | None
+        ) = None,
+        single_request_prefill: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5955,6 +5959,8 @@ class GPUModelRunner(
             is_profile: If True, this is a profile run.
             create_mixed_batch: If True, create a mixed batch with both decode
                 (1 token) and prefill (multiple tokens) requests.
+            single_request_prefill: If True, construct one causal prefill
+                request containing all ``num_tokens`` tokens.
             remove_lora: If False, dummy LoRAs are not destroyed after the run
             activate_lora: If False, dummy_run is performed without LoRAs.
         """
@@ -5976,6 +5982,9 @@ class GPUModelRunner(
         # When setting max_query_len = 1, we switch to and capture the optimized
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
+        if single_request_prefill:
+            assert not uniform_decode
+            assert not create_mixed_batch
         max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
 
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
@@ -5983,7 +5992,10 @@ class GPUModelRunner(
         # has num_tokens in total.
         assert num_tokens <= self.scheduler_config.max_num_batched_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if create_mixed_batch:
+        if single_request_prefill:
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens]
+        elif create_mixed_batch:
             assert not uniform_decode
             # Create mixed batch:
             # first half decode tokens, second half one prefill
@@ -6062,7 +6074,22 @@ class GPUModelRunner(
         # If force_attention is True, we always capture attention. Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.
         if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            if create_mixed_batch:
+            if single_request_prefill:
+                seq_lens = [num_tokens]
+                self.input_batch.num_computed_tokens_cpu[0] = 0
+                positions_np = self.positions.np[:num_tokens]
+                positions_np[:] = np.arange(num_tokens, dtype=positions_np.dtype)
+                self.positions.copy_to_gpu(num_tokens)
+
+                req_indices = np.zeros(num_tokens, dtype=np.int32)
+                for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
+                    block_table = self.input_batch.block_table[kv_cache_gid]
+                    num_blocks = cdiv(num_tokens, block_table.block_size)
+                    block_table.add_row(list(range(num_blocks)), 0)
+                    block_table.commit_block_table(1)
+                    block_table.compute_slot_mapping(req_indices, positions_np)
+                    block_table.commit_slot_mapping(num_tokens)
+            elif create_mixed_batch:
                 # In the mixed batch mode (used for FI warmup), we use
                 # shorter sequence lengths to run faster.
                 # TODO(luka) better system for describing dummy batches
@@ -6082,7 +6109,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_query_len,
                 num_reqs=num_reqs,
                 ubatch_slices=ubatch_slices,
-                for_cudagraph_capture=True,
+                for_cudagraph_capture=not single_request_prefill,
             )
 
         with self.maybe_dummy_run_with_lora(
@@ -6153,6 +6180,8 @@ class GPUModelRunner(
                     ubatch_slices=ubatch_slices,
                 ),
             ):
+                if forward_timing_events is not None:
+                    forward_timing_events[0].record()
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -6160,6 +6189,8 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                if forward_timing_events is not None:
+                    forward_timing_events[1].record()
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -6201,6 +6232,245 @@ class GPUModelRunner(
             self.device, non_blocking=True
         )
         return hidden_states, hidden_states[logit_indices_device]
+
+    @torch.inference_mode()
+    def run_forward_token_benchmark(self) -> None:
+        """Benchmark the full-model forward for synthetic token batches."""
+        enabled = os.environ.get("VLLM_FORWARD_TOKEN_BENCH_ENABLE", "0")
+        if enabled.strip().lower() not in ("1", "true", "yes", "on"):
+            return
+
+        sizes = sorted(
+            {
+                int(value.strip())
+                for value in os.environ.get(
+                    "VLLM_FORWARD_TOKEN_BENCH_SIZES", "1,4,8,32,64,128"
+                ).split(",")
+                if value.strip()
+            }
+        )
+        patterns = [
+            value.strip().lower()
+            for value in os.environ.get(
+                "VLLM_FORWARD_TOKEN_BENCH_PATTERNS", "identical,diverse"
+            ).split(",")
+            if value.strip()
+        ]
+        warmups = int(os.environ.get("VLLM_FORWARD_TOKEN_BENCH_WARMUPS", "5"))
+        iterations = int(os.environ.get("VLLM_FORWARD_TOKEN_BENCH_ITERS", "20"))
+        burst_iterations = int(
+            os.environ.get("VLLM_FORWARD_TOKEN_BENCH_BURST_ITERS", "10")
+        )
+        burst_rounds = int(
+            os.environ.get("VLLM_FORWARD_TOKEN_BENCH_BURST_ROUNDS", "3")
+        )
+        label = os.environ.get("VLLM_FORWARD_TOKEN_BENCH_LABEL", "unspecified")
+        mode = (
+            os.environ.get("VLLM_FORWARD_TOKEN_BENCH_MODE", "decode")
+            .strip()
+            .lower()
+        )
+
+        if not sizes or sizes[0] <= 0:
+            raise ValueError("forward token benchmark sizes must be positive")
+        if sizes[-1] > self.scheduler_config.max_num_batched_tokens:
+            raise ValueError(
+                "forward token benchmark maximum size exceeds "
+                f"max_num_batched_tokens: {sizes[-1]} > "
+                f"{self.scheduler_config.max_num_batched_tokens}"
+            )
+        if mode == "decode" and sizes[-1] > self.scheduler_config.max_num_seqs:
+            raise ValueError(
+                "uniform-decode forward token benchmark requires "
+                f"max_num_seqs >= {sizes[-1]}"
+            )
+        if (
+            warmups < 0
+            or iterations <= 0
+            or burst_iterations <= 0
+            or burst_rounds <= 0
+        ):
+            raise ValueError(
+                "benchmark warmups must be nonnegative and iteration counts positive"
+            )
+        unsupported_patterns = set(patterns) - {"identical", "diverse"}
+        if not patterns or unsupported_patterns:
+            raise ValueError(
+                f"unsupported forward token benchmark patterns: {unsupported_patterns}"
+            )
+        if mode not in ("decode", "prefill"):
+            raise ValueError(f"unsupported forward token benchmark mode: {mode}")
+        uniform_decode = mode == "decode"
+        single_request_prefill = mode == "prefill"
+
+        max_size = sizes[-1]
+        input_ids = self.input_ids.gpu[:max_size]
+        saved_input_ids = input_ids.clone()
+        diverse_input_ids = (
+            torch.arange(max_size, device=self.device, dtype=input_ids.dtype) * 7919
+            + 17
+        ) % self.model_config.get_vocab_size()
+
+        logger.info(
+            "VLLM_FORWARD_TOKEN_BENCH_BEGIN %s",
+            json.dumps(
+                {
+                    "event": "forward_token_benchmark_begin",
+                    "burst_iterations": burst_iterations,
+                    "burst_rounds": burst_rounds,
+                    "iterations": iterations,
+                    "label": label,
+                    "mode": mode,
+                    "patterns": patterns,
+                    "sizes": sizes,
+                    "warmups": warmups,
+                },
+                sort_keys=True,
+            ),
+        )
+
+        try:
+            for pattern in patterns:
+                if pattern == "identical":
+                    input_ids.fill_(17)
+                else:
+                    input_ids.copy_(diverse_input_ids)
+
+                for num_tokens in sizes:
+                    for _ in range(warmups):
+                        hidden_states, last_hidden_states = self._dummy_run(
+                            num_tokens,
+                            force_attention=True,
+                            uniform_decode=uniform_decode,
+                            allow_microbatching=False,
+                            skip_eplb=True,
+                            is_profile=True,
+                            remove_lora=False,
+                            single_request_prefill=single_request_prefill,
+                        )
+                        del hidden_states, last_hidden_states
+                    torch.cuda.synchronize(self.device)
+
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    samples_ms: list[float] = []
+                    synchronized_samples_ms: list[float] = []
+                    for _ in range(iterations):
+                        torch.cuda.synchronize(self.device)
+                        synchronized_start = time.perf_counter()
+                        hidden_states, last_hidden_states = self._dummy_run(
+                            num_tokens,
+                            force_attention=True,
+                            uniform_decode=uniform_decode,
+                            allow_microbatching=False,
+                            skip_eplb=True,
+                            is_profile=True,
+                            remove_lora=False,
+                            forward_timing_events=(start_event, end_event),
+                            single_request_prefill=single_request_prefill,
+                        )
+                        torch.cuda.synchronize(self.device)
+                        synchronized_samples_ms.append(
+                            (time.perf_counter() - synchronized_start) * 1000.0
+                        )
+                        samples_ms.append(start_event.elapsed_time(end_event))
+                        del hidden_states, last_hidden_states
+
+                    sample_array = np.asarray(samples_ms, dtype=np.float64)
+                    synchronized_sample_array = np.asarray(
+                        synchronized_samples_ms, dtype=np.float64
+                    )
+                    median_ms = float(np.median(sample_array))
+                    synchronized_median_ms = float(
+                        np.median(synchronized_sample_array)
+                    )
+
+                    burst_round_total_ms: list[float] = []
+                    for _ in range(burst_rounds):
+                        torch.cuda.synchronize(self.device)
+                        burst_start = time.perf_counter()
+                        for _ in range(burst_iterations):
+                            hidden_states, last_hidden_states = self._dummy_run(
+                                num_tokens,
+                                force_attention=True,
+                                uniform_decode=uniform_decode,
+                                allow_microbatching=False,
+                                skip_eplb=True,
+                                is_profile=True,
+                                remove_lora=False,
+                                single_request_prefill=single_request_prefill,
+                            )
+                            del hidden_states, last_hidden_states
+                        torch.cuda.synchronize(self.device)
+                        burst_round_total_ms.append(
+                            (time.perf_counter() - burst_start) * 1000.0
+                        )
+                    burst_round_ms_per_forward = [
+                        value / burst_iterations for value in burst_round_total_ms
+                    ]
+                    burst_median_ms_per_forward = float(
+                        np.median(burst_round_ms_per_forward)
+                    )
+                    result = {
+                        "burst_iterations": burst_iterations,
+                        "burst_median_ms_per_forward": (
+                            burst_median_ms_per_forward
+                        ),
+                        "burst_round_ms_per_forward": [
+                            round(value, 6) for value in burst_round_ms_per_forward
+                        ],
+                        "burst_round_total_ms": [
+                            round(value, 6) for value in burst_round_total_ms
+                        ],
+                        "burst_rounds": burst_rounds,
+                        "burst_tokens_per_second": (
+                            num_tokens * 1000.0 / burst_median_ms_per_forward
+                        ),
+                        "event": "forward_token_benchmark_result",
+                        "iterations": iterations,
+                        "label": label,
+                        "max_ms": float(np.max(sample_array)),
+                        "mean_ms": float(np.mean(sample_array)),
+                        "median_ms": median_ms,
+                        "min_ms": float(np.min(sample_array)),
+                        "mode": mode,
+                        "ms_per_token": median_ms / num_tokens,
+                        "num_tokens": num_tokens,
+                        "p95_ms": float(np.percentile(sample_array, 95)),
+                        "pattern": pattern,
+                        "samples_ms": [round(value, 6) for value in samples_ms],
+                        "synchronized_mean_ms": float(
+                            np.mean(synchronized_sample_array)
+                        ),
+                        "synchronized_median_ms": synchronized_median_ms,
+                        "synchronized_p95_ms": float(
+                            np.percentile(synchronized_sample_array, 95)
+                        ),
+                        "synchronized_samples_ms": [
+                            round(value, 6) for value in synchronized_samples_ms
+                        ],
+                        "tokens_per_second": num_tokens * 1000.0 / median_ms,
+                        "synchronized_tokens_per_second": (
+                            num_tokens * 1000.0 / synchronized_median_ms
+                        ),
+                        "uniform_decode": uniform_decode,
+                        "warmups": warmups,
+                    }
+                    logger.info(
+                        "VLLM_FORWARD_TOKEN_BENCH_RESULT %s",
+                        json.dumps(result, sort_keys=True),
+                    )
+        finally:
+            input_ids.copy_(saved_input_ids)
+            torch.cuda.synchronize(self.device)
+
+        logger.info(
+            "VLLM_FORWARD_TOKEN_BENCH_END %s",
+            json.dumps(
+                {"event": "forward_token_benchmark_end", "label": label},
+                sort_keys=True,
+            ),
+        )
 
     @torch.inference_mode()
     def _dummy_sampler_run(
@@ -6456,7 +6726,12 @@ class GPUModelRunner(
                 hidden_states, last_hidden_states = self._dummy_run(
                     self.max_num_tokens, is_profile=True
                 )
-            if get_pp_group().is_last_rank:
+            forward_only_benchmark = os.environ.get(
+                "VLLM_FORWARD_TOKEN_BENCH_ENABLE", "0"
+            ).strip().lower() in ("1", "true", "yes", "on")
+            if forward_only_benchmark:
+                output = None
+            elif get_pp_group().is_last_rank:
                 if self.is_pooling_model:
                     output = self._dummy_pooler_run(hidden_states)
                 else:
@@ -6538,15 +6813,39 @@ class GPUModelRunner(
                 "Stage M init-time weight placement visited %d MoE modules.",
                 issued_modules,
             )
-            section_start = time.monotonic()
-            logger.warning("UVM controlled remap debug: model_runner Stage M slot PTE clear begin")
-            self._maybe_clear_uvm_init_time_slot_ptes_after_placement()
-            logger.warning(
-                "UVM controlled remap debug: model_runner Stage M slot PTE clear end "
-                "elapsed=%.3fs",
-                time.monotonic() - section_start,
+            remote_read_mode = (
+                os.environ.get(
+                    "VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE",
+                    "restore",
+                )
+                .strip()
+                .lower()
+                == "remote_read"
             )
-            if os.environ.get("VLLM_UVM_CONTROLLED_REMAP_SYNC_AFTER_CLEAR", "1") == "1":
+            if remote_read_mode:
+                logger.info(
+                    "Stage M remote-read mode skips reserved slot PTE clear, "
+                    "preallocation, and slot-use probing."
+                )
+            else:
+                section_start = time.monotonic()
+                logger.warning(
+                    "UVM controlled remap debug: model_runner Stage M "
+                    "slot PTE clear begin"
+                )
+                self._maybe_clear_uvm_init_time_slot_ptes_after_placement()
+                logger.warning(
+                    "UVM controlled remap debug: model_runner Stage M "
+                    "slot PTE clear end elapsed=%.3fs",
+                    time.monotonic() - section_start,
+                )
+            if (
+                not remote_read_mode
+                and os.environ.get(
+                    "VLLM_UVM_CONTROLLED_REMAP_SYNC_AFTER_CLEAR", "1"
+                )
+                == "1"
+            ):
                 section_start = time.monotonic()
                 logger.warning(
                     "UVM controlled remap debug: model_runner Stage M "
@@ -6562,17 +6861,23 @@ class GPUModelRunner(
                 except Exception:
                     logger.debug("Failed to synchronize after Stage M slot PTE clear",
                                  exc_info=True)
+            post_stage_marker = (
+                "after_stage_m_remote_prepare"
+                if remote_read_mode
+                else "after_stage_m_clear"
+            )
             self._record_uvm_init_weight_plan_residency(
-                "after_stage_m_clear_before_prealloc"
+                f"{post_stage_marker}_before_prealloc"
             )
-            if prealloc_reserved:
+            if prealloc_reserved and not remote_read_mode:
                 self._maybe_prealloc_uvm_expert_reserved_slots_after_stage_m()
-            self._record_uvm_init_weight_plan_residency("after_stage_m_clear")
-            self._record_uvm_active_expert_residency_probe("after_stage_m_clear")
-            self._record_uvm_post_offload_slot_use_probe("after_stage_m_clear")
-            self._record_uvm_active_expert_residency_probe(
-                "after_post_offload_slot_use_probe"
-            )
+            self._record_uvm_init_weight_plan_residency(post_stage_marker)
+            self._record_uvm_active_expert_residency_probe(post_stage_marker)
+            if not remote_read_mode:
+                self._record_uvm_post_offload_slot_use_probe(post_stage_marker)
+                self._record_uvm_active_expert_residency_probe(
+                    "after_post_offload_slot_use_probe"
+                )
         if matched_issued:
             logger.info(
                 "Stage M matched CPU offload issued %d parameter ranges.",

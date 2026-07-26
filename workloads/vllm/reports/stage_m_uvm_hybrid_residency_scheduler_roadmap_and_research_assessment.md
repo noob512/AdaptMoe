@@ -653,9 +653,9 @@ request active set
 
 这比单纯调 UVM 参数更系统。
 
-### 5.2 bpftime-like 应用层 runtime 思路
+### 5.2 应用层 runtime 思路
 
-本项目借鉴的不是 eBPF 语法，而是 bpftime 的系统设计思想：
+本项目采用控制面与执行后端分离的系统设计：
 
 ```text
 把高频、复杂、语义丰富的系统层开销移动到应用层 runtime；

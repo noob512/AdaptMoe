@@ -740,6 +740,15 @@ class Worker(WorkerBase):
             os.environ.get("VLLM_UVM_WEIGHT_EXECUTOR", "").strip().lower()
             == "expert_reserved_regions_async"
         )
+        remote_read_mode = (
+            os.environ.get(
+                "VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE",
+                "restore",
+            )
+            .strip()
+            .lower()
+            == "remote_read"
+        )
         placement_requested = any(
             self._uvm_env_flag(name, default=False)
             for name in (
@@ -782,13 +791,23 @@ class Worker(WorkerBase):
         self.model_runner.run_uvm_init_time_weight_placement(prealloc_reserved=False)
         logger.info("UVM controlled remap boundary: post-warmup expert placement end")
 
-        prealloc_result = (
-            self.model_runner._maybe_prealloc_uvm_expert_reserved_slots_after_stage_m()
-        )
-        reserved_after_warmup = self._uvm_env_flag(
-            "VLLM_UVM_EXPERT_RESERVED_ENABLE_AFTER_WARMUP",
-            default=reserved_executor_enabled,
-        )
+        if remote_read_mode:
+            prealloc_result = {
+                "requested": False,
+                "ok": True,
+                "reason": "remote_read_does_not_use_reserved_slots",
+            }
+            reserved_after_warmup = False
+            os.environ["VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY"] = "0"
+        else:
+            prealloc_reserved = (
+                self.model_runner._maybe_prealloc_uvm_expert_reserved_slots_after_stage_m
+            )
+            prealloc_result = prealloc_reserved()
+            reserved_after_warmup = self._uvm_env_flag(
+                "VLLM_UVM_EXPERT_RESERVED_ENABLE_AFTER_WARMUP",
+                default=reserved_executor_enabled,
+            )
         if reserved_after_warmup:
             prealloc_ready = (
                 not reserved_executor_enabled
@@ -839,6 +858,7 @@ class Worker(WorkerBase):
                 "VLLM_UVM_CONTROLLED_REMAP_SKIP_POST_INIT_WARMUP=1"
             )
             self._run_uvm_post_warmup_rebalance()
+            self.model_runner.run_forward_token_benchmark()
             set_random_seed(self.model_config.seed)
             return
 
@@ -964,6 +984,7 @@ class Worker(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         self._run_uvm_post_warmup_rebalance()
+        self.model_runner.run_forward_token_benchmark()
 
         set_random_seed(self.model_config.seed)
         logger.info("UVM controlled remap boundary: compile_or_warm_up_model end")

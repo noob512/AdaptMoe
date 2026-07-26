@@ -89,14 +89,6 @@ uv run python bench_gpu_1bn.py SIFT10M IVF4096,Flat -nprobe 1,4,16
 uv run python bench_gpu_1bn.py SIFT100M IVF4096,Flat -nprobe 1,4,16 -uvm
 ```
 
-### One-click experiment script (Paper Figure 9)
-
-```bash
-bash run_exp4_vector_search.sh
-# Runs SIFT20M → SIFT50M → SIFT100M with UVM
-# Saves full logs + JSON to results/exp4_vector_search/<timestamp>/
-```
-
 Options: `-abs N` (add batch size), `-qbs N` (query batch size), `-nocache` (skip index cache).
 
 ## Verified Results (2026-02-16, RTX 5090)
@@ -118,18 +110,9 @@ Options: `-abs N` (add batch size), `-qbs N` (query batch size), `-nocache` (ski
 | Search nprobe=1 | 26.5 s |
 | 1-R@1 (nprobe=1) | 0.4486 |
 
-### Paper reference (SIFT100M, UVM baseline)
-
-| Metric | UVM Baseline | UVM + gpu_ext |
-|--------|-------------|--------------|
-| Add time | 68.41 s | 49.31 s |
-| Search nprobe=1 | 5.14 s | 4.53 s |
-| Search nprobe=4 | 14.39 s | 13.11 s |
-| Search nprobe=16 | 56.51 s | 51.44 s |
-
-Note: Our UVM baseline add time (231s) is slower than paper (68s) because FAISS's UVM
-integration uses `cudaMallocManaged` for the full IVF index, causing heavy page migration
-on the stock nvidia-uvm driver. The modified kernel module significantly improves this.
+The UVM baseline can be substantially slower than native GPU mode because FAISS uses
+`cudaMallocManaged` for the full IVF index, which can cause heavy page migration under
+oversubscription.
 
 ## Directory Structure
 
@@ -140,9 +123,8 @@ faiss/
 ├── uv.lock                  # Locked dependencies
 ├── bench_gpu_1bn.py         # GPU benchmark (with -uvm flag)
 ├── bench_cpu_1bn.py         # CPU benchmark (for comparison)
-├── run_exp4_vector_search.sh  # One-click experiment (Figure 9)
 ├── download_sift.sh         # SIFT dataset downloader
-├── faiss/                   # [submodule] eunomia-bpf/faiss
+├── faiss/                   # FAISS source submodule
 │   ├── build/               # cmake build output
 │   │   └── faiss/python/    # _swigfaiss.so + Python bindings
 │   └── benchs/bigann/       # SIFT dataset location

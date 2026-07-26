@@ -5,7 +5,7 @@ Usage:
     uv run python configs/bench.py --ncmoe 64 --output results/bench_ncmoe64.json
     uv run python configs/bench.py --uvm --output results/bench_uvm.json
 
-Same script works with or without eBPF kernel module loaded.
+The script supports native CUDA and UVM modes.
 """
 import argparse
 import json

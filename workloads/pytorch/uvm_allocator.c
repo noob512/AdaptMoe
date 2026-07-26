@@ -7,13 +7,11 @@
  * cudaMemPrefetchAsync or cudaMemAdvise calls. This is the canonical
  * "without-user-prefetch" baseline used in all paper experiments.
  *
- * - cudaMemPrefetchAsync masks BPF prefetch effects (makes BPF useless)
+ * - cudaMemPrefetchAsync changes the lazy-migration baseline
  * - cudaMemAdviseSetPreferredLocation=CPU causes 2x regression by forcing
  *   evicted pages back to CPU, doubling migration traffic
  *
  * Paper baseline: 10M nodes = ~70s/epoch (UVM lazy migration)
- * Paper +BPF prefetch: 10M nodes = ~26.5s/epoch (2.65x speedup)
- *
  * If you need a different allocator variant, create a SEPARATE file.
  *
  * !!!! DO NOT MODIFY THIS FILE !!!!

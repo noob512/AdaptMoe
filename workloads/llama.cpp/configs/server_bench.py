@@ -8,7 +8,7 @@ Usage:
 Starts llama-server, benchmarks with `vllm bench serve` (from vllm workload),
 parses output, stops server.
 
-Same script works with or without eBPF kernel module loaded.
+The script supports native CUDA and UVM modes.
 """
 import argparse
 import json

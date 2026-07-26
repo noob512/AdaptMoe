@@ -1,3 +1,0 @@
-\section{Conclusion}
-\label{sec:conclusion}
-We presented \sys, a cross-layer, verifier-backed policy runtime that treats the GPU driver and device as a single programmable OS subsystem. \sys exposes stable attach points for memory placement and scheduling, executes the same restricted eBPF IR on host and device, and shares state through cross-layer BPF maps, enabling low-overhead observability and adaptive policies. Across PyTorch, llama.cpp, vLLM, and Faiss, \sys-based policies transparently improve throughput by up to $4.8\times$ and reduce tail latency by up to $2\times$ relative to static heuristics, while instrumentation-only deployments incur low overhead. \sys demonstrates that kernel extensibility is an effective approach for GPU management.

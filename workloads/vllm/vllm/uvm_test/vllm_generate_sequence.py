@@ -414,6 +414,7 @@ def main() -> int:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--quantization", default=None)
     parser.add_argument("--sleep-between-requests", type=float, default=0.0)
@@ -581,6 +582,7 @@ def main() -> int:
             sampling_params = SamplingParams(
                 max_tokens=max_tokens,
                 temperature=args.temperature,
+                ignore_eos=args.ignore_eos,
             )
             request_started = time.time()
             append_jsonl(

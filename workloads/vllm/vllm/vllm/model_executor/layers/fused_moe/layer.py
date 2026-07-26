@@ -23,6 +23,7 @@ from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.device_allocator.uvm import (
     batch_prefetch_ranges_to_device,
     batch_prefetch_ranges_to_device_with_executor,
+    batch_prepare_ranges_for_native_remote_access_with_executor,
     driver_batch_query_ranges_residency_bytes,
     driver_expert_offload_release_regions,
     probe_driver_capable_range,
@@ -960,12 +961,26 @@ class FusedMoE(CustomOp):
             "none",
             "simple",
             "fused_select",
+            "fused_select_async",
         ):
             logger.warning(
                 "Unknown VLLM_UVM_EXPERT_RESERVED_TOPK_GATE_IMPL=%s; using triton",
                 self.uvm_expert_reserved_topk_gate_impl,
             )
             self.uvm_expert_reserved_topk_gate_impl = "triton"
+        self.uvm_expert_offload_access_mode = os.environ.get(
+            "VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE",
+            "restore",
+        ).strip().lower()
+        if self.uvm_expert_offload_access_mode not in (
+            "restore",
+            "remote_read",
+        ):
+            logger.warning(
+                "Unknown VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE=%s; using restore",
+                self.uvm_expert_offload_access_mode,
+            )
+            self.uvm_expert_offload_access_mode = "restore"
         self.uvm_expert_reserved_topk_gate_assume_valid = _env_flag_enabled(
             "VLLM_UVM_EXPERT_RESERVED_TOPK_GATE_ASSUME_VALID",
             default=True,
@@ -1388,6 +1403,7 @@ class FusedMoE(CustomOp):
             tuple[str, int], torch.Tensor
         ] = {}
         self._uvm_slot_managed_global_expert_ids: set[int] = set()
+        self._uvm_remote_read_global_expert_ids: set[int] = set()
         self._uvm_offloaded_warm_global_expert_ids: set[int] = set()
         self._uvm_expert_envelope_region_cache: dict[
             tuple[int | None, int, str], list[ReservedRegionItem]
@@ -2619,7 +2635,8 @@ class FusedMoE(CustomOp):
         self._uvm_fused_select_hit_flag = None
         self._uvm_fused_select_hit_layer_id = None
         run_reserved_topk_gate = (
-            self.uvm_expert_reserved_enable
+            self.uvm_expert_offload_access_mode == "restore"
+            and self.uvm_expert_reserved_enable
             and self.uvm_weight_prefetch_enabled
             and not self.uvm_expert_reserved_skip_active_topk
             and (
@@ -2633,7 +2650,8 @@ class FusedMoE(CustomOp):
         )
         if (
             run_reserved_topk_gate
-            and self.uvm_expert_reserved_topk_gate_impl == "fused_select"
+            and self.uvm_expert_reserved_topk_gate_impl
+            in ("fused_select", "fused_select_async")
             and not self.enable_eplb
             and routing_strategy == ""
             and not self.use_grouped_topk
@@ -2769,7 +2787,10 @@ class FusedMoE(CustomOp):
             },
         )
         self._run_uvm_moe_topk_item_probe(topk_ids)
-        if self.uvm_expert_reserved_enable:
+        if (
+            self.uvm_expert_reserved_enable
+            and self.uvm_expert_offload_access_mode == "restore"
+        ):
             if (
                 self.uvm_weight_prefetch_enabled
                 and self.uvm_expert_reserved_cleanup_delay_steps > 0
@@ -3068,7 +3089,10 @@ class FusedMoE(CustomOp):
             if plan_layer_id == layer_id
         }
         for global_expert_id, local_expert_id in all_local_pairs:
-            if global_expert_id in self._uvm_slot_managed_global_expert_ids:
+            if global_expert_id in (
+                self._uvm_slot_managed_global_expert_ids
+                | getattr(self, "_uvm_remote_read_global_expert_ids", set())
+            ):
                 continue
             expert_class = self._uvm_init_weight_expert_class(
                 layer_id=layer_id,
@@ -3136,6 +3160,10 @@ class FusedMoE(CustomOp):
         self,
         local_expert_id: int,
     ) -> bool:
+        if self._uvm_stage_m_uses_remote_read():
+            # Remote-read experts keep their managed VA and use CPU backing.
+            # They do not consume a reserved restore slot.
+            return True
         bank_count = min(
             max(
                 _env_int("VLLM_UVM_EXPERT_RESERVED_BANK_COUNT", default=2),
@@ -3189,7 +3217,13 @@ class FusedMoE(CustomOp):
     ) -> dict[str, object]:
         if not self.uvm_incremental_expert_offload_enable:
             return {"ok": True, "reason": "disabled", "released_experts": []}
-        before = set(self._uvm_slot_managed_global_expert_ids)
+        remote_read = self._uvm_stage_m_uses_remote_read()
+        tracked_experts = (
+            self._uvm_remote_read_global_expert_ids
+            if remote_read
+            else self._uvm_slot_managed_global_expert_ids
+        )
+        before = set(tracked_experts)
         self._uvm_incremental_offload_in_progress = True
         self._uvm_incremental_allow_warm = bool(allow_warm)
         self._uvm_incremental_selected_global_expert_id = (
@@ -3204,7 +3238,7 @@ class FusedMoE(CustomOp):
             self._uvm_incremental_offload_in_progress = False
             self._uvm_incremental_allow_warm = False
             self._uvm_incremental_selected_global_expert_id = None
-        released = sorted(self._uvm_slot_managed_global_expert_ids - before)
+        released = sorted(set(tracked_experts) - before)
         return {
             "ok": True,
             "reason": "released" if released else "no_capacity_or_candidates",
@@ -3213,6 +3247,7 @@ class FusedMoE(CustomOp):
             "released_count": len(released),
             "allow_warm": bool(allow_warm),
             "selected_global_expert_id": selected_global_expert_id,
+            "access_mode": "remote_read" if remote_read else "restore",
         }
 
     def _uvm_mark_slot_managed_expert(
@@ -3228,6 +3263,22 @@ class FusedMoE(CustomOp):
             )
         self._uvm_reserved_offload_mask_values_cache = None
         self._uvm_reserved_offload_mask_tensor_cache.clear()
+
+    def _uvm_mark_remote_read_expert(self, global_expert_id: int) -> None:
+        self._uvm_remote_read_global_expert_ids.add(int(global_expert_id))
+
+    def _uvm_stage_m_uses_remote_read(self) -> bool:
+        return (
+            getattr(self, "uvm_expert_offload_access_mode", "restore")
+            == "remote_read"
+            and self.uvm_init_weight_offload_mode
+            in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+        )
+
+    def _uvm_stage_m_sync_enabled(self) -> bool:
+        return self._uvm_stage_m_uses_remote_read() or bool(
+            self.uvm_init_weight_offload_sync
+        )
 
     def _uvm_init_weight_class_metadata(
         self,
@@ -3280,13 +3331,26 @@ class FusedMoE(CustomOp):
             "priority": 20 if expert_class == "warm" else 10,
         }
         if cpu_offload_placement:
-            reserved_metadata.update(
-                {
-                    "placement": "CPU_OFFLOADED_RESERVED",
-                    "cpu_offloaded_reserved": True,
-                    "reserved_prefetch_eligible": True,
-                }
-            )
+            if self._uvm_stage_m_uses_remote_read():
+                reserved_metadata.update(
+                    {
+                        "driver_subpool": f"{expert_class}_remote_read",
+                        "placement": "CPU_REMOTE_READ",
+                        "target_placement": "CPU_REMOTE_READ",
+                        "cpu_remote_read": True,
+                        "cpu_offloaded_reserved": False,
+                        "reserved_prefetch_eligible": False,
+                        "prefetchable": False,
+                    }
+                )
+            else:
+                reserved_metadata.update(
+                    {
+                        "placement": "CPU_OFFLOADED_RESERVED",
+                        "cpu_offloaded_reserved": True,
+                        "reserved_prefetch_eligible": True,
+                    }
+                )
         else:
             reserved_metadata["placement"] = "GPU_RESIDENT"
         return reserved_metadata
@@ -3497,12 +3561,20 @@ class FusedMoE(CustomOp):
             )
             if self.uvm_expert_reserved_topk_gate_impl == "none":
                 return False
-            if self.uvm_expert_reserved_topk_gate_impl == "fused_select":
+            if self.uvm_expert_reserved_topk_gate_impl in (
+                "fused_select",
+                "fused_select_async",
+            ):
                 fused_flag = getattr(self, "_uvm_fused_select_hit_flag", None)
                 fused_layer_id = getattr(
                     self, "_uvm_fused_select_hit_layer_id", None
                 )
                 if fused_flag is not None and fused_layer_id == layer_id:
+                    if (
+                        self.uvm_expert_reserved_topk_gate_impl
+                        == "fused_select_async"
+                    ):
+                        return False
                     hit = bool(fused_flag.item())
                     if hit:
                         fused_flag.zero_()
@@ -6441,6 +6513,7 @@ class FusedMoE(CustomOp):
             self.uvm_init_weight_offload_enable
             and self.uvm_init_weight_offload_mode
             in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+            and not self._uvm_stage_m_uses_remote_read()
             and (
                 not self.uvm_expert_reserved_enable
                 or not self.uvm_weight_prefetch_enabled
@@ -6453,6 +6526,9 @@ class FusedMoE(CustomOp):
                     "layer_name": self.layer_name,
                     "action": "init_weight_offload_reject_without_slot_restore",
                     "mode": self.uvm_init_weight_offload_mode,
+                    "access_mode": getattr(
+                        self, "uvm_expert_offload_access_mode", "restore"
+                    ),
                     "reserved_executor_enabled": self.uvm_expert_reserved_enable,
                     "runtime_prefetch_enabled": self.uvm_weight_prefetch_enabled,
                 }
@@ -6627,7 +6703,10 @@ class FusedMoE(CustomOp):
                         layer_id=layer_id,
                         global_expert_id=global_expert_id,
                     )
-                    logical_driver_tag_skip = bool(self.uvm_expert_envelope_enable)
+                    logical_driver_tag_skip = bool(
+                        self.uvm_expert_envelope_enable
+                        and not self._uvm_stage_m_uses_remote_read()
+                    )
                     offload_metadata = self._uvm_init_weight_class_metadata(
                         metadata=residency_metadata,
                         expert_class=expert_class,
@@ -6661,7 +6740,8 @@ class FusedMoE(CustomOp):
                         )
                     envelope_records: list[dict[str, object]] = []
                     if (
-                        self.uvm_init_weight_offload_mode
+                        not self._uvm_stage_m_uses_remote_read()
+                        and self.uvm_init_weight_offload_mode
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                     ):
                         envelope_items = self._uvm_get_or_build_expert_envelope_items(
@@ -6704,7 +6784,8 @@ class FusedMoE(CustomOp):
                         )
                     ]
                     if (
-                        self.uvm_expert_envelope_enable
+                        not self._uvm_stage_m_uses_remote_read()
+                        and self.uvm_expert_envelope_enable
                         and self.uvm_init_weight_offload_mode
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                         and (
@@ -6808,7 +6889,7 @@ class FusedMoE(CustomOp):
                                     residency_metadata
                                 ),
                                 "device": -1,
-                                "sync_offload": self.uvm_init_weight_offload_sync,
+                                "sync_offload": self._uvm_stage_m_sync_enabled(),
                                 "plan_policy": self.uvm_init_weight_plan_policy,
                                 "expert_init_class": expert_class,
                                 "residency_metadata": offload_metadata,
@@ -6822,7 +6903,38 @@ class FusedMoE(CustomOp):
                     prefetch_success = False
                     driver_release_success = False
                     driver_release_result: dict[str, object] | None = None
-                    if (
+                    remote_accessed_by_result = 0
+                    remote_prefetch_cpu_successes = 0
+                    remote_preferred_cpu_result = 0
+                    remote_executor = ""
+                    if self._uvm_stage_m_uses_remote_read():
+                        (
+                            remote_successes,
+                            remote_executor,
+                            remote_accessed_by_result,
+                            remote_prefetch_cpu_successes,
+                            remote_preferred_cpu_result,
+                        ) = (
+                            batch_prepare_ranges_for_native_remote_access_with_executor(
+                                [(ptr, size_bytes)],
+                                sync=self._uvm_stage_m_sync_enabled(),
+                                executor=self.uvm_weight_executor,
+                                device=(
+                                    int(torch.cuda.current_device())
+                                    if torch.cuda.is_available()
+                                    else 0
+                                ),
+                            )
+                        )
+                        success = remote_successes == 1
+                        advise_success = remote_preferred_cpu_result == 1
+                        prefetch_success = remote_prefetch_cpu_successes == 1
+                        action = (
+                            "init_weight_remote_read_prepare_issued"
+                            if success
+                            else "init_weight_remote_read_prepare_failed"
+                        )
+                    elif (
                         self.uvm_init_weight_offload_mode
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                     ):
@@ -6867,7 +6979,7 @@ class FusedMoE(CustomOp):
                         issued_bytes += size_bytes
                         next_state = (
                             "cpu"
-                            if self.uvm_init_weight_offload_sync
+                            if self._uvm_stage_m_sync_enabled()
                             else "prefetching_cpu"
                         )
                         mark_uvm_residency_state(
@@ -6875,8 +6987,17 @@ class FusedMoE(CustomOp):
                             state=next_state,
                             metadata={
                                 **offload_metadata,
-                                "sync_offload": self.uvm_init_weight_offload_sync,
+                                "sync_offload": self._uvm_stage_m_sync_enabled(),
                                 "driver_release": driver_release_success,
+                                "access_mode": self.uvm_expert_offload_access_mode,
+                                "executor": remote_executor or None,
+                                "accessed_by_result": remote_accessed_by_result,
+                                "prefetch_cpu_successes": (
+                                    remote_prefetch_cpu_successes
+                                ),
+                                "preferred_cpu_result": (
+                                    remote_preferred_cpu_result
+                                ),
                             },
                         )
                         self._uvm_update_weight_expert_role_cache(
@@ -6886,9 +7007,23 @@ class FusedMoE(CustomOp):
                             state=next_state,
                             estimated_gpu_resident=False,
                         )
-                        self._uvm_mark_slot_managed_expert(
-                            global_expert_id=global_expert_id,
-                            expert_class=expert_class,
+                        if self._uvm_stage_m_uses_remote_read():
+                            self._uvm_mark_remote_read_expert(global_expert_id)
+                        else:
+                            self._uvm_mark_slot_managed_expert(
+                                global_expert_id=global_expert_id,
+                                expert_class=expert_class,
+                            )
+                    elif self._uvm_stage_m_uses_remote_read():
+                        mark_uvm_residency_state(
+                            region_id=region_id,
+                            state="gpu",
+                            metadata={
+                                **offload_metadata,
+                                "placement": "GPU_RESIDENT",
+                                "cpu_remote_read": False,
+                                "remote_prepare_failed": True,
+                            },
                         )
                     elif self.uvm_init_weight_offload_mode == "trace_only":
                         issued_records += 1
@@ -6901,6 +7036,7 @@ class FusedMoE(CustomOp):
                             "layer_name": self.layer_name,
                             "action": action,
                             "mode": self.uvm_init_weight_offload_mode,
+                            "access_mode": self.uvm_expert_offload_access_mode,
                             "role": role,
                             "residency_region_id": region_id,
                             "driver_region_id": driver_region_id,
@@ -6928,19 +7064,27 @@ class FusedMoE(CustomOp):
                             "success": success,
                             "advise_cpu_success": (
                                 advise_success
-                                if self.uvm_init_weight_offload_mode
+                                if self._uvm_stage_m_uses_remote_read()
+                                or self.uvm_init_weight_offload_mode
                                 in ("advise_cpu", "prefetch_cpu", "offload_cpu")
                                 else False
                             ),
                             "prefetch_cpu_success": (
                                 prefetch_success
-                                if self.uvm_init_weight_offload_mode
+                                if self._uvm_stage_m_uses_remote_read()
+                                or self.uvm_init_weight_offload_mode
                                 in ("prefetch_cpu", "offload_cpu")
                                 else False
                             ),
                             "driver_release_success": driver_release_success,
                             "driver_release_result": driver_release_result,
-                            "sync_offload": self.uvm_init_weight_offload_sync,
+                            "remote_executor": remote_executor,
+                            "accessed_by_result": remote_accessed_by_result,
+                            "prefetch_cpu_successes": (
+                                remote_prefetch_cpu_successes
+                            ),
+                            "preferred_cpu_result": remote_preferred_cpu_result,
+                            "sync_offload": self._uvm_stage_m_sync_enabled(),
                             "plan_policy": self.uvm_init_weight_plan_policy,
                         }
                     )
@@ -6951,7 +7095,31 @@ class FusedMoE(CustomOp):
                 driver_release_entries_by_region: dict[int, dict[str, object]] = {}
                 driver_advise_result = 0
                 driver_prefetch_result = 0
-                if (
+                remote_accessed_by_result = 0
+                remote_prefetch_cpu_successes = 0
+                remote_preferred_cpu_result = 0
+                if self._uvm_stage_m_uses_remote_read():
+                    ranges = [
+                        (int(item["ptr"]), int(item["bytes"]))
+                        for item in batch_items
+                    ]
+                    (
+                        batch_successes,
+                        executor_used,
+                        remote_accessed_by_result,
+                        remote_prefetch_cpu_successes,
+                        remote_preferred_cpu_result,
+                    ) = batch_prepare_ranges_for_native_remote_access_with_executor(
+                        ranges,
+                        sync=self._uvm_stage_m_sync_enabled(),
+                        executor=self.uvm_weight_executor,
+                        device=(
+                            int(torch.cuda.current_device())
+                            if torch.cuda.is_available()
+                            else 0
+                        ),
+                    )
+                elif (
                     self.uvm_init_weight_offload_mode
                     in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                 ):
@@ -7005,7 +7173,9 @@ class FusedMoE(CustomOp):
                     executor_used = "unsupported_init_weight_offload_mode"
                 for batch_index, item in enumerate(batch_items):
                     driver_release_entry: dict[str, object] | None = None
-                    if (
+                    if self._uvm_stage_m_uses_remote_read():
+                        success = batch_index < batch_successes
+                    elif (
                         self.uvm_init_weight_offload_mode
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                     ):
@@ -7039,9 +7209,20 @@ class FusedMoE(CustomOp):
                         success
                         if self.uvm_init_weight_offload_mode
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                        and not self._uvm_stage_m_uses_remote_read()
                         else False
                     )
-                    if (
+                    if self._uvm_stage_m_uses_remote_read():
+                        action = (
+                            "init_weight_remote_read_prepare_issued"
+                            if success
+                            else "init_weight_remote_read_prepare_failed"
+                        )
+                        advise_success = batch_index < remote_preferred_cpu_result
+                        prefetch_success = (
+                            batch_index < remote_prefetch_cpu_successes
+                        )
+                    elif (
                         self.uvm_init_weight_offload_mode
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                     ):
@@ -7061,7 +7242,7 @@ class FusedMoE(CustomOp):
                         issued_bytes += int(item["bytes"])
                         next_state = (
                             "cpu"
-                            if self.uvm_init_weight_offload_sync
+                            if self._uvm_stage_m_sync_enabled()
                             else "prefetching_cpu"
                         )
                         mark_uvm_residency_state(
@@ -7069,9 +7250,17 @@ class FusedMoE(CustomOp):
                             state=next_state,
                             metadata={
                                 **cast(dict[str, object], item["residency_metadata"]),
-                                "sync_offload": self.uvm_init_weight_offload_sync,
+                                "sync_offload": self._uvm_stage_m_sync_enabled(),
                                 "executor": executor_used,
                                 "driver_release": driver_release_success,
+                                "access_mode": self.uvm_expert_offload_access_mode,
+                                "accessed_by_result": remote_accessed_by_result,
+                                "prefetch_cpu_successes": (
+                                    remote_prefetch_cpu_successes
+                                ),
+                                "preferred_cpu_result": (
+                                    remote_preferred_cpu_result
+                                ),
                             },
                         )
                         self._uvm_update_weight_expert_role_cache(
@@ -7081,9 +7270,27 @@ class FusedMoE(CustomOp):
                             state=next_state,
                             estimated_gpu_resident=False,
                         )
-                        self._uvm_mark_slot_managed_expert(
-                            global_expert_id=int(item["global_expert_id"]),
-                            expert_class=str(item["expert_init_class"]),
+                        if self._uvm_stage_m_uses_remote_read():
+                            self._uvm_mark_remote_read_expert(
+                                int(item["global_expert_id"])
+                            )
+                        else:
+                            self._uvm_mark_slot_managed_expert(
+                                global_expert_id=int(item["global_expert_id"]),
+                                expert_class=str(item["expert_init_class"]),
+                            )
+                    elif self._uvm_stage_m_uses_remote_read():
+                        mark_uvm_residency_state(
+                            region_id=str(item["residency_region_id"]),
+                            state="gpu",
+                            metadata={
+                                **cast(
+                                    dict[str, object], item["residency_metadata"]
+                                ),
+                                "placement": "GPU_RESIDENT",
+                                "cpu_remote_read": False,
+                                "remote_prepare_failed": True,
+                            },
                         )
                     self._append_uvm_init_weight_trace(
                         {
@@ -7099,6 +7306,12 @@ class FusedMoE(CustomOp):
                             "prefetch_cpu_success": prefetch_success,
                             "executor": executor_used,
                             "requested_executor": self.uvm_weight_executor,
+                            "access_mode": self.uvm_expert_offload_access_mode,
+                            "accessed_by_result": remote_accessed_by_result,
+                            "prefetch_cpu_successes": (
+                                remote_prefetch_cpu_successes
+                            ),
+                            "preferred_cpu_result": remote_preferred_cpu_result,
                             "driver_advise_result": driver_advise_result,
                             "driver_prefetch_result": driver_prefetch_result,
                             "driver_release_success": driver_release_success,
@@ -7129,6 +7342,7 @@ class FusedMoE(CustomOp):
                         "layer_name": self.layer_name,
                         "action": "init_weight_offload_summary",
                         "mode": self.uvm_init_weight_offload_mode,
+                        "access_mode": self.uvm_expert_offload_access_mode,
                         "planned_experts": [
                             global_expert_id
                             for global_expert_id, _ in expert_pairs
@@ -7146,6 +7360,9 @@ class FusedMoE(CustomOp):
                         ),
                         "slot_managed_global_experts": sorted(
                             self._uvm_slot_managed_global_expert_ids
+                        ),
+                        "remote_read_global_experts": sorted(
+                            self._uvm_remote_read_global_expert_ids
                         ),
                         "offloaded_warm_global_experts": sorted(
                             self._uvm_offloaded_warm_global_expert_ids

@@ -1,8 +1,0 @@
-\section{Portability}
-\label{sec:discussion}
-
-\xiangyu{\sys is designed to offer portability on both the host side and the device side.}
-
-On the host, \sys relies on abstractions with direct equivalents in the Linux kernel. We currently hook into NVIDIA's UVM and scheduler rather than generic Linux subsystems because the production NVIDIA driver stack largely bypasses these paths. However, our design anticipates driver convergence: for memory, our logic maps to Linux HMM (used by AMD ROCm with XNACK retryable faults), where policies would attach to generic \texttt{migrate\_vma} hooks~\cite{rocm-gpu-memory,linux-gpusvm-doc}. For scheduling, our hardware queue abstraction maps to each vendor's fundamental scheduling unit: TSGs on NVIDIA (as described in \S\ref{sec:impl-host}) and user-mode queues on AMD, where policies can set queue priority and scheduling mode (e.g., \texttt{HWS} vs \texttt{HWS\_NO\_OVERSUBSCRIPTION}) that the MES firmware respects during HQD mapping~\cite{drm-gpu-sched,amdgpu-userq-doc}. This abstraction aligns with the Linux DRM scheduler's \texttt{drm\_sched\_entity} lifecycle, enabling cross-vendor policy enforcement.
-
-On the device, \sys leverages the standard SIMT execution model. Our compiler already implements an eBPF-to-SPIR-V backend, enabling policy logic to be compiled for generic compute runtimes like AMD ROCm and Intel Level Zero. However, end-to-end portability is currently limited by the runtime environment: while the policy bytecode is portable, adapting the control plane, instrumentation hooks, and performance optimizations to the specific driver interfaces and hardware characteristics of these platforms remains future work~\cite{spirv-ir-rfc,llvm-offload-design}.

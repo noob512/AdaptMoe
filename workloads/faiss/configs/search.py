@@ -5,7 +5,7 @@ Usage:
     uv run python configs/search.py --dataset SIFT100M --uvm --output results/sift100m_uvm.json
     uv run python configs/search.py --dataset SIFT20M --output results/sift20m_gpu.json
 
-Same script works with or without eBPF kernel module loaded.
+The script supports native CUDA and UVM modes.
 """
 import argparse
 import json

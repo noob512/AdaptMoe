@@ -1,8 +1,0 @@
-\section{Related Work}\label{sec:related_work}
-\xiangyu{simplify the description of each part in the related work because they are far from the focus of this paper.}
-
-\textbf{PTX injection for telemetry.} Neutrino~\cite{neutrino} shows that user-level PTX injection and CUDA API hooks can expose allocation, launch, and resource metrics with minimal app changes, motivating low-overhead GPU observability. \sys extends this idea with dynamic, on-device probes and CPU–GPU co-design under stronger safety constraints.
-
-\textbf{AI observability stacks.} Meta's production pipeline~\cite{ai-observability} combines fleet metrics (Dynolog/DCGM) and selective CUPTI tracing with automated analysis. Such platforms motivate seamless interoperability; \sys is designed to plug into similar pipelines while offering finer, live GPU hooks.
-
-\textbf{Energy-aware split execution.} Neurosurgeon~\cite{neurosurgeon} profiles DNN layers to choose edge–cloud split points, while Perseus~\cite{chung2024reducing} cuts training "energy bloat" via dynamic GPU frequency planning. Our ML-Green use case aligns with these goals by using access traces to steer CPU–GPU partitioning under power constraints.

@@ -1,6 +1,6 @@
 # PyTorch GNN Training Benchmark (Experiment 3)
 
-Benchmarks Graph Neural Network (GCN) training with CUDA Unified Virtual Memory, comparing default UVM vs gpu_ext eBPF-optimized UVM.
+Benchmarks Graph Neural Network (GCN) training with native CUDA and CUDA Unified Virtual Memory.
 
 No external dataset needed -- graphs are randomly generated.
 
@@ -29,7 +29,7 @@ for NODES in 1000000 3000000 5000000 7000000; do
 done
 ```
 
-### Config 2: UVM baseline (default driver, no eBPF)
+### Config 2: UVM baseline
 
 The UVM allocator replaces PyTorch's default CUDA allocator with `cudaMallocManaged`. Allocations exceeding the GPU memory budget (default: `total_mem - 2 GB`) get `cudaMemAdviseSetPreferredLocation=CPU` to prevent OOM from device memory exhaustion.
 
@@ -41,27 +41,6 @@ for NODES in 5000000 7000000 8000000 10000000 12000000 15000000; do
     --epochs 2 --warmup 1 --prop chunked --use_uvm \
     --report_json result/uvm_baseline_${NODES}.json
 done
-```
-
-### Config 3: UVM + gpu_ext eBPF
-
-```bash
-# Load sequential prefetch policy
-sudo bpftool struct_ops register /path/to/gpu_ext/extension/.output/prefetch_adaptive_sequential.bpf.o
-
-for NODES in 5000000 7000000 8000000 10000000 12000000 15000000; do
-  CUDA_MANAGED_FORCE_DEVICE_ALLOC=1 uv run python benchmark_gnn_uvm.py \
-    --dataset random --nodes $NODES \
-    --edges_per_node 10 --features 128 --hidden 256 \
-    --epochs 2 --warmup 1 --prop chunked --use_uvm \
-    --report_json result/uvm_ebpf_${NODES}.json
-done
-```
-
-### One-click experiment
-
-```bash
-uv run bash run_exp3_gnn.sh
 ```
 
 ## Verification
@@ -91,12 +70,12 @@ CUDA_MANAGED_FORCE_DEVICE_ALLOC=1 uv run python benchmark_gnn_uvm.py \
 
 ### Reference results (RTX 5090, NVIDIA driver 575, CUDA 12.9)
 
-| Nodes | Normal GPU | UVM Baseline | UVM + gpu_ext | Speedup |
-|-------|-----------|-------------|--------------|---------|
-| 1M | 0.22s | - | - | - |
-| 5M | ~1.1s | 5.6s | TBD | TBD |
-| 10M | OOM | 145.6s | TBD | TBD |
-| 15M | OOM | 247.2s | TBD | TBD |
+| Nodes | Normal GPU | UVM Baseline |
+|-------|-----------|-------------|
+| 1M | 0.22s | - |
+| 5M | ~1.1s | 5.6s |
+| 10M | OOM | 145.6s |
+| 15M | OOM | 247.2s |
 
 ### UVM allocator environment variables
 
@@ -104,13 +83,6 @@ CUDA_MANAGED_FORCE_DEVICE_ALLOC=1 uv run python benchmark_gnn_uvm.py \
 |----------|---------|-------------|
 | `UVM_GPU_BUDGET_GB` | auto | GPU memory budget in GB (default: `total_mem - 2GB`) |
 | `CUDA_MANAGED_FORCE_DEVICE_ALLOC` | `0` | Set to `1` for UVM mode |
-
-## Generate Figures
-
-```bash
-uv run python visualize_all.py
-# produces uvm_benchmark_comparison.pdf
-```
 
 ## Directory Structure
 
@@ -121,8 +93,6 @@ pytorch/
 ├── pyproject.toml           # Python dependencies (uv)
 ├── uv.lock                  # Version lock
 ├── benchmark_gnn_uvm.py     # Main benchmark script
-├── run_exp3_gnn.sh          # One-click experiment script
-├── visualize_all.py         # Figure generation
 ├── uvm_allocator.c          # Custom UVM CUDA allocator
 ├── gpu_allocator.c          # Pure GPU allocator (for baseline)
 ├── result/                  # Benchmark output JSON

@@ -5,7 +5,7 @@
     uv run python configs/serve_bench.py --mode cpu_offload --output results/cpu_offload.json
     uv run python configs/serve_bench.py --mode uvm --output results/uvm_baseline.json
 
-此脚本可以在加载或不加载 eBPF 内核模块的情况下工作。
+此脚本支持 vLLM 原生 CPU offload 与项目的 UVM 模式。
 """
 import argparse
 import json
@@ -51,7 +51,7 @@ MODE_CONFIGS = {
         "server_cmd": f"uv run vllm serve {MODEL} --enforce-eager --cpu-offload-gb 8",
         "env": {}, # 无特殊环境变量
     },
-    # 模式2: UVM (Unified Virtual Memory，统一虚拟内存，可能是该项目通过 eBPF/驱动 修改的自定义机制)
+    # 模式2: UVM (Unified Virtual Memory，使用项目内的 allocator 和驱动机制)
     "uvm": {
         "server_cmd": f"uv run vllm serve {MODEL} --enforce-eager --max-num-seqs 16",
         "env": {"VLLM_USE_UVM": "1"}, # 注入特定的环境变量以开启 UVM 特性

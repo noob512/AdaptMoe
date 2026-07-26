@@ -83,22 +83,6 @@ uv run python uvm/test_uvm_baselines.py \
     --sharegpt-output-len 512 --seed 42 --request-rate 5"
 ```
 
-### With gpu_ext eBPF policy
-
-```bash
-# Load policies first
-sudo bpftool struct_ops register /path/to/gpu_ext/extension/.output/prefetch_adaptive_sequential.bpf.o
-sudo bpftool struct_ops register /path/to/gpu_ext/extension/.output/eviction_lfu.bpf.o
-
-# Run UVM baseline (eBPF is transparent)
-uv run python uvm/test_uvm_baselines.py \
-  --baselines uvm_baseline \
-  --bench-args "--model Qwen/Qwen3-30B-A3B-FP8 \
-    --dataset-name sharegpt --num-prompts 100 \
-    --dataset-path datasets/ShareGPT_V3_unfiltered_cleaned_split.json \
-    --sharegpt-output-len 512 --seed 42 --request-rate 5"
-```
-
 ## Verification
 
 Results are saved to `results/uvm_baseline_results_YYYYMMDD_HHMMSS.json`.
@@ -109,7 +93,6 @@ Results are saved to `results/uvm_baseline_results_YYYYMMDD_HHMMSS.json`.
 |--------|---------------|----------------|--------------------------|-------------|
 | CPU Offload (8GB) | 1,120 | 230 | 364 | 141 |
 | UVM Baseline | 261,163 | 152 | 91 | 561 |
-| UVM + gpu_ext eBPF | TBD | TBD | TBD | TBD |
 
 **Note on TTFT**: UVM baseline shows high TTFT due to `--max-num-seqs 16` causing request queuing (only 16 concurrent sequences vs 100 for cpu_offload). Per-token generation latency (TPOT=152ms) is actually better than cpu_offload. Peak output throughput reaches 272 tok/s.
 

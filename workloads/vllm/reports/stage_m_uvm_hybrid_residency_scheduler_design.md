@@ -185,9 +185,9 @@ migration stream priority
 page fault fast path
 ```
 
-## 4. bpftime 启发：应用层策略运行时
+## 4. 应用层策略运行时
 
-bpftime 的关键启发不是“照搬 eBPF”，而是它的系统设计思想：
+这里采用控制面与执行后端分离的系统设计：
 
 ```text
 将高频、复杂、可在用户态完成的系统层开销移到应用层 / 用户态 runtime。

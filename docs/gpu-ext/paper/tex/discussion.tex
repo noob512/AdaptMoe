@@ -1,6 +1,0 @@
-\section{Portability}
-\label{sec:discussion}
-
-\sys is designed for portability, though our current implementation targets NVIDIA GPUs. NVIDIA's production drivers bypass Linux's standard kernel interfaces, but our design aligns with generic Linux abstractions.
-On the host side, for memory management we follow Linux's Heterogeneous Memory Management (HMM) and its \texttt{migrate\_vma} interface, already adopted by AMD ROCm with XNACK retryable faults. For scheduling, we abstract GPU queues based on Linux DRM scheduler's \texttt{drm\_sched\_entity}, mapping to NVIDIA TSGs and potentially AMD user-mode queues~\cite{rocm-gpu-memory,linux-gpusvm-doc,drm-gpu-sched,amdgpu-userq-doc}.
-On the device side, our compiler generates vendor-neutral eBPF bytecode using SPIR-V, enabling future compatibility with AMD ROCm and Intel Level Zero. End-to-end portability requires vendor-specific runtime support and hardware tuning, which remain future work~\cite{spirv-ir-rfc,llvm-offload-design}.

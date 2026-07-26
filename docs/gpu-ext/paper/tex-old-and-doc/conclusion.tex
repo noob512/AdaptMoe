@@ -1,6 +1,0 @@
-\section{Conclusion}
-\label{sec:conclusion}
-
-\xiangyu{We build \sys{} that offloads eBPF bytecode to monitor GPU's runtime performance using dynamic PTX injection. On standard NVIDIA servers, \sys{} reduces instrumentation overhead, boosts throughput and cut the CPU-GPU round trip latency.}
-
-\sys brings eBPF-style, low-overhead instrumentation to running GPU kernels via dynamic PTX injection, unified user-space maps, and safe trampolines. Across diverse systems (P40, H100, and Grace Hopper), we observe low probe overheads and strong end-to-end efficiency, while use cases like MemTrace and Fair Share illustrate practical benefits. We see \sys as a foundation for programmable GPU observability that integrates with production pipelines and future coherent platforms.

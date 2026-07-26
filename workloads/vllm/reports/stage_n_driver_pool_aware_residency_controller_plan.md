@@ -15,10 +15,6 @@ UVM driver:
   维护 region table、VA 反查、pool budget、真实 residency accounting
   对 KV cache、weight、临时缓冲区三个 pool 执行 protected/evictable
   状态管理、victim selection、migrate/evict
-
-BPF struct_ops:
-  可选实验策略插件
-  不承载 correctness
 ```
 
 当前项目已经不是从零开始。Phase F 已经完成了 driver-backed range action、
@@ -71,8 +67,7 @@ Temp scratch pool:
 | P5: Driver victim selection | Batch Trace Done | driver 自主选择 victim | `GET_POOL_STATE` 已计算 over_budget/reclaim_target/victim_candidate/selected_victim trace 字段，并返回最多 8 个 batch victim 候选；scratch 只把 `TRANSIENT|EVICTABLE` 且非 active/protected 的 region 作为候选 | 用 vLLM 三池 smoke 验证候选质量 | 超 budget 时 driver 选出同 pool 可驱逐页面/region |
 | P6: 接入 UVM eviction/migration | Hard Enforce Implemented | 使用 UVM 原生路径执行 reclaim，并形成硬限制闭环 | `phase-n-reclaim` 三池 smoke 已通过；`RECLAIM_POOL` 已抽成 `uvm_phase_n_reclaim_pool_execute()` 并调用 `uvm_migrate_managed_range_to_cpu()`；replayable fault batch 外层安全点已接入执行型 `phase_n_auto_reclaim_hook`；enforce 模式现在会三池 sweep、优先大 victim、同步多轮 reclaim，最终仍超预算则返回 `NV_ERR_INSUFFICIENT_RESOURCES` 并记录 `deny_or_block=1` | 重编译/重载 UVM 后运行 hard partition proof；再根据结果调预算和性能 | 任一池 final resident 不得无证据超预算；超预算时必须有 pool-specific `reclaim_to_budget=1` 或 `deny/block/reject` |
 | P7: 稳定性和性能优化 | Hard Proof Harness Ready | 降低抖动、带宽竞争和锁开销，并验证硬分区正确性 | `run_stage_n_p7_ab_sweep.sh` 支持 native UVM / Stage N trace / Stage N soft / soft sweep / enforce probe；新增 hard proof wrapper 和 `check_stage_n_hard_partition.py`，汇总 `Hard pass`、`Max over bytes`、`Hard block`、`Scratch reject` | 先跑 hard partition proof；随后运行多请求 A/B、scratch/cooldown/max-victim sweep | hard proof PASS；性能 A/B 中 TTFT/TPOT 不明显恶化；soft 模式 failed_requests=0 |
-| P8: BPF 可选插件 | Pending | 快速实验 victim scoring | 当前不需要 BPF 承载正确性 | 暴露只读 kfunc/struct_ops score hook | 不加载 BPF 时 C 策略完整可用 |
-| P9: 通用化 | Pending | 支持非 vLLM workload | vLLM 内已有较多专用接入 | 提供 C/Python tag SDK，适配 llama.cpp/SGLang | 新应用只需少量 tag 接入 |
+| P8: 通用化 | Pending | 支持非 vLLM workload | vLLM 内已有较多专用接入 | 提供 C/Python tag SDK，适配 llama.cpp/SGLang | 新应用只需少量 tag 接入 |
 
 ## 2. 当前实现基线
 
@@ -219,19 +214,17 @@ runtime scratch/workspace 需求。因此 Stage N 的判断应拆成两部分：
 3. 超 budget 时，driver 在同 pool 内优先选择 victim 并调用 UVM 原生迁移/驱逐路径。
 4. dense/shared weight、active KV、正在使用的 scratch 能被 protected。
 5. MoE expert、inactive KV、evictable scratch 能被 driver 选择为 victim。
-6. BPF 只作为可选 scoring 插件，driver C 策略必须完整可用。
-7. temp scratch pool 默认保留约 100MiB GPU 空间，优先服务 runtime scratch、
+6. temp scratch pool 默认保留约 100MiB GPU 空间，优先服务 runtime scratch、
    cuBLAS/cuDNN/workspace、MoE/attention 临时 buffer，避免污染 KV/weight pool。
 
 ### 3.2 非目标
 
 1. 不在第一版追求真正的硬件显存硬隔离。
 2. 不让 vLLM 在 allocate path 上执行复杂 victim selection。
-3. 不把 correctness 依赖到 BPF。
-4. 不一次性重写 UVM 全部 fault/migration 机制。
-5. 不把应用层 `device_direct` allocator 继续作为长期 correctness 路径；它保留
+3. 不一次性重写 UVM 全部 fault/migration 机制。
+4. 不把应用层 `device_direct` allocator 继续作为长期 correctness 路径；它保留
    为对照、fallback 和 size-class 设计参考。
-6. 不让 scratch 临时缓冲区与 KV/weight 共用无限制预算；scratch 必须作为第三个
+5. 不让 scratch 临时缓冲区与 KV/weight 共用无限制预算；scratch 必须作为第三个
    独立 pool 进入 driver accounting 和 victim selection。
 
 ## 4. ABI 设计
@@ -635,7 +628,7 @@ MoE expert weight:
 ```
 
 第一版不需要 driver 理解 MoE router，只接收 vLLM 更新的 `last_access_epoch` 和
-`ACTIVE` flag。复杂 hotness 以后可由 BPF 或 userspace hint 提供。
+`ACTIVE` flag。复杂 hotness 可由 userspace hint 提供。
 
 ### 7.4 Scratch pool policy
 
@@ -1287,42 +1280,7 @@ scratch size-class hit/miss/reclaim
 | 过度 reclaim 抖动 | fault 增加、吞吐下降 | hysteresis、cooldown、rate limit |
 | 与 UVM 原生 eviction 冲突 | 非预期迁移 | policy hook 先 trace，再 soft，再 enforce |
 | 应用 tag 不通用 | 只能服务 vLLM | 提供 C/Python SDK，其他框架只接 register/update/unregister |
-| BPF verifier/版本问题 | 策略不可加载 | BPF 可选；C fallback 必须完整 |
-
-## 13. BPF 可选设计
-
-BPF 不作为 Stage N 必需项。driver C 策略先完成后，再开放只读查询和 scoring：
-
-```c
-bpf_gpu_chunk_pool()
-bpf_gpu_chunk_region_id()
-bpf_gpu_chunk_flags()
-bpf_gpu_region_last_access_epoch()
-bpf_gpu_pool_budget()
-bpf_gpu_pool_resident_bytes()
-```
-
-BPF 返回：
-
-```text
-score
-skip reason
-optional priority adjustment
-```
-
-driver 仍负责：
-
-```text
-预算正确性
-protected/active 跳过
-最终 victim selection fallback
-迁移/驱逐执行
-错误处理
-```
-
-这样既保留开源内核直接修改的稳定路径，又能为后续策略实验提供快速迭代入口。
-
-## 14. 推荐近期执行顺序
+## 13. 推荐近期执行顺序
 
 ### Step 1: 补 Python driver region wrapper
 

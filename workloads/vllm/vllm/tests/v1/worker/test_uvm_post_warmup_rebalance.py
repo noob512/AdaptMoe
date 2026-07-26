@@ -134,3 +134,38 @@ def test_reserved_runtime_stays_closed_when_preallocation_fails(
         worker._run_uvm_post_warmup_rebalance()
 
     assert os.environ["VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY"] == "0"
+
+
+def test_remote_read_skips_reserved_preallocation(
+    monkeypatch: Any,
+) -> None:
+    events: list[str] = []
+
+    class FakeModelRunner:
+        def run_uvm_init_time_weight_placement(
+            self,
+            *,
+            prealloc_reserved: bool,
+        ) -> None:
+            assert prealloc_reserved is False
+            events.append("experts")
+
+        def _maybe_prealloc_uvm_expert_reserved_slots_after_stage_m(
+            self,
+        ) -> dict[str, Any]:
+            events.append("slots")
+            return {"requested": True, "ok": True}
+
+    monkeypatch.setenv("VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE", "post_warmup")
+    monkeypatch.setenv("VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE", "1")
+    monkeypatch.setenv("VLLM_UVM_WEIGHT_EXECUTOR", "expert_reserved_regions_async")
+    monkeypatch.setenv("VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE", "remote_read")
+    monkeypatch.delenv("VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY", raising=False)
+
+    worker = object.__new__(Worker)
+    worker.model_runner = FakeModelRunner()
+
+    worker._run_uvm_post_warmup_rebalance()
+
+    assert events == ["experts"]
+    assert os.environ["VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY"] == "0"

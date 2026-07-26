@@ -3701,7 +3701,7 @@ static std::atomic<size_t> scratch_pool_reuse_cache_event_errors{0};
  * * 此结构体充当每个 UVM 显存块的“数字档案”。它在内存分配 (cudaMallocManaged) 时被创建，
  * 记录了从底层物理属性到上层业务意图（如 KV Cache、Weights）的完整映射关系。
  * 这些详尽的追踪数据不仅用于运行时的动态策略干预（Gap Watch/Device Direct），
- * 更是离线分析 CPU-GPU 耦合瓶颈、生成 eBPF 性能重放日志的核心数据源。
+ * 更是离线分析 CPU-GPU 耦合瓶颈和生成性能重放日志的核心数据源。
  */
 struct AllocationInfo {
     // ========================================================================
@@ -4976,8 +4976,8 @@ struct GapWatchConfigSnapshot {
     uintptr_t end;
 
     /// @brief 该观测任务的可读标识符（如 "layer_0_kv_cache_hotspot"）。
-    /// @note 极具工程价值：它会被直接透传到详细日志中，方便与 eBPF 探针收集到的内核级
-    /// page fault 堆栈或 SysAI-Agent 的时序图谱进行无缝联合关联 (Join)。
+    /// @note 极具工程价值：它会被直接透传到详细日志中，方便与内核级 page fault
+    /// 堆栈或 SysAI-Agent 的时序图谱进行无缝联合关联 (Join)。
     std::string name;
 
     // ========================================================================
@@ -7464,7 +7464,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         }
     }
 
-    // 结构化的详细追踪日志，用于后续的离线分析或 eBPF 性能重放关联
+    // 结构化的详细追踪日志，用于后续的离线分析或性能重放关联
     if (size >= trace_min_bytes) {
         trace_allocation_event(
             ptr, static_cast<size_t>(size), alloc_count, current,

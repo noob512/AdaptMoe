@@ -1813,7 +1813,8 @@ typedef struct
 //
 #define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT                (1U << 0)
 #define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_STRICT_2M_BLOCKS              (1U << 1)
-#define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K                  (1U << 2)
+#define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K                  (1U << 2) // region must be 64KiB aligned
+#define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ                   (1U << 3)
 
 #define UVM_EXPERT_OFFLOAD_RELEASE                                   UVM_IOCTL_BASE(100)
 typedef struct
@@ -1836,6 +1837,11 @@ typedef struct
     NvU64 attempted_bytes NV_ALIGN_BYTES(8); // OUT
     NvU64 released_bytes NV_ALIGN_BYTES(8);  // OUT, PMM root chunk bytes freed
     NvU64 failed_bytes NV_ALIGN_BYTES(8);    // OUT
+    NvU32 remote_map_blocks;                 // OUT, blocks fully CPU-backed and remotely mapped
+    NvU32 remote_map_failure_blocks;         // OUT
+    NvU64 cpu_resident_bytes NV_ALIGN_BYTES(8); // OUT, requested bytes resident on CPU after release
+    NvU64 remote_mapped_bytes NV_ALIGN_BYTES(8); // OUT, requested bytes readable through GPU remote PTEs
+    NvU64 newly_remote_mapped_bytes NV_ALIGN_BYTES(8); // OUT, PTE bytes installed by this call
     NvU64 first_failed_block NV_ALIGN_BYTES(8); // OUT
     NV_STATUS first_error;                   // OUT
     NV_STATUS rmStatus;                      // OUT

@@ -1190,6 +1190,32 @@ class UvmPoolResidencyManager:
                 return None
             return self._region_snapshot_locked(region)
 
+    def ensure_driver_region_registered(
+        self,
+        region_id: str,
+    ) -> dict[str, Any]:
+        """Register one region without enabling global driver tagging.
+
+        Targeted release operations need a driver region in the allocation's
+        UVM VA space even when the general residency controller is running
+        with driver tagging disabled. Keeping this opt-in avoids registering
+        every preregistered expert merely because release_remote is enabled.
+        """
+        with self._lock:
+            region = self._regions.get(region_id)
+            if region is None:
+                return {
+                    "enabled": True,
+                    "attempted": False,
+                    "registered": False,
+                    "status": None,
+                    "reason": "region_not_found",
+                    "driver_region_id": 0,
+                }
+            record = self._sync_driver_region_tag_locked(region, force=True)
+            record["forced"] = True
+            return record
+
     def regions_snapshot(self) -> list[dict[str, Any]]:
         with self._lock:
             return [
@@ -1415,16 +1441,19 @@ class UvmPoolResidencyManager:
     def _sync_driver_region_tag_locked(
         self,
         region: UvmResidencyRegion,
+        *,
+        force: bool = False,
     ) -> dict[str, Any]:
+        enabled = self.driver_tag_enable or force
         record: dict[str, Any] = {
-            "enabled": self.driver_tag_enable,
+            "enabled": enabled,
             "attempted": False,
             "registered": region.driver_registered,
             "status": region.driver_register_status,
             "reason": None,
             "driver_region_id": region.driver_region_id,
         }
-        if not self.driver_tag_enable:
+        if not enabled:
             record["reason"] = "driver_tag_disabled"
             return record
         if bool(region.metadata.get("driver_tag_skip")):
@@ -2026,6 +2055,14 @@ def register_uvm_residency_region(
         evictable=evictable,
         active=active,
         metadata=metadata,
+    )
+
+
+def ensure_uvm_residency_driver_region_registered(
+    region_id: str,
+) -> dict[str, Any]:
+    return get_uvm_pool_residency_manager().ensure_driver_region_registered(
+        region_id
     )
 
 

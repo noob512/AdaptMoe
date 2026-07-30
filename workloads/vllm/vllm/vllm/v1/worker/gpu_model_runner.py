@@ -6748,10 +6748,41 @@ class GPUModelRunner(
             ):
                 self._log_model_weight_addresses("after_profile_run")
 
+    def run_uvm_init_hot_weight_repair(self) -> None:
+        if (
+            os.environ.get("VLLM_UVM_INIT_WEIGHT_HOT_REPAIR_ENABLE", "0")
+            != "1"
+        ):
+            return
+        repair_start = time.monotonic()
+        repaired_modules = 0
+        logger.warning("UVM controlled remap debug: global hot repair pass begin")
+        with uvm_enabled_allocation_phase("enabled:init_weight_hot_repair"):
+            for module in self.get_model().modules():
+                repair_hot = getattr(
+                    module,
+                    "repair_uvm_init_hot_weight_residency",
+                    None,
+                )
+                if callable(repair_hot):
+                    repair_hot()
+                    repaired_modules += 1
+        logger.warning(
+            "UVM controlled remap debug: global hot repair pass end "
+            "repaired_modules=%d elapsed=%.3fs",
+            repaired_modules,
+            time.monotonic() - repair_start,
+        )
+        self._record_uvm_init_weight_plan_residency("after_global_hot_repair")
+        self._record_uvm_active_expert_residency_probe(
+            "after_global_hot_repair"
+        )
+
     def run_uvm_init_time_weight_placement(
         self,
         *,
         prealloc_reserved: bool = True,
+        run_hot_repair: bool = True,
     ) -> None:
         debug_start = time.monotonic()
         logger.warning("UVM controlled remap debug: model_runner Stage M placement entered")
@@ -6762,7 +6793,14 @@ class GPUModelRunner(
         init_hot_prefetch_enabled = (
             os.environ.get("VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_ENABLE", "0") == "1"
         )
-        if not (init_weight_offload_enabled or init_hot_prefetch_enabled):
+        init_hot_repair_enabled = (
+            os.environ.get("VLLM_UVM_INIT_WEIGHT_HOT_REPAIR_ENABLE", "0") == "1"
+        )
+        if not (
+            init_weight_offload_enabled
+            or init_hot_prefetch_enabled
+            or init_hot_repair_enabled
+        ):
             logger.warning(
                 "UVM controlled remap debug: model_runner Stage M placement skipped "
                 "disabled elapsed=%.3fs",
@@ -6808,6 +6846,8 @@ class GPUModelRunner(
             except Exception:
                 logger.debug("Failed to synchronize after Stage M weight offload",
                              exc_info=True)
+        if init_hot_repair_enabled and run_hot_repair:
+            self.run_uvm_init_hot_weight_repair()
         if issued_modules:
             logger.info(
                 "Stage M init-time weight placement visited %d MoE modules.",
@@ -7024,6 +7064,83 @@ class GPUModelRunner(
             "selected_layers": len(selected_experts_by_layer or {}),
             "selected_experts_by_layer": selected_experts_by_layer or {},
             "released_count": released_count,
+            "results": results,
+        }
+
+    def get_uvm_dynamic_expert_heat(
+        self,
+        reset: bool = False,
+    ) -> dict[str, Any]:
+        """Collect per-layer routing heat and current remote expert sets."""
+        if not self._env_flag_enabled(
+            "VLLM_UVM_DYNAMIC_EXPERT_SWAP_ENABLE",
+            default=False,
+        ):
+            return {"ok": False, "reason": "dynamic_expert_swap_disabled"}
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        layers: dict[str, dict[str, Any]] = {}
+        for module in self.get_model().modules():
+            snapshot = getattr(module, "get_uvm_dynamic_expert_heat", None)
+            if not callable(snapshot):
+                continue
+            layer_key = self._uvm_incremental_expert_layer_key(module)
+            value = snapshot(reset=bool(reset))
+            if isinstance(value, dict):
+                layers[layer_key] = value
+        return {
+            "ok": True,
+            "reason": "heat_collected",
+            "reset": bool(reset),
+            "layer_count": len(layers),
+            "layers": layers,
+        }
+
+    def run_uvm_dynamic_expert_swaps(
+        self,
+        swaps_by_layer: dict[str, list[dict[str, object]]],
+    ) -> dict[str, Any]:
+        """Execute EngineCore-selected remote/GPU expert exchanges."""
+        if not self._env_flag_enabled(
+            "VLLM_UVM_DYNAMIC_EXPERT_SWAP_ENABLE",
+            default=False,
+        ):
+            return {"ok": False, "reason": "dynamic_expert_swap_disabled"}
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        results: list[dict[str, object]] = []
+        visited_layers: set[str] = set()
+        with uvm_enabled_allocation_phase("enabled:dynamic_expert_swap"):
+            for module in self.get_model().modules():
+                run_swaps = getattr(
+                    module,
+                    "run_uvm_dynamic_remote_read_swaps",
+                    None,
+                )
+                if not callable(run_swaps):
+                    continue
+                layer_key = self._uvm_incremental_expert_layer_key(module)
+                layer_swaps = swaps_by_layer.get(layer_key)
+                if not layer_swaps:
+                    continue
+                visited_layers.add(layer_key)
+                value = run_swaps(layer_swaps)
+                results.append({**value, "layer_key": layer_key})
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        missing_layers = sorted(set(swaps_by_layer) - visited_layers)
+        return {
+            "ok": (
+                not missing_layers
+                and all(bool(result.get("ok")) for result in results)
+            ),
+            "reason": "swaps_executed" if not missing_layers else "layers_missing",
+            "selected_layers": len(swaps_by_layer),
+            "visited_layers": len(visited_layers),
+            "missing_layers": missing_layers,
+            "swapped_count": sum(
+                int(result.get("swapped_count") or 0) for result in results
+            ),
             "results": results,
         }
 

@@ -819,6 +819,210 @@ class EngineCore:
         )
         return result
 
+    @staticmethod
+    def _plan_uvm_dynamic_expert_swaps(
+        snapshot_results: list[Any],
+        *,
+        max_swaps_per_layer: int,
+        min_count_delta: int,
+    ) -> dict[str, Any]:
+        aggregated: dict[str, dict[str, Any]] = {}
+        errors: list[str] = []
+        for worker_index, worker_result in enumerate(snapshot_results):
+            if not isinstance(worker_result, dict) or not bool(
+                worker_result.get("ok")
+            ):
+                errors.append(f"worker:{worker_index}:snapshot_failed")
+                continue
+            layers = worker_result.get("layers")
+            if not isinstance(layers, dict):
+                errors.append(f"worker:{worker_index}:layers_missing")
+                continue
+            for layer_key, layer_value in layers.items():
+                if not isinstance(layer_value, dict):
+                    errors.append(f"worker:{worker_index}:{layer_key}:invalid")
+                    continue
+                try:
+                    global_count = int(layer_value["global_num_experts"])
+                    local_count = int(layer_value["local_num_experts"])
+                    counts = [
+                        int(value)
+                        for value in layer_value["expert_token_counts"]
+                    ]
+                    remote = {
+                        int(value) for value in layer_value["remote_experts"]
+                    }
+                except (KeyError, TypeError, ValueError):
+                    errors.append(f"worker:{worker_index}:{layer_key}:malformed")
+                    continue
+                if local_count != global_count:
+                    errors.append(
+                        f"worker:{worker_index}:{layer_key}:"
+                        "distributed_expert_placement_unsupported"
+                    )
+                    continue
+                if len(counts) != global_count:
+                    errors.append(
+                        f"worker:{worker_index}:{layer_key}:count_width_mismatch"
+                    )
+                    continue
+                normalized_key = str(layer_key)
+                current = aggregated.get(normalized_key)
+                if current is None:
+                    aggregated[normalized_key] = {
+                        "global_num_experts": global_count,
+                        "counts": counts,
+                        "remote": remote,
+                    }
+                    continue
+                if (
+                    int(current["global_num_experts"]) != global_count
+                    or set(current["remote"]) != remote
+                ):
+                    errors.append(
+                        f"worker:{worker_index}:{layer_key}:replica_state_mismatch"
+                    )
+                    continue
+                current["counts"] = [
+                    left + right
+                    for left, right in zip(current["counts"], counts)
+                ]
+
+        swaps_by_layer: dict[str, list[dict[str, object]]] = {}
+        layer_summaries: dict[str, dict[str, object]] = {}
+        limit = max(int(max_swaps_per_layer), 0)
+        minimum_delta = max(int(min_count_delta), 0)
+        for layer_key, layer in sorted(aggregated.items()):
+            counts = list(layer["counts"])
+            remote = set(layer["remote"])
+            target_count = len(remote)
+            ranked = sorted(
+                range(len(counts)),
+                key=lambda expert: (counts[expert], expert),
+            )
+            target_remote = set(ranked[:target_count])
+            promote = sorted(
+                remote - target_remote,
+                key=lambda expert: (-counts[expert], expert),
+            )
+            demote = sorted(
+                target_remote - remote,
+                key=lambda expert: (counts[expert], expert),
+            )
+            selected: list[dict[str, object]] = []
+            for promote_expert, demote_expert in zip(promote, demote):
+                count_delta = counts[promote_expert] - counts[demote_expert]
+                if count_delta < minimum_delta or len(selected) >= limit:
+                    continue
+                selected.append(
+                    {
+                        "promote_expert": promote_expert,
+                        "demote_expert": demote_expert,
+                        "promote_count": counts[promote_expert],
+                        "demote_count": counts[demote_expert],
+                        "count_delta": count_delta,
+                    }
+                )
+            if selected:
+                swaps_by_layer[layer_key] = selected
+            layer_summaries[layer_key] = {
+                "remote_count": target_count,
+                "current_remote_experts": sorted(remote),
+                "target_remote_experts": sorted(target_remote),
+                "eligible_swap_count": min(len(promote), len(demote)),
+                "selected_swap_count": len(selected),
+                "selected_swaps": selected,
+                "observed_assignments": sum(counts),
+            }
+        return {
+            "ok": not errors,
+            "errors": errors,
+            "swaps_by_layer": swaps_by_layer,
+            "selected_layers": len(swaps_by_layer),
+            "selected_swaps": sum(len(value) for value in swaps_by_layer.values()),
+            "layers": layer_summaries,
+        }
+
+    def reset_uvm_dynamic_expert_heat(self) -> dict[str, Any]:
+        """Reset routing windows while preserving expert placement."""
+        if self.scheduler.has_unfinished_requests():
+            return {"ok": False, "reason": "maintenance_requires_idle_scheduler"}
+        if getattr(self, "batch_queue", None):
+            return {"ok": False, "reason": "maintenance_requires_drained_batches"}
+        snapshots = self.collective_rpc(
+            "get_uvm_dynamic_expert_heat",
+            args=(True,),
+        )
+        return {
+            "ok": bool(snapshots)
+            and all(
+                isinstance(result, dict) and bool(result.get("ok"))
+                for result in snapshots
+            ),
+            "reason": "heat_reset",
+            "worker_results": snapshots,
+        }
+
+    def rebalance_uvm_remote_experts(
+        self,
+        max_swaps_per_layer: int = 1,
+        min_count_delta: int = 1,
+        reset_heat: bool = True,
+    ) -> dict[str, Any]:
+        """Recompute cold experts from recent routing and exchange placement."""
+        if not self._uvm_env_flag(
+            "VLLM_UVM_DYNAMIC_EXPERT_SWAP_ENABLE",
+            default=False,
+        ):
+            return {"ok": False, "reason": "dynamic_expert_swap_disabled"}
+        if self.scheduler.has_unfinished_requests():
+            return {"ok": False, "reason": "maintenance_requires_idle_scheduler"}
+        if getattr(self, "batch_queue", None):
+            return {"ok": False, "reason": "maintenance_requires_drained_batches"}
+
+        snapshots = self.collective_rpc(
+            "get_uvm_dynamic_expert_heat",
+            args=(bool(reset_heat),),
+        )
+        plan = self._plan_uvm_dynamic_expert_swaps(
+            snapshots,
+            max_swaps_per_layer=max_swaps_per_layer,
+            min_count_delta=min_count_delta,
+        )
+        if not bool(plan.get("ok")):
+            return {
+                "ok": False,
+                "reason": "heat_snapshot_invalid",
+                "snapshot_results": snapshots,
+                "plan": plan,
+            }
+        swaps_by_layer = plan.get("swaps_by_layer") or {}
+        if not swaps_by_layer:
+            return {
+                "ok": True,
+                "reason": "placement_already_matches_heat",
+                "snapshot_results": snapshots,
+                "plan": plan,
+                "worker_results": [],
+            }
+        worker_results = self.collective_rpc(
+            "run_uvm_dynamic_expert_swaps",
+            args=(swaps_by_layer,),
+        )
+        execution_ok = bool(worker_results) and all(
+            isinstance(result, dict) and bool(result.get("ok"))
+            for result in worker_results
+        )
+        return {
+            "ok": execution_ok,
+            "reason": (
+                "expert_swaps_committed" if execution_ok else "expert_swap_failed"
+            ),
+            "snapshot_results": snapshots,
+            "plan": plan,
+            "worker_results": worker_results,
+        }
+
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
 

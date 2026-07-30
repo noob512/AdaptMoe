@@ -103,6 +103,20 @@ def apply_kv_target(
     return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 
+def call_engine_utility(llm: Any, method: str, *args: Any) -> dict[str, Any]:
+    llm_engine = getattr(llm, "llm_engine", None)
+    engine_core = getattr(llm_engine, "engine_core", None)
+    if engine_core is None:
+        return {"ok": False, "reason": "engine_core_unavailable"}
+    if hasattr(engine_core, "call_utility"):
+        value = engine_core.call_utility(method, *args)
+    elif hasattr(engine_core, method):
+        value = getattr(engine_core, method)(*args)
+    else:
+        return {"ok": False, "reason": f"utility_unavailable:{method}"}
+    return value if isinstance(value, dict) else {"ok": True, "result": value}
+
+
 def request_metrics(output: Any) -> dict[str, Any]:
     completion = output.outputs[0] if output.outputs else None
     token_ids = list(completion.token_ids) if completion is not None else []
@@ -138,12 +152,17 @@ def main() -> int:
     parser.add_argument("--progress", required=True, type=Path)
     parser.add_argument("--phase-names", default="low,high")
     parser.add_argument("--phase-request-counts", default="8,64")
+    parser.add_argument("--phase-request-offsets", default="")
     parser.add_argument("--phase-output-tokens", default="64,256")
     parser.add_argument("--grow-after-phase", type=int, default=0)
     parser.add_argument("--grow-target-blocks", default="")
     parser.add_argument("--maintenance-waves-per-phase", type=int, default=0)
     parser.add_argument("--pre-phase-target-blocks", type=int, default=-1)
     parser.add_argument("--release-expert-wave", action="store_true")
+    parser.add_argument("--dynamic-expert-swap-after-phases", default="")
+    parser.add_argument("--dynamic-expert-swap-max-per-layer", type=int, default=1)
+    parser.add_argument("--dynamic-expert-swap-min-count-delta", type=int, default=1)
+    parser.add_argument("--reset-dynamic-expert-heat-before-phases", action="store_true")
     parser.add_argument("--kv-cache-memory-bytes", type=int, required=True)
     parser.add_argument("--cpu-offload-gb", type=float, default=0.0)
     parser.add_argument("--max-model-len", type=int, default=1024)
@@ -160,15 +179,36 @@ def main() -> int:
         if value.strip()
     ]
     phase_counts = parse_ints(args.phase_request_counts)
+    phase_offsets = parse_ints(args.phase_request_offsets)
+    if not phase_offsets:
+        phase_offsets = [0] * len(phase_counts)
     phase_outputs = parse_ints(args.phase_output_tokens)
+    dynamic_swap_after_phases = set(
+        parse_ints(args.dynamic_expert_swap_after_phases)
+    )
     grow_targets = parse_ints(args.grow_target_blocks)
-    if not (len(phase_names) == len(phase_counts) == len(phase_outputs)):
-        raise ValueError("phase names, request counts, and output tokens must align")
+    if not (
+        len(phase_names)
+        == len(phase_counts)
+        == len(phase_offsets)
+        == len(phase_outputs)
+    ):
+        raise ValueError(
+            "phase names, request counts, offsets, and output tokens must align"
+        )
     if args.maintenance_waves_per_phase < 0:
         raise ValueError("maintenance waves per phase must be non-negative")
     requests = load_requests(args.fixture)
-    if max(phase_counts) > len(requests):
-        raise ValueError("phase request count exceeds fixture size")
+    if any(
+        offset < 0 or offset + count > len(requests)
+        for offset, count in zip(phase_offsets, phase_counts)
+    ):
+        raise ValueError("phase request range exceeds fixture size")
+    if any(
+        index < 0 or index >= len(phase_names)
+        for index in dynamic_swap_after_phases
+    ):
+        raise ValueError("dynamic expert swap phase index is out of range")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.progress.parent.mkdir(parents=True, exist_ok=True)
@@ -207,6 +247,7 @@ def main() -> int:
         "gpu_after_load": gpu_snapshot(),
         "phases": [],
         "maintenance": [],
+        "expert_swaps": [],
     }
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
@@ -215,6 +256,20 @@ def main() -> int:
 
         next_wave = 1
         grow_cursor = 0
+
+        if (
+            dynamic_swap_after_phases
+            or args.reset_dynamic_expert_heat_before_phases
+        ):
+            reset_result = call_engine_utility(
+                llm,
+                "reset_uvm_dynamic_expert_heat",
+            )
+            result["dynamic_expert_heat_initial_reset"] = reset_result
+            if not bool(reset_result.get("ok")):
+                raise RuntimeError(
+                    f"initial dynamic expert heat reset failed: {reset_result!r}"
+                )
 
         def run_maintenance(
             target_blocks: int,
@@ -264,10 +319,12 @@ def main() -> int:
                 reason="phased_pre_phase_target",
             )
 
-        for phase_index, (name, count, output_tokens) in enumerate(
-            zip(phase_names, phase_counts, phase_outputs)
+        for phase_index, (name, count, offset, output_tokens) in enumerate(
+            zip(phase_names, phase_counts, phase_offsets, phase_outputs)
         ):
-            prompts = [item["prompt"] for item in requests[:count]]
+            prompts = [
+                item["prompt"] for item in requests[offset : offset + count]
+            ]
             sampling = SamplingParams(
                 max_tokens=output_tokens,
                 temperature=0.0,
@@ -278,6 +335,7 @@ def main() -> int:
                     "action": "phase_begin",
                     "phase": name,
                     "request_count": count,
+                    "request_offset": offset,
                     "timestamp": time.time(),
                 }
             )
@@ -304,6 +362,7 @@ def main() -> int:
             phase_result = {
                 "phase": name,
                 "request_count": count,
+                "request_offset": offset,
                 "output_tokens_per_request": output_tokens,
                 "elapsed_seconds": elapsed,
                 "prompt_tokens": sum(
@@ -335,6 +394,43 @@ def main() -> int:
                     },
                 }
             )
+
+            if phase_index in dynamic_swap_after_phases:
+                torch.cuda.synchronize()
+                swap_started = time.perf_counter()
+                swap_result = call_engine_utility(
+                    llm,
+                    "rebalance_uvm_remote_experts",
+                    args.dynamic_expert_swap_max_per_layer,
+                    args.dynamic_expert_swap_min_count_delta,
+                    True,
+                )
+                torch.cuda.synchronize()
+                swap_record = {
+                    "after_phase": phase_index,
+                    "after_phase_name": name,
+                    "elapsed_seconds": time.perf_counter() - swap_started,
+                    "max_swaps_per_layer": (
+                        args.dynamic_expert_swap_max_per_layer
+                    ),
+                    "min_count_delta": (
+                        args.dynamic_expert_swap_min_count_delta
+                    ),
+                    "result": swap_result,
+                    "gpu_after_swap": gpu_snapshot(),
+                }
+                result["expert_swaps"].append(swap_record)
+                progress(
+                    {
+                        "action": "dynamic_expert_swap",
+                        "timestamp": time.time(),
+                        **swap_record,
+                    }
+                )
+                if not bool(swap_result.get("ok")):
+                    raise RuntimeError(
+                        f"dynamic expert swap failed: {swap_result!r}"
+                    )
 
             if args.maintenance_waves_per_phase:
                 stop = min(

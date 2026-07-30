@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -9,6 +11,7 @@ import pytest
 from vllm.v1.core.uvm_kv_runtime_policy import UvmKvRuntimePolicy
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
 from vllm.v1.worker.gpu_model_runner import _uvm_kv_tail_range_for_allocation
+from vllm.v1.worker import gpu_worker as gpu_worker_module
 from vllm.v1.worker.gpu_worker import Worker
 
 
@@ -34,6 +37,43 @@ def test_uvm_kv_tail_range_respects_block_boundaries() -> None:
         )
         is None
     )
+
+
+def test_pre_kv_stage_orders_cold_placement_before_kv_and_hot_repair(
+    monkeypatch: Any,
+) -> None:
+    events: list[str] = []
+
+    class FakeModelRunner:
+        def run_uvm_init_time_weight_placement(self, **kwargs: Any) -> None:
+            assert kwargs == {"run_hot_repair": False}
+            events.append("cold_placement")
+
+        def initialize_kv_cache(self, kv_cache_config: object) -> None:
+            events.append("kv_allocation")
+
+        def run_uvm_init_hot_weight_repair(self) -> None:
+            events.append("hot_repair")
+
+    monkeypatch.setenv("VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE", "pre_kv")
+    monkeypatch.setenv("VLLM_UVM_EXPERT_RESERVED_ENABLE_AFTER_WARMUP", "0")
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "ensure_kv_transfer_initialized",
+        lambda config, kv_config: None,
+    )
+
+    worker = object.__new__(Worker)
+    worker.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(enable_sleep_mode=False)
+    )
+    worker.model_runner = FakeModelRunner()
+    worker._kv_cache_uvm_allocations_enabled = lambda: False
+    worker._maybe_get_kv_cache_uvm_memory_pool_context = nullcontext
+
+    worker.initialize_from_config(object())
+
+    assert events == ["cold_placement", "kv_allocation", "hot_repair"]
 
 
 def test_post_warmup_rebalance_order_and_reserved_gate(

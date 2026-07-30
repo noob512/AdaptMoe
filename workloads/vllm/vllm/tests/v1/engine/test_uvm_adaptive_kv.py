@@ -193,3 +193,62 @@ def test_incremental_candidate_merge_selects_one_global_expert_per_layer() -> No
     )
 
     assert selected == {"layer.7": 2, "layer.8": 4}
+
+
+def test_dynamic_expert_swap_plan_preserves_count_and_uses_heat_delta() -> None:
+    plan = EngineCore._plan_uvm_dynamic_expert_swaps(
+        [
+            {
+                "ok": True,
+                "layers": {
+                    "layer.7": {
+                        "global_num_experts": 6,
+                        "local_num_experts": 6,
+                        "expert_token_counts": [0, 2, 80, 1, 5, 100],
+                        "remote_experts": [0, 5],
+                    }
+                },
+            }
+        ],
+        max_swaps_per_layer=1,
+        min_count_delta=10,
+    )
+
+    assert plan["ok"] is True
+    assert plan["swaps_by_layer"] == {
+        "layer.7": [
+            {
+                "promote_expert": 5,
+                "demote_expert": 3,
+                "promote_count": 100,
+                "demote_count": 1,
+                "count_delta": 99,
+            }
+        ]
+    }
+    layer = plan["layers"]["layer.7"]
+    assert layer["remote_count"] == 2
+    assert layer["target_remote_experts"] == [0, 3]
+
+
+def test_dynamic_expert_swap_plan_rejects_distributed_expert_slices() -> None:
+    plan = EngineCore._plan_uvm_dynamic_expert_swaps(
+        [
+            {
+                "ok": True,
+                "layers": {
+                    "layer.7": {
+                        "global_num_experts": 8,
+                        "local_num_experts": 4,
+                        "expert_token_counts": [0] * 8,
+                        "remote_experts": [0],
+                    }
+                },
+            }
+        ],
+        max_swaps_per_layer=1,
+        min_count_delta=1,
+    )
+
+    assert plan["ok"] is False
+    assert "distributed_expert_placement_unsupported" in plan["errors"][0]

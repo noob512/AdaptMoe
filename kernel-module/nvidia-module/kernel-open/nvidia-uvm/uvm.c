@@ -11203,6 +11203,70 @@ static NV_STATUS uvm_expert_offload_release_subchunk_block(uvm_va_space_t *va_sp
     return status;
 }
 
+static NV_STATUS uvm_expert_offload_remote_map_block(uvm_gpu_t *gpu,
+                                                     uvm_va_block_t *block,
+                                                     uvm_va_block_context_t *block_context,
+                                                     uvm_va_block_region_t block_region,
+                                                     UVM_EXPERT_OFFLOAD_RELEASE_PARAMS *params)
+{
+    uvm_va_block_gpu_state_t *gpu_state;
+    uvm_page_index_t page_index;
+    NvU32 expected_pages = uvm_va_block_region_num_pages(block_region);
+    NvU32 cpu_pages = 0;
+    NvU32 remote_pages = 0;
+    NvU32 newly_mapped_pages = 0;
+    NV_STATUS status;
+
+    status = UVM_VA_BLOCK_LOCK_RETRY(block,
+                                     NULL,
+                                     uvm_va_block_premap_readmostly_remote_read(block,
+                                                                                block_context,
+                                                                                gpu->id,
+                                                                                block_region,
+                                                                                true,
+                                                                                &newly_mapped_pages));
+    if (status != NV_OK)
+        goto failed;
+
+    uvm_mutex_lock(&block->lock);
+    gpu_state = uvm_va_block_gpu_state_get(block, gpu->id);
+    for_each_va_block_page_in_region(page_index, block_region) {
+        bool cpu_resident = uvm_page_mask_test(&block->cpu.resident, page_index);
+        bool gpu_resident = gpu_state &&
+                            uvm_page_mask_test(&gpu_state->resident, page_index);
+        bool gpu_read_mapped = gpu_state &&
+                               uvm_page_mask_test(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ],
+                                                  page_index);
+
+        if (cpu_resident)
+            ++cpu_pages;
+        if (cpu_resident && !gpu_resident && gpu_read_mapped)
+            ++remote_pages;
+    }
+    uvm_mutex_unlock(&block->lock);
+
+    params->cpu_resident_bytes += (NvU64)cpu_pages * PAGE_SIZE;
+    params->remote_mapped_bytes += (NvU64)remote_pages * PAGE_SIZE;
+    params->newly_remote_mapped_bytes += (NvU64)newly_mapped_pages * PAGE_SIZE;
+
+    if (cpu_pages != expected_pages || remote_pages != expected_pages) {
+        status = NV_ERR_INVALID_STATE;
+        goto failed;
+    }
+
+    ++params->remote_map_blocks;
+    return NV_OK;
+
+failed:
+    ++params->remote_map_failure_blocks;
+    if (params->first_error == NV_OK) {
+        params->first_error = status;
+        params->first_failed_block = block->start +
+                                     (NvU64)block_region.first * PAGE_SIZE;
+    }
+    return status;
+}
+
 static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAMS *params,
                                                 struct file *filp)
 {
@@ -11210,13 +11274,15 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
     uvm_gpu_t *gpu = NULL;
     struct mm_struct *mm = NULL;
     uvm_phase_f_region_t *region;
+    uvm_va_block_context_t *block_context = NULL;
     NvU64 region_end;
     NvU64 addr;
     NV_STATUS status = NV_OK;
 
     if (params->flags & ~(UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT |
                           UVM_EXPERT_OFFLOAD_RELEASE_FLAG_STRICT_2M_BLOCKS |
-                          UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K)) {
+                          UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K |
+                          UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ)) {
         return NV_ERR_INVALID_ARGUMENT;
     }
 
@@ -11236,6 +11302,8 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
 
     mm = uvm_va_space_mm_or_current_retain_lock(va_space);
     uvm_va_space_down_write(va_space);
+    if (params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ)
+        block_context = uvm_va_space_block_context(va_space, mm);
 
     region = radix_tree_lookup(&va_space->phase_f_regions, params->region_id);
     if (!region) {
@@ -11268,8 +11336,8 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
     }
 
     if (params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K) {
-        if (region->length != UVM_CHUNK_SIZE_512K ||
-            !IS_ALIGNED(region->base, UVM_CHUNK_SIZE_512K)) {
+        if (!IS_ALIGNED(region->base, UVM_CHUNK_SIZE_64K) ||
+            !IS_ALIGNED(region->length, UVM_CHUNK_SIZE_64K)) {
             status = NV_ERR_INVALID_ARGUMENT;
             goto done_unlock;
         }
@@ -11301,6 +11369,7 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
 
         for (block_index = first_block_index; block_index <= last_block_index; ++block_index) {
             uvm_va_block_t *block;
+            uvm_va_block_region_t block_region;
             NV_STATUS block_status;
 
             block_status = uvm_va_range_block_create(managed_range, block_index, &block);
@@ -11314,6 +11383,10 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
             }
 
             ++params->block_count;
+
+            block_region = uvm_va_block_region_from_start_end(block,
+                                                               max(region->base, block->start),
+                                                               min(region_end, block->end));
 
             if (params->max_blocks != 0 &&
                 params->attempted_blocks >= params->max_blocks) {
@@ -11347,6 +11420,15 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
                                                                 params);
             }
 
+            if ((params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ) &&
+                (block_status == NV_OK || block_status == NV_WARN_NOTHING_TO_DO)) {
+                block_status = uvm_expert_offload_remote_map_block(gpu,
+                                                                   block,
+                                                                   block_context,
+                                                                   block_region,
+                                                                   params);
+            }
+
             if (block_status == NV_WARN_NOTHING_TO_DO) {
                 ++params->skipped_blocks;
             }
@@ -11368,7 +11450,7 @@ done_unlock:
 
     params->rmStatus = status;
 
-    uvm_phase_f_route_log("expert_offload_release region_id=%llu pool=%u layer=%u expert=%u role=%u base=0x%llx length=%llu blocks=%llu attempted=%u success=%u failure=%u skipped=%u attempted_bytes=%llu released_bytes=%llu failed_bytes=%llu first_failed=0x%llx status=0x%x\n",
+    uvm_phase_f_route_log("expert_offload_release region_id=%llu pool=%u layer=%u expert=%u role=%u base=0x%llx length=%llu blocks=%llu attempted=%u success=%u failure=%u skipped=%u attempted_bytes=%llu released_bytes=%llu failed_bytes=%llu remote_blocks=%u remote_failures=%u cpu_bytes=%llu remote_bytes=%llu newly_remote_bytes=%llu first_failed=0x%llx status=0x%x\n",
                           params->region_id,
                           params->pool,
                           params->layer_id,
@@ -11384,6 +11466,11 @@ done_unlock:
                           params->attempted_bytes,
                           params->released_bytes,
                           params->failed_bytes,
+                          params->remote_map_blocks,
+                          params->remote_map_failure_blocks,
+                          params->cpu_resident_bytes,
+                          params->remote_mapped_bytes,
+                          params->newly_remote_mapped_bytes,
                           params->first_failed_block,
                           params->rmStatus);
 

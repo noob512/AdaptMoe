@@ -484,6 +484,18 @@ class Worker(WorkerBase):
             selected_experts_by_layer,
         )
 
+    def get_uvm_dynamic_expert_heat(
+        self,
+        reset: bool = False,
+    ) -> dict[str, Any]:
+        return self.model_runner.get_uvm_dynamic_expert_heat(reset)
+
+    def run_uvm_dynamic_expert_swaps(
+        self,
+        swaps_by_layer: dict[str, list[dict[str, object]]],
+    ) -> dict[str, Any]:
+        return self.model_runner.run_uvm_dynamic_expert_swaps(swaps_by_layer)
+
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""
 
@@ -533,6 +545,40 @@ class Worker(WorkerBase):
             time.monotonic() - section_start,
         )
 
+        stage_m_stage = (
+            os.environ.get(
+                "VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE",
+                "post_warmup",
+            )
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        reserved_executor_enabled = (
+            os.environ.get("VLLM_UVM_WEIGHT_EXECUTOR", "").strip().lower()
+            == "expert_reserved_regions_async"
+        )
+        reserved_after_warmup = os.environ.get(
+            "VLLM_UVM_EXPERT_RESERVED_ENABLE_AFTER_WARMUP",
+            "1" if reserved_executor_enabled else "0",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if reserved_after_warmup:
+            os.environ["VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY"] = "0"
+
+        if stage_m_stage == "pre_kv":
+            logger.info(
+                "UVM controlled remap boundary: pre-KV Stage M placement begin"
+            )
+            section_start = time.monotonic()
+            self.model_runner.run_uvm_init_time_weight_placement(
+                run_hot_repair=False,
+            )
+            logger.warning(
+                "UVM controlled remap debug: pre-KV Stage M placement end "
+                "elapsed=%.3fs",
+                time.monotonic() - section_start,
+            )
+
         # 2. 判断是否启用了“休眠模式 (Sleep Mode)”
         # 休眠模式允许 vLLM 实例在闲置时释放物理计算资源，这是弹性计算（Elasticity）的重要特性。
         if self.vllm_config.model_config.enable_sleep_mode:
@@ -577,6 +623,18 @@ class Worker(WorkerBase):
                 "UVM controlled remap debug: initialize_kv_cache end "
                 "allocator=%s elapsed=%.3fs",
                 allocator_name,
+                time.monotonic() - section_start,
+            )
+
+        if stage_m_stage == "pre_kv":
+            section_start = time.monotonic()
+            logger.info(
+                "UVM controlled remap boundary: post-KV hot residency repair begin"
+            )
+            self.model_runner.run_uvm_init_hot_weight_repair()
+            logger.warning(
+                "UVM controlled remap debug: post-KV hot residency repair end "
+                "elapsed=%.3fs",
                 time.monotonic() - section_start,
             )
 
@@ -625,20 +683,12 @@ class Worker(WorkerBase):
         # By default keep the original pre-warmup placement point, but allow
         # experiments to defer CPU migration until kernel/sampler warmup has
         # finished so warmup/autotune does not see CPU-prefetched weights.
-        stage_m_stage = os.environ.get(
-            "VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE",
-            "post_warmup",
-        ).strip().lower().replace("-", "_")
-        reserved_executor_enabled = os.environ.get(
-            "VLLM_UVM_WEIGHT_EXECUTOR", ""
-        ).strip().lower() == "expert_reserved_regions_async"
-        reserved_after_warmup = os.environ.get(
-            "VLLM_UVM_EXPERT_RESERVED_ENABLE_AFTER_WARMUP",
-            "1" if reserved_executor_enabled else "0",
-        ).strip().lower() in ("1", "true", "yes", "on")
-        if reserved_after_warmup:
-            os.environ["VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY"] = "0"
-        if stage_m_stage not in ("post_warmup", "after_warmup", "deferred"):
+        if stage_m_stage == "pre_kv":
+            logger.info(
+                "UVM controlled remap boundary: Stage M placement already "
+                "completed before KV allocation"
+            )
+        elif stage_m_stage not in ("post_warmup", "after_warmup", "deferred"):
             logger.info("UVM controlled remap boundary: Stage M init-time placement begin")
             section_start = time.monotonic()
             logger.warning(

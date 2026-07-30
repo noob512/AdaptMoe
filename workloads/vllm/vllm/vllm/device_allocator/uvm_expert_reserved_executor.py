@@ -12,7 +12,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -196,6 +196,10 @@ class ExpertReservedRegionsExecutor:
         self.bank_sync_on_reuse = _env_flag(
             "VLLM_UVM_EXPERT_RESERVED_BANK_SYNC_ON_REUSE",
             True,
+        )
+        self.fused_bank_reuse = _env_flag(
+            "VLLM_UVM_EXPERT_RESERVED_FUSED_BANK_REUSE",
+            False,
         )
         self._lock = threading.Lock()
         self._slots = {
@@ -400,7 +404,7 @@ class ExpertReservedRegionsExecutor:
         event = slot.last_event
         if event is None:
             return False
-        if not self.wait_on_reuse and event.query():
+        if event.query():
             slot.last_event = None
             return False
         if self.wait_on_reuse:
@@ -597,6 +601,8 @@ class ExpertReservedRegionsExecutor:
         items: Sequence[ReservedRegionItem],
         async_: bool | None = None,
         sync_before_compute: bool | None = None,
+        before_driver_ioctl: Callable[[], None] | None = None,
+        after_driver_ioctl: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         start_ns = time.perf_counter_ns()
         effective_async = self.async_ if async_ is None else bool(async_)
@@ -656,6 +662,7 @@ class ExpertReservedRegionsExecutor:
         current_layer_id = valid_items[0].layer_id
         bank_slot_ids = self._bank_slot_ids_for_layer(current_layer_id)
         bank_reuse_result: dict[str, Any] | None = None
+        deferred_reuse_items: list[ReservedRegionItem] = []
         items_to_load = list(valid_items)
         reused_items: list[ReservedRegionItem] = []
         reused_slot_records: list[dict[str, Any]] = []
@@ -766,16 +773,44 @@ class ExpertReservedRegionsExecutor:
                     for item in valid_items
                     if int(item.driver_region_id) not in reused_driver_ids
                 ]
-                bank_reuse_result = self._invalidate_slots_for_reuse_locked(
-                    slots=[
-                        slot
-                        for slot in bank_slots
-                        if slot.slot_id not in reused_slot_ids
-                    ],
-                    layer_name=layer_name,
-                    step=int(step),
-                    reason="layer_mod_bank_reuse",
+                replacement_slots = [
+                    slot
+                    for slot in bank_slots
+                    if slot.slot_id not in reused_slot_ids
+                ]
+                stale_replacement_slots = [
+                    slot for slot in replacement_slots if slot.owner_regions
+                ]
+                can_fuse_bank_reuse = (
+                    self.fused_bank_reuse
+                    and bool(stale_replacement_slots)
+                    and len(items_to_load) == len(replacement_slots)
+                    and len(stale_replacement_slots) == len(replacement_slots)
+                    and all(
+                        slot.last_event is not None or slot.state != "IN_USE"
+                        for slot in stale_replacement_slots
+                    )
                 )
+                if can_fuse_bank_reuse:
+                    for slot in stale_replacement_slots:
+                        self._wait_for_slot_locked(slot)
+                        deferred_reuse_items.extend(slot.owner_regions)
+                    bank_reuse_result = {
+                        "ok": True,
+                        "status": "deferred_to_install_ioctl",
+                        "invalidated_slots": len(stale_replacement_slots),
+                        "regions": [
+                            item.region_id for item in deferred_reuse_items
+                        ],
+                        "driver_result": None,
+                    }
+                else:
+                    bank_reuse_result = self._invalidate_slots_for_reuse_locked(
+                        slots=replacement_slots,
+                        layer_name=layer_name,
+                        step=int(step),
+                        reason="layer_mod_bank_reuse",
+                    )
                 if bank_reuse_result.get("ok") is not True:
                     return {
                         "ok": False,
@@ -1001,15 +1036,21 @@ class ExpertReservedRegionsExecutor:
                 ),
                 "mode": "reserved_prefetch",
             })
-            driver_result = driver_expert_reserved_prefetch_regions(
-                assignments=assignments,
-                device=self.device,
-                async_=effective_async,
-                strict_footprint=self.strict_footprint,
-                mode="reserved_prefetch",
-                prefer_existing=True,
-                return_entries=True,
-            )
+            if before_driver_ioctl is not None:
+                before_driver_ioctl()
+            try:
+                driver_result = driver_expert_reserved_prefetch_regions(
+                    assignments=assignments,
+                    device=self.device,
+                    async_=effective_async,
+                    strict_footprint=self.strict_footprint,
+                    mode="reserved_prefetch",
+                    prefer_existing=True,
+                    return_entries=True,
+                )
+            finally:
+                if after_driver_ioctl is not None:
+                    after_driver_ioctl()
             _append_debug_trace({
                 "action": "reserved_debug_prefetch_ioctl_exit",
                 "layer_name": layer_name,
@@ -1101,6 +1142,19 @@ class ExpertReservedRegionsExecutor:
             failed_region_ids.extend(
                 str(item["region_id"]) for item in register_failures
             )
+
+        if driver_result.get("ok") is True:
+            for item in deferred_reuse_items:
+                mark_uvm_residency_state(
+                    region_id=item.region_id,
+                    state="cpu",
+                    metadata={
+                        **item.metadata,
+                        "executor": "expert_reserved_regions_async",
+                        "reserved_cleanup_step": int(step),
+                        "reserved_cleanup_reason": "fused_bank_reuse",
+                    },
+                )
 
         layer_key = (str(layer_name), int(step))
         with self._lock:

@@ -7,6 +7,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from enum import Enum
 from functools import partial
@@ -21,11 +22,13 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.device_allocator.uvm import (
+    batch_advise_ranges_preferred_location,
     batch_prefetch_ranges_to_device,
     batch_prefetch_ranges_to_device_with_executor,
     batch_prepare_ranges_for_native_remote_access_with_executor,
     driver_batch_query_ranges_residency_bytes,
     driver_expert_offload_release_regions,
+    driver_expert_offload_release_remote_regions,
     probe_driver_capable_range,
     uvm_enabled_allocation_phase,
     uvm_local_memory_pool,
@@ -35,6 +38,7 @@ from vllm.device_allocator.uvm_expert_reserved_executor import (
     get_expert_reserved_regions_executor,
 )
 from vllm.device_allocator.uvm_pool_residency import (
+    ensure_uvm_residency_driver_region_registered,
     get_uvm_residency_region_snapshot,
     mark_uvm_residency_state,
     record_uvm_residency_access,
@@ -234,10 +238,38 @@ def _record_uvm_pre_expert_timing_ids_ready(
     except Exception:
         logger.debug("Failed to record UVM pre-expert timing end", exc_info=True)
 
+
 _UVM_WARM_PREFETCH_REGISTRY_LOCK = threading.Lock()
 _UVM_WARM_PREFETCH_REGISTRY: weakref.WeakValueDictionary[
     tuple[int, str, int], object
 ] = weakref.WeakValueDictionary()
+_UVM_WARM_PREFETCH_EXECUTOR_LOCK = threading.Lock()
+_UVM_WARM_PREFETCH_EXECUTORS: dict[int, ThreadPoolExecutor] = {}
+_UVM_WARM_PREFETCH_TIMING_STREAM_LOCK = threading.Lock()
+_UVM_WARM_PREFETCH_TIMING_STREAMS: dict[tuple[int, int], torch.cuda.Stream] = {}
+
+
+def _uvm_warm_prefetch_executor() -> ThreadPoolExecutor:
+    pid = os.getpid()
+    with _UVM_WARM_PREFETCH_EXECUTOR_LOCK:
+        executor = _UVM_WARM_PREFETCH_EXECUTORS.get(pid)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="uvm-warm-prefetch",
+            )
+            _UVM_WARM_PREFETCH_EXECUTORS[pid] = executor
+        return executor
+
+
+def _uvm_warm_prefetch_timing_stream(device: int) -> torch.cuda.Stream:
+    key = (os.getpid(), int(device))
+    with _UVM_WARM_PREFETCH_TIMING_STREAM_LOCK:
+        stream = _UVM_WARM_PREFETCH_TIMING_STREAMS.get(key)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            _UVM_WARM_PREFETCH_TIMING_STREAMS[key] = stream
+        return stream
 
 
 def _uvm_layer_sequence_key(layer_name: str) -> str:
@@ -916,10 +948,14 @@ class FusedMoE(CustomOp):
             default=False,
         )
         self._uvm_moe_stream_trace_marker_disabled = False
-        self.uvm_moe_topk_item_probe_mode = os.environ.get(
-            "VLLM_UVM_MOE_TOPK_ITEM_PROBE_MODE",
-            "off",
-        ).strip().lower()
+        self.uvm_moe_topk_item_probe_mode = (
+            os.environ.get(
+                "VLLM_UVM_MOE_TOPK_ITEM_PROBE_MODE",
+                "off",
+            )
+            .strip()
+            .lower()
+        )
         if self.uvm_moe_topk_item_probe_mode == "gpu_only":
             self.uvm_moe_topk_item_probe_mode = "any"
         elif self.uvm_moe_topk_item_probe_mode == "with_item":
@@ -950,10 +986,14 @@ class FusedMoE(CustomOp):
         ] = {}
         self._uvm_moe_topk_item_probe_last: torch.Tensor | None = None
         self._uvm_moe_topk_item_probe_last_item = False
-        self.uvm_expert_reserved_topk_gate_impl = os.environ.get(
-            "VLLM_UVM_EXPERT_RESERVED_TOPK_GATE_IMPL",
-            "triton",
-        ).strip().lower()
+        self.uvm_expert_reserved_topk_gate_impl = (
+            os.environ.get(
+                "VLLM_UVM_EXPERT_RESERVED_TOPK_GATE_IMPL",
+                "triton",
+            )
+            .strip()
+            .lower()
+        )
         if self.uvm_expert_reserved_topk_gate_impl not in (
             "triton",
             "triton_async",
@@ -968,10 +1008,14 @@ class FusedMoE(CustomOp):
                 self.uvm_expert_reserved_topk_gate_impl,
             )
             self.uvm_expert_reserved_topk_gate_impl = "triton"
-        self.uvm_expert_offload_access_mode = os.environ.get(
-            "VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE",
-            "restore",
-        ).strip().lower()
+        self.uvm_expert_offload_access_mode = (
+            os.environ.get(
+                "VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE",
+                "restore",
+            )
+            .strip()
+            .lower()
+        )
         if self.uvm_expert_offload_access_mode not in (
             "restore",
             "remote_read",
@@ -981,6 +1025,20 @@ class FusedMoE(CustomOp):
                 self.uvm_expert_offload_access_mode,
             )
             self.uvm_expert_offload_access_mode = "restore"
+        self.uvm_remote_prepare_mode = (
+            os.environ.get(
+                "VLLM_UVM_REMOTE_PREPARE_MODE",
+                "native",
+            )
+            .strip()
+            .lower()
+        )
+        if self.uvm_remote_prepare_mode not in ("native", "release_remote"):
+            logger.warning(
+                "Unknown VLLM_UVM_REMOTE_PREPARE_MODE=%s; using native",
+                self.uvm_remote_prepare_mode,
+            )
+            self.uvm_remote_prepare_mode = "native"
         self.uvm_expert_reserved_topk_gate_assume_valid = _env_flag_enabled(
             "VLLM_UVM_EXPERT_RESERVED_TOPK_GATE_ASSUME_VALID",
             default=True,
@@ -1145,6 +1203,14 @@ class FusedMoE(CustomOp):
             _env_int("VLLM_UVM_EXPERT_WARM_ASYNC_MIN_TOKENS", default=0),
             0,
         )
+        self.uvm_expert_warm_background_enable = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_WARM_BACKGROUND_ENABLE",
+            default=True,
+        )
+        self.uvm_expert_warm_fail_closed = _env_flag_enabled(
+            "VLLM_UVM_EXPERT_WARM_FAIL_CLOSED",
+            default=True,
+        )
         self.uvm_expert_reserved_cleanup_on_layer_done = _env_flag_enabled(
             "VLLM_UVM_EXPERT_RESERVED_CLEANUP_ON_LAYER_DONE",
             default=True,
@@ -1307,6 +1373,20 @@ class FusedMoE(CustomOp):
             "VLLM_UVM_INIT_WEIGHT_HOT_PREFETCH_REAL_QUERY_ENABLE",
             default=False,
         )
+        self.uvm_init_weight_hot_repair_enable = _env_flag_enabled(
+            "VLLM_UVM_INIT_WEIGHT_HOT_REPAIR_ENABLE",
+            default=False,
+        )
+        self.uvm_init_weight_hot_repair_preferred_gpu = _env_flag_enabled(
+            "VLLM_UVM_INIT_WEIGHT_HOT_REPAIR_PREFERRED_GPU",
+            default=True,
+        )
+        self.uvm_init_weight_hot_repair_require_full_residency = (
+            _env_flag_enabled(
+                "VLLM_UVM_INIT_WEIGHT_HOT_REPAIR_REQUIRE_FULL_RESIDENCY",
+                default=True,
+            )
+        )
         self.uvm_hot_residency_stage_trace_enable = _env_flag_enabled(
             "VLLM_UVM_HOT_RESIDENCY_STAGE_TRACE_ENABLE",
             default=False,
@@ -1361,6 +1441,7 @@ class FusedMoE(CustomOp):
             self.uvm_expert_reserved_enable
             or self.uvm_init_weight_offload_enable
             or self.uvm_init_weight_hot_prefetch_enable
+            or self.uvm_init_weight_hot_repair_enable
         )
         self.uvm_init_weight_register_all_local_experts = _env_flag_enabled(
             "VLLM_UVM_INIT_WEIGHT_REGISTER_ALL_LOCAL_EXPERTS",
@@ -1382,6 +1463,11 @@ class FusedMoE(CustomOp):
             "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE",
             default=False,
         )
+        self.uvm_dynamic_expert_swap_enable = _env_flag_enabled(
+            "VLLM_UVM_DYNAMIC_EXPERT_SWAP_ENABLE",
+            default=False,
+        )
+        self._uvm_dynamic_expert_heat_counts: torch.Tensor | None = None
         self.uvm_incremental_experts_per_layer_per_round = max(
             _env_int(
                 "VLLM_UVM_INCREMENTAL_EXPERTS_PER_LAYER_PER_ROUND",
@@ -1396,19 +1482,23 @@ class FusedMoE(CustomOp):
         self._uvm_reserved_offload_mask_tensor_cache: dict[
             tuple[int | None, str, int], torch.Tensor
         ] = {}
-        self._uvm_reserved_offload_mask_values_cache: tuple[
-            frozenset[int], int, list[bool]
-        ] | None = None
-        self._uvm_topk_gate_hit_flag_cache: dict[
-            tuple[str, int], torch.Tensor
-        ] = {}
+        self._uvm_reserved_offload_mask_values_cache: (
+            tuple[frozenset[int], int, list[bool]] | None
+        ) = None
+        self._uvm_topk_gate_hit_flag_cache: dict[tuple[str, int], torch.Tensor] = {}
         self._uvm_slot_managed_global_expert_ids: set[int] = set()
         self._uvm_remote_read_global_expert_ids: set[int] = set()
         self._uvm_offloaded_warm_global_expert_ids: set[int] = set()
+        self._uvm_warm_prefetch_generation = 0
+        self._uvm_warm_prefetch_ticket: dict[str, object] | None = None
+        self._uvm_warm_prefetch_ready_step = -1
+        self._uvm_warm_prefetch_ready_global_expert_ids: set[int] = set()
+        self._uvm_warm_prefetch_source_tickets: list[dict[str, object]] = []
         self._uvm_expert_envelope_region_cache: dict[
             tuple[int | None, int, str], list[ReservedRegionItem]
         ] = {}
         self._uvm_init_weight_offload_done = False
+        self._uvm_init_weight_hot_repair_done = False
         uvm_layer_id = self._uvm_layer_id()
         if uvm_layer_id is not None:
             self._uvm_register_warm_prefetch_module(uvm_layer_id)
@@ -1614,9 +1704,7 @@ class FusedMoE(CustomOp):
                     device,
                 )
             except Exception:
-                logger.debug(
-                    "Failed to query expert-only UVM residency", exc_info=True
-                )
+                logger.debug("Failed to query expert-only UVM residency", exc_info=True)
                 residency_query = {
                     "ok": False,
                     "status": -1,
@@ -1637,9 +1725,7 @@ class FusedMoE(CustomOp):
                 "role": str(record["role"]),
                 "ptr": str(record["ptr_hex"]),
                 "bytes": int(record["bytes"]),
-                "driver_capability_reason": str(
-                    record["driver_capability_reason"]
-                ),
+                "driver_capability_reason": str(record["driver_capability_reason"]),
                 "driver_capability_code": int(record["driver_capability_code"]),
             }
             for record in records
@@ -1709,10 +1795,13 @@ class FusedMoE(CustomOp):
                     exc_info=True,
                 )
 
-        if _env_flag_enabled(
-            "VLLM_UVM_EXPERT_WEIGHTS_REQUIRE_GPU_FULL",
-            default=False,
-        ) and not gpu_full:
+        if (
+            _env_flag_enabled(
+                "VLLM_UVM_EXPERT_WEIGHTS_REQUIRE_GPU_FULL",
+                default=False,
+            )
+            and not gpu_full
+        ):
             raise RuntimeError(
                 "expert-only UVM managed weights are not fully GPU resident: "
                 f"layer={self.layer_name} result={result!r}"
@@ -2642,8 +2731,7 @@ class FusedMoE(CustomOp):
             and (
                 self.uvm_weight_router_topk_every_n_steps <= 1
                 or (
-                    self._uvm_moe_trace_step
-                    % self.uvm_weight_router_topk_every_n_steps
+                    self._uvm_moe_trace_step % self.uvm_weight_router_topk_every_n_steps
                 )
                 == 0
             )
@@ -2737,6 +2825,8 @@ class FusedMoE(CustomOp):
                 topk=self.top_k,
                 renormalize=self.renormalize,
             )
+
+        self._record_uvm_dynamic_expert_heat(topk_ids)
 
         if self.enable_eplb:
             topk_ids = eplb_map_to_physical_and_record(
@@ -2890,12 +2980,8 @@ class FusedMoE(CustomOp):
                         minlength=max(int(self.global_num_experts), 0),
                     ).cpu()
                     weight_sums = {
-                        str(int(expert_id)): float(
-                            weighted_counts[expert_id].item()
-                        )
-                        for expert_id in torch.nonzero(
-                            weighted_counts, as_tuple=False
-                        )
+                        str(int(expert_id)): float(weighted_counts[expert_id].item())
+                        for expert_id in torch.nonzero(weighted_counts, as_tuple=False)
                         .flatten()
                         .tolist()
                         if weighted_counts[expert_id].item() > 0
@@ -2933,6 +3019,59 @@ class FusedMoE(CustomOp):
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
         except Exception:
             logger.debug("Failed to write UVM MoE routing trace", exc_info=True)
+
+    def _record_uvm_dynamic_expert_heat(self, topk_ids: torch.Tensor) -> None:
+        """Accumulate logical expert assignments on GPU until maintenance."""
+        if not self.uvm_dynamic_expert_swap_enable:
+            return
+        try:
+            ids = topk_ids.detach()
+            valid_ids = ids[(ids >= 0) & (ids < int(self.global_num_experts))]
+            if valid_ids.numel() == 0:
+                return
+            counts = torch.bincount(
+                valid_ids.flatten().to(dtype=torch.long),
+                minlength=int(self.global_num_experts),
+            )
+            if (
+                self._uvm_dynamic_expert_heat_counts is None
+                or self._uvm_dynamic_expert_heat_counts.device != counts.device
+            ):
+                self._uvm_dynamic_expert_heat_counts = torch.zeros(
+                    int(self.global_num_experts),
+                    dtype=torch.int64,
+                    device=counts.device,
+                )
+            self._uvm_dynamic_expert_heat_counts.add_(counts)
+        except Exception:
+            logger.debug("Failed to record dynamic expert heat", exc_info=True)
+
+    def get_uvm_dynamic_expert_heat(
+        self,
+        *,
+        reset: bool = False,
+    ) -> dict[str, object]:
+        """Materialize one layer's routing window at a maintenance boundary."""
+        counts_tensor = self._uvm_dynamic_expert_heat_counts
+        if counts_tensor is None:
+            counts = [0] * int(self.global_num_experts)
+        else:
+            # The counter is created during model inference and is therefore an
+            # inference tensor. Maintenance RPCs run outside that context.
+            with torch.inference_mode():
+                counts = [int(value) for value in counts_tensor.detach().cpu().tolist()]
+                if reset:
+                    counts_tensor.zero_()
+        return {
+            "ok": True,
+            "layer_name": self.layer_name,
+            "layer_id": self._uvm_layer_id(),
+            "global_num_experts": int(self.global_num_experts),
+            "local_num_experts": int(self.local_num_experts),
+            "expert_token_counts": counts,
+            "remote_experts": sorted(self._uvm_remote_read_global_expert_ids),
+            "reset": bool(reset),
+        }
 
     def _uvm_layer_id(self) -> int | None:
         parts = self.layer_name.split(".")
@@ -3066,10 +3205,14 @@ class FusedMoE(CustomOp):
     ) -> str:
         if self._uvm_init_weight_expert_is_hot(layer_id, global_expert_id):
             return "hot"
-        if layer_id is not None and (
-            layer_id,
-            global_expert_id,
-        ) in self.uvm_init_weight_offload_plan_keys:
+        if (
+            layer_id is not None
+            and (
+                layer_id,
+                global_expert_id,
+            )
+            in self.uvm_init_weight_offload_plan_keys
+        ):
             return "cold"
         return "warm"
 
@@ -3200,10 +3343,13 @@ class FusedMoE(CustomOp):
             self._uvm_all_local_expert_pairs(),
         )
         for global_expert_id, local_expert_id in pairs:
-            if self._uvm_init_weight_expert_class(
-                layer_id=layer_id,
-                global_expert_id=global_expert_id,
-            ) != expert_class:
+            if (
+                self._uvm_init_weight_expert_class(
+                    layer_id=layer_id,
+                    global_expert_id=global_expert_id,
+                )
+                != expert_class
+            ):
                 continue
             if self._uvm_incremental_slot_capacity_allows(local_expert_id):
                 return int(global_expert_id)
@@ -3258,21 +3404,426 @@ class FusedMoE(CustomOp):
     ) -> None:
         self._uvm_slot_managed_global_expert_ids.add(int(global_expert_id))
         if expert_class == "warm":
-            self._uvm_offloaded_warm_global_expert_ids.add(
-                int(global_expert_id)
-            )
+            self._uvm_offloaded_warm_global_expert_ids.add(int(global_expert_id))
         self._uvm_reserved_offload_mask_values_cache = None
         self._uvm_reserved_offload_mask_tensor_cache.clear()
 
     def _uvm_mark_remote_read_expert(self, global_expert_id: int) -> None:
         self._uvm_remote_read_global_expert_ids.add(int(global_expert_id))
 
+    def _uvm_record_release_remote_envelope_states(
+        self,
+        envelope_records: object,
+        entries_by_region: dict[int, dict[str, object]],
+    ) -> None:
+        if not isinstance(envelope_records, list):
+            return
+        for record in envelope_records:
+            if not isinstance(record, dict):
+                continue
+            driver_region_id = int(record.get("driver_region_id") or 0)
+            entry = entries_by_region.get(driver_region_id)
+            if entry is None:
+                continue
+            region_id = str(record.get("region_id") or "")
+            if not region_id:
+                continue
+            snapshot = get_uvm_residency_region_snapshot(region_id) or {}
+            metadata = dict(
+                cast(dict[str, object], snapshot.get("metadata") or {})
+            )
+            complete = bool(entry.get("ok"))
+            changed = (
+                int(entry.get("released_bytes") or 0) > 0
+                or int(entry.get("remote_mapped_bytes") or 0) > 0
+            )
+            metadata.update(
+                {
+                    "remote_prepare_mode": "release_remote",
+                    "driver_release_remote": True,
+                    "driver_release_remote_complete": complete,
+                    "driver_release_remote_entry": entry,
+                    "placement": (
+                        "CPU_REMOTE_READ"
+                        if complete
+                        else "MIXED_UNCOMMITTED"
+                        if changed
+                        else "GPU_RESIDENT"
+                    ),
+                    "cpu_remote_read": complete,
+                }
+            )
+            mark_uvm_residency_state(
+                region_id=region_id,
+                state="cpu" if complete else "unknown" if changed else "gpu",
+                metadata=metadata,
+            )
+
+    def _uvm_mark_dynamic_expert_placement(
+        self,
+        *,
+        layer_id: int,
+        global_expert_id: int,
+        local_expert_id: int,
+        slices: list[tuple[str, int, int, dict[str, object] | None]],
+        state: str,
+        action: str,
+        transaction_id: str,
+    ) -> None:
+        cpu_remote = state == "cpu"
+        placement = "CPU_REMOTE_READ" if cpu_remote else "GPU_RESIDENT"
+        for role, ptr, size_bytes, _ in slices:
+            region_id = self._uvm_expert_weight_region_id(
+                layer_id,
+                global_expert_id,
+                role,
+            )
+            metadata = self._uvm_expert_weight_residency_metadata(
+                layer_id=layer_id,
+                global_expert_id=global_expert_id,
+                local_expert_id=local_expert_id,
+                role=role,
+                ptr=ptr,
+                size_bytes=size_bytes,
+                active_this_step=False,
+                source_action=action,
+            )
+            metadata.update(
+                {
+                    "source": "dynamic_expert_swap",
+                    "placement": placement,
+                    "target_placement": placement,
+                    "cpu_remote_read": cpu_remote,
+                    "dynamic_expert_swap": True,
+                    "transaction_id": transaction_id,
+                }
+            )
+            mark_uvm_residency_state(
+                region_id=region_id,
+                state=state,
+                metadata=metadata,
+            )
+            self._uvm_update_weight_expert_role_cache(
+                layer_id=layer_id,
+                global_expert_id=global_expert_id,
+                role=role,
+                state=state,
+                estimated_gpu_resident=not cpu_remote,
+            )
+            self._append_uvm_init_weight_trace(
+                {
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "layer_name": self.layer_name,
+                    "layer_id": layer_id,
+                    "action": action,
+                    "transaction_id": transaction_id,
+                    "global_expert_id": global_expert_id,
+                    "local_expert_id": local_expert_id,
+                    "role": role,
+                    "ptr": f"0x{ptr:x}",
+                    "bytes": size_bytes,
+                    "state": state,
+                    "placement": placement,
+                    "success": True,
+                }
+            )
+
+    def _uvm_release_remote_expert_slices(
+        self,
+        *,
+        layer_id: int,
+        global_expert_id: int,
+        local_expert_id: int,
+        slices: list[tuple[str, int, int, dict[str, object] | None]],
+        device: int,
+        source_action: str,
+    ) -> dict[str, object]:
+        driver_region_ids: list[int] = []
+        for role, ptr, size_bytes, existing in slices:
+            region_id = self._uvm_expert_weight_region_id(
+                layer_id,
+                global_expert_id,
+                role,
+            )
+            snapshot = existing or get_uvm_residency_region_snapshot(region_id) or {}
+            if not bool(snapshot.get("driver_registered")):
+                registration = ensure_uvm_residency_driver_region_registered(
+                    region_id
+                )
+                if not bool(registration.get("registered")):
+                    return {
+                        "ok": False,
+                        "reason": "release_remote_driver_registration_failed",
+                        "role": role,
+                        "region_id": region_id,
+                        "driver_registration": registration,
+                    }
+                snapshot = get_uvm_residency_region_snapshot(region_id) or snapshot
+            driver_region_id = int(snapshot.get("driver_region_id") or 0)
+            if (
+                ptr % (64 * 1024) != 0
+                or size_bytes % (64 * 1024) != 0
+                or driver_region_id <= 0
+                or not bool(snapshot.get("driver_registered"))
+            ):
+                return {
+                    "ok": False,
+                    "reason": "invalid_release_remote_logical_region",
+                    "role": role,
+                    "ptr": ptr,
+                    "bytes": size_bytes,
+                    "driver_region_id": driver_region_id,
+                    "driver_registered": bool(snapshot.get("driver_registered")),
+                }
+            driver_region_ids.append(driver_region_id)
+
+        driver_region_ids = list(dict.fromkeys(driver_region_ids))
+        result = driver_expert_offload_release_remote_regions(
+            driver_region_ids,
+            device=device,
+            subchunk_64k=True,
+            prefer_existing=True,
+            return_entries=True,
+        )
+        return {
+            **result,
+            "logical_region_count": len(driver_region_ids),
+            "logical_range_count": len(slices),
+            "source_action": source_action,
+        }
+
+    def run_uvm_dynamic_remote_read_swaps(
+        self,
+        swaps: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Swap newly cold GPU experts with newly hot remote-read experts."""
+        if not self.uvm_dynamic_expert_swap_enable:
+            return {"ok": False, "reason": "dynamic_expert_swap_disabled"}
+        if not self._uvm_stage_m_uses_remote_read():
+            return {"ok": False, "reason": "remote_read_mode_required"}
+        layer_id = self._uvm_layer_id()
+        if layer_id is None:
+            return {"ok": False, "reason": "layer_id_unavailable"}
+
+        device = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
+        results: list[dict[str, object]] = []
+        for swap_index, swap in enumerate(swaps):
+            try:
+                promote_expert = int(swap["promote_expert"])
+                demote_expert = int(swap["demote_expert"])
+            except (KeyError, TypeError, ValueError):
+                return {
+                    "ok": False,
+                    "reason": "invalid_swap_record",
+                    "swap_index": swap_index,
+                    "results": results,
+                }
+            transaction_id = (
+                f"layer{layer_id}:swap{swap_index}:"
+                f"{promote_expert}->{demote_expert}:{time.time_ns()}"
+            )
+            if (
+                promote_expert not in self._uvm_remote_read_global_expert_ids
+                or demote_expert in self._uvm_remote_read_global_expert_ids
+                or promote_expert == demote_expert
+            ):
+                return {
+                    "ok": False,
+                    "reason": "stale_or_invalid_swap",
+                    "transaction_id": transaction_id,
+                    "promote_expert": promote_expert,
+                    "demote_expert": demote_expert,
+                    "remote_experts": sorted(self._uvm_remote_read_global_expert_ids),
+                    "results": results,
+                }
+
+            promote_local = self._uvm_global_to_local_expert(promote_expert)
+            demote_local = self._uvm_global_to_local_expert(demote_expert)
+            if not (
+                0 <= promote_local < int(self.local_num_experts)
+                and 0 <= demote_local < int(self.local_num_experts)
+            ):
+                return {
+                    "ok": False,
+                    "reason": "nonlocal_expert_swap_unsupported",
+                    "transaction_id": transaction_id,
+                    "promote_expert": promote_expert,
+                    "demote_expert": demote_expert,
+                    "results": results,
+                }
+
+            promote_slices = self._uvm_stage_m_expert_weight_slices(
+                layer_id=layer_id,
+                global_expert_id=promote_expert,
+                local_expert_id=promote_local,
+            )
+            demote_slices = self._uvm_stage_m_expert_weight_slices(
+                layer_id=layer_id,
+                global_expert_id=demote_expert,
+                local_expert_id=demote_local,
+            )
+            promote_ranges = [
+                (ptr, size_bytes) for _, ptr, size_bytes, _ in promote_slices
+            ]
+            demote_ranges = [
+                (ptr, size_bytes) for _, ptr, size_bytes, _ in demote_slices
+            ]
+            if not promote_ranges or len(promote_ranges) != len(demote_ranges):
+                return {
+                    "ok": False,
+                    "reason": "incomplete_expert_weight_slices",
+                    "transaction_id": transaction_id,
+                    "promote_range_count": len(promote_ranges),
+                    "demote_range_count": len(demote_ranges),
+                    "results": results,
+                }
+
+            demote_driver_release_result: dict[str, object] | None = None
+            if self._uvm_remote_prepare_uses_release():
+                demote_driver_release_result = self._uvm_release_remote_expert_slices(
+                    layer_id=layer_id,
+                    global_expert_id=demote_expert,
+                    local_expert_id=demote_local,
+                    slices=demote_slices,
+                    device=device,
+                    source_action="dynamic_expert_swap_release_remote_envelope",
+                )
+                demote_successes = (
+                    len(demote_ranges)
+                    if bool(demote_driver_release_result.get("ok"))
+                    else 0
+                )
+                demote_executor = "driver_release_remote"
+                demote_accessed_by = 0
+                demote_prefetch_cpu = 0
+                demote_preferred_cpu = 0
+            else:
+                (
+                    demote_successes,
+                    demote_executor,
+                    demote_accessed_by,
+                    demote_prefetch_cpu,
+                    demote_preferred_cpu,
+                ) = batch_prepare_ranges_for_native_remote_access_with_executor(
+                    demote_ranges,
+                    sync=True,
+                    executor=self.uvm_weight_executor,
+                    device=device,
+                )
+            if demote_successes != len(demote_ranges):
+                return {
+                    "ok": False,
+                    "reason": "demote_remote_prepare_failed",
+                    "transaction_id": transaction_id,
+                    "demote_expert": demote_expert,
+                    "demote_successes": demote_successes,
+                    "demote_range_count": len(demote_ranges),
+                    "demote_driver_release_result": demote_driver_release_result,
+                    "results": results,
+                }
+
+            # Commit the capacity-producing half first. If promotion fails, the
+            # conservative state is two remote experts rather than an OOM.
+            self._uvm_remote_read_global_expert_ids.add(demote_expert)
+            self._uvm_mark_dynamic_expert_placement(
+                layer_id=layer_id,
+                global_expert_id=demote_expert,
+                local_expert_id=demote_local,
+                slices=demote_slices,
+                state="cpu",
+                action="dynamic_expert_swap_demote_issued",
+                transaction_id=transaction_id,
+            )
+
+            promote_preferred_gpu = batch_advise_ranges_preferred_location(
+                promote_ranges,
+                device,
+            )
+            promote_successes = 0
+            promote_executor = self.uvm_weight_executor
+            promote_driver_result = 0
+            if promote_preferred_gpu == len(promote_ranges):
+                (
+                    promote_successes,
+                    promote_executor,
+                    promote_driver_result,
+                ) = batch_prefetch_ranges_to_device_with_executor(
+                    promote_ranges,
+                    device=device,
+                    executor=self.uvm_weight_executor,
+                )
+                if promote_successes > 0 and torch.cuda.is_available():
+                    torch.cuda.synchronize(device)
+
+            pair_result = {
+                "transaction_id": transaction_id,
+                "promote_expert": promote_expert,
+                "demote_expert": demote_expert,
+                "range_count": len(promote_ranges),
+                "bytes": sum(size for _, size in promote_ranges),
+                "demote_executor": demote_executor,
+                "demote_accessed_by_result": demote_accessed_by,
+                "demote_prefetch_cpu_successes": demote_prefetch_cpu,
+                "demote_preferred_cpu_result": demote_preferred_cpu,
+                "demote_driver_release_result": demote_driver_release_result,
+                "promote_executor": promote_executor,
+                "promote_driver_result": promote_driver_result,
+                "promote_preferred_gpu_result": promote_preferred_gpu,
+                "promote_prefetch_gpu_successes": promote_successes,
+            }
+            if promote_preferred_gpu != len(promote_ranges) or promote_successes != len(
+                promote_ranges
+            ):
+                results.append({**pair_result, "ok": False})
+                return {
+                    "ok": False,
+                    "reason": "promote_gpu_prefetch_failed",
+                    "partial_demote_committed": True,
+                    "remote_experts": sorted(self._uvm_remote_read_global_expert_ids),
+                    "results": results,
+                }
+
+            self._uvm_remote_read_global_expert_ids.remove(promote_expert)
+            self._uvm_mark_dynamic_expert_placement(
+                layer_id=layer_id,
+                global_expert_id=promote_expert,
+                local_expert_id=promote_local,
+                slices=promote_slices,
+                state="gpu",
+                action="dynamic_expert_swap_promote_issued",
+                transaction_id=transaction_id,
+            )
+            results.append({**pair_result, "ok": True})
+
+        return {
+            "ok": True,
+            "reason": "swapped" if results else "no_swaps",
+            "layer_id": layer_id,
+            "swapped_count": len(results),
+            "remote_experts": sorted(self._uvm_remote_read_global_expert_ids),
+            "results": results,
+        }
+
     def _uvm_stage_m_uses_remote_read(self) -> bool:
         return (
-            getattr(self, "uvm_expert_offload_access_mode", "restore")
-            == "remote_read"
+            getattr(self, "uvm_expert_offload_access_mode", "restore") == "remote_read"
             and self.uvm_init_weight_offload_mode
             in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+        )
+
+    def _uvm_remote_prepare_uses_release(self) -> bool:
+        return (
+            self._uvm_stage_m_uses_remote_read()
+            and getattr(self, "uvm_remote_prepare_mode", "native")
+            == "release_remote"
+        )
+
+    def _uvm_stage_m_requires_release_envelopes(self) -> bool:
+        return (
+            self.uvm_init_weight_offload_mode
+            in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+            and not self._uvm_stage_m_uses_remote_read()
         )
 
     def _uvm_stage_m_sync_enabled(self) -> bool:
@@ -3296,9 +3847,7 @@ class FusedMoE(CustomOp):
             "plan_policy": self.uvm_init_weight_plan_policy,
             "driver_tag_skip": bool(driver_tag_skip),
             "driver_tag_skip_reason": (
-                self._uvm_expert_envelope_skip_reason()
-                if driver_tag_skip
-                else None
+                self._uvm_expert_envelope_skip_reason() if driver_tag_skip else None
             ),
         }
         if expert_class == "hot":
@@ -3566,14 +4115,9 @@ class FusedMoE(CustomOp):
                 "fused_select_async",
             ):
                 fused_flag = getattr(self, "_uvm_fused_select_hit_flag", None)
-                fused_layer_id = getattr(
-                    self, "_uvm_fused_select_hit_layer_id", None
-                )
+                fused_layer_id = getattr(self, "_uvm_fused_select_hit_layer_id", None)
                 if fused_flag is not None and fused_layer_id == layer_id:
-                    if (
-                        self.uvm_expert_reserved_topk_gate_impl
-                        == "fused_select_async"
-                    ):
+                    if self.uvm_expert_reserved_topk_gate_impl == "fused_select_async":
                         return False
                     hit = bool(fused_flag.item())
                     if hit:
@@ -3804,15 +4348,13 @@ class FusedMoE(CustomOp):
         if int(self.uvm_expert_envelope_bytes) == _UVM_EXPERT_2MB_ENVELOPE_BYTES:
             return "logical_slice_covered_by_2mb_envelope"
         return (
-            "logical_slice_covered_by_"
-            f"{int(self.uvm_expert_envelope_bytes)}b_envelope"
+            f"logical_slice_covered_by_{int(self.uvm_expert_envelope_bytes)}b_envelope"
         )
 
     def _uvm_expert_release_uses_subchunk_64k(self) -> bool:
         return (
             bool(self.uvm_expert_envelope_enable)
-            and int(self.uvm_expert_envelope_bytes)
-            == _UVM_EXPERT_512K_ENVELOPE_BYTES
+            and int(self.uvm_expert_envelope_bytes) == _UVM_EXPERT_512K_ENVELOPE_BYTES
         )
 
     def _uvm_role_tensor_bounds(self, role: str) -> tuple[int, int] | None:
@@ -3854,12 +4396,8 @@ class FusedMoE(CustomOp):
 
         slice_start = int(ptr)
         slice_end = slice_start + int(size_bytes)
-        if (
-            self.uvm_expert_envelope_strict_logical_alignment
-            and (
-                slice_start % block_bytes != 0
-                or int(size_bytes) % block_bytes != 0
-            )
+        if self.uvm_expert_envelope_strict_logical_alignment and (
+            slice_start % block_bytes != 0 or int(size_bytes) % block_bytes != 0
         ):
             self._append_uvm_init_weight_trace(
                 {
@@ -3960,18 +4498,12 @@ class FusedMoE(CustomOp):
                 region_id=envelope_id,
                 ptr=int(envelope_base),
                 bytes=int(block_bytes),
-                state=(
-                    str(existing.get("state"))
-                    if existing is not None
-                    else state
-                ),
+                state=(str(existing.get("state")) if existing is not None else state),
                 evictable=True,
                 active=False,
                 metadata=envelope_metadata,
             )
-            driver_registered = bool(
-                getattr(registered, "driver_registered", False)
-            )
+            driver_registered = bool(getattr(registered, "driver_registered", False))
             driver_register_status = getattr(
                 registered,
                 "driver_register_status",
@@ -4250,8 +4782,7 @@ class FusedMoE(CustomOp):
             "plan_hot": (
                 layer_id is not None
                 and (
-                    (layer_id, global_expert_id)
-                    in self.uvm_weight_prefetch_plan_keys
+                    (layer_id, global_expert_id) in self.uvm_weight_prefetch_plan_keys
                     or (layer_id, global_expert_id)
                     in self.uvm_init_weight_hot_plan_keys
                 )
@@ -4259,16 +4790,14 @@ class FusedMoE(CustomOp):
             "plan_cold": (
                 layer_id is not None
                 and (
-                    (layer_id, global_expert_id)
-                    in self.uvm_weight_offload_plan_keys
+                    (layer_id, global_expert_id) in self.uvm_weight_offload_plan_keys
                     or (layer_id, global_expert_id)
                     in self.uvm_init_weight_offload_plan_keys
                 )
             ),
             "plan_warm": (
                 layer_id is not None
-                and (layer_id, global_expert_id)
-                in self.uvm_init_weight_warm_plan_keys
+                and (layer_id, global_expert_id) in self.uvm_init_weight_warm_plan_keys
             ),
             "active_this_step": active_this_step,
             "source_action": source_action,
@@ -4424,6 +4953,8 @@ class FusedMoE(CustomOp):
         fail_fast: bool | None = None,
         async_: bool | None = None,
         sync_before_compute: bool | None = None,
+        before_driver_ioctl: Callable[[], None] | None = None,
+        after_driver_ioctl: Callable[[], None] | None = None,
     ) -> dict[str, object]:
         candidate_items: list[dict[str, object]] = []
         skipped_items: list[dict[str, object]] = []
@@ -4473,6 +5004,8 @@ class FusedMoE(CustomOp):
             items=executor_items,
             async_=async_,
             sync_before_compute=sync_before_compute,
+            before_driver_ioctl=before_driver_ioctl,
+            after_driver_ioctl=after_driver_ioctl,
         )
         result = self._uvm_reduce_envelope_prefetch_result(
             result,
@@ -4582,6 +5115,43 @@ class FusedMoE(CustomOp):
             "reserved_selected_experts": sorted(selected_experts),
             "reserved_success_region_ids": sorted(success_ids),
             "reserved_failed_region_ids": sorted(failed_ids),
+            "reserved_expected_physical_region_ids": sorted(
+                {
+                    envelope_id
+                    for envelope_ids in envelope_ids_by_logical.values()
+                    for envelope_id in envelope_ids
+                }
+            ),
+            "reserved_success_physical_region_ids": sorted(
+                result.get("envelope_successful_region_ids") or []
+            ),
+            "reserved_assigned_physical_region_ids": sorted(
+                {
+                    str(record.get("region_id"))
+                    for record in (result.get("assigned_slots") or [])
+                    if record.get("region_id") is not None
+                }
+            ),
+            "reserved_driver_requested_bytes": int(
+                (result.get("driver_result") or {}).get("requested_bytes", 0) or 0
+            ),
+            "reserved_driver_accepted_bytes": int(
+                (result.get("driver_result") or {}).get("accepted_bytes", 0) or 0
+            ),
+            "reserved_driver_success_count": int(
+                (result.get("driver_result") or {}).get("success_count", 0) or 0
+            ),
+            "reserved_driver_failure_count": int(
+                (result.get("driver_result") or {}).get("failure_count", 0) or 0
+            ),
+            "reserved_driver_ordinary_resident_bytes": int(
+                (result.get("driver_result") or {}).get("ordinary_resident_bytes", 0)
+                or 0
+            ),
+            "reserved_driver_footprint_contract_broken": int(
+                (result.get("driver_result") or {}).get("footprint_contract_broken", 0)
+                or 0
+            ),
             "reserved_executor_result": {
                 key: value for key, value in result.items() if key != "driver_result"
             },
@@ -4699,9 +5269,7 @@ class FusedMoE(CustomOp):
             "driver_capability_reason": str(
                 metadata.get("driver_capability_reason") or ""
             ),
-            "driver_capability_code": int(
-                metadata.get("driver_capability_code") or 0
-            ),
+            "driver_capability_code": int(metadata.get("driver_capability_code") or 0),
         }
 
     def _record_uvm_weight_prefetch_issue(
@@ -4794,8 +5362,7 @@ class FusedMoE(CustomOp):
                     else self.uvm_residency_weight_initial_state
                 )
                 estimated_gpu = bool(
-                    snapshot is not None
-                    and snapshot.get("estimated_gpu_resident")
+                    snapshot is not None and snapshot.get("estimated_gpu_resident")
                 )
                 estimated_hit = estimated_gpu or state in (
                     "gpu",
@@ -4805,9 +5372,8 @@ class FusedMoE(CustomOp):
                     hit_estimated += 1
                 else:
                     miss_estimated += 1
-                if (
-                    self.uvm_weight_prefetch_hit_driver_query_enabled
-                    and (max_regions == 0 or len(driver_ranges) < max_regions)
+                if self.uvm_weight_prefetch_hit_driver_query_enabled and (
+                    max_regions == 0 or len(driver_ranges) < max_regions
                 ):
                     driver_ranges.append((ptr, size_bytes))
                 if len(sample_records) < 8:
@@ -4830,9 +5396,7 @@ class FusedMoE(CustomOp):
         stats.update(
             {
                 "prefetch_access_region_records": probe_records,
-                "prefetch_before_access_candidate_records": (
-                    before_access_candidates
-                ),
+                "prefetch_before_access_candidate_records": (before_access_candidates),
                 "prefetch_hit_before_access_estimated_records": hit_estimated,
                 "prefetch_miss_before_access_estimated_records": miss_estimated,
                 "prefetch_same_step_access_records": same_step_access,
@@ -4877,9 +5441,7 @@ class FusedMoE(CustomOp):
                     "prefetch_hit_before_access_real_query_ranges": (
                         len(driver_ranges)
                     ),
-                    "prefetch_hit_before_access_real_queried_bytes": (
-                        queried_bytes
-                    ),
+                    "prefetch_hit_before_access_real_queried_bytes": (queried_bytes),
                     "prefetch_hit_before_access_real_gpu_bytes": gpu_bytes,
                     "prefetch_hit_before_access_real_cpu_bytes": int(
                         driver_result.get("cpu_bytes") or 0
@@ -4992,9 +5554,7 @@ class FusedMoE(CustomOp):
                 "local_hot_experts": len(hot_pairs),
                 "device": device,
                 "requested_stage_device": self.uvm_hot_residency_stage_device,
-                "requested_prefetch_device": (
-                    self.uvm_init_weight_hot_prefetch_device
-                ),
+                "requested_prefetch_device": (self.uvm_init_weight_hot_prefetch_device),
                 "plan_policy": self.uvm_init_weight_plan_policy,
                 **payload,
             }
@@ -5230,11 +5790,7 @@ class FusedMoE(CustomOp):
         if extra:
             record.update(extra)
 
-        if (
-            self.uvm_moe_address_map_driver_probe
-            and tensor.is_cuda
-            and data_bytes > 0
-        ):
+        if self.uvm_moe_address_map_driver_probe and tensor.is_cuda and data_bytes > 0:
             try:
                 (
                     driver_capable,
@@ -5353,8 +5909,9 @@ class FusedMoE(CustomOp):
             with open(probe_file, encoding="utf-8") as handle:
                 payload = json.load(handle)
         except Exception:
-            logger.debug("Failed to read active expert residency probe file",
-                         exc_info=True)
+            logger.debug(
+                "Failed to read active expert residency probe file", exc_info=True
+            )
             return None
 
         layers = payload.get("layers") if isinstance(payload, dict) else payload
@@ -5399,8 +5956,7 @@ class FusedMoE(CustomOp):
             with open(output_file, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
         except OSError:
-            logger.debug("Failed to write active expert residency trace",
-                         exc_info=True)
+            logger.debug("Failed to write active expert residency trace", exc_info=True)
         return record
 
     def record_uvm_post_offload_slot_use_probe(
@@ -5513,9 +6069,7 @@ class FusedMoE(CustomOp):
                     active=False,
                     metadata=metadata,
                 )
-                driver_region_id = int(
-                    getattr(region, "driver_region_id", 0) or 0
-                )
+                driver_region_id = int(getattr(region, "driver_region_id", 0) or 0)
                 item = ReservedRegionItem(
                     region_id=region_id,
                     driver_region_id=driver_region_id,
@@ -5601,8 +6155,9 @@ class FusedMoE(CustomOp):
             with open(output_file, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
         except OSError:
-            logger.debug("Failed to write post-offload slot use probe trace",
-                         exc_info=True)
+            logger.debug(
+                "Failed to write post-offload slot use probe trace", exc_info=True
+            )
         return record
 
     def _query_uvm_expert_reserved_active_residency(
@@ -5611,10 +6166,7 @@ class FusedMoE(CustomOp):
         layer_id: int | None,
         all_active_expert_pairs: list[tuple[int, int]],
     ) -> dict[str, object]:
-        if (
-            not self.uvm_expert_reserved_coverage_residency_query
-            or layer_id is None
-        ):
+        if not self.uvm_expert_reserved_coverage_residency_query or layer_id is None:
             return {}
 
         unique_pairs = sorted(
@@ -5704,9 +6256,7 @@ class FusedMoE(CustomOp):
                 state = "query_failed"
                 query_failed_experts.append(global_expert_id)
             elif (
-                queried_bytes > 0
-                and gpu_bytes == queried_bytes
-                and unknown_bytes == 0
+                queried_bytes > 0 and gpu_bytes == queried_bytes and unknown_bytes == 0
             ):
                 state = "gpu_full"
             elif cpu_bytes > 0:
@@ -5764,15 +6314,12 @@ class FusedMoE(CustomOp):
         if not self.uvm_expert_reserved_coverage_trace_enabled:
             return
         try:
-            active_reserved_pairs = (
-                self._uvm_active_reserved_offload_expert_pairs(
-                    layer_id,
-                    all_active_expert_pairs,
-                )
+            active_reserved_pairs = self._uvm_active_reserved_offload_expert_pairs(
+                layer_id,
+                all_active_expert_pairs,
             )
             requested_experts = {
-                int(global_expert_id)
-                for global_expert_id, _ in requested_expert_pairs
+                int(global_expert_id) for global_expert_id, _ in requested_expert_pairs
             }
             candidate_experts = {
                 int(item["global_expert_id"]) for item in batch_prefetch_items
@@ -5812,11 +6359,13 @@ class FusedMoE(CustomOp):
                 expected_region_ids_by_expert.items()
             ):
                 success_count = sum(
-                    1 for region_id in expected_region_ids
+                    1
+                    for region_id in expected_region_ids
                     if region_id in success_region_ids
                 )
                 failed_count = sum(
-                    1 for region_id in expected_region_ids
+                    1
+                    for region_id in expected_region_ids
                     if region_id in failed_region_ids
                 )
                 requested = global_expert_id in requested_experts
@@ -5855,8 +6404,10 @@ class FusedMoE(CustomOp):
                     }
                 ),
                 "active_reserved_experts": sorted(
-                    {int(global_expert_id)
-                     for global_expert_id, _ in active_reserved_pairs}
+                    {
+                        int(global_expert_id)
+                        for global_expert_id, _ in active_reserved_pairs
+                    }
                 ),
                 "requested_reserved_experts": sorted(requested_experts),
                 "candidate_reserved_experts": sorted(candidate_experts),
@@ -6216,12 +6767,15 @@ class FusedMoE(CustomOp):
         prefetch_attempted_bytes = 0
         prefetch_requested_bytes = 0
         for global_expert_id, local_expert_id in hot_pairs:
-            for role, ptr, size_bytes, existing_region in (
-                self._uvm_stage_m_expert_weight_slices(
-                    layer_id=layer_id,
-                    global_expert_id=global_expert_id,
-                    local_expert_id=local_expert_id,
-                )
+            for (
+                role,
+                ptr,
+                size_bytes,
+                existing_region,
+            ) in self._uvm_stage_m_expert_weight_slices(
+                layer_id=layer_id,
+                global_expert_id=global_expert_id,
+                local_expert_id=local_expert_id,
             ):
                 region_id = self._uvm_expert_weight_region_id(
                     layer_id,
@@ -6343,9 +6897,7 @@ class FusedMoE(CustomOp):
         hot_real_unknown_bytes = 0
         hot_real_gpu_ratio: float | None = None
         if prefetch_items:
-            ranges = [
-                (int(item["ptr"]), int(item["bytes"])) for item in prefetch_items
-            ]
+            ranges = [(int(item["ptr"]), int(item["bytes"])) for item in prefetch_items]
             (
                 batch_successes,
                 executor_used,
@@ -6496,6 +7048,389 @@ class FusedMoE(CustomOp):
             "hot_prefetch_real_gpu_ratio": hot_real_gpu_ratio,
         }
 
+    def _uvm_init_hot_repair_expert_pairs(
+        self,
+        layer_id: int,
+    ) -> list[tuple[int, int]]:
+        """Return local experts which must remain GPU resident after Stage M."""
+        offloaded_ids = (
+            self._uvm_slot_managed_global_expert_ids
+            | self._uvm_remote_read_global_expert_ids
+        )
+        return [
+            (global_expert_id, local_expert_id)
+            for global_expert_id, local_expert_id in (
+                self._uvm_all_local_expert_pairs()
+            )
+            if (layer_id, global_expert_id)
+            not in self.uvm_init_weight_offload_plan_keys
+            and global_expert_id not in offloaded_ids
+        ]
+
+    def _uvm_init_hot_repair_layer_weight_ranges(
+        self,
+    ) -> list[tuple[int, int]]:
+        ranges: list[tuple[int, int]] = []
+        for role in ("moe_gate_up", "moe_down"):
+            if role not in self.uvm_init_weight_offload_target_roles:
+                continue
+            bounds = self._uvm_role_tensor_bounds(role)
+            if bounds is None:
+                continue
+            start, end = bounds
+            if end > start:
+                ranges.append((start, end - start))
+        return ranges
+
+    def _uvm_init_hot_repair_excluded_ranges(
+        self,
+        *,
+        layer_id: int,
+        hot_expert_pairs: list[tuple[int, int]],
+    ) -> list[tuple[int, int]]:
+        hot_pairs = set(hot_expert_pairs)
+        ranges: list[tuple[int, int]] = []
+        for global_expert_id, local_expert_id in self._uvm_all_local_expert_pairs():
+            if (global_expert_id, local_expert_id) in hot_pairs:
+                continue
+            ranges.extend(
+                (ptr, size_bytes)
+                for _, ptr, size_bytes, _ in (
+                    self._uvm_stage_m_expert_weight_slices(
+                        layer_id=layer_id,
+                        global_expert_id=global_expert_id,
+                        local_expert_id=local_expert_id,
+                    )
+                )
+            )
+        return ranges
+
+    @staticmethod
+    def _uvm_init_hot_residency_from_aggregate_queries(
+        *,
+        layer_residency: dict[str, int | bool],
+        excluded_residency: dict[str, int | bool],
+        layer_requested_bytes: int,
+        excluded_requested_bytes: int,
+        hot_requested_bytes: int,
+    ) -> dict[str, int | bool]:
+        def subtract(field: str) -> int:
+            return max(
+                int(layer_residency.get(field) or 0)
+                - int(excluded_residency.get(field) or 0),
+                0,
+            )
+
+        excluded_ok = bool(excluded_residency.get("ok"))
+        if excluded_requested_bytes == 0:
+            excluded_ok = True
+        queried_bytes = subtract("queried_bytes")
+        gpu_bytes = subtract("gpu_bytes")
+        cpu_bytes = subtract("cpu_bytes")
+        any_bytes = subtract("any_bytes")
+        unknown_bytes = subtract("unknown_bytes")
+        ok = bool(
+            layer_residency.get("ok")
+            and excluded_ok
+            and int(layer_residency.get("queried_bytes") or 0)
+            == layer_requested_bytes
+            and int(excluded_residency.get("queried_bytes") or 0)
+            == excluded_requested_bytes
+            and queried_bytes == hot_requested_bytes
+        )
+        return {
+            "ok": ok,
+            "status": (
+                int(layer_residency.get("status") or 0)
+                if not excluded_requested_bytes
+                else min(
+                    int(layer_residency.get("status") or 0),
+                    int(excluded_residency.get("status") or 0),
+                )
+            ),
+            "queried_bytes": queried_bytes,
+            "gpu_bytes": gpu_bytes,
+            "cpu_bytes": cpu_bytes,
+            "any_bytes": any_bytes,
+            "unknown_bytes": unknown_bytes,
+            "layer_queried_bytes": int(
+                layer_residency.get("queried_bytes") or 0
+            ),
+            "excluded_queried_bytes": int(
+                excluded_residency.get("queried_bytes") or 0
+            ),
+        }
+
+    def _uvm_query_init_hot_weight_residency(
+        self,
+        *,
+        layer_ranges: list[tuple[int, int]],
+        excluded_ranges: list[tuple[int, int]],
+        hot_requested_bytes: int,
+        device: int,
+    ) -> dict[str, int | bool]:
+        layer_residency = driver_batch_query_ranges_residency_bytes(
+            layer_ranges,
+            device,
+            wait_for_trackers=False,
+        )
+        excluded_residency: dict[str, int | bool]
+        if excluded_ranges:
+            excluded_residency = driver_batch_query_ranges_residency_bytes(
+                excluded_ranges,
+                device,
+                wait_for_trackers=False,
+            )
+        else:
+            excluded_residency = {
+                "ok": True,
+                "status": 0,
+                "queried_bytes": 0,
+                "gpu_bytes": 0,
+                "cpu_bytes": 0,
+                "any_bytes": 0,
+                "unknown_bytes": 0,
+            }
+        result = self._uvm_init_hot_residency_from_aggregate_queries(
+            layer_residency=layer_residency,
+            excluded_residency=excluded_residency,
+            layer_requested_bytes=sum(size for _, size in layer_ranges),
+            excluded_requested_bytes=sum(size for _, size in excluded_ranges),
+            hot_requested_bytes=hot_requested_bytes,
+        )
+        result["layer_query_ranges"] = len(layer_ranges)
+        result["excluded_query_ranges"] = len(excluded_ranges)
+        return result
+
+    def repair_uvm_init_hot_weight_residency(self) -> dict[str, object]:
+        """Repair and verify hot expert residency after all cold release work.
+
+        The model runner invokes this in a second global module pass. This is
+        intentionally separate from per-layer Stage M so cold ranges across all
+        layers have released their HBM capacity before hot pages are restored.
+        """
+        if not self.uvm_init_weight_hot_repair_enable:
+            return {"hot_repair_enabled": False}
+        if self._uvm_init_weight_hot_repair_done:
+            return {
+                "hot_repair_enabled": True,
+                "hot_repair_already_done": True,
+            }
+
+        self._refresh_uvm_weight_action_plans()
+        layer_id = self._uvm_layer_id()
+        if layer_id is None:
+            return {
+                "hot_repair_enabled": True,
+                "hot_repair_skipped_no_layer": True,
+            }
+
+        device = self.uvm_init_weight_hot_prefetch_device
+        if device < 0:
+            device = int(torch.cuda.current_device())
+        expert_pairs = self._uvm_init_hot_repair_expert_pairs(layer_id)
+        repair_items: list[dict[str, object]] = []
+        for global_expert_id, local_expert_id in expert_pairs:
+            for role, ptr, size_bytes, _ in self._uvm_stage_m_expert_weight_slices(
+                layer_id=layer_id,
+                global_expert_id=global_expert_id,
+                local_expert_id=local_expert_id,
+            ):
+                repair_items.append(
+                    {
+                        "global_expert_id": global_expert_id,
+                        "local_expert_id": local_expert_id,
+                        "role": role,
+                        "ptr": ptr,
+                        "bytes": size_bytes,
+                        "region_id": self._uvm_expert_weight_region_id(
+                            layer_id,
+                            global_expert_id,
+                            role,
+                        ),
+                    }
+                )
+
+        ranges = [
+            (int(item["ptr"]), int(item["bytes"])) for item in repair_items
+        ]
+        requested_bytes = sum(size_bytes for _, size_bytes in ranges)
+        layer_ranges = self._uvm_init_hot_repair_layer_weight_ranges()
+        excluded_ranges = self._uvm_init_hot_repair_excluded_ranges(
+            layer_id=layer_id,
+            hot_expert_pairs=expert_pairs,
+        )
+        if not layer_ranges:
+            layer_ranges = ranges
+            excluded_ranges = []
+        torch.cuda.synchronize()
+        initial_residency = self._uvm_query_init_hot_weight_residency(
+            layer_ranges=layer_ranges,
+            excluded_ranges=excluded_ranges,
+            hot_requested_bytes=requested_bytes,
+            device=device,
+        )
+        initial_queried_bytes = int(initial_residency.get("queried_bytes") or 0)
+        initial_gpu_bytes = int(initial_residency.get("gpu_bytes") or 0)
+        initial_cpu_bytes = int(initial_residency.get("cpu_bytes") or 0)
+        initial_unknown_bytes = int(initial_residency.get("unknown_bytes") or 0)
+        initially_fully_gpu_resident = bool(
+            initial_residency.get("ok")
+            and initial_queried_bytes == requested_bytes
+            and initial_gpu_bytes == requested_bytes
+            and initial_cpu_bytes == 0
+            and initial_unknown_bytes == 0
+        )
+        if (
+            self.uvm_init_weight_hot_repair_require_full_residency
+            and not initial_residency.get("ok")
+        ):
+            raise RuntimeError(
+                "Stage-M hot repair initial residency query failed: "
+                f"layer_id={layer_id}, requested_bytes={requested_bytes}, "
+                f"status={initial_residency.get('status')}"
+            )
+
+        preferred_result = len(ranges)
+        if self.uvm_init_weight_hot_repair_preferred_gpu:
+            preferred_result = batch_advise_ranges_preferred_location(
+                ranges,
+                device,
+            )
+            if preferred_result != len(ranges):
+                raise RuntimeError(
+                    "Stage-M hot repair failed to set PreferredLocation(GPU): "
+                    f"layer_id={layer_id}, expected={len(ranges)}, "
+                    f"actual={preferred_result}"
+                )
+
+        prefetch_successes = 0
+        executor_used = "query_skip"
+        driver_result = 0
+        if not initially_fully_gpu_resident:
+            prefetch_successes, executor_used, driver_result = (
+                batch_prefetch_ranges_to_device_with_executor(
+                    ranges,
+                    device,
+                    executor=self.uvm_weight_executor,
+                )
+            )
+            if prefetch_successes != len(ranges):
+                raise RuntimeError(
+                    "Stage-M hot repair GPU prefetch was incomplete: "
+                    f"layer_id={layer_id}, expected={len(ranges)}, "
+                    f"actual={prefetch_successes}, executor={executor_used}, "
+                    f"driver_result={driver_result}"
+                )
+            torch.cuda.synchronize()
+            residency = self._uvm_query_init_hot_weight_residency(
+                layer_ranges=layer_ranges,
+                excluded_ranges=excluded_ranges,
+                hot_requested_bytes=requested_bytes,
+                device=device,
+            )
+        else:
+            residency = initial_residency
+        queried_bytes = int(residency.get("queried_bytes") or 0)
+        gpu_bytes = int(residency.get("gpu_bytes") or 0)
+        cpu_bytes = int(residency.get("cpu_bytes") or 0)
+        unknown_bytes = int(residency.get("unknown_bytes") or 0)
+        fully_gpu_resident = bool(
+            residency.get("ok")
+            and queried_bytes == requested_bytes
+            and gpu_bytes == requested_bytes
+            and cpu_bytes == 0
+            and unknown_bytes == 0
+        )
+        stats: dict[str, object] = {
+            "hot_repair_enabled": True,
+            "hot_repair_layer_id": layer_id,
+            "hot_repair_experts": len(expert_pairs),
+            "hot_repair_ranges": len(ranges),
+            "hot_repair_requested_bytes": requested_bytes,
+            "hot_repair_layer_query_ranges": int(
+                residency.get("layer_query_ranges") or 0
+            ),
+            "hot_repair_excluded_query_ranges": int(
+                residency.get("excluded_query_ranges") or 0
+            ),
+            "hot_repair_initial_residency_ok": bool(
+                initial_residency.get("ok")
+            ),
+            "hot_repair_initial_residency_status": int(
+                initial_residency.get("status") or 0
+            ),
+            "hot_repair_initial_queried_bytes": initial_queried_bytes,
+            "hot_repair_initial_gpu_bytes": initial_gpu_bytes,
+            "hot_repair_initial_cpu_bytes": initial_cpu_bytes,
+            "hot_repair_initial_unknown_bytes": initial_unknown_bytes,
+            "hot_repair_initially_fully_gpu_resident": (
+                initially_fully_gpu_resident
+            ),
+            "hot_repair_preferred_gpu": (
+                self.uvm_init_weight_hot_repair_preferred_gpu
+            ),
+            "hot_repair_preferred_result": preferred_result,
+            "hot_repair_prefetch_successes": prefetch_successes,
+            "hot_repair_executor": executor_used,
+            "hot_repair_driver_result": driver_result,
+            "hot_repair_residency_ok": bool(residency.get("ok")),
+            "hot_repair_residency_status": int(residency.get("status") or 0),
+            "hot_repair_queried_bytes": queried_bytes,
+            "hot_repair_gpu_bytes": gpu_bytes,
+            "hot_repair_cpu_bytes": cpu_bytes,
+            "hot_repair_any_bytes": int(residency.get("any_bytes") or 0),
+            "hot_repair_unknown_bytes": unknown_bytes,
+            "hot_repair_gpu_ratio": (
+                gpu_bytes / queried_bytes if queried_bytes else 0.0
+            ),
+            "hot_repair_fully_gpu_resident": fully_gpu_resident,
+        }
+        self._append_uvm_init_weight_trace(
+            {
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "layer_name": self.layer_name,
+                "layer_id": layer_id,
+                "action": "init_weight_hot_repair_summary",
+                "plan_policy": self.uvm_init_weight_plan_policy,
+                **stats,
+            }
+        )
+        if (
+            self.uvm_init_weight_hot_repair_require_full_residency
+            and not fully_gpu_resident
+        ):
+            raise RuntimeError(
+                "Stage-M hot repair residency verification failed: "
+                f"layer_id={layer_id}, requested_bytes={requested_bytes}, "
+                f"queried_bytes={queried_bytes}, gpu_bytes={gpu_bytes}, "
+                f"cpu_bytes={cpu_bytes}, unknown_bytes={unknown_bytes}, "
+                f"status={residency.get('status')}"
+            )
+
+        for item in repair_items:
+            region_id = str(item["region_id"])
+            mark_uvm_residency_state(
+                region_id=region_id,
+                state="gpu",
+                metadata={
+                    "placement": "GPU_RESIDENT",
+                    "target_placement": "GPU_RESIDENT",
+                    "hot_repair_verified": fully_gpu_resident,
+                    "hot_repair_device": device,
+                },
+            )
+            self._uvm_update_weight_expert_role_cache(
+                layer_id=layer_id,
+                global_expert_id=int(item["global_expert_id"]),
+                role=str(item["role"]),
+                state="gpu",
+                estimated_gpu_resident=fully_gpu_resident,
+            )
+        self._uvm_init_weight_hot_repair_done = True
+        return stats
+
     def run_uvm_init_weight_offload(self) -> None:
         """Stage M: apply hot/warm/cold MoE placement before serving.
 
@@ -6580,14 +7515,16 @@ class FusedMoE(CustomOp):
                     "register_all_local_experts": (
                         self.uvm_init_weight_register_all_local_experts
                     ),
-                    "complete_expert_plan": (
-                        self.uvm_init_weight_complete_expert_plan
-                    ),
+                    "complete_expert_plan": (self.uvm_init_weight_complete_expert_plan),
                 }
             )
             if not self.uvm_init_weight_register_all_local_experts:
                 return
 
+        require_complete_remote_prepare = _env_flag_enabled(
+            "VLLM_UVM_INIT_WEIGHT_REQUIRE_COMPLETE_REMOTE_PREPARE",
+            default=False,
+        )
         try:
             layer_id = self._uvm_layer_id()
             if layer_id is None:
@@ -6599,9 +7536,7 @@ class FusedMoE(CustomOp):
             preregister_stats = self._register_uvm_init_all_local_weight_regions(
                 layer_id
             )
-            hot_stats = self._register_uvm_init_hot_weight_regions(
-                layer_id
-            )
+            hot_stats = self._register_uvm_init_hot_weight_regions(layer_id)
             all_local_pairs = self._uvm_all_local_expert_pairs()
             expert_pairs = self._uvm_stage_m_offload_expert_pairs(
                 layer_id,
@@ -6625,15 +7560,12 @@ class FusedMoE(CustomOp):
                             == "cold"
                         )
                         and (
-                            self._uvm_incremental_selected_global_expert_id
-                            is None
+                            self._uvm_incremental_selected_global_expert_id is None
                             or pair[0]
                             == self._uvm_incremental_selected_global_expert_id
                         )
                         and self._uvm_incremental_slot_capacity_allows(pair[1])
-                    ][
-                        : self.uvm_incremental_experts_per_layer_per_round
-                    ]
+                    ][: self.uvm_incremental_experts_per_layer_per_round]
             ignore_limits = bool(
                 self.uvm_init_weight_complete_expert_plan
                 and self.uvm_init_weight_complete_plan_ignore_limits
@@ -6664,9 +7596,7 @@ class FusedMoE(CustomOp):
                         > self.uvm_init_weight_offload_max_bytes
                     ):
                         break
-                    byte_limited_pairs.append(
-                        (global_expert_id, local_expert_id)
-                    )
+                    byte_limited_pairs.append((global_expert_id, local_expert_id))
                     selected_bytes += expert_bytes
                 expert_pairs = byte_limited_pairs
 
@@ -6677,12 +7607,15 @@ class FusedMoE(CustomOp):
             rejected_records = 0
             batch_items: list[dict[str, object]] = []
             for global_expert_id, local_expert_id in expert_pairs:
-                for role, ptr, size_bytes, existing_region in (
-                    self._uvm_stage_m_expert_weight_slices(
-                        layer_id=layer_id,
-                        global_expert_id=global_expert_id,
-                        local_expert_id=local_expert_id,
-                    )
+                for (
+                    role,
+                    ptr,
+                    size_bytes,
+                    existing_region,
+                ) in self._uvm_stage_m_expert_weight_slices(
+                    layer_id=layer_id,
+                    global_expert_id=global_expert_id,
+                    local_expert_id=local_expert_id,
                 ):
                     region_id = self._uvm_expert_weight_region_id(
                         layer_id,
@@ -6705,7 +7638,7 @@ class FusedMoE(CustomOp):
                     )
                     logical_driver_tag_skip = bool(
                         self.uvm_expert_envelope_enable
-                        and not self._uvm_stage_m_uses_remote_read()
+                        and self._uvm_stage_m_requires_release_envelopes()
                     )
                     offload_metadata = self._uvm_init_weight_class_metadata(
                         metadata=residency_metadata,
@@ -6738,11 +7671,26 @@ class FusedMoE(CustomOp):
                             state=str(existing_region.get("state") or "gpu"),
                             metadata=offload_metadata,
                         )
+                    targeted_driver_registration: dict[str, object] | None = None
+                    if self._uvm_remote_prepare_uses_release():
+                        targeted_driver_registration = (
+                            ensure_uvm_residency_driver_region_registered(region_id)
+                        )
+                        refreshed_region = get_uvm_residency_region_snapshot(region_id)
+                        if refreshed_region is not None:
+                            driver_region_id = int(
+                                refreshed_region.get("driver_region_id") or 0
+                            )
+                        if not bool(
+                            targeted_driver_registration.get("registered")
+                        ):
+                            raise RuntimeError(
+                                "Stage-M release_remote driver registration failed "
+                                f"for {region_id}: {targeted_driver_registration}"
+                            )
                     envelope_records: list[dict[str, object]] = []
                     if (
-                        not self._uvm_stage_m_uses_remote_read()
-                        and self.uvm_init_weight_offload_mode
-                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+                        self._uvm_stage_m_requires_release_envelopes()
                     ):
                         envelope_items = self._uvm_get_or_build_expert_envelope_items(
                             source_region_id=region_id,
@@ -6759,9 +7707,7 @@ class FusedMoE(CustomOp):
                                 if existing_region is not None
                                 else "gpu"
                             ),
-                            source_action=(
-                                "stage_m_driver_release_chunk_envelope"
-                            ),
+                            source_action=("stage_m_driver_release_chunk_envelope"),
                         )
                         envelope_records = [
                             {
@@ -6784,14 +7730,11 @@ class FusedMoE(CustomOp):
                         )
                     ]
                     if (
-                        not self._uvm_stage_m_uses_remote_read()
+                        self._uvm_stage_m_requires_release_envelopes()
                         and self.uvm_expert_envelope_enable
-                        and self.uvm_init_weight_offload_mode
-                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                         and (
                             not envelope_records
-                            or len(release_driver_region_ids)
-                            != len(envelope_records)
+                            or len(release_driver_region_ids) != len(envelope_records)
                         )
                     ):
                         raise RuntimeError(
@@ -6824,6 +7767,9 @@ class FusedMoE(CustomOp):
                                 "role": role,
                                 "residency_region_id": region_id,
                                 "driver_region_id": driver_region_id,
+                                "targeted_driver_registration": (
+                                    targeted_driver_registration
+                                ),
                                 "release_driver_region_ids": (
                                     release_driver_region_ids
                                 ),
@@ -6867,6 +7813,9 @@ class FusedMoE(CustomOp):
                                 "role": role,
                                 "residency_region_id": region_id,
                                 "driver_region_id": driver_region_id,
+                                "targeted_driver_registration": (
+                                    targeted_driver_registration
+                                ),
                                 "release_driver_region_ids": (
                                     release_driver_region_ids
                                 ),
@@ -6908,27 +7857,61 @@ class FusedMoE(CustomOp):
                     remote_preferred_cpu_result = 0
                     remote_executor = ""
                     if self._uvm_stage_m_uses_remote_read():
-                        (
-                            remote_successes,
-                            remote_executor,
-                            remote_accessed_by_result,
-                            remote_prefetch_cpu_successes,
-                            remote_preferred_cpu_result,
-                        ) = (
-                            batch_prepare_ranges_for_native_remote_access_with_executor(
-                                [(ptr, size_bytes)],
-                                sync=self._uvm_stage_m_sync_enabled(),
-                                executor=self.uvm_weight_executor,
-                                device=(
-                                    int(torch.cuda.current_device())
-                                    if torch.cuda.is_available()
-                                    else 0
-                                ),
-                            )
+                        device = (
+                            int(torch.cuda.current_device())
+                            if torch.cuda.is_available()
+                            else 0
                         )
-                        success = remote_successes == 1
-                        advise_success = remote_preferred_cpu_result == 1
-                        prefetch_success = remote_prefetch_cpu_successes == 1
+                        if self._uvm_remote_prepare_uses_release():
+                            driver_release_result = (
+                                driver_expert_offload_release_remote_regions(
+                                    release_driver_region_ids,
+                                    device=device,
+                                    subchunk_64k=True,
+                                    prefer_existing=True,
+                                    return_entries=True,
+                                )
+                            )
+                            release_entries_by_id = {
+                                int(entry.get("region_id") or 0): entry
+                                for entry in (
+                                    driver_release_result.get("entries") or []
+                                )
+                                if isinstance(entry, dict)
+                            }
+                            self._uvm_record_release_remote_envelope_states(
+                                envelope_records,
+                                release_entries_by_id,
+                            )
+                            success = bool(driver_release_result.get("ok")) and all(
+                                bool(
+                                    release_entries_by_id.get(driver_id, {}).get(
+                                        "ok"
+                                    )
+                                )
+                                for driver_id in release_driver_region_ids
+                            )
+                            driver_release_success = success
+                            remote_executor = "driver_release_remote"
+                        else:
+                            remote_prepare_result = (
+                                batch_prepare_ranges_for_native_remote_access_with_executor(
+                                    [(ptr, size_bytes)],
+                                    sync=self._uvm_stage_m_sync_enabled(),
+                                    executor=self.uvm_weight_executor,
+                                    device=device,
+                                )
+                            )
+                            (
+                                remote_successes,
+                                remote_executor,
+                                remote_accessed_by_result,
+                                remote_prefetch_cpu_successes,
+                                remote_preferred_cpu_result,
+                            ) = remote_prepare_result
+                            success = remote_successes == 1
+                            advise_success = remote_preferred_cpu_result == 1
+                            prefetch_success = remote_prefetch_cpu_successes == 1
                         action = (
                             "init_weight_remote_read_prepare_issued"
                             if success
@@ -6943,28 +7926,20 @@ class FusedMoE(CustomOp):
                             if torch.cuda.is_available()
                             else 0
                         )
-                        driver_release_result = (
-                            driver_expert_offload_release_regions(
-                                release_driver_region_ids,
-                                device=device,
-                                subchunk_64k=(
-                                    self._uvm_expert_release_uses_subchunk_64k()
-                                ),
-                                prefer_existing=True,
-                                return_entries=True,
-                            )
+                        driver_release_result = driver_expert_offload_release_regions(
+                            release_driver_region_ids,
+                            device=device,
+                            subchunk_64k=(self._uvm_expert_release_uses_subchunk_64k()),
+                            prefer_existing=True,
+                            return_entries=True,
                         )
                         release_entries_by_id: dict[int, dict[str, object]] = {
                             int(entry.get("region_id") or 0): entry
-                            for entry in (
-                                driver_release_result.get("entries") or []
-                            )
+                            for entry in (driver_release_result.get("entries") or [])
                             if isinstance(entry, dict)
                         }
                         success = bool(driver_release_result.get("ok")) and all(
-                            bool(
-                                release_entries_by_id.get(driver_id, {}).get("ok")
-                            )
+                            bool(release_entries_by_id.get(driver_id, {}).get("ok"))
                             for driver_id in release_driver_region_ids
                         )
                         driver_release_success = success
@@ -6990,14 +7965,14 @@ class FusedMoE(CustomOp):
                                 "sync_offload": self._uvm_stage_m_sync_enabled(),
                                 "driver_release": driver_release_success,
                                 "access_mode": self.uvm_expert_offload_access_mode,
+                                "remote_prepare_mode": self.uvm_remote_prepare_mode,
                                 "executor": remote_executor or None,
                                 "accessed_by_result": remote_accessed_by_result,
                                 "prefetch_cpu_successes": (
                                     remote_prefetch_cpu_successes
                                 ),
-                                "preferred_cpu_result": (
-                                    remote_preferred_cpu_result
-                                ),
+                                "preferred_cpu_result": (remote_preferred_cpu_result),
+                                "driver_release_result": driver_release_result,
                             },
                         )
                         self._uvm_update_weight_expert_role_cache(
@@ -7015,14 +7990,35 @@ class FusedMoE(CustomOp):
                                 expert_class=expert_class,
                             )
                     elif self._uvm_stage_m_uses_remote_read():
+                        partial_release = bool(
+                            self._uvm_remote_prepare_uses_release()
+                            and driver_release_result
+                            and (
+                                int(driver_release_result.get("released_bytes") or 0)
+                                > 0
+                                or int(
+                                    driver_release_result.get(
+                                        "remote_mapped_bytes"
+                                    )
+                                    or 0
+                                )
+                                > 0
+                            )
+                        )
                         mark_uvm_residency_state(
                             region_id=region_id,
-                            state="gpu",
+                            state="unknown" if partial_release else "gpu",
                             metadata={
                                 **offload_metadata,
-                                "placement": "GPU_RESIDENT",
+                                "placement": (
+                                    "MIXED_UNCOMMITTED"
+                                    if partial_release
+                                    else "GPU_RESIDENT"
+                                ),
                                 "cpu_remote_read": False,
                                 "remote_prepare_failed": True,
+                                "remote_prepare_mode": self.uvm_remote_prepare_mode,
+                                "driver_release_result": driver_release_result,
                             },
                         )
                     elif self.uvm_init_weight_offload_mode == "trace_only":
@@ -7037,10 +8033,14 @@ class FusedMoE(CustomOp):
                             "action": action,
                             "mode": self.uvm_init_weight_offload_mode,
                             "access_mode": self.uvm_expert_offload_access_mode,
+                            "remote_prepare_mode": self.uvm_remote_prepare_mode,
                             "role": role,
                             "residency_region_id": region_id,
-                            "driver_region_id": driver_region_id,
-                            "release_driver_region_ids": release_driver_region_ids,
+                                "driver_region_id": driver_region_id,
+                                "targeted_driver_registration": (
+                                    targeted_driver_registration
+                                ),
+                                "release_driver_region_ids": release_driver_region_ids,
                             "envelope_records": [
                                 {
                                     "region_id": str(record.get("region_id")),
@@ -7080,9 +8080,7 @@ class FusedMoE(CustomOp):
                             "driver_release_result": driver_release_result,
                             "remote_executor": remote_executor,
                             "accessed_by_result": remote_accessed_by_result,
-                            "prefetch_cpu_successes": (
-                                remote_prefetch_cpu_successes
-                            ),
+                            "prefetch_cpu_successes": (remote_prefetch_cpu_successes),
                             "preferred_cpu_result": remote_preferred_cpu_result,
                             "sync_offload": self._uvm_stage_m_sync_enabled(),
                             "plan_policy": self.uvm_init_weight_plan_policy,
@@ -7099,26 +8097,70 @@ class FusedMoE(CustomOp):
                 remote_prefetch_cpu_successes = 0
                 remote_preferred_cpu_result = 0
                 if self._uvm_stage_m_uses_remote_read():
-                    ranges = [
-                        (int(item["ptr"]), int(item["bytes"]))
-                        for item in batch_items
-                    ]
-                    (
-                        batch_successes,
-                        executor_used,
-                        remote_accessed_by_result,
-                        remote_prefetch_cpu_successes,
-                        remote_preferred_cpu_result,
-                    ) = batch_prepare_ranges_for_native_remote_access_with_executor(
-                        ranges,
-                        sync=self._uvm_stage_m_sync_enabled(),
-                        executor=self.uvm_weight_executor,
-                        device=(
-                            int(torch.cuda.current_device())
-                            if torch.cuda.is_available()
-                            else 0
-                        ),
+                    device = (
+                        int(torch.cuda.current_device())
+                        if torch.cuda.is_available()
+                        else 0
                     )
+                    if self._uvm_remote_prepare_uses_release():
+                        driver_region_ids: list[int] = []
+                        seen_driver_region_ids: set[int] = set()
+                        for item in batch_items:
+                            release_ids = item.get("release_driver_region_ids")
+                            if not isinstance(release_ids, list):
+                                release_ids = []
+                            for driver_id_value in release_ids:
+                                try:
+                                    driver_id = int(driver_id_value)
+                                except (TypeError, ValueError):
+                                    continue
+                                if (
+                                    driver_id <= 0
+                                    or driver_id in seen_driver_region_ids
+                                ):
+                                    continue
+                                seen_driver_region_ids.add(driver_id)
+                                driver_region_ids.append(driver_id)
+                        driver_release_result = (
+                            driver_expert_offload_release_remote_regions(
+                                driver_region_ids,
+                                device=device,
+                                subchunk_64k=True,
+                                prefer_existing=True,
+                                return_entries=True,
+                            )
+                        )
+                        driver_release_summary = {
+                            key: value
+                            for key, value in driver_release_result.items()
+                            if key != "entries"
+                        }
+                        for entry in driver_release_result.get("entries") or []:
+                            if isinstance(entry, dict):
+                                driver_release_entries_by_region[
+                                    int(entry.get("region_id") or 0)
+                                ] = entry
+                        batch_successes = int(
+                            driver_release_result.get("success_count") or 0
+                        )
+                        executor_used = "driver_release_remote"
+                    else:
+                        ranges = [
+                            (int(item["ptr"]), int(item["bytes"]))
+                            for item in batch_items
+                        ]
+                        (
+                            batch_successes,
+                            executor_used,
+                            remote_accessed_by_result,
+                            remote_prefetch_cpu_successes,
+                            remote_preferred_cpu_result,
+                        ) = batch_prepare_ranges_for_native_remote_access_with_executor(
+                            ranges,
+                            sync=self._uvm_stage_m_sync_enabled(),
+                            executor=self.uvm_weight_executor,
+                            device=device,
+                        )
                 elif (
                     self.uvm_init_weight_offload_mode
                     in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
@@ -7143,16 +8185,12 @@ class FusedMoE(CustomOp):
                                 continue
                             seen_driver_region_ids.add(driver_id)
                             driver_region_ids.append(driver_id)
-                    driver_release_result = (
-                        driver_expert_offload_release_regions(
-                            driver_region_ids,
-                            device=device,
-                            subchunk_64k=(
-                                self._uvm_expert_release_uses_subchunk_64k()
-                            ),
-                            prefer_existing=True,
-                            return_entries=True,
-                        )
+                    driver_release_result = driver_expert_offload_release_regions(
+                        driver_region_ids,
+                        device=device,
+                        subchunk_64k=(self._uvm_expert_release_uses_subchunk_64k()),
+                        prefer_existing=True,
+                        return_entries=True,
                     )
                     driver_release_summary = {
                         key: value
@@ -7173,9 +8211,12 @@ class FusedMoE(CustomOp):
                     executor_used = "unsupported_init_weight_offload_mode"
                 for batch_index, item in enumerate(batch_items):
                     driver_release_entry: dict[str, object] | None = None
-                    if self._uvm_stage_m_uses_remote_read():
+                    if (
+                        self._uvm_stage_m_uses_remote_read()
+                        and not self._uvm_remote_prepare_uses_release()
+                    ):
                         success = batch_index < batch_successes
-                    elif (
+                    elif self._uvm_remote_prepare_uses_release() or (
                         self.uvm_init_weight_offload_mode
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
                     ):
@@ -7194,9 +8235,13 @@ class FusedMoE(CustomOp):
                             driver_release_entries_by_region.get(driver_id)
                             for driver_id in release_driver_ids
                         ]
+                        if self._uvm_remote_prepare_uses_release():
+                            self._uvm_record_release_remote_envelope_states(
+                                item.get("envelope_records"),
+                                driver_release_entries_by_region,
+                            )
                         success = bool(release_entries) and all(
-                            bool(entry and entry.get("ok"))
-                            for entry in release_entries
+                            bool(entry and entry.get("ok")) for entry in release_entries
                         )
                         driver_release_entry = {
                             "release_driver_region_ids": release_driver_ids,
@@ -7209,7 +8254,10 @@ class FusedMoE(CustomOp):
                         success
                         if self.uvm_init_weight_offload_mode
                         in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
-                        and not self._uvm_stage_m_uses_remote_read()
+                        and (
+                            not self._uvm_stage_m_uses_remote_read()
+                            or self._uvm_remote_prepare_uses_release()
+                        )
                         else False
                     )
                     if self._uvm_stage_m_uses_remote_read():
@@ -7218,9 +8266,13 @@ class FusedMoE(CustomOp):
                             if success
                             else "init_weight_remote_read_prepare_failed"
                         )
-                        advise_success = batch_index < remote_preferred_cpu_result
+                        advise_success = (
+                            not self._uvm_remote_prepare_uses_release()
+                            and batch_index < remote_preferred_cpu_result
+                        )
                         prefetch_success = (
-                            batch_index < remote_prefetch_cpu_successes
+                            not self._uvm_remote_prepare_uses_release()
+                            and batch_index < remote_prefetch_cpu_successes
                         )
                     elif (
                         self.uvm_init_weight_offload_mode
@@ -7254,13 +8306,13 @@ class FusedMoE(CustomOp):
                                 "executor": executor_used,
                                 "driver_release": driver_release_success,
                                 "access_mode": self.uvm_expert_offload_access_mode,
+                                "remote_prepare_mode": self.uvm_remote_prepare_mode,
                                 "accessed_by_result": remote_accessed_by_result,
                                 "prefetch_cpu_successes": (
                                     remote_prefetch_cpu_successes
                                 ),
-                                "preferred_cpu_result": (
-                                    remote_preferred_cpu_result
-                                ),
+                                "preferred_cpu_result": (remote_preferred_cpu_result),
+                                "driver_release_entry": driver_release_entry,
                             },
                         )
                         self._uvm_update_weight_expert_role_cache(
@@ -7280,16 +8332,32 @@ class FusedMoE(CustomOp):
                                 expert_class=str(item["expert_init_class"]),
                             )
                     elif self._uvm_stage_m_uses_remote_read():
+                        partial_release = bool(
+                            self._uvm_remote_prepare_uses_release()
+                            and driver_release_entry
+                            and any(
+                                int(entry.get("released_bytes") or 0) > 0
+                                or int(entry.get("remote_mapped_bytes") or 0) > 0
+                                for entry in (
+                                    driver_release_entry.get("entries") or []
+                                )
+                                if isinstance(entry, dict)
+                            )
+                        )
                         mark_uvm_residency_state(
                             region_id=str(item["residency_region_id"]),
-                            state="gpu",
+                            state="unknown" if partial_release else "gpu",
                             metadata={
-                                **cast(
-                                    dict[str, object], item["residency_metadata"]
+                                **cast(dict[str, object], item["residency_metadata"]),
+                                "placement": (
+                                    "MIXED_UNCOMMITTED"
+                                    if partial_release
+                                    else "GPU_RESIDENT"
                                 ),
-                                "placement": "GPU_RESIDENT",
                                 "cpu_remote_read": False,
                                 "remote_prepare_failed": True,
+                                "remote_prepare_mode": self.uvm_remote_prepare_mode,
+                                "driver_release_entry": driver_release_entry,
                             },
                         )
                     self._append_uvm_init_weight_trace(
@@ -7307,10 +8375,9 @@ class FusedMoE(CustomOp):
                             "executor": executor_used,
                             "requested_executor": self.uvm_weight_executor,
                             "access_mode": self.uvm_expert_offload_access_mode,
+                            "remote_prepare_mode": self.uvm_remote_prepare_mode,
                             "accessed_by_result": remote_accessed_by_result,
-                            "prefetch_cpu_successes": (
-                                remote_prefetch_cpu_successes
-                            ),
+                            "prefetch_cpu_successes": (remote_prefetch_cpu_successes),
                             "preferred_cpu_result": remote_preferred_cpu_result,
                             "driver_advise_result": driver_advise_result,
                             "driver_prefetch_result": driver_prefetch_result,
@@ -7343,9 +8410,9 @@ class FusedMoE(CustomOp):
                         "action": "init_weight_offload_summary",
                         "mode": self.uvm_init_weight_offload_mode,
                         "access_mode": self.uvm_expert_offload_access_mode,
+                        "remote_prepare_mode": self.uvm_remote_prepare_mode,
                         "planned_experts": [
-                            global_expert_id
-                            for global_expert_id, _ in expert_pairs
+                            global_expert_id for global_expert_id, _ in expert_pairs
                         ],
                         "planned_expert_classes": {
                             str(global_expert_id): self._uvm_init_weight_expert_class(
@@ -7355,9 +8422,7 @@ class FusedMoE(CustomOp):
                             for global_expert_id, _ in expert_pairs
                         },
                         "hot_plan_records": len(self.uvm_init_weight_hot_plan_keys),
-                        "warm_plan_records": len(
-                            self.uvm_init_weight_warm_plan_keys
-                        ),
+                        "warm_plan_records": len(self.uvm_init_weight_warm_plan_keys),
                         "slot_managed_global_experts": sorted(
                             self._uvm_slot_managed_global_expert_ids
                         ),
@@ -7390,6 +8455,26 @@ class FusedMoE(CustomOp):
                         ),
                     }
                 )
+                self._uvm_init_weight_offload_last_stats = {
+                    "attempted_bytes": attempted_bytes,
+                    "issued_bytes": issued_bytes,
+                    "issued_records": issued_records,
+                    "rejected_records": rejected_records,
+                }
+                if (
+                    require_complete_remote_prepare
+                    and self._uvm_stage_m_uses_remote_read()
+                    and (
+                        issued_bytes != attempted_bytes
+                        or rejected_records != 0
+                    )
+                ):
+                    raise RuntimeError(
+                        "Stage-M remote prepare was incomplete for "
+                        f"{self.layer_name}: issued={issued_bytes}/"
+                        f"{attempted_bytes} bytes, rejected_records="
+                        f"{rejected_records}"
+                    )
         except Exception as exc:
             logger.warning("Failed to run Stage M init weight offload", exc_info=True)
             try:
@@ -7408,6 +8493,8 @@ class FusedMoE(CustomOp):
                 )
             except Exception:
                 logger.debug("Failed to write Stage M exception trace", exc_info=True)
+            if require_complete_remote_prepare:
+                raise
 
     def _uvm_warm_prefetch_expert_pairs(
         self,
@@ -7445,31 +8532,48 @@ class FusedMoE(CustomOp):
         *,
         source_layer_name: str,
         source_layer_id: int | None,
-    ) -> None:
+        force_sync: bool = False,
+        source_compute_start_event: torch.cuda.Event | None = None,
+    ) -> dict[str, object] | None:
         if not self.uvm_expert_warm_prefetch_enable:
-            return
+            return None
         if not self.uvm_expert_reserved_enable or not self.uvm_weight_prefetch_enabled:
-            return
+            return None
         if (
             self.uvm_expert_reserved_enable_after_warmup
-            and os.environ.get("VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY", "0")
-            != "1"
+            and os.environ.get("VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY", "0") != "1"
         ):
-            return
+            return None
 
         layer_id = self._uvm_layer_id()
         if layer_id is None:
-            return
+            return None
         expert_pairs = self._uvm_warm_prefetch_expert_pairs()
         if not expert_pairs:
-            return
+            return None
+
+        step = self._uvm_moe_trace_step
+        with _UVM_WARM_PREFETCH_REGISTRY_LOCK:
+            existing_ticket = getattr(self, "_uvm_warm_prefetch_ticket", None)
+            if (
+                existing_ticket is not None
+                and int(existing_ticket.get("target_step", -1)) == step
+            ):
+                return existing_ticket
+            existing_future = (
+                existing_ticket.get("future") if existing_ticket is not None else None
+            )
+            if isinstance(existing_future, Future) and not existing_future.done():
+                raise RuntimeError(
+                    "warm expert prefetch pipeline overrun: previous target layer "
+                    f"ticket is still pending for {self.layer_name}"
+                )
 
         device = (
             int(torch.cuda.current_device())
             if self.uvm_weight_prefetch_device < 0
             else self.uvm_weight_prefetch_device
         )
-        step = self._uvm_moe_trace_step
         batch_prefetch_items: list[dict[str, object]] = []
         attempted_bytes = 0
         for global_expert_id, local_expert_id in expert_pairs:
@@ -7512,8 +8616,7 @@ class FusedMoE(CustomOp):
                         else None
                     ),
                     "driver_flags": (
-                        int(residency_metadata.get("driver_flags") or 0)
-                        | (1 << 14)
+                        int(residency_metadata.get("driver_flags") or 0) | (1 << 14)
                     ),
                     "existing_state": existing_state,
                     "warm_prefetch_source_layer_name": source_layer_name,
@@ -7544,22 +8647,133 @@ class FusedMoE(CustomOp):
                         "local_expert_id": local_expert_id,
                         "ptr": ptr,
                         "bytes": size_bytes,
-                        **self._uvm_driver_capability_trace_fields(
-                            residency_metadata
-                        ),
+                        **self._uvm_driver_capability_trace_fields(residency_metadata),
                         "device": device,
                         "residency_metadata": residency_metadata,
                     }
                 )
 
-        result = self._run_uvm_expert_reserved_prefetch_batch(
-            batch_prefetch_items=batch_prefetch_items,
-            device=device,
-            step=step,
-            fail_fast=False,
-            async_=True,
-            sync_before_compute=False,
+        roles_by_expert: dict[int, set[str]] = {}
+        for item in batch_prefetch_items:
+            roles_by_expert.setdefault(int(item["global_expert_id"]), set()).add(
+                str(item["role"])
+            )
+        required_roles = {"moe_gate_up", "moe_down"}
+        incomplete_experts = {
+            expert_id: sorted(required_roles - roles)
+            for expert_id, roles in roles_by_expert.items()
+            if not required_roles.issubset(roles)
+        }
+        if incomplete_experts:
+            raise RuntimeError(
+                "warm expert pipeline requires complete w13/w2 coverage: "
+                f"layer={self.layer_name} missing={incomplete_experts}"
+            )
+
+        self._uvm_warm_prefetch_generation = (
+            getattr(self, "_uvm_warm_prefetch_generation", 0) + 1
         )
+        generation = self._uvm_warm_prefetch_generation
+        expected_region_ids = sorted(
+            str(item["residency_region_id"]) for item in batch_prefetch_items
+        )
+        ticket: dict[str, object] = {
+            "generation": generation,
+            "target_step": step,
+            "target_layer_name": self.layer_name,
+            "target_layer_id": layer_id,
+            "source_layer_name": source_layer_name,
+            "source_layer_id": source_layer_id,
+            "enqueue_ns": time.perf_counter_ns(),
+            "expected_region_ids": expected_region_ids,
+            "expected_records": len(expected_region_ids),
+            "expected_bytes": attempted_bytes,
+            "expected_global_experts": [pair[0] for pair in expert_pairs],
+            "items": batch_prefetch_items,
+            "force_sync": bool(force_sync),
+            "source_compute_start_event": source_compute_start_event,
+        }
+
+        def run_prefetch() -> dict[str, object]:
+            ticket["worker_start_ns"] = time.perf_counter_ns()
+            timing_stream: torch.cuda.Stream | None = None
+
+            def before_driver_ioctl() -> None:
+                nonlocal timing_stream
+                if (
+                    not ticket.get("background")
+                    or source_compute_start_event is None
+                    or not torch.cuda.is_available()
+                ):
+                    return
+                try:
+                    source_compute_start_event.synchronize()
+                    timing_stream = _uvm_warm_prefetch_timing_stream(device)
+                    ioctl_start_event = torch.cuda.Event(enable_timing=True)
+                    with torch.cuda.stream(timing_stream):
+                        ioctl_start_event.record(timing_stream)
+                    ioctl_start_event.synchronize()
+                    ticket["ioctl_cuda_start_event"] = ioctl_start_event
+                    ticket["ioctl_start_ns"] = time.perf_counter_ns()
+                except Exception:
+                    timing_stream = None
+                    ticket["ioctl_cuda_timing_error"] = True
+                    logger.debug(
+                        "Failed to record warm prefetch ioctl start",
+                        exc_info=True,
+                    )
+
+            def after_driver_ioctl() -> None:
+                if timing_stream is None:
+                    return
+                try:
+                    ioctl_end_event = torch.cuda.Event(enable_timing=True)
+                    with torch.cuda.stream(timing_stream):
+                        ioctl_end_event.record(timing_stream)
+                    ioctl_end_event.synchronize()
+                    ticket["ioctl_cuda_end_event"] = ioctl_end_event
+                    ticket["ioctl_end_ns"] = time.perf_counter_ns()
+                except Exception:
+                    ticket["ioctl_cuda_timing_error"] = True
+                    logger.debug(
+                        "Failed to record warm prefetch ioctl end",
+                        exc_info=True,
+                    )
+
+            try:
+                result = self._run_uvm_expert_reserved_prefetch_batch(
+                    batch_prefetch_items=batch_prefetch_items,
+                    device=device,
+                    step=step,
+                    fail_fast=False,
+                    # The driver waits for its copy tracker inside this ioctl.
+                    # Running it off-thread creates the cross-layer overlap.
+                    async_=False,
+                    sync_before_compute=False,
+                    before_driver_ioctl=before_driver_ioctl,
+                    after_driver_ioctl=after_driver_ioctl,
+                )
+                ticket["result"] = result
+                return result
+            except BaseException as exc:
+                ticket["worker_error"] = repr(exc)
+                raise
+            finally:
+                ticket["worker_end_ns"] = time.perf_counter_ns()
+
+        background = bool(self.uvm_expert_warm_background_enable and not force_sync)
+        ticket["background"] = background
+        if background:
+            future = _uvm_warm_prefetch_executor().submit(run_prefetch)
+        else:
+            future = Future()
+            try:
+                future.set_result(run_prefetch())
+            except BaseException as exc:
+                future.set_exception(exc)
+        ticket["future"] = future
+        with _UVM_WARM_PREFETCH_REGISTRY_LOCK:
+            self._uvm_warm_prefetch_ticket = ticket
         self._append_uvm_weight_prefetch_trace(
             {
                 "timestamp": time.time(),
@@ -7569,15 +8783,253 @@ class FusedMoE(CustomOp):
                 "step": step,
                 "mode": "prefetch",
                 "prefetch_source": "next_layer_warm_pipeline",
-                "action": "next_layer_warm_prefetch_summary",
+                "action": "next_layer_warm_prefetch_enqueued",
                 "source_layer_name": source_layer_name,
                 "source_layer_id": source_layer_id,
+                "generation": generation,
+                "target_step": step,
+                "background": background,
                 "warm_global_experts": [pair[0] for pair in expert_pairs],
                 "candidate_records": len(batch_prefetch_items),
                 "attempted_bytes": attempted_bytes,
-                **result,
+                "expected_region_ids": expected_region_ids,
             }
         )
+        return ticket
+
+    def _wait_for_uvm_warm_prefetch_before_compute(self) -> None:
+        if not self.uvm_expert_warm_prefetch_enable:
+            return
+        expert_pairs = self._uvm_warm_prefetch_expert_pairs()
+        if not expert_pairs:
+            return
+
+        step = self._uvm_moe_trace_step
+        with _UVM_WARM_PREFETCH_REGISTRY_LOCK:
+            ticket = getattr(self, "_uvm_warm_prefetch_ticket", None)
+        if ticket is None or int(ticket.get("target_step", -1)) != step:
+            ticket = self._prefetch_uvm_offloaded_warm_expert_weights(
+                source_layer_name=self.layer_name,
+                source_layer_id=self._uvm_layer_id(),
+                force_sync=True,
+            )
+        if ticket is None:
+            return
+
+        future = ticket.get("future")
+        if not isinstance(future, Future):
+            raise RuntimeError(
+                f"warm expert prefetch ticket has no future: {self.layer_name}"
+            )
+        source_end_event = ticket.get("source_compute_end_event")
+        prefetch_pending_at_barrier = not future.done()
+        source_compute_pending_at_barrier = False
+        if source_end_event is not None:
+            try:
+                source_compute_pending_at_barrier = not bool(source_end_event.query())
+            except Exception:
+                logger.debug("Failed to query warm source compute event", exc_info=True)
+
+        wait_start_ns = time.perf_counter_ns()
+        result = future.result()
+        wait_end_ns = time.perf_counter_ns()
+        expected_ids = set(cast(list[str], ticket["expected_region_ids"]))
+        successful_ids = set(result.get("reserved_success_region_ids") or [])
+        failed_ids = set(result.get("reserved_failed_region_ids") or [])
+        missing_ids = sorted(expected_ids - successful_ids)
+        unexpected_ids = sorted(successful_ids - expected_ids)
+        expected_physical_ids = set(
+            result.get("reserved_expected_physical_region_ids") or []
+        )
+        successful_physical_ids = set(
+            result.get("reserved_success_physical_region_ids") or []
+        )
+        assigned_physical_ids = set(
+            result.get("reserved_assigned_physical_region_ids") or []
+        )
+        missing_physical_ids = sorted(expected_physical_ids - successful_physical_ids)
+        unassigned_physical_ids = sorted(expected_physical_ids - assigned_physical_ids)
+        driver_requested_bytes = int(
+            result.get("reserved_driver_requested_bytes", 0) or 0
+        )
+        driver_accepted_bytes = int(
+            result.get("reserved_driver_accepted_bytes", 0) or 0
+        )
+        physical_coverage_ok = bool(expected_physical_ids) and (
+            expected_physical_ids == successful_physical_ids == assigned_physical_ids
+            and int(result.get("reserved_driver_failure_count", 0) or 0) == 0
+            and driver_accepted_bytes == driver_requested_bytes
+            and int(result.get("reserved_driver_ordinary_resident_bytes", 0) or 0) == 0
+            and int(result.get("reserved_driver_footprint_contract_broken", 0) or 0)
+            == 0
+        )
+        logical_coverage_ok = (
+            not missing_ids
+            and not unexpected_ids
+            and not failed_ids
+            and int(result.get("reserved_success_records", 0)) == len(expected_ids)
+        )
+        coverage_ok = logical_coverage_ok and physical_coverage_ok
+        worker_start_ns = int(ticket.get("worker_start_ns", wait_start_ns))
+        worker_end_ns = int(ticket.get("worker_end_ns", wait_end_ns))
+        worker_us = max(worker_end_ns - worker_start_ns, 0) / 1000.0
+        wait_us = max(wait_end_ns - wait_start_ns, 0) / 1000.0
+        background = bool(ticket.get("background"))
+        hidden_us = max(worker_us - wait_us, 0.0) if background else 0.0
+        overlap_ratio = hidden_us / worker_us if worker_us > 0 else 0.0
+
+        source_compute_ms = None
+        ioctl_start_offset_ms = None
+        ioctl_end_offset_ms = None
+        ioctl_duration_ms = None
+        direct_overlap_ms = 0.0
+        direct_overlap_ratio = 0.0
+        source_start_event = ticket.get("source_compute_start_event")
+        ioctl_start_event = ticket.get("ioctl_cuda_start_event")
+        ioctl_end_event = ticket.get("ioctl_cuda_end_event")
+        if source_start_event is not None and source_end_event is not None:
+            try:
+                source_end_event.synchronize()
+                source_compute_ms = float(
+                    source_start_event.elapsed_time(source_end_event)
+                )
+                if ioctl_start_event is not None and ioctl_end_event is not None:
+                    ioctl_end_event.synchronize()
+                    ioctl_start_offset_ms = float(
+                        source_start_event.elapsed_time(ioctl_start_event)
+                    )
+                    ioctl_end_offset_ms = float(
+                        source_start_event.elapsed_time(ioctl_end_event)
+                    )
+                    ioctl_duration_ms = float(
+                        ioctl_start_event.elapsed_time(ioctl_end_event)
+                    )
+                    direct_overlap_ms = max(
+                        min(source_compute_ms, ioctl_end_offset_ms)
+                        - max(0.0, ioctl_start_offset_ms),
+                        0.0,
+                    )
+                    if ioctl_duration_ms > 0:
+                        direct_overlap_ratio = direct_overlap_ms / ioctl_duration_ms
+            except Exception:
+                logger.debug(
+                    "Failed to measure warm source/driver overlap", exc_info=True
+                )
+
+        self._append_uvm_weight_prefetch_trace(
+            {
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "layer_name": self.layer_name,
+                "layer_id": self._uvm_layer_id(),
+                "step": step,
+                "action": "warm_prefetch_target_barrier",
+                "generation": ticket.get("generation"),
+                "source_layer_name": ticket.get("source_layer_name"),
+                "source_layer_id": ticket.get("source_layer_id"),
+                "background": background,
+                "expected_records": len(expected_ids),
+                "successful_records": len(successful_ids),
+                "failed_region_ids": sorted(failed_ids),
+                "missing_region_ids": missing_ids,
+                "unexpected_region_ids": unexpected_ids,
+                "logical_coverage_ok": logical_coverage_ok,
+                "expected_physical_records": len(expected_physical_ids),
+                "successful_physical_records": len(successful_physical_ids),
+                "assigned_physical_records": len(assigned_physical_ids),
+                "missing_physical_region_ids": missing_physical_ids,
+                "unassigned_physical_region_ids": unassigned_physical_ids,
+                "physical_coverage_ok": physical_coverage_ok,
+                "driver_requested_bytes": driver_requested_bytes,
+                "driver_accepted_bytes": driver_accepted_bytes,
+                "driver_success_count": int(
+                    result.get("reserved_driver_success_count", 0) or 0
+                ),
+                "driver_failure_count": int(
+                    result.get("reserved_driver_failure_count", 0) or 0
+                ),
+                "driver_ordinary_resident_bytes": int(
+                    result.get("reserved_driver_ordinary_resident_bytes", 0) or 0
+                ),
+                "driver_footprint_contract_broken": int(
+                    result.get("reserved_driver_footprint_contract_broken", 0) or 0
+                ),
+                "coverage_ok": coverage_ok,
+                "worker_us": worker_us,
+                "target_wait_us": wait_us,
+                "pipeline_hidden_us": hidden_us,
+                "pipeline_overlap_ratio": overlap_ratio,
+                "prefetch_pending_at_barrier": prefetch_pending_at_barrier,
+                "source_compute_pending_at_barrier": (
+                    source_compute_pending_at_barrier
+                ),
+                "overlap_observed_at_barrier": (
+                    prefetch_pending_at_barrier and source_compute_pending_at_barrier
+                ),
+                "source_compute_ms": source_compute_ms,
+                "driver_ioctl_start_offset_ms": ioctl_start_offset_ms,
+                "driver_ioctl_end_offset_ms": ioctl_end_offset_ms,
+                "driver_ioctl_duration_ms": ioctl_duration_ms,
+                "direct_compute_ioctl_overlap_ms": direct_overlap_ms,
+                "direct_compute_ioctl_overlap_ratio": direct_overlap_ratio,
+                "direct_compute_ioctl_overlap_observed": direct_overlap_ms > 0.0,
+            }
+        )
+        if not coverage_ok:
+            message = (
+                "warm expert prefetch coverage incomplete before MoE compute: "
+                f"layer={self.layer_name} step={step} missing={missing_ids} "
+                f"failed={sorted(failed_ids)} unexpected={unexpected_ids} "
+                f"missing_physical={missing_physical_ids} "
+                f"unassigned_physical={unassigned_physical_ids} "
+                f"driver_bytes={driver_accepted_bytes}/{driver_requested_bytes}"
+            )
+            if self.uvm_expert_warm_fail_closed:
+                raise RuntimeError(message)
+            logger.error(message)
+            return
+
+        for item in cast(list[dict[str, object]], ticket.get("items") or []):
+            region_id = str(item["residency_region_id"])
+            metadata = cast(dict[str, object], item.get("residency_metadata") or {})
+            mark_uvm_residency_state(
+                region_id=region_id,
+                state="gpu",
+                metadata={
+                    **metadata,
+                    "warm_prefetch_generation": ticket.get("generation"),
+                    "warm_prefetch_coverage_complete": True,
+                    "placement": "GPU_RESERVED_SLOT",
+                },
+            )
+            self._uvm_update_weight_expert_role_cache(
+                layer_id=cast(int | None, item.get("layer_id")),
+                global_expert_id=int(item["global_expert_id"]),
+                role=str(item["role"]),
+                state="gpu",
+                estimated_gpu_resident=True,
+            )
+        self._uvm_warm_prefetch_ready_step = step
+        self._uvm_warm_prefetch_ready_global_expert_ids = {
+            pair[0] for pair in expert_pairs
+        }
+        ticket["consumed"] = True
+
+    def _mark_uvm_warm_source_compute_end(self) -> None:
+        tickets = getattr(self, "_uvm_warm_prefetch_source_tickets", [])
+        if not tickets:
+            return
+        self._uvm_warm_prefetch_source_tickets = []
+        if not torch.cuda.is_available():
+            return
+        try:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record(torch.cuda.current_stream())
+            for ticket in tickets:
+                ticket["source_compute_end_event"] = end_event
+                ticket["source_compute_end_enqueued_ns"] = time.perf_counter_ns()
+        except Exception:
+            logger.debug("Failed to record warm source compute end", exc_info=True)
 
     def _maybe_prefetch_next_layer_uvm_warm_expert_weights(
         self,
@@ -7627,10 +9079,32 @@ class FusedMoE(CustomOp):
             return
         if source_layer_id % bank_count == target_layer_id % bank_count:
             return
-        target_module._prefetch_uvm_offloaded_warm_expert_weights(
+        source_start_event = None
+        if torch.cuda.is_available() and self.uvm_expert_warm_background_enable:
+            try:
+                source_start_event = torch.cuda.Event(enable_timing=True)
+                source_start_event.record(torch.cuda.current_stream())
+            except Exception:
+                source_start_event = None
+                logger.debug(
+                    "Failed to record warm source compute start",
+                    exc_info=True,
+                )
+        ticket = target_module._prefetch_uvm_offloaded_warm_expert_weights(
             source_layer_name=self.layer_name,
             source_layer_id=source_layer_id,
+            source_compute_start_event=source_start_event,
         )
+        if ticket is None:
+            return
+        if source_start_event is not None and ticket.get("background"):
+            ticket["source_compute_start_enqueued_ns"] = time.perf_counter_ns()
+        source_tickets = getattr(self, "_uvm_warm_prefetch_source_tickets", None)
+        if source_tickets is None:
+            source_tickets = []
+            self._uvm_warm_prefetch_source_tickets = source_tickets
+        if not any(existing is ticket for existing in source_tickets):
+            source_tickets.append(ticket)
 
     def _maybe_restore_uvm_reserved_expert_weights(
         self,
@@ -7649,8 +9123,7 @@ class FusedMoE(CustomOp):
             return
         if (
             self.uvm_expert_reserved_enable_after_warmup
-            and os.environ.get("VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY", "0")
-            != "1"
+            and os.environ.get("VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY", "0") != "1"
         ):
             if self.uvm_weight_prefetch_trace_enabled:
                 self._append_uvm_weight_prefetch_trace(
@@ -7691,8 +9164,7 @@ class FusedMoE(CustomOp):
                 else self._uvm_active_expert_pairs(topk_ids)
             )
             all_active_global_experts = {
-                global_expert_id
-                for global_expert_id, _ in all_active_expert_pairs
+                global_expert_id for global_expert_id, _ in all_active_expert_pairs
             }
             expert_pairs = (
                 reserved_expert_pairs
@@ -7702,6 +9174,18 @@ class FusedMoE(CustomOp):
                     all_active_expert_pairs,
                 )
             )
+            if (
+                getattr(self, "_uvm_warm_prefetch_ready_step", -1)
+                == self._uvm_moe_trace_step
+            ):
+                ready_warm_experts = getattr(
+                    self,
+                    "_uvm_warm_prefetch_ready_global_expert_ids",
+                    set(),
+                )
+                expert_pairs = [
+                    pair for pair in expert_pairs if pair[0] not in ready_warm_experts
+                ]
             if not expert_pairs:
                 self._append_uvm_weight_prefetch_trace(
                     {
@@ -7712,9 +9196,7 @@ class FusedMoE(CustomOp):
                         "mode": self.uvm_weight_prefetch_mode,
                         "prefetch_source": "reserved_fast_gate",
                         "action": "reserved_prefetch_no_offloaded_active",
-                        "active_global_experts": sorted(
-                            all_active_global_experts
-                        ),
+                        "active_global_experts": sorted(all_active_global_experts),
                         "candidate_expert_records": 0,
                         "reserved_offload_mask_hit_records": 0,
                     }
@@ -7791,8 +9273,7 @@ class FusedMoE(CustomOp):
                             else None
                         ),
                         "driver_flags": (
-                            int(residency_metadata.get("driver_flags") or 0)
-                            | (1 << 14)
+                            int(residency_metadata.get("driver_flags") or 0) | (1 << 14)
                         ),
                         "existing_state": existing_state,
                     }
@@ -7826,9 +9307,7 @@ class FusedMoE(CustomOp):
                         "local_expert_id": local_expert_id,
                         "ptr": ptr,
                         "bytes": size_bytes,
-                        **self._uvm_driver_capability_trace_fields(
-                            residency_metadata
-                        ),
+                        **self._uvm_driver_capability_trace_fields(residency_metadata),
                         "device": device,
                         "residency_metadata": residency_metadata,
                     }
@@ -7862,9 +9341,7 @@ class FusedMoE(CustomOp):
                     device=device,
                     step=self._uvm_moe_trace_step,
                     async_=False if force_synchronous_restore else None,
-                    sync_before_compute=(
-                        True if force_synchronous_restore else None
-                    ),
+                    sync_before_compute=(True if force_synchronous_restore else None),
                 )
                 self._append_uvm_expert_reserved_coverage_trace(
                     layer_id=layer_id,
@@ -7890,12 +9367,9 @@ class FusedMoE(CustomOp):
                         "mode": self.uvm_weight_prefetch_mode,
                         "prefetch_source": "reserved_fast_gate",
                         "action": "reserved_fast_gate_step_summary",
-                        "active_global_experts": sorted(
-                            all_active_global_experts
-                        ),
+                        "active_global_experts": sorted(all_active_global_experts),
                         "requested_reserved_global_experts": [
-                            global_expert_id
-                            for global_expert_id, _ in expert_pairs
+                            global_expert_id for global_expert_id, _ in expert_pairs
                         ],
                         "requested_reserved_local_experts": [
                             local_expert_id for _, local_expert_id in expert_pairs
@@ -7910,19 +9384,14 @@ class FusedMoE(CustomOp):
                         "warm_async_min_tokens": (
                             self.uvm_expert_warm_async_min_tokens
                         ),
-                        "forced_synchronous_restore": (
-                            force_synchronous_restore
-                        ),
+                        "forced_synchronous_restore": (force_synchronous_restore),
                         **reserved_batch_stats,
                         **prefetch_hit_stats,
                     }
                 )
         except Exception:
             logger.debug("Failed to run UVM reserved expert restore", exc_info=True)
-            if (
-                self.uvm_expert_reserved_enable
-                and self.uvm_expert_reserved_fail_fast
-            ):
+            if self.uvm_expert_reserved_enable and self.uvm_expert_reserved_fail_fast:
                 raise
 
     def must_reduce_shared_expert_outputs(self) -> bool:
@@ -8137,6 +9606,7 @@ class FusedMoE(CustomOp):
                 logical_to_physical_map=self.logical_to_physical_map,
                 logical_replica_count=self.logical_replica_count,
             )
+            self._mark_uvm_warm_source_compute_end()
             self._append_uvm_reserved_debug_trace(
                 "moe_quant_apply_exit",
                 stage="chunked",
@@ -8220,6 +9690,8 @@ class FusedMoE(CustomOp):
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.quant_method is not None
+
+        self._wait_for_uvm_warm_prefetch_before_compute()
 
         self.ensure_moe_quant_config_init()
         self.ensure_dp_chunking_init()
@@ -8322,6 +9794,7 @@ class FusedMoE(CustomOp):
                 logical_to_physical_map=self.logical_to_physical_map,
                 logical_replica_count=self.logical_replica_count,
             )
+            self._mark_uvm_warm_source_compute_end()
             self._append_uvm_reserved_debug_trace(
                 "moe_quant_apply_exit",
                 stage="eager",

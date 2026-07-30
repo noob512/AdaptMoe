@@ -8854,15 +8854,17 @@ int uvm_driver_batch_resume_bg_promotion(const uintptr_t* ptrs,
         nullptr);
 }
 
-int uvm_driver_batch_query_residency_bytes(const uintptr_t* ptrs,
-                                           const size_t* sizes,
-                                           size_t count,
-                                           int device,
-                                           uint64_t* gpu_bytes_out,
-                                           uint64_t* cpu_bytes_out,
-                                           uint64_t* any_bytes_out,
-                                           uint64_t* unknown_bytes_out,
-                                           uint64_t* queried_bytes_out) {
+static int uvm_driver_batch_query_residency_bytes_internal(
+    const uintptr_t* ptrs,
+    const size_t* sizes,
+    size_t count,
+    int device,
+    int async,
+    uint64_t* gpu_bytes_out,
+    uint64_t* cpu_bytes_out,
+    uint64_t* any_bytes_out,
+    uint64_t* unknown_bytes_out,
+    uint64_t* queried_bytes_out) {
     uint64_t gpu_bytes = 0;
     uint64_t cpu_bytes = 0;
     uint64_t any_bytes = 0;
@@ -8885,7 +8887,7 @@ int uvm_driver_batch_query_residency_bytes(const uintptr_t* ptrs,
         count,
         UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY,
         device,
-        0,
+        async,
         nullptr,
         results.empty() ? nullptr : results.data());
 
@@ -8909,6 +8911,51 @@ int uvm_driver_batch_query_residency_bytes(const uintptr_t* ptrs,
     if (unknown_bytes_out != nullptr) *unknown_bytes_out = unknown_bytes;
     if (queried_bytes_out != nullptr) *queried_bytes_out = queried_bytes;
     return ret;
+}
+
+int uvm_driver_batch_query_residency_bytes(const uintptr_t* ptrs,
+                                           const size_t* sizes,
+                                           size_t count,
+                                           int device,
+                                           uint64_t* gpu_bytes_out,
+                                           uint64_t* cpu_bytes_out,
+                                           uint64_t* any_bytes_out,
+                                           uint64_t* unknown_bytes_out,
+                                           uint64_t* queried_bytes_out) {
+    return uvm_driver_batch_query_residency_bytes_internal(
+        ptrs,
+        sizes,
+        count,
+        device,
+        0,
+        gpu_bytes_out,
+        cpu_bytes_out,
+        any_bytes_out,
+        unknown_bytes_out,
+        queried_bytes_out);
+}
+
+int uvm_driver_batch_query_residency_bytes_nowait(
+    const uintptr_t* ptrs,
+    const size_t* sizes,
+    size_t count,
+    int device,
+    uint64_t* gpu_bytes_out,
+    uint64_t* cpu_bytes_out,
+    uint64_t* any_bytes_out,
+    uint64_t* unknown_bytes_out,
+    uint64_t* queried_bytes_out) {
+    return uvm_driver_batch_query_residency_bytes_internal(
+        ptrs,
+        sizes,
+        count,
+        device,
+        1,
+        gpu_bytes_out,
+        cpu_bytes_out,
+        any_bytes_out,
+        unknown_bytes_out,
+        queried_bytes_out);
 }
 
 int uvm_is_managed_pointer(uintptr_t ptr, size_t size) {

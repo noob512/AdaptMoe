@@ -184,6 +184,7 @@ UVM_EXPERT_RESERVED_PREFETCH_ENTRY_NATIVE_POPULATE_UNSUPPORTED = 9
 UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT = 1 << 0
 UVM_EXPERT_OFFLOAD_RELEASE_FLAG_STRICT_2M_BLOCKS = 1 << 1
 UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K = 1 << 2
+UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ = 1 << 3
 
 
 class _UvmInitializeParams(ctypes.Structure):
@@ -467,6 +468,11 @@ class _ExpertOffloadReleaseParams(ctypes.Structure):
         ("attempted_bytes", ctypes.c_uint64),
         ("released_bytes", ctypes.c_uint64),
         ("failed_bytes", ctypes.c_uint64),
+        ("remote_map_blocks", ctypes.c_uint32),
+        ("remote_map_failure_blocks", ctypes.c_uint32),
+        ("cpu_resident_bytes", ctypes.c_uint64),
+        ("remote_mapped_bytes", ctypes.c_uint64),
+        ("newly_remote_mapped_bytes", ctypes.c_uint64),
         ("first_failed_block", ctypes.c_uint64),
         ("first_error", ctypes.c_uint32),
         ("rmStatus", ctypes.c_uint32),
@@ -915,6 +921,11 @@ def load_uvm_library() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_uint64),
     ]
+    if hasattr(lib, "uvm_driver_batch_query_residency_bytes_nowait"):
+        lib.uvm_driver_batch_query_residency_bytes_nowait.restype = ctypes.c_int
+        lib.uvm_driver_batch_query_residency_bytes_nowait.argtypes = (
+            lib.uvm_driver_batch_query_residency_bytes.argtypes
+        )
 
     lib.uvm_driver_phase_f_register_region.restype = ctypes.c_int
     lib.uvm_driver_phase_f_register_region.argtypes = [
@@ -2584,15 +2595,29 @@ def _expert_offload_release_entry_to_dict(
     fd_source: str | None = None,
 ) -> dict[str, object]:
     raw_ok = int(ret) == 0 and int(params.rmStatus) == 0
+    remote_read = bool(
+        int(params.flags) & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ
+    )
     effective_ok = raw_ok and (
         int(params.block_count) > 0
         or int(params.attempted_blocks) > 0
         or int(params.skipped_blocks) > 0
         or int(params.released_bytes) > 0
     )
+    if remote_read:
+        effective_ok = (
+            effective_ok
+            and int(params.remote_map_failure_blocks) == 0
+            and int(params.cpu_resident_bytes) >= int(params.length)
+            and int(params.remote_mapped_bytes) >= int(params.length)
+        )
     reason = None
     if raw_ok and not effective_ok:
-        reason = "no_va_blocks"
+        reason = (
+            "remote_mapping_incomplete"
+            if remote_read
+            else "no_va_blocks"
+        )
     elif not raw_ok:
         reason = "ioctl_or_rm_error"
     return {
@@ -2603,6 +2628,8 @@ def _expert_offload_release_entry_to_dict(
         "ioctl_ret": int(ret),
         "errno": int(saved_errno),
         "rm_status": int(params.rmStatus),
+        "flags": int(params.flags),
+        "remote_read": remote_read,
         "region_id": int(params.region_id),
         "pool": int(params.pool),
         "layer_id": int(params.layer_id),
@@ -2618,6 +2645,11 @@ def _expert_offload_release_entry_to_dict(
         "attempted_bytes": int(params.attempted_bytes),
         "released_bytes": int(params.released_bytes),
         "failed_bytes": int(params.failed_bytes),
+        "remote_map_blocks": int(params.remote_map_blocks),
+        "remote_map_failure_blocks": int(params.remote_map_failure_blocks),
+        "cpu_resident_bytes": int(params.cpu_resident_bytes),
+        "remote_mapped_bytes": int(params.remote_mapped_bytes),
+        "newly_remote_mapped_bytes": int(params.newly_remote_mapped_bytes),
         "first_failed_block": int(params.first_failed_block),
         "first_error": int(params.first_error),
     }
@@ -2630,6 +2662,7 @@ def driver_expert_offload_release_regions(
     require_expert: bool = True,
     strict_2m_blocks: bool = False,
     subchunk_64k: bool = False,
+    remote_read: bool = False,
     max_blocks: int = 0,
     prefer_existing: bool = True,
     return_entries: bool = True,
@@ -2637,8 +2670,9 @@ def driver_expert_offload_release_regions(
     """Targeted offload registered expert regions and release GPU PMM chunks.
 
     The region ids are Phase-F driver region ids, not Python residency keys.
-    The managed VA ranges remain allocated; only GPU physical backing is
-    evicted through the driver release path.
+    The managed VA ranges remain allocated. With ``remote_read=True``, each
+    released range is also synchronously mapped read-only from the GPU to its
+    CPU backing before the ioctl commits success.
     """
     normalized: list[int] = []
     for region_id in region_ids:
@@ -2661,6 +2695,11 @@ def driver_expert_offload_release_regions(
         "attempted_bytes": 0,
         "released_bytes": 0,
         "failed_bytes": 0,
+        "remote_map_blocks": 0,
+        "remote_map_failure_blocks": 0,
+        "cpu_resident_bytes": 0,
+        "remote_mapped_bytes": 0,
+        "newly_remote_mapped_bytes": 0,
         "first_error": 0,
         "first_failed_region_id": 0,
         "first_failed_block": 0,
@@ -2677,6 +2716,8 @@ def driver_expert_offload_release_regions(
         flags |= UVM_EXPERT_OFFLOAD_RELEASE_FLAG_STRICT_2M_BLOCKS
     if subchunk_64k:
         flags |= UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K
+    if remote_read:
+        flags |= UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ
 
     try:
         gpu_uuid = _phase_f_gpu_uuid(device)
@@ -2701,6 +2742,11 @@ def driver_expert_offload_release_regions(
             "attempted_bytes": 0,
             "released_bytes": 0,
             "failed_bytes": 0,
+            "remote_map_blocks": 0,
+            "remote_map_failure_blocks": 0,
+            "cpu_resident_bytes": 0,
+            "remote_mapped_bytes": 0,
+            "newly_remote_mapped_bytes": 0,
             "first_error": 0,
             "first_failed_region_id": 0,
             "first_failed_block": 0,
@@ -2737,6 +2783,11 @@ def driver_expert_offload_release_regions(
                 "attempted_bytes",
                 "released_bytes",
                 "failed_bytes",
+                "remote_map_blocks",
+                "remote_map_failure_blocks",
+                "cpu_resident_bytes",
+                "remote_mapped_bytes",
+                "newly_remote_mapped_bytes",
             ):
                 candidate[key] = int(candidate[key]) + int(entry.get(key) or 0)
             if not ok and int(candidate["first_error"]) == 0:
@@ -2812,6 +2863,36 @@ def driver_expert_offload_release_regions(
             else []
         )
         return result
+
+
+def driver_expert_offload_release_remote_regions(
+    region_ids: Sequence[int],
+    *,
+    device: int = 0,
+    require_expert: bool = True,
+    strict_2m_blocks: bool = False,
+    subchunk_64k: bool = False,
+    max_blocks: int = 0,
+    prefer_existing: bool = True,
+    return_entries: bool = True,
+) -> dict[str, object]:
+    """Release expert GPU backing and establish remote-read PTEs atomically.
+
+    Atomicity here is per registered driver region: the ioctl reports success
+    only after all bytes in that region are CPU resident and GPU remote mapped.
+    The aggregate result remains failed if any submitted region is incomplete.
+    """
+    return driver_expert_offload_release_regions(
+        region_ids,
+        device=device,
+        require_expert=require_expert,
+        strict_2m_blocks=strict_2m_blocks,
+        subchunk_64k=subchunk_64k,
+        remote_read=True,
+        max_blocks=max_blocks,
+        prefer_existing=prefer_existing,
+        return_entries=return_entries,
+    )
 
 
 def _expert_reserved_prefetch_mode_value(mode: str | int) -> int:
@@ -3661,8 +3742,16 @@ def driver_batch_query_ranges_residency(
 def driver_batch_query_ranges_residency_bytes(
     ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
     device: int = 0,
+    *,
+    wait_for_trackers: bool = True,
 ) -> dict[str, int | bool]:
-    """Query page-granular real UVM residency bytes for managed ranges."""
+    """Query page-granular real UVM residency bytes for managed ranges.
+
+    A no-wait query is intended for callers which have already synchronized
+    CUDA work. It reads the protected resident masks without waiting on each
+    VA block tracker, avoiding an unbounded wait on stale experimental tracker
+    entries.
+    """
     result: dict[str, int | bool] = {
         "ok": False,
         "status": -1,
@@ -3684,6 +3773,17 @@ def driver_batch_query_ranges_residency_bytes(
         result["status"] = 0
         return result
 
+    query_fn = _uvm_lib.uvm_driver_batch_query_residency_bytes
+    if not wait_for_trackers:
+        query_fn = getattr(
+            _uvm_lib,
+            "uvm_driver_batch_query_residency_bytes_nowait",
+            None,
+        )
+        if query_fn is None:
+            result["status"] = -2
+            return result
+
     final_status = 0
     total_gpu_bytes = 0
     total_cpu_bytes = 0
@@ -3702,7 +3802,7 @@ def driver_batch_query_ranges_residency_bytes(
         unknown_bytes = ctypes.c_uint64(0)
         queried_bytes = ctypes.c_uint64(0)
         status = int(
-            _uvm_lib.uvm_driver_batch_query_residency_bytes(
+            query_fn(
                 ptr_array,
                 size_array,
                 ctypes.c_size_t(count),

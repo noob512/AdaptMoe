@@ -37,6 +37,17 @@ CUSTOM_SKIP_ACTIVE_TOPK="${CUSTOM_SKIP_ACTIVE_TOPK:-0}"
 CUSTOM_KV_MANAGED="${CUSTOM_KV_MANAGED:-1}"
 UVA_KV_MANAGED="${UVA_KV_MANAGED:-0}"
 SKIP_POST_INIT_WARMUP="${SKIP_POST_INIT_WARMUP:-0}"
+REMOTE_PREPARE_MODE="${REMOTE_PREPARE_MODE:-native}"
+HOT_REPAIR_ENABLE="${HOT_REPAIR_ENABLE:-0}"
+HOT_REPAIR_PREFERRED_GPU="${HOT_REPAIR_PREFERRED_GPU:-1}"
+HOT_REPAIR_REQUIRE_FULL_RESIDENCY="${HOT_REPAIR_REQUIRE_FULL_RESIDENCY:-1}"
+INIT_WEIGHT_OFFLOAD_STAGE="${INIT_WEIGHT_OFFLOAD_STAGE:-post_warmup}"
+REQUIRE_UVM_PROACTIVE_MIGRATION_DISABLED="${REQUIRE_UVM_PROACTIVE_MIGRATION_DISABLED:-0}"
+REQUIRE_COMPLETE_REMOTE_PREPARE="${REQUIRE_COMPLETE_REMOTE_PREPARE:-0}"
+KV_INIT_FAULT_PROBE="${KV_INIT_FAULT_PROBE:-0}"
+KV_INIT_FAULT_PROBE_SYNC="${KV_INIT_FAULT_PROBE_SYNC:-0}"
+NVIDIA_SMI_MONITOR_ENABLE="${NVIDIA_SMI_MONITOR_ENABLE:-1}"
+SKIP_GPU_CLEAN_CHECK="${SKIP_GPU_CLEAN_CHECK:-0}"
 REUSE_PREP="${REUSE_PREP:-0}"
 SUMMARY_ONLY="${SUMMARY_ONLY:-0}"
 COLD_PLAN_SELECTION_MODE="${COLD_PLAN_SELECTION_MODE:-global_budget}"
@@ -71,6 +82,25 @@ restore_pte_params() {
   set_param "${PTE_MAX_PATH}" "${ORIGINAL_PTE_MAX}" || true
   set_param "${PTE_ENABLE_PATH}" "${ORIGINAL_PTE_ENABLE}" || true
 }
+
+require_uvm_proactive_migration_disabled() {
+  [[ "${REQUIRE_UVM_PROACTIVE_MIGRATION_DISABLED}" == "1" ]] || return 0
+  local name value
+  for name in \
+    uvm_perf_prefetch_enable \
+    uvm_perf_access_counter_migration_enable \
+    uvm_perf_thrashing_enable; do
+    if [[ ! -r "${PARAM_DIR}/${name}" ]]; then
+      echo "Required UVM parameter is unavailable: ${name}" >&2
+      return 1
+    fi
+    value="$(tr -d '[:space:]' < "${PARAM_DIR}/${name}")"
+    if [[ "${value}" != "0" && "${value}" != "N" ]]; then
+      echo "UVM proactive migration must be disabled: ${name}=${value}" >&2
+      return 1
+    fi
+  done
+}
 trap restore_pte_params EXIT
 
 gpu_used_mib() {
@@ -81,6 +111,9 @@ gpu_used_mib() {
 wait_for_clean_gpu() {
   local label="$1"
   local used
+  if [[ "${SKIP_GPU_CLEAN_CHECK}" == "1" ]]; then
+    return 0
+  fi
   for _ in $(seq 1 120); do
     used="$(gpu_used_mib || echo 999999)"
     if [[ "${used}" =~ ^[0-9]+$ ]] && [[ "${used}" -le 1024 ]]; then
@@ -473,15 +506,23 @@ run_custom_case() {
       VLLM_UVM_DRIVER_TAG_ENABLE=1 \
       VLLM_UVM_DRIVER_TAG_REQUIRE_MANAGED=1 \
       VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE="${CUSTOM_ACCESS_MODE}" \
+      VLLM_UVM_REMOTE_PREPARE_MODE="${REMOTE_PREPARE_MODE}" \
       VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE=1 \
       VLLM_UVM_INIT_WEIGHT_OFFLOAD_MODE=driver_release_cpu \
-      VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE=post_warmup \
+      VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE="${INIT_WEIGHT_OFFLOAD_STAGE}" \
       VLLM_UVM_INIT_WEIGHT_PLAN_FILE="${COLD_PLAN}" \
       VLLM_UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN=1 \
       VLLM_UVM_INIT_WEIGHT_TARGET_ROLES="${TARGET_ROLES}" \
       VLLM_UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER="${NUM_EXPERTS}" \
       VLLM_UVM_INIT_WEIGHT_SYNC=1 \
+      VLLM_UVM_INIT_WEIGHT_HOT_REPAIR_ENABLE="${HOT_REPAIR_ENABLE}" \
+      VLLM_UVM_INIT_WEIGHT_HOT_REPAIR_PREFERRED_GPU="${HOT_REPAIR_PREFERRED_GPU}" \
+      VLLM_UVM_INIT_WEIGHT_HOT_REPAIR_REQUIRE_FULL_RESIDENCY="${HOT_REPAIR_REQUIRE_FULL_RESIDENCY}" \
+      VLLM_UVM_INIT_WEIGHT_REQUIRE_COMPLETE_REMOTE_PREPARE="${REQUIRE_COMPLETE_REMOTE_PREPARE}" \
       VLLM_UVM_INIT_WEIGHT_TRACE_FILE="${dir}/init_trace.jsonl" \
+      VLLM_UVM_KV_INIT_FAULT_PROBE="${KV_INIT_FAULT_PROBE}" \
+      VLLM_UVM_KV_INIT_FAULT_PROBE_FILE="${dir}/kv_init_probe.jsonl" \
+      VLLM_UVM_KV_INIT_FAULT_PROBE_SYNC="${KV_INIT_FAULT_PROBE_SYNC}" \
       VLLM_UVM_INIT_WEIGHT_PLAN_RESIDENCY_TRACE_ENABLE=0 \
       VLLM_UVM_WEIGHT_PREFETCH_ENABLE=1 \
       VLLM_UVM_WEIGHT_PREFETCH_MODE=prefetch \
@@ -541,11 +582,15 @@ run_custom_case() {
     return 0
   fi
 
-  nvidia-smi dmon -s t -d 1 -o DT > "${dir}/dmon_pcie.csv" 2>&1 &
-  local dmon_pcie_pid=$!
-  nvidia-smi dmon -i 0 -d 1 --gpm-metrics 20,21,160,161,255,256 -o DT \
-    > "${dir}/dmon_gpm.csv" 2>&1 &
-  local dmon_gpm_pid=$!
+  local dmon_pcie_pid=""
+  local dmon_gpm_pid=""
+  if [[ "${NVIDIA_SMI_MONITOR_ENABLE}" == "1" ]]; then
+    nvidia-smi dmon -s t -d 1 -o DT > "${dir}/dmon_pcie.csv" 2>&1 &
+    dmon_pcie_pid=$!
+    nvidia-smi dmon -i 0 -d 1 --gpm-metrics 20,21,160,161,255,256 -o DT \
+      > "${dir}/dmon_gpm.csv" 2>&1 &
+    dmon_gpm_pid=$!
+  fi
 
   set +e
   (
@@ -689,7 +734,8 @@ write_summary() {
     "${VLLM_PY}" - "${RUN_ROOT}" "${COLD_PLAN}" \
       "${CUSTOM_ACCESS_MODE}" "${NUM_PROMPTS}" "${OUTPUT_LEN}" \
       "${KV_CACHE_MEMORY_BYTES}" "${CUSTOM_KV_MANAGED}" \
-      "${UVA_KV_MANAGED}" "${SKIP_POST_INIT_WARMUP}" <<'PY'
+      "${UVA_KV_MANAGED}" "${SKIP_POST_INIT_WARMUP}" \
+      "${INIT_WEIGHT_OFFLOAD_STAGE}" <<'PY'
 import hashlib
 import json
 import re
@@ -706,6 +752,7 @@ kv_cache_memory_bytes = int(sys.argv[6])
 custom_kv_managed = int(sys.argv[7])
 uva_kv_managed = int(sys.argv[8])
 skip_post_init_warmup = int(sys.argv[9])
+init_weight_offload_stage = sys.argv[10]
 
 def read_json(path: Path):
     if not path.exists():
@@ -923,6 +970,7 @@ summary = {
         "custom_kv_managed": custom_kv_managed,
         "uva_kv_managed": uva_kv_managed,
         "skip_post_init_warmup": skip_post_init_warmup,
+        "init_weight_offload_stage": init_weight_offload_stage,
     },
     "plan": read_json(plan_path).get("metadata", {}),
     "cases": cases,
@@ -945,7 +993,14 @@ main() {
   echo "run_root=${RUN_ROOT}" | tee -a "${RUN_ROOT}/run.log"
   echo "max_num_seqs_list=${MAX_NUM_SEQS_LIST}" | tee -a "${RUN_ROOT}/run.log"
   echo "custom_access_mode=${CUSTOM_ACCESS_MODE}" | tee -a "${RUN_ROOT}/run.log"
+  echo "remote_prepare_mode=${REMOTE_PREPARE_MODE}" | tee -a "${RUN_ROOT}/run.log"
+  echo "hot_repair_enable=${HOT_REPAIR_ENABLE}" | tee -a "${RUN_ROOT}/run.log"
+  echo "init_weight_offload_stage=${INIT_WEIGHT_OFFLOAD_STAGE}" | tee -a "${RUN_ROOT}/run.log"
+  echo "require_complete_remote_prepare=${REQUIRE_COMPLETE_REMOTE_PREPARE}" | tee -a "${RUN_ROOT}/run.log"
+  echo "kv_init_fault_probe=${KV_INIT_FAULT_PROBE}" | tee -a "${RUN_ROOT}/run.log"
+  echo "nvidia_smi_monitor_enable=${NVIDIA_SMI_MONITOR_ENABLE}" | tee -a "${RUN_ROOT}/run.log"
   echo "cold_plan_selection_mode=${COLD_PLAN_SELECTION_MODE}" | tee -a "${RUN_ROOT}/run.log"
+  require_uvm_proactive_migration_disabled
   if [[ "${REUSE_PREP}" == "1" && -s "${PILOT_TRACE}" && -s "${COLD_PLAN}" ]]; then
     echo "reusing pilot trace and cold plan" | tee -a "${RUN_ROOT}/run.log"
   elif [[ "${REUSE_PILOT}" == "1" && -s "${PILOT_TRACE}" ]]; then

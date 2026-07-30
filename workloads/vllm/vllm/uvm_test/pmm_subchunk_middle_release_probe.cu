@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
@@ -49,6 +50,7 @@ static constexpr unsigned int kRegionFlagCpuOffloadedReserved = 1u << 14;
 static constexpr unsigned int kRegionFlagExpertEnvelope = 1u << 15;
 static constexpr unsigned int kReleaseRequireExpert = 1u << 0;
 static constexpr unsigned int kReleaseSubchunk64K = 1u << 2;
+static constexpr unsigned int kReleaseRemoteRead = 1u << 3;
 
 static constexpr unsigned long long kObserverRegionId = 0x6dd0000000000001ull;
 static constexpr unsigned long long kEnvelopeRegionBase = 0x6dd0000000001000ull;
@@ -165,6 +167,11 @@ struct ExpertOffloadReleaseParams {
     unsigned long long attempted_bytes = 0;
     unsigned long long released_bytes = 0;
     unsigned long long failed_bytes = 0;
+    unsigned int remote_map_blocks = 0;
+    unsigned int remote_map_failure_blocks = 0;
+    unsigned long long cpu_resident_bytes = 0;
+    unsigned long long remote_mapped_bytes = 0;
+    unsigned long long newly_remote_mapped_bytes = 0;
     unsigned long long first_failed_block = 0;
     unsigned int first_error = 0;
     unsigned int rmStatus = 0;
@@ -174,6 +181,7 @@ struct Args {
     int device = 0;
     bool envelope = true;
     bool retouch = true;
+    bool remote_read = false;
 };
 
 __global__ void verify_pattern_kernel(const unsigned int *ptr,
@@ -205,10 +213,13 @@ static bool parse_args(int argc, char **argv, Args *args)
         else if (std::strcmp(argv[i], "--no-retouch") == 0) {
             args->retouch = false;
         }
+        else if (std::strcmp(argv[i], "--remote-read") == 0) {
+            args->remote_read = true;
+        }
         else {
             std::fprintf(stderr,
                          "usage: %s [--device N] [--envelope|--legacy] "
-                         "[--no-retouch]\n",
+                         "[--no-retouch] [--remote-read]\n",
                          argv[0]);
             return false;
         }
@@ -511,18 +522,30 @@ static PhaseNQueryRegionBlocksParams observer_query(int fd,
 static ExpertOffloadReleaseParams release_region(int fd,
                                                  const PhaseFUuid &gpu_uuid,
                                                  unsigned long long region_id,
-                                                 const char *label)
+                                                 const char *label,
+                                                 bool remote_read,
+                                                 double *elapsed_ms_out)
 {
     ExpertOffloadReleaseParams params{};
     params.region_id = region_id;
     params.gpu_uuid = gpu_uuid;
     params.flags = kReleaseRequireExpert | kReleaseSubchunk64K;
+    if (remote_read)
+        params.flags |= kReleaseRemoteRead;
 
+    const auto start = std::chrono::steady_clock::now();
     int ret = ioctl(fd, kExpertOffloadReleaseIoctl, &params);
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count();
+    if (elapsed_ms_out)
+        *elapsed_ms_out = elapsed_ms;
     std::printf("expert_offload_release label=%s region_id=%llu ret=%d rmStatus=%u "
                 "base=0x%llx length=%llu blocks=%llu attempted=%u success=%u "
                 "failure=%u skipped=%u attempted_bytes=%llu released_bytes=%llu "
-                "failed_bytes=%llu first_error=%u first_failed=0x%llx\n",
+                "failed_bytes=%llu remote_blocks=%u remote_failures=%u "
+                "cpu_bytes=%llu remote_bytes=%llu newly_remote_bytes=%llu "
+                "elapsed_ms=%.3f first_error=%u first_failed=0x%llx\n",
                 label,
                 region_id,
                 ret,
@@ -537,6 +560,12 @@ static ExpertOffloadReleaseParams release_region(int fd,
                 params.attempted_bytes,
                 params.released_bytes,
                 params.failed_bytes,
+                params.remote_map_blocks,
+                params.remote_map_failure_blocks,
+                params.cpu_resident_bytes,
+                params.remote_mapped_bytes,
+                params.newly_remote_mapped_bytes,
+                elapsed_ms,
                 params.first_error,
                 params.first_failed_block);
     if (ret != 0 || params.rmStatus != 0)
@@ -558,11 +587,13 @@ int main(int argc, char **argv)
     PhaseFUuid gpu_uuid = gpu_uuid_for_device(args.device);
 
     std::printf("pmm_subchunk_middle_release_probe_begin device=%d gpu=%s mode=%s "
+                "remote_read=%u "
                 "total_bytes=%zu release_offset=%zu release_bytes=%zu "
                 "envelope_bytes=%zu envelope_count=%u\n",
                 args.device,
                 prop.name,
                 args.envelope ? "envelope" : "legacy",
+                args.remote_read ? 1u : 0u,
                 kTotalBytes,
                 kReleaseOffset,
                 kReleaseBytes,
@@ -642,18 +673,22 @@ int main(int argc, char **argv)
                                     kRegionFlagStreamingSubpool |
                                     kRegionFlagCpuOffloadedReserved;
     const unsigned int release_flags =
-        base_flags | (args.envelope ? kRegionFlagExpertEnvelope : 0u);
+        base_flags |
+        (args.envelope && !args.remote_read ? kRegionFlagExpertEnvelope : 0u);
 
     std::vector<unsigned long long> region_ids;
-    for (unsigned int i = 0; i < kEnvelopeCount; ++i) {
+    const unsigned int release_region_count =
+        args.remote_read ? 1u : kEnvelopeCount;
+    for (unsigned int i = 0; i < release_region_count; ++i) {
         unsigned long long region_id = kEnvelopeRegionBase + i;
         uintptr_t region_base = base + kReleaseOffset + i * kEnvelopeBytes;
+        size_t region_bytes = args.remote_read ? kReleaseBytes : kEnvelopeBytes;
         char label[64];
         std::snprintf(label, sizeof(label), "middle_%u_register", i);
         register_region(fd,
                         region_id,
                         region_base,
-                        kEnvelopeBytes,
+                        region_bytes,
                         release_flags,
                         i,
                         label);
@@ -662,19 +697,33 @@ int main(int argc, char **argv)
 
     unsigned long long total_released = 0;
     unsigned long long total_attempted = 0;
+    unsigned long long total_cpu_resident = 0;
+    unsigned long long total_remote_mapped = 0;
+    unsigned long long total_newly_remote_mapped = 0;
+    double total_release_ms = 0.0;
     bool release_ok = true;
     print_mem("before_middle_release");
     for (unsigned int i = 0; i < region_ids.size(); ++i) {
         char label[64];
         std::snprintf(label, sizeof(label), "middle_%u_release", i);
-        ExpertOffloadReleaseParams rel =
-            release_region(fd, gpu_uuid, region_ids[i], label);
+        double release_ms = 0.0;
+        ExpertOffloadReleaseParams rel = release_region(
+            fd, gpu_uuid, region_ids[i], label, args.remote_read, &release_ms);
         total_released += rel.released_bytes;
         total_attempted += rel.attempted_bytes;
+        total_cpu_resident += rel.cpu_resident_bytes;
+        total_remote_mapped += rel.remote_mapped_bytes;
+        total_newly_remote_mapped += rel.newly_remote_mapped_bytes;
+        total_release_ms += release_ms;
         release_ok = release_ok &&
                      rel.rmStatus == 0 &&
                      rel.failure_blocks == 0 &&
-                     rel.released_bytes == kEnvelopeBytes;
+                     rel.released_bytes ==
+                         (args.remote_read ? kReleaseBytes : kEnvelopeBytes) &&
+                     (!args.remote_read ||
+                      (rel.remote_map_failure_blocks == 0 &&
+                       rel.cpu_resident_bytes == kReleaseBytes &&
+                       rel.remote_mapped_bytes == kReleaseBytes));
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     print_mem("after_middle_release");
@@ -703,6 +752,19 @@ int main(int argc, char **argv)
                         allocation_bytes + right_offset,
                         right_bytes,
                         "after_release_right_4_6m");
+
+    bool remote_gpu_verify_ok = !args.remote_read;
+    PhaseFRangeResult after_remote_read_target = after_target;
+    if (args.remote_read) {
+        remote_gpu_verify_ok = gpu_verify_all(
+            allocation, kTotalBytes, "after_release_remote_read");
+        after_remote_read_target =
+            query_residency(fd,
+                            gpu_uuid,
+                            allocation_bytes + target_offset,
+                            target_bytes,
+                            "after_gpu_remote_read_target_2_3p5m");
+    }
 
     for (unsigned int i = 0; i < region_ids.size(); ++i) {
         char label[64];
@@ -765,6 +827,13 @@ int main(int argc, char **argv)
     const bool target_offloaded =
         after_target.resident_gpu_bytes == 0 &&
         after_target.resident_cpu_bytes == target_bytes;
+    const bool remote_mapping_ok =
+        !args.remote_read ||
+        (total_cpu_resident == target_bytes &&
+         total_remote_mapped == target_bytes &&
+         after_remote_read_target.resident_gpu_bytes == 0 &&
+         after_remote_read_target.resident_cpu_bytes == target_bytes &&
+         remote_gpu_verify_ok);
     const bool neighbors_unaffected =
         after_left.resident_gpu_bytes == left_bytes &&
         after_tail.resident_gpu_bytes == tail_bytes &&
@@ -788,19 +857,26 @@ int main(int argc, char **argv)
                                sampled_first_stable &&
                                retouch_stable;
 
-    std::printf("pmm_subchunk_middle_release_probe_final mode=%s "
+    std::printf("pmm_subchunk_middle_release_probe_final mode=%s remote_read=%u "
                 "release_ok=%u total_attempted=%llu total_released=%llu "
+                "total_cpu_resident=%llu total_remote_mapped=%llu "
+                "total_newly_remote_mapped=%llu total_release_ms=%.3f "
                 "expected_released=%zu before_residency_ok=%u "
                 "target_offloaded=%u neighbors_unaffected=%u restore_ok=%u "
                 "restored_neighbors_ok=%u gpu_verify_ok=%u "
                 "before_va_ranges=%u after_va_ranges=%u "
                 "before_populated=%llu after_populated=%llu "
                 "before_logical=%llu after_logical=%llu object_stable=%u "
-                "retouch_stable=%u\n",
+                "retouch_stable=%u remote_mapping_ok=%u remote_gpu_verify_ok=%u\n",
                 args.envelope ? "envelope" : "legacy",
+                args.remote_read ? 1u : 0u,
                 release_ok ? 1u : 0u,
                 total_attempted,
                 total_released,
+                total_cpu_resident,
+                total_remote_mapped,
+                total_newly_remote_mapped,
+                total_release_ms,
                 kReleaseBytes,
                 before_residency_ok ? 1u : 0u,
                 target_offloaded ? 1u : 0u,
@@ -815,7 +891,9 @@ int main(int argc, char **argv)
                 before.logical_block_count,
                 after.logical_block_count,
                 object_stable ? 1u : 0u,
-                retouch_stable ? 1u : 0u);
+                retouch_stable ? 1u : 0u,
+                remote_mapping_ok ? 1u : 0u,
+                remote_gpu_verify_ok ? 1u : 0u);
 
     close(fd);
     CUDA_CHECK(cudaFree(allocation));
@@ -826,6 +904,7 @@ int main(int argc, char **argv)
         !before_residency_ok ||
         !target_offloaded ||
         !neighbors_unaffected ||
+        !remote_mapping_ok ||
         !restore_ok ||
         !restored_neighbors_ok ||
         !gpu_verify_ok) {

@@ -70,6 +70,85 @@ def test_release_remote_wrapper_enables_combined_flag(monkeypatch: Any) -> None:
     assert captured["subchunk_64k"] is True
 
 
+def test_custom_512k_prefetch_requires_migration_release_and_remote_map(
+    monkeypatch: Any,
+) -> None:
+    envelope_bytes = 512 * 1024
+    captured: dict[str, object] = {}
+
+    def release(region_ids: Any, **kwargs: Any) -> dict[str, object]:
+        captured["region_ids"] = list(region_ids)
+        captured.update(kwargs)
+        return {
+            "ok": True,
+            "entries": [
+                {
+                    "ok": True,
+                    "region_id": 10,
+                    "length": envelope_bytes,
+                    "released_bytes": envelope_bytes,
+                    "cpu_resident_bytes": envelope_bytes,
+                    "remote_mapped_bytes": envelope_bytes,
+                    "remote_map_failure_blocks": 0,
+                },
+                {
+                    "ok": True,
+                    "region_id": 11,
+                    "length": envelope_bytes,
+                    "released_bytes": envelope_bytes - 64 * 1024,
+                    "cpu_resident_bytes": envelope_bytes,
+                    "remote_mapped_bytes": envelope_bytes,
+                    "remote_map_failure_blocks": 0,
+                },
+            ],
+        }
+
+    monkeypatch.setattr(
+        uvm_module,
+        "driver_expert_offload_release_remote_regions",
+        release,
+    )
+
+    result = uvm_module.driver_prefetch_cpu_release_remote_512k_regions([10, 11])
+
+    assert captured["region_ids"] == [10, 11]
+    assert captured["subchunk_64k"] is True
+    assert result["operation"] == "prefetch_cpu_release_remote_512k"
+    assert result["ok"] is False
+    assert result["validated_success_count"] == 1
+    assert result["validated_failure_count"] == 1
+    assert result["entries"][0]["prefetch_release_complete"] is True
+    assert result["entries"][1]["prefetch_release_reason"] == (
+        "gpu_backing_release_incomplete"
+    )
+
+
+@pytest.mark.parametrize(
+    ("access_mode", "prepare_mode", "requires_envelopes", "requires_logical"),
+    [
+        ("restore", "native", True, False),
+        ("remote_read", "native", False, False),
+        ("remote_read", "release_remote", True, False),
+    ],
+)
+def test_stage_m_release_registration_granularity(
+    access_mode: str,
+    prepare_mode: str,
+    requires_envelopes: bool,
+    requires_logical: bool,
+) -> None:
+    layer = object.__new__(FusedMoE)
+    layer.uvm_init_weight_offload_mode = "driver_release_cpu"
+    layer.uvm_expert_offload_access_mode = access_mode
+    layer.uvm_remote_prepare_mode = prepare_mode
+
+    assert layer._uvm_stage_m_requires_release_envelopes() is requires_envelopes
+    assert (
+        layer._uvm_stage_m_requires_logical_release_registration()
+        is requires_logical
+    )
+
+
 def test_empty_weight_plan_is_loaded_only_once(
     monkeypatch: Any,
     tmp_path: Path,
@@ -722,6 +801,16 @@ def test_incremental_remote_read_does_not_require_reserved_capacity() -> None:
     assert layer._uvm_incremental_slot_capacity_allows(6) is True
 
 
+def test_incremental_release_remote_initial_stage_requires_envelopes() -> None:
+    layer = object.__new__(FusedMoE)
+    layer.uvm_init_weight_offload_mode = "driver_release_cpu"
+    layer.uvm_expert_offload_access_mode = "remote_read"
+    layer.uvm_remote_prepare_mode = "release_remote"
+
+    assert layer._uvm_stage_m_requires_release_envelopes() is True
+    assert layer._uvm_stage_m_requires_logical_release_registration() is False
+
+
 def test_dynamic_expert_heat_accumulates_and_resets() -> None:
     import torch
 
@@ -791,6 +880,19 @@ def test_dynamic_remote_read_swap_demotes_before_promoting(
         "batch_prefetch_ranges_to_device_with_executor",
         prefetch_gpu,
     )
+    monkeypatch.setattr(
+        layer_module,
+        "driver_batch_query_ranges_residency_bytes",
+        lambda ranges, _device: {
+            "ok": True,
+            "status": 0,
+            "queried_bytes": sum(size for _, size in ranges),
+            "gpu_bytes": sum(size for _, size in ranges),
+            "cpu_bytes": 0,
+            "any_bytes": sum(size for _, size in ranges),
+            "unknown_bytes": 0,
+        },
+    )
     monkeypatch.setattr(layer_module.torch.cuda, "is_available", lambda: False)
 
     result = layer.run_uvm_dynamic_remote_read_swaps(
@@ -849,6 +951,19 @@ def test_dynamic_release_remote_swap_uses_combined_driver_path(
         "batch_prefetch_ranges_to_device_with_executor",
         prefetch_gpu,
     )
+    monkeypatch.setattr(
+        layer_module,
+        "driver_batch_query_ranges_residency_bytes",
+        lambda ranges, _device: {
+            "ok": True,
+            "status": 0,
+            "queried_bytes": sum(size for _, size in ranges),
+            "gpu_bytes": sum(size for _, size in ranges),
+            "cpu_bytes": 0,
+            "any_bytes": sum(size for _, size in ranges),
+            "unknown_bytes": 0,
+        },
+    )
     monkeypatch.setattr(layer_module.torch.cuda, "is_available", lambda: False)
 
     result = layer.run_uvm_dynamic_remote_read_swaps(
@@ -860,6 +975,93 @@ def test_dynamic_release_remote_swap_uses_combined_driver_path(
     assert placements == [(2, "cpu"), (5, "gpu")]
     assert layer._uvm_remote_read_global_expert_ids == {2}
     assert result["results"][0]["demote_driver_release_result"]["ok"] is True
+
+
+def test_dynamic_release_remote_uses_registered_512k_envelopes(
+    monkeypatch: Any,
+) -> None:
+    envelope_bytes = 512 * 1024
+    layer = object.__new__(FusedMoE)
+    layer.uvm_expert_envelope_enable = True
+    layer.uvm_expert_envelope_bytes = envelope_bytes
+    layer._uvm_expert_weight_region_id = (
+        lambda layer_id, expert_id, role: f"weights:{layer_id}:{expert_id}:{role}"
+    )
+    layer._uvm_expert_weight_residency_metadata = lambda **_kwargs: {}
+    recorded: list[tuple[object, dict[int, dict[str, object]]]] = []
+    layer._uvm_record_release_remote_envelope_states = (
+        lambda records, entries: recorded.append((records, entries))
+    )
+
+    def envelopes(**kwargs: Any) -> list[Any]:
+        role = str(kwargs["role"])
+        driver_region_id = 101 if role == "moe_gate_up" else 102
+        return [
+            layer_module.ReservedRegionItem(
+                region_id=f"envelope:{role}",
+                driver_region_id=driver_region_id,
+                ptr=int(kwargs["ptr"]),
+                bytes=envelope_bytes,
+                layer_id=7,
+                global_expert_id=2,
+                local_expert_id=2,
+                role=role,
+                metadata={"driver_registered": True},
+            )
+        ]
+
+    layer._uvm_get_or_build_expert_envelope_items = envelopes
+    captured: dict[str, object] = {}
+
+    def release(region_ids: Any, **kwargs: Any) -> dict[str, object]:
+        captured["region_ids"] = list(region_ids)
+        captured.update(kwargs)
+        return {
+            "ok": True,
+            "success_count": 2,
+            "validated_success_count": 2,
+            "entries": [
+                {
+                    "ok": True,
+                    "prefetch_release_complete": True,
+                    "region_id": region_id,
+                    "length": envelope_bytes,
+                    "released_bytes": envelope_bytes,
+                    "cpu_resident_bytes": envelope_bytes,
+                    "remote_mapped_bytes": envelope_bytes,
+                    "remote_map_failure_blocks": 0,
+                }
+                for region_id in (101, 102)
+            ],
+        }
+
+    monkeypatch.setattr(
+        layer_module,
+        "driver_prefetch_cpu_release_remote_512k_regions",
+        release,
+    )
+
+    result = layer._uvm_release_remote_expert_slices(
+        layer_id=7,
+        global_expert_id=2,
+        local_expert_id=2,
+        slices=[
+            ("moe_gate_up", 0x10000000, envelope_bytes, None),
+            ("moe_down", 0x20000000, envelope_bytes, None),
+        ],
+        device=0,
+        source_action="test_dynamic_swap",
+    )
+
+    assert result["ok"] is True
+    assert result["envelope_region_count"] == 2
+    assert result["expected_bytes"] == 2 * envelope_bytes
+    assert result["released_bytes"] == 2 * envelope_bytes
+    assert result["cpu_resident_bytes"] == 2 * envelope_bytes
+    assert result["remote_mapped_bytes"] == 2 * envelope_bytes
+    assert captured["region_ids"] == [101, 102]
+    assert captured["prefer_existing"] is True
+    assert len(recorded) == 1
 
 
 def test_dynamic_release_remote_failure_does_not_commit_placement(
@@ -891,6 +1093,69 @@ def test_dynamic_release_remote_failure_does_not_commit_placement(
     assert result["ok"] is False
     assert result["reason"] == "demote_remote_prepare_failed"
     assert layer._uvm_remote_read_global_expert_ids == {5}
+
+
+def test_dynamic_swap_requires_exact_promoted_gpu_residency(
+    monkeypatch: Any,
+) -> None:
+    layer = object.__new__(FusedMoE)
+    layer.uvm_dynamic_expert_swap_enable = True
+    layer.uvm_remote_prepare_mode = "release_remote"
+    layer.uvm_weight_executor = "cpp_batch"
+    layer.local_num_experts = 8
+    layer._uvm_remote_read_global_expert_ids = {5}
+    layer._uvm_stage_m_uses_remote_read = lambda: True
+    layer._uvm_layer_id = lambda: 7
+    layer._uvm_global_to_local_expert = lambda expert_id: expert_id
+    layer._uvm_stage_m_expert_weight_slices = lambda **kwargs: [
+        ("moe_gate_up", 1000 + int(kwargs["global_expert_id"]) * 100, 40, None),
+        ("moe_down", 1040 + int(kwargs["global_expert_id"]) * 100, 60, None),
+    ]
+    layer._uvm_release_remote_expert_slices = lambda **_kwargs: {
+        "ok": True,
+        "released_bytes": 100,
+        "cpu_resident_bytes": 100,
+        "remote_mapped_bytes": 100,
+    }
+    placements: list[tuple[int, str]] = []
+    layer._uvm_mark_dynamic_expert_placement = lambda **kwargs: placements.append(
+        (int(kwargs["global_expert_id"]), str(kwargs["state"]))
+    )
+    monkeypatch.setattr(
+        layer_module,
+        "batch_advise_ranges_preferred_location",
+        lambda ranges, _device: len(ranges),
+    )
+    monkeypatch.setattr(
+        layer_module,
+        "batch_prefetch_ranges_to_device_with_executor",
+        lambda ranges, **_kwargs: (len(ranges), "cpp_batch", 0),
+    )
+    monkeypatch.setattr(
+        layer_module,
+        "driver_batch_query_ranges_residency_bytes",
+        lambda ranges, _device: {
+            "ok": True,
+            "status": 0,
+            "queried_bytes": sum(size for _, size in ranges),
+            "gpu_bytes": sum(size for _, size in ranges) - 20,
+            "cpu_bytes": 20,
+            "any_bytes": sum(size for _, size in ranges),
+            "unknown_bytes": 0,
+        },
+    )
+    monkeypatch.setattr(layer_module.torch.cuda, "is_available", lambda: False)
+
+    result = layer.run_uvm_dynamic_remote_read_swaps(
+        [{"promote_expert": 5, "demote_expert": 2}]
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "promote_gpu_residency_incomplete"
+    assert result["partial_demote_committed"] is True
+    assert layer._uvm_remote_read_global_expert_ids == {2, 5}
+    assert placements == [(2, "cpu")]
+    assert result["results"][0]["promote_residency_complete"] is False
 
 
 def test_incremental_slot_requirement_counts_aligned_envelopes(

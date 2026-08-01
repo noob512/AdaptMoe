@@ -13,12 +13,20 @@ COLD_EXPERTS_PER_LAYER="${COLD_EXPERTS_PER_LAYER:-10}"
 MAX_SWAPS_PER_LAYER="${MAX_SWAPS_PER_LAYER:-10}"
 MIN_COUNT_DELTA="${MIN_COUNT_DELTA:-1}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-128}"
+PILOT_REQUEST_COUNT="${PILOT_REQUEST_COUNT:-64}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-2400}"
 RUN_CASES="${RUN_CASES:-pilot_a,control,dynamic}"
 B_PHASE_NAMES="${B_PHASE_NAMES:-observe_b,after_b,repeat_b}"
 B_PHASE_COUNTS="${B_PHASE_COUNTS:-64,64,64}"
 B_PHASE_OFFSETS="${B_PHASE_OFFSETS:-64,64,64}"
 B_PHASE_OUTPUTS="${B_PHASE_OUTPUTS:-${OUTPUT_TOKENS},${OUTPUT_TOKENS},${OUTPUT_TOKENS}}"
+REMOTE_PREPARE_MODE="${REMOTE_PREPARE_MODE:-native}"
+REQUIRE_COMPLETE_REMOTE_PREPARE="${REQUIRE_COMPLETE_REMOTE_PREPARE:-0}"
+REQUIRE_UVM_PROACTIVE_MIGRATION_DISABLED="${REQUIRE_UVM_PROACTIVE_MIGRATION_DISABLED:-0}"
+DRIVER_TAG_ENABLE="${DRIVER_TAG_ENABLE:-1}"
+DRIVER_TAG_REQUIRE_MANAGED="${DRIVER_TAG_REQUIRE_MANAGED:-1}"
+EXPERT_ENVELOPE_BYTES="${EXPERT_ENVELOPE_BYTES:-524288}"
+NVIDIA_SMI_MONITOR_ENABLE="${NVIDIA_SMI_MONITOR_ENABLE:-1}"
 
 FIXTURE="${RUN_ROOT}/sharegpt_shift_128.json"
 FIXTURE_META="${RUN_ROOT}/fixture_metadata.json"
@@ -58,6 +66,24 @@ stop_pid() {
     kill "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
   fi
+}
+
+require_uvm_proactive_migration_disabled() {
+  if [[ "${REQUIRE_UVM_PROACTIVE_MIGRATION_DISABLED}" != "1" ]]; then
+    return 0
+  fi
+
+  local parameter
+  for parameter in \
+    uvm_perf_prefetch_enable \
+    uvm_perf_access_counter_migration_enable \
+    uvm_perf_thrashing_enable; do
+    local path="/sys/module/nvidia_uvm/parameters/${parameter}"
+    if [[ ! -r "${path}" ]] || [[ "$(<"${path}")" != "0" ]]; then
+      echo "Required UVM parameter ${parameter}=0 is not active" >&2
+      return 1
+    fi
+  done
 }
 
 prepare_fixture() {
@@ -161,7 +187,7 @@ run_case() {
     )
     phase_args=(
       --phase-names pilot_a
-      --phase-request-counts 64
+      --phase-request-counts "${PILOT_REQUEST_COUNT}"
       --phase-request-offsets 0
       --phase-output-tokens "${OUTPUT_TOKENS}"
     )
@@ -169,6 +195,7 @@ run_case() {
     env_args+=(
       VLLM_UVM_MOE_ROUTING_TRACE_ENABLE=0
       VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE=remote_read
+      VLLM_UVM_REMOTE_PREPARE_MODE="${REMOTE_PREPARE_MODE}"
       VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE=1
       VLLM_UVM_INIT_WEIGHT_OFFLOAD_MODE=driver_release_cpu
       VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE=post_warmup
@@ -177,9 +204,16 @@ run_case() {
       VLLM_UVM_INIT_WEIGHT_TARGET_ROLES=moe_gate_up,moe_down
       VLLM_UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER=128
       VLLM_UVM_INIT_WEIGHT_SYNC=1
+      VLLM_UVM_INIT_WEIGHT_REQUIRE_COMPLETE_REMOTE_PREPARE="${REQUIRE_COMPLETE_REMOTE_PREPARE}"
       VLLM_UVM_INIT_WEIGHT_TRACE_FILE="${dir}/expert_trace.jsonl"
       VLLM_UVM_INIT_WEIGHT_REGISTER_ALL_LOCAL_EXPERTS=1
       VLLM_UVM_INIT_WEIGHT_COMPLETE_EXPERT_PLAN=1
+      VLLM_UVM_DRIVER_TAG_ENABLE="${DRIVER_TAG_ENABLE}"
+      VLLM_UVM_DRIVER_TAG_REQUIRE_MANAGED="${DRIVER_TAG_REQUIRE_MANAGED}"
+      VLLM_UVM_EXPERT_ENVELOPE_ENABLE=1
+      VLLM_UVM_EXPERT_ENVELOPE_BYTES="${EXPERT_ENVELOPE_BYTES}"
+      VLLM_UVM_EXPERT_ENVELOPE_STRICT_LOGICAL_ALIGNMENT=1
+      VLLM_UVM_REQUIRE_PROACTIVE_MIGRATION_DISABLED="${REQUIRE_UVM_PROACTIVE_MIGRATION_DISABLED}"
       VLLM_UVM_WEIGHT_BATCH_EXECUTOR_ENABLE=1
       VLLM_UVM_WEIGHT_EXECUTOR=cpp_batch
       VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE=0
@@ -202,8 +236,11 @@ run_case() {
     fi
   fi
 
-  nvidia-smi dmon -s t -d 1 -o DT > "${dir}/dmon_pcie.csv" 2>&1 &
-  local dmon_pid=$!
+  local dmon_pid=""
+  if [[ "${NVIDIA_SMI_MONITOR_ENABLE}" == "1" ]]; then
+    nvidia-smi dmon -s t -d 1 -o DT > "${dir}/dmon_pcie.csv" 2>&1 &
+    dmon_pid=$!
+  fi
   set +e
   (
     cd "${VLLM_ROOT}"
@@ -346,6 +383,7 @@ PY
 }
 
 prepare_fixture
+require_uvm_proactive_migration_disabled
 if should_run_case pilot_a; then
   run_case pilot_a pilot || true
 fi

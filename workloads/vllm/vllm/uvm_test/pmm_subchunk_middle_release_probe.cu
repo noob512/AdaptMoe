@@ -673,16 +673,15 @@ int main(int argc, char **argv)
                                     kRegionFlagStreamingSubpool |
                                     kRegionFlagCpuOffloadedReserved;
     const unsigned int release_flags =
-        base_flags |
-        (args.envelope && !args.remote_read ? kRegionFlagExpertEnvelope : 0u);
+        base_flags | (args.envelope ? kRegionFlagExpertEnvelope : 0u);
 
     std::vector<unsigned long long> region_ids;
     const unsigned int release_region_count =
-        args.remote_read ? 1u : kEnvelopeCount;
+        args.envelope ? kEnvelopeCount : 1u;
     for (unsigned int i = 0; i < release_region_count; ++i) {
         unsigned long long region_id = kEnvelopeRegionBase + i;
         uintptr_t region_base = base + kReleaseOffset + i * kEnvelopeBytes;
-        size_t region_bytes = args.remote_read ? kReleaseBytes : kEnvelopeBytes;
+        size_t region_bytes = args.envelope ? kEnvelopeBytes : kReleaseBytes;
         char label[64];
         std::snprintf(label, sizeof(label), "middle_%u_register", i);
         register_region(fd,
@@ -715,15 +714,16 @@ int main(int argc, char **argv)
         total_remote_mapped += rel.remote_mapped_bytes;
         total_newly_remote_mapped += rel.newly_remote_mapped_bytes;
         total_release_ms += release_ms;
+        const size_t expected_region_bytes =
+            args.envelope ? kEnvelopeBytes : kReleaseBytes;
         release_ok = release_ok &&
                      rel.rmStatus == 0 &&
                      rel.failure_blocks == 0 &&
-                     rel.released_bytes ==
-                         (args.remote_read ? kReleaseBytes : kEnvelopeBytes) &&
+                     rel.released_bytes == expected_region_bytes &&
                      (!args.remote_read ||
                       (rel.remote_map_failure_blocks == 0 &&
-                       rel.cpu_resident_bytes == kReleaseBytes &&
-                       rel.remote_mapped_bytes == kReleaseBytes));
+                       rel.cpu_resident_bytes == expected_region_bytes &&
+                       rel.remote_mapped_bytes == expected_region_bytes));
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     print_mem("after_middle_release");

@@ -185,6 +185,7 @@ UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT = 1 << 0
 UVM_EXPERT_OFFLOAD_RELEASE_FLAG_STRICT_2M_BLOCKS = 1 << 1
 UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K = 1 << 2
 UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ = 1 << 3
+UVM_EXPERT_REMOTE_PREFETCH_ENVELOPE_BYTES = 512 * 1024
 
 
 class _UvmInitializeParams(ctypes.Structure):
@@ -2893,6 +2894,77 @@ def driver_expert_offload_release_remote_regions(
         prefer_existing=prefer_existing,
         return_entries=return_entries,
     )
+
+
+def driver_prefetch_cpu_release_remote_512k_regions(
+    region_ids: Sequence[int],
+    *,
+    device: int = 0,
+    prefer_existing: bool = True,
+) -> dict[str, object]:
+    """Move registered 512 KiB envelopes to CPU and free their GPU backing.
+
+    This is the driver-backed equivalent of CPU prefetch for expert envelopes.
+    One ioctl path migrates each envelope to CPU, releases its GPU PMM backing,
+    and installs GPU remote-read PTEs. Success requires all four effects for
+    every submitted envelope; an accepted ioctl alone is not sufficient.
+    """
+    normalized = [int(region_id) for region_id in region_ids if int(region_id) > 0]
+    result = driver_expert_offload_release_remote_regions(
+        normalized,
+        device=device,
+        subchunk_64k=True,
+        prefer_existing=prefer_existing,
+        return_entries=True,
+    )
+    validated_entries: list[dict[str, object]] = []
+    complete_count = 0
+    for raw_entry in result.get("entries") or []:
+        if not isinstance(raw_entry, dict):
+            continue
+        entry = dict(raw_entry)
+        length = int(entry.get("length") or 0)
+        complete = (
+            bool(entry.get("ok"))
+            and length == UVM_EXPERT_REMOTE_PREFETCH_ENVELOPE_BYTES
+            and int(entry.get("released_bytes") or 0) >= length
+            and int(entry.get("cpu_resident_bytes") or 0) >= length
+            and int(entry.get("remote_mapped_bytes") or 0) >= length
+            and int(entry.get("remote_map_failure_blocks") or 0) == 0
+        )
+        if complete:
+            reason = None
+            complete_count += 1
+        elif length != UVM_EXPERT_REMOTE_PREFETCH_ENVELOPE_BYTES:
+            reason = "not_512k_envelope"
+        elif int(entry.get("released_bytes") or 0) < length:
+            reason = "gpu_backing_release_incomplete"
+        elif int(entry.get("cpu_resident_bytes") or 0) < length:
+            reason = "cpu_migration_incomplete"
+        elif int(entry.get("remote_mapped_bytes") or 0) < length:
+            reason = "remote_mapping_incomplete"
+        else:
+            reason = str(entry.get("reason") or "driver_operation_failed")
+        entry["prefetch_release_complete"] = complete
+        entry["prefetch_release_reason"] = reason
+        validated_entries.append(entry)
+
+    requested_count = len(normalized)
+    aggregate_ok = (
+        bool(result.get("ok"))
+        and len(validated_entries) == requested_count
+        and complete_count == requested_count
+    )
+    return {
+        **result,
+        "ok": aggregate_ok,
+        "entries": validated_entries,
+        "operation": "prefetch_cpu_release_remote_512k",
+        "envelope_bytes": UVM_EXPERT_REMOTE_PREFETCH_ENVELOPE_BYTES,
+        "requested_region_count": requested_count,
+        "validated_success_count": complete_count,
+        "validated_failure_count": requested_count - complete_count,
+    }
 
 
 def _expert_reserved_prefetch_mode_value(mode: str | int) -> int:

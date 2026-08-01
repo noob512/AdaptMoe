@@ -28,7 +28,7 @@ from vllm.device_allocator.uvm import (
     batch_prepare_ranges_for_native_remote_access_with_executor,
     driver_batch_query_ranges_residency_bytes,
     driver_expert_offload_release_regions,
-    driver_expert_offload_release_remote_regions,
+    driver_prefetch_cpu_release_remote_512k_regions,
     probe_driver_capable_range,
     uvm_enabled_allocation_phase,
     uvm_local_memory_pool,
@@ -3419,13 +3419,17 @@ class FusedMoE(CustomOp):
         if not isinstance(envelope_records, list):
             return
         for record in envelope_records:
-            if not isinstance(record, dict):
+            if isinstance(record, ReservedRegionItem):
+                region_id = str(record.region_id)
+                driver_region_id = int(record.driver_region_id)
+            elif isinstance(record, dict):
+                region_id = str(record.get("region_id") or "")
+                driver_region_id = int(record.get("driver_region_id") or 0)
+            else:
                 continue
-            driver_region_id = int(record.get("driver_region_id") or 0)
             entry = entries_by_region.get(driver_region_id)
             if entry is None:
                 continue
-            region_id = str(record.get("region_id") or "")
             if not region_id:
                 continue
             snapshot = get_uvm_residency_region_snapshot(region_id) or {}
@@ -3529,6 +3533,51 @@ class FusedMoE(CustomOp):
                 }
             )
 
+            cache = getattr(self, "_uvm_expert_envelope_region_cache", None)
+            if not isinstance(cache, dict):
+                continue
+            cache_key = self._uvm_expert_envelope_cache_key(
+                layer_id,
+                global_expert_id,
+                role,
+            )
+            cached_items = cache.get(cache_key)
+            if not isinstance(cached_items, list):
+                continue
+            updated_items: list[ReservedRegionItem] = []
+            for item in cached_items:
+                snapshot = get_uvm_residency_region_snapshot(item.region_id) or {}
+                envelope_metadata = {
+                    **cast(dict[str, object], snapshot.get("metadata") or {}),
+                    **item.metadata,
+                    "source": "dynamic_expert_swap",
+                    "placement": placement,
+                    "target_placement": placement,
+                    "cpu_remote_read": cpu_remote,
+                    "driver_release_remote_active": cpu_remote,
+                    "dynamic_expert_swap": True,
+                    "transaction_id": transaction_id,
+                }
+                mark_uvm_residency_state(
+                    region_id=item.region_id,
+                    state=state,
+                    metadata=envelope_metadata,
+                )
+                updated_items.append(
+                    ReservedRegionItem(
+                        region_id=item.region_id,
+                        driver_region_id=int(item.driver_region_id),
+                        ptr=int(item.ptr),
+                        bytes=int(item.bytes),
+                        layer_id=item.layer_id,
+                        global_expert_id=int(item.global_expert_id),
+                        local_expert_id=int(item.local_expert_id),
+                        role=item.role,
+                        metadata=envelope_metadata,
+                    )
+                )
+            cache[cache_key] = updated_items
+
     def _uvm_release_remote_expert_slices(
         self,
         *,
@@ -3539,7 +3588,20 @@ class FusedMoE(CustomOp):
         device: int,
         source_action: str,
     ) -> dict[str, object]:
-        driver_region_ids: list[int] = []
+        envelope_bytes = _UVM_EXPERT_512K_ENVELOPE_BYTES
+        if (
+            not self.uvm_expert_envelope_enable
+            or int(self.uvm_expert_envelope_bytes) != envelope_bytes
+        ):
+            return {
+                "ok": False,
+                "reason": "release_remote_512k_envelopes_required",
+                "envelope_enable": bool(self.uvm_expert_envelope_enable),
+                "envelope_bytes": int(self.uvm_expert_envelope_bytes),
+            }
+
+        envelope_items: list[ReservedRegionItem] = []
+        logical_region_ids: list[str] = []
         for role, ptr, size_bytes, existing in slices:
             region_id = self._uvm_expert_weight_region_id(
                 layer_id,
@@ -3547,49 +3609,166 @@ class FusedMoE(CustomOp):
                 role,
             )
             snapshot = existing or get_uvm_residency_region_snapshot(region_id) or {}
-            if not bool(snapshot.get("driver_registered")):
-                registration = ensure_uvm_residency_driver_region_registered(
-                    region_id
-                )
-                if not bool(registration.get("registered")):
-                    return {
-                        "ok": False,
-                        "reason": "release_remote_driver_registration_failed",
-                        "role": role,
-                        "region_id": region_id,
-                        "driver_registration": registration,
-                    }
-                snapshot = get_uvm_residency_region_snapshot(region_id) or snapshot
-            driver_region_id = int(snapshot.get("driver_region_id") or 0)
-            if (
-                ptr % (64 * 1024) != 0
-                or size_bytes % (64 * 1024) != 0
-                or driver_region_id <= 0
-                or not bool(snapshot.get("driver_registered"))
-            ):
+            if ptr % envelope_bytes != 0 or size_bytes % envelope_bytes != 0:
                 return {
                     "ok": False,
-                    "reason": "invalid_release_remote_logical_region",
+                    "reason": "unaligned_release_remote_logical_region",
                     "role": role,
                     "ptr": ptr,
                     "bytes": size_bytes,
-                    "driver_region_id": driver_region_id,
-                    "driver_registered": bool(snapshot.get("driver_registered")),
+                    "envelope_bytes": envelope_bytes,
                 }
-            driver_region_ids.append(driver_region_id)
+            base_metadata = self._uvm_expert_weight_residency_metadata(
+                layer_id=layer_id,
+                global_expert_id=global_expert_id,
+                local_expert_id=local_expert_id,
+                role=role,
+                ptr=ptr,
+                size_bytes=size_bytes,
+                active_this_step=False,
+                source_action=source_action,
+            )
+            metadata = {
+                **cast(dict[str, object], snapshot.get("metadata") or {}),
+                **base_metadata,
+                "source": source_action,
+                "placement": "GPU_RESIDENT",
+                "target_placement": "CPU_REMOTE_READ",
+                "cpu_remote_read": False,
+                "dynamic_expert_swap": True,
+            }
+            role_envelopes = self._uvm_get_or_build_expert_envelope_items(
+                source_region_id=region_id,
+                logical_driver_region_id=int(
+                    snapshot.get("driver_region_id") or 0
+                ),
+                layer_id=layer_id,
+                global_expert_id=global_expert_id,
+                local_expert_id=local_expert_id,
+                role=role,
+                ptr=ptr,
+                size_bytes=size_bytes,
+                metadata=metadata,
+                state=str(snapshot.get("state") or "gpu"),
+                source_action=source_action,
+            )
+            if (
+                not role_envelopes
+                or sum(int(item.bytes) for item in role_envelopes) != size_bytes
+            ):
+                return {
+                    "ok": False,
+                    "reason": "release_remote_envelope_coverage_incomplete",
+                    "role": role,
+                    "region_id": region_id,
+                    "logical_bytes": size_bytes,
+                    "envelope_count": len(role_envelopes),
+                    "envelope_covered_bytes": sum(
+                        int(item.bytes) for item in role_envelopes
+                    ),
+                }
+            for item in role_envelopes:
+                if (
+                    int(item.ptr) % envelope_bytes != 0
+                    or int(item.bytes) != envelope_bytes
+                    or int(item.driver_region_id) <= 0
+                    or not bool(item.metadata.get("driver_registered"))
+                ):
+                    return {
+                        "ok": False,
+                        "reason": "invalid_release_remote_envelope",
+                        "role": role,
+                        "region_id": item.region_id,
+                        "ptr": int(item.ptr),
+                        "bytes": int(item.bytes),
+                        "driver_region_id": int(item.driver_region_id),
+                        "driver_registered": bool(
+                            item.metadata.get("driver_registered")
+                        ),
+                    }
+            logical_region_ids.append(region_id)
+            envelope_items.extend(role_envelopes)
 
-        driver_region_ids = list(dict.fromkeys(driver_region_ids))
-        result = driver_expert_offload_release_remote_regions(
+        unique_envelopes: dict[int, ReservedRegionItem] = {}
+        for item in envelope_items:
+            driver_region_id = int(item.driver_region_id)
+            existing_item = unique_envelopes.get(driver_region_id)
+            if existing_item is not None and (
+                existing_item.region_id != item.region_id
+                or int(existing_item.ptr) != int(item.ptr)
+                or int(existing_item.bytes) != int(item.bytes)
+            ):
+                return {
+                    "ok": False,
+                    "reason": "conflicting_release_remote_envelope_identity",
+                    "driver_region_id": driver_region_id,
+                    "first_region_id": existing_item.region_id,
+                    "second_region_id": item.region_id,
+                }
+            unique_envelopes[driver_region_id] = item
+
+        driver_region_ids = list(unique_envelopes)
+        result = driver_prefetch_cpu_release_remote_512k_regions(
             driver_region_ids,
             device=device,
-            subchunk_64k=True,
             prefer_existing=True,
-            return_entries=True,
+        )
+        entries_by_region = {
+            int(entry.get("region_id") or 0): entry
+            for entry in result.get("entries") or []
+            if isinstance(entry, dict)
+        }
+        self._uvm_record_release_remote_envelope_states(
+            list(unique_envelopes.values()),
+            entries_by_region,
+        )
+        complete_entries = [
+            entries_by_region.get(driver_region_id)
+            for driver_region_id in driver_region_ids
+        ]
+        exact_complete = bool(driver_region_ids) and all(
+            entry is not None
+            and bool(entry.get("ok"))
+            and bool(entry.get("prefetch_release_complete"))
+            and int(entry.get("length") or 0) == envelope_bytes
+            and int(entry.get("released_bytes") or 0) == envelope_bytes
+            and int(entry.get("cpu_resident_bytes") or 0) == envelope_bytes
+            and int(entry.get("remote_mapped_bytes") or 0) == envelope_bytes
+            and int(entry.get("remote_map_failure_blocks") or 0) == 0
+            for entry in complete_entries
+        )
+        expected_bytes = len(driver_region_ids) * envelope_bytes
+        released_bytes = sum(
+            int(entry.get("released_bytes") or 0)
+            for entry in complete_entries
+            if entry is not None
+        )
+        cpu_resident_bytes = sum(
+            int(entry.get("cpu_resident_bytes") or 0)
+            for entry in complete_entries
+            if entry is not None
+        )
+        remote_mapped_bytes = sum(
+            int(entry.get("remote_mapped_bytes") or 0)
+            for entry in complete_entries
+            if entry is not None
         )
         return {
             **result,
-            "logical_region_count": len(driver_region_ids),
+            "ok": bool(result.get("ok")) and exact_complete,
+            "reason": (
+                "released_remote_512k"
+                if bool(result.get("ok")) and exact_complete
+                else "release_remote_512k_validation_failed"
+            ),
+            "logical_region_ids": logical_region_ids,
+            "logical_region_count": len(logical_region_ids),
             "logical_range_count": len(slices),
+            "envelope_region_count": len(driver_region_ids),
+            "expected_bytes": expected_bytes,
+            "released_bytes": released_bytes,
+            "cpu_resident_bytes": cpu_resident_bytes,
+            "remote_mapped_bytes": remote_mapped_bytes,
             "source_action": source_action,
         }
 
@@ -3743,6 +3922,15 @@ class FusedMoE(CustomOp):
             promote_successes = 0
             promote_executor = self.uvm_weight_executor
             promote_driver_result = 0
+            promote_residency: dict[str, int | bool] = {
+                "ok": False,
+                "status": -1,
+                "queried_bytes": 0,
+                "gpu_bytes": 0,
+                "cpu_bytes": 0,
+                "any_bytes": 0,
+                "unknown_bytes": 0,
+            }
             if promote_preferred_gpu == len(promote_ranges):
                 (
                     promote_successes,
@@ -3755,6 +3943,34 @@ class FusedMoE(CustomOp):
                 )
                 if promote_successes > 0 and torch.cuda.is_available():
                     torch.cuda.synchronize(device)
+                if promote_successes == len(promote_ranges):
+                    try:
+                        promote_residency = (
+                            driver_batch_query_ranges_residency_bytes(
+                                promote_ranges,
+                                device,
+                            )
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Dynamic expert promotion residency query failed: "
+                            "layer=%s expert=%s",
+                            layer_id,
+                            promote_expert,
+                        )
+
+            promote_bytes = sum(size for _, size in promote_ranges)
+            promote_residency_complete = (
+                bool(promote_residency.get("ok"))
+                and int(promote_residency.get("queried_bytes") or 0)
+                == promote_bytes
+                and int(promote_residency.get("gpu_bytes") or 0)
+                == promote_bytes
+                and int(promote_residency.get("cpu_bytes") or 0) == 0
+                and int(promote_residency.get("any_bytes") or 0)
+                == promote_bytes
+                and int(promote_residency.get("unknown_bytes") or 0) == 0
+            )
 
             pair_result = {
                 "transaction_id": transaction_id,
@@ -3771,6 +3987,8 @@ class FusedMoE(CustomOp):
                 "promote_driver_result": promote_driver_result,
                 "promote_preferred_gpu_result": promote_preferred_gpu,
                 "promote_prefetch_gpu_successes": promote_successes,
+                "promote_residency": promote_residency,
+                "promote_residency_complete": promote_residency_complete,
             }
             if promote_preferred_gpu != len(promote_ranges) or promote_successes != len(
                 promote_ranges
@@ -3781,6 +3999,18 @@ class FusedMoE(CustomOp):
                     "reason": "promote_gpu_prefetch_failed",
                     "partial_demote_committed": True,
                     "remote_experts": sorted(self._uvm_remote_read_global_expert_ids),
+                    "results": results,
+                }
+
+            if not promote_residency_complete:
+                results.append({**pair_result, "ok": False})
+                return {
+                    "ok": False,
+                    "reason": "promote_gpu_residency_incomplete",
+                    "partial_demote_committed": True,
+                    "remote_experts": sorted(
+                        self._uvm_remote_read_global_expert_ids
+                    ),
                     "results": results,
                 }
 
@@ -3823,7 +4053,15 @@ class FusedMoE(CustomOp):
         return (
             self.uvm_init_weight_offload_mode
             in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
-            and not self._uvm_stage_m_uses_remote_read()
+            and (
+                not self._uvm_stage_m_uses_remote_read()
+                or self._uvm_remote_prepare_uses_release()
+            )
+        )
+
+    def _uvm_stage_m_requires_logical_release_registration(self) -> bool:
+        return self._uvm_remote_prepare_uses_release() and not (
+            self._uvm_stage_m_requires_release_envelopes()
         )
 
     def _uvm_stage_m_sync_enabled(self) -> bool:
@@ -7542,11 +7780,18 @@ class FusedMoE(CustomOp):
                 layer_id,
                 all_local_pairs,
             )
+            incremental_preregister_only = False
             if self.uvm_incremental_expert_offload_enable:
                 if not self._uvm_incremental_offload_in_progress:
-                    # Initial Stage-M only registers/protects weights. KV
-                    # pressure releases one expert per MoE layer in later waves.
-                    expert_pairs = []
+                    # release_remote submits stable envelope region IDs to the
+                    # driver. Register planned envelopes before serving, but
+                    # leave their backing and residency unchanged until a KV
+                    # pressure wave selects the expert for release.
+                    incremental_preregister_only = (
+                        self._uvm_stage_m_requires_release_envelopes()
+                    )
+                    if not incremental_preregister_only:
+                        expert_pairs = []
                 else:
                     expert_pairs = [
                         pair
@@ -7645,7 +7890,8 @@ class FusedMoE(CustomOp):
                         expert_class=expert_class,
                         driver_tag_skip=logical_driver_tag_skip,
                         cpu_offload_placement=(
-                            self.uvm_init_weight_offload_mode != "trace_only"
+                            not incremental_preregister_only
+                            and self.uvm_init_weight_offload_mode != "trace_only"
                         ),
                     )
                     if existing_region is None:
@@ -7672,7 +7918,7 @@ class FusedMoE(CustomOp):
                             metadata=offload_metadata,
                         )
                     targeted_driver_registration: dict[str, object] | None = None
-                    if self._uvm_remote_prepare_uses_release():
+                    if self._uvm_stage_m_requires_logical_release_registration():
                         targeted_driver_registration = (
                             ensure_uvm_residency_driver_region_registered(region_id)
                         )
@@ -7745,6 +7991,38 @@ class FusedMoE(CustomOp):
                         )
                     if not release_driver_region_ids and driver_region_id > 0:
                         release_driver_region_ids = [driver_region_id]
+
+                    if incremental_preregister_only:
+                        self._append_uvm_init_weight_trace(
+                            {
+                                "timestamp": time.time(),
+                                "pid": os.getpid(),
+                                "layer_name": self.layer_name,
+                                "layer_id": layer_id,
+                                "action": (
+                                    "init_weight_incremental_envelope_preregistered"
+                                ),
+                                "mode": self.uvm_init_weight_offload_mode,
+                                "access_mode": self.uvm_expert_offload_access_mode,
+                                "remote_prepare_mode": self.uvm_remote_prepare_mode,
+                                "role": role,
+                                "residency_region_id": region_id,
+                                "global_expert_id": global_expert_id,
+                                "local_expert_id": local_expert_id,
+                                "expert_init_class": expert_class,
+                                "ptr": f"0x{ptr:x}",
+                                "bytes": size_bytes,
+                                "release_driver_region_ids": (
+                                    release_driver_region_ids
+                                ),
+                                "envelope_count": len(envelope_records),
+                                "envelope_bytes": sum(
+                                    int(record.get("bytes") or 0)
+                                    for record in envelope_records
+                                ),
+                            }
+                        )
+                        continue
 
                     attempted_bytes += size_bytes
                     if (
@@ -7864,12 +8142,10 @@ class FusedMoE(CustomOp):
                         )
                         if self._uvm_remote_prepare_uses_release():
                             driver_release_result = (
-                                driver_expert_offload_release_remote_regions(
+                                driver_prefetch_cpu_release_remote_512k_regions(
                                     release_driver_region_ids,
                                     device=device,
-                                    subchunk_64k=True,
                                     prefer_existing=True,
-                                    return_entries=True,
                                 )
                             )
                             release_entries_by_id = {
@@ -8122,12 +8398,10 @@ class FusedMoE(CustomOp):
                                 seen_driver_region_ids.add(driver_id)
                                 driver_region_ids.append(driver_id)
                         driver_release_result = (
-                            driver_expert_offload_release_remote_regions(
+                            driver_prefetch_cpu_release_remote_512k_regions(
                                 driver_region_ids,
                                 device=device,
-                                subchunk_64k=True,
                                 prefer_existing=True,
-                                return_entries=True,
                             )
                         )
                         driver_release_summary = {
@@ -8411,6 +8685,9 @@ class FusedMoE(CustomOp):
                         "mode": self.uvm_init_weight_offload_mode,
                         "access_mode": self.uvm_expert_offload_access_mode,
                         "remote_prepare_mode": self.uvm_remote_prepare_mode,
+                        "incremental_preregister_only": (
+                            incremental_preregister_only
+                        ),
                         "planned_experts": [
                             global_expert_id for global_expert_id, _ in expert_pairs
                         ],

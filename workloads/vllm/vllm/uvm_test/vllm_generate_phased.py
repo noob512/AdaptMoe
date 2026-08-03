@@ -157,6 +157,7 @@ def main() -> int:
     parser.add_argument("--grow-after-phase", type=int, default=0)
     parser.add_argument("--grow-target-blocks", default="")
     parser.add_argument("--maintenance-waves-per-phase", type=int, default=0)
+    parser.add_argument("--maintenance-waves-per-phase-list", default="")
     parser.add_argument("--pre-phase-target-blocks", type=int, default=-1)
     parser.add_argument("--release-expert-wave", action="store_true")
     parser.add_argument("--dynamic-expert-swap-after-phases", default="")
@@ -187,6 +188,9 @@ def main() -> int:
         parse_ints(args.dynamic_expert_swap_after_phases)
     )
     grow_targets = parse_ints(args.grow_target_blocks)
+    maintenance_wave_list = parse_ints(
+        args.maintenance_waves_per_phase_list
+    )
     if not (
         len(phase_names)
         == len(phase_counts)
@@ -198,6 +202,15 @@ def main() -> int:
         )
     if args.maintenance_waves_per_phase < 0:
         raise ValueError("maintenance waves per phase must be non-negative")
+    if maintenance_wave_list:
+        if len(maintenance_wave_list) != len(phase_names):
+            raise ValueError(
+                "maintenance wave list must align with phase names"
+            )
+        if any(value < 0 for value in maintenance_wave_list):
+            raise ValueError(
+                "maintenance wave list values must be non-negative"
+            )
     requests = load_requests(args.fixture)
     if any(
         offset < 0 or offset + count > len(requests)
@@ -432,7 +445,14 @@ def main() -> int:
                         f"dynamic expert swap failed: {swap_result!r}"
                     )
 
-            if args.maintenance_waves_per_phase:
+            if maintenance_wave_list:
+                stop = min(
+                    grow_cursor + maintenance_wave_list[phase_index],
+                    len(grow_targets),
+                )
+                targets = grow_targets[grow_cursor:stop]
+                grow_cursor = stop
+            elif args.maintenance_waves_per_phase:
                 stop = min(
                     grow_cursor + args.maintenance_waves_per_phase,
                     len(grow_targets),

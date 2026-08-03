@@ -31,6 +31,7 @@ TIMEOUT_SEC="${TIMEOUT_SEC:-3600}"
 RUN_CASES="${RUN_CASES:-pilot,baseline,adaptive,static_custom,native_uva}"
 RESIDENCY_TRACE_ENABLE="${RESIDENCY_TRACE_ENABLE:-1}"
 RESIDENCY_KV_METADATA_ENABLE="${RESIDENCY_KV_METADATA_ENABLE:-1}"
+MAINTENANCE_WAVES_PER_PHASE_LIST="${MAINTENANCE_WAVES_PER_PHASE_LIST:-}"
 
 PHASE_NAMES="${PHASE_NAMES:-low,stage1,stage2,stage3,stage4,stage5,stage6,stage7,stage8,stage9}"
 PHASE_COUNTS="${PHASE_COUNTS:-8,64,96,128,160,192,224,256,256,256}"
@@ -270,9 +271,16 @@ run_case() {
         extra_args=(
           --grow-after-phase -1
           --grow-target-blocks "$(<"${TARGETS_FILE}")"
-          --maintenance-waves-per-phase 5
           --release-expert-wave
         )
+        if [[ -n "${MAINTENANCE_WAVES_PER_PHASE_LIST}" ]]; then
+          extra_args+=(
+            --maintenance-waves-per-phase-list
+            "${MAINTENANCE_WAVES_PER_PHASE_LIST}"
+          )
+        else
+          extra_args+=(--maintenance-waves-per-phase 5)
+        fi
       else
         env_args+=(VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE=0)
         extra_args=(

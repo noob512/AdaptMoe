@@ -1,9 +1,0 @@
-tqdm
-requests
-huggingface-hub
-aiohttp
-numpy
-pandas
-matplotlib
-
-psutil

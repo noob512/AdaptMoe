@@ -37,26 +37,6 @@
 
 namespace {
 
-__global__ void uvm_smoke_copy_bytes_kernel(const unsigned char* src,
-                                            unsigned char* dst,
-                                            size_t bytes) {
-    size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = blockDim.x * gridDim.x;
-
-    for (; index < bytes; index += stride)
-        dst[index] = src[index];
-}
-
-__global__ void uvm_smoke_fill_bytes_kernel(unsigned char* dst,
-                                            unsigned char value,
-                                            size_t bytes) {
-    size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = blockDim.x * gridDim.x;
-
-    for (; index < bytes; index += stride)
-        dst[index] = value;
-}
-
 constexpr unsigned int UVM_INITIALIZE_IOCTL = 0x30000001;
 constexpr unsigned int UVM_TEST_PHASE_F_PING_IOCTL =
     200 + 115;
@@ -67,21 +47,18 @@ constexpr unsigned int UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL =
 constexpr unsigned int UVM_PHASE_F_BATCH_EXECUTOR_IOCTL = 81;
 constexpr unsigned int UVM_PHASE_F_REGISTER_REGION_IOCTL = 82;
 constexpr unsigned int UVM_PHASE_F_UNREGISTER_REGION_IOCTL = 83;
-constexpr unsigned int UVM_PHASE_F_BATCH_REGIONS_IOCTL = 84;
 constexpr unsigned int UVM_PHASE_N_SET_POOL_BUDGET_IOCTL = 85;
 constexpr unsigned int UVM_PHASE_N_GET_POOL_STATE_IOCTL = 86;
 constexpr unsigned int UVM_PHASE_N_UPDATE_REGION_STATE_IOCTL = 87;
 constexpr unsigned int UVM_PHASE_N_QUERY_REGION_IOCTL = 88;
 constexpr unsigned int UVM_PHASE_N_QUERY_REGION_BY_VA_IOCTL = 89;
 constexpr unsigned int UVM_PHASE_N_RECLAIM_POOL_IOCTL = 90;
-constexpr unsigned int UVM_MOE_SLOT_REMAP_BATCH_IOCTL = 91;
 constexpr unsigned int UVM_PHASE_N_SET_DYNAMIC_BUDGETS_IOCTL = 94;
 constexpr unsigned int UVM_PHASE_N_PROTECT_ACTIVE_KV_IOCTL = 95;
 constexpr unsigned int UVM_PHASE_N_QUERY_REGION_BLOCKS_IOCTL = 96;
 constexpr unsigned int UVM_PHASE_N_RECLAIM_REGION_IOCTL = 97;
 constexpr unsigned int UVM_EXPERT_RESERVED_PREFETCH_BATCH_IOCTL = 99;
 constexpr size_t UVM_TEST_PHASE_F_MAX_RANGES = 64;
-constexpr size_t UVM_MOE_SLOT_REMAP_MAX_ENTRIES = 128;
 constexpr size_t UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES = 128;
 constexpr size_t UVM_PHASE_N_TRACE_VICTIM_MAX = 8;
 constexpr size_t UVM_PHASE_N_REGION_BLOCK_TRACE_MAX = 16;
@@ -100,15 +77,7 @@ constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_EXPERT_READ_DUP_FAST = 18;
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_EXPERT_READ_DUP_FAST_NATIVE_REGIONS = 19;
-constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_DRY_RUN = 0;
-constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_VALIDATE = 1;
-constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_REMAP = 2;
-constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY = 3;
-constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY = 4;
-constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP = 5;
-constexpr uint32_t UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP = 6;
 constexpr uint32_t UVM_EXPERT_RESERVED_PREFETCH_MODE_DRY_RUN = 0;
-constexpr uint32_t UVM_EXPERT_RESERVED_PREFETCH_MODE_RESOLVE = 1;
 constexpr uint32_t UVM_EXPERT_RESERVED_PREFETCH_MODE_INVALIDATE = 2;
 constexpr uint32_t UVM_EXPERT_RESERVED_PREFETCH_MODE_RESERVED_PREFETCH = 3;
 constexpr uint32_t UVM_EXPERT_RESERVED_PREFETCH_ENTRY_INVALID_DEVICE = 2;
@@ -170,18 +139,6 @@ struct PhaseFRegisterRegionParams {
 
 struct PhaseFUnregisterRegionParams {
     uint64_t region_id;
-    uint32_t rmStatus;
-};
-
-struct PhaseFBatchRegionsParams {
-    uint32_t action;
-    uint32_t count;
-    PhaseFUuid gpu_uuid;
-    uint8_t async;
-    uint32_t success_count;
-    uint32_t failure_count;
-    uint64_t region_ids[UVM_TEST_PHASE_F_MAX_RANGES];
-    PhaseFRangeResult results[UVM_TEST_PHASE_F_MAX_RANGES];
     uint32_t rmStatus;
 };
 
@@ -409,35 +366,6 @@ struct PhaseNReclaimPoolParams {
     uint32_t rmStatus;
 };
 
-struct MoeSlotRemapEntry {
-    uint32_t layer_id;
-    uint32_t expert_id;
-    uint32_t slot_id;
-    uint32_t role;
-    uint64_t va_base;
-    uint64_t bytes;
-    uint64_t slot_offset;
-    uint32_t flags;
-    uint32_t status;
-};
-
-struct MoeSlotRemapBatchParams {
-    uint32_t mode;
-    uint32_t count;
-    PhaseFUuid gpu_uuid;
-    uint32_t validate_managed;
-    uint32_t success_count;
-    uint32_t failure_count;
-    uint32_t conflict_count;
-    uint32_t remap_count;
-    uint32_t tlb_invalidate_count;
-    uint32_t reserved;
-    uint64_t requested_bytes;
-    uint64_t accepted_bytes;
-    MoeSlotRemapEntry entries[UVM_MOE_SLOT_REMAP_MAX_ENTRIES];
-    uint32_t rmStatus;
-};
-
 struct ExpertReservedPrefetchEntry {
     uint64_t region_id;
     uint32_t pool_id;
@@ -509,8 +437,6 @@ struct UvmFdCandidate {
 
 std::mutex g_phase_n_persistent_fd_mutex;
 int g_phase_n_persistent_fd = -1;
-std::mutex g_phase_f_batch_regions_fd_mutex;
-int g_phase_f_batch_regions_source_fd = -1;
 std::mutex g_expert_reserved_prefetch_fd_mutex;
 int g_expert_reserved_prefetch_source_fd = -1;
 std::mutex g_phase_f_region_cache_mutex;
@@ -532,17 +458,6 @@ void cache_phase_f_region(uint64_t region_id, uintptr_t base, size_t length) {
 void uncache_phase_f_region(uint64_t region_id) {
     std::lock_guard<std::mutex> lock(g_phase_f_region_cache_mutex);
     g_phase_f_region_cache.erase(region_id);
-}
-
-bool lookup_phase_f_region(uint64_t region_id, PhaseFRange* range_out) {
-    std::lock_guard<std::mutex> lock(g_phase_f_region_cache_mutex);
-    auto it = g_phase_f_region_cache.find(region_id);
-    if (it == g_phase_f_region_cache.end())
-        return false;
-
-    if (range_out != nullptr)
-        *range_out = it->second;
-    return true;
 }
 
 bool phase_f_use_test_ioctl() {
@@ -689,59 +604,6 @@ int adopt_existing_uvm_fd(const char* op_name) {
     }
 
     return -1;
-}
-
-int get_cached_phase_f_batch_regions_fd(const char* op_name, int* source_fd_out) {
-    int source_fd;
-    int fd;
-
-    if (source_fd_out != nullptr)
-        *source_fd_out = -1;
-
-    {
-        std::lock_guard<std::mutex> lock(g_phase_f_batch_regions_fd_mutex);
-        source_fd = g_phase_f_batch_regions_source_fd;
-    }
-
-    if (source_fd < 0)
-        return -1;
-
-    fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 3);
-    if (fd < 0) {
-        phase_f_debug_log("%s cached_fd duplicate_failed source_fd=%d errno=%d",
-                          op_name,
-                          source_fd,
-                          errno);
-        std::lock_guard<std::mutex> lock(g_phase_f_batch_regions_fd_mutex);
-        if (g_phase_f_batch_regions_source_fd == source_fd)
-            g_phase_f_batch_regions_source_fd = -1;
-        return -1;
-    }
-
-    if (source_fd_out != nullptr)
-        *source_fd_out = source_fd;
-    return fd;
-}
-
-void set_cached_phase_f_batch_regions_source_fd(const char* op_name, int source_fd) {
-    std::lock_guard<std::mutex> lock(g_phase_f_batch_regions_fd_mutex);
-
-    if (source_fd < 0)
-        return;
-
-    if (g_phase_f_batch_regions_source_fd != source_fd) {
-        g_phase_f_batch_regions_source_fd = source_fd;
-        phase_f_debug_log("%s cached_fd_set source_fd=%d", op_name, source_fd);
-    }
-}
-
-void clear_cached_phase_f_batch_regions_source_fd(const char* op_name, int source_fd) {
-    std::lock_guard<std::mutex> lock(g_phase_f_batch_regions_fd_mutex);
-
-    if (source_fd >= 0 && g_phase_f_batch_regions_source_fd == source_fd) {
-        phase_f_debug_log("%s cached_fd_clear source_fd=%d", op_name, source_fd);
-        g_phase_f_batch_regions_source_fd = -1;
-    }
 }
 
 int get_cached_expert_reserved_prefetch_fd(const char* op_name, int* source_fd_out) {
@@ -1232,404 +1094,6 @@ int uvm_driver_phase_f_unregister_region_internal(uint64_t region_id) {
     result = uvm_driver_phase_f_unregister_region_fd(fd, region_id);
     close(fd);
     uncache_phase_f_region(region_id);
-    return result;
-}
-
-int uvm_driver_phase_f_batch_regions_fd(int fd,
-                                        const uint64_t* region_ids,
-                                        size_t count,
-                                        uint32_t action,
-                                        int device,
-                                        int async,
-                                        uint32_t* failure_count_out) {
-    if (failure_count_out != nullptr) *failure_count_out = 0;
-    if (region_ids == nullptr || count == 0) return 0;
-    if (count > UVM_TEST_PHASE_F_MAX_RANGES) return -2;
-
-    PhaseFBatchRegionsParams params{};
-    params.action = action;
-    params.count = static_cast<uint32_t>(count);
-    params.async = async ? 1 : 0;
-    params.gpu_uuid = CPU_UUID;
-    if (phase_f_action_needs_gpu_uuid(action) &&
-        !get_cuda_device_uuid(device, &params.gpu_uuid)) {
-        phase_f_debug_log("driver_batch_regions action=%s count=%zu device=%d uuid_lookup_failed",
-                          phase_f_action_name(action), count, device);
-        return -3;
-    }
-
-    for (size_t i = 0; i < count; ++i) {
-        params.region_ids[i] = region_ids[i];
-    }
-
-    phase_f_debug_log("driver_batch_regions cmd=%u action=%s count=%zu device=%d async=%d ioctl_begin first_region=%llu",
-                      UVM_PHASE_F_BATCH_REGIONS_IOCTL,
-                      phase_f_action_name(action),
-                      count,
-                      device,
-                      async,
-                      count > 0 ? static_cast<unsigned long long>(params.region_ids[0]) : 0ULL);
-    int ret = ioctl(fd, UVM_PHASE_F_BATCH_REGIONS_IOCTL, &params);
-    int saved_errno = errno;
-    phase_f_debug_log("driver_batch_regions cmd=%u action=%s count=%zu ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u first_status=%u",
-                      UVM_PHASE_F_BATCH_REGIONS_IOCTL,
-                      phase_f_action_name(action),
-                      count,
-                      ret,
-                      saved_errno,
-                      params.rmStatus,
-                      params.success_count,
-                      params.failure_count,
-                      count > 0 ? params.results[0].status : 0);
-
-    if (ret != 0) return -6;
-    if (failure_count_out != nullptr) *failure_count_out = params.failure_count;
-    if (params.rmStatus != 0 && params.success_count == 0) {
-        return -static_cast<int>(params.rmStatus);
-    }
-    return static_cast<int>(params.success_count);
-}
-
-int uvm_driver_phase_f_batch_regions_internal(const uint64_t* region_ids,
-                                              size_t count,
-                                              uint32_t action,
-                                              int device,
-                                              int async,
-                                              uint32_t* failure_count_out) {
-    int final_result = -4;
-    uint32_t final_failure_count = 0;
-
-    if (failure_count_out != nullptr)
-        *failure_count_out = 0;
-
-    if (phase_f_adopt_cuda_uvm_fd_enabled()) {
-        int cached_source_fd = -1;
-        int cached_fd = get_cached_phase_f_batch_regions_fd("driver_batch_regions", &cached_source_fd);
-
-        if (cached_fd >= 0) {
-            uint32_t local_failure_count = 0;
-            int result;
-
-            phase_f_debug_log("driver_batch_regions fd_source=cached source_fd=%d fd=%d action=%s count=%zu",
-                              cached_source_fd,
-                              cached_fd,
-                              phase_f_action_name(action),
-                              count);
-            result = uvm_driver_phase_f_batch_regions_fd(
-                cached_fd, region_ids, count, action, device, async, &local_failure_count);
-            close(cached_fd);
-
-            if (result >= 0) {
-                if (failure_count_out != nullptr)
-                    *failure_count_out = local_failure_count;
-                return result;
-            }
-
-            final_result = result;
-            final_failure_count = local_failure_count;
-            clear_cached_phase_f_batch_regions_source_fd("driver_batch_regions", cached_source_fd);
-        }
-
-        std::vector<UvmFdCandidate> candidates = collect_existing_uvm_fd_candidates("driver_batch_regions");
-
-        for (const UvmFdCandidate& candidate : candidates) {
-            int fd = duplicate_uvm_fd_candidate("driver_batch_regions", candidate);
-            uint32_t local_failure_count = 0;
-            int result;
-
-            if (fd < 0)
-                continue;
-
-            phase_f_debug_log("driver_batch_regions fd_source=adopted source_fd=%d fd=%d path=%s action=%s count=%zu",
-                              candidate.source_fd,
-                              fd,
-                              candidate.path.c_str(),
-                              phase_f_action_name(action),
-                              count);
-            result = uvm_driver_phase_f_batch_regions_fd(
-                fd, region_ids, count, action, device, async, &local_failure_count);
-            close(fd);
-
-            if (result >= 0) {
-                set_cached_phase_f_batch_regions_source_fd("driver_batch_regions", candidate.source_fd);
-                if (failure_count_out != nullptr)
-                    *failure_count_out = local_failure_count;
-                return result;
-            }
-
-            final_result = result;
-            final_failure_count = local_failure_count;
-        }
-    }
-
-    if (phase_f_action_needs_gpu_uuid(action))
-        return final_result;
-
-    int fd = open_initialized_uvm_fd("driver_batch_regions", true);
-    int result;
-
-    if (fd < 0)
-        return final_result;
-
-    result = uvm_driver_phase_f_batch_regions_fd(
-        fd, region_ids, count, action, device, async, &final_failure_count);
-    close(fd);
-
-    if (failure_count_out != nullptr)
-        *failure_count_out = final_failure_count;
-
-    return result;
-}
-
-int uvm_driver_phase_f_register_query_region_internal(uint64_t region_id,
-                                                      uintptr_t base,
-                                                      size_t length,
-                                                      int device) {
-    int fd = open_initialized_uvm_fd("driver_register_query_region", true);
-    int register_result;
-    int query_result;
-    int unregister_result;
-
-    if (fd < 0) return -4;
-
-    register_result = uvm_driver_phase_f_register_region_fd(
-        fd, region_id, base, length, 1, 0, 0, 0, 0);
-    if (register_result < 0) {
-        close(fd);
-        return register_result;
-    }
-
-    query_result = uvm_driver_phase_f_batch_regions_fd(
-        fd,
-        &region_id,
-        1,
-        UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY,
-        device,
-        0,
-        nullptr);
-
-    unregister_result = uvm_driver_phase_f_unregister_region_fd(fd, region_id);
-    close(fd);
-
-    if (query_result < 0)
-        return query_result;
-    if (unregister_result < 0)
-        return unregister_result;
-
-    return query_result;
-}
-
-int uvm_driver_moe_slot_remap_batch_fd(int fd,
-                                       const uint32_t* layer_ids,
-                                       const uint32_t* expert_ids,
-                                       const uint32_t* slot_ids,
-                                       const uint32_t* roles,
-                                       const uintptr_t* ptrs,
-                                       const size_t* sizes,
-                                       size_t count,
-                                       uint32_t mode,
-                                       int device,
-                                       uint32_t validate_managed,
-                                       uint64_t* stats_out,
-                                       size_t stats_count) {
-    if (stats_out != nullptr) {
-        for (size_t i = 0; i < stats_count; ++i)
-            stats_out[i] = 0;
-    }
-    if (count == 0) return 0;
-    if (layer_ids == nullptr || expert_ids == nullptr || slot_ids == nullptr ||
-        roles == nullptr || ptrs == nullptr || sizes == nullptr)
-        return -1;
-    if (count > UVM_MOE_SLOT_REMAP_MAX_ENTRIES)
-        return -2;
-    if (mode > UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP)
-        return -1;
-
-    MoeSlotRemapBatchParams params{};
-    params.mode = mode;
-    params.count = static_cast<uint32_t>(count);
-    params.validate_managed = validate_managed ? 1 : 0;
-    params.gpu_uuid = CPU_UUID;
-    if (device >= 0 && !get_cuda_device_uuid(device, &params.gpu_uuid)) {
-        phase_f_debug_log("driver_moe_slot_remap count=%zu mode=%u device=%d uuid_lookup_failed",
-                          count, mode, device);
-        return -3;
-    }
-
-    for (size_t i = 0; i < count; ++i) {
-        params.entries[i].layer_id = layer_ids[i];
-        params.entries[i].expert_id = expert_ids[i];
-        params.entries[i].slot_id = slot_ids[i];
-        params.entries[i].role = roles[i];
-        params.entries[i].va_base = static_cast<uint64_t>(ptrs[i]);
-        params.entries[i].bytes = static_cast<uint64_t>(sizes[i]);
-        params.entries[i].slot_offset = 0;
-        params.entries[i].flags = 0;
-    }
-
-    phase_f_debug_log("driver_moe_slot_remap cmd=%u count=%zu mode=%u device=%d validate_managed=%u ioctl_begin first_layer=%u first_expert=%u first_slot=%u first_va=0x%llx first_bytes=%llu",
-                      UVM_MOE_SLOT_REMAP_BATCH_IOCTL,
-                      count,
-                      mode,
-                      device,
-                      validate_managed,
-                      count > 0 ? params.entries[0].layer_id : 0,
-                      count > 0 ? params.entries[0].expert_id : 0,
-                      count > 0 ? params.entries[0].slot_id : 0,
-                      count > 0 ? static_cast<unsigned long long>(params.entries[0].va_base) : 0ULL,
-                      count > 0 ? static_cast<unsigned long long>(params.entries[0].bytes) : 0ULL);
-    int ret = ioctl(fd, UVM_MOE_SLOT_REMAP_BATCH_IOCTL, &params);
-    int saved_errno = errno;
-    phase_f_debug_log("driver_moe_slot_remap cmd=%u count=%zu mode=%u ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u conflicts=%u requested=%llu accepted=%llu remap=%u tlb=%u first_status=%u",
-                      UVM_MOE_SLOT_REMAP_BATCH_IOCTL,
-                      count,
-                      mode,
-                      ret,
-                      saved_errno,
-                      params.rmStatus,
-                      params.success_count,
-                      params.failure_count,
-                      params.conflict_count,
-                      static_cast<unsigned long long>(params.requested_bytes),
-                      static_cast<unsigned long long>(params.accepted_bytes),
-                      params.remap_count,
-                      params.tlb_invalidate_count,
-                      count > 0 ? params.entries[0].status : 0);
-
-    if (stats_out != nullptr && stats_count > 0) {
-        if (stats_count > 0) stats_out[0] = params.rmStatus;
-        if (stats_count > 1) stats_out[1] = params.success_count;
-        if (stats_count > 2) stats_out[2] = params.failure_count;
-        if (stats_count > 3) stats_out[3] = params.conflict_count;
-        if (stats_count > 4) stats_out[4] = params.requested_bytes;
-        if (stats_count > 5) stats_out[5] = params.accepted_bytes;
-        if (stats_count > 6) stats_out[6] = params.remap_count;
-        if (stats_count > 7) stats_out[7] = params.tlb_invalidate_count;
-    }
-
-    if (ret != 0) return -6;
-    if (params.rmStatus != 0 && params.success_count == 0)
-        return -static_cast<int>(params.rmStatus);
-    return static_cast<int>(params.success_count);
-}
-
-bool uvm_driver_moe_slot_remap_fd_validates_targets(int fd,
-                                                    const uint32_t* layer_ids,
-                                                    const uint32_t* expert_ids,
-                                                    const uint32_t* slot_ids,
-                                                    const uint32_t* roles,
-                                                    const uintptr_t* ptrs,
-                                                    const size_t* sizes,
-                                                    size_t count,
-                                                    int device) {
-    uint64_t stats[8] = {};
-    int result = uvm_driver_moe_slot_remap_batch_fd(fd,
-                                                   layer_ids,
-                                                   expert_ids,
-                                                   slot_ids,
-                                                   roles,
-                                                   ptrs,
-                                                   sizes,
-                                                   count,
-                                                   UVM_MOE_SLOT_REMAP_MODE_DRY_RUN,
-                                                   device,
-                                                   1,
-                                                   stats,
-                                                   8);
-
-    return result == static_cast<int>(count) &&
-           stats[0] == 0 &&
-           stats[1] == count &&
-           stats[2] == 0;
-}
-
-int uvm_driver_moe_slot_remap_batch_internal(const uint32_t* layer_ids,
-                                             const uint32_t* expert_ids,
-                                             const uint32_t* slot_ids,
-                                             const uint32_t* roles,
-                                             const uintptr_t* ptrs,
-                                             const size_t* sizes,
-                                             size_t count,
-                                             uint32_t mode,
-                                             int device,
-                                             uint32_t validate_managed,
-                                             uint64_t* stats_out,
-                                             size_t stats_count) {
-    if (phase_f_adopt_cuda_uvm_fd_enabled()) {
-        std::vector<UvmFdCandidate> candidates =
-            collect_existing_uvm_fd_candidates("driver_moe_slot_remap");
-
-        for (const UvmFdCandidate& candidate : candidates) {
-            int candidate_fd = duplicate_uvm_fd_candidate("driver_moe_slot_remap", candidate);
-            int result;
-
-            if (candidate_fd < 0)
-                continue;
-
-            if (!initialize_duplicated_uvm_fd("driver_moe_slot_remap", candidate_fd, candidate)) {
-                close(candidate_fd);
-                continue;
-            }
-
-            if (!uvm_driver_moe_slot_remap_fd_validates_targets(candidate_fd,
-                                                                layer_ids,
-                                                                expert_ids,
-                                                                slot_ids,
-                                                                roles,
-                                                                ptrs,
-                                                                sizes,
-                                                                count,
-                                                                device)) {
-                phase_f_debug_log("driver_moe_slot_remap adopt_fd target_validation_failed source_fd=%d fd=%d path=%s",
-                                  candidate.source_fd,
-                                  candidate_fd,
-                                  candidate.path.c_str());
-                close(candidate_fd);
-                continue;
-            }
-
-            phase_f_debug_log("driver_moe_slot_remap adopt_fd target_validated source_fd=%d fd=%d path=%s",
-                              candidate.source_fd,
-                              candidate_fd,
-                              candidate.path.c_str());
-            result = uvm_driver_moe_slot_remap_batch_fd(
-                candidate_fd,
-                layer_ids,
-                expert_ids,
-                slot_ids,
-                roles,
-                ptrs,
-                sizes,
-                count,
-                mode,
-                device,
-                validate_managed,
-                stats_out,
-                stats_count);
-            close(candidate_fd);
-            return result;
-        }
-    }
-
-    int fd = open_initialized_uvm_fd("driver_moe_slot_remap", false);
-    int result;
-
-    if (fd < 0) return -4;
-    result = uvm_driver_moe_slot_remap_batch_fd(
-        fd,
-        layer_ids,
-        expert_ids,
-        slot_ids,
-        roles,
-        ptrs,
-        sizes,
-        count,
-        mode,
-        device,
-        validate_managed,
-        stats_out,
-        stats_count);
-    close(fd);
     return result;
 }
 
@@ -8743,86 +8207,9 @@ int uvm_driver_batch_start_bg_promotion(const uintptr_t* ptrs,
         nullptr);
 }
 
-int uvm_driver_batch_gpu_only_read_dup_soft(const uintptr_t* ptrs,
-                                            const size_t* sizes,
-                                            size_t count,
-                                            int device,
-                                            int async) {
-    return uvm_driver_batch_execute_internal(
-        ptrs,
-        sizes,
-        count,
-        UVM_TEST_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT,
-        device,
-        async,
-        nullptr);
-}
 
-int uvm_driver_batch_expert_read_dup_fast(const uintptr_t* ptrs,
-                                          const size_t* sizes,
-                                          size_t count,
-                                          int device,
-                                          int async) {
-    return uvm_driver_batch_execute_internal(
-        ptrs,
-        sizes,
-        count,
-        UVM_TEST_PHASE_F_ACTION_EXPERT_READ_DUP_FAST,
-        device,
-        async,
-        nullptr);
-}
 
-int uvm_driver_batch_expert_read_dup_fast_regions(const uint64_t* region_ids,
-                                                  size_t count,
-                                                  int device,
-                                                  int async) {
-    return uvm_driver_phase_f_batch_regions_internal(
-        region_ids,
-        count,
-        UVM_TEST_PHASE_F_ACTION_EXPERT_READ_DUP_FAST,
-        device,
-        async,
-        nullptr);
-}
 
-int uvm_driver_batch_expert_read_dup_fast_native_regions(const uint64_t* region_ids,
-                                                         size_t count,
-                                                         int device,
-                                                         int async,
-                                                         cudaStream_t stream) {
-    (void)async;
-
-    if (region_ids == nullptr || count == 0)
-        return 0;
-
-    int successes = 0;
-    for (size_t i = 0; i < count; ++i) {
-        PhaseFRange range{};
-
-        if (!lookup_phase_f_region(region_ids[i], &range))
-            continue;
-
-        cudaError_t err = cudaMemPrefetchAsync(
-            reinterpret_cast<void*>(static_cast<uintptr_t>(range.base)),
-            static_cast<size_t>(range.length),
-            device,
-            stream);
-
-        if (err == cudaSuccess) {
-            ++successes;
-        }
-        else {
-            fprintf(stderr,
-                    "[vLLM UVM] cudaMemPrefetchAsync region[%zu] id=%llu failed: %s\n",
-                    i,
-                    static_cast<unsigned long long>(region_ids[i]),
-                    cudaGetErrorString(err));
-        }
-    }
-
-    return successes;
-}
 
 int uvm_driver_batch_pause_bg_promotion(const uintptr_t* ptrs,
                                         const size_t* sizes,
@@ -8988,55 +8375,8 @@ int uvm_is_managed_pointer(uintptr_t ptr, size_t size) {
     return attrs.type == cudaMemoryTypeManaged ? 1 : 0;
 }
 
-int uvm_driver_batch_query_residency_regions(const uint64_t* region_ids,
-                                             size_t count,
-                                             int device) {
-    return uvm_driver_phase_f_batch_regions_internal(
-        region_ids,
-        count,
-        UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY,
-        device,
-        0,
-        nullptr);
-}
 
-int uvm_driver_phase_f_register_query_region(uint64_t region_id,
-                                             uintptr_t base,
-                                             size_t length,
-                                             int device) {
-    return uvm_driver_phase_f_register_query_region_internal(
-        region_id,
-        base,
-        length,
-        device);
-}
 
-int uvm_driver_moe_slot_remap_batch(const uint32_t* layer_ids,
-                                    const uint32_t* expert_ids,
-                                    const uint32_t* slot_ids,
-                                    const uint32_t* roles,
-                                    const uintptr_t* ptrs,
-                                    const size_t* sizes,
-                                    size_t count,
-                                    uint32_t mode,
-                                    int device,
-                                    uint32_t validate_managed,
-                                    uint64_t* stats_out,
-                                    size_t stats_count) {
-    return uvm_driver_moe_slot_remap_batch_internal(
-        layer_ids,
-        expert_ids,
-        slot_ids,
-        roles,
-        ptrs,
-        sizes,
-        count,
-        mode,
-        device,
-        validate_managed,
-        stats_out,
-        stats_count);
-}
 
 __attribute__((visibility("default")))
 int uvm_driver_expert_reserved_prefetch_regions(const uint64_t* region_ids,
@@ -9070,79 +8410,7 @@ int uvm_driver_expert_reserved_prefetch_regions(const uint64_t* region_ids,
         entries_count);
 }
 
-int uvm_smoke_gpu_readback(const void* src, void* dst, size_t bytes, int device) {
-    if (src == nullptr || dst == nullptr || bytes == 0)
-        return -1;
 
-    cudaError_t err = cudaSetDevice(device);
-    if (err != cudaSuccess)
-        return -2;
-
-    unsigned char* device_dst = nullptr;
-    err = cudaMalloc(&device_dst, bytes);
-    if (err != cudaSuccess)
-        return -3;
-
-    int threads = 256;
-    int blocks = static_cast<int>((bytes + threads - 1) / threads);
-    if (blocks < 1)
-        blocks = 1;
-    if (blocks > 1024)
-        blocks = 1024;
-
-    uvm_smoke_copy_bytes_kernel<<<blocks, threads>>>(
-        static_cast<const unsigned char*>(src),
-        device_dst,
-        bytes);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        cudaFree(device_dst);
-        return -4;
-    }
-
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        cudaFree(device_dst);
-        return -5;
-    }
-
-    err = cudaMemcpy(dst, device_dst, bytes, cudaMemcpyDeviceToHost);
-    cudaFree(device_dst);
-    if (err != cudaSuccess)
-        return -6;
-
-    return 0;
-}
-
-int uvm_smoke_gpu_fill(void* dst, unsigned int value, size_t bytes, int device) {
-    if (dst == nullptr || bytes == 0 || value > 0xff)
-        return -1;
-
-    cudaError_t err = cudaSetDevice(device);
-    if (err != cudaSuccess)
-        return -2;
-
-    int threads = 256;
-    int blocks = static_cast<int>((bytes + threads - 1) / threads);
-    if (blocks < 1)
-        blocks = 1;
-    if (blocks > 1024)
-        blocks = 1024;
-
-    uvm_smoke_fill_bytes_kernel<<<blocks, threads>>>(
-        static_cast<unsigned char*>(dst),
-        static_cast<unsigned char>(value),
-        bytes);
-    err = cudaGetLastError();
-    if (err != cudaSuccess)
-        return -3;
-
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess)
-        return -4;
-
-    return 0;
-}
 
 int uvm_driver_phase_n_set_pool_budget(uint32_t pool,
                                        uint32_t gpu_id,

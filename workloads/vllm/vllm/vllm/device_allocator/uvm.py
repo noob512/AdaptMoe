@@ -62,16 +62,13 @@ _UVM_DRIVER_BATCH_MAX_RANGES = 64
 _UVM_INITIALIZE_IOCTL = 0x30000001
 _UVM_PHASE_F_BATCH_EXECUTOR_IOCTL = 81
 _UVM_PHASE_F_MAX_RANGES = 64
-_UVM_MOE_SLOT_REMAP_BATCH_IOCTL = 91
 _UVM_MOE_SLOT_POOL_QUERY_IOCTL = 92
 _UVM_EXPERT_RESERVED_POOL_IOCTL = 98
 _UVM_EXPERT_RESERVED_PREFETCH_BATCH_IOCTL = 99
 _UVM_EXPERT_OFFLOAD_RELEASE_IOCTL = 100
-_UVM_MOE_SLOT_REMAP_MAX_ENTRIES = 128
 _UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES = 128
 _UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES = 128
 _UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES = 128
-_UVM_MOE_SLOT_REMAP_STATS_COUNT = 8
 _UVM_EXPERT_RESERVED_PREFETCH_STATS_COUNT = 16
 _UVM_PAGE_SIZE = 0
 
@@ -79,11 +76,8 @@ UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ = 5
 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG = 6
 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED = 7
 UVM_PHASE_F_ACTION_START_BG_PROMOTION = 8
-UVM_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT = 14
 UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16
 UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17
-UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST = 18
-UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST_NATIVE_REGIONS = 19
 
 UVM_REGION_POOL_UNKNOWN = 0
 UVM_REGION_POOL_KV = 1
@@ -122,17 +116,7 @@ UVM_POOL_BUDGET_MODE_TRACE_ONLY = 0
 UVM_POOL_BUDGET_MODE_SOFT = 1
 UVM_POOL_BUDGET_MODE_ENFORCE = 2
 
-UVM_MOE_SLOT_REMAP_MODE_DRY_RUN = 0
-UVM_MOE_SLOT_REMAP_MODE_VALIDATE = 1
-UVM_MOE_SLOT_REMAP_MODE_REMAP = 2
-UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY = 3
-UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY = 4
-UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP = 5
-UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP = 6
 
-UVM_MOE_SLOT_REMAP_ROLE_UNKNOWN = 0
-UVM_MOE_SLOT_REMAP_ROLE_GATE_UP = 3
-UVM_MOE_SLOT_REMAP_ROLE_DOWN = 4
 
 UVM_MOE_SLOT_POOL_QUERY_FLAG_FILTER_LAYER = 1 << 0
 UVM_MOE_SLOT_POOL_QUERY_FLAG_FILTER_SLOT = 1 << 1
@@ -234,37 +218,8 @@ class _PhaseFBatchExecutorParams(ctypes.Structure):
     ]
 
 
-class _MoeSlotRemapEntry(ctypes.Structure):
-    _fields_ = [
-        ("layer_id", ctypes.c_uint32),
-        ("expert_id", ctypes.c_uint32),
-        ("slot_id", ctypes.c_uint32),
-        ("role", ctypes.c_uint32),
-        ("va_base", ctypes.c_uint64),
-        ("bytes", ctypes.c_uint64),
-        ("slot_offset", ctypes.c_uint64),
-        ("flags", ctypes.c_uint32),
-        ("status", ctypes.c_uint32),
-    ]
 
 
-class _MoeSlotRemapBatchParams(ctypes.Structure):
-    _fields_ = [
-        ("mode", ctypes.c_uint32),
-        ("count", ctypes.c_uint32),
-        ("gpu_uuid", _PhaseFUuid),
-        ("validate_managed", ctypes.c_uint32),
-        ("success_count", ctypes.c_uint32),
-        ("failure_count", ctypes.c_uint32),
-        ("conflict_count", ctypes.c_uint32),
-        ("remap_count", ctypes.c_uint32),
-        ("tlb_invalidate_count", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
-        ("requested_bytes", ctypes.c_uint64),
-        ("accepted_bytes", ctypes.c_uint64),
-        ("entries", _MoeSlotRemapEntry * _UVM_MOE_SLOT_REMAP_MAX_ENTRIES),
-        ("rmStatus", ctypes.c_uint32),
-    ]
 
 
 class _MoeSlotPoolQueryEntry(ctypes.Structure):
@@ -626,99 +581,10 @@ def _open_or_adopt_initialized_uvm_fd(*, prefer_existing: bool = False) -> int:
     return _open_initialized_uvm_fd()
 
 
-def _fill_moe_slot_remap_params(
-    params: _MoeSlotRemapBatchParams,
-    *,
-    chunk: list[dict[str, int]],
-    mode_value: int,
-    gpu_uuid: _PhaseFUuid,
-    validate_managed: bool,
-) -> None:
-    params.mode = mode_value
-    params.count = len(chunk)
-    params.gpu_uuid = gpu_uuid
-    params.validate_managed = 1 if validate_managed else 0
-    for index, entry in enumerate(chunk):
-        params.entries[index].layer_id = entry["layer_id"]
-        params.entries[index].expert_id = entry["expert_id"]
-        params.entries[index].slot_id = entry["slot_id"]
-        params.entries[index].role = entry["role"]
-        params.entries[index].va_base = entry["va_base"]
-        params.entries[index].bytes = entry["bytes"]
-        params.entries[index].slot_offset = entry["slot_offset"]
-        params.entries[index].flags = entry["flags"]
 
 
-def _moe_slot_fd_validates_targets(
-    fd: int,
-    normalized: list[dict[str, int]],
-    *,
-    gpu_uuid: _PhaseFUuid,
-) -> bool:
-    for start in range(0, len(normalized), _UVM_MOE_SLOT_REMAP_MAX_ENTRIES):
-        chunk = normalized[start:start + _UVM_MOE_SLOT_REMAP_MAX_ENTRIES]
-        params = _MoeSlotRemapBatchParams()
-        _fill_moe_slot_remap_params(
-            params,
-            chunk=chunk,
-            mode_value=UVM_MOE_SLOT_REMAP_MODE_DRY_RUN,
-            gpu_uuid=gpu_uuid,
-            validate_managed=True,
-        )
-        ctypes.set_errno(0)
-        ret = _libc_ioctl(fd, _UVM_MOE_SLOT_REMAP_BATCH_IOCTL, params)
-        if (
-            ret != 0
-            or int(params.rmStatus) != 0
-            or int(params.success_count) != len(chunk)
-            or int(params.failure_count) != 0
-        ):
-            return False
-    return True
 
 
-def _open_moe_slot_uvm_fd_for_targets(
-    normalized: list[dict[str, int]],
-    *,
-    mode_value: int,
-    gpu_uuid: _PhaseFUuid,
-    prefer_existing: bool,
-) -> int:
-    needs_target_owner = mode_value in (
-        UVM_MOE_SLOT_REMAP_MODE_REMAP,
-        UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY,
-        UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY,
-        UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP,
-        UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP,
-    )
-
-    if prefer_existing:
-        fallback_fd: Optional[int] = None
-        for fd in _iter_initialized_existing_uvm_fds():
-            if needs_target_owner:
-                if _moe_slot_fd_validates_targets(
-                    fd,
-                    normalized,
-                    gpu_uuid=gpu_uuid,
-                ):
-                    if fallback_fd is not None:
-                        os.close(fallback_fd)
-                    return fd
-                os.close(fd)
-                continue
-            elif fallback_fd is None:
-                fallback_fd = fd
-                continue
-
-            if fallback_fd is None:
-                fallback_fd = fd
-            else:
-                os.close(fd)
-
-        if fallback_fd is not None:
-            return fallback_fd
-
-    return _open_initialized_uvm_fd()
 
 
 def find_uvm_allocator_library() -> Optional[str]:
@@ -894,8 +760,6 @@ def load_uvm_library() -> ctypes.CDLL:
         "uvm_driver_batch_prepare_remote_read",
         "uvm_driver_batch_prepare_remote_read_bg_deferred",
         "uvm_driver_batch_start_bg_promotion",
-        "uvm_driver_batch_gpu_only_read_dup_soft",
-        "uvm_driver_batch_expert_read_dup_fast",
         "uvm_driver_batch_pause_bg_promotion",
         "uvm_driver_batch_resume_bg_promotion",
     ):
@@ -943,56 +807,10 @@ def load_uvm_library() -> ctypes.CDLL:
     lib.uvm_driver_phase_f_unregister_region.restype = ctypes.c_int
     lib.uvm_driver_phase_f_unregister_region.argtypes = [ctypes.c_uint64]
 
-    lib.uvm_driver_batch_query_residency_regions.restype = ctypes.c_int
-    lib.uvm_driver_batch_query_residency_regions.argtypes = [
-        ctypes.POINTER(ctypes.c_uint64),
-        ctypes.c_size_t,
-        ctypes.c_int,
-    ]
 
-    if hasattr(lib, "uvm_driver_batch_expert_read_dup_fast_regions"):
-        lib.uvm_driver_batch_expert_read_dup_fast_regions.restype = ctypes.c_int
-        lib.uvm_driver_batch_expert_read_dup_fast_regions.argtypes = [
-            ctypes.POINTER(ctypes.c_uint64),
-            ctypes.c_size_t,
-            ctypes.c_int,
-            ctypes.c_int,
-        ]
 
-    if hasattr(lib, "uvm_driver_batch_expert_read_dup_fast_native_regions"):
-        lib.uvm_driver_batch_expert_read_dup_fast_native_regions.restype = ctypes.c_int
-        lib.uvm_driver_batch_expert_read_dup_fast_native_regions.argtypes = [
-            ctypes.POINTER(ctypes.c_uint64),
-            ctypes.c_size_t,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-        ]
 
-    lib.uvm_driver_phase_f_register_query_region.restype = ctypes.c_int
-    lib.uvm_driver_phase_f_register_query_region.argtypes = [
-        ctypes.c_uint64,
-        ctypes.c_uint64,
-        ctypes.c_size_t,
-        ctypes.c_int,
-    ]
 
-    if hasattr(lib, "uvm_driver_moe_slot_remap_batch"):
-        lib.uvm_driver_moe_slot_remap_batch.restype = ctypes.c_int
-        lib.uvm_driver_moe_slot_remap_batch.argtypes = [
-            ctypes.POINTER(ctypes.c_uint32),
-            ctypes.POINTER(ctypes.c_uint32),
-            ctypes.POINTER(ctypes.c_uint32),
-            ctypes.POINTER(ctypes.c_uint32),
-            ctypes.POINTER(ctypes.c_uint64),
-            ctypes.POINTER(ctypes.c_size_t),
-            ctypes.c_size_t,
-            ctypes.c_uint32,
-            ctypes.c_int,
-            ctypes.c_uint32,
-            ctypes.POINTER(ctypes.c_uint64),
-            ctypes.c_size_t,
-        ]
 
     if hasattr(lib, "uvm_driver_expert_reserved_prefetch_regions"):
         lib.uvm_driver_expert_reserved_prefetch_regions.restype = ctypes.c_int
@@ -1110,35 +928,6 @@ def ensure_uvm_runtime_library() -> ctypes.CDLL:
     return _uvm_lib
 
 
-def cleanup_uvm_local_memory_pool() -> None:
-    """Drop local UVM MemPool objects before interpreter/CUDA teardown.
-
-    PyTorch's CUDAPluggableAllocator/MemPool destructors can run very late
-    during Python shutdown. Keeping the local UVM allocator cached globally
-    until then has caused process-exit segfaults in isolated microbenchmarks,
-    even after all tensors were explicitly deleted. Clearing the cached pool
-    while CUDA and Python runtime state are still healthy avoids that teardown
-    ordering hazard.
-    """
-    global _uvm_local_allocator, _uvm_local_mem_pool, _uvm_local_prefetch_stack
-
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-    except Exception:
-        logger.debug("Failed to synchronize before UVM local pool cleanup", exc_info=True)
-
-    _uvm_local_mem_pool = None
-    _uvm_local_allocator = None
-    _uvm_local_prefetch_stack.clear()
-    gc.collect()
-
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-    except Exception:
-        logger.debug("Failed to synchronize after UVM local pool cleanup", exc_info=True)
 
 
 def _uvm_local_prefetch_enabled() -> bool:
@@ -1322,70 +1111,12 @@ def uvm_enabled_allocation_phase(phase: str):
         yield
 
 
-def get_uvm_stats() -> dict:
-    """
-    Get UVM memory statistics.
-
-    Returns:
-        Dictionary with memory statistics:
-        - allocated_bytes: Current allocated bytes
-        - peak_bytes: Peak allocated bytes
-        - num_allocs: Total number of allocations
-        - num_frees: Total number of frees
-    """
-    if not _uvm_enabled or _uvm_lib is None:
-        return {
-            "allocated_bytes": 0,
-            "peak_bytes": 0,
-            "num_allocs": 0,
-            "num_frees": 0,
-            "enabled": False,
-        }
-
-    return {
-        "allocated_bytes": _uvm_lib.uvm_get_allocated_bytes(),
-        "peak_bytes": _uvm_lib.uvm_get_peak_allocated_bytes(),
-        "num_allocs": _uvm_lib.uvm_get_num_allocs(),
-        "num_frees": _uvm_lib.uvm_get_num_frees(),
-        "enabled": True,
-    }
 
 
-def reset_uvm_peak_stats() -> None:
-    """Reset peak memory statistics to current allocation."""
-    if _uvm_lib is not None:
-        _uvm_lib.uvm_reset_peak_stats()
 
 
-def reset_uvm_all_stats() -> None:
-    """Reset all memory statistics."""
-    if _uvm_lib is not None:
-        _uvm_lib.uvm_reset_all_stats()
 
 
-def prefetch_to_device(tensor: torch.Tensor, device: int = 0) -> None:
-    """
-    Prefetch a UVM tensor to the specified GPU device.
-
-    This can improve performance by proactively moving data to GPU
-    before it's needed.
-
-    Args:
-        tensor: The tensor to prefetch (must be on CUDA)
-        device: Target GPU device ID
-    """
-    if not _uvm_enabled:
-        return
-
-    if not tensor.is_cuda:
-        logger.warning("Cannot prefetch non-CUDA tensor")
-        return
-
-    # Use cudaMemPrefetchAsync via the library
-    if _uvm_lib is not None:
-        ptr = tensor.data_ptr()
-        size = tensor.numel() * tensor.element_size()
-        prefetch_range_to_device(ptr, size, device)
 
 
 def prefetch_range_to_device(ptr: int, size: int, device: int = 0) -> bool:
@@ -1405,9 +1136,6 @@ def prefetch_range_to_device(ptr: int, size: int, device: int = 0) -> bool:
     return batch_prefetch_ranges_to_device(((ptr, size),), device=device) == 1
 
 
-def prefetch_range_to_cpu(ptr: int, size: int) -> bool:
-    """Prefetch a raw UVM address range to CPU memory."""
-    return prefetch_range_to_device(ptr, size, device=-1)
 
 
 def probe_driver_capable_range(ptr: int, size: int) -> tuple[bool, str, int]:
@@ -1536,10 +1264,6 @@ def _phase_f_cpp_helper_name(action: int) -> str | None:
         return "uvm_driver_batch_prepare_remote_read_bg_deferred"
     if action == UVM_PHASE_F_ACTION_START_BG_PROMOTION:
         return "uvm_driver_batch_start_bg_promotion"
-    if action == UVM_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT:
-        return "uvm_driver_batch_gpu_only_read_dup_soft"
-    if action == UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST:
-        return "uvm_driver_batch_expert_read_dup_fast"
     if action == UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION:
         return "uvm_driver_batch_pause_bg_promotion"
     if action == UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION:
@@ -1703,370 +1427,16 @@ def driver_phase_f_batch_execute_ranges(
                 pass
 
 
-def _moe_slot_remap_mode_value(mode: str | int) -> int:
-    if isinstance(mode, int):
-        return int(mode)
-    normalized = str(mode or "dry_run").strip().lower()
-    if normalized in ("dry_run", "dry-run", "trace", "trace_only"):
-        return UVM_MOE_SLOT_REMAP_MODE_DRY_RUN
-    if normalized in ("validate", "validate_only"):
-        return UVM_MOE_SLOT_REMAP_MODE_VALIDATE
-    if normalized in ("remap", "pte_remap", "real"):
-        return UVM_MOE_SLOT_REMAP_MODE_REMAP
-    if normalized in ("copy_only", "copy-only", "copy", "migration", "migrate"):
-        return UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY
-    if normalized in (
-        "gpu_copy_only",
-        "gpu-copy-only",
-        "gpu_copy",
-        "vidmem_copy_only",
-        "vidmem-copy-only",
-    ):
-        return UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY
-    if normalized in (
-        "slot_pte_remap",
-        "slot-pte-remap",
-        "pte_remap",
-        "pte-remap",
-        "slot_pte",
-    ):
-        return UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP
-    if normalized in (
-        "slot_va_block_remap",
-        "slot-va-block-remap",
-        "slot_va_block",
-        "va_block_remap",
-        "va-block-remap",
-    ):
-        return UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP
-    return UVM_MOE_SLOT_REMAP_MODE_DRY_RUN
 
 
-def _moe_slot_role_value(role: str | int | None) -> int:
-    if isinstance(role, int):
-        return int(role)
-    normalized = str(role or "").strip().lower()
-    if normalized in ("moe_gate_up", "gate_up", "w13", "w13_weight"):
-        return UVM_MOE_SLOT_REMAP_ROLE_GATE_UP
-    if normalized in ("moe_down", "down", "w2", "w2_weight"):
-        return UVM_MOE_SLOT_REMAP_ROLE_DOWN
-    return UVM_MOE_SLOT_REMAP_ROLE_UNKNOWN
 
 
-def _normalize_moe_slot_remap_entries(
-    entries: Sequence[dict[str, object]],
-    *,
-    round_to_pages: bool = True,
-) -> list[dict[str, int]]:
-    page = get_uvm_page_size()
-    normalized: list[dict[str, int]] = []
-    for entry in entries:
-        try:
-            va_base = int(entry.get("va_base", entry.get("ptr", 0)))
-            size_bytes = int(entry.get("bytes", entry.get("size", 0)))
-            layer_id = int(entry.get("layer_id", 0))
-            expert_id = int(entry.get("expert_id", 0))
-            slot_id = int(entry.get("slot_id", 0))
-            slot_offset = int(entry.get("slot_offset", 0))
-            flags = int(entry.get("flags", 0))
-        except (TypeError, ValueError, AttributeError):
-            continue
-
-        if va_base <= 0 or size_bytes <= 0:
-            continue
-        if round_to_pages:
-            end = va_base + size_bytes
-            va_base = va_base - (va_base % page)
-            rounded_end = ((end + page - 1) // page) * page
-            size_bytes = max(rounded_end - va_base, 0)
-        if size_bytes <= 0:
-            continue
-        normalized.append({
-            "layer_id": layer_id,
-            "expert_id": expert_id,
-            "slot_id": slot_id,
-            "role": _moe_slot_role_value(entry.get("role")),
-            "va_base": va_base,
-            "bytes": size_bytes,
-            "slot_offset": slot_offset,
-            "flags": flags,
-        })
-    return normalized
 
 
-def _empty_moe_slot_remap_result(
-    *,
-    mode: str | int,
-    ioctl_ret: int = 0,
-    rm_status: int = 0,
-) -> dict[str, object]:
-    mode_value = _moe_slot_remap_mode_value(mode)
-    return {
-        "mode": mode_value,
-        "mode_name": {
-            UVM_MOE_SLOT_REMAP_MODE_DRY_RUN: "dry_run",
-            UVM_MOE_SLOT_REMAP_MODE_VALIDATE: "validate",
-            UVM_MOE_SLOT_REMAP_MODE_REMAP: "remap",
-            UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY: "copy_only",
-            UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY: "gpu_copy_only",
-            UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP: "slot_pte_remap",
-            UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP: "slot_va_block_remap",
-        }.get(mode_value, str(mode)),
-        "entry_count": 0,
-        "success_count": 0,
-        "failure_count": 0,
-        "conflict_count": 0,
-        "requested_bytes": 0,
-        "accepted_bytes": 0,
-        "remap_count": 0,
-        "tlb_invalidate_count": 0,
-        "copy_count": 0,
-        "copy_bytes": 0,
-        "copy_failed_count": 0,
-        "rm_status": int(rm_status),
-        "ioctl_ret": int(ioctl_ret),
-        "ok": int(ioctl_ret) == 0 and int(rm_status) == 0,
-        "backend": "none",
-    }
 
 
-def _driver_moe_slot_remap_batch_cpp_helper(
-    entries: list[dict[str, int]],
-    *,
-    mode: str | int = "dry_run",
-    device: int = 0,
-    validate_managed: bool = False,
-) -> dict[str, int | str | bool] | None:
-    if _uvm_lib is None or not hasattr(_uvm_lib, "uvm_driver_moe_slot_remap_batch"):
-        return None
-    if not entries:
-        return _empty_moe_slot_remap_result(mode=mode)
-
-    helper = _uvm_lib.uvm_driver_moe_slot_remap_batch
-    mode_value = _moe_slot_remap_mode_value(mode)
-    if (mode_value in (
-            UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY,
-            UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY,
-    ) or
-            any(int(entry.get("slot_offset") or 0) != 0 for entry in entries)):
-        return None
-    total = _empty_moe_slot_remap_result(mode=mode)
-    total["backend"] = "cpp_helper"
-    total["ok"] = True
-
-    for start in range(0, len(entries), _UVM_MOE_SLOT_REMAP_MAX_ENTRIES):
-        chunk = entries[start:start + _UVM_MOE_SLOT_REMAP_MAX_ENTRIES]
-        count = len(chunk)
-        layer_ids = (ctypes.c_uint32 * count)(*(e["layer_id"] for e in chunk))
-        expert_ids = (ctypes.c_uint32 * count)(*(e["expert_id"] for e in chunk))
-        slot_ids = (ctypes.c_uint32 * count)(*(e["slot_id"] for e in chunk))
-        roles = (ctypes.c_uint32 * count)(*(e["role"] for e in chunk))
-        ptrs = (ctypes.c_uint64 * count)(*(e["va_base"] for e in chunk))
-        sizes = (ctypes.c_size_t * count)(*(e["bytes"] for e in chunk))
-        stats = (ctypes.c_uint64 * _UVM_MOE_SLOT_REMAP_STATS_COUNT)()
-        ret = int(helper(
-            layer_ids,
-            expert_ids,
-            slot_ids,
-            roles,
-            ptrs,
-            sizes,
-            ctypes.c_size_t(count),
-            ctypes.c_uint32(mode_value),
-            ctypes.c_int(device),
-            ctypes.c_uint32(1 if validate_managed else 0),
-            stats,
-            ctypes.c_size_t(_UVM_MOE_SLOT_REMAP_STATS_COUNT),
-        ))
-
-        total["entry_count"] = int(total["entry_count"]) + count
-        total["rm_status"] = int(stats[0])
-        total["success_count"] = int(total["success_count"]) + int(stats[1])
-        total["failure_count"] = int(total["failure_count"]) + int(stats[2])
-        total["conflict_count"] = int(total["conflict_count"]) + int(stats[3])
-        total["requested_bytes"] = int(total["requested_bytes"]) + int(stats[4])
-        total["accepted_bytes"] = int(total["accepted_bytes"]) + int(stats[5])
-        total["remap_count"] = int(total["remap_count"]) + int(stats[6])
-        total["tlb_invalidate_count"] = (
-            int(total["tlb_invalidate_count"]) + int(stats[7])
-        )
-        total["ioctl_ret"] = ret if ret < 0 else 0
-        if ret < 0 or int(stats[0]) != 0:
-            total["ok"] = False
-            break
-
-    if mode_value in (
-            UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY,
-            UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY,
-    ):
-        total["copy_count"] = int(total["success_count"])
-        total["copy_bytes"] = int(total["accepted_bytes"])
-        total["copy_failed_count"] = int(total["failure_count"])
-
-    return total
 
 
-def driver_moe_slot_remap_batch(
-    entries: Sequence[dict[str, object]],
-    *,
-    mode: str | int = "dry_run",
-    device: int = 0,
-    validate_managed: bool = False,
-    round_to_pages: bool = True,
-    fd_target_entries: Sequence[dict[str, object]] | None = None,
-    fd_target_round_to_pages: bool | None = None,
-    reset_slot_pool_after: bool = False,
-) -> dict[str, object]:
-    """Submit MoE slot remap assignments to the modified UVM driver."""
-    normalized = _normalize_moe_slot_remap_entries(
-        entries,
-        round_to_pages=round_to_pages,
-    )
-    if not normalized or uvm_residency_tag_only_enabled():
-        return _empty_moe_slot_remap_result(mode=mode)
-
-    fd_targets = normalized
-    if fd_target_entries is not None:
-        fd_targets = _normalize_moe_slot_remap_entries(
-            fd_target_entries,
-            round_to_pages=(
-                round_to_pages
-                if fd_target_round_to_pages is None
-                else fd_target_round_to_pages
-            ),
-        )
-        if not fd_targets:
-            result = _empty_moe_slot_remap_result(mode=mode, ioctl_ret=-5)
-            result["entry_count"] = len(normalized)
-            result["failure_count"] = len(normalized)
-            result["requested_bytes"] = sum(e["bytes"] for e in normalized)
-            result["backend"] = "python_ioctl"
-            result["ok"] = False
-            return result
-    else:
-        helper_result = _driver_moe_slot_remap_batch_cpp_helper(
-            normalized,
-            mode=mode,
-            device=device,
-            validate_managed=validate_managed,
-        ) if not reset_slot_pool_after else None
-        if helper_result is not None:
-            return helper_result
-
-    try:
-        gpu_uuid = _phase_f_gpu_uuid(device) if int(device) >= 0 else _PhaseFUuid()
-    except Exception:
-        logger.debug("Failed to resolve CUDA UUID for MoE slot remap ioctl",
-                     exc_info=True)
-        result = _empty_moe_slot_remap_result(mode=mode, ioctl_ret=-3)
-        result["entry_count"] = len(normalized)
-        result["failure_count"] = len(normalized)
-        result["requested_bytes"] = sum(e["bytes"] for e in normalized)
-        result["backend"] = "python_ioctl"
-        result["ok"] = False
-        return result
-
-    mode_value = _moe_slot_remap_mode_value(mode)
-    fd = -1
-    total = _empty_moe_slot_remap_result(mode=mode)
-    total["backend"] = "python_ioctl"
-    total["ok"] = True
-    try:
-        prefer_existing_fd = (
-            validate_managed
-            or mode_value in (
-                UVM_MOE_SLOT_REMAP_MODE_REMAP,
-                UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY,
-                UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY,
-                UVM_MOE_SLOT_REMAP_MODE_SLOT_PTE_REMAP,
-                UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP,
-            )
-        )
-        fd = _open_moe_slot_uvm_fd_for_targets(
-            fd_targets,
-            mode_value=mode_value,
-            gpu_uuid=gpu_uuid,
-            prefer_existing=prefer_existing_fd,
-        )
-        for start in range(0, len(normalized), _UVM_MOE_SLOT_REMAP_MAX_ENTRIES):
-            chunk = normalized[start:start + _UVM_MOE_SLOT_REMAP_MAX_ENTRIES]
-            params = _MoeSlotRemapBatchParams()
-            _fill_moe_slot_remap_params(
-                params,
-                chunk=chunk,
-                mode_value=mode_value,
-                gpu_uuid=gpu_uuid,
-                validate_managed=validate_managed,
-            )
-
-            ret = _libc_ioctl(fd, _UVM_MOE_SLOT_REMAP_BATCH_IOCTL, params)
-            total["entry_count"] = int(total["entry_count"]) + len(chunk)
-            total["success_count"] = (
-                int(total["success_count"]) + int(params.success_count)
-            )
-            total["failure_count"] = (
-                int(total["failure_count"]) + int(params.failure_count)
-            )
-            total["conflict_count"] = (
-                int(total["conflict_count"]) + int(params.conflict_count)
-            )
-            total["requested_bytes"] = (
-                int(total["requested_bytes"]) + int(params.requested_bytes)
-            )
-            total["accepted_bytes"] = (
-                int(total["accepted_bytes"]) + int(params.accepted_bytes)
-            )
-            total["remap_count"] = int(total["remap_count"]) + int(params.remap_count)
-            total["tlb_invalidate_count"] = (
-                int(total["tlb_invalidate_count"]) + int(params.tlb_invalidate_count)
-            )
-            total["rm_status"] = int(params.rmStatus)
-            total["ioctl_ret"] = int(ret)
-
-            if ret != 0 or int(params.rmStatus) != 0:
-                saved_errno = ctypes.get_errno()
-                logger.warning(
-                    "MoE slot remap ioctl failed: mode=%s ret=%s errno=%s "
-                    "rmStatus=%s success=%s failure=%s conflicts=%s",
-                    mode,
-                    ret,
-                    saved_errno,
-                    int(params.rmStatus),
-                    int(params.success_count),
-                    int(params.failure_count),
-                    int(params.conflict_count),
-                )
-                total["ok"] = False
-                break
-        if reset_slot_pool_after and total.get("ok") is True:
-            reset_result = _driver_moe_slot_pool_reset_after_remap_on_fd(fd)
-            total["slot_pool_reset_after_remap"] = reset_result
-            if reset_result.get("ok") is not True:
-                total["ok"] = False
-                total["reset_after_remap_failed"] = True
-        if mode_value in (
-                UVM_MOE_SLOT_REMAP_MODE_COPY_ONLY,
-                UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ONLY,
-        ):
-            total["copy_count"] = int(total["success_count"])
-            total["copy_bytes"] = int(total["accepted_bytes"])
-            total["copy_failed_count"] = int(total["failure_count"])
-        return total
-    except Exception:
-        logger.debug("MoE slot remap direct ioctl failed", exc_info=True)
-        result = _empty_moe_slot_remap_result(mode=mode, ioctl_ret=-4)
-        result["entry_count"] = len(normalized)
-        result["failure_count"] = len(normalized)
-        result["requested_bytes"] = sum(e["bytes"] for e in normalized)
-        result["backend"] = "python_ioctl"
-        result["ok"] = False
-        return result
-    finally:
-        if fd >= 0:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
 
 
 def _moe_slot_pool_entry_to_dict(entry: _MoeSlotPoolQueryEntry) -> dict[str, int]:
@@ -2268,34 +1638,6 @@ def _driver_moe_slot_pool_query_on_fd(
     return result
 
 
-def _driver_moe_slot_pool_reset_after_remap_on_fd(
-    fd: int,
-) -> dict[str, object]:
-    before = _driver_moe_slot_pool_query_on_fd(fd, max_entries=0)
-    reset = _driver_moe_slot_pool_query_on_fd(fd, max_entries=0, reset=True)
-    after = _driver_moe_slot_pool_query_on_fd(fd, max_entries=0)
-
-    before_summary = _compact_moe_slot_pool_query_result(before)
-    reset_summary = _compact_moe_slot_pool_query_result(reset)
-    after_summary = _compact_moe_slot_pool_query_result(after)
-    ok = (
-        bool(before_summary["ok"])
-        and bool(reset_summary["ok"])
-        and bool(after_summary["ok"])
-        and int(after_summary["active_slots"]) == 0
-        and int(after_summary["backed_slots"]) == 0
-        and int(after_summary["slot_backing_bytes"]) == 0
-        and int(reset_summary["pte_residual_va_block_count"]) == 0
-        and int(reset_summary["pte_residual_page_count"]) == 0
-        and int(after_summary["pte_residual_va_block_count"]) == 0
-        and int(after_summary["pte_residual_page_count"]) == 0
-    )
-    return {
-        "ok": ok,
-        "before": before_summary,
-        "reset": reset_summary,
-        "after": after_summary,
-    }
 
 
 def driver_moe_slot_pool_query(
@@ -2576,16 +1918,6 @@ def driver_expert_reserved_pool_query(
     )
 
 
-def driver_expert_reserved_pool_reset(
-    *,
-    max_entries: int = _UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES,
-    prefer_existing: bool = False,
-) -> dict[str, object]:
-    return driver_expert_reserved_pool(
-        mode="reset",
-        max_entries=max_entries,
-        prefer_existing=prefer_existing,
-    )
 
 
 def _expert_offload_release_entry_to_dict(
@@ -3430,118 +2762,12 @@ def driver_start_ranges_bg_promotion(
     )
 
 
-def driver_gpu_only_read_dup_soft(
-    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
-    *,
-    device: int = 0,
-    async_: bool = False,
-) -> tuple[int, int, int, int]:
-    return driver_phase_f_batch_execute_ranges(
-        ranges,
-        UVM_PHASE_F_ACTION_GPU_ONLY_READ_DUP_SOFT,
-        device=device,
-        async_=async_,
-    )
 
 
-def driver_expert_read_dup_fast(
-    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
-    *,
-    device: int = 0,
-    async_: bool = False,
-) -> tuple[int, int, int, int]:
-    return driver_phase_f_batch_execute_ranges(
-        ranges,
-        UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST,
-        device=device,
-        async_=async_,
-    )
 
 
-def driver_expert_read_dup_fast_regions(
-    region_ids: Sequence[int],
-    *,
-    device: int = 0,
-    async_: bool = False,
-) -> int:
-    try:
-        lib = ensure_uvm_runtime_library()
-    except Exception:
-        logger.debug("Failed to load UVM runtime library", exc_info=True)
-        return -1
-
-    if not hasattr(lib, "uvm_driver_batch_expert_read_dup_fast_regions"):
-        return -2
-
-    valid_ids = [int(region_id) for region_id in region_ids if int(region_id) > 0]
-    if not valid_ids:
-        return 0
-
-    total = 0
-    for start in range(0, len(valid_ids), _UVM_DRIVER_BATCH_MAX_RANGES):
-        chunk = valid_ids[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
-        id_array = (ctypes.c_uint64 * len(chunk))(*chunk)
-        try:
-            result = int(
-                lib.uvm_driver_batch_expert_read_dup_fast_regions(
-                    id_array,
-                    ctypes.c_size_t(len(chunk)),
-                    ctypes.c_int(device),
-                    ctypes.c_int(1 if async_ else 0),
-                )
-            )
-        except Exception:
-            logger.debug("Failed to expert-read-duplicate Phase F driver regions", exc_info=True)
-            return -3
-        if result < 0:
-            return result
-        total += result
-
-    return total
 
 
-def driver_expert_read_dup_fast_native_regions(
-    region_ids: Sequence[int],
-    *,
-    device: int = 0,
-    async_: bool = False,
-) -> int:
-    try:
-        lib = ensure_uvm_runtime_library()
-    except Exception:
-        logger.debug("Failed to load UVM runtime library", exc_info=True)
-        return -1
-
-    if not hasattr(lib, "uvm_driver_batch_expert_read_dup_fast_native_regions"):
-        return -2
-
-    valid_ids = [int(region_id) for region_id in region_ids if int(region_id) > 0]
-    if not valid_ids:
-        return 0
-
-    total = 0
-    stream = torch.cuda.current_stream().cuda_stream
-    for start in range(0, len(valid_ids), _UVM_DRIVER_BATCH_MAX_RANGES):
-        chunk = valid_ids[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
-        id_array = (ctypes.c_uint64 * len(chunk))(*chunk)
-        try:
-            result = int(
-                lib.uvm_driver_batch_expert_read_dup_fast_native_regions(
-                    id_array,
-                    ctypes.c_size_t(len(chunk)),
-                    ctypes.c_int(device),
-                    ctypes.c_int(1 if async_ else 0),
-                    ctypes.c_void_p(stream),
-                )
-            )
-        except Exception:
-            logger.debug("Failed to native expert-read-duplicate Phase F driver regions", exc_info=True)
-            return -3
-        if result < 0:
-            return result
-        total += result
-
-    return total
 
 
 def driver_pause_ranges_bg_promotion(
@@ -3780,35 +3006,6 @@ def driver_batch_advise_ranges_cpu(
     return total
 
 
-def driver_batch_query_ranges_residency(
-    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
-    device: int = 0,
-) -> int:
-    """Try Phase F driver batch residency query. Returns successes or negative."""
-    try:
-        ensure_uvm_runtime_library()
-    except Exception:
-        logger.debug("Failed to load UVM runtime library", exc_info=True)
-        return -1
-    range_list = list(ranges)
-    if not range_list:
-        return 0
-    total = 0
-    for start in range(0, len(range_list), _UVM_DRIVER_BATCH_MAX_RANGES):
-        chunk = range_list[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
-        ptr_array, size_array, count = _prepare_uvm_range_arrays(chunk)
-        if count <= 0:
-            continue
-        result = int(_uvm_lib.uvm_driver_batch_query_residency(
-            ptr_array,
-            size_array,
-            ctypes.c_size_t(count),
-            ctypes.c_int(device),
-        ))
-        if result < 0:
-            return result
-        total += result
-    return total
 
 
 def driver_batch_query_ranges_residency_bytes(
@@ -3967,68 +3164,8 @@ def driver_unregister_region(region_id: int) -> int:
         return -3
 
 
-def driver_batch_query_regions_residency(
-    region_ids: Sequence[int],
-    device: int = 0,
-) -> int:
-    """Query residency by Phase F registered region ids."""
-    try:
-        lib = ensure_uvm_runtime_library()
-    except Exception:
-        logger.debug("Failed to load UVM runtime library", exc_info=True)
-        return -1
-    valid_ids = [int(region_id) for region_id in region_ids if int(region_id) > 0]
-    if not valid_ids:
-        return 0
-    total = 0
-    for start in range(0, len(valid_ids), _UVM_DRIVER_BATCH_MAX_RANGES):
-        chunk = valid_ids[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
-        id_array = (ctypes.c_uint64 * len(chunk))(*chunk)
-        try:
-            result = int(
-                lib.uvm_driver_batch_query_residency_regions(
-                    id_array,
-                    ctypes.c_size_t(len(chunk)),
-                    ctypes.c_int(device),
-                )
-            )
-        except Exception:
-            logger.debug("Failed to query Phase F driver regions", exc_info=True)
-            return -3
-        if result < 0:
-            return result
-        total += result
-    return total
 
 
-def driver_register_query_region(
-    *,
-    region_id: int,
-    ptr: int,
-    nbytes: int,
-    device: int = 0,
-) -> int:
-    """Register, query, and unregister a region using the C++ smoke helper."""
-    try:
-        lib = ensure_uvm_runtime_library()
-    except Exception:
-        logger.debug("Failed to load UVM runtime library", exc_info=True)
-        return -1
-    if region_id <= 0 or ptr <= 0 or nbytes <= 0:
-        return -2
-    try:
-        return int(
-            lib.uvm_driver_phase_f_register_query_region(
-                ctypes.c_uint64(region_id),
-                ctypes.c_uint64(ptr),
-                ctypes.c_size_t(nbytes),
-                ctypes.c_int(device),
-            )
-        )
-    except Exception:
-        logger.debug("Failed to register/query Phase F driver region",
-                     exc_info=True)
-        return -3
 
 
 def driver_set_pool_budget(
@@ -4286,41 +3423,8 @@ def driver_query_region(region_id: int) -> dict[str, int] | None:
     return _driver_region_values_to_dict(values)
 
 
-def driver_query_region_by_va(address: int) -> dict[str, int] | None:
-    """Query Stage N region metadata by a virtual address."""
-    if not has_region_state_ioctl() or address <= 0:
-        return None
-    values = (ctypes.c_uint64 * 11)()
-    try:
-        status = int(
-            _uvm_lib.uvm_driver_phase_n_query_region_by_va(
-                ctypes.c_uint64(int(address)),
-                values,
-                ctypes.c_size_t(len(values)),
-            )
-        )
-    except Exception:
-        logger.debug("Failed to query Phase N driver region by VA",
-                     exc_info=True)
-        return None
-    if status < 0:
-        return None
-    return _driver_region_values_to_dict(values)
 
 
-def has_driver_region_ioctl() -> bool:
-    try:
-        lib = ensure_uvm_runtime_library()
-    except Exception:
-        return False
-    return all(
-        hasattr(lib, name)
-        for name in (
-            "uvm_driver_phase_f_register_region",
-            "uvm_driver_phase_f_unregister_region",
-            "uvm_driver_batch_query_residency_regions",
-        )
-    )
 
 
 def has_pool_budget_ioctl() -> bool:
@@ -4545,27 +3649,6 @@ def batch_prepare_ranges_for_native_remote_access_with_executor(
     )
 
 
-def offload_range_to_cpu(
-    ptr: int,
-    size: int,
-    *,
-    sync: bool = False,
-) -> bool:
-    """Set CPU preferred location and prefetch a raw UVM range to CPU.
-
-    This is the common Stage G/M weight enforcement primitive. It still uses
-    CUDA/UVM as the execution layer, but keeps the semantic decision in vLLM.
-    """
-    advise_success = advise_range_preferred_location(ptr, size, -1)
-    prefetch_success = prefetch_range_to_cpu(ptr, size)
-    success = advise_success and prefetch_success
-    if success and sync:
-        try:
-            torch.cuda.synchronize()
-        except Exception:
-            logger.debug("Failed to synchronize after UVM CPU offload",
-                         exc_info=True)
-    return success
 
 
 def batch_offload_ranges_to_cpu(
@@ -4586,86 +3669,3 @@ def batch_offload_ranges_to_cpu(
             logger.debug("Failed to synchronize after batch UVM CPU offload",
                          exc_info=True)
     return successes
-
-
-def set_preferred_location(tensor: torch.Tensor, device: int) -> None:
-    """
-    Set the preferred location for a UVM tensor.
-
-    Args:
-        tensor: The tensor to configure
-        device: Preferred device (-1 for CPU, >= 0 for GPU)
-    """
-    if not _uvm_enabled or _uvm_lib is None:
-        return
-
-    if not tensor.is_cuda:
-        return
-
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
-    advise_range_preferred_location(ptr, size, device)
-
-
-@contextmanager
-def uvm_memory_tracking():
-    """
-    Context manager for tracking UVM memory usage within a block.
-
-    Example:
-        with uvm_memory_tracking() as tracker:
-            # Do some operations
-            pass
-        print(f"Peak memory: {tracker['peak_bytes'] / 1e9:.2f} GB")
-    """
-    if not _uvm_enabled:
-        yield {"enabled": False}
-        return
-
-    reset_uvm_peak_stats()
-    stats_before = get_uvm_stats()
-
-    result = {
-        "enabled": True,
-        "start_bytes": stats_before["allocated_bytes"],
-    }
-
-    try:
-        yield result
-    finally:
-        stats_after = get_uvm_stats()
-        result["end_bytes"] = stats_after["allocated_bytes"]
-        result["peak_bytes"] = stats_after["peak_bytes"]
-        result["delta_bytes"] = (
-            stats_after["allocated_bytes"] - stats_before["allocated_bytes"]
-        )
-        result["allocations"] = (
-            stats_after["num_allocs"] - stats_before["num_allocs"]
-        )
-
-
-def maybe_enable_uvm_from_env() -> bool:
-    """
-    Enable UVM allocator if VLLM_USE_UVM environment variable is set.
-
-    This is called automatically during vLLM initialization.
-
-    Returns:
-        True if UVM was enabled, False otherwise.
-    """
-    if os.environ.get("VLLM_USE_UVM", "0").lower() in ("1", "true", "yes"):
-        enable_prefetch = os.environ.get(
-            "VLLM_UVM_PREFETCH", "0"
-        ).lower() in ("1", "true", "yes")
-        verbose = os.environ.get(
-            "VLLM_UVM_VERBOSE", "0"
-        ).lower() in ("1", "true", "yes")
-
-        try:
-            enable_uvm_allocator(enable_prefetch=enable_prefetch, verbose=verbose)
-            return True
-        except Exception as e:
-            logger.error("Failed to enable UVM allocator from environment: %s", e)
-            return False
-
-    return False

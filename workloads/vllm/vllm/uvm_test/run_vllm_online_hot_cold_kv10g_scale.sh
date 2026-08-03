@@ -28,7 +28,7 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.97}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-3600}"
-RUN_CASES="${RUN_CASES:-pilot,baseline,adaptive,static_custom,native_uva}"
+RUN_CASES="${RUN_CASES:-pilot,adaptive,static_custom,native_uva}"
 RESIDENCY_TRACE_ENABLE="${RESIDENCY_TRACE_ENABLE:-1}"
 RESIDENCY_KV_METADATA_ENABLE="${RESIDENCY_KV_METADATA_ENABLE:-1}"
 MAINTENANCE_WAVES_PER_PHASE_LIST="${MAINTENANCE_WAVES_PER_PHASE_LIST:-}"
@@ -39,9 +39,6 @@ PHASE_OUTPUTS="${PHASE_OUTPUTS:-64,64,64,64,64,64,64,64,64,64}"
 STATIC_PHASE_NAMES="${STATIC_PHASE_NAMES:-warm,final}"
 STATIC_PHASE_COUNTS="${STATIC_PHASE_COUNTS:-256,256}"
 STATIC_PHASE_OUTPUTS="${STATIC_PHASE_OUTPUTS:-1,64}"
-BASELINE_PHASE_NAMES="${BASELINE_PHASE_NAMES:-warm,final}"
-BASELINE_PHASE_COUNTS="${BASELINE_PHASE_COUNTS:-256,256}"
-BASELINE_PHASE_OUTPUTS="${BASELINE_PHASE_OUTPUTS:-1,64}"
 NATIVE_PHASE_NAMES="${NATIVE_PHASE_NAMES:-warm,final}"
 NATIVE_PHASE_COUNTS="${NATIVE_PHASE_COUNTS:-256,256}"
 NATIVE_PHASE_OUTPUTS="${NATIVE_PHASE_OUTPUTS:-1,64}"
@@ -72,14 +69,6 @@ wait_for_clean_gpu() {
   echo "GPU is not clean before ${label}: ${used} MiB" >&2
   nvidia-smi >&2 || true
   return 1
-}
-
-stop_pid() {
-  local pid="${1:-}"
-  if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-    kill "${pid}" 2>/dev/null || true
-    wait "${pid}" 2>/dev/null || true
-  fi
 }
 
 should_run_case() {
@@ -170,8 +159,7 @@ initial = int(sys.argv[1])
 final = int(sys.argv[2])
 waves = int(sys.argv[3])
 path = Path(sys.argv[4])
-targets = [initial + round((final - initial) * wave / waves)
-           for wave in range(1, waves + 1)]
+targets = [initial + round((final - initial) * wave / waves) for wave in range(1, waves + 1)]
 if targets[-1] != final or any(a >= b for a, b in zip(targets, targets[1:])):
     raise SystemExit(f"invalid targets: {targets}")
 path.write_text(",".join(str(value) for value in targets) + "\n", encoding="utf-8")
@@ -193,7 +181,6 @@ run_case() {
     "${dir}/progress.jsonl" \
     "${dir}/run.log" \
     "${dir}/returncode.txt" \
-    "${dir}/dmon_pcie.csv" \
     "${dir}/routing_trace.jsonl" \
     "${dir}/expert_trace.jsonl" \
     "${dir}/kv_runtime_trace.jsonl" \
@@ -209,11 +196,11 @@ run_case() {
     VLLM_UVM_WEIGHT_PREFETCH_ENABLE=0
     VLLM_UVM_KV_ADAPTIVE_PRESSURE_ENABLE=0
   )
-  local -a extra_args=(--grow-after-phase -1)
+  local -a extra_args=()
   local cpu_offload_gb=0
 
   case "${mode}" in
-    pilot|baseline)
+    pilot)
       env_args+=(
         VLLM_UVM_EXPERT_WEIGHTS_MANAGED=1
         VLLM_UVM_KV_CACHE_MANAGED=1
@@ -221,15 +208,9 @@ run_case() {
         VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE=0
         VLLM_UVM_KV_RUNTIME_ENABLE=0
         VLLM_UVM_KV_DYNAMIC_POOL_ENABLE=0
+        VLLM_UVM_MOE_ROUTING_TRACE_ENABLE=1
+        VLLM_UVM_MOE_ROUTING_TRACE_FILE="${dir}/routing_trace.jsonl"
       )
-      if [[ "${mode}" == "pilot" ]]; then
-        env_args+=(
-          VLLM_UVM_MOE_ROUTING_TRACE_ENABLE=1
-          VLLM_UVM_MOE_ROUTING_TRACE_FILE="${dir}/routing_trace.jsonl"
-        )
-      else
-        env_args+=(VLLM_UVM_MOE_ROUTING_TRACE_ENABLE=0)
-      fi
       ;;
     adaptive|static_custom)
       env_args+=(
@@ -269,7 +250,6 @@ run_case() {
           VLLM_UVM_INCREMENTAL_EXPERTS_PER_LAYER_PER_ROUND=1
         )
         extra_args=(
-          --grow-after-phase -1
           --grow-target-blocks "$(<"${TARGETS_FILE}")"
           --release-expert-wave
         )
@@ -283,10 +263,7 @@ run_case() {
         fi
       else
         env_args+=(VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE=0)
-        extra_args=(
-          --grow-after-phase -1
-          --pre-phase-target-blocks "${FINAL_KV_BLOCKS}"
-        )
+        extra_args=(--pre-phase-target-blocks "${FINAL_KV_BLOCKS}")
       fi
       ;;
     native_uva)
@@ -310,8 +287,6 @@ run_case() {
       ;;
   esac
 
-  nvidia-smi dmon -s t -d 1 -o DT > "${dir}/dmon_pcie.csv" 2>&1 &
-  local dmon_pid=$!
   set +e
   (
     cd "${VLLM_ROOT}"
@@ -330,12 +305,10 @@ run_case() {
       --max-num-seqs "${MAX_NUM_SEQS}" \
       --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
       --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
-      --disable-prefix-caching \
       "${extra_args[@]}"
   ) > "${dir}/run.log" 2>&1
   local rc=$?
   set -e
-  stop_pid "${dmon_pid}"
   printf '%s\n' "${rc}" > "${dir}/returncode.txt"
   wait_for_clean_gpu "after_${name}" || true
   return "${rc}"
@@ -351,189 +324,91 @@ build_plan() {
       --num-experts 128 \
       --cold-experts-per-layer "${COLD_EXPERTS_PER_LAYER}" \
       --expert-est-bytes "${EXPERT_EST_BYTES}"
-  ) > "${RUN_ROOT}/plan_build.log" 2>&1
+  )
 }
 
 write_summary() {
-  "${VLLM_ROOT}/${VLLM_PY}" - "${RUN_ROOT}" "${SUMMARY}" "${PLAN}" \
-    "${FIXTURE_META}" <<'PY'
-import hashlib
+  "${VLLM_ROOT}/${VLLM_PY}" - "${RUN_ROOT}" "${SUMMARY}" "${FIXTURE_META}" "${PLAN}" "${TARGETS_FILE}" <<'PY'
 import json
-import math
-import re
-import statistics
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
 summary_path = Path(sys.argv[2])
-plan_path = Path(sys.argv[3])
-fixture_meta_path = Path(sys.argv[4])
+fixture_meta_path = Path(sys.argv[3])
+plan_path = Path(sys.argv[4])
+targets_path = Path(sys.argv[5])
+
 
 def read_json(path):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
 
 def read_jsonl(path):
-    records = []
     if not path.exists():
-        return records
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            records.append(value)
-    return records
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
-def quantile(values, q):
-    if not values:
-        return None
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * q
-    low, high = math.floor(position), math.ceil(position)
-    if low == high:
-        return ordered[low]
-    return ordered[low] * (high - position) + ordered[high] * (position - low)
 
-def parse_dmon(path):
-    rx, tx = [], []
-    if not path.exists():
-        return {}
-    for line in path.read_text(errors="replace").splitlines():
-        numbers = []
-        for item in line.split():
-            try:
-                numbers.append(float(item))
-            except ValueError:
-                pass
-        if len(numbers) >= 3:
-            rx.append(numbers[-2])
-            tx.append(numbers[-1])
-    return {
-        "pcie_rx_mean_MBps": statistics.mean(rx) if rx else None,
-        "pcie_rx_p95_MBps": quantile(rx, 0.95),
-        "pcie_rx_max_MBps": max(rx) if rx else None,
-        "pcie_tx_mean_MBps": statistics.mean(tx) if tx else None,
-    }
-
-def phase_monitor(log):
-    sections = {}
-    current = None
-    for line in log.splitlines():
-        begin = re.search(r"UVM_PHASE_BEGIN name=([^ ]+)", line)
-        if begin:
-            current = begin.group(1)
-            sections[current] = []
-        if current is not None:
-            sections[current].append(line)
-        end = re.search(r"UVM_PHASE_END name=([^ ]+)", line)
-        if end and current == end.group(1):
-            current = None
-    result = {}
-    for name, lines in sections.items():
-        text = "\n".join(lines)
-        running = [int(v) for v in re.findall(r"Running:\s*(\d+)\s*reqs", text)]
-        waiting = [int(v) for v in re.findall(r"Waiting:\s*(\d+)\s*reqs", text)]
-        usage = [float(v) for v in re.findall(r"GPU KV cache usage:\s*([0-9.]+)%", text)]
-        result[name] = {
-            "max_running": max(running) if running else None,
-            "max_waiting": max(waiting) if waiting else None,
-            "max_kv_usage_pct": max(usage) if usage else None,
-        }
-    return result
-
-def output_hash(data):
-    values = []
-    for phase in data.get("phases") or []:
-        values.extend(request.get("output_token_ids") or []
-                      for request in phase.get("requests") or [])
-    return hashlib.sha256(json.dumps(values, separators=(",", ":")).encode()).hexdigest()
-
-def summarize_maintenance(data):
-    values = []
-    for wave in data.get("maintenance") or []:
-        result = wave.get("result") or {}
-        expert_results = result.get("expert_results") or []
-        worker_results = result.get("worker_results") or []
-        values.append({
-            "wave": wave.get("wave"),
-            "after_phase": wave.get("after_phase"),
-            "target_blocks": wave.get("target_blocks"),
-            "elapsed_seconds": wave.get("elapsed_seconds"),
-            "ok": result.get("ok"),
-            "released_experts": sum(int(item.get("released_count") or 0)
-                                    for item in expert_results if isinstance(item, dict)),
-            "kv_prefetch_bytes": sum(int(item.get("range_bytes") or 0)
-                                     for item in worker_results if isinstance(item, dict)),
-        })
-    return values
-
-def case(name):
+def summarize_case(name):
     case_dir = root / name
-    data = read_json(case_dir / "result.json")
-    log_path = case_dir / "run.log"
-    log = log_path.read_text(errors="replace") if log_path.exists() else ""
-    rc = None
-    try:
-        rc = int((case_dir / "returncode.txt").read_text().strip())
-    except Exception:
-        pass
-    phases = []
-    monitor = phase_monitor(log)
-    for phase in data.get("phases") or []:
-        item = {key: value for key, value in phase.items() if key != "requests"}
-        item.update(monitor.get(str(phase.get("phase")), {}))
-        phases.append(item)
-    fatal_markers = [
-        marker for marker in (
-            "OutOfMemoryError", "illegal memory access", "UVM fatal", "Xid", "MMU Fault"
-        ) if marker.lower() in log.lower()
+    result = read_json(case_dir / "result.json") or {}
+    returncode = None
+    returncode_path = case_dir / "returncode.txt"
+    if returncode_path.exists():
+        returncode = int(returncode_path.read_text().strip())
+    phases = [
+        {key: value for key, value in phase.items() if key != "requests"}
+        for phase in result.get("phases", [])
     ]
     return {
-        "returncode": rc,
-        "status": data.get("status"),
-        "error": data.get("error"),
-        "load_seconds": data.get("load_seconds"),
+        "returncode": returncode,
+        "status": result.get("status"),
+        "error": result.get("error"),
+        "load_seconds": result.get("load_seconds"),
         "phases": phases,
-        "maintenance": summarize_maintenance(data),
+        "maintenance": result.get("maintenance", []),
         "maintenance_total_seconds": sum(
-            float(wave.get("elapsed_seconds") or 0)
-            for wave in data.get("maintenance") or []
+            float(item.get("elapsed_seconds") or 0)
+            for item in result.get("maintenance", [])
         ),
-        "output_hash": output_hash(data),
-        "fatal_markers": fatal_markers,
-        **parse_dmon(case_dir / "dmon_pcie.csv"),
     }
 
-cases = {
-    name: case(name)
-    for name in ("pilot", "baseline", "adaptive", "static_custom", "native_uva")
-}
-for name in ("adaptive", "static_custom"):
-    records = read_jsonl(root / name / "expert_trace.jsonl")
-    issued = [r for r in records if r.get("action") == "init_weight_remote_read_prepare_issued"]
-    failed = [r for r in records if r.get("action") == "init_weight_remote_read_prepare_failed"]
-    cases[name]["remote_prepare_records"] = len(issued)
-    cases[name]["remote_prepare_failed_records"] = len(failed)
-    cases[name]["remote_prepare_bytes"] = sum(int(r.get("bytes") or 0) for r in issued)
 
-native_manifest = read_jsonl(root / "native_uva" / "cpu_offload_manifest.jsonl")
-native_parameters = [r for r in native_manifest if r.get("event") == "cpu_offload_parameter"]
-cases["native_uva"]["cpu_offload_parameter_records"] = len(native_parameters)
-cases["native_uva"]["cpu_offload_bytes"] = sum(
-    int(record.get("bytes") or 0) for record in native_parameters
-)
+cases = {}
+for name in ("pilot", "adaptive", "static_custom", "native_uva"):
+    if (root / name / "result.json").exists():
+        cases[name] = summarize_case(name)
+
+for name in ("adaptive", "static_custom"):
+    if name not in cases:
+        continue
+    records = read_jsonl(root / name / "expert_trace.jsonl")
+    issued = [
+        record for record in records
+        if record.get("action") == "init_weight_remote_read_prepare_issued"
+    ]
+    cases[name]["remote_prepare_records"] = len(issued)
+    cases[name]["remote_prepare_bytes"] = sum(
+        int(record.get("bytes") or 0) for record in issued
+    )
+
+if "native_uva" in cases:
+    parameters = [
+        record for record in read_jsonl(root / "native_uva" / "cpu_offload_manifest.jsonl")
+        if record.get("event") == "cpu_offload_parameter"
+    ]
+    cases["native_uva"]["cpu_offload_parameter_records"] = len(parameters)
+    cases["native_uva"]["cpu_offload_bytes"] = sum(
+        int(record.get("bytes") or 0) for record in parameters
+    )
 
 summary = {
     "run_root": str(root),
     "fixture": read_json(fixture_meta_path),
-    "plan": read_json(plan_path).get("metadata") or {},
+    "plan": (read_json(plan_path) or {}).get("metadata", {}),
     "kv_grow_targets": [
-        int(value) for value in (root / "kv_grow_targets.txt").read_text().split(",")
+        int(value) for value in (targets_path.read_text().split(",") if targets_path.exists() else [])
         if value.strip()
     ],
     "cases": cases,
@@ -548,19 +423,21 @@ generate_targets
 
 if should_run_case pilot; then
   run_case pilot pilot "${SMALL_KV_BYTES}" pilot \
-    "${PILOT_REQUEST_COUNT}" "${PILOT_OUTPUT_TOKENS}"
+    "${PILOT_REQUEST_COUNT}" "${PILOT_OUTPUT_TOKENS}" || true
 fi
-if should_run_case pilot \
-  || { should_run_case adaptive && [[ -f "${RUN_ROOT}/pilot/routing_trace.jsonl" ]]; } \
-  || [[ ! -f "${PLAN}" ]]; then
+
+needs_plan=0
+if should_run_case pilot || should_run_case adaptive || should_run_case static_custom; then
+  needs_plan=1
+fi
+if [[ "${needs_plan}" -eq 1 ]] && [[ ! -f "${PLAN}" ]]; then
+  if [[ ! -f "${RUN_ROOT}/pilot/routing_trace.jsonl" ]]; then
+    echo "missing ${PLAN} and pilot/routing_trace.jsonl" >&2
+    exit 1
+  fi
   build_plan
 fi
 
-if should_run_case baseline; then
-  run_case baseline baseline "${SMALL_KV_BYTES}" \
-    "${BASELINE_PHASE_NAMES}" "${BASELINE_PHASE_COUNTS}" \
-    "${BASELINE_PHASE_OUTPUTS}" || true
-fi
 if should_run_case adaptive; then
   run_case adaptive adaptive "${LARGE_KV_BYTES}" \
     "${PHASE_NAMES}" "${PHASE_COUNTS}" "${PHASE_OUTPUTS}" || true

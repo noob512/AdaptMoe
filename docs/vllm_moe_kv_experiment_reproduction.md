@@ -73,7 +73,13 @@ git show --stat --oneline 23c4cc93
 
 该提交在 `kernel-module/nvidia-module/kernel-open/nvidia-uvm/uvm_va_block.c` 中移除了 `uvm_va_block_evict_chunks()` 内过早的 `goto out`。这是空间复用实验的**必要条件**：当待驱逐页面被 `moe_slot_pte_bits` 过滤为空时，函数仍需继续执行后续逻辑，才能使释放的 KV 物理 chunk 可被后来的专家分配复用。
 
-截至本文档快照，工作树还包含两个**未提交但必须保留**的分阶段维护接口修改：
+当前实验基线提交为：
+
+```text
+4a10e1ac（准备精简代码）
+```
+
+该提交已经包含两个必须保留的分阶段维护接口：
 
 ```text
 workloads/vllm/vllm/uvm_test/run_vllm_online_hot_cold_kv10g_scale.sh
@@ -87,16 +93,7 @@ workloads/vllm/vllm/uvm_test/vllm_generate_phased.py
 CLI 参数：--maintenance-waves-per-phase-list
 ```
 
-该接口使每个 phase 可消耗不同数量的 maintenance wave，是精确复现 4→7→10 GB 阶梯实验的必要条件。后续精简代码前应将这两个改动提交，或至少保存二进制 patch：
-
-```bash
-git diff --binary -- \
-  workloads/vllm/vllm/uvm_test/run_vllm_online_hot_cold_kv10g_scale.sh \
-  workloads/vllm/vllm/uvm_test/vllm_generate_phased.py \
-  > /safe/archive/maintenance-waves-per-phase-list.patch
-```
-
-并在新工作树恢复后验证：
+该接口使每个 phase 可消耗不同数量的 maintenance wave，是精确复现 4→7→10 GB 阶梯实验的必要条件。检出基线后验证：
 
 ```bash
 rg -n 'MAINTENANCE_WAVES_PER_PHASE_LIST|maintenance-waves-per-phase-list' \
@@ -159,7 +156,7 @@ PY
 | UVM-to-UVM 空间复用 probe | `workloads/vllm/vllm/uvm_test/uvm_to_uvm_reuse_probe.cu` |
 | vLLM 侧 UVM 动态池 / 专家释放实现 | 与上述 runner 使用的 vLLM 修改代码 |
 
-不应把 `/tmp/<run-root>` 中的 JSON、trace 和 CSV 当作实现代码删除前的唯一证据；它们应另行归档。
+不应把 `/tmp/<run-root>` 中的 JSON 和 trace 当作实现代码删除前的唯一证据；它们应另行归档。
 
 ### 3.2 默认模型和数据路径
 
@@ -211,7 +208,7 @@ sudo systemctl start gdm3 2>/dev/null || true
 nvidia-smi
 ```
 
-若只替换 `nvidia-uvm.ko`，也必须确保没有 CUDA 进程或依赖 UVM 的进程仍在运行。完整操作背景见 `docs/uvm_gpu_only_cpu_unmap_executable_plan.md`。
+若只替换 `nvidia-uvm.ko`，也必须确保没有 CUDA 进程或依赖 UVM 的进程仍在运行。本节已包含本项目实验所需的完整模块重载步骤。
 
 ### 4.3 编译 allocator 与空间复用 probe
 
@@ -484,7 +481,7 @@ root = Path(sys.argv[1])
 summary = json.loads((root / "summary.json").read_text())
 case = summary["cases"]["static_custom"]
 print("summary_status=", case.get("status"))
-print("fatal_markers=", case.get("fatal_markers"))
+print("summary_returncode=", case.get("returncode"))
 result = json.loads((root / "static_custom" / "result.json").read_text())
 print("result_status=", result.get("status"))
 print("phases=", [phase["phase"] for phase in result.get("phases", [])])
@@ -495,8 +492,8 @@ PY
 必须同时满足：
 
 - `returncode.txt` 为 `0`；
+- `summary.json` 对应 case 的 `returncode == 0`；
 - `summary.json` 对应 case 的 `status == "ok"`；
-- `fatal_markers == []`；
 - `result.json` 的 `status == "ok"`；
 - 包含 `setup4` 至 `c96` 的全部 14 个 phase；
 - 对应计划的 `remote_prepare_bytes` 和 records 符合第 5.2 节；
@@ -769,6 +766,7 @@ fixture_metadata.json
 hot_cold_plan_k45.json
 kv_grow_targets.txt
 summary.json
+pilot/routing_trace.jsonl
 <case>/result.json
 <case>/progress.jsonl
 <case>/run.log
@@ -777,7 +775,6 @@ summary.json
 <case>/kv_runtime_trace.jsonl
 <case>/kv_physical_trace.jsonl
 <case>/residency_trace.jsonl
-<case>/dmon_pcie.csv
 ```
 
 `native_uva` 还应保存：
@@ -808,7 +805,8 @@ root = Path(sys.argv[1])
 summary = json.loads((root / "summary.json").read_text())
 for name, case in summary["cases"].items():
     print(name, "status=", case.get("status"),
-          "fatal_markers=", case.get("fatal_markers"))
+          "returncode=", case.get("returncode"),
+          "error=", case.get("error"))
     result_path = root / name / "result.json"
     if result_path.exists():
         result = json.loads(result_path.read_text())

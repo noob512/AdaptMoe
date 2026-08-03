@@ -14,7 +14,7 @@ def gpu_memory_snapshot() -> dict[str, int | str] | None:
         result = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=name,memory.used,memory.total,utilization.gpu,utilization.memory",
+                "--query-gpu=name,memory.used,memory.free,memory.total,utilization.gpu,utilization.memory",
                 "--format=csv,noheader,nounits",
             ],
             check=True,
@@ -26,18 +26,61 @@ def gpu_memory_snapshot() -> dict[str, int | str] | None:
         return None
     line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
     parts = [part.strip() for part in line.split(",")]
-    if len(parts) < 5:
+    if len(parts) < 6:
         return None
     try:
         return {
             "name": parts[0],
             "memory_used_mib": int(parts[1]),
-            "memory_total_mib": int(parts[2]),
-            "utilization_gpu": int(parts[3]),
-            "utilization_memory": int(parts[4]),
+            "memory_free_mib": int(parts[2]),
+            "memory_total_mib": int(parts[3]),
+            "utilization_gpu": int(parts[4]),
+            "utilization_memory": int(parts[5]),
         }
     except ValueError:
         return None
+
+
+def uvm_proactive_migration_snapshot() -> dict[str, str | None]:
+    names = (
+        "uvm_perf_prefetch_enable",
+        "uvm_perf_access_counter_migration_enable",
+        "uvm_perf_thrashing_enable",
+    )
+    values: dict[str, str | None] = {}
+    try:
+        values["nvidia_uvm_srcversion"] = Path(
+            "/sys/module/nvidia_uvm/srcversion"
+        ).read_text(encoding="utf-8").strip()
+    except OSError:
+        values["nvidia_uvm_srcversion"] = None
+    for name in names:
+        path = Path("/sys/module/nvidia_uvm/parameters") / name
+        try:
+            values[name] = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            values[name] = None
+    return values
+
+
+def engine_cuda_memory_snapshot(llm: Any) -> list[dict[str, int]] | None:
+    llm_engine = getattr(llm, "llm_engine", None)
+    engine_core = getattr(llm_engine, "engine_core", None)
+    if engine_core is None or not hasattr(engine_core, "call_utility"):
+        return None
+    try:
+        result = engine_core.call_utility(
+            "collective_rpc",
+            "get_cuda_memory_info",
+            30.0,
+            (),
+            None,
+        )
+    except Exception:
+        return None
+    if not isinstance(result, list):
+        return None
+    return [item for item in result if isinstance(item, dict)]
 
 
 def parse_expert_ids(raw: str) -> list[int]:
@@ -514,7 +557,11 @@ def main() -> int:
     )
     parser.add_argument("--weight-regions-file", type=Path, default=None)
     parser.add_argument("--residency-query-device", type=int, default=0)
+    parser.add_argument("--settle-seconds", type=float, default=0.0)
     args = parser.parse_args()
+
+    if args.settle_seconds < 0:
+        raise ValueError("settle seconds must be non-negative")
 
     from vllm import LLM
 
@@ -540,6 +587,10 @@ def main() -> int:
     llm = LLM(**kwargs)
     loaded = time.time()
     gpu_memory_after_warmup = gpu_memory_snapshot()
+    if args.settle_seconds > 0:
+        time.sleep(args.settle_seconds)
+    gpu_memory_after_settle = gpu_memory_snapshot()
+    cuda_memory_after_settle = engine_cuda_memory_snapshot(llm)
     active_probe = load_active_expert_probe(args.active_expert_probe_json)
     weight_regions_file = (
         args.weight_regions_file
@@ -593,6 +644,8 @@ def main() -> int:
         "load_and_warmup_seconds": loaded - started,
         "gpu_memory_before": gpu_memory_before,
         "gpu_memory_after_warmup": gpu_memory_after_warmup,
+        "gpu_memory_after_settle": gpu_memory_after_settle,
+        "cuda_memory_after_settle": cuda_memory_after_settle,
         "gpu_memory_before_prealloc": gpu_memory_before_prealloc,
         "gpu_memory_after_prealloc": gpu_memory_after_prealloc,
         "gpu_memory_after_slot_use_probe": gpu_memory_after_slot_use_probe,
@@ -605,6 +658,8 @@ def main() -> int:
         "active_residency_before_prealloc": active_residency_before_prealloc,
         "active_residency_after_prealloc": active_residency_after_prealloc,
         "hold_seconds": args.hold_seconds,
+        "settle_seconds": args.settle_seconds,
+        "uvm_proactive_migration_parameters": uvm_proactive_migration_snapshot(),
     }
     print(json.dumps(result, indent=2, sort_keys=True))
     if args.output_json is not None:

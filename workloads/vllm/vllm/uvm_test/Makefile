@@ -24,7 +24,7 @@ NVCCFLAGS = -Xcompiler -fPIC -O2 -std=c++17
 LDFLAGS = -shared -L$(CUDA_LIB) -lcudart -ldl
 
 # Targets
-all: uvm_allocator.so libcudamalloc_managed.so libuvm_managed_budget.so phase_f_smoke managed_pool_probe expert_reserved_fault_probe expert_reserved_double_slot_event_probe expert_reclaim_slot_smoke expert_offload_release_smoke expert_offload_slot_reuse_smoke expert_reserved_no_fault_probe manual_migration_fault_probe pmm_subchunk_middle_release_probe
+all: uvm_allocator.so libcudamalloc_managed.so libuvm_managed_budget.so phase_f_smoke managed_pool_probe uvm_to_uvm_reuse_probe expert_reserved_fault_probe expert_reserved_double_slot_event_probe expert_reclaim_slot_smoke expert_offload_release_smoke expert_offload_slot_reuse_smoke expert_reserved_no_fault_probe manual_migration_fault_probe pmm_subchunk_middle_release_probe
 
 # PyTorch pluggable allocator (same as before)
 uvm: uvm_allocator.so
@@ -82,7 +82,10 @@ libuvm_managed_budget.so: cuda_managed_budget_preload.cpp
 managed_pool_probe: managed_pool_probe.cu
 	$(NVCC) -O2 -std=c++17 -o $@ $< -lcudart
 
+uvm_to_uvm_reuse_probe: uvm_to_uvm_reuse_probe.cu uvm_allocator.so
+	$(NVCC) -O2 -std=c++17 -I$(CUDA_INCLUDE) -L. -Xlinker -rpath,'$$ORIGIN' -o $@ $< -l:uvm_allocator.so -L$(CUDA_LIB) -lcudart -ldl
+
 clean:
-	rm -f uvm_allocator.so libcudamalloc_managed.so libuvm_managed_budget.so phase_f_smoke phase_n_operator_sim phase_n_object_mapping_smoke phase_n_3gb_rebalance_smoke managed_pool_probe expert_reserved_fault_probe expert_reserved_double_slot_event_probe expert_reclaim_slot_smoke expert_offload_release_smoke expert_offload_slot_reuse_smoke expert_reserved_no_fault_probe manual_migration_fault_probe pmm_subchunk_middle_release_probe
+	rm -f uvm_allocator.so libcudamalloc_managed.so libuvm_managed_budget.so phase_f_smoke phase_n_operator_sim phase_n_object_mapping_smoke phase_n_3gb_rebalance_smoke managed_pool_probe uvm_to_uvm_reuse_probe expert_reserved_fault_probe expert_reserved_double_slot_event_probe expert_reclaim_slot_smoke expert_offload_release_smoke expert_offload_slot_reuse_smoke expert_reserved_no_fault_probe manual_migration_fault_probe pmm_subchunk_middle_release_probe
 
 .PHONY: all uvm preload budget clean

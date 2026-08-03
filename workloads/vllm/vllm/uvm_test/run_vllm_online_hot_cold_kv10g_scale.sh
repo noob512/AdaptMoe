@@ -10,6 +10,8 @@ DATASET="${DATASET:-/home/ubuntu/nvidia-uvm-gpu/workloads/vllm/datasets/ShareGPT
 RUN_ROOT="${RUN_ROOT:-/tmp/vllm_online_hot_cold_kv10g_scale_$(date +%Y%m%d_%H%M%S)}"
 
 REQUEST_COUNT="${REQUEST_COUNT:-256}"
+PILOT_REQUEST_COUNT="${PILOT_REQUEST_COUNT:-${REQUEST_COUNT}}"
+PILOT_OUTPUT_TOKENS="${PILOT_OUTPUT_TOKENS:-${OUTPUT_TOKENS:-64}}"
 PROMPT_MIN_TOKENS="${PROMPT_MIN_TOKENS:-320}"
 PROMPT_MAX_TOKENS="${PROMPT_MAX_TOKENS:-360}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-64}"
@@ -27,6 +29,8 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.97}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-3600}"
 RUN_CASES="${RUN_CASES:-pilot,baseline,adaptive,static_custom,native_uva}"
+RESIDENCY_TRACE_ENABLE="${RESIDENCY_TRACE_ENABLE:-1}"
+RESIDENCY_KV_METADATA_ENABLE="${RESIDENCY_KV_METADATA_ENABLE:-1}"
 
 PHASE_NAMES="${PHASE_NAMES:-low,stage1,stage2,stage3,stage4,stage5,stage6,stage7,stage8,stage9}"
 PHASE_COUNTS="${PHASE_COUNTS:-8,64,96,128,160,192,224,256,256,256}"
@@ -254,9 +258,9 @@ run_case() {
         VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_EXECUTOR=cpp_batch
         VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_SYNC=1
         VLLM_UVM_POST_WARMUP_REBALANCE_TRACE_FILE="${dir}/kv_physical_trace.jsonl"
-        VLLM_UVM_RESIDENCY_TRACE_ENABLE=1
+        VLLM_UVM_RESIDENCY_TRACE_ENABLE="${RESIDENCY_TRACE_ENABLE}"
         VLLM_UVM_RESIDENCY_TRACE_FILE="${dir}/residency_trace.jsonl"
-        VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE=1
+        VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE="${RESIDENCY_KV_METADATA_ENABLE}"
       )
       if [[ "${mode}" == "adaptive" ]]; then
         env_args+=(
@@ -535,7 +539,8 @@ prepare_fixture
 generate_targets
 
 if should_run_case pilot; then
-  run_case pilot pilot "${SMALL_KV_BYTES}" pilot 256 64
+  run_case pilot pilot "${SMALL_KV_BYTES}" pilot \
+    "${PILOT_REQUEST_COUNT}" "${PILOT_OUTPUT_TOKENS}"
 fi
 if should_run_case pilot \
   || { should_run_case adaptive && [[ -f "${RUN_ROOT}/pilot/routing_trace.jsonl" ]]; } \

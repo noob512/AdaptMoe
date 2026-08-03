@@ -17840,8 +17840,6 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                      uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE));
     uvm_page_mask_and(pages_to_evict, pages_to_evict, &block_context->scratch_page_mask);
     uvm_page_mask_andnot(pages_to_evict, pages_to_evict, &gpu_state->moe_slot_pte_bits);
-    if (uvm_page_mask_empty(pages_to_evict))
-        goto out;
 
     uvm_processor_mask_zero(&block_context->make_resident.all_involved_processors);
 

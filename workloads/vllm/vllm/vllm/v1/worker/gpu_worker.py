@@ -496,6 +496,18 @@ class Worker(WorkerBase):
     ) -> dict[str, Any]:
         return self.model_runner.run_uvm_dynamic_expert_swaps(swaps_by_layer)
 
+    def get_cuda_memory_info(self) -> dict[str, int]:
+        torch.cuda.synchronize()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        return {
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
+            "used_bytes": int(total_bytes - free_bytes),
+            "free_mib": int(free_bytes // (1024 * 1024)),
+            "total_mib": int(total_bytes // (1024 * 1024)),
+            "used_mib": int((total_bytes - free_bytes) // (1024 * 1024)),
+        }
+
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""
 

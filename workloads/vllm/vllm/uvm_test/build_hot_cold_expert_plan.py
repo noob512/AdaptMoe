@@ -27,6 +27,7 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--num-layers", type=int, default=48)
     parser.add_argument("--num-experts", type=int, default=128)
+    parser.add_argument("--first-moe-layer", type=int, default=0)
     parser.add_argument("--cold-experts-per-layer", type=int, default=5)
     parser.add_argument("--expert-est-bytes", type=int, default=4718592)
     args = parser.parse_args()
@@ -74,7 +75,8 @@ def main() -> int:
     hot_plan: list[dict[str, Any]] = []
     selected_counts: list[int] = []
     selected_by_layer: dict[str, list[int]] = {}
-    for layer_id in range(args.num_layers):
+    first_moe_layer = min(max(args.first_moe_layer, 0), args.num_layers)
+    for layer_id in range(first_moe_layer, args.num_layers):
         ranked = sorted(
             (
                 token_counts[(layer_id, expert_id)],

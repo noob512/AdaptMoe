@@ -5998,8 +5998,30 @@ class FusedMoE(CustomOp):
                     and bool(item.metadata.get("driver_registered"))
                     for item in envelope_items
                 ):
+                    block_bytes = int(self.uvm_expert_envelope_bytes)
+                    envelope_status = [
+                        {
+                            "region_id": item.region_id,
+                            "driver_region_id": int(item.driver_region_id),
+                            "driver_registered": bool(
+                                item.metadata.get("driver_registered")
+                            ),
+                            "driver_register_status": item.metadata.get(
+                                "driver_register_status"
+                            ),
+                        }
+                        for item in envelope_items[:4]
+                    ]
                     raise RuntimeError(
-                        f"Stage-M envelope registration is incomplete for {region_id}"
+                        "Stage-M envelope registration is incomplete for "
+                        f"{region_id}: ptr=0x{ptr:x} bytes={size_bytes} "
+                        f"block_bytes={block_bytes} ptr_mod={ptr % block_bytes} "
+                        f"bytes_mod={size_bytes % block_bytes} "
+                        "strict_alignment="
+                        f"{self.uvm_expert_envelope_strict_logical_alignment} "
+                        f"tensor_bounds={self._uvm_role_tensor_bounds(role)} "
+                        f"envelope_count={len(envelope_items)} "
+                        f"envelope_status={envelope_status}"
                     )
         self._uvm_init_all_local_weight_regions_registered = True
 

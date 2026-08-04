@@ -1,0 +1,104 @@
+{
+  "comparison": {
+    "mean_peak_memory_difference_mib_vllm_minus_moe": 199.66666666666788,
+    "mean_peak_memory_difference_percent_of_vllm": 0.6218208242499779,
+    "moe_over_vllm_generation_time_ratio": 4.616226156517628,
+    "vllm_over_moe_throughput_ratio": 4.632974721371614,
+    "vllm_throughput_advantage_percent": 363.2974721371614
+  },
+  "current_vllm_uvm": {
+    "aggregate": {
+      "generation_seconds_mean": 8.518036885999512,
+      "generation_seconds_sample_stddev": 0.6870682934429293,
+      "peak_gpu_used_mib_max": 32110,
+      "peak_gpu_used_mib_mean": 32110,
+      "throughput_mean": 241.51417516860676,
+      "throughput_sample_stddev": 20.15448312399823,
+      "valid_trials": 3
+    },
+    "gpu_memory_utilization": 0.97,
+    "trials": [
+      {
+        "generation_seconds": 8.714636917000462,
+        "output_tokens_per_second": 235.0069222051895,
+        "peak_gpu_used_mib": 32110,
+        "result": "/tmp/moe_equal_vram_20260804_212047/vllm_trial1_cold64/adaptive/result.json",
+        "status": "ok",
+        "trial": 1
+      },
+      {
+        "generation_seconds": 7.7540987100001075,
+        "output_tokens_per_second": 264.11838133538174,
+        "peak_gpu_used_mib": 32110,
+        "result": "/tmp/moe_equal_vram_20260804_212047/vllm_trial2_cold64/adaptive/result.json",
+        "status": "ok",
+        "trial": 2
+      },
+      {
+        "generation_seconds": 9.085375030997966,
+        "output_tokens_per_second": 225.41722196524904,
+        "peak_gpu_used_mib": 32110,
+        "result": "/tmp/moe_equal_vram_20260804_212047/vllm_trial3_cold64/adaptive/result.json",
+        "status": "ok",
+        "trial": 3
+      }
+    ]
+  },
+  "moe_infinity": {
+    "aggregate": {
+      "generation_seconds_mean": 39.321184675332916,
+      "generation_seconds_sample_stddev": 1.4266540014316924,
+      "peak_gpu_used_mib_max": 31929,
+      "peak_gpu_used_mib_mean": 31910.333333333332,
+      "throughput_mean": 52.12939627201448,
+      "throughput_sample_stddev": 1.8820119862372204,
+      "valid_trials": 3
+    },
+    "device_memory_ratio": 0.55,
+    "prefetch": true,
+    "trials": [
+      {
+        "generation_seconds": 37.97430400899975,
+        "output_tokens_per_second": 53.931205678309006,
+        "peak_gpu_used_mib": 31929,
+        "result": "/tmp/moe_equal_vram_20260804_212047/moe_calibration_ratio055/result.json",
+        "status": "ok",
+        "trial": 1
+      },
+      {
+        "generation_seconds": 40.81607250700108,
+        "output_tokens_per_second": 50.17631227621696,
+        "peak_gpu_used_mib": 31929,
+        "result": "/tmp/moe_equal_vram_20260804_212047/moe_trial2_ratio055/result.json",
+        "status": "ok",
+        "trial": 2
+      },
+      {
+        "generation_seconds": 39.17317750999791,
+        "output_tokens_per_second": 52.280670861517486,
+        "peak_gpu_used_mib": 31873,
+        "result": "/tmp/moe_equal_vram_20260804_212047/moe_trial3_ratio055/result.json",
+        "status": "ok",
+        "trial": 3
+      }
+    ]
+  },
+  "run_root": "/tmp/moe_equal_vram_20260804_212047",
+  "scope": {
+    "batching": "one static batch of 64 requests",
+    "fixture": "/tmp/deepseek_v2_lite_compare_20260804_192435/sharegpt_256_prompt320_360.json",
+    "measurement_state": "first 64-request batch after model load (cold process)",
+    "model": "deepseek-ai/DeepSeek-V2-Lite-Chat",
+    "output_tokens_per_request": 32,
+    "prompt_tokens": "323-358 after special tokens in MoE-Infinity tokenizer",
+    "requests": 64
+  },
+  "metadata": {
+    "experiment_date": "2026-08-04",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "gpu_total_mib": 32607,
+    "fixture_sha256": "33958542f9f732b8a66d595ef78923d53051f3d7efcf8ab1ece1adaa1e03328e",
+    "current_repo_commit": "ac98e939ce42a43698b6d1c9a59736fc052ac140",
+    "moe_infinity_commit": "ba5651897a80d9c9b7a1500cef2c68adaa63db0f"
+  }
+}

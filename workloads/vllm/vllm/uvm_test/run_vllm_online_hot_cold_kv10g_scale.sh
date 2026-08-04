@@ -15,12 +15,16 @@ PILOT_OUTPUT_TOKENS="${PILOT_OUTPUT_TOKENS:-${OUTPUT_TOKENS:-64}}"
 PROMPT_MIN_TOKENS="${PROMPT_MIN_TOKENS:-320}"
 PROMPT_MAX_TOKENS="${PROMPT_MAX_TOKENS:-360}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-64}"
+FIXTURE_OUTPUT_TOKENS="${FIXTURE_OUTPUT_TOKENS:-${OUTPUT_TOKENS}}"
 SMALL_KV_BYTES="${SMALL_KV_BYTES:-1288490189}"
 LARGE_KV_BYTES="${LARGE_KV_BYTES:-10737418240}"
 INITIAL_KV_BLOCKS="${INITIAL_KV_BLOCKS:-818}"
 FINAL_KV_BLOCKS="${FINAL_KV_BLOCKS:-6825}"
 COLD_EXPERTS_PER_LAYER="${COLD_EXPERTS_PER_LAYER:-45}"
 EXPERT_EST_BYTES="${EXPERT_EST_BYTES:-4718592}"
+MODEL_NUM_LAYERS="${MODEL_NUM_LAYERS:-48}"
+MODEL_NUM_EXPERTS="${MODEL_NUM_EXPERTS:-128}"
+FIRST_MOE_LAYER="${FIRST_MOE_LAYER:-0}"
 NATIVE_CPU_OFFLOAD_GB="${NATIVE_CPU_OFFLOAD_GB:-10.0}"
 
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-512}"
@@ -80,7 +84,8 @@ prepare_fixture() {
   (
     cd "${VLLM_ROOT}"
     "${VLLM_PY}" - "${DATASET}" "${MODEL}" "${FIXTURE}" "${FIXTURE_META}" \
-      "${REQUEST_COUNT}" "${PROMPT_MIN_TOKENS}" "${PROMPT_MAX_TOKENS}" <<'PY'
+      "${REQUEST_COUNT}" "${PROMPT_MIN_TOKENS}" "${PROMPT_MAX_TOKENS}" \
+      "${FIXTURE_OUTPUT_TOKENS}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -94,6 +99,7 @@ metadata_path = Path(sys.argv[4])
 request_count = int(sys.argv[5])
 min_tokens = int(sys.argv[6])
 max_tokens = int(sys.argv[7])
+fixture_output_tokens = int(sys.argv[8])
 
 tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=False)
 source = json.loads(dataset_path.read_text(encoding="utf-8"))
@@ -115,7 +121,7 @@ for index, item in enumerate(source):
         "request": len(requests),
         "prompt": prompt,
         "prompt_tokens": prompt_tokens,
-        "max_tokens": 64,
+        "max_tokens": fixture_output_tokens,
     })
     source_indices.append(index)
     prompt_lengths.append(prompt_tokens)
@@ -317,8 +323,9 @@ build_plan() {
     "${VLLM_PY}" "${SCRIPT_DIR}/build_hot_cold_expert_plan.py" \
       --routing-trace "${RUN_ROOT}/pilot/routing_trace.jsonl" \
       --output "${PLAN}" \
-      --num-layers 48 \
-      --num-experts 128 \
+      --num-layers "${MODEL_NUM_LAYERS}" \
+      --num-experts "${MODEL_NUM_EXPERTS}" \
+      --first-moe-layer "${FIRST_MOE_LAYER}" \
       --cold-experts-per-layer "${COLD_EXPERTS_PER_LAYER}" \
       --expert-est-bytes "${EXPERT_EST_BYTES}"
   )

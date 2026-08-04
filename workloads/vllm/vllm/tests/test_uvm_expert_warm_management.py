@@ -127,7 +127,7 @@ def test_custom_512k_prefetch_requires_migration_release_and_remote_map(
     ("access_mode", "prepare_mode", "requires_envelopes", "requires_logical"),
     [
         ("restore", "native", True, False),
-        ("remote_read", "native", False, False),
+        ("remote_read", "native", True, False),
         ("remote_read", "release_remote", True, False),
     ],
 )
@@ -144,8 +144,7 @@ def test_stage_m_release_registration_granularity(
 
     assert layer._uvm_stage_m_requires_release_envelopes() is requires_envelopes
     assert (
-        layer._uvm_stage_m_requires_logical_release_registration()
-        is requires_logical
+        layer._uvm_stage_m_requires_logical_release_registration() is requires_logical
     )
 
 
@@ -290,11 +289,9 @@ def test_hot_repair_prefers_prefetches_and_verifies_gpu_residency(
         ("moe_gate_up", 0x100000, 4096, None),
         ("moe_down", 0x200000, 4096, None),
     ]
-    layer._uvm_expert_weight_region_id = (
-        lambda layer_id, expert_id, role: f"{layer_id}:{expert_id}:{role}"
+    layer._uvm_expert_weight_region_id = lambda layer_id, expert_id, role: (
+        f"{layer_id}:{expert_id}:{role}"
     )
-    trace: list[dict[str, object]] = []
-    layer._append_uvm_init_weight_trace = trace.append
     layer._uvm_update_weight_expert_role_cache = lambda **kwargs: None
 
     monkeypatch.setattr(
@@ -342,7 +339,6 @@ def test_hot_repair_prefers_prefetches_and_verifies_gpu_residency(
     assert sync_calls == [True]
     assert layer._uvm_init_weight_hot_repair_done is True
     assert len(marked) == 2
-    assert trace[-1]["action"] == "init_weight_hot_repair_summary"
 
 
 def test_hot_repair_fails_closed_on_cpu_resident_bytes(
@@ -367,11 +363,9 @@ def test_hot_repair_fails_closed_on_cpu_resident_bytes(
     layer._uvm_stage_m_expert_weight_slices = lambda **kwargs: [
         ("moe_gate_up", 0x100000, 4096, None),
     ]
-    layer._uvm_expert_weight_region_id = (
-        lambda layer_id, expert_id, role: f"{layer_id}:{expert_id}:{role}"
+    layer._uvm_expert_weight_region_id = lambda layer_id, expert_id, role: (
+        f"{layer_id}:{expert_id}:{role}"
     )
-    layer._append_uvm_init_weight_trace = lambda record: None
-
     monkeypatch.setattr(
         layer_module,
         "batch_advise_ranges_preferred_location",
@@ -616,7 +610,6 @@ def test_stage_m_weight_slices_reuse_preregistered_logical_regions(
         "moe_gate_up",
         "moe_down",
     }
-    layer.uvm_init_weight_register_all_local_experts = True
     snapshots = {
         "weights:12:6:moe_gate_up": {
             "ptr": 0x700000600000,
@@ -658,7 +651,7 @@ def test_stage_m_weight_slices_reuse_preregistered_logical_regions(
     ]
 
 
-def test_stage_m_weight_slices_fail_closed_when_preregister_is_incomplete(
+def test_stage_m_weight_slices_fall_back_without_preregistration(
     monkeypatch: Any,
 ) -> None:
     layer = object.__new__(FusedMoE)
@@ -666,19 +659,217 @@ def test_stage_m_weight_slices_fail_closed_when_preregister_is_incomplete(
         "moe_gate_up",
         "moe_down",
     }
-    layer.uvm_init_weight_register_all_local_experts = True
     monkeypatch.setattr(
         layer_module,
         "get_uvm_residency_region_snapshot",
         lambda _region_id: None,
     )
+    monkeypatch.setattr(
+        layer,
+        "_uvm_expert_weight_slices",
+        lambda *_args, **_kwargs: [
+            ("moe_gate_up", 0x700000600000, 1024 * 1024),
+            ("moe_down", 0x710000300000, 512 * 1024),
+        ],
+    )
 
-    with pytest.raises(RuntimeError, match="preregistration is incomplete"):
-        layer._uvm_stage_m_expert_weight_slices(
-            layer_id=12,
-            global_expert_id=6,
-            local_expert_id=6,
-        )
+    resolved = layer._uvm_stage_m_expert_weight_slices(
+        layer_id=12,
+        global_expert_id=6,
+        local_expert_id=6,
+    )
+
+    assert resolved == [
+        ("moe_gate_up", 0x700000600000, 1024 * 1024, None),
+        ("moe_down", 0x710000300000, 512 * 1024, None),
+    ]
+
+
+def test_weight_residency_region_is_registered_once(monkeypatch: Any) -> None:
+    layer = object.__new__(FusedMoE)
+    snapshots: dict[str, dict[str, object]] = {}
+    register_calls: list[dict[str, object]] = []
+
+    class RegisteredRegion:
+        driver_region_id = 101
+        driver_registered = False
+        driver_register_status = None
+
+    def register(**kwargs: Any) -> RegisteredRegion:
+        register_calls.append(kwargs)
+        snapshots[str(kwargs["region_id"])] = {
+            "region_id": kwargs["region_id"],
+            "driver_region_id": 101,
+            "driver_registered": False,
+            "driver_register_status": None,
+            "ptr": kwargs["ptr"],
+            "bytes": kwargs["bytes"],
+            "state": kwargs["state"],
+            "metadata": dict(kwargs["metadata"]),
+        }
+        return RegisteredRegion()
+
+    monkeypatch.setattr(
+        layer_module,
+        "get_uvm_residency_region_snapshot",
+        snapshots.get,
+    )
+    monkeypatch.setattr(layer_module, "register_uvm_residency_region", register)
+
+    kwargs = {
+        "region_id": "weights:12:6:moe_gate_up",
+        "ptr": 0x700000600000,
+        "size_bytes": 1024 * 1024,
+        "state": "gpu",
+        "evictable": True,
+        "active": False,
+        "metadata": {"role": "moe_gate_up"},
+    }
+    first, first_created = layer._uvm_ensure_weight_residency_region(**kwargs)
+    second, second_created = layer._uvm_ensure_weight_residency_region(**kwargs)
+
+    assert first_created is True
+    assert second_created is False
+    assert first == second
+    assert len(register_calls) == 1
+
+
+def test_all_local_experts_and_envelopes_are_registered_once(
+    monkeypatch: Any,
+) -> None:
+    layer = object.__new__(FusedMoE)
+    layer.uvm_expert_envelope_enable = True
+    layer.uvm_expert_envelope_bytes = 512 * 1024
+    layer.uvm_init_weight_offload_target_roles = {"moe_gate_up"}
+    layer._uvm_expert_envelope_region_cache = {}
+    layer._uvm_all_local_expert_pairs = lambda: [(10, 0), (11, 1)]
+    layer._uvm_expert_weight_slices = lambda local_id, _roles: [
+        ("moe_gate_up", 0x700000000000 + local_id * 0x100000, 512 * 1024)
+    ]
+    layer._uvm_expert_weight_residency_metadata = lambda **kwargs: {
+        "layer_name": "model.layers.12.mlp.experts",
+        "layer_id": kwargs["layer_id"],
+        "global_expert_id": kwargs["global_expert_id"],
+        "local_expert_id": kwargs["local_expert_id"],
+        "role": kwargs["role"],
+        "ptr": f"0x{kwargs['ptr']:x}",
+        "bytes": kwargs["size_bytes"],
+        "driver_capable": True,
+        "driver_capability_reason": "managed",
+        "driver_capability_code": 0,
+    }
+
+    snapshots: dict[str, dict[str, object]] = {}
+    register_calls: list[dict[str, object]] = []
+    envelope_build_calls: list[dict[str, object]] = []
+
+    class RegisteredRegion:
+        driver_region_id = 101
+        driver_registered = False
+        driver_register_status = None
+
+    def register(**kwargs: Any) -> RegisteredRegion:
+        register_calls.append(kwargs)
+        snapshots[str(kwargs["region_id"])] = {
+            "region_id": kwargs["region_id"],
+            "driver_region_id": 101,
+            "driver_registered": False,
+            "ptr": kwargs["ptr"],
+            "bytes": kwargs["bytes"],
+            "state": kwargs["state"],
+            "metadata": dict(kwargs["metadata"]),
+        }
+        return RegisteredRegion()
+
+    def build_envelope(**kwargs: Any) -> list[dict[str, object]]:
+        envelope_build_calls.append(kwargs)
+        region_id = f"envelope:{kwargs['global_expert_id']}:{kwargs['role']}"
+        return [
+            {
+                "region_id": region_id,
+                "driver_region_id": 200 + int(kwargs["global_expert_id"]),
+                "ptr": kwargs["ptr"],
+                "bytes": kwargs["size_bytes"],
+                "metadata": {
+                    "logical_region_id": kwargs["source_region_id"],
+                    "logical_ptr": kwargs["ptr"],
+                    "logical_bytes": kwargs["size_bytes"],
+                    "envelope_granularity_bytes": layer.uvm_expert_envelope_bytes,
+                    "driver_registered": True,
+                    "driver_register_status": 0,
+                    "driver_cpu_offloaded_reserved_registered": True,
+                },
+            }
+        ]
+
+    monkeypatch.setattr(
+        layer_module,
+        "get_uvm_residency_region_snapshot",
+        snapshots.get,
+    )
+    monkeypatch.setattr(layer_module, "register_uvm_residency_region", register)
+    monkeypatch.setattr(
+        layer,
+        "_uvm_build_expert_chunk_envelope_records",
+        build_envelope,
+    )
+
+    layer._register_uvm_init_all_local_weight_regions(12)
+    layer._register_uvm_init_all_local_weight_regions(12)
+
+    assert {call["region_id"] for call in register_calls} == {
+        "weights:12:10:moe_gate_up",
+        "weights:12:11:moe_gate_up",
+    }
+    assert len(register_calls) == 2
+    assert len(envelope_build_calls) == 2
+
+
+def test_incremental_stage_m_consumes_only_upper_selected_expert(
+    monkeypatch: Any,
+) -> None:
+    layer = object.__new__(FusedMoE)
+    layer.uvm_init_weight_offload_enable = True
+    layer.uvm_init_weight_hot_prefetch_enable = False
+    layer.uvm_init_weight_offload_mode = "trace_only"
+    layer.uvm_expert_envelope_enable = True
+    layer.uvm_incremental_expert_offload_enable = True
+    layer._uvm_incremental_offload_in_progress = True
+    layer._uvm_incremental_selected_global_expert_id = 6
+    layer._uvm_init_weight_offload_done = False
+    layer.layer_name = "model.layers.7.mlp.experts"
+    layer._refresh_uvm_weight_action_plans = lambda: None
+    layer._uvm_layer_id = lambda: 7
+    layer._uvm_register_warm_prefetch_module = lambda _layer_id: None
+    layer._record_uvm_moe_address_map = lambda **_kwargs: None
+    layer._register_uvm_init_all_local_weight_regions = lambda _layer_id: None
+    layer._prepare_uvm_init_hot_weight_regions = lambda _layer_id: None
+    layer._uvm_all_local_expert_pairs = lambda: [(4, 0), (6, 1)]
+    layer._uvm_stage_m_offload_expert_pairs = lambda *_args: pytest.fail(
+        "incremental Stage M must not reselect experts"
+    )
+    selected: list[tuple[int, int]] = []
+
+    def slices(**kwargs: Any) -> list[tuple[str, int, int, object]]:
+        selected.append((kwargs["global_expert_id"], kwargs["local_expert_id"]))
+        return []
+
+    layer._uvm_stage_m_expert_weight_slices = slices
+
+    layer.run_uvm_init_weight_offload()
+
+    assert selected == [(6, 1)]
+
+
+def test_stage_m_requires_envelope_registration() -> None:
+    layer = object.__new__(FusedMoE)
+    layer.uvm_init_weight_offload_enable = True
+    layer.uvm_init_weight_hot_prefetch_enable = False
+    layer.uvm_init_weight_offload_mode = "trace_only"
+    layer.uvm_expert_envelope_enable = False
+
+    with pytest.raises(RuntimeError, match="requires envelope registration"):
+        layer.run_uvm_init_weight_offload()
 
 
 def test_reserved_executor_fallback_register_preserves_envelope_flag(
@@ -714,18 +905,13 @@ def test_stage_m_rejects_release_without_runtime_slot_restore() -> None:
     layer = object.__new__(FusedMoE)
     layer.uvm_init_weight_offload_enable = True
     layer.uvm_init_weight_hot_prefetch_enable = False
-    layer.uvm_init_weight_register_all_local_experts = False
     layer.uvm_init_weight_offload_mode = "driver_release"
+    layer.uvm_expert_envelope_enable = True
     layer.uvm_expert_reserved_enable = False
     layer.uvm_weight_prefetch_enabled = True
     layer.layer_name = "model.layers.7.mlp.experts"
-    traces: list[dict[str, object]] = []
-    layer._append_uvm_init_weight_trace = traces.append
-
     with pytest.raises(RuntimeError, match="requires reserved slot restore"):
         layer.run_uvm_init_weight_offload()
-
-    assert traces[0]["action"] == ("init_weight_offload_reject_without_slot_restore")
 
 
 def test_incremental_offload_wrapper_reopens_one_stage_m_wave(
@@ -984,13 +1170,13 @@ def test_dynamic_release_remote_uses_registered_512k_envelopes(
     layer = object.__new__(FusedMoE)
     layer.uvm_expert_envelope_enable = True
     layer.uvm_expert_envelope_bytes = envelope_bytes
-    layer._uvm_expert_weight_region_id = (
-        lambda layer_id, expert_id, role: f"weights:{layer_id}:{expert_id}:{role}"
+    layer._uvm_expert_weight_region_id = lambda layer_id, expert_id, role: (
+        f"weights:{layer_id}:{expert_id}:{role}"
     )
     layer._uvm_expert_weight_residency_metadata = lambda **_kwargs: {}
     recorded: list[tuple[object, dict[int, dict[str, object]]]] = []
-    layer._uvm_record_release_remote_envelope_states = (
-        lambda records, entries: recorded.append((records, entries))
+    layer._uvm_record_release_remote_envelope_states = lambda records, entries: (
+        recorded.append((records, entries))
     )
 
     def envelopes(**kwargs: Any) -> list[Any]:
@@ -1261,15 +1447,11 @@ def test_warm_async_prefetch_waits_for_token_threshold() -> None:
     layer = object.__new__(FusedMoE)
     layer.uvm_expert_warm_prefetch_enable = True
     layer.uvm_expert_warm_async_min_tokens = 32
-    layer.layer_name = "model.layers.7.mlp.experts"
-    layer._uvm_moe_trace_step = 3
-    traces: list[dict[str, object]] = []
-    layer._append_uvm_weight_prefetch_trace = traces.append
+    layer._uvm_next_warm_prefetch_module = lambda: pytest.fail(
+        "prefetch lookup must not run below the token threshold"
+    )
 
     layer._maybe_prefetch_next_layer_uvm_warm_expert_weights(num_tokens=16)
-
-    assert traces[0]["action"] == ("next_layer_warm_prefetch_below_token_threshold")
-    assert traces[0]["fallback"] == "synchronous_restore_on_actual_topk_hit"
 
 
 def _make_warm_barrier_layer(
@@ -1282,7 +1464,6 @@ def _make_warm_barrier_layer(
     layer.layer_name = "model.layers.7.mlp.experts"
     layer._uvm_warm_prefetch_expert_pairs = lambda: [(3, 3)]
     layer._uvm_layer_id = lambda: 7
-    layer._append_uvm_weight_prefetch_trace = lambda _record: None
     layer._uvm_update_weight_expert_role_cache = lambda **_kwargs: None
     region_ids = [
         "weight:layer7:expert3:moe_gate_up",
@@ -1387,48 +1568,6 @@ def test_warm_target_barrier_fails_closed_on_missing_physical_envelope() -> None
         layer._wait_for_uvm_warm_prefetch_before_compute()
 
 
-def test_warm_target_barrier_records_direct_compute_ioctl_overlap(
-    monkeypatch: Any,
-) -> None:
-    class FakeEvent:
-        def __init__(self, timestamp_ms: float) -> None:
-            self.timestamp_ms = timestamp_ms
-
-        def query(self) -> bool:
-            return True
-
-        def synchronize(self) -> None:
-            return None
-
-        def elapsed_time(self, other: "FakeEvent") -> float:
-            return other.timestamp_ms - self.timestamp_ms
-
-    future: Future[dict[str, object]] = Future()
-    layer = _make_warm_barrier_layer(future)
-    expected = list(layer._uvm_warm_prefetch_ticket["expected_region_ids"])
-    future.set_result(_complete_warm_prefetch_result(expected))
-    ticket = layer._uvm_warm_prefetch_ticket
-    ticket.update(
-        {
-            "background": True,
-            "source_compute_start_event": FakeEvent(0.0),
-            "source_compute_end_event": FakeEvent(5.0),
-            "ioctl_cuda_start_event": FakeEvent(1.0),
-            "ioctl_cuda_end_event": FakeEvent(9.0),
-        }
-    )
-    traces: list[dict[str, object]] = []
-    layer._append_uvm_weight_prefetch_trace = traces.append
-    monkeypatch.setattr(layer_module, "mark_uvm_residency_state", lambda **_: None)
-
-    layer._wait_for_uvm_warm_prefetch_before_compute()
-
-    barrier = traces[-1]
-    assert barrier["direct_compute_ioctl_overlap_ms"] == pytest.approx(4.0)
-    assert barrier["direct_compute_ioctl_overlap_ratio"] == pytest.approx(0.5)
-    assert barrier["direct_compute_ioctl_overlap_observed"] is True
-
-
 def test_warm_prefetch_background_submission_returns_before_driver(
     monkeypatch: Any,
 ) -> None:
@@ -1456,8 +1595,6 @@ def test_warm_prefetch_background_submission_returns_before_driver(
         f"{layer_id}:{expert_id}:{role}"
     )
     layer._uvm_expert_weight_residency_metadata = lambda **_kwargs: {}
-    layer._uvm_driver_capability_trace_fields = lambda _metadata: {}
-    layer._append_uvm_weight_prefetch_trace = lambda _record: None
     release_driver = threading.Event()
 
     def blocked_driver(**_kwargs: Any) -> dict[str, object]:
@@ -1664,8 +1801,6 @@ def test_fused_bank_reuse_defers_old_mapping_release_to_install(
         after_driver_ioctl=lambda: callback_order.append("after"),
     )
 
-    assert result["bank_reuse_result"]["status"] == (
-        "deferred_to_install_ioctl"
-    )
+    assert result["bank_reuse_result"]["status"] == ("deferred_to_install_ioctl")
     assert driver_modes == ["reserved_prefetch", "reserved_prefetch"]
     assert callback_order == ["before", "after"]

@@ -8,17 +8,12 @@ import os
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from typing import Any
 
 import torch
 
-_TRACE_MARKER_PATHS = (
-    "/sys/kernel/tracing/trace_marker",
-    "/sys/kernel/debug/tracing/trace_marker",
-)
 _LOG_LOCK = threading.Lock()
-_TRACE_MARKER_PATH: str | None = None
-_TRACE_MARKER_MISSING = False
 
 
 def kv_init_probe_enabled() -> bool:
@@ -220,10 +215,8 @@ def _append_jsonl(record: dict[str, Any]) -> None:
     if path is None:
         return
 
-    try:
+    with suppress(Exception):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-    except Exception:
-        pass
 
     line = json.dumps(record, sort_keys=True, separators=(",", ":"))
     with _LOG_LOCK:
@@ -235,43 +228,8 @@ def _append_jsonl(record: dict[str, Any]) -> None:
             pass
 
 
-def _find_trace_marker_path() -> str | None:
-    global _TRACE_MARKER_MISSING, _TRACE_MARKER_PATH
-
-    if _TRACE_MARKER_MISSING:
-        return None
-    if _TRACE_MARKER_PATH is not None:
-        return _TRACE_MARKER_PATH
-
-    for path in _TRACE_MARKER_PATHS:
-        if os.path.exists(path):
-            _TRACE_MARKER_PATH = path
-            return path
-
-    _TRACE_MARKER_MISSING = True
-    return None
 
 
-def write_uvm_trace_marker(prefix: str, fields: dict[str, Any]) -> None:
-    path = _find_trace_marker_path()
-    if path is None:
-        return
-
-    parts = [prefix]
-    for key in sorted(fields):
-        value = fields[key]
-        if isinstance(value, (list, tuple)):
-            text = "x".join(str(item) for item in value)
-        else:
-            text = str(value)
-        text = text.replace(" ", "_")
-        parts.append(f"{key}={text}")
-
-    try:
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(" ".join(parts))
-    except Exception:
-        pass
 
 
 def record_kv_init_probe_event(
@@ -307,25 +265,6 @@ def record_kv_init_probe_event(
     record.update(_tensor_metadata(tensor))
     record.update(_tensor_residency_metadata(tensor))
     _append_jsonl(record)
-
-    marker_fields = {
-        "event": record.get("event"),
-        "path": record.get("path"),
-        "index": record.get("index"),
-        "pid": record.get("pid"),
-    }
-    for key in (
-        "requested_size_bytes",
-        "size_bytes",
-        "ptr_hex",
-        "end_hex",
-        "dtype",
-        "device",
-    ):
-        if key in record:
-            marker_fields[key] = record[key]
-    write_uvm_trace_marker("VLLM_KV_INIT_PROBE", marker_fields)
-
 
 def synchronize_kv_init_probe_tensor(
     *,

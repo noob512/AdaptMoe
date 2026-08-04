@@ -11,7 +11,6 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
-from vllm.v1.core.uvm_kv_runtime_policy import UvmKvRuntimePolicy
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashList,
@@ -24,6 +23,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
+from vllm.v1.core.uvm_kv_runtime_policy import UvmKvRuntimePolicy
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -395,12 +395,6 @@ class BlockPool:
             # eviction is not needed
             return False
 
-        if self.uvm_kv_runtime_policy is not None:
-            self.uvm_kv_runtime_policy.record_prefix_cache_eviction(
-                block=block,
-                block_hash=block_hash,
-            )
-
         block.reset_hash()
 
         if self.enable_kv_cache_events:
@@ -498,11 +492,6 @@ class BlockPool:
                 gpu_blocks.append(block)
         self.free_block_queue.append_n(gpu_blocks)
         self.offline_block_queue.append_n(offline_blocks)
-        if self.uvm_kv_runtime_policy is not None:
-            self.uvm_kv_runtime_policy.on_blocks_freed(
-                blocks=blocks_list,
-                reason="free_blocks",
-            )
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF

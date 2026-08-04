@@ -14,22 +14,18 @@ import threading
 import time
 from typing import Any
 
-from vllm.logger import init_logger
-from vllm.device_allocator.uvm_pool_coordinator import (
-    record_uvm_pool_pressure,
-    request_uvm_pool_action,
-)
 from vllm.device_allocator.uvm import (
     batch_offload_ranges_to_cpu_with_executor,
     batch_prefetch_ranges_to_device_with_executor,
 )
 from vllm.device_allocator.uvm_policy_runtime import get_uvm_policy_runtime
+from vllm.device_allocator.uvm_pool_coordinator import (
+    request_uvm_pool_action,
+)
 from vllm.device_allocator.uvm_pool_residency import (
-    get_uvm_residency_region_snapshot,
     get_uvm_pool_residency_manager,
+    get_uvm_residency_region_snapshot,
     mark_uvm_residency_state,
-    record_uvm_residency_kv_metadata_candidate,
-    record_uvm_residency_action,
     register_uvm_residency_region,
     request_uvm_gpu_residency,
 )
@@ -38,6 +34,7 @@ from vllm.device_allocator.uvm_unified_residency_controller import (
     record_unified_kv_target,
     record_unified_residency_snapshot,
 )
+from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
@@ -130,6 +127,8 @@ def register_uvm_kv_cache_physical_ranges(
                 f"kv_phys:{record['group_id']}:{record['layer_name']}:"
                 f"{record['tensor_index']}"
             )
+            if get_uvm_residency_region_snapshot(region_id) is not None:
+                continue
             register_uvm_residency_region(
                 pool="kv",
                 region_id=region_id,
@@ -138,6 +137,7 @@ def register_uvm_kv_cache_physical_ranges(
                 state="gpu",
                 evictable=True,
                 active=False,
+                driver_register=True,
                 metadata={
                     "stage": "stage_l5_physical",
                     "source": "kv_cache_physical_range_map",
@@ -239,7 +239,9 @@ def _read_int_env(name: str, default: int = 0) -> int:
     try:
         return max(int(raw), 0)
     except ValueError:
-        logger.warning("Ignoring invalid %s=%r; expected non-negative integer.", name, raw)
+        logger.warning(
+            "Ignoring invalid %s=%r; expected non-negative integer.", name, raw
+        )
         return default
 
 
@@ -298,13 +300,9 @@ class UvmKvRuntimePolicy:
             automatic_post_warmup_pool,
         )
         self.mode = _read_mode_env()
-        self.trace_file = os.environ.get("VLLM_UVM_KV_RUNTIME_TRACE_FILE", "")
         self.policy = os.environ.get(
             "VLLM_UVM_KV_RUNTIME_EVICTION_POLICY", "lru_prefix_cache"
         ).strip().lower()
-        self.candidate_limit = _read_int_env(
-            "VLLM_UVM_KV_RUNTIME_CANDIDATE_LIMIT", 16
-        )
         self.prefix_evict_enable = _read_bool_env(
             "VLLM_UVM_KV_RUNTIME_PREFIX_EVICT_ENABLE", False
         )
@@ -349,7 +347,9 @@ class UvmKvRuntimePolicy:
         budget_blocks_override = _read_int_env(
             "VLLM_UVM_KV_RUNTIME_BUDGET_BLOCKS", 0
         )
-        self.total_bytes = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+        self.total_bytes = sum(
+            tensor.size for tensor in kv_cache_config.kv_cache_tensors
+        )
         self.total_blocks = max(kv_cache_config.num_blocks - 1, 0)
         self.num_kv_cache_groups = max(len(kv_cache_config.kv_cache_groups), 1)
         self.bytes_per_block = (
@@ -442,45 +442,11 @@ class UvmKvRuntimePolicy:
             )
             self.policy = "lru_prefix_cache"
         self._lock = threading.Lock()
-        self._config_recorded = False
-        self._summary = {
-            "allocation_pressure_records": 0,
-            "over_budget_records": 0,
-            "would_deny_records": 0,
-            "denied_records": 0,
-            "candidate_records": 0,
-            "prefix_evict_attempt_records": 0,
-            "prefix_evict_success_blocks": 0,
-            "prefix_evict_noop_records": 0,
-            "prefix_evict_failed_records": 0,
-            "prefix_evict_coordinator_reject_records": 0,
-            "prefix_cache_eviction_records": 0,
-            "unsafe_prefix_cache_eviction_records": 0,
-            "reuse_failure_records": 0,
-            "stage_l5_kv_region_register_records": 0,
-            "stage_l5_residency_request_records": 0,
-            "stage_l5_safe_candidate_records": 0,
-            "stage_l5_unsafe_candidate_records": 0,
-            "stage_l5_data_offload_records": 0,
-            "active_protect_attempt_records": 0,
-            "active_protect_issued_records": 0,
-            "active_protect_fallback_records": 0,
-            "active_protect_blocks": 0,
-            "active_protect_bytes": 0,
-            "dynamic_pool_resize_records": 0,
-            "dynamic_pool_offload_blocks": 0,
-            "dynamic_pool_prefetch_blocks": 0,
-            "dynamic_pool_deferred_active_blocks": 0,
-            "dynamic_pool_physical_migration_records": 0,
-            "dynamic_pool_physical_migration_ranges": 0,
-            "dynamic_pool_physical_migration_bytes": 0,
-            "dynamic_pool_physical_migration_successes": 0,
-        }
         self._unified_config_recorded = False
 
     @property
     def active(self) -> bool:
-        return self.enabled and bool(self.trace_file)
+        return self.enabled
 
     def record_config(self) -> None:
         if not self._unified_config_recorded:
@@ -512,53 +478,6 @@ class UvmKvRuntimePolicy:
                     "num_kv_cache_groups": self.num_kv_cache_groups,
                 },
             )
-        if not self.active or self._config_recorded:
-            return
-        self._config_recorded = True
-        self._write(
-            {
-                "action": "runtime_config",
-                "enabled": self.enabled,
-                "mode": self.mode,
-                "policy": self.policy,
-                "budget_bytes": self.budget_bytes,
-                "budget_blocks": self.budget_blocks,
-                "bytes_per_block": self.bytes_per_block,
-                "total_bytes": self.total_bytes,
-                "total_blocks": self.total_blocks,
-                "candidate_limit": self.candidate_limit,
-                "prefix_evict_enable": self.prefix_evict_enable,
-                "prefix_evict_max_blocks": self.prefix_evict_max_blocks,
-                "stage_l5_metadata_enable": self.stage_l5_metadata_enable,
-                "active_protect_enable": self.active_protect_enable,
-                "active_protect_mode": self.active_protect_mode,
-                "active_protect_device": self.active_protect_device,
-                "active_protect_max_blocks": self.active_protect_max_blocks,
-                "prefer_gpu_resident_free_blocks": (
-                    self.prefer_gpu_resident_free_blocks
-                ),
-                "prefer_gpu_resident_allow_cached": (
-                    self.prefer_gpu_resident_allow_cached
-                ),
-                "dynamic_pool_enable": self.dynamic_pool_enable,
-                "dynamic_pool_control_file": self.dynamic_pool_control_file,
-                "dynamic_pool_initial_blocks": self.dynamic_pool_initial_blocks,
-                "dynamic_pool_target_blocks": self.dynamic_pool_target_blocks,
-                "dynamic_pool_physical_migration_enable": (
-                    self.dynamic_pool_physical_migration_enable
-                ),
-                "dynamic_pool_physical_migration_executor": (
-                    self.dynamic_pool_physical_migration_executor
-                ),
-                "dynamic_pool_physical_migration_sync": (
-                    self.dynamic_pool_physical_migration_sync
-                ),
-                "dynamic_pool_physical_migration_device": (
-                    self.dynamic_pool_physical_migration_device
-                ),
-                "num_kv_cache_groups": self.num_kv_cache_groups,
-            }
-        )
 
     def dynamic_pool_active(self) -> bool:
         return self.dynamic_pool_enable
@@ -624,17 +543,6 @@ class UvmKvRuntimePolicy:
                     **metadata,
                 },
             )
-            self._write(
-                {
-                    "action": "kv_dynamic_pool_target_update",
-                    "reason": reason,
-                    "source": "unified_control_file",
-                    "old_target_blocks": old_target,
-                    "new_target_blocks": target,
-                    "generation": self._dynamic_pool_generation,
-                    "metadata": metadata,
-                }
-            )
         apply_result = self._ensure_dynamic_pool_applied(
             block_pool=block_pool,
             reason=reason,
@@ -671,7 +579,11 @@ class UvmKvRuntimePolicy:
         self.record_config()
         records: list[dict[str, Any]] = []
         for spec in block_specs:
-            block_id = int(spec.get("block_id") if spec.get("block_id") is not None else -1)
+            block_id = int(
+                spec.get("block_id")
+                if spec.get("block_id") is not None
+                else -1
+            )
             if block_id < 0:
                 continue
             group_value = spec.get("group_id")
@@ -723,17 +635,6 @@ class UvmKvRuntimePolicy:
             if item.get("before_state") in ("cpu", "prefetching_cpu")
             and item.get("after_state") in ("gpu", "prefetching_gpu")
         ]
-        self._write(
-            {
-                "action": "unified_prefetch_kv_blocks_result",
-                "reason": reason,
-                "requested_blocks": block_specs,
-                "attempted_regions": len(records),
-                "issued_regions": len(issued),
-                "records": records,
-                "metadata": metadata,
-            }
-        )
         return {
             "ok": True,
             "requested_blocks": block_specs,
@@ -767,15 +668,7 @@ class UvmKvRuntimePolicy:
         )
         try:
             free_blocks = block_pool.free_block_queue.get_all_free_blocks()
-        except Exception as exc:  # pragma: no cover - defensive trace path.
-            self._write(
-                {
-                    "action": "gpu_resident_free_block_select_failed",
-                    "reason": "free_queue_snapshot_failed",
-                    "error": repr(exc),
-                    "requested_blocks": num_blocks,
-                }
-            )
+        except Exception:  # pragma: no cover - defensive queue path.
             return None
 
         if len(free_blocks) < num_blocks:
@@ -785,10 +678,6 @@ class UvmKvRuntimePolicy:
         gpu_warm_blocks: list[Any] = []
         unknown_blocks: list[Any] = []
         cpu_blocks: list[Any] = []
-        skipped_cached = 0
-        skipped_dynamic_pool = 0
-        skipped_unsafe = 0
-
         for block in free_blocks:
             block_id = int(getattr(block, "block_id", -1))
             safe = (
@@ -797,17 +686,14 @@ class UvmKvRuntimePolicy:
                 and getattr(block, "ref_cnt", None) == 0
             )
             if not safe:
-                skipped_unsafe += 1
                 continue
             if dynamic_active and not self._dynamic_pool_block_id_allocatable(block_id):
-                skipped_dynamic_pool += 1
                 continue
             if (
                 enable_caching
                 and not self.prefer_gpu_resident_allow_cached
                 and getattr(block, "block_hash", None) is not None
             ):
-                skipped_cached += 1
                 continue
 
             state = self._kv_block_residency_class(block_id)
@@ -826,50 +712,7 @@ class UvmKvRuntimePolicy:
             gpu_fresh_blocks + gpu_warm_blocks + unknown_blocks + cpu_blocks
         )[:num_blocks]
         if len(selected) != num_blocks:
-            self._write(
-                {
-                    "action": "gpu_resident_free_block_select_fallback",
-                    "requested_blocks": num_blocks,
-                    "free_blocks": len(free_blocks),
-                    "gpu_candidates": len(gpu_fresh_blocks) + len(gpu_warm_blocks),
-                    "gpu_fresh_candidates": len(gpu_fresh_blocks),
-                    "gpu_warm_candidates": len(gpu_warm_blocks),
-                    "unknown_candidates": len(unknown_blocks),
-                    "cpu_candidates": len(cpu_blocks),
-                    "skipped_cached": skipped_cached,
-                    "skipped_dynamic_pool": skipped_dynamic_pool,
-                    "skipped_unsafe": skipped_unsafe,
-                    "enable_caching": enable_caching,
-                    "dynamic_pool_target_blocks": (
-                        self.dynamic_pool_target_blocks if dynamic_active else None
-                    ),
-                }
-            )
             return [] if dynamic_active else None
-
-        selected_ids = [int(getattr(block, "block_id", -1)) for block in selected]
-        self._write(
-            {
-                "action": "gpu_resident_free_block_select",
-                "requested_blocks": num_blocks,
-                "selected_block_ids": selected_ids,
-                "selected_lifecycle_states": [
-                    self._kv_block_lifecycle_class(block) for block in selected
-                ],
-                "gpu_candidates": len(gpu_fresh_blocks) + len(gpu_warm_blocks),
-                "gpu_fresh_candidates": len(gpu_fresh_blocks),
-                "gpu_warm_candidates": len(gpu_warm_blocks),
-                "unknown_candidates": len(unknown_blocks),
-                "cpu_candidates": len(cpu_blocks),
-                "skipped_cached": skipped_cached,
-                "skipped_dynamic_pool": skipped_dynamic_pool,
-                "skipped_unsafe": skipped_unsafe,
-                "enable_caching": enable_caching,
-                "dynamic_pool_target_blocks": (
-                    self.dynamic_pool_target_blocks if dynamic_active else None
-                ),
-            }
-        )
         return selected
 
     def _clamp_dynamic_pool_target(self, target_blocks: int) -> int:
@@ -913,22 +756,16 @@ class UvmKvRuntimePolicy:
                 stat = os.stat(self.dynamic_pool_control_file)
             except FileNotFoundError:
                 stat = None
-            except OSError as exc:  # pragma: no cover - diagnostic path.
-                self._write(
-                    {
-                        "action": "kv_dynamic_pool_control_read_failed",
-                        "control_file": self.dynamic_pool_control_file,
-                        "reason": reason,
-                        "error": repr(exc),
-                    }
-                )
+            except OSError:  # pragma: no cover - optional control file.
                 stat = None
-            if stat is not None and stat.st_mtime_ns != self._dynamic_pool_control_mtime_ns:
+            if (
+                stat is not None
+                and stat.st_mtime_ns != self._dynamic_pool_control_mtime_ns
+            ):
                 self._dynamic_pool_control_mtime_ns = stat.st_mtime_ns
                 try:
                     with open(
                         self.dynamic_pool_control_file,
-                        "r",
                         encoding="utf-8",
                         errors="replace",
                     ) as handle:
@@ -936,15 +773,8 @@ class UvmKvRuntimePolicy:
                     parsed = self._parse_dynamic_pool_control(raw_value)
                     if parsed is not None:
                         target = self._clamp_dynamic_pool_target(parsed)
-                except Exception as exc:  # pragma: no cover - diagnostic path.
-                    self._write(
-                        {
-                            "action": "kv_dynamic_pool_control_read_failed",
-                            "control_file": self.dynamic_pool_control_file,
-                            "reason": reason,
-                            "error": repr(exc),
-                        }
-                    )
+                except Exception:  # pragma: no cover - optional control file.
+                    pass
         if target != self.dynamic_pool_target_blocks:
             old_target = self.dynamic_pool_target_blocks
             self.dynamic_pool_target_blocks = target
@@ -959,17 +789,6 @@ class UvmKvRuntimePolicy:
                     "control_file": self.dynamic_pool_control_file,
                     "raw_value": raw_value,
                 },
-            )
-            self._write(
-                {
-                    "action": "kv_dynamic_pool_target_update",
-                    "reason": reason,
-                    "old_target_blocks": old_target,
-                    "new_target_blocks": target,
-                    "generation": self._dynamic_pool_generation,
-                    "control_file": self.dynamic_pool_control_file,
-                    "raw_value": raw_value,
-                }
             )
         self._ensure_dynamic_pool_applied(block_pool=block_pool, reason=reason)
 
@@ -1019,48 +838,23 @@ class UvmKvRuntimePolicy:
                 "block_count": 0,
             }
         if not self.dynamic_pool_physical_migration_enable:
-            result = {
+            return {
                 "ok": False,
                 "reason": "physical_migration_disabled",
                 "direction": direction,
                 "block_count": len(unique_block_ids),
             }
-            self._write(
-                {
-                    "action": "kv_dynamic_pool_physical_migration_skipped",
-                    **result,
-                    "old_target_blocks": old_target,
-                    "new_target_blocks": new_target,
-                    "source_reason": reason,
-                }
-            )
-            return result
 
         collection = collect_uvm_kv_cache_physical_ranges_for_blocks(unique_block_ids)
         ranges = list(collection.get("ranges") or [])
         if not ranges:
-            result = {
+            return {
                 "ok": False,
                 "reason": str(collection.get("reason") or "no_registered_ranges"),
                 "direction": direction,
                 "block_count": len(unique_block_ids),
                 "registered_spans": int(collection.get("registered_spans") or 0),
             }
-            self._write(
-                {
-                    "action": "kv_dynamic_pool_physical_migration_skipped",
-                    **result,
-                    "old_target_blocks": old_target,
-                    "new_target_blocks": new_target,
-                    "source_reason": reason,
-                    "collection": {
-                        key: value
-                        for key, value in collection.items()
-                        if key != "ranges"
-                    },
-                }
-            )
-            return result
 
         start = time.monotonic()
         if direction == "shrink":
@@ -1076,7 +870,6 @@ class UvmKvRuntimePolicy:
                 "prefetch_result": prefetch_result,
             }
             state = "cpu"
-            action = "kv_dynamic_pool_physical_offload"
         else:
             successes, executor_used, prefetch_result = (
                 batch_prefetch_ranges_to_device_with_executor(
@@ -1087,7 +880,6 @@ class UvmKvRuntimePolicy:
             )
             driver_result = {"prefetch_result": prefetch_result}
             state = "gpu"
-            action = "kv_dynamic_pool_physical_prefetch"
 
         elapsed = time.monotonic() - start
         complete = int(successes) == len(ranges)
@@ -1125,27 +917,6 @@ class UvmKvRuntimePolicy:
                     },
                 )
 
-        self._summary["dynamic_pool_physical_migration_records"] += 1
-        self._summary["dynamic_pool_physical_migration_ranges"] += len(ranges)
-        self._summary["dynamic_pool_physical_migration_bytes"] += int(
-            collection.get("range_bytes") or 0
-        )
-        self._summary["dynamic_pool_physical_migration_successes"] += int(successes)
-        record_uvm_residency_action(
-            action=action,
-            pool="kv",
-            region_id=f"kv:dynamic_pool:{direction}:{old_target}:{new_target}",
-            bytes=int(collection.get("range_bytes") or 0),
-            mode=executor_used,
-            range_count=len(ranges),
-            metadata={
-                **metadata,
-                "block_count": len(unique_block_ids),
-                "block_intervals": collection.get("block_intervals"),
-                "range_records": collection.get("range_records"),
-                "elapsed_seconds": elapsed,
-            },
-        )
         record_unified_residency_snapshot(
             reason="kv_dynamic_pool_physical_migration",
             kv_pressure={
@@ -1166,16 +937,6 @@ class UvmKvRuntimePolicy:
             "elapsed_seconds": elapsed,
             **driver_result,
         }
-        self._write(
-            {
-                "action": "kv_dynamic_pool_physical_migration",
-                **result,
-                "old_target_blocks": old_target,
-                "new_target_blocks": new_target,
-                "source_reason": reason,
-                "range_records": collection.get("range_records"),
-            }
-        )
         return result
 
     def _ensure_dynamic_pool_applied(
@@ -1345,26 +1106,6 @@ class UvmKvRuntimePolicy:
                 }
                 committed = False
 
-        self._summary["dynamic_pool_resize_records"] += 1
-        self._summary["dynamic_pool_offload_blocks"] += offloaded
-        self._summary["dynamic_pool_prefetch_blocks"] += prefetched
-        self._summary["dynamic_pool_deferred_active_blocks"] += skipped_active
-        self._write(
-            {
-                "action": "kv_dynamic_pool_resize",
-                "reason": reason,
-                "direction": direction,
-                "old_target_blocks": old_target,
-                "new_target_blocks": target,
-                "offloaded_blocks": offloaded,
-                "prefetched_blocks": prefetched,
-                "deferred_active_blocks": skipped_active,
-                "committed": committed,
-                "queue_transition": queue_result,
-                "generation": self._dynamic_pool_generation,
-                "physical_migration": physical_result,
-            }
-        )
         record_unified_residency_snapshot(
             reason="kv_dynamic_pool_resize",
             kv_pressure={
@@ -1425,10 +1166,6 @@ class UvmKvRuntimePolicy:
             snapshot = get_uvm_residency_region_snapshot(region_id)
             snapshot_metadata = dict((snapshot or {}).get("metadata") or {})
             state = str((snapshot or {}).get("state") or "unknown")
-            size_bytes = int(
-                (snapshot or {}).get("bytes")
-                or self.bytes_per_group_block
-            )
             if state == "cpu":
                 issued = True
                 continue
@@ -1452,29 +1189,11 @@ class UvmKvRuntimePolicy:
                 "physical_migration_issued": False,
                 "metadata_only": True,
             }
-            record_uvm_residency_action(
-                action="residency_kv_data_offload_attempt",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                metadata=metadata,
-            )
             mark_uvm_residency_state(
                 region_id=region_id,
                 state="cpu",
                 metadata=metadata,
             )
-            record_uvm_residency_action(
-                action="residency_kv_data_offload_issued",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                mode="logical_dynamic_pool",
-                ptr=None,
-                range_count=0,
-                metadata=metadata,
-            )
-            self._summary["stage_l5_data_offload_records"] += 1
             issued = True
         return issued
 
@@ -1500,10 +1219,6 @@ class UvmKvRuntimePolicy:
             snapshot = get_uvm_residency_region_snapshot(region_id)
             snapshot_metadata = dict((snapshot or {}).get("metadata") or {})
             state = str((snapshot or {}).get("state") or "unknown")
-            size_bytes = int(
-                (snapshot or {}).get("bytes")
-                or self.bytes_per_group_block
-            )
             if state == "gpu":
                 issued = True
                 continue
@@ -1527,13 +1242,6 @@ class UvmKvRuntimePolicy:
                 "physical_migration_issued": False,
                 "metadata_only": True,
             }
-            record_uvm_residency_action(
-                action="residency_kv_prefetch_back_attempt",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                metadata=metadata,
-            )
             mark_uvm_residency_state(
                 region_id=region_id,
                 state="prefetching_gpu",
@@ -1542,16 +1250,6 @@ class UvmKvRuntimePolicy:
             mark_uvm_residency_state(
                 region_id=region_id,
                 state="gpu",
-                metadata=metadata,
-            )
-            record_uvm_residency_action(
-                action="residency_kv_prefetch_back_issued",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                mode="logical_dynamic_pool",
-                ptr=None,
-                range_count=0,
                 metadata=metadata,
             )
             issued = True
@@ -1585,7 +1283,6 @@ class UvmKvRuntimePolicy:
         if not get_uvm_pool_residency_manager().active:
             return
         bytes_per_region = max(self.bytes_per_group_block, 1)
-        total_registered = 0
         for group_id in range(self.num_kv_cache_groups):
             for block in getattr(block_pool, "blocks", []):
                 if getattr(block, "is_null", False):
@@ -1593,14 +1290,18 @@ class UvmKvRuntimePolicy:
                 block_id = int(getattr(block, "block_id", -1))
                 if block_id < 0:
                     continue
+                region_id = f"kv:{group_id}:{block_id}"
+                if get_uvm_residency_region_snapshot(region_id) is not None:
+                    continue
                 register_uvm_residency_region(
                     pool="kv",
-                    region_id=f"kv:{group_id}:{block_id}",
+                    region_id=region_id,
                     ptr=None,
                     bytes=bytes_per_region,
                     state="gpu",
                     evictable=True,
                     active=False,
+                    driver_register=False,
                     metadata={
                         "stage": "stage_l5",
                         "source": "kv_block_metadata",
@@ -1622,18 +1323,6 @@ class UvmKvRuntimePolicy:
                         "metadata_only": True,
                     },
                 )
-                total_registered += 1
-        self._summary["stage_l5_kv_region_register_records"] += total_registered
-        self._write(
-            {
-                "action": "stage_l5_kv_metadata_registered",
-                "registered_regions": total_registered,
-                "bytes_per_region": bytes_per_region,
-                "num_kv_cache_groups": self.num_kv_cache_groups,
-                "metadata_only": True,
-                "data_offload_issued": False,
-            }
-        )
 
     def should_allow_allocation(
         self,
@@ -1658,24 +1347,6 @@ class UvmKvRuntimePolicy:
         if not self.active:
             return True
         over_budget = bool(pressure["over_budget"])
-        record_uvm_pool_pressure(
-            pool="kv",
-            pressure_bytes=int(pressure.get("pressure_bytes") or 0),
-            pressure_ratio=(
-                (
-                    float(pressure.get("projected_used_blocks") or 0)
-                    / float(pressure.get("budget_blocks") or 1)
-                )
-                if int(pressure.get("budget_blocks") or 0) > 0
-                else None
-            ),
-            action_queue_depth=num_blocks_to_allocate,
-            metadata={
-                "stage": "stage_j",
-                "request_id": request_id,
-                "over_budget": over_budget,
-            },
-        )
         if self.stage_l5_metadata_enable:
             request_uvm_gpu_residency(
                 pool="kv",
@@ -1693,99 +1364,15 @@ class UvmKvRuntimePolicy:
                     **pressure,
                 },
             )
-            self._summary["stage_l5_residency_request_records"] += 1
-        self._write(
-            {
-                "action": "allocation_pressure",
-                "request_id": request_id,
-                "num_blocks_to_allocate": num_blocks_to_allocate,
-                **pressure,
-            }
-        )
-        self._summary["allocation_pressure_records"] += 1
         if over_budget:
-            self._summary["over_budget_records"] += 1
-            self._trace_candidates(
-                request_id=request_id,
-                block_pool=block_pool,
-                reason="runtime_budget_pressure",
-            )
             self._maybe_execute_prefix_eviction(
                 request_id=request_id,
                 block_pool=block_pool,
                 pressure=pressure,
                 reason="runtime_budget_pressure",
             )
-            self._write(
-                {
-                    "action": "would_deny_allocation",
-                    "request_id": request_id,
-                    "mode": self.mode,
-                    "policy": self.policy,
-                    "num_blocks_to_allocate": num_blocks_to_allocate,
-                    **pressure,
-                }
-            )
-            self._summary["would_deny_records"] += 1
-            allowed = self.mode != "enforce"
-            if not allowed:
-                self._summary["denied_records"] += 1
-                self._write(
-                    {
-                        "action": "deny_allocation",
-                        "request_id": request_id,
-                        "mode": self.mode,
-                        "policy": self.policy,
-                        "num_blocks_to_allocate": num_blocks_to_allocate,
-                        **pressure,
-                    }
-                )
-            self._record_summary()
-            return allowed
-        self._record_summary()
+            return self.mode != "enforce"
         return True
-
-    def record_reuse_failure(
-        self,
-        *,
-        request_id: str,
-        num_blocks_to_allocate: int,
-        block_pool: Any,
-    ) -> None:
-        if not self.active:
-            return
-        self.record_config()
-        self._write(
-            {
-                "action": "allocation_no_free_blocks",
-                "request_id": request_id,
-                "num_blocks_to_allocate": num_blocks_to_allocate,
-                **self._pressure_snapshot(block_pool, num_blocks_to_allocate),
-            }
-        )
-        self._summary["reuse_failure_records"] += 1
-        self._record_summary()
-
-    def record_prefix_cache_eviction(self, *, block: Any, block_hash: Any) -> None:
-        """Record a real vLLM-safe prefix-cache eviction/reuse event."""
-        if not self.active:
-            return
-        self.record_config()
-        safe_ref_cnt_zero = getattr(block, "ref_cnt", None) == 0
-        self._write(
-            {
-                "action": "evict_prefix_cache_block",
-                "block_id": getattr(block, "block_id", None),
-                "ref_cnt": getattr(block, "ref_cnt", None),
-                "is_null": getattr(block, "is_null", None),
-                "block_hash": _block_hash_to_text(block_hash),
-                "safe_ref_cnt_zero": safe_ref_cnt_zero,
-            }
-        )
-        self._summary["prefix_cache_eviction_records"] += 1
-        if not safe_ref_cnt_zero:
-            self._summary["unsafe_prefix_cache_eviction_records"] += 1
-        self._record_summary()
 
     def _pressure_snapshot(
         self, block_pool: Any, num_blocks_to_allocate: int
@@ -1825,86 +1412,6 @@ class UvmKvRuntimePolicy:
             "over_budget": budget_blocks > 0 and pressure_blocks > 0,
         }
 
-    def _trace_candidates(
-        self,
-        *,
-        request_id: str,
-        block_pool: Any,
-        reason: str,
-    ) -> None:
-        if self.candidate_limit <= 0:
-            return
-        try:
-            free_blocks = block_pool.free_block_queue.get_all_free_blocks()
-        except Exception as exc:  # pragma: no cover - defensive trace path.
-            self._write(
-                {
-                    "action": "candidate_snapshot_failed",
-                    "request_id": request_id,
-                    "reason": reason,
-                    "error": repr(exc),
-                }
-            )
-            return
-        for index, block in enumerate(free_blocks[: self.candidate_limit]):
-            block_hash = getattr(block, "block_hash", None)
-            block_id = int(getattr(block, "block_id", -1))
-            safe = (
-                block_id >= 0
-                and not bool(getattr(block, "is_null", False))
-                and getattr(block, "ref_cnt", None) == 0
-            )
-            if self.stage_l5_metadata_enable and block_id >= 0:
-                for group_id in range(self.num_kv_cache_groups):
-                    record_uvm_residency_kv_metadata_candidate(
-                        region_id=f"kv:{group_id}:{block_id}",
-                        block_id=block_id,
-                        group_id=group_id,
-                        bytes_per_block=max(self.bytes_per_group_block, 1),
-                        safe=safe,
-                        reason=reason,
-                        metadata={
-                            "stage": "stage_l5",
-                            "source": "free_queue_candidate_snapshot",
-                            "candidate_index": index,
-                            "ref_cnt": getattr(block, "ref_cnt", None),
-                            "lifecycle_state": self._kv_block_lifecycle_class(block),
-                            "ever_used": (
-                                self._kv_block_lifecycle_class(block) != "never_used"
-                            ),
-                            "is_null": getattr(block, "is_null", None),
-                            "is_prefix_cache": block_hash is not None,
-                            "in_free_queue": True,
-                            "block_hash": _block_hash_to_text(block_hash),
-                            "offload_capable": self._kv_region_offload_capable(
-                                group_id, block_id
-                            ),
-                            "metadata_only": True,
-                        },
-                    )
-                    if safe:
-                        self._summary["stage_l5_safe_candidate_records"] += 1
-                    else:
-                        self._summary["stage_l5_unsafe_candidate_records"] += 1
-            self._write(
-                {
-                    "action": "would_evict_candidate"
-                    if block_hash is not None
-                    else "would_reuse_free_block",
-                    "request_id": request_id,
-                    "reason": reason,
-                    "candidate_index": index,
-                    "block_id": getattr(block, "block_id", None),
-                    "ref_cnt": getattr(block, "ref_cnt", None),
-                    "lifecycle_state": self._kv_block_lifecycle_class(block),
-                    "ever_used": self._kv_block_lifecycle_class(block) != "never_used",
-                    "is_null": getattr(block, "is_null", None),
-                    "has_block_hash": block_hash is not None,
-                    "block_hash": _block_hash_to_text(block_hash),
-                    "safe_ref_cnt_zero": safe,
-                }
-            )
-            self._summary["candidate_records"] += 1
 
     def on_blocks_allocated(
         self,
@@ -1929,14 +1436,6 @@ class UvmKvRuntimePolicy:
 
         runtime = get_uvm_policy_runtime()
         if not runtime.active:
-            self._write(
-                {
-                    "action": "active_kv_protect_skipped",
-                    "request_id": request_id,
-                    "reason": "policy_runtime_disabled",
-                    "protect_mode": self.active_protect_mode,
-                }
-            )
             return
 
         active_region_ids: set[str] = set()
@@ -1953,20 +1452,8 @@ class UvmKvRuntimePolicy:
         if self.active_protect_max_blocks > 0:
             candidates = candidates[: self.active_protect_max_blocks]
         if not candidates:
-            self._write(
-                {
-                    "action": "active_kv_protect_noop",
-                    "request_id": request_id,
-                    "reason": reason,
-                    "protect_mode": self.active_protect_mode,
-                }
-            )
             return
 
-        attempted = 0
-        issued = 0
-        fallback = 0
-        issued_bytes = 0
         for group_id, block_id, block, region_id in candidates:
             snapshot = get_uvm_residency_region_snapshot(region_id)
             size_bytes = int(
@@ -1987,7 +1474,7 @@ class UvmKvRuntimePolicy:
                 "block_hash": _block_hash_to_text(getattr(block, "block_hash", None)),
                 "metadata_only": True,
             }
-            result = runtime.protect_kv_region(
+            runtime.protect_kv_region(
                 region_id=region_id,
                 block_id=block_id,
                 group_id=group_id,
@@ -1999,76 +1486,6 @@ class UvmKvRuntimePolicy:
                 active_region_ids=active_region_ids,
                 metadata=protect_metadata,
             )
-            attempted += 1
-            if result.issued:
-                issued += 1
-                issued_bytes += result.bytes
-            else:
-                fallback += 1
-            self._write(
-                {
-                    "action": (
-                        "active_kv_protect_issued"
-                        if result.issued
-                        else "active_kv_protect_fallback"
-                    ),
-                    "request_id": request_id,
-                    "region_id": region_id,
-                    "block_id": block_id,
-                    "group_id": group_id,
-                    "bytes": result.bytes,
-                    "range_count": result.range_count,
-                    "protect_mode": result.mode,
-                    "result_reason": result.reason,
-                    "runtime_enabled": result.enabled,
-                    "allowed": result.allowed,
-                }
-            )
-
-        self._summary["active_protect_attempt_records"] += attempted
-        self._summary["active_protect_issued_records"] += issued
-        self._summary["active_protect_fallback_records"] += fallback
-        self._summary["active_protect_blocks"] += issued
-        self._summary["active_protect_bytes"] += issued_bytes
-        self._record_summary()
-
-    def on_blocks_freed(self, *, blocks: list[Any], reason: str) -> None:
-        if not self.active or not self.stage_l5_metadata_enable:
-            return
-        for block in blocks:
-            block_id = int(getattr(block, "block_id", -1))
-            if block_id < 0 or bool(getattr(block, "is_null", False)):
-                continue
-            safe = getattr(block, "ref_cnt", None) == 0
-            for group_id in range(self.num_kv_cache_groups):
-                record_uvm_residency_kv_metadata_candidate(
-                    region_id=f"kv:{group_id}:{block_id}",
-                    block_id=block_id,
-                    group_id=group_id,
-                    bytes_per_block=max(self.bytes_per_group_block, 1),
-                    safe=safe,
-                    reason=reason,
-                    metadata={
-                        "stage": "stage_l5",
-                        "source": "block_free_lifecycle",
-                        "ref_cnt": getattr(block, "ref_cnt", None),
-                        "lifecycle_state": self._kv_block_lifecycle_class(block),
-                        "ever_used": self._kv_block_lifecycle_class(block) != "never_used",
-                        "is_null": getattr(block, "is_null", None),
-                        "is_prefix_cache": getattr(block, "block_hash", None) is not None,
-                        "in_free_queue": safe,
-                        "block_hash": _block_hash_to_text(getattr(block, "block_hash", None)),
-                        "offload_capable": self._kv_region_offload_capable(group_id, block_id),
-                        "metadata_only": True,
-                    },
-                )
-
-    def _kv_region_offload_capable(self, group_id: int, block_id: int) -> bool:
-        snapshot = get_uvm_residency_region_snapshot(f"kv:{group_id}:{block_id}")
-        if not snapshot:
-            return False
-        metadata = snapshot.get("metadata") or {}
-        return bool(snapshot.get("ptr")) and bool(metadata.get("offload_capable"))
 
     def _maybe_execute_prefix_eviction(
         self,
@@ -2086,7 +1503,6 @@ class UvmKvRuntimePolicy:
         if max_blocks <= 0:
             return
 
-        self._summary["prefix_evict_attempt_records"] += 1
         requested_bytes = max_blocks * int(pressure.get("bytes_per_block") or 0)
         coordinator_decision = request_uvm_pool_action(
             pool="kv",
@@ -2102,91 +1518,8 @@ class UvmKvRuntimePolicy:
             },
         )
         if not coordinator_decision.allowed:
-            self._summary["prefix_evict_coordinator_reject_records"] += 1
-            self._write(
-                {
-                    "action": "prefix_evict_coordinator_reject",
-                    "request_id": request_id,
-                    "reason": reason,
-                    "max_blocks": max_blocks,
-                    "requested_bytes": requested_bytes,
-                    "coordinator_mode": coordinator_decision.mode,
-                    "coordinator_reason": coordinator_decision.reason,
-                    **pressure,
-                }
-            )
             return
-        self._write(
-            {
-                "action": "prefix_evict_attempt",
-                "request_id": request_id,
-                "reason": reason,
-                "max_blocks": max_blocks,
-                **pressure,
-            }
-        )
         try:
-            evicted_blocks = int(block_pool.evict_cached_free_blocks(max_blocks))
-        except Exception as exc:  # pragma: no cover - defensive trace path.
-            self._summary["prefix_evict_failed_records"] += 1
-            self._write(
-                {
-                    "action": "prefix_evict_failed",
-                    "request_id": request_id,
-                    "reason": reason,
-                    "max_blocks": max_blocks,
-                    "error": repr(exc),
-                }
-            )
+            block_pool.evict_cached_free_blocks(max_blocks)
+        except Exception:  # pragma: no cover - defensive eviction path.
             return
-
-        if evicted_blocks > 0:
-            self._summary["prefix_evict_success_blocks"] += evicted_blocks
-            action = "prefix_evict_success"
-        else:
-            self._summary["prefix_evict_noop_records"] += 1
-            action = "prefix_evict_noop"
-        self._write(
-            {
-                "action": action,
-                "request_id": request_id,
-                "reason": reason,
-                "requested_blocks": max_blocks,
-                "evicted_blocks": evicted_blocks,
-                **pressure,
-            }
-        )
-
-    def _record_summary(self) -> None:
-        if not self.active:
-            return
-        self._write(
-            {
-                "action": "runtime_summary",
-                "mode": self.mode,
-                "policy": self.policy,
-                "budget_blocks": self.budget_blocks,
-                "budget_bytes": self.budget_bytes,
-                "dynamic_pool_enable": self.dynamic_pool_active(),
-                "dynamic_pool_target_blocks": (
-                    self.dynamic_pool_target_blocks
-                    if self.dynamic_pool_active()
-                    else None
-                ),
-                "prefix_evict_enable": self.prefix_evict_enable,
-                "prefix_evict_max_blocks": self.prefix_evict_max_blocks,
-                **self._summary,
-            }
-        )
-
-    def _write(self, record: dict[str, Any]) -> None:
-        if not self.trace_file:
-            return
-        record.setdefault("ts", time.time())
-        record.setdefault("stage", "stage_j")
-        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        with self._lock:
-            os.makedirs(os.path.dirname(self.trace_file) or ".", exist_ok=True)
-            with open(self.trace_file, "a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-                handle.flush()

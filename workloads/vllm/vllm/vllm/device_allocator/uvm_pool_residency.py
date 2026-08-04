@@ -9,14 +9,22 @@ migrate, evict, or prefetch memory by itself.
 
 from __future__ import annotations
 
-import json
+import hashlib
 import os
 import threading
 import time
-import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
+from vllm.device_allocator.uvm import (
+    driver_batch_query_ranges_residency_bytes,
+    driver_get_pool_state,
+    driver_reclaim_pool,
+    driver_register_region,
+    driver_set_pool_budget,
+    driver_unregister_region,
+    driver_update_region_state,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -212,49 +220,6 @@ def _metadata_int(metadata: dict[str, Any], key: str, default: int = 0) -> int:
         return default
 
 
-def _metadata_has_expert_id(metadata: dict[str, Any]) -> bool:
-    for key in ("global_expert_id", "local_expert_id", "expert_id"):
-        value = metadata.get(key)
-        if value is None:
-            continue
-        try:
-            int(value)
-            return True
-        except (TypeError, ValueError):
-            continue
-    return False
-
-
-def _skip_moe_parent_driver_tag(metadata: dict[str, Any]) -> bool:
-    raw = os.environ.get("VLLM_UVM_DRIVER_TAG_SKIP_MOE_PARENT")
-    if raw is not None and raw.strip():
-        return raw.strip().lower() in ("1", "true", "yes", "on")
-
-    slices_enabled = (
-        os.environ.get("VLLM_UVM_WEIGHT_MAP_INCLUDE_EXPERT_SLICES", "")
-        .strip()
-        .lower()
-        in ("1", "true", "yes", "on")
-    )
-    if not slices_enabled:
-        return False
-
-    role = str(metadata.get("role") or "").strip().lower()
-    is_moe_parent = bool(metadata.get("is_moe_expert")) and not _metadata_has_expert_id(
-        metadata
-    )
-    return is_moe_parent and role in (
-        "moe_gate_up",
-        "moe_down",
-        "w13",
-        "w13_weight",
-        "w2",
-        "w2_weight",
-        "moe_expert_w13",
-        "moe_expert_w2",
-    )
-
-
 def _driver_role_id(pool: str, metadata: dict[str, Any]) -> int:
     explicit = metadata.get("driver_role_id")
     if explicit is not None:
@@ -339,14 +304,6 @@ def _driver_flags(
     return flags
 
 
-def _metadata_requests_cpu_offloaded_reserved(metadata: dict[str, Any]) -> bool:
-    return (
-        bool(metadata.get("cpu_offloaded_reserved"))
-        or str(metadata.get("placement") or "").strip().upper()
-        == "CPU_OFFLOADED_RESERVED"
-    )
-
-
 def _driver_region_state_id(
     state: str,
     *,
@@ -418,19 +375,6 @@ class UvmPoolResidencyManager:
             "VLLM_UVM_DRIVER_TAG_ENABLE",
             self.tag_only_mode,
         )
-        self.driver_tag_require_managed = _read_bool_env(
-            "VLLM_UVM_DRIVER_TAG_REQUIRE_MANAGED",
-            True,
-        )
-        self.trace_enabled = _read_bool_env("VLLM_UVM_RESIDENCY_TRACE_ENABLE", True)
-        self.trace_file = (
-            os.environ.get(
-                "VLLM_UVM_RESIDENCY_TRACE_FILE",
-                "vllm_uvm_pool_residency_stage_l.jsonl",
-            )
-            if self.trace_enabled
-            else ""
-        )
         self.global_budget_bytes = _read_int_env(
             "VLLM_UVM_RESIDENCY_GLOBAL_GPU_BYTES", 0
         )
@@ -451,138 +395,23 @@ class UvmPoolResidencyManager:
             "VLLM_UVM_DRIVER_TEMP_BUFFER_BYTES",
             DEFAULT_DRIVER_TEMP_BUFFER_BYTES,
         )
-        self.driver_pool_state_snapshot_on_tag_only_every = _read_int_env(
-            "VLLM_UVM_DRIVER_POOL_STATE_SNAPSHOT_ON_TAG_ONLY_EVERY",
-            0,
-        )
-        self.driver_pool_state_snapshot_device = _read_int_env(
-            "VLLM_UVM_DRIVER_POOL_STATE_SNAPSHOT_DEVICE",
-            0,
-        )
         self._driver_pool_budget_status: dict[str, int] = {}
         self._driver_pool_budgets_applied = False
         self.safety_margin_bytes = _read_int_env(
             "VLLM_UVM_RESIDENCY_SAFETY_MARGIN_BYTES", 0
         )
-        self.scratch_reserved_bytes = _read_int_env(
-            "VLLM_UVM_RESIDENCY_SCRATCH_RESERVED_BYTES", 0
-        )
-        self.scratch_margin_bytes = _read_int_env(
-            "VLLM_UVM_RESIDENCY_SCRATCH_MARGIN_BYTES", 0
-        )
-        self.kv_metadata_enable = _read_bool_env(
-            "VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE",
-            os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "") == "stage_l5",
-        )
-        self.kv_data_offload_enable = _read_bool_env(
-            "VLLM_UVM_RESIDENCY_KV_DATA_OFFLOAD_ENABLE",
-            False,
-        )
-        self.kv_prefetch_back_enable = _read_bool_env(
-            "VLLM_UVM_RESIDENCY_KV_PREFETCH_BACK_ENABLE",
-            False,
-        )
-        self.priority = os.environ.get(
-            "VLLM_UVM_RESIDENCY_PRIORITY", "kv,scratch,weights"
-        )
-        self.stage_label = os.environ.get("VLLM_UVM_RESIDENCY_STAGE", "stage_l0")
-        self.weight_initial_state = _normalize_state(
-            os.environ.get("VLLM_UVM_RESIDENCY_WEIGHT_INITIAL_STATE", "cpu")
-        )
-        self.weight_enforce_hot_set = _read_bool_env(
-            "VLLM_UVM_RESIDENCY_WEIGHT_ENFORCE_HOT_SET", False
-        )
-        self.weight_sync_offload = _read_bool_env(
-            "VLLM_UVM_RESIDENCY_WEIGHT_SYNC_OFFLOAD", True
-        )
-        self.weight_max_victims_per_step = _read_int_env(
-            "VLLM_UVM_RESIDENCY_WEIGHT_MAX_VICTIMS_PER_STEP", 0
-        )
-        self.weight_victim_policy = os.environ.get(
-            "VLLM_UVM_RESIDENCY_WEIGHT_VICTIM_POLICY", "cold_plan_lru"
-        )
         self.real_residency_enable = _read_bool_env(
             "VLLM_UVM_REAL_RESIDENCY_ENABLE", False
-        )
-        self.real_residency_trace_file = (
-            os.environ.get(
-                "VLLM_UVM_REAL_RESIDENCY_TRACE_FILE",
-                "vllm_uvm_real_residency_stage_l.jsonl",
-            )
-            if self.real_residency_enable
-            else ""
         )
         self.real_residency_device = _read_int_env(
             "VLLM_UVM_REAL_RESIDENCY_DEVICE", 0
         )
-        self.real_residency_on_register_every = _read_int_env(
-            "VLLM_UVM_REAL_RESIDENCY_ON_REGISTER_EVERY", 0
-        )
-        self.real_residency_on_action_every = _read_int_env(
-            "VLLM_UVM_REAL_RESIDENCY_ON_ACTION_EVERY", 0
-        )
-        self.real_residency_max_snapshots = _read_int_env(
-            "VLLM_UVM_REAL_RESIDENCY_MAX_SNAPSHOTS", 0
-        )
         self.real_residency_max_regions_per_pool = _read_int_env(
             "VLLM_UVM_REAL_RESIDENCY_MAX_REGIONS_PER_POOL", 0
         )
-        self._real_residency_snapshots = 0
-        self._real_residency_errors = 0
-        self._last_real_residency: dict[str, Any] | None = None
         self._lock = threading.Lock()
-        self._config_recorded = False
         self._regions: dict[str, UvmResidencyRegion] = {}
         self._pool_estimated_bytes = {"weights": 0, "kv": 0, "scratch": 0}
-        self._scratch_summary: dict[str, Any] = {
-            "scratch_peak_bytes": 0,
-            "scratch_live_bytes": 0,
-            "scratch_reserved_bytes": self.scratch_reserved_bytes,
-            "scratch_margin_bytes": self.scratch_margin_bytes,
-            "scratch_pool_enabled": False,
-            "scratch_pool_mode": None,
-            "scratch_trace_records": 0,
-            "scratch_eligible_records": 0,
-            "scratch_device_direct_records": 0,
-            "scratch_budget_over_records": 0,
-            "scratch_budget_reject_records": 0,
-            "scratch_eviction_records": 0,
-            "scratch_stage_g_summary_present": False,
-        }
-        self._summary = {
-            "register_region_records": 0,
-            "requests": 0,
-            "grants": 0,
-            "denies": 0,
-            "would_denies": 0,
-            "state_updates": 0,
-            "access_records": 0,
-            "would_evict_candidates": 0,
-            "real_action_records": 0,
-            "scratch_summary_records": 0,
-            "kv_metadata_records": 0,
-            "kv_safe_candidate_records": 0,
-            "kv_unsafe_candidate_records": 0,
-            "kv_data_offload_records": 0,
-            "kv_data_offload_attempt_records": 0,
-            "kv_data_offload_issued_records": 0,
-            "kv_data_offload_fallback_records": 0,
-            "kv_prefetch_back_records": 0,
-            "kv_prefetch_back_issued_records": 0,
-            "kv_prefetch_back_fallback_records": 0,
-            "driver_tag_register_attempts": 0,
-            "driver_tag_register_success": 0,
-            "driver_tag_register_skips": 0,
-            "driver_tag_register_failures": 0,
-            "driver_region_state_update_attempts": 0,
-            "driver_region_state_update_success": 0,
-            "driver_region_state_update_skips": 0,
-            "driver_region_state_update_failures": 0,
-            "driver_pool_state_queries": 0,
-            "driver_pool_state_failures": 0,
-            "driver_pool_reclaim_attempts": 0,
-            "driver_pool_reclaim_failures": 0,
-        }
 
     @property
     def active(self) -> bool:
@@ -590,7 +419,6 @@ class UvmPoolResidencyManager:
 
     def sync_driver_pool_budgets(self) -> dict[str, int]:
         with self._lock:
-            self._record_config_locked()
             self._sync_driver_pool_budgets_locked(force=True)
             return dict(self._driver_pool_budget_status)
 
@@ -606,7 +434,6 @@ class UvmPoolResidencyManager:
         pool_name = _normalize_driver_pool_name(pool)
         pool_id = DRIVER_POOL_IDS.get(pool_name)
         budget = max(int(budget_bytes or 0), 0)
-        metadata = metadata or {}
         if pool_id is None or pool_name == "unknown":
             return {
                 "ok": False,
@@ -615,33 +442,9 @@ class UvmPoolResidencyManager:
                 "status": -2,
                 "reason": "unknown_pool",
             }
-        budget_mode = self.driver_pool_budget_mode if mode is None else max(int(mode), 0)
-
-        try:
-            from vllm.device_allocator.uvm import driver_set_pool_budget
-        except Exception as exc:  # pragma: no cover - diagnostic path
-            result = {
-                "ok": False,
-                "pool": pool_name,
-                "pool_id": pool_id,
-                "budget_bytes": budget,
-                "gpu_id": max(int(gpu_id or 0), 0),
-                "mode": budget_mode,
-                "status": -3,
-                "reason": "import_failed",
-                "error": repr(exc),
-            }
-            with self._lock:
-                self._record_config_locked()
-                self._driver_pool_budget_status[pool_name] = -3
-                self._write_locked(
-                    {
-                        "action": "residency_driver_pool_budget_update",
-                        **result,
-                        "metadata": metadata,
-                    }
-                )
-            return result
+        budget_mode = (
+            self.driver_pool_budget_mode if mode is None else max(int(mode), 0)
+        )
 
         status = driver_set_pool_budget(
             pool=pool_id,
@@ -660,47 +463,21 @@ class UvmPoolResidencyManager:
             "reason": "updated" if status >= 0 else f"driver_set_failed:{status}",
         }
         with self._lock:
-            self._record_config_locked()
             self.pool_budgets[pool_name] = budget
             self.driver_pool_budget_overrides[pool_name] = budget
             self._driver_pool_budget_status[pool_name] = status
-            self._write_locked(
-                {
-                    "action": "residency_driver_pool_budget_update",
-                    **result,
-                    "metadata": metadata,
-                }
-            )
-            self._record_summary_locked()
         return result
 
     def driver_pool_state_snapshot(self, gpu_id: int = 0) -> dict[str, Any]:
         with self._lock:
-            self._record_config_locked()
             self._sync_driver_pool_budgets_locked()
 
-        try:
-            from vllm.device_allocator.uvm import driver_get_pool_state
-        except Exception as exc:  # pragma: no cover - diagnostic path
-            with self._lock:
-                self._summary["driver_pool_state_failures"] += 1
-                self._write_locked(
-                    {
-                        "action": "residency_driver_pool_state",
-                        "reason": "import_failed",
-                        "error": repr(exc),
-                    }
-                )
-            return {}
-
         states: dict[str, Any] = {}
-        failures = 0
         for pool, pool_id in DRIVER_POOL_IDS.items():
             if pool == "unknown":
                 continue
             state = driver_get_pool_state(pool_id, gpu_id=gpu_id)
             if state is None:
-                failures += 1
                 continue
             victim_count = int(state.get("victim_count", 0))
             state["victims"] = [
@@ -712,18 +489,6 @@ class UvmPoolResidencyManager:
                 if int(state.get(f"victim_region_id_{i}", 0)) != 0
             ]
             states[pool] = state
-
-        with self._lock:
-            self._summary["driver_pool_state_queries"] += 1
-            self._summary["driver_pool_state_failures"] += failures
-            self._write_locked(
-                {
-                    "action": "residency_driver_pool_state",
-                    "gpu_id": max(int(gpu_id or 0), 0),
-                    "states": states,
-                    "failures": failures,
-                }
-            )
         return states
 
     def driver_soft_reclaim_pool(
@@ -743,23 +508,7 @@ class UvmPoolResidencyManager:
             return None
 
         with self._lock:
-            self._record_config_locked()
             self._sync_driver_pool_budgets_locked()
-
-        try:
-            from vllm.device_allocator.uvm import driver_reclaim_pool
-        except Exception as exc:  # pragma: no cover - diagnostic path
-            with self._lock:
-                self._summary["driver_pool_reclaim_failures"] += 1
-                self._write_locked(
-                    {
-                        "action": "residency_driver_pool_reclaim",
-                        "pool": pool_name,
-                        "reason": "import_failed",
-                        "error": repr(exc),
-                    }
-                )
-            return None
 
         result = driver_reclaim_pool(
             pool_id,
@@ -770,23 +519,6 @@ class UvmPoolResidencyManager:
             max_victims=max_victims,
             async_reclaim=async_reclaim,
         )
-        with self._lock:
-            self._summary["driver_pool_reclaim_attempts"] += 1
-            if result is None:
-                self._summary["driver_pool_reclaim_failures"] += 1
-            self._write_locked(
-                {
-                    "action": "residency_driver_pool_reclaim",
-                    "pool": pool_name,
-                    "gpu_id": max(int(gpu_id or 0), 0),
-                    "target_bytes": max(int(target_bytes or 0), 0),
-                    "current_epoch": max(int(current_epoch or 0), 0),
-                    "cooldown_epochs": max(int(cooldown_epochs or 0), 0),
-                    "max_victims": max(int(max_victims or 0), 0),
-                    "async_reclaim": bool(async_reclaim),
-                    "result": result,
-                }
-            )
         return result
 
     def register_region(
@@ -799,6 +531,7 @@ class UvmPoolResidencyManager:
         state: str = "unknown",
         evictable: bool = False,
         active: bool = False,
+        driver_register: bool,
         metadata: dict[str, Any] | None = None,
     ) -> UvmResidencyRegion:
         pool = _normalize_pool(pool)
@@ -806,40 +539,20 @@ class UvmPoolResidencyManager:
         bytes = max(int(bytes or 0), 0)
         metadata = metadata or {}
         with self._lock:
-            self._record_config_locked()
             self._sync_driver_pool_budgets_locked()
-            existing = self._regions.get(region_id)
-            if existing is not None:
-                old_bytes = existing.bytes
-                old_estimated = existing.estimated_gpu_resident
-                if old_estimated and existing.pool in self._pool_estimated_bytes:
-                    self._pool_estimated_bytes[existing.pool] = max(
-                        self._pool_estimated_bytes[existing.pool] - old_bytes, 0
-                    )
-                existing.pool = pool
-                existing.ptr = ptr
-                existing.bytes = bytes
-                existing.state = state
-                existing.evictable = evictable
-                existing.active = active
-                existing.metadata.update(metadata)
-                existing.estimated_gpu_resident = _state_counts_as_gpu(state)
-                existing.last_state_update_ts = time.time()
-                region = existing
-            else:
-                region = UvmResidencyRegion(
-                    region_id=region_id,
-                    pool=pool,
-                    ptr=ptr,
-                    bytes=bytes,
-                    driver_region_id=_stable_driver_region_id(region_id),
-                    state=state,
-                    estimated_gpu_resident=_state_counts_as_gpu(state),
-                    evictable=evictable,
-                    active=active,
-                    metadata=dict(metadata),
-                )
-                self._regions[region_id] = region
+            region = UvmResidencyRegion(
+                region_id=region_id,
+                pool=pool,
+                ptr=ptr,
+                bytes=bytes,
+                driver_region_id=_stable_driver_region_id(region_id),
+                state=state,
+                estimated_gpu_resident=_state_counts_as_gpu(state),
+                evictable=evictable,
+                active=active,
+                metadata=dict(metadata),
+            )
+            self._regions[region_id] = region
 
             if (
                 region.estimated_gpu_resident
@@ -847,40 +560,10 @@ class UvmPoolResidencyManager:
             ):
                 self._pool_estimated_bytes[pool] += bytes
 
-            driver_tag_record = self._sync_driver_region_tag_locked(region)
-            driver_state_record = self._sync_driver_region_state_locked(region)
-
-            self._summary["register_region_records"] += 1
-            register_count = self._summary["register_region_records"]
-            self._write_locked(
-                {
-                    "action": "residency_register_region",
-                    "pool": pool,
-                    "region_id": region_id,
-                    "driver_region_id": region.driver_region_id,
-                    "driver_registered": region.driver_registered,
-                    "driver_register_status": region.driver_register_status,
-                    "driver_tag": driver_tag_record,
-                    "driver_state": driver_state_record,
-                    "ptr": f"0x{ptr:x}" if isinstance(ptr, int) else None,
-                    "bytes": bytes,
-                    "state": state,
-                    "estimated_gpu_resident": region.estimated_gpu_resident,
-                    "evictable": evictable,
-                    "active": active,
-                    "metadata": metadata,
-                }
-            )
-            self._record_summary_locked()
-            if (
-                self.real_residency_on_register_every > 0
-                and register_count % self.real_residency_on_register_every == 0
-            ):
-                self._record_real_residency_locked(
-                    trigger="register_region",
-                    trigger_count=register_count,
-                    trigger_region_id=region_id,
-                )
+            if driver_register and self.driver_tag_enable:
+                self._sync_driver_region_tag_locked(region)
+            if region.driver_registered:
+                self._sync_driver_region_state_locked(region)
             return region
 
     def request_gpu_residency(
@@ -896,12 +579,9 @@ class UvmPoolResidencyManager:
         pool = _normalize_pool(pool)
         bytes = max(int(bytes or 0), 0)
         scope_key = scope_key or "global"
-        metadata = metadata or {}
         active_region_ids = active_region_ids or set()
         if self.tag_only_mode:
-            snapshot_due = False
             with self._lock:
-                self._record_config_locked()
                 decision = UvmResidencyDecision(
                     enabled=self.enabled,
                     mode="tag_only",
@@ -923,16 +603,6 @@ class UvmPoolResidencyManager:
                         self._global_estimated_bytes_locked()
                     ),
                     global_remaining_bytes=None,
-                )
-                self._record_request_locked(decision, metadata)
-                request_count = self._summary["requests"]
-                snapshot_every = self.driver_pool_state_snapshot_on_tag_only_every
-                snapshot_due = (
-                    snapshot_every > 0 and request_count % snapshot_every == 0
-                )
-            if snapshot_due:
-                self.driver_pool_state_snapshot(
-                    gpu_id=self.driver_pool_state_snapshot_device
                 )
             return decision
         if not self.active or bytes <= 0:
@@ -956,7 +626,6 @@ class UvmPoolResidencyManager:
             )
 
         with self._lock:
-            self._record_config_locked()
             region = self._regions.get(region_id)
             already_gpu = bool(region and region.estimated_gpu_resident)
             incremental_bytes = 0 if already_gpu else bytes
@@ -1000,7 +669,7 @@ class UvmPoolResidencyManager:
                 request_region_id=region_id,
             ) if would_deny else []
 
-            decision = UvmResidencyDecision(
+            return UvmResidencyDecision(
                 enabled=True,
                 mode=self.mode,
                 pool=pool,
@@ -1019,8 +688,6 @@ class UvmPoolResidencyManager:
                 global_remaining_bytes=global_remaining,
                 victims=tuple(victims),
             )
-            self._record_request_locked(decision, metadata)
-            return decision
 
     def mark_state(
         self,
@@ -1034,31 +701,18 @@ class UvmPoolResidencyManager:
         if not self.active:
             return
         with self._lock:
-            self._record_config_locked()
             region = self._regions.get(region_id)
             if region is None:
-                self._write_locked(
-                    {
-                        "action": "residency_state_update_failed",
-                        "region_id": region_id,
-                        "new_state": state,
-                        "reason": "unknown_region",
-                        "metadata": metadata,
-                    }
-                )
                 return
-            old_state = region.state
             old_estimated = region.estimated_gpu_resident
             new_estimated = _state_counts_as_gpu(state, old_estimated)
             before_pool = self._pool_estimated_bytes.get(region.pool, 0)
-            before_global = self._global_estimated_bytes_locked()
             if old_estimated and not new_estimated:
                 self._pool_estimated_bytes[region.pool] = max(
                     before_pool - region.bytes, 0
                 )
             elif not old_estimated and new_estimated:
                 self._pool_estimated_bytes[region.pool] = before_pool + region.bytes
-            after_pool = self._pool_estimated_bytes.get(region.pool, 0)
             region.state = state
             region.estimated_gpu_resident = new_estimated
             region.metadata.update(metadata)
@@ -1066,33 +720,8 @@ class UvmPoolResidencyManager:
             if "evictable" in metadata:
                 region.evictable = bool(metadata.get("evictable"))
             region.last_state_update_ts = time.time()
-            driver_tag_record = None
-            if "driver_tag_skip" in metadata:
-                driver_tag_record = self._sync_driver_region_tag_locked(region)
-            driver_state_record = self._sync_driver_region_state_locked(region)
-            self._summary["state_updates"] += 1
-            self._write_locked(
-                {
-                    "action": "residency_state_update",
-                    "pool": region.pool,
-                    "region_id": region_id,
-                    "old_state": old_state,
-                    "new_state": state,
-                    "bytes": region.bytes,
-                    "old_estimated_gpu_resident": old_estimated,
-                    "new_estimated_gpu_resident": new_estimated,
-                    "pool_estimated_gpu_resident_bytes_before": before_pool,
-                    "pool_estimated_gpu_resident_bytes_after": after_pool,
-                    "global_estimated_gpu_resident_bytes_before": before_global,
-                    "global_estimated_gpu_resident_bytes_after": (
-                        self._global_estimated_bytes_locked()
-                    ),
-                    "driver_tag": driver_tag_record,
-                    "driver_state": driver_state_record,
-                    "metadata": metadata,
-                }
-            )
-            self._record_summary_locked()
+            if region.driver_registered:
+                self._sync_driver_region_state_locked(region)
 
     def unregister_region(
         self,
@@ -1100,21 +729,11 @@ class UvmPoolResidencyManager:
         region_id: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        metadata = metadata or {}
         if not self.active:
             return
         with self._lock:
-            self._record_config_locked()
             region = self._regions.pop(region_id, None)
             if region is None:
-                self._write_locked(
-                    {
-                        "action": "residency_unregister_region_failed",
-                        "region_id": region_id,
-                        "reason": "unknown_region",
-                        "metadata": metadata,
-                    }
-                )
                 return
             if (
                 region.estimated_gpu_resident
@@ -1124,31 +743,8 @@ class UvmPoolResidencyManager:
                     self._pool_estimated_bytes[region.pool] - region.bytes,
                     0,
                 )
-            driver_unregister_status: int | None = None
-            if self.driver_tag_enable and region.driver_registered:
-                try:
-                    from vllm.device_allocator.uvm import driver_unregister_region
-
-                    driver_unregister_status = driver_unregister_region(
-                        region.driver_region_id
-                    )
-                except Exception as exc:  # pragma: no cover - diagnostic path
-                    driver_unregister_status = -3
-                    metadata = {**metadata, "driver_unregister_error": repr(exc)}
-            self._write_locked(
-                {
-                    "action": "residency_unregister_region",
-                    "pool": region.pool,
-                    "region_id": region_id,
-                    "driver_region_id": region.driver_region_id,
-                    "driver_registered": region.driver_registered,
-                    "driver_unregister_status": driver_unregister_status,
-                    "bytes": region.bytes,
-                    "state": region.state,
-                    "metadata": metadata,
-                }
-            )
-            self._record_summary_locked()
+            if region.driver_registered:
+                driver_unregister_region(region.driver_region_id)
 
     def record_access(
         self,
@@ -1159,29 +755,17 @@ class UvmPoolResidencyManager:
     ) -> None:
         if not self.active:
             return
-        metadata = metadata or {}
         with self._lock:
-            self._record_config_locked()
             region = self._regions.get(region_id)
             if region is None:
                 return
             region.last_access_step = int(step)
-            driver_state_record = self._sync_driver_region_state_locked(region)
-            self._summary["access_records"] += 1
-            self._write_locked(
-                {
-                    "action": "residency_access",
-                    "pool": region.pool,
-                    "region_id": region_id,
-                    "step": int(step),
-                    "driver_state": driver_state_record,
-                    "metadata": metadata,
-                }
-            )
+            if region.driver_registered:
+                self._sync_driver_region_state_locked(region)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return self._summary_record_locked()
+            return self._snapshot_locked()
 
     def region_snapshot(self, region_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -1193,28 +777,13 @@ class UvmPoolResidencyManager:
     def ensure_driver_region_registered(
         self,
         region_id: str,
-    ) -> dict[str, Any]:
-        """Register one region without enabling global driver tagging.
-
-        Targeted release operations need a driver region in the allocation's
-        UVM VA space even when the general residency controller is running
-        with driver tagging disabled. Keeping this opt-in avoids registering
-        every preregistered expert merely because release_remote is enabled.
-        """
+    ) -> int:
+        """Register a pre-created region once for driver operations."""
         with self._lock:
-            region = self._regions.get(region_id)
-            if region is None:
-                return {
-                    "enabled": True,
-                    "attempted": False,
-                    "registered": False,
-                    "status": None,
-                    "reason": "region_not_found",
-                    "driver_region_id": 0,
-                }
-            record = self._sync_driver_region_tag_locked(region, force=True)
-            record["forced"] = True
-            return record
+            region = self._regions[region_id]
+            if region.driver_registered:
+                return int(region.driver_register_status or 0)
+            return self._sync_driver_region_tag_locked(region)
 
     def regions_snapshot(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -1223,168 +792,9 @@ class UvmPoolResidencyManager:
                 for region in self._regions.values()
             ]
 
-    def record_action(
-        self,
-        *,
-        action: str,
-        pool: str,
-        region_id: str | None = None,
-        bytes: int = 0,
-        metadata: dict[str, Any] | None = None,
-        **extra: Any,
-    ) -> None:
-        if not self.active:
-            return
-        pool = _normalize_pool(pool)
-        metadata = metadata or {}
-        with self._lock:
-            self._record_config_locked()
-            self._sync_driver_pool_budgets_locked()
-            self._summary["real_action_records"] += 1
-            action_count = self._summary["real_action_records"]
-            if pool == "kv":
-                if action == "residency_kv_data_offload_attempt":
-                    self._summary["kv_data_offload_attempt_records"] += 1
-                elif action == "residency_kv_data_offload_issued":
-                    self._summary["kv_data_offload_records"] += 1
-                    self._summary["kv_data_offload_issued_records"] += 1
-                elif action == "residency_kv_data_offload_fallback":
-                    self._summary["kv_data_offload_records"] += 1
-                    self._summary["kv_data_offload_fallback_records"] += 1
-                elif action == "residency_kv_prefetch_back_issued":
-                    self._summary["kv_prefetch_back_records"] += 1
-                    self._summary["kv_prefetch_back_issued_records"] += 1
-                elif action == "residency_kv_prefetch_back_fallback":
-                    self._summary["kv_prefetch_back_records"] += 1
-                    self._summary["kv_prefetch_back_fallback_records"] += 1
-            record: dict[str, Any] = {
-                "action": action,
-                "pool": pool,
-                "region_id": region_id,
-                "bytes": max(int(bytes or 0), 0),
-                "metadata": metadata,
-            }
-            record.update(extra)
-            self._write_locked(record)
-            self._record_summary_locked()
-            if (
-                self.real_residency_on_action_every > 0
-                and action_count % self.real_residency_on_action_every == 0
-            ):
-                self._record_real_residency_locked(
-                    trigger="record_action",
-                    trigger_count=action_count,
-                    trigger_region_id=region_id,
-                    trigger_action=action,
-                )
-
     def real_residency_snapshot(self, *, trigger: str = "manual") -> dict[str, Any]:
         with self._lock:
-            self._record_config_locked()
-            return self._record_real_residency_locked(trigger=trigger)
-
-    def record_scratch_summary(
-        self,
-        *,
-        scratch_live_bytes: int = 0,
-        scratch_peak_bytes: int = 0,
-        scratch_reserved_bytes: int | None = None,
-        scratch_margin_bytes: int | None = None,
-        scratch_pool_enabled: bool | None = None,
-        scratch_pool_mode: str | None = None,
-        scratch_trace_records: int = 0,
-        scratch_eligible_records: int = 0,
-        scratch_device_direct_records: int = 0,
-        scratch_budget_over_records: int = 0,
-        scratch_budget_reject_records: int = 0,
-        scratch_eviction_records: int = 0,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        if not self.active:
-            return
-        metadata = metadata or {}
-        with self._lock:
-            self._record_config_locked()
-            self._sync_driver_pool_budgets_locked()
-            if scratch_reserved_bytes is None:
-                scratch_reserved_bytes = self.scratch_reserved_bytes
-            if scratch_margin_bytes is None:
-                scratch_margin_bytes = self.scratch_margin_bytes
-            scratch_summary = {
-                "scratch_peak_bytes": max(int(scratch_peak_bytes or 0), 0),
-                "scratch_live_bytes": max(int(scratch_live_bytes or 0), 0),
-                "scratch_reserved_bytes": max(int(scratch_reserved_bytes or 0), 0),
-                "scratch_margin_bytes": max(int(scratch_margin_bytes or 0), 0),
-                "scratch_pool_enabled": bool(scratch_pool_enabled),
-                "scratch_pool_mode": scratch_pool_mode,
-                "scratch_trace_records": max(int(scratch_trace_records or 0), 0),
-                "scratch_eligible_records": max(int(scratch_eligible_records or 0), 0),
-                "scratch_device_direct_records": max(
-                    int(scratch_device_direct_records or 0), 0
-                ),
-                "scratch_budget_over_records": max(
-                    int(scratch_budget_over_records or 0), 0
-                ),
-                "scratch_budget_reject_records": max(
-                    int(scratch_budget_reject_records or 0), 0
-                ),
-                "scratch_eviction_records": max(
-                    int(scratch_eviction_records or 0), 0
-                ),
-                "scratch_stage_g_summary_present": True,
-            }
-            self._scratch_summary.update(scratch_summary)
-            self._summary["scratch_summary_records"] += 1
-            self._write_locked(
-                {
-                    "action": "residency_scratch_summary",
-                    "pool": "scratch",
-                    **scratch_summary,
-                    "scratch_gpu_budget_bytes": self.pool_budgets["scratch"],
-                    "metadata": metadata,
-                }
-            )
-            self._record_summary_locked()
-
-    def record_kv_metadata_candidate(
-        self,
-        *,
-        region_id: str,
-        block_id: int,
-        group_id: int,
-        bytes_per_block: int,
-        safe: bool,
-        reason: str,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        if not self.active:
-            return
-        metadata = metadata or {}
-        bytes_per_block = max(int(bytes_per_block or 0), 0)
-        with self._lock:
-            self._record_config_locked()
-            if safe:
-                self._summary["kv_safe_candidate_records"] += 1
-                action = "residency_kv_safe_candidate"
-            else:
-                self._summary["kv_unsafe_candidate_records"] += 1
-                action = "residency_kv_unsafe_candidate"
-            self._summary["kv_metadata_records"] += 1
-            self._write_locked(
-                {
-                    "action": action,
-                    "pool": "kv",
-                    "region_id": region_id,
-                    "block_id": int(block_id),
-                    "group_id": int(group_id),
-                    "bytes_per_block": bytes_per_block,
-                    "safe": bool(safe),
-                    "reason": reason,
-                    "data_offload_issued": False,
-                    "metadata": metadata,
-                }
-            )
-            self._record_summary_locked()
+            return self._real_residency_snapshot_locked(trigger=trigger)
 
     def _candidate_victims_locked(
         self,
@@ -1418,22 +828,6 @@ class UvmPoolResidencyManager:
         for region in candidates:
             victims.append(region.region_id)
             reclaimed += region.bytes
-            self._summary["would_evict_candidates"] += 1
-            self._write_locked(
-                {
-                    "action": "residency_would_evict_candidate",
-                    "pool": region.pool,
-                    "region_id": region.region_id,
-                    "bytes": region.bytes,
-                    "state": region.state,
-                    "evictable": region.evictable,
-                    "active": region.active,
-                    "last_access_step": region.last_access_step,
-                    "scope_key": scope_key,
-                    "request_region_id": request_region_id,
-                    "reason": "same_pool_budget_pressure",
-                }
-            )
             if reclaimed >= required_bytes:
                 break
         return victims
@@ -1441,113 +835,7 @@ class UvmPoolResidencyManager:
     def _sync_driver_region_tag_locked(
         self,
         region: UvmResidencyRegion,
-        *,
-        force: bool = False,
-    ) -> dict[str, Any]:
-        enabled = self.driver_tag_enable or force
-        record: dict[str, Any] = {
-            "enabled": enabled,
-            "attempted": False,
-            "registered": region.driver_registered,
-            "status": region.driver_register_status,
-            "reason": None,
-            "driver_region_id": region.driver_region_id,
-        }
-        if not enabled:
-            record["reason"] = "driver_tag_disabled"
-            return record
-        if bool(region.metadata.get("driver_tag_skip")):
-            if region.driver_registered:
-                try:
-                    from vllm.device_allocator.uvm import driver_unregister_region
-                except Exception as exc:  # pragma: no cover - diagnostic path
-                    self._summary["driver_tag_register_failures"] += 1
-                    record["reason"] = "driver_tag_skip_unregister_import_failed"
-                    record["error"] = repr(exc)
-                    return record
-                unregister_status = driver_unregister_region(region.driver_region_id)
-                record["driver_tag_skip_unregister_status"] = unregister_status
-                if unregister_status < 0:
-                    self._summary["driver_tag_register_failures"] += 1
-                    record["reason"] = "driver_tag_skip_unregister_failed"
-                    record["status"] = unregister_status
-                    return record
-                region.driver_registered = False
-                region.driver_register_status = unregister_status
-                record["registered"] = False
-            self._summary["driver_tag_register_skips"] += 1
-            record["reason"] = (
-                region.metadata.get("driver_tag_skip_reason")
-                or "metadata_driver_tag_skip"
-            )
-            return record
-        if region.driver_registered:
-            if not (
-                _metadata_requests_cpu_offloaded_reserved(region.metadata)
-                and not bool(
-                    region.metadata.get(
-                        "driver_cpu_offloaded_reserved_registered",
-                        False,
-                    )
-                )
-            ):
-                record["reason"] = "already_registered"
-                return record
-            try:
-                from vllm.device_allocator.uvm import driver_unregister_region
-            except Exception as exc:  # pragma: no cover - diagnostic path
-                self._summary["driver_tag_register_failures"] += 1
-                record["reason"] = "cpu_offloaded_reserved_reregister_import_failed"
-                record["error"] = repr(exc)
-                return record
-            unregister_status = driver_unregister_region(region.driver_region_id)
-            record["cpu_offloaded_reserved_reregister_unregister_status"] = (
-                unregister_status
-            )
-            if unregister_status < 0:
-                self._summary["driver_tag_register_failures"] += 1
-                record["reason"] = (
-                    "cpu_offloaded_reserved_reregister_unregister_failed"
-                )
-                record["status"] = unregister_status
-                return record
-            region.driver_registered = False
-            region.driver_register_status = unregister_status
-        if region.driver_region_id <= 0:
-            self._summary["driver_tag_register_skips"] += 1
-            record["reason"] = "invalid_driver_region_id"
-            return record
-        if region.pool not in DRIVER_POOL_IDS or region.pool == "unknown":
-            self._summary["driver_tag_register_skips"] += 1
-            record["reason"] = "unknown_pool"
-            return record
-        if not isinstance(region.ptr, int) or region.ptr <= 0 or region.bytes <= 0:
-            self._summary["driver_tag_register_skips"] += 1
-            record["reason"] = "missing_ptr_or_size"
-            return record
-        if _skip_moe_parent_driver_tag(region.metadata):
-            self._summary["driver_tag_register_skips"] += 1
-            record["reason"] = "moe_parent_skipped_for_expert_slices"
-            return record
-        if (
-            self.driver_tag_require_managed
-            and region.metadata.get("driver_capable") is False
-        ):
-            self._summary["driver_tag_register_skips"] += 1
-            record["reason"] = (
-                region.metadata.get("driver_capability_reason")
-                or "not_driver_capable"
-            )
-            return record
-
-        try:
-            from vllm.device_allocator.uvm import driver_register_region
-        except Exception as exc:  # pragma: no cover - diagnostic path
-            self._summary["driver_tag_register_failures"] += 1
-            record["reason"] = "import_failed"
-            record["error"] = repr(exc)
-            return record
-
+    ) -> int:
         metadata = region.metadata
         pool_id = DRIVER_POOL_IDS[region.pool]
         role_id = _driver_role_id(region.pool, metadata)
@@ -1560,17 +848,6 @@ class UvmPoolResidencyManager:
         )
         layer_id = _metadata_int(metadata, "layer_id", 0)
         expert_id = _metadata_int(metadata, "global_expert_id", 0)
-        self._summary["driver_tag_register_attempts"] += 1
-        record.update(
-            {
-                "attempted": True,
-                "pool_id": pool_id,
-                "role_id": role_id,
-                "flags": flags,
-                "layer_id": layer_id,
-                "expert_id": expert_id,
-            }
-        )
         status = driver_register_region(
             region_id=region.driver_region_id,
             ptr=int(region.ptr),
@@ -1582,19 +859,9 @@ class UvmPoolResidencyManager:
             flags=flags,
         )
         region.driver_register_status = status
-        record["status"] = status
         if status >= 0:
             region.driver_registered = True
-            if _metadata_requests_cpu_offloaded_reserved(metadata):
-                region.metadata["driver_cpu_offloaded_reserved_registered"] = True
-            self._summary["driver_tag_register_success"] += 1
-            record["registered"] = True
-            record["reason"] = "registered"
-        else:
-            self._summary["driver_tag_register_failures"] += 1
-            record["registered"] = False
-            record["reason"] = f"driver_register_failed:{status}"
-        return record
+        return status
 
     def _sync_driver_pool_budgets_locked(self, force: bool = False) -> None:
         if self._driver_pool_budgets_applied and not force:
@@ -1602,21 +869,6 @@ class UvmPoolResidencyManager:
         if not self.driver_pool_budget_enable:
             return
 
-        try:
-            from vllm.device_allocator.uvm import driver_set_pool_budget
-        except Exception as exc:  # pragma: no cover - diagnostic path
-            self._driver_pool_budget_status["import_error"] = -3
-            self._write_locked(
-                {
-                    "action": "residency_driver_pool_budget_config",
-                    "enabled": self.driver_pool_budget_enable,
-                    "reason": "import_failed",
-                    "error": repr(exc),
-                }
-            )
-            return
-
-        records: list[dict[str, Any]] = []
         retry_later = False
         for pool, pool_id in DRIVER_POOL_IDS.items():
             if pool == "unknown":
@@ -1634,29 +886,12 @@ class UvmPoolResidencyManager:
             if status == -1:
                 retry_later = True
             self._driver_pool_budget_status[pool] = status
-            records.append(
-                {
-                    "pool": pool,
-                    "pool_id": pool_id,
-                    "budget_bytes": budget,
-                    "mode": self.driver_pool_budget_mode,
-                    "status": status,
-                }
-            )
-
-        self._write_locked(
-            {
-                "action": "residency_driver_pool_budget_config",
-                "enabled": self.driver_pool_budget_enable,
-                "records": records,
-            }
-        )
         self._driver_pool_budgets_applied = not retry_later
 
     def _sync_driver_region_state_locked(
         self,
         region: UvmResidencyRegion,
-    ) -> dict[str, Any]:
+    ) -> int:
         state_id = _driver_region_state_id(region.state, active=region.active)
         flags = _driver_flags(
             pool=region.pool,
@@ -1665,34 +900,7 @@ class UvmPoolResidencyManager:
             active=region.active,
             metadata=region.metadata,
         )
-        record: dict[str, Any] = {
-            "enabled": self.driver_tag_enable,
-            "attempted": False,
-            "status": None,
-            "reason": None,
-            "driver_region_id": region.driver_region_id,
-            "state_id": state_id,
-            "flags": flags,
-        }
-        if not self.driver_tag_enable:
-            record["reason"] = "driver_tag_disabled"
-            return record
-        if not region.driver_registered:
-            self._summary["driver_region_state_update_skips"] += 1
-            record["reason"] = "driver_region_not_registered"
-            return record
-
-        try:
-            from vllm.device_allocator.uvm import driver_update_region_state
-        except Exception as exc:  # pragma: no cover - diagnostic path
-            self._summary["driver_region_state_update_failures"] += 1
-            record["reason"] = "import_failed"
-            record["error"] = repr(exc)
-            return record
-
-        self._summary["driver_region_state_update_attempts"] += 1
-        record["attempted"] = True
-        status = driver_update_region_state(
+        return driver_update_region_state(
             region_id=region.driver_region_id,
             state=state_id,
             flags_set=flags,
@@ -1700,124 +908,13 @@ class UvmPoolResidencyManager:
             priority=_metadata_int(region.metadata, "priority", 0),
             last_access_epoch=max(int(region.last_access_step or 0), 0),
         )
-        record["status"] = status
-        if status >= 0:
-            self._summary["driver_region_state_update_success"] += 1
-            record["reason"] = "updated"
-        else:
-            self._summary["driver_region_state_update_failures"] += 1
-            record["reason"] = f"driver_state_update_failed:{status}"
-        return record
 
-    def _record_request_locked(
-        self,
-        decision: UvmResidencyDecision,
-        metadata: dict[str, Any],
-    ) -> None:
-        self._summary["requests"] += 1
-        if decision.would_deny:
-            self._summary["would_denies"] += 1
-        if decision.allowed:
-            self._summary["grants"] += 1
-            outcome = "residency_grant"
-        else:
-            self._summary["denies"] += 1
-            outcome = "residency_deny"
-        self._write_locked(
-            {
-                "action": "residency_request",
-                "outcome": outcome,
-                "pool": decision.pool,
-                "region_id": decision.region_id,
-                "requested_bytes": decision.requested_bytes,
-                "incremental_bytes": decision.incremental_bytes,
-                "scope_key": decision.scope_key,
-                "allowed": decision.allowed,
-                "would_deny": decision.would_deny,
-                "reason": decision.reason,
-                "mode": decision.mode,
-                "pool_budget_bytes": decision.pool_budget_bytes,
-                "pool_estimated_gpu_resident_bytes": (
-                    decision.pool_estimated_gpu_resident_bytes
-                ),
-                "pool_remaining_bytes": decision.pool_remaining_bytes,
-                "global_budget_bytes": decision.global_budget_bytes,
-                "global_estimated_gpu_resident_bytes": (
-                    decision.global_estimated_gpu_resident_bytes
-                ),
-                "global_remaining_bytes": decision.global_remaining_bytes,
-                "victims": list(decision.victims),
-                "metadata": metadata,
-            }
-        )
-        self._record_summary_locked()
-
-    def _record_config_locked(self) -> None:
-        if self._config_recorded or not self.trace_file:
-            return
-        self._config_recorded = True
-        self._write_locked(
-            {
-                "action": "residency_config",
-                "enabled": self.enabled,
-                "mode": self.mode,
-                "tag_only_mode": self.tag_only_mode,
-                "driver_tag_enable": self.driver_tag_enable,
-                "driver_tag_require_managed": self.driver_tag_require_managed,
-                "driver_pool_budget_enable": self.driver_pool_budget_enable,
-                "driver_pool_budget_mode": self.driver_pool_budget_mode,
-                "driver_pool_budget_overrides": self.driver_pool_budget_overrides,
-                "driver_temp_buffer_bytes": self.driver_temp_buffer_bytes,
-                "driver_pool_state_snapshot_on_tag_only_every": (
-                    self.driver_pool_state_snapshot_on_tag_only_every
-                ),
-                "driver_pool_state_snapshot_device": (
-                    self.driver_pool_state_snapshot_device
-                ),
-                "trace_file": self.trace_file,
-                "global_budget_bytes": self.global_budget_bytes,
-                "pool_budgets": self.pool_budgets,
-                "safety_margin_bytes": self.safety_margin_bytes,
-                "priority": self.priority,
-                "estimated_residency_semantics": (
-                    "application_managed_intent_not_driver_page_residency"
-                ),
-                "l0_trace_only_no_real_reclaim": True,
-                "stage_label": self.stage_label,
-                "weight_initial_state": self.weight_initial_state,
-                "weight_enforce_hot_set": self.weight_enforce_hot_set,
-                "weight_sync_offload": self.weight_sync_offload,
-                "weight_max_victims_per_step": self.weight_max_victims_per_step,
-                "weight_victim_policy": self.weight_victim_policy,
-                "scratch_reserved_bytes": self.scratch_reserved_bytes,
-                "scratch_margin_bytes": self.scratch_margin_bytes,
-                "kv_metadata_enable": self.kv_metadata_enable,
-                "kv_data_offload_enable": self.kv_data_offload_enable,
-                "kv_prefetch_back_enable": self.kv_prefetch_back_enable,
-                "real_residency_enable": self.real_residency_enable,
-                "real_residency_trace_file": self.real_residency_trace_file,
-                "real_residency_device": self.real_residency_device,
-                "real_residency_on_register_every": (
-                    self.real_residency_on_register_every
-                ),
-                "real_residency_on_action_every": self.real_residency_on_action_every,
-                "real_residency_max_snapshots": self.real_residency_max_snapshots,
-                "real_residency_max_regions_per_pool": (
-                    self.real_residency_max_regions_per_pool
-                ),
-            }
-        )
-
-    def _record_summary_locked(self) -> None:
-        self._write_locked(self._summary_record_locked())
-
-    def _summary_record_locked(self) -> dict[str, Any]:
+    def _snapshot_locked(self) -> dict[str, Any]:
         pool_region_counts = {pool: 0 for pool in VALID_POOLS}
         for region in self._regions.values():
             if region.pool in pool_region_counts:
                 pool_region_counts[region.pool] += 1
         return {
-            "action": "residency_summary",
             "weights_estimated_gpu_resident_bytes": (
                 self._pool_estimated_bytes["weights"]
             ),
@@ -1832,6 +929,7 @@ class UvmPoolResidencyManager:
             "kv_gpu_budget_bytes": self.pool_budgets["kv"],
             "scratch_gpu_budget_bytes": self.pool_budgets["scratch"],
             "global_gpu_budget_bytes": self.global_budget_bytes,
+            "safety_margin_bytes": self.safety_margin_bytes,
             "pool_region_counts": pool_region_counts,
             "region_records": len(self._regions),
             "real_residency_enabled": self.real_residency_enable,
@@ -1839,12 +937,6 @@ class UvmPoolResidencyManager:
             "driver_tag_enable": self.driver_tag_enable,
             "driver_pool_budget_enable": self.driver_pool_budget_enable,
             "driver_pool_budget_status": dict(self._driver_pool_budget_status),
-            "real_residency_trace_file": self.real_residency_trace_file,
-            "real_residency_snapshots": self._real_residency_snapshots,
-            "real_residency_errors": self._real_residency_errors,
-            "real_residency_last": self._last_real_residency,
-            **self._scratch_summary,
-            **self._summary,
         }
 
     def _region_snapshot_locked(
@@ -1871,21 +963,13 @@ class UvmPoolResidencyManager:
     def _global_estimated_bytes_locked(self) -> int:
         return sum(self._pool_estimated_bytes.values())
 
-    def _record_real_residency_locked(
+    def _real_residency_snapshot_locked(
         self,
         *,
         trigger: str,
-        trigger_count: int | None = None,
-        trigger_region_id: str | None = None,
-        trigger_action: str | None = None,
     ) -> dict[str, Any]:
         if not self.real_residency_enable:
             return {"enabled": False, "reason": "disabled"}
-        if (
-            self.real_residency_max_snapshots > 0
-            and self._real_residency_snapshots >= self.real_residency_max_snapshots
-        ):
-            return {"enabled": True, "skipped": True, "reason": "max_snapshots"}
 
         regions_by_pool: dict[str, list[UvmResidencyRegion]] = {
             "weights": [],
@@ -1902,34 +986,15 @@ class UvmPoolResidencyManager:
                 continue
             regions_by_pool[region.pool].append(region)
 
-        try:
-            from vllm.device_allocator.uvm import (
-                driver_batch_query_ranges_residency_bytes,
-            )
-        except Exception as exc:  # pragma: no cover - diagnostic path
-            self._real_residency_errors += 1
-            record = {
-                "action": "real_residency_snapshot",
-                "ok": False,
-                "trigger": trigger,
-                "trigger_count": trigger_count,
-                "trigger_region_id": trigger_region_id,
-                "trigger_action": trigger_action,
-                "reason": "import_failed",
-                "error": repr(exc),
-                "device": self.real_residency_device,
-            }
-            self._write_real_locked(record)
-            self._last_real_residency = record
-            return record
-
         totals = _empty_real_residency_totals()
         by_pool: dict[str, dict[str, Any]] = {}
         ok = True
         max_regions = self.real_residency_max_regions_per_pool
         query_batch_size = 64
         for pool, pool_regions in regions_by_pool.items():
-            queried_regions = pool_regions[:max_regions] if max_regions > 0 else pool_regions
+            queried_regions = (
+                pool_regions[:max_regions] if max_regions > 0 else pool_regions
+            )
             ranges = [(region.ptr or 0, region.bytes) for region in queried_regions]
             pool_record: dict[str, Any] = {
                 "region_count": len(pool_regions),
@@ -1977,18 +1042,9 @@ class UvmPoolResidencyManager:
                 totals[key] += int(pool_record.get(key) or 0)
             by_pool[pool] = pool_record
 
-        self._real_residency_snapshots += 1
-        if not ok:
-            self._real_residency_errors += 1
-
-        record = {
-            "action": "real_residency_snapshot",
+        return {
             "ok": ok,
-            "snapshot_index": self._real_residency_snapshots,
             "trigger": trigger,
-            "trigger_count": trigger_count,
-            "trigger_region_id": trigger_region_id,
-            "trigger_action": trigger_action,
             "device": self.real_residency_device,
             "region_records": len(self._regions),
             "skipped_regions": skipped_regions,
@@ -1997,29 +1053,6 @@ class UvmPoolResidencyManager:
             **totals,
             "by_pool": by_pool,
         }
-        self._last_real_residency = record
-        self._write_real_locked(record)
-        return record
-
-    def _write_locked(self, record: dict[str, Any]) -> None:
-        if not self.trace_file:
-            return
-        record.setdefault("ts", time.time())
-        record.setdefault("stage", self.stage_label)
-        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        os.makedirs(os.path.dirname(self.trace_file) or ".", exist_ok=True)
-        with open(self.trace_file, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-
-    def _write_real_locked(self, record: dict[str, Any]) -> None:
-        if not self.real_residency_trace_file:
-            return
-        record.setdefault("ts", time.time())
-        record.setdefault("stage", self.stage_label)
-        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        os.makedirs(os.path.dirname(self.real_residency_trace_file) or ".", exist_ok=True)
-        with open(self.real_residency_trace_file, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
 
 
 _RESIDENCY_MANAGER: UvmPoolResidencyManager | None = None
@@ -2044,6 +1077,7 @@ def register_uvm_residency_region(
     state: str = "unknown",
     evictable: bool = False,
     active: bool = False,
+    driver_register: bool,
     metadata: dict[str, Any] | None = None,
 ) -> UvmResidencyRegion:
     return get_uvm_pool_residency_manager().register_region(
@@ -2054,13 +1088,14 @@ def register_uvm_residency_region(
         state=state,
         evictable=evictable,
         active=active,
+        driver_register=driver_register,
         metadata=metadata,
     )
 
 
 def ensure_uvm_residency_driver_region_registered(
     region_id: str,
-) -> dict[str, Any]:
+) -> int:
     return get_uvm_pool_residency_manager().ensure_driver_region_registered(
         region_id
     )
@@ -2184,76 +1219,3 @@ def get_uvm_residency_region_snapshot(region_id: str) -> dict[str, Any] | None:
 
 def get_uvm_residency_regions_snapshot() -> list[dict[str, Any]]:
     return get_uvm_pool_residency_manager().regions_snapshot()
-
-
-def record_uvm_residency_action(
-    *,
-    action: str,
-    pool: str,
-    region_id: str | None = None,
-    bytes: int = 0,
-    metadata: dict[str, Any] | None = None,
-    **extra: Any,
-) -> None:
-    get_uvm_pool_residency_manager().record_action(
-        action=action,
-        pool=pool,
-        region_id=region_id,
-        bytes=bytes,
-        metadata=metadata,
-        **extra,
-    )
-
-
-def record_uvm_residency_scratch_summary(
-    *,
-    scratch_live_bytes: int = 0,
-    scratch_peak_bytes: int = 0,
-    scratch_reserved_bytes: int | None = None,
-    scratch_margin_bytes: int | None = None,
-    scratch_pool_enabled: bool | None = None,
-    scratch_pool_mode: str | None = None,
-    scratch_trace_records: int = 0,
-    scratch_eligible_records: int = 0,
-    scratch_device_direct_records: int = 0,
-    scratch_budget_over_records: int = 0,
-    scratch_budget_reject_records: int = 0,
-    scratch_eviction_records: int = 0,
-    metadata: dict[str, Any] | None = None,
-) -> None:
-    get_uvm_pool_residency_manager().record_scratch_summary(
-        scratch_live_bytes=scratch_live_bytes,
-        scratch_peak_bytes=scratch_peak_bytes,
-        scratch_reserved_bytes=scratch_reserved_bytes,
-        scratch_margin_bytes=scratch_margin_bytes,
-        scratch_pool_enabled=scratch_pool_enabled,
-        scratch_pool_mode=scratch_pool_mode,
-        scratch_trace_records=scratch_trace_records,
-        scratch_eligible_records=scratch_eligible_records,
-        scratch_device_direct_records=scratch_device_direct_records,
-        scratch_budget_over_records=scratch_budget_over_records,
-        scratch_budget_reject_records=scratch_budget_reject_records,
-        scratch_eviction_records=scratch_eviction_records,
-        metadata=metadata,
-    )
-
-
-def record_uvm_residency_kv_metadata_candidate(
-    *,
-    region_id: str,
-    block_id: int,
-    group_id: int,
-    bytes_per_block: int,
-    safe: bool,
-    reason: str,
-    metadata: dict[str, Any] | None = None,
-) -> None:
-    get_uvm_pool_residency_manager().record_kv_metadata_candidate(
-        region_id=region_id,
-        block_id=block_id,
-        group_id=group_id,
-        bytes_per_block=bytes_per_block,
-        safe=safe,
-        reason=reason,
-        metadata=metadata,
-    )

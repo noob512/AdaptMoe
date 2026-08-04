@@ -38,6 +38,32 @@ from vllm.config import (
     get_layers_from_vllm_config,
     update_config,
 )
+from vllm.device_allocator.uvm import (
+    batch_advise_ranges_cpu_with_executor,
+    batch_offload_ranges_to_cpu_with_executor,
+    batch_prefetch_ranges_to_device,
+    batch_prefetch_ranges_to_device_with_executor,
+    batch_prepare_ranges_for_native_remote_access_with_executor,
+    batch_prepare_ranges_for_remote_read_with_executor,
+    driver_batch_query_ranges_residency_bytes,
+    driver_expert_reserved_pool_prealloc,
+    driver_expert_reserved_pool_query,
+    driver_moe_slot_pool_query,
+    probe_driver_capable_range,
+    uvm_allocation_phase,
+    uvm_enabled_allocation_phase,
+)
+from vllm.device_allocator.uvm_kv_init_probe import (
+    record_kv_init_probe_event,
+    synchronize_kv_init_probe_tensor,
+)
+from vllm.device_allocator.uvm_pool_residency import (
+    get_uvm_pool_residency_manager,
+    get_uvm_real_residency_snapshot,
+    get_uvm_residency_region_snapshot,
+    mark_uvm_residency_state,
+    register_uvm_residency_region,
+)
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -50,32 +76,6 @@ from vllm.distributed.parallel_state import (
     graph_capture,
     is_global_first_rank,
     prepare_communication_buffer_for_model,
-)
-from vllm.device_allocator.uvm import (
-    batch_advise_ranges_cpu_with_executor,
-    batch_offload_ranges_to_cpu_with_executor,
-    batch_prepare_ranges_for_native_remote_access_with_executor,
-    batch_prepare_ranges_for_remote_read_with_executor,
-    batch_prefetch_ranges_to_device,
-    batch_prefetch_ranges_to_device_with_executor,
-    driver_batch_query_ranges_residency_bytes,
-    driver_expert_reserved_pool_prealloc,
-    driver_expert_reserved_pool_query,
-    driver_moe_slot_pool_query,
-    probe_driver_capable_range,
-    uvm_allocation_phase,
-    uvm_enabled_allocation_phase,
-)
-from vllm.device_allocator.uvm_kv_init_probe import (
-    record_kv_init_probe_event,
-    synchronize_kv_init_probe_tensor,
-    write_uvm_trace_marker,
-)
-from vllm.device_allocator.uvm_pool_residency import (
-    get_uvm_real_residency_snapshot,
-    get_uvm_pool_residency_manager,
-    mark_uvm_residency_state,
-    register_uvm_residency_region,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -133,6 +133,10 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
     split_attn_metadata,
 )
+from vllm.v1.core.uvm_kv_runtime_policy import (
+    collect_uvm_kv_cache_physical_ranges_for_blocks,
+    register_uvm_kv_cache_physical_ranges,
+)
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -159,10 +163,6 @@ from vllm.v1.outputs import (
     PoolerOutput,
     SamplerOutput,
     make_empty_encoder_model_runner_output,
-)
-from vllm.v1.core.uvm_kv_runtime_policy import (
-    collect_uvm_kv_cache_physical_ranges_for_blocks,
-    register_uvm_kv_cache_physical_ranges,
 )
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
@@ -3186,16 +3186,6 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            self._write_uvm_compute_start_trace_marker(
-                step_id=self._layer_timing_step_id,
-                phase=layer_timing_phase,
-                enabled_step_phase=enabled_step_phase,
-                num_reqs=int(num_reqs),
-                num_input_tokens=int(num_input_tokens),
-                total_num_scheduled_tokens=int(total_num_scheduled_tokens),
-                max_num_scheduled_tokens=int(max_num_scheduled_tokens),
-                cudagraph_runtime_mode=str(cudagraph_runtime_mode),
-            )
             with uvm_enabled_allocation_phase("enabled:model_forward"):
                 model_output = self._model_forward(
                     input_ids=input_ids,
@@ -4127,14 +4117,18 @@ class GPUModelRunner(
                 driver_capable, driver_reason, driver_probe_result = (
                     probe_driver_capable_range(ptr, size_bytes)
                 )
+            region_id = self._uvm_weight_region_id(record)
+            if get_uvm_residency_region_snapshot(region_id) is not None:
+                continue
             register_uvm_residency_region(
                 pool="weights",
-                region_id=self._uvm_weight_region_id(record),
+                region_id=region_id,
                 ptr=ptr,
                 bytes=size_bytes,
                 state="gpu",
                 evictable=bool(record.get("evictable", is_moe_expert)),
                 active=False,
+                driver_register=driver_capable,
                 metadata={
                     **semantic,
                     "stage": "stage_n",
@@ -4860,44 +4854,6 @@ class GPUModelRunner(
             scope="local",
         )
 
-    def _record_uvm_init_weight_plan_residency(self, marker: str) -> int:
-        if os.environ.get(
-            "VLLM_UVM_INIT_WEIGHT_PLAN_RESIDENCY_TRACE_ENABLE", "0"
-        ).strip().lower() not in ("1", "true", "yes", "on"):
-            return 0
-
-        model = getattr(self, "model", None)
-        if model is None:
-            return 0
-
-        records = 0
-        try:
-            for module in model.modules():
-                recorder = getattr(
-                    module,
-                    "record_uvm_init_weight_plan_residency",
-                    None,
-                )
-                if not callable(recorder):
-                    continue
-                result = recorder(marker)
-                if result is not None:
-                    records += 1
-        except Exception:
-            logger.debug(
-                "Failed to record UVM init weight plan residency marker=%s",
-                marker,
-                exc_info=True,
-            )
-
-        if records:
-            logger.warning(
-                "UVM init weight plan residency snapshot marker=%s records=%d",
-                marker,
-                records,
-            )
-        return records
-
     def _record_uvm_active_expert_residency_probe(self, marker: str) -> int:
         if os.environ.get(
             "VLLM_UVM_ACTIVE_EXPERT_RESIDENCY_PROBE_ENABLE", "0"
@@ -5058,20 +5014,6 @@ class GPUModelRunner(
             )
         return records
 
-    def _write_uvm_compute_start_trace_marker(self, **fields: object) -> None:
-        if os.environ.get(
-            "VLLM_UVM_COMPUTE_START_TRACE_MARKER_ENABLE", "0"
-        ).strip().lower() not in ("1", "true", "yes", "on"):
-            return
-
-        marker_fields = {"pid": os.getpid(), **fields}
-        try:
-            write_uvm_trace_marker("VLLM_UVM_COMPUTE_START", marker_fields)
-        except Exception:
-            logger.debug(
-                "Failed to write UVM compute start trace marker",
-                exc_info=True,
-            )
 
     def _log_kv_cache_addresses(self, kv_caches: dict[str, Any], phase: str) -> None:
         """
@@ -5262,26 +5204,6 @@ class GPUModelRunner(
             "ranges": range_records,
         }
 
-    def _append_uvm_post_warmup_rebalance_trace(
-        self,
-        record: dict[str, Any],
-    ) -> None:
-        trace_file = os.environ.get(
-            "VLLM_UVM_POST_WARMUP_REBALANCE_TRACE_FILE",
-            "",
-        )
-        if not trace_file:
-            return
-        try:
-            os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
-            with open(trace_file, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, sort_keys=True) + "\n")
-        except OSError as exc:
-            logger.warning(
-                "Failed to write post-warmup UVM rebalance trace %s: %s",
-                trace_file,
-                exc,
-            )
 
     def rebalance_uvm_kv_cache_after_warmup(
         self,
@@ -5296,12 +5218,10 @@ class GPUModelRunner(
             **collection,
         }
         if not collection.get("ok"):
-            self._append_uvm_post_warmup_rebalance_trace(record)
             return record
         if not ranges:
             record["offload_successes"] = 0
             record["offload_complete"] = True
-            self._append_uvm_post_warmup_rebalance_trace(record)
             return record
 
         executor = (
@@ -5358,7 +5278,6 @@ class GPUModelRunner(
                     exc_info=True,
                 )
 
-        self._append_uvm_post_warmup_rebalance_trace(record)
         logger.info(
             "UVM post-warmup KV rebalance target_blocks=%d ranges=%d "
             "bytes=%d successes=%d executor=%s elapsed=%.3fs",
@@ -5471,14 +5390,6 @@ class GPUModelRunner(
             "elapsed_seconds": time.monotonic() - start,
             **result_fields,
         }
-        self._append_uvm_post_warmup_rebalance_trace(
-            {
-                "action": "adaptive_kv_target_resize",
-                "timestamp": time.time(),
-                "pid": os.getpid(),
-                **result,
-            }
-        )
         return result
 
     def load_model(self, eep_scale_up: bool = False) -> None:
@@ -5650,7 +5561,6 @@ class GPUModelRunner(
         self._prepare_uvm_managed_expert_weights_for_request("after_load_model")
         # 记录模型权重的内存地址（通常用于调试或低级别内存管理验证）
         self._log_model_weight_addresses("load_model")
-        self._record_uvm_init_weight_plan_residency("after_load_model")
         self._record_uvm_active_expert_residency_probe("after_load_model")
 
         # 处理模型图编译加速
@@ -6773,7 +6683,6 @@ class GPUModelRunner(
             repaired_modules,
             time.monotonic() - repair_start,
         )
-        self._record_uvm_init_weight_plan_residency("after_global_hot_repair")
         self._record_uvm_active_expert_residency_probe(
             "after_global_hot_repair"
         )
@@ -6816,7 +6725,6 @@ class GPUModelRunner(
             return
         self._uvm_init_weight_placement_done = True
         model = self.get_model()
-        self._record_uvm_init_weight_plan_residency("before_stage_m")
         self._record_uvm_active_expert_residency_probe("before_stage_m")
         issued_modules = 0
         section_start = time.monotonic()
@@ -6906,12 +6814,8 @@ class GPUModelRunner(
                 if remote_read_mode
                 else "after_stage_m_clear"
             )
-            self._record_uvm_init_weight_plan_residency(
-                f"{post_stage_marker}_before_prealloc"
-            )
             if prealloc_reserved and not remote_read_mode:
                 self._maybe_prealloc_uvm_expert_reserved_slots_after_stage_m()
-            self._record_uvm_init_weight_plan_residency(post_stage_marker)
             self._record_uvm_active_expert_residency_probe(post_stage_marker)
             if not remote_read_mode:
                 self._record_uvm_post_offload_slot_use_probe(post_stage_marker)
@@ -6931,26 +6835,6 @@ class GPUModelRunner(
             time.monotonic() - debug_start,
         )
 
-    def _append_uvm_expert_reserved_post_stage_m_prealloc_trace(
-        self,
-        record: dict[str, object],
-    ) -> None:
-        trace_file = os.environ.get(
-            "VLLM_UVM_EXPERT_RESERVED_POST_STAGE_M_PREALLOC_FILE",
-            "",
-        )
-        if not trace_file:
-            return
-        try:
-            os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
-            with open(trace_file, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, sort_keys=True) + "\n")
-        except OSError as exc:
-            logger.warning(
-                "Failed to write post-Stage-M reserved prealloc trace %s: %s",
-                trace_file,
-                exc,
-            )
 
     @staticmethod
     def _uvm_incremental_expert_layer_key(module: Any) -> str:
@@ -7258,7 +7142,6 @@ class GPUModelRunner(
                 "slot_bytes": slot_bytes,
                 "timestamp": time.time(),
             }
-            self._append_uvm_expert_reserved_post_stage_m_prealloc_trace(record)
             logger.warning(
                 "UVM controlled remap debug: post-Stage-M reserved prealloc "
                 "skipped invalid config slot_count=%d slot_bytes=%d",
@@ -7321,7 +7204,6 @@ class GPUModelRunner(
             "query_after": query_after,
             "incremental_capacity": capacity,
         }
-        self._append_uvm_expert_reserved_post_stage_m_prealloc_trace(record)
         logger.warning(
             "UVM controlled remap debug: post-Stage-M reserved prealloc end "
             "ok=%s success=%s failure=%s backing=%s elapsed=%.3fs",
@@ -7486,23 +7368,6 @@ class GPUModelRunner(
             index.setdefault(name, (tensor, "buffer"))
         return index
 
-    def _append_uvm_matched_cpu_offload_trace(
-        self,
-        record: dict[str, object],
-    ) -> None:
-        trace_file = os.environ.get("VLLM_UVM_MATCHED_CPU_OFFLOAD_TRACE_FILE", "")
-        if not trace_file:
-            return
-        try:
-            os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
-            with open(trace_file, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, sort_keys=True) + "\n")
-        except OSError as exc:
-            logger.warning(
-                "Failed to write matched UVM CPU offload trace %s: %s",
-                trace_file,
-                exc,
-            )
 
     def _run_uvm_matched_cpu_offload_manifest(self) -> int:
         if os.environ.get("VLLM_UVM_MATCHED_CPU_OFFLOAD_ENABLE", "0") != "1":
@@ -7543,14 +7408,6 @@ class GPUModelRunner(
             "VLLM_UVM_MATCHED_CPU_OFFLOAD_MAX_BYTES", "0"
         ) or "0")
         if not manifest_records:
-            self._append_uvm_matched_cpu_offload_trace(
-                {
-                    "event": "matched_cpu_offload_no_manifest_names",
-                    "timestamp": time.time(),
-                    "pid": os.getpid(),
-                    "mode": mode,
-                }
-            )
             return 0
 
         ranges: list[tuple[int, int]] = []
@@ -7564,33 +7421,10 @@ class GPUModelRunner(
                 continue
             tensor_entry = tensor_index.get(name)
             if tensor_entry is None:
-                self._append_uvm_matched_cpu_offload_trace(
-                    {
-                        "event": "matched_cpu_offload_missing_parameter",
-                        "timestamp": time.time(),
-                        "pid": os.getpid(),
-                        "parameter_name": name,
-                        "mode": mode,
-                        "manifest_bytes": record.get("bytes"),
-                        "manifest_shape": record.get("shape"),
-                        "manifest_dtype": record.get("dtype"),
-                    }
-                )
                 continue
             tensor, tensor_kind = tensor_entry
             bytes_ = int(tensor.numel() * tensor.element_size())
             if max_bytes > 0 and attempted_bytes + bytes_ > max_bytes:
-                self._append_uvm_matched_cpu_offload_trace(
-                    {
-                        "event": "matched_cpu_offload_budget_reject",
-                        "timestamp": time.time(),
-                        "pid": os.getpid(),
-                        "parameter_name": name,
-                        "bytes": bytes_,
-                        "attempted_bytes_before": attempted_bytes,
-                        "max_bytes": max_bytes,
-                    }
-                )
                 continue
             ptr = int(tensor.data_ptr())
             driver_capable, driver_reason, driver_probe_result = (
@@ -7623,32 +7457,20 @@ class GPUModelRunner(
             matched_names.add(name)
 
         if not ranges:
-            self._append_uvm_matched_cpu_offload_trace(
-                {
-                    "event": "matched_cpu_offload_no_matched_parameters",
-                    "timestamp": time.time(),
-                    "pid": os.getpid(),
-                    "mode": mode,
-                    "matched_manifest_count": len(manifest_records),
-                }
-            )
             return 0
 
         if mode == "trace_only":
             successes = len(ranges)
             executor_used = "trace_only"
-            driver_advise_result = 0
-            driver_prefetch_result = 0
         elif mode == "advise_cpu":
-            successes, executor_used, driver_advise_result = (
+            successes, executor_used, _ = (
                 batch_advise_ranges_cpu_with_executor(
                     ranges,
                     executor=executor,
                 )
             )
-            driver_prefetch_result = 0
         elif mode in {"prefetch_cpu", "offload_cpu"}:
-            successes, executor_used, driver_advise_result, driver_prefetch_result = (
+            successes, executor_used, _, _ = (
                 batch_offload_ranges_to_cpu_with_executor(
                     ranges,
                     sync=sync,
@@ -7659,46 +7481,23 @@ class GPUModelRunner(
             (
                 successes,
                 executor_used,
-                accessed_by_result,
-                prefetch_cpu_successes,
-                preferred_cpu_result,
+                _,
+                _,
+                _,
             ) = batch_prepare_ranges_for_native_remote_access_with_executor(
                 ranges,
                 sync=sync,
                 executor=executor,
                 device=torch.cuda.current_device(),
             )
-            driver_advise_result = 0
-            driver_prefetch_result = 0
-            self._append_uvm_matched_cpu_offload_trace(
-                {
-                    "event": "matched_cpu_offload_native_remote_prepare",
-                    "timestamp": time.time(),
-                    "pid": os.getpid(),
-                    "mode": mode,
-                    "matched_parameter_count": len(items),
-                    "attempted_bytes": attempted_bytes,
-                    "successes": successes,
-                    "executor": executor_used,
-                    "requested_executor": executor,
-                    "accessed_by_result": accessed_by_result,
-                    "prefetch_cpu_successes": prefetch_cpu_successes,
-                    "preferred_cpu_result": preferred_cpu_result,
-                    "driver_advise_result": driver_advise_result,
-                    "driver_prefetch_result": driver_prefetch_result,
-                    "sync": sync,
-                    "preferred_location_cpu": True,
-                    "readmostly": False,
-                }
-            )
         elif mode in {"remote_read", "remote_read_bg", "remote_read_accessed_by"}:
             (
                 successes,
                 executor_used,
-                readmostly_result,
-                accessed_by_result,
-                driver_advise_result,
-                driver_prefetch_result,
+                _,
+                _,
+                _,
+                _,
             ) = batch_prepare_ranges_for_remote_read_with_executor(
                 ranges,
                 sync=sync,
@@ -7706,46 +7505,9 @@ class GPUModelRunner(
                 device=torch.cuda.current_device(),
                 accessed_by=mode == "remote_read_accessed_by",
             )
-            self._append_uvm_matched_cpu_offload_trace(
-                {
-                    "event": "matched_cpu_offload_remote_read_prepare",
-                    "timestamp": time.time(),
-                    "pid": os.getpid(),
-                    "mode": mode,
-                    "matched_parameter_count": len(items),
-                    "attempted_bytes": attempted_bytes,
-                    "successes": successes,
-                    "executor": executor_used,
-                    "requested_executor": executor,
-                    "readmostly_result": readmostly_result,
-                    "accessed_by_result": accessed_by_result,
-                    "driver_advise_result": driver_advise_result,
-                    "driver_prefetch_result": driver_prefetch_result,
-                    "sync": sync,
-                }
-            )
         else:
             successes = batch_prefetch_ranges_to_device(ranges, device=0)
             executor_used = "cpp_batch"
-            driver_advise_result = 0
-            driver_prefetch_result = successes
-
-        for index, item in enumerate(items):
-            self._append_uvm_matched_cpu_offload_trace(
-                {
-                    **item,
-                    "success": index < successes,
-                    "batch_successes": successes,
-                    "executor": executor_used,
-                    "requested_executor": executor,
-                    "driver_advise_result": driver_advise_result,
-                    "driver_prefetch_result": driver_prefetch_result,
-                    "sync": sync,
-                    "matched_manifest_count": len(manifest_records),
-                    "matched_parameter_count": len(items),
-                    "attempted_bytes": attempted_bytes,
-                }
-            )
 
         if sync and successes > 0:
             try:

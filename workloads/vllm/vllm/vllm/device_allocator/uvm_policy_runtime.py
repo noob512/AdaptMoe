@@ -22,7 +22,6 @@ from vllm.device_allocator.uvm_pool_coordinator import request_uvm_pool_action
 from vllm.device_allocator.uvm_pool_residency import (
     get_uvm_residency_region_snapshot,
     mark_uvm_residency_state,
-    record_uvm_residency_action,
     register_uvm_residency_region,
     request_uvm_gpu_residency,
 )
@@ -99,16 +98,24 @@ class UvmPolicyRuntime:
             "ptr_present": ptr is not None,
         }
 
-        register_uvm_residency_region(
-            pool="kv",
-            region_id=region_id,
-            ptr=ptr,
-            bytes=size_bytes,
-            state=existing_state,
-            evictable=False,
-            active=True,
-            metadata=action_metadata,
-        )
+        if existing is None:
+            register_uvm_residency_region(
+                pool="kv",
+                region_id=region_id,
+                ptr=ptr,
+                bytes=size_bytes,
+                state=existing_state,
+                evictable=False,
+                active=True,
+                driver_register=ptr is not None,
+                metadata=action_metadata,
+            )
+        else:
+            mark_uvm_residency_state(
+                region_id=region_id,
+                state=existing_state,
+                metadata={**action_metadata, "active": True, "evictable": False},
+            )
         residency_decision = request_uvm_gpu_residency(
             pool="kv",
             region_id=region_id,
@@ -118,16 +125,6 @@ class UvmPolicyRuntime:
             metadata=action_metadata,
         )
         if not residency_decision.allowed:
-            record_uvm_residency_action(
-                action="policy_kv_active_protect_skipped",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                fallback_reason=residency_decision.reason,
-                would_deny=residency_decision.would_deny,
-                victims=list(residency_decision.victims),
-                metadata=action_metadata,
-            )
             return UvmPolicyActionResult(
                 enabled=self.active,
                 allowed=False,
@@ -150,16 +147,6 @@ class UvmPolicyRuntime:
             },
         )
         if not coordinator_decision.allowed:
-            record_uvm_residency_action(
-                action="policy_kv_active_protect_skipped",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                fallback_reason=coordinator_decision.reason,
-                coordinator_mode=coordinator_decision.mode,
-                coordinator_reason=coordinator_decision.reason,
-                metadata=action_metadata,
-            )
             return UvmPolicyActionResult(
                 enabled=self.active,
                 allowed=False,
@@ -176,16 +163,6 @@ class UvmPolicyRuntime:
                 state="gpu",
                 metadata=action_metadata,
             )
-            record_uvm_residency_action(
-                action="policy_kv_active_protect_traced",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                mode=mode,
-                coordinator_mode=coordinator_decision.mode,
-                coordinator_reason=coordinator_decision.reason,
-                metadata=action_metadata,
-            )
             return UvmPolicyActionResult(
                 enabled=self.active,
                 allowed=True,
@@ -197,14 +174,6 @@ class UvmPolicyRuntime:
             )
 
         if not ranges:
-            record_uvm_residency_action(
-                action="policy_kv_active_protect_fallback",
-                pool="kv",
-                region_id=region_id,
-                bytes=size_bytes,
-                fallback_reason="missing_pointer_ranges",
-                metadata=action_metadata,
-            )
             return UvmPolicyActionResult(
                 enabled=self.active,
                 allowed=True,
@@ -242,21 +211,6 @@ class UvmPolicyRuntime:
         mark_uvm_residency_state(
             region_id=region_id,
             state="gpu" if issued else existing_state,
-            metadata=action_metadata,
-        )
-        record_uvm_residency_action(
-            action=(
-                "policy_kv_active_protect_issued"
-                if issued
-                else "policy_kv_active_protect_fallback"
-            ),
-            pool="kv",
-            region_id=region_id,
-            bytes=size_bytes,
-            mode=mode,
-            fallback_reason=None if issued else "uvm_action_failed",
-            coordinator_mode=coordinator_decision.mode,
-            coordinator_reason=coordinator_decision.reason,
             metadata=action_metadata,
         )
         return UvmPolicyActionResult(

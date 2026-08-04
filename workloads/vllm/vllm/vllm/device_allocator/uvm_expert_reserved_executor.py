@@ -8,7 +8,6 @@ their original managed VAs are remapped to readonly slot-backed GPU PTEs.
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 import time
@@ -60,33 +59,8 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _debug_trace_enabled() -> bool:
-    return _env_flag(
-        "VLLM_UVM_EXPERT_RESERVED_DEBUG_TRACE",
-        _env_flag("VLLM_UVM_WEIGHT_PREFETCH_TRACE_ENABLE", False),
-    )
 
 
-def _append_debug_trace(record: dict[str, Any]) -> None:
-    if not _debug_trace_enabled():
-        return
-    path = (
-        os.environ.get("VLLM_UVM_EXPERT_RESERVED_DEBUG_TRACE_FILE")
-        or os.environ.get("VLLM_UVM_WEIGHT_PREFETCH_TRACE_FILE")
-        or "/tmp/vllm_reserved_debug_trace.jsonl"
-    )
-    try:
-        enriched = {
-            "timestamp": time.time(),
-            "pid": os.getpid(),
-            "thread": threading.get_ident(),
-            "executor": "expert_reserved_regions_async",
-            **record,
-        }
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(enriched, sort_keys=True) + "\n")
-    except OSError:
-        logger.debug("Failed to write reserved expert debug trace", exc_info=True)
 
 
 def _page_size() -> int:
@@ -252,13 +226,6 @@ class ExpertReservedRegionsExecutor:
         if cached == desired:
             item.metadata["driver_registered"] = True
             item.metadata["driver_cpu_offloaded_reserved_registered"] = True
-            _append_debug_trace({
-                "action": "reserved_debug_register_region_cached",
-                "region_id": item.region_id,
-                "driver_region_id": item.driver_region_id,
-                "ptr": f"0x{item.ptr:x}",
-                "bytes": item.bytes,
-            })
             return 0
 
         queried = driver_query_region(int(item.driver_region_id))
@@ -275,13 +242,6 @@ class ExpertReservedRegionsExecutor:
                 self._registered_regions[int(item.driver_region_id)] = desired
                 item.metadata["driver_registered"] = True
                 item.metadata["driver_cpu_offloaded_reserved_registered"] = True
-                _append_debug_trace({
-                    "action": "reserved_debug_register_region_driver_cached",
-                    "region_id": item.region_id,
-                    "driver_region_id": item.driver_region_id,
-                    "ptr": f"0x{item.ptr:x}",
-                    "bytes": item.bytes,
-                })
                 return 0
             if (
                 item.metadata.get("stage")
@@ -292,15 +252,6 @@ class ExpertReservedRegionsExecutor:
                 self._registered_regions[int(item.driver_region_id)] = desired
                 item.metadata["driver_registered"] = True
                 item.metadata["driver_cpu_offloaded_reserved_registered"] = True
-                _append_debug_trace({
-                    "action": "reserved_debug_register_region_envelope_va_cached",
-                    "region_id": item.region_id,
-                    "driver_region_id": item.driver_region_id,
-                    "ptr": f"0x{item.ptr:x}",
-                    "bytes": item.bytes,
-                    "queried": queried,
-                    "desired": desired.__dict__,
-                })
                 return 0
 
         should_unregister = (
@@ -311,14 +262,6 @@ class ExpertReservedRegionsExecutor:
         if should_unregister:
             unregister_status = driver_unregister_region(int(item.driver_region_id))
             if unregister_status < 0:
-                _append_debug_trace({
-                    "action": "reserved_debug_unregister_before_register_failed",
-                    "region_id": item.region_id,
-                    "driver_region_id": item.driver_region_id,
-                    "status": unregister_status,
-                    "cached": cached.__dict__ if cached is not None else None,
-                    "queried": queried,
-                })
                 return int(unregister_status)
             self._registered_regions.pop(int(item.driver_region_id), None)
         status = driver_register_region(
@@ -408,24 +351,8 @@ class ExpertReservedRegionsExecutor:
             slot.last_event = None
             return False
         if self.wait_on_reuse:
-            wait_start_ns = time.perf_counter_ns()
-            _append_debug_trace({
-                "action": "reserved_debug_slot_event_wait_enter",
-                "pool_id": self.pool_id,
-                "slot_id": slot.slot_id,
-                "slot_state": slot.state,
-                "owner_layer_name": slot.owner_layer_name,
-                "owner_step": slot.owner_step,
-                "owner_expert_id": slot.owner_expert_id,
-            })
             event.synchronize()
             slot.last_event = None
-            _append_debug_trace({
-                "action": "reserved_debug_slot_event_wait_exit",
-                "pool_id": self.pool_id,
-                "slot_id": slot.slot_id,
-                "elapsed_us": (time.perf_counter_ns() - wait_start_ns) / 1000.0,
-            })
             return True
         return False
 
@@ -477,31 +404,7 @@ class ExpertReservedRegionsExecutor:
             if slot.last_event is not None:
                 self._wait_for_slot_locked(slot)
             elif slot.state == "IN_USE" and self.bank_sync_on_reuse:
-                sync_start_ns = time.perf_counter_ns()
-                _append_debug_trace({
-                    "action": "reserved_debug_bank_reuse_device_sync_enter",
-                    "layer_name": layer_name,
-                    "step": int(step),
-                    "pool_id": self.pool_id,
-                    "slot_id": slot.slot_id,
-                    "owner_layer_name": slot.owner_layer_name,
-                    "owner_step": slot.owner_step,
-                    "owner_layer_id": slot.owner_layer_id,
-                    "owner_expert_id": slot.owner_expert_id,
-                    "reason": reason,
-                })
                 torch.cuda.synchronize(self.device)
-                _append_debug_trace({
-                    "action": "reserved_debug_bank_reuse_device_sync_exit",
-                    "layer_name": layer_name,
-                    "step": int(step),
-                    "pool_id": self.pool_id,
-                    "slot_id": slot.slot_id,
-                    "elapsed_us": (
-                        time.perf_counter_ns() - sync_start_ns
-                    ) / 1000.0,
-                    "reason": reason,
-                })
 
         assignments = [
             {
@@ -511,15 +414,6 @@ class ExpertReservedRegionsExecutor:
             }
             for slot in stale_slots
         ]
-        ioctl_start_ns = time.perf_counter_ns()
-        _append_debug_trace({
-            "action": "reserved_debug_bank_reuse_invalidate_ioctl_enter",
-            "layer_name": layer_name,
-            "step": int(step),
-            "slot_ids": [slot.slot_id for slot in stale_slots],
-            "assignment_count": len(assignments),
-            "reason": reason,
-        })
         driver_result = driver_expert_reserved_prefetch_regions(
             assignments=assignments,
             device=self.device,
@@ -530,18 +424,6 @@ class ExpertReservedRegionsExecutor:
             return_entries=False,
         )
         ok = driver_result.get("ok") is True
-        _append_debug_trace({
-            "action": "reserved_debug_bank_reuse_invalidate_ioctl_exit",
-            "layer_name": layer_name,
-            "step": int(step),
-            "ok": ok,
-            "rm_status": driver_result.get("rm_status"),
-            "success_count": driver_result.get("success_count"),
-            "failure_count": driver_result.get("failure_count"),
-            "invalidated_slots": driver_result.get("invalidated_slots"),
-            "elapsed_us": (time.perf_counter_ns() - ioctl_start_ns) / 1000.0,
-            "reason": reason,
-        })
         if not ok:
             return {
                 "ok": False,
@@ -611,20 +493,6 @@ class ExpertReservedRegionsExecutor:
             if sync_before_compute is None
             else bool(sync_before_compute)
         )
-        _append_debug_trace({
-            "action": "reserved_debug_prefetch_enter",
-            "layer_name": layer_name,
-            "step": int(step),
-            "item_count": len(items),
-            "pool_id": self.pool_id,
-            "slot_count": self.slot_count,
-            "configured_slot_bytes": self.configured_slot_bytes,
-            "async": effective_async,
-            "sync_before_compute": effective_sync_before_compute,
-            "prefetch_cpu_source": self.prefetch_cpu_source,
-            "slot_policy": self.slot_policy,
-            "bank_count": self.bank_count,
-        })
         page_size = _page_size()
         valid_items: list[ReservedRegionItem] = []
         for item in items:
@@ -633,12 +501,6 @@ class ExpertReservedRegionsExecutor:
             valid_items.append(item)
 
         if not valid_items:
-            _append_debug_trace({
-                "action": "reserved_debug_prefetch_no_regions",
-                "layer_name": layer_name,
-                "step": int(step),
-                "elapsed_us": (time.perf_counter_ns() - start_ns) / 1000.0,
-            })
             return {
                 "ok": True,
                 "status": "no_regions",
@@ -669,25 +531,7 @@ class ExpertReservedRegionsExecutor:
         reused_slot_ids: set[int] = set()
 
         with self._lock:
-            slot_check_start_ns = time.perf_counter_ns()
-            _append_debug_trace({
-                "action": "reserved_debug_preallocated_slot_check_enter",
-                "layer_name": layer_name,
-                "step": int(step),
-                "required_slot_bytes": required_slot_bytes,
-                "slot_count": self.slot_count,
-                "pool_id": self.pool_id,
-            })
             slot_check = self._ensure_preallocated_locked(required_slot_bytes)
-            _append_debug_trace({
-                "action": "reserved_debug_preallocated_slot_check_exit",
-                "layer_name": layer_name,
-                "step": int(step),
-                "ok": slot_check.get("ok") is True,
-                "reason": slot_check.get("reason"),
-                "slot_bytes": self.slot_bytes,
-                "elapsed_us": (time.perf_counter_ns() - slot_check_start_ns) / 1000.0,
-            })
             if slot_check.get("ok") is not True:
                 return {
                     "ok": False,
@@ -839,18 +683,6 @@ class ExpertReservedRegionsExecutor:
             register_failures: list[dict[str, Any]] = []
 
             for item in items_to_load:
-                _append_debug_trace({
-                    "action": "reserved_debug_assign_item_enter",
-                    "layer_name": layer_name,
-                    "step": int(step),
-                    "region_id": item.region_id,
-                    "driver_region_id": item.driver_region_id,
-                    "bytes": item.bytes,
-                    "expert_id": item.global_expert_id,
-                    "role": item.role,
-                    "slot_policy": self.slot_policy,
-                    "bank_slot_ids": bank_slot_ids,
-                })
                 slot = self._choose_slot_locked(used_slots, bank_slot_ids)
                 if slot is None:
                     register_failures.append({
@@ -866,15 +698,6 @@ class ExpertReservedRegionsExecutor:
                 self._free_cursor = (slot.slot_id + 1) % self.slot_count
 
                 register_status = self._ensure_driver_region(item)
-                _append_debug_trace({
-                    "action": "reserved_debug_register_region_exit",
-                    "layer_name": layer_name,
-                    "step": int(step),
-                    "region_id": item.region_id,
-                    "driver_region_id": item.driver_region_id,
-                    "slot_id": slot.slot_id,
-                    "register_status": register_status,
-                })
                 if register_status < 0:
                     register_failures.append({
                         "region_id": item.region_id,
@@ -916,13 +739,6 @@ class ExpertReservedRegionsExecutor:
 
         if not assignments and not reused_items:
             elapsed_us = (time.perf_counter_ns() - start_ns) / 1000.0
-            _append_debug_trace({
-                "action": "reserved_debug_prefetch_no_assignments",
-                "layer_name": layer_name,
-                "step": int(step),
-                "elapsed_us": elapsed_us,
-                "register_failures": register_failures,
-            })
             return {
                 "ok": False,
                 "status": "no_assignments",
@@ -939,14 +755,6 @@ class ExpertReservedRegionsExecutor:
 
         source_offload_result: dict[str, Any] | None = None
         if assignments and self.prefetch_cpu_source:
-            source_start_ns = time.perf_counter_ns()
-            _append_debug_trace({
-                "action": "reserved_debug_source_offload_enter",
-                "layer_name": layer_name,
-                "step": int(step),
-                "range_count": len(source_ranges),
-                "bytes": sum(size for _, size in source_ranges),
-            })
             try:
                 (
                     source_successes,
@@ -983,18 +791,6 @@ class ExpertReservedRegionsExecutor:
                     "prefetch_result": int(source_prefetch_result),
                     "range_count": len(source_ranges),
                 }
-                _append_debug_trace({
-                    "action": "reserved_debug_source_offload_exit",
-                    "layer_name": layer_name,
-                    "step": int(step),
-                    "ok": int(source_successes) == len(source_ranges),
-                    "successes": int(source_successes),
-                    "advise_result": int(source_advise_result),
-                    "prefetch_result": int(source_prefetch_result),
-                    "elapsed_us": (
-                        time.perf_counter_ns() - source_start_ns
-                    ) / 1000.0,
-                })
             except Exception as exc:
                 logger.debug(
                     "Failed to CPU-offload reserved expert source ranges",
@@ -1007,15 +803,6 @@ class ExpertReservedRegionsExecutor:
                     "error": repr(exc),
                     "range_count": len(source_ranges),
                 }
-                _append_debug_trace({
-                    "action": "reserved_debug_source_offload_exception",
-                    "layer_name": layer_name,
-                    "step": int(step),
-                    "error": repr(exc),
-                    "elapsed_us": (
-                        time.perf_counter_ns() - source_start_ns
-                    ) / 1000.0,
-                })
         else:
             source_offload_result = {
                 "enabled": False,
@@ -1024,18 +811,6 @@ class ExpertReservedRegionsExecutor:
             }
 
         if assignments:
-            ioctl_start_ns = time.perf_counter_ns()
-            _append_debug_trace({
-                "action": "reserved_debug_prefetch_ioctl_enter",
-                "layer_name": layer_name,
-                "step": int(step),
-                "assignment_count": len(assignments),
-                "assigned_slots": [record["slot_id"] for record in slot_records],
-                "requested_bytes": sum(
-                    int(item["bytes_override"]) for item in assignments
-                ),
-                "mode": "reserved_prefetch",
-            })
             if before_driver_ioctl is not None:
                 before_driver_ioctl()
             try:
@@ -1051,17 +826,6 @@ class ExpertReservedRegionsExecutor:
             finally:
                 if after_driver_ioctl is not None:
                     after_driver_ioctl()
-            _append_debug_trace({
-                "action": "reserved_debug_prefetch_ioctl_exit",
-                "layer_name": layer_name,
-                "step": int(step),
-                "ok": driver_result.get("ok") is True,
-                "rm_status": driver_result.get("rm_status"),
-                "success_count": driver_result.get("success_count"),
-                "failure_count": driver_result.get("failure_count"),
-                "accepted_bytes": driver_result.get("accepted_bytes"),
-                "elapsed_us": (time.perf_counter_ns() - ioctl_start_ns) / 1000.0,
-            })
         else:
             driver_result = {
                 "ok": True,
@@ -1078,23 +842,7 @@ class ExpertReservedRegionsExecutor:
             and driver_result.get("ok") is True
         ):
             try:
-                sync_start_ns = time.perf_counter_ns()
-                _append_debug_trace({
-                    "action": "reserved_debug_sync_before_compute_enter",
-                    "layer_name": layer_name,
-                    "step": int(step),
-                    "device": self.device,
-                })
                 torch.cuda.synchronize(self.device)
-                _append_debug_trace({
-                    "action": "reserved_debug_sync_before_compute_exit",
-                    "layer_name": layer_name,
-                    "step": int(step),
-                    "device": self.device,
-                    "elapsed_us": (
-                        time.perf_counter_ns() - sync_start_ns
-                    ) / 1000.0,
-                })
             except Exception:
                 logger.debug(
                     "Failed to synchronize after reserved expert prefetch",
@@ -1176,17 +924,6 @@ class ExpertReservedRegionsExecutor:
                     slot.state = "READY"
 
         elapsed_us = (time.perf_counter_ns() - start_ns) / 1000.0
-        _append_debug_trace({
-            "action": "reserved_debug_prefetch_exit",
-            "layer_name": layer_name,
-            "step": int(step),
-            "ok": driver_result.get("ok") is True and not register_failures,
-            "success_count": len(successful_region_ids),
-            "failure_count": len(failed_region_ids),
-            "elapsed_us": elapsed_us,
-            "successful_region_ids": successful_region_ids,
-            "failed_region_ids": failed_region_ids,
-        })
         return {
             "ok": driver_result.get("ok") is True and not register_failures,
             "status": "ok" if driver_result.get("ok") is True else "driver_failed",
@@ -1225,14 +962,6 @@ class ExpertReservedRegionsExecutor:
     ) -> dict[str, Any]:
         start_ns = time.perf_counter_ns()
         layer_key = (str(layer_name), int(step))
-        _append_debug_trace({
-            "action": "reserved_debug_cleanup_enter",
-            "layer_name": layer_name,
-            "step": int(step),
-            "record_event": bool(record_event),
-            "invalidate": bool(invalidate),
-            "cleanup_synchronize": self.cleanup_synchronize,
-        })
         with self._lock:
             slot_ids = sorted(self._active_layer_slots.pop(layer_key, set()))
             slots = [
@@ -1242,12 +971,6 @@ class ExpertReservedRegionsExecutor:
             ]
 
         if not slots:
-            _append_debug_trace({
-                "action": "reserved_debug_cleanup_no_active_slots",
-                "layer_name": layer_name,
-                "step": int(step),
-                "elapsed_us": (time.perf_counter_ns() - start_ns) / 1000.0,
-            })
             return {
                 "ok": True,
                 "status": "no_active_slots",
@@ -1259,56 +982,12 @@ class ExpertReservedRegionsExecutor:
 
         event: torch.cuda.Event | None = None
         if record_event:
-            event_start_ns = time.perf_counter_ns()
-            _append_debug_trace({
-                "action": "reserved_debug_cleanup_event_record_enter",
-                "layer_name": layer_name,
-                "step": int(step),
-                "slot_ids": slot_ids,
-            })
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream())
-            _append_debug_trace({
-                "action": "reserved_debug_cleanup_event_record_exit",
-                "layer_name": layer_name,
-                "step": int(step),
-                "elapsed_us": (time.perf_counter_ns() - event_start_ns) / 1000.0,
-            })
             if self.cleanup_synchronize or invalidate:
-                sync_start_ns = time.perf_counter_ns()
-                _append_debug_trace({
-                    "action": "reserved_debug_cleanup_event_sync_enter",
-                    "layer_name": layer_name,
-                    "step": int(step),
-                    "slot_ids": slot_ids,
-                    "invalidate_after_sync": bool(invalidate),
-                })
                 event.synchronize()
-                _append_debug_trace({
-                    "action": "reserved_debug_cleanup_event_sync_exit",
-                    "layer_name": layer_name,
-                    "step": int(step),
-                    "elapsed_us": (time.perf_counter_ns() - sync_start_ns) / 1000.0,
-                })
                 if self.cleanup_synchronize:
-                    device_sync_start_ns = time.perf_counter_ns()
-                    _append_debug_trace({
-                        "action": "reserved_debug_cleanup_device_sync_enter",
-                        "layer_name": layer_name,
-                        "step": int(step),
-                        "slot_ids": slot_ids,
-                        "device": self.device,
-                    })
                     torch.cuda.synchronize(self.device)
-                    _append_debug_trace({
-                        "action": "reserved_debug_cleanup_device_sync_exit",
-                        "layer_name": layer_name,
-                        "step": int(step),
-                        "device": self.device,
-                        "elapsed_us": (
-                            time.perf_counter_ns() - device_sync_start_ns
-                        ) / 1000.0,
-                    })
 
         if self._layer_mod_bank_enabled():
             pending_regions: list[dict[str, Any]] = []
@@ -1334,15 +1013,6 @@ class ExpertReservedRegionsExecutor:
                     )
                     slot.last_event = None if self.cleanup_synchronize else event
             elapsed_us = (time.perf_counter_ns() - start_ns) / 1000.0
-            _append_debug_trace({
-                "action": "reserved_debug_cleanup_defer_invalidate_exit",
-                "layer_name": layer_name,
-                "step": int(step),
-                "slot_ids": slot_ids,
-                "pending_region_count": len(pending_regions),
-                "elapsed_us": elapsed_us,
-                "slot_policy": self.slot_policy,
-            })
             return {
                 "ok": True,
                 "status": "deferred_until_bank_reuse",
@@ -1366,14 +1036,6 @@ class ExpertReservedRegionsExecutor:
         ]
         driver_result: dict[str, Any] | None = None
         if invalidate:
-            ioctl_start_ns = time.perf_counter_ns()
-            _append_debug_trace({
-                "action": "reserved_debug_cleanup_invalidate_ioctl_enter",
-                "layer_name": layer_name,
-                "step": int(step),
-                "slot_ids": slot_ids,
-                "assignment_count": len(assignments),
-            })
             driver_result = driver_expert_reserved_prefetch_regions(
                 assignments=assignments,
                 device=self.device,
@@ -1383,17 +1045,6 @@ class ExpertReservedRegionsExecutor:
                 prefer_existing=True,
                 return_entries=False,
             )
-            _append_debug_trace({
-                "action": "reserved_debug_cleanup_invalidate_ioctl_exit",
-                "layer_name": layer_name,
-                "step": int(step),
-                "ok": driver_result.get("ok") is True,
-                "rm_status": driver_result.get("rm_status"),
-                "success_count": driver_result.get("success_count"),
-                "failure_count": driver_result.get("failure_count"),
-                "invalidated_slots": driver_result.get("invalidated_slots"),
-                "elapsed_us": (time.perf_counter_ns() - ioctl_start_ns) / 1000.0,
-            })
 
         invalidated_regions: list[dict[str, Any]] = []
         with self._lock:
@@ -1435,16 +1086,6 @@ class ExpertReservedRegionsExecutor:
             ok = False
             status = "invalidate_failed"
         elapsed_us = (time.perf_counter_ns() - start_ns) / 1000.0
-        _append_debug_trace({
-            "action": "reserved_debug_cleanup_exit",
-            "layer_name": layer_name,
-            "step": int(step),
-            "ok": ok,
-            "status": status,
-            "invalidated_slots": len(slots),
-            "region_count": len(invalidated_regions),
-            "elapsed_us": elapsed_us,
-        })
         return {
             "ok": ok,
             "status": status,

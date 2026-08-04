@@ -290,11 +290,6 @@ class KVCacheManager:
             return None
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
-            self.uvm_kv_runtime_policy.record_reuse_failure(
-                request_id=request.request_id,
-                num_blocks_to_allocate=num_blocks_to_allocate,
-                block_pool=self.block_pool,
-            )
             # Cannot allocate new blocks
             return None
 

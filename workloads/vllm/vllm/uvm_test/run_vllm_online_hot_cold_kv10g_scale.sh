@@ -182,7 +182,6 @@ run_case() {
     "${dir}/run.log" \
     "${dir}/returncode.txt" \
     "${dir}/routing_trace.jsonl" \
-    "${dir}/expert_trace.jsonl" \
     "${dir}/kv_runtime_trace.jsonl" \
     "${dir}/kv_physical_trace.jsonl" \
     "${dir}/residency_trace.jsonl" \
@@ -216,6 +215,8 @@ run_case() {
       env_args+=(
         VLLM_UVM_EXPERT_WEIGHTS_MANAGED=1
         VLLM_UVM_KV_CACHE_MANAGED=1
+        VLLM_UVM_EXPERT_ENVELOPE_ENABLE=1
+        VLLM_UVM_EXPERT_ENVELOPE_BYTES=524288
         VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE=remote_read
         VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE=1
         VLLM_UVM_INIT_WEIGHT_OFFLOAD_MODE=driver_release_cpu
@@ -223,10 +224,7 @@ run_case() {
         VLLM_UVM_INIT_WEIGHT_PLAN_FILE="${PLAN}"
         VLLM_UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN=1
         VLLM_UVM_INIT_WEIGHT_TARGET_ROLES=moe_gate_up,moe_down
-        VLLM_UVM_INIT_WEIGHT_MAX_EXPERTS_PER_LAYER=128
         VLLM_UVM_INIT_WEIGHT_SYNC=1
-        VLLM_UVM_INIT_WEIGHT_TRACE_FILE="${dir}/expert_trace.jsonl"
-        VLLM_UVM_INIT_WEIGHT_REGISTER_ALL_LOCAL_EXPERTS=1
         VLLM_UVM_INIT_WEIGHT_COMPLETE_EXPERT_PLAN=1
         VLLM_UVM_WEIGHT_BATCH_EXECUTOR_ENABLE=1
         VLLM_UVM_WEIGHT_EXECUTOR=cpp_batch
@@ -239,7 +237,6 @@ run_case() {
         VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_ENABLE=1
         VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_EXECUTOR=cpp_batch
         VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_SYNC=1
-        VLLM_UVM_POST_WARMUP_REBALANCE_TRACE_FILE="${dir}/kv_physical_trace.jsonl"
         VLLM_UVM_RESIDENCY_TRACE_ENABLE="${RESIDENCY_TRACE_ENABLE}"
         VLLM_UVM_RESIDENCY_TRACE_FILE="${dir}/residency_trace.jsonl"
         VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE="${RESIDENCY_KV_METADATA_ENABLE}"
@@ -379,19 +376,6 @@ cases = {}
 for name in ("pilot", "adaptive", "static_custom", "native_uva"):
     if (root / name / "result.json").exists():
         cases[name] = summarize_case(name)
-
-for name in ("adaptive", "static_custom"):
-    if name not in cases:
-        continue
-    records = read_jsonl(root / name / "expert_trace.jsonl")
-    issued = [
-        record for record in records
-        if record.get("action") == "init_weight_remote_read_prepare_issued"
-    ]
-    cases[name]["remote_prepare_records"] = len(issued)
-    cases[name]["remote_prepare_bytes"] = sum(
-        int(record.get("bytes") or 0) for record in issued
-    )
 
 if "native_uva" in cases:
     parameters = [

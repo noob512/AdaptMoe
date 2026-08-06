@@ -61,7 +61,6 @@ from vllm.device_allocator.uvm_pool_residency import (
     get_uvm_pool_residency_manager,
     get_uvm_real_residency_snapshot,
     get_uvm_residency_region_snapshot,
-    mark_uvm_residency_state,
     register_uvm_residency_region,
 )
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
@@ -5038,19 +5037,13 @@ class GPUModelRunner(
         self,
         kv_cache_config: KVCacheConfig,
         kv_caches: dict[str, Any],
-        phase: str,
-    ) -> dict[str, Any]:
+    ) -> None:
         records: list[dict[str, Any]] = []
-        skipped_non_tensor = 0
-        skipped_non_cuda = 0
-        skipped_noncontiguous = 0
-        skipped_invalid = 0
         total_blocks = max(int(kv_cache_config.num_blocks) - 1, 0)
 
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             page_size = int(group.kv_cache_spec.page_size_bytes)
             if page_size <= 0:
-                skipped_invalid += 1
                 continue
             for layer_name in group.layer_names:
                 cache_value = kv_caches.get(layer_name)
@@ -5059,69 +5052,35 @@ class GPUModelRunner(
                 )
                 for tensor_index, tensor in enumerate(tensors):
                     if not isinstance(tensor, torch.Tensor):
-                        skipped_non_tensor += 1
                         continue
                     if not tensor.is_cuda:
-                        skipped_non_cuda += 1
                         continue
                     if not tensor.is_contiguous():
-                        skipped_noncontiguous += 1
                         continue
                     ptr = int(tensor.data_ptr())
                     size_bytes = int(tensor.numel() * tensor.element_size())
                     if ptr <= 0 or size_bytes <= 0:
-                        skipped_invalid += 1
                         continue
                     allocation_blocks = size_bytes // page_size
                     max_block_id = min(total_blocks, allocation_blocks - 1)
                     if max_block_id <= 0:
-                        skipped_invalid += 1
                         continue
                     records.append(
                         {
-                            "phase": phase,
-                            "source": "initialize_kv_cache",
-                            "group_id": group_id,
-                            "layer_name": layer_name,
-                            "tensor_index": tensor_index,
+                            "span_id": (
+                                f"kv_phys:{group_id}:{layer_name}:{tensor_index}"
+                            ),
                             "ptr": ptr,
                             "size_bytes": size_bytes,
                             "page_size": page_size,
-                            "total_blocks": total_blocks,
-                            "allocation_blocks": allocation_blocks,
                             "max_block_id": max_block_id,
-                            "dtype": str(tensor.dtype),
-                            "shape": list(tensor.shape),
-                            "stride": list(tensor.stride()),
-                            "device": str(tensor.device),
                         }
                     )
 
-        result = register_uvm_kv_cache_physical_ranges(
+        register_uvm_kv_cache_physical_ranges(
             records,
             clear_existing=True,
         )
-        result.update(
-            {
-                "phase": phase,
-                "records": len(records),
-                "total_blocks": total_blocks,
-                "skipped_non_tensor": skipped_non_tensor,
-                "skipped_non_cuda": skipped_non_cuda,
-                "skipped_noncontiguous": skipped_noncontiguous,
-                "skipped_invalid": skipped_invalid,
-            }
-        )
-        logger.info(
-            "Registered UVM KV physical ranges phase=%s records=%d "
-            "registered=%d skipped_noncontiguous=%d skipped_invalid=%d",
-            phase,
-            len(records),
-            int(result.get("registered") or 0),
-            skipped_noncontiguous,
-            skipped_invalid,
-        )
-        return result
 
     def _collect_uvm_post_warmup_kv_tail_ranges(
         self,
@@ -5315,12 +5274,11 @@ class GPUModelRunner(
         first_block = min(old_target, new_target) + 1
         last_block = max(old_target, new_target)
         block_ids = list(range(first_block, last_block + 1))
-        collection = collect_uvm_kv_cache_physical_ranges_for_blocks(block_ids)
-        ranges = list(collection.get("ranges") or [])
+        ranges = collect_uvm_kv_cache_physical_ranges_for_blocks(block_ids)
         if not ranges:
             return {
                 "ok": False,
-                "reason": str(collection.get("reason") or "no_registered_ranges"),
+                "reason": "no_registered_ranges",
                 "direction": direction,
                 "old_target_blocks": old_target,
                 "new_target_blocks": new_target,
@@ -5345,7 +5303,6 @@ class GPUModelRunner(
                 "VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_SYNC", "1"
             ).strip().lower() in ("1", "true", "yes", "on"):
                 torch.cuda.synchronize(device)
-            state = "gpu"
             result_fields: dict[str, Any] = {"driver_result": driver_result}
         else:
             successes, executor_used, advise_result, prefetch_result = (
@@ -5355,27 +5312,12 @@ class GPUModelRunner(
                     executor=executor,
                 )
             )
-            state = "cpu"
             result_fields = {
                 "driver_advise_result": advise_result,
                 "driver_prefetch_result": prefetch_result,
             }
 
         complete = int(successes) == len(ranges)
-        if complete:
-            for block_id in block_ids:
-                for group_id in range(len(kv_cache_config.kv_cache_groups)):
-                    mark_uvm_residency_state(
-                        region_id=f"kv:{group_id}:{block_id}",
-                        state=state,
-                        metadata={
-                            "source": "worker_adaptive_kv_resize",
-                            "reason": reason,
-                            "direction": direction,
-                            "old_target_blocks": old_target,
-                            "new_target_blocks": new_target,
-                        },
-                    )
         result = {
             "ok": complete,
             "reason": "complete" if complete else "partial",
@@ -5384,7 +5326,7 @@ class GPUModelRunner(
             "new_target_blocks": new_target,
             "block_count": len(block_ids),
             "range_count": len(ranges),
-            "range_bytes": int(collection.get("range_bytes") or 0),
+            "range_bytes": sum(size for _, size in ranges),
             "successes": int(successes),
             "executor": executor_used,
             "elapsed_seconds": time.monotonic() - start,
@@ -8443,29 +8385,9 @@ class GPUModelRunner(
             len(kv_caches),
             time.monotonic() - section_start,
         )
-        section_start = time.monotonic()
-        logger.warning("UVM controlled remap debug: model_runner _log_kv_cache_addresses begin")
-        self._log_kv_cache_addresses(kv_caches, "initialize_kv_cache")
-        logger.warning(
-            "UVM controlled remap debug: model_runner _log_kv_cache_addresses end "
-            "elapsed=%.3fs",
-            time.monotonic() - section_start,
-        )
-        section_start = time.monotonic()
-        logger.warning(
-            "UVM controlled remap debug: model_runner "
-            "_register_uvm_kv_cache_physical_ranges begin"
-        )
-        kv_physical_result = self._register_uvm_kv_cache_physical_ranges(
+        self._register_uvm_kv_cache_physical_ranges(
             kv_cache_config,
             kv_caches,
-            "initialize_kv_cache",
-        )
-        logger.warning(
-            "UVM controlled remap debug: model_runner "
-            "_register_uvm_kv_cache_physical_ranges end result=%s elapsed=%.3fs",
-            kv_physical_result,
-            time.monotonic() - section_start,
         )
         logger.warning(
             "UVM controlled remap debug: model_runner initialize_kv_cache_tensors returning "

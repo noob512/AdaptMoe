@@ -1227,7 +1227,7 @@ static unsigned long uvm_phase_n_block_base_key(uvm_va_range_managed_t *managed_
 static uvm_phase_f_region_t *uvm_phase_n_find_tagged_region(uvm_va_space_t *va_space, NvU64 address)
 {
     uvm_range_tree_node_t *node;
-    uvm_phase_f_region_t *region;
+    uvm_phase_f_region_t *region = NULL;
 
     uvm_assert_rwsem_locked(&va_space->lock);
 
@@ -5995,9 +5995,7 @@ static NV_STATUS uvm_phase_f_expert_batch_fill_entries(uvm_va_space_t *va_space,
 
 static bool uvm_phase_f_registered_region_is_expert_weight(const uvm_phase_f_region_t *region)
 {
-    return region->pool == UVM_PHASE_N_POOL_WEIGHT &&
-           (region->role == UVM_PHASE_N_ROLE_MOE_EXPERT_W13 ||
-            region->role == UVM_PHASE_N_ROLE_MOE_EXPERT_W2);
+    return region && region->region_id != 0 && region->base != 0 && region->length != 0;
 }
 
 static NV_STATUS uvm_phase_f_expert_batch_collect_region(uvm_va_space_t *va_space,
@@ -6719,11 +6717,13 @@ static NV_STATUS uvm_api_phase_f_register_region(UVM_PHASE_F_REGISTER_REGION_PAR
     region->region_id = params->region.region_id;
     region->base = params->region.base;
     region->length = params->region.length;
-    region->pool = params->region.pool;
-    region->layer_id = params->region.layer_id;
-    region->expert_id = params->region.expert_id;
-    region->role = params->region.role;
-    region->flags = params->region.flags;
+    // Compatibility ABI fields are intentionally ignored. Region identity,
+    // geometry and state are the complete kernel-side contract.
+    region->pool = UVM_PHASE_N_POOL_UNKNOWN;
+    region->layer_id = 0;
+    region->expert_id = 0;
+    region->role = 0;
+    region->flags = 0;
     region->state = UVM_PHASE_N_REGION_STATE_UNKNOWN;
     region->priority = 0;
     region->last_access_epoch = 0;
@@ -6738,10 +6738,6 @@ static NV_STATUS uvm_api_phase_f_register_region(UVM_PHASE_F_REGISTER_REGION_PAR
         if (status != NV_OK)
             uvm_range_tree_remove(&va_space->phase_f_region_ranges, &region->va_node);
     }
-    if (status == NV_OK &&
-        !(region->flags & UVM_PHASE_N_REGION_FLAG_EXPERT_ENVELOPE)) {
-        uvm_phase_n_native_attach_region(va_space, region);
-    }
     uvm_va_space_up_write(va_space);
 
     if (status != NV_OK) {
@@ -6749,26 +6745,11 @@ static NV_STATUS uvm_api_phase_f_register_region(UVM_PHASE_F_REGISTER_REGION_PAR
         return status;
     }
 
-    uvm_phase_f_route_log("phase_f_register_region id=%llu base=0x%llx length=%llu pool=%u layer=%u expert=%u role=%u flags=0x%x\n",
+    uvm_phase_f_route_log("phase_f_register_region id=%llu base=0x%llx length=%llu state=%u\n",
                           region->region_id,
                           region->base,
                           region->length,
-                          region->pool,
-                          region->layer_id,
-                          region->expert_id,
-                          region->role,
-                          region->flags);
-    if (uvm_phase_n_range_tagging_enabled()) {
-        uvm_phase_f_route_log("phase_n_tagged_range_register region_id=%llu base=0x%llx length=%llu pool=%u role=%u flags=0x%x aligned_2mb_base=%u aligned_2mb_length=%u\n",
-                              region->region_id,
-                              region->base,
-                              region->length,
-                              region->pool,
-                              region->role,
-                              region->flags,
-                              IS_ALIGNED(region->base, UVM_VA_BLOCK_SIZE) ? 1 : 0,
-                              IS_ALIGNED(region->length, UVM_VA_BLOCK_SIZE) ? 1 : 0);
-    }
+                          region->state);
 
     return NV_OK;
 }
@@ -6784,8 +6765,6 @@ static NV_STATUS uvm_api_phase_f_unregister_region(UVM_PHASE_F_UNREGISTER_REGION
     uvm_va_space_down_write(va_space);
     region = radix_tree_delete(&va_space->phase_f_regions, params->region_id);
     if (region) {
-        if (!(region->flags & UVM_PHASE_N_REGION_FLAG_EXPERT_ENVELOPE))
-            uvm_phase_n_native_detach_region(va_space, region);
         uvm_range_tree_remove(&va_space->phase_f_region_ranges, &region->va_node);
     }
     uvm_va_space_up_write(va_space);
@@ -11273,7 +11252,7 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
     uvm_va_space_t *va_space = uvm_va_space_get(filp);
     uvm_gpu_t *gpu = NULL;
     struct mm_struct *mm = NULL;
-    uvm_phase_f_region_t *region;
+    uvm_phase_f_region_t *region = NULL;
     uvm_va_block_context_t *block_context = NULL;
     NvU64 region_end;
     NvU64 addr;
@@ -11311,18 +11290,16 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
         goto done_unlock;
     }
 
-    if ((params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT) &&
-        !uvm_phase_f_registered_region_is_expert_weight(region)) {
-        status = NV_ERR_NOT_SUPPORTED;
-        goto done_unlock;
-    }
-
-    params->pool = region->pool;
-    params->layer_id = region->layer_id;
-    params->expert_id = region->expert_id;
-    params->role = region->role;
     params->base = region->base;
     params->length = region->length;
+
+    if (region->state == UVM_PHASE_N_REGION_STATE_CPU)
+        goto done_unlock;
+    if (region->state == UVM_PHASE_N_REGION_STATE_UNKNOWN) {
+        status = NV_ERR_INVALID_STATE;
+        goto done_unlock;
+    }
+    region->state = UVM_PHASE_N_REGION_STATE_PREFETCHING_CPU;
 
     if (region->length == 0) {
         status = NV_ERR_INVALID_ARGUMENT;
@@ -11443,6 +11420,11 @@ next_range:
 done_unlock:
     if (status == NV_OK && params->first_error != NV_OK)
         status = params->first_error;
+    if (region) {
+        region->state = status == NV_OK ?
+                        UVM_PHASE_N_REGION_STATE_CPU :
+                        UVM_PHASE_N_REGION_STATE_UNKNOWN;
+    }
 
     uvm_va_space_up_write(va_space);
     uvm_va_space_mm_or_current_release_unlock(va_space, mm);
@@ -11450,12 +11432,8 @@ done_unlock:
 
     params->rmStatus = status;
 
-    uvm_phase_f_route_log("expert_offload_release region_id=%llu pool=%u layer=%u expert=%u role=%u base=0x%llx length=%llu blocks=%llu attempted=%u success=%u failure=%u skipped=%u attempted_bytes=%llu released_bytes=%llu failed_bytes=%llu remote_blocks=%u remote_failures=%u cpu_bytes=%llu remote_bytes=%llu newly_remote_bytes=%llu first_failed=0x%llx status=0x%x\n",
+    uvm_phase_f_route_log("region_release region_id=%llu base=0x%llx length=%llu blocks=%llu attempted=%u success=%u failure=%u skipped=%u attempted_bytes=%llu released_bytes=%llu failed_bytes=%llu remote_blocks=%u remote_failures=%u cpu_bytes=%llu remote_bytes=%llu newly_remote_bytes=%llu first_failed=0x%llx status=0x%x\n",
                           params->region_id,
-                          params->pool,
-                          params->layer_id,
-                          params->expert_id,
-                          params->role,
                           params->base,
                           params->length,
                           params->block_count,
@@ -12832,26 +12810,16 @@ static NV_STATUS uvm_api_phase_n_update_region_state(UVM_PHASE_N_UPDATE_REGION_S
 
     uvm_va_space_down_write(va_space);
     region = radix_tree_lookup(&va_space->phase_f_regions, params->region_id);
-    if (region) {
+    if (region)
         region->state = params->state;
-        region->flags &= ~params->flags_clear;
-        region->flags |= params->flags_set;
-        region->priority = params->priority;
-        region->last_access_epoch = params->last_access_epoch;
-        uvm_phase_n_native_sync_region_flags(va_space, region);
-    }
     uvm_va_space_up_write(va_space);
 
     if (!region)
         return NV_ERR_OBJECT_NOT_FOUND;
 
-    uvm_phase_f_route_log("phase_n_update_region_state id=%llu state=%u flags_set=0x%x flags_clear=0x%x priority=%u last_access_epoch=%llu\n",
+    uvm_phase_f_route_log("region_state_update id=%llu state=%u\n",
                           params->region_id,
-                          params->state,
-                          params->flags_set,
-                          params->flags_clear,
-                          params->priority,
-                          params->last_access_epoch);
+                          params->state);
 
     return NV_OK;
 }

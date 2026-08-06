@@ -43,6 +43,14 @@ from vllm.device_allocator.uvm_pool_residency import (
     mark_uvm_residency_state,
     record_uvm_residency_access,
     register_uvm_residency_region,
+    register_uvm_region,
+    release_uvm_regions,
+    restore_uvm_regions,
+)
+from vllm.device_allocator.uvm_region import (
+    ExpertRecord,
+    RegionState,
+    compile_expert_envelopes,
 )
 from vllm.distributed import (
     get_dp_group,
@@ -906,16 +914,6 @@ class FusedMoE(CustomOp):
             "vllm_uvm_moe_routing_trace.jsonl",
         )
         self._uvm_moe_trace_step = 0
-        self.uvm_moe_address_map_enabled = _env_flag_enabled(
-            "VLLM_UVM_MOE_ADDRESS_MAP_ENABLE", default=False
-        )
-        self.uvm_moe_address_map_file = os.environ.get(
-            "VLLM_UVM_MOE_ADDRESS_MAP_FILE",
-            "vllm_uvm_moe_address_map.jsonl",
-        )
-        self.uvm_moe_address_map_driver_probe = _env_flag_enabled(
-            "VLLM_UVM_MOE_ADDRESS_MAP_DRIVER_PROBE", default=True
-        )
         self.uvm_weight_prefetch_enabled = _env_flag_enabled(
             "VLLM_UVM_WEIGHT_PREFETCH_ENABLE", default=False
         )
@@ -1040,16 +1038,9 @@ class FusedMoE(CustomOp):
             "VLLM_UVM_WEIGHT_PREFETCH_EXPERT_CACHE_ENABLE",
             default=True,
         )
-        self._uvm_weight_expert_role_states: dict[tuple[str, int], dict[str, str]] = {}
+        self._uvm_expert_records: dict[tuple[int, int], ExpertRecord] = {}
         self._uvm_weight_full_gpu_experts: set[tuple[str, int]] = set()
-        self.uvm_weight_prefetch_target_roles = {
-            role.strip()
-            for role in os.environ.get(
-                "VLLM_UVM_WEIGHT_PREFETCH_TARGET_ROLES",
-                "moe_gate_up,moe_down",
-            ).split(",")
-            if role.strip()
-        }
+        self.uvm_weight_prefetch_target_roles = {"moe_gate_up", "moe_down"}
         self.uvm_weight_prefetch_device = _env_int(
             "VLLM_UVM_WEIGHT_PREFETCH_DEVICE",
             default=-1,
@@ -1286,14 +1277,7 @@ class FusedMoE(CustomOp):
             "VLLM_UVM_INIT_WEIGHT_REQUIRE_ROUTING_PLAN",
             default=False,
         )
-        self.uvm_init_weight_offload_target_roles = {
-            role.strip()
-            for role in os.environ.get(
-                "VLLM_UVM_INIT_WEIGHT_TARGET_ROLES",
-                ",".join(sorted(self.uvm_weight_prefetch_target_roles)),
-            ).split(",")
-            if role.strip()
-        }
+        self.uvm_init_weight_offload_target_roles = {"moe_gate_up", "moe_down"}
         self.uvm_init_weight_offload_max_bytes = _env_int(
             "VLLM_UVM_INIT_WEIGHT_MAX_BYTES",
             default=0,
@@ -2779,15 +2763,6 @@ class FusedMoE(CustomOp):
             topk_weights=topk_weights,
             hidden_states=hidden_states,
             router_logits=router_logits,
-        )
-        self._record_uvm_moe_address_map(
-            marker="select_experts_after_topk",
-            extra_tensors={
-                "hidden_states": hidden_states,
-                "router_logits": router_logits,
-                "topk_ids": topk_ids,
-                "topk_weights": topk_weights,
-            },
         )
         self._run_uvm_moe_topk_item_probe(topk_ids)
         if (
@@ -4344,6 +4319,91 @@ class FusedMoE(CustomOp):
             slices.append((role, ptr, slice_bytes))
         return slices
 
+    def _uvm_compile_expert_records(self, layer_id: int) -> None:
+        """Compile temporary tensor slices into exclusive explicit regions."""
+        records: dict[tuple[int, int], ExpertRecord] = {}
+        envelope_owners: dict[str, tuple[int, int]] = {}
+        geometry_by_region: dict[str, tuple[int, int]] = {}
+        for global_expert_id, local_expert_id in self._uvm_all_local_expert_pairs():
+            slices = self._uvm_expert_weight_slices(
+                local_expert_id,
+                {"moe_gate_up", "moe_down"},
+            )
+            compile_slices: list[tuple[int, int]] = []
+            block_bytes = int(self.uvm_expert_envelope_bytes)
+            if block_bytes <= 0:
+                raise ValueError("uvm_expert_envelope_bytes must be positive")
+            for role, ptr, size_bytes in slices:
+                envelope_start = _align_down(int(ptr), block_bytes)
+                envelope_end = _align_up(int(ptr) + int(size_bytes), block_bytes)
+                tensor_bounds = self._uvm_role_tensor_bounds(role)
+                if tensor_bounds is not None:
+                    tensor_base, tensor_end = tensor_bounds
+                    if envelope_start < tensor_base or envelope_end > tensor_end:
+                        raise RuntimeError(
+                            "Expert envelope exceeds tensor allocation: "
+                            f"layer_id={layer_id}, "
+                            f"global_expert_id={global_expert_id}, "
+                            f"role={role}, ptr=0x{int(ptr):x}, "
+                            f"bytes={int(size_bytes)}, "
+                            f"envelope_base=0x{envelope_start:x}, "
+                            f"envelope_end=0x{envelope_end:x}, "
+                            f"tensor_base=0x{tensor_base:x}, "
+                            f"tensor_end=0x{tensor_end:x}"
+                        )
+                compile_slices.append((int(ptr), int(size_bytes)))
+            record = compile_expert_envelopes(
+                layer_id=layer_id,
+                global_expert_id=global_expert_id,
+                slices=compile_slices,
+                envelope_bytes=int(self.uvm_expert_envelope_bytes),
+                existing_owners=envelope_owners,
+            )
+            for region_id in record.envelope_region_ids:
+                _, base_text, length_text = region_id.rsplit(":", 2)
+                geometry_by_region[region_id] = (
+                    int(base_text, 16),
+                    int(length_text, 16),
+                )
+            record.aggregate_state = RegionState.GPU
+            records[record.key] = record
+
+        for region_id, (base, length) in geometry_by_region.items():
+            register_uvm_region(region_id, base, length, state="gpu")
+        self._uvm_expert_records = records
+
+    def _uvm_release_expert_record(
+        self,
+        *,
+        layer_id: int,
+        global_expert_id: int,
+        device: int,
+    ) -> dict[str, object]:
+        record = getattr(self, "_uvm_expert_records", {})[(layer_id, global_expert_id)]
+        result = release_uvm_regions(record.envelope_region_ids, device=device)
+        record.aggregate_state = (
+            RegionState.CPU if bool(result.get("ok")) else RegionState.UNKNOWN
+        )
+        return result
+
+    def _uvm_restore_expert_record(
+        self,
+        *,
+        layer_id: int,
+        global_expert_id: int,
+        device: int,
+    ) -> dict[str, object]:
+        record = getattr(self, "_uvm_expert_records", {})[(layer_id, global_expert_id)]
+        result = restore_uvm_regions(
+            record.envelope_region_ids,
+            device=device,
+            executor=self.uvm_weight_executor,
+        )
+        record.aggregate_state = (
+            RegionState.GPU if bool(result.get("ok")) else RegionState.UNKNOWN
+        )
+        return result
+
     def _uvm_stage_m_expert_weight_slices(
         self,
         *,
@@ -4409,17 +4469,13 @@ class FusedMoE(CustomOp):
     def _uvm_expert_weight_envelope_region_id(
         self,
         layer_id: int | None,
-        role: str,
+        global_expert_id: int,
         envelope_base: int,
         envelope_bytes: int,
     ) -> str:
         layer_label = "unknown" if layer_id is None else str(layer_id)
-        if int(envelope_bytes) == _UVM_EXPERT_2MB_ENVELOPE_BYTES:
-            envelope_kind = "uvm2m"
-        else:
-            envelope_kind = f"uvmchunk:{int(envelope_bytes):x}"
         return (
-            f"weights:{layer_label}:{envelope_kind}:{role}:"
+            f"weights:{layer_label}:{int(global_expert_id)}:envelope:"
             f"{int(envelope_base):x}:{int(envelope_bytes):x}"
         )
 
@@ -4499,7 +4555,7 @@ class FusedMoE(CustomOp):
         for envelope_base in range(envelope_start, envelope_end, block_bytes):
             envelope_id = self._uvm_expert_weight_envelope_region_id(
                 layer_id,
-                role,
+                global_expert_id,
                 envelope_base,
                 block_bytes,
             )
@@ -4793,16 +4849,19 @@ class FusedMoE(CustomOp):
         if not self.uvm_weight_prefetch_expert_cache_enabled:
             return
         key = self._uvm_weight_expert_cache_key(layer_id, global_expert_id)
-        role_states = self._uvm_weight_expert_role_states.setdefault(key, {})
         normalized_state = str(state or "unknown")
         if estimated_gpu_resident is True:
             normalized_state = "gpu"
-        role_states[role] = normalized_state
-        target_roles = self.uvm_weight_prefetch_target_roles
-        if target_roles and all(
-            role_states.get(target_role) in ("gpu", "prefetching_gpu")
-            for target_role in target_roles
-        ):
+        if layer_id is not None:
+            record = getattr(self, "_uvm_expert_records", {}).get(
+                (int(layer_id), int(global_expert_id))
+            )
+            if record is not None:
+                try:
+                    record.aggregate_state = RegionState(normalized_state)
+                except ValueError:
+                    record.aggregate_state = RegionState.UNKNOWN
+        if normalized_state in ("gpu", "prefetching_gpu"):
             self._uvm_weight_full_gpu_experts.add(key)
         else:
             self._uvm_weight_full_gpu_experts.discard(key)
@@ -5242,6 +5301,7 @@ class FusedMoE(CustomOp):
             return
         if not self.uvm_expert_reserved_cleanup_on_layer_done:
             return
+
         if step is None:
             latest_cleanup_step = (
                 self._uvm_moe_trace_step
@@ -5303,173 +5363,6 @@ class FusedMoE(CustomOp):
                 logger.debug("Failed to cleanup reserved expert slots", exc_info=True)
             finally:
                 self._uvm_expert_reserved_active_steps.discard(cleanup_step)
-
-    def _append_uvm_moe_address_map(self, record: dict[str, object]) -> None:
-        if not self.uvm_moe_address_map_enabled:
-            return
-        try:
-            with open(self.uvm_moe_address_map_file, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, sort_keys=True) + "\n")
-        except OSError:
-            logger.debug("Failed to write UVM MoE address map", exc_info=True)
-
-    def _uvm_tensor_address_record(
-        self,
-        *,
-        marker: str,
-        name: str,
-        tensor: torch.Tensor,
-        source: str,
-        layer_id: int | None,
-        extra: dict[str, object] | None = None,
-    ) -> dict[str, object] | None:
-        if not isinstance(tensor, torch.Tensor):
-            return None
-        if tensor.numel() <= 0:
-            return None
-        try:
-            ptr = int(tensor.data_ptr())
-        except Exception:
-            return None
-        if ptr == 0:
-            return None
-
-        element_size = int(tensor.element_size())
-        data_bytes = int(tensor.numel()) * element_size
-        storage_ptr = ptr
-        storage_bytes = data_bytes
-        try:
-            storage = tensor.untyped_storage()
-            storage_ptr = int(storage.data_ptr())
-            storage_bytes = int(storage.nbytes())
-        except Exception:
-            pass
-
-        record: dict[str, object] = {
-            "timestamp": time.time(),
-            "pid": os.getpid(),
-            "action": "moe_address_map",
-            "marker": marker,
-            "source": source,
-            "layer_name": self.layer_name,
-            "layer_id": layer_id,
-            "step": self._uvm_moe_trace_step,
-            "name": name,
-            "dtype": str(tensor.dtype),
-            "device": str(tensor.device),
-            "is_cuda": bool(tensor.is_cuda),
-            "shape": [int(dim) for dim in tensor.shape],
-            "stride": [int(value) for value in tensor.stride()],
-            "storage_offset": int(tensor.storage_offset()),
-            "element_size": element_size,
-            "numel": int(tensor.numel()),
-            "ptr": f"0x{ptr:x}",
-            "bytes": data_bytes,
-            "end": f"0x{ptr + data_bytes:x}",
-            "storage_ptr": f"0x{storage_ptr:x}",
-            "storage_bytes": storage_bytes,
-            "storage_end": f"0x{storage_ptr + storage_bytes:x}",
-            "is_contiguous": bool(tensor.is_contiguous()),
-        }
-        if extra:
-            record.update(extra)
-
-        if self.uvm_moe_address_map_driver_probe and tensor.is_cuda and data_bytes > 0:
-            try:
-                (
-                    driver_capable,
-                    driver_capability_reason,
-                    driver_capability_code,
-                ) = probe_driver_capable_range(ptr, data_bytes)
-                record.update(
-                    {
-                        "driver_capable": driver_capable,
-                        "driver_capability_reason": driver_capability_reason,
-                        "driver_capability_code": driver_capability_code,
-                    }
-                )
-            except Exception as exc:
-                record.update(
-                    {
-                        "driver_capable": False,
-                        "driver_capability_reason": f"probe_exception:{exc!r}",
-                        "driver_capability_code": -1,
-                    }
-                )
-        return record
-
-    def _record_uvm_moe_address_map(
-        self,
-        *,
-        marker: str,
-        extra_tensors: dict[str, torch.Tensor] | None = None,
-    ) -> None:
-        if not self.uvm_moe_address_map_enabled:
-            return
-
-        try:
-            layer_id = self._uvm_layer_id()
-        except Exception:
-            layer_id = None
-
-        records = 0
-        seen: set[tuple[str, int, int]] = set()
-
-        def emit(name: str, tensor: torch.Tensor, source: str) -> None:
-            nonlocal records
-            if not isinstance(tensor, torch.Tensor):
-                return
-            try:
-                ptr = int(tensor.data_ptr())
-                bytes_ = int(tensor.numel()) * int(tensor.element_size())
-            except Exception:
-                return
-            key = (name, ptr, bytes_)
-            if key in seen:
-                return
-            seen.add(key)
-            record = self._uvm_tensor_address_record(
-                marker=marker,
-                name=name,
-                tensor=tensor,
-                source=source,
-                layer_id=layer_id,
-            )
-            if record is not None:
-                self._append_uvm_moe_address_map(record)
-                records += 1
-
-        for name, tensor in self.named_parameters(recurse=False):
-            emit(f"parameter:{name}", tensor, "named_parameter")
-        for name, tensor in self.named_buffers(recurse=False):
-            emit(f"buffer:{name}", tensor, "named_buffer")
-
-        for name, value in self.__dict__.items():
-            if isinstance(value, torch.Tensor):
-                emit(f"attr:{name}", value, "module_attr")
-
-        quant_method = getattr(self, "quant_method", None)
-        if quant_method is not None:
-            for name, value in vars(quant_method).items():
-                if isinstance(value, torch.Tensor):
-                    emit(f"quant_method:{name}", value, "quant_method_attr")
-
-        if extra_tensors:
-            for name, tensor in extra_tensors.items():
-                emit(f"runtime:{name}", tensor, "runtime_tensor")
-
-        self._append_uvm_moe_address_map(
-            {
-                "timestamp": time.time(),
-                "pid": os.getpid(),
-                "action": "moe_address_map_summary",
-                "marker": marker,
-                "layer_name": self.layer_name,
-                "layer_id": layer_id,
-                "step": self._uvm_moe_trace_step,
-                "records": records,
-            }
-        )
 
     def record_uvm_active_expert_residency_probe(
         self,
@@ -6540,13 +6433,9 @@ class FusedMoE(CustomOp):
             if layer_id is None:
                 return
             self._uvm_register_warm_prefetch_module(layer_id)
-            self._record_uvm_moe_address_map(
-                marker="stage_m_init_offload_begin",
-            )
-            if self.uvm_init_weight_offload_enable:
-                self._register_uvm_init_all_local_weight_regions(layer_id)
-            self._prepare_uvm_init_hot_weight_regions(layer_id)
             all_local_pairs = self._uvm_all_local_expert_pairs()
+            if not getattr(self, "_uvm_expert_records", None):
+                self._uvm_compile_expert_records(layer_id)
             if self.uvm_incremental_expert_offload_enable:
                 selected_expert = self._uvm_incremental_selected_global_expert_id
                 if (
@@ -6564,515 +6453,35 @@ class FusedMoE(CustomOp):
                     all_local_pairs,
                 )
 
-            batch_items: list[dict[str, object]] = []
-            for global_expert_id, local_expert_id in expert_pairs:
-                for (
-                    role,
-                    ptr,
-                    size_bytes,
-                    existing_region,
-                ) in self._uvm_stage_m_expert_weight_slices(
+            if self.uvm_init_weight_offload_mode == "trace_only":
+                return
+
+            device = (
+                int(torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else 0
+            )
+            for global_expert_id, _ in expert_pairs:
+                expert_class = self._uvm_init_weight_expert_class(
                     layer_id=layer_id,
                     global_expert_id=global_expert_id,
-                    local_expert_id=local_expert_id,
-                ):
-                    region_id = self._uvm_expert_weight_region_id(
-                        layer_id,
-                        global_expert_id,
-                        role,
-                    )
-                    residency_metadata = self._uvm_expert_weight_residency_metadata(
-                        layer_id=layer_id,
-                        global_expert_id=global_expert_id,
-                        local_expert_id=local_expert_id,
-                        role=role,
-                        ptr=ptr,
-                        size_bytes=size_bytes,
-                        active_this_step=False,
-                        source_action="stage_m_init_offload",
-                    )
-                    expert_class = self._uvm_init_weight_expert_class(
-                        layer_id=layer_id,
-                        global_expert_id=global_expert_id,
-                    )
-                    logical_driver_tag_skip = not (
-                        self._uvm_stage_m_requires_logical_release_registration()
-                    )
-                    registration_metadata = self._uvm_init_weight_class_metadata(
-                        metadata=residency_metadata,
-                        expert_class=expert_class,
-                        driver_tag_skip=logical_driver_tag_skip,
-                        cpu_offload_placement=(
-                            self.uvm_init_weight_offload_mode != "trace_only"
-                        ),
-                    )
-                    if existing_region is None:
-                        raise RuntimeError(
-                            f"Stage-M local expert was not registered: {region_id}"
-                        )
-                    driver_region_id = int(existing_region.get("driver_region_id") or 0)
-                    offload_metadata = {
-                        key: value
-                        for key, value in registration_metadata.items()
-                        if key not in ("driver_tag_skip", "driver_tag_skip_reason")
-                    }
-                    envelope_items = self._uvm_get_or_build_expert_envelope_items(
-                        source_region_id=region_id,
-                        logical_driver_region_id=driver_region_id,
-                        layer_id=layer_id,
-                        global_expert_id=global_expert_id,
-                        local_expert_id=local_expert_id,
-                        role=role,
-                        ptr=ptr,
-                        size_bytes=size_bytes,
-                        metadata=offload_metadata,
-                        state=str(existing_region.get("state") or "gpu"),
-                        source_action="stage_m_driver_release_chunk_envelope",
-                    )
-                    envelope_records = [
-                        {
-                            "region_id": item.region_id,
-                            "driver_region_id": item.driver_region_id,
-                            "ptr": item.ptr,
-                            "bytes": item.bytes,
-                            "metadata": item.metadata,
-                        }
-                        for item in envelope_items
-                    ]
-                    release_driver_region_ids = [
-                        int(record.get("driver_region_id") or 0)
-                        for record in envelope_records
-                        if int(record.get("driver_region_id") or 0) > 0
-                        and bool(
-                            cast(dict[str, object], record.get("metadata") or {}).get(
-                                "driver_registered"
-                            )
-                        )
-                    ]
-                    if not envelope_records or len(release_driver_region_ids) != len(
-                        envelope_records
-                    ):
-                        raise RuntimeError(
-                            "Stage-M envelope driver registration is incomplete "
-                            f"for {region_id}: registered="
-                            f"{len(release_driver_region_ids)}/"
-                            f"{len(envelope_records)}"
-                        )
-
-                    if (
-                        self.uvm_weight_batch_executor_enable
-                        and self.uvm_init_weight_offload_mode
-                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
-                    ):
-                        batch_items.append(
-                            {
-                                "timestamp": time.time(),
-                                "pid": os.getpid(),
-                                "layer_name": self.layer_name,
-                                "mode": self.uvm_init_weight_offload_mode,
-                                "role": role,
-                                "residency_region_id": region_id,
-                                "driver_region_id": driver_region_id,
-                                "release_driver_region_ids": (
-                                    release_driver_region_ids
-                                ),
-                                "envelope_records": [
-                                    {
-                                        "region_id": str(record.get("region_id")),
-                                        "driver_region_id": int(
-                                            record.get("driver_region_id") or 0
-                                        ),
-                                        "ptr": int(record.get("ptr") or 0),
-                                        "bytes": int(record.get("bytes") or 0),
-                                    }
-                                    for record in envelope_records
-                                ],
-                                "global_expert_id": global_expert_id,
-                                "local_expert_id": local_expert_id,
-                                "ptr": ptr,
-                                "bytes": size_bytes,
-                                "device": -1,
-                                "sync_offload": self._uvm_stage_m_sync_enabled(),
-                                "plan_policy": self.uvm_init_weight_plan_policy,
-                                "expert_init_class": expert_class,
-                                "residency_metadata": offload_metadata,
-                            }
-                        )
-                        continue
-
-                    success = False
-                    driver_release_success = False
-                    driver_release_result: dict[str, object] | None = None
-                    remote_accessed_by_result = 0
-                    remote_prefetch_cpu_successes = 0
-                    remote_preferred_cpu_result = 0
-                    remote_executor = ""
-                    if self._uvm_stage_m_uses_remote_read():
-                        device = (
-                            int(torch.cuda.current_device())
-                            if torch.cuda.is_available()
-                            else 0
-                        )
-                        if self._uvm_remote_prepare_uses_release():
-                            driver_release_result = (
-                                driver_prefetch_cpu_release_remote_512k_regions(
-                                    release_driver_region_ids,
-                                    device=device,
-                                    prefer_existing=True,
-                                )
-                            )
-                            release_entries_by_id = {
-                                int(entry.get("region_id") or 0): entry
-                                for entry in (
-                                    driver_release_result.get("entries") or []
-                                )
-                                if isinstance(entry, dict)
-                            }
-                            self._uvm_record_release_remote_envelope_states(
-                                envelope_records,
-                                release_entries_by_id,
-                            )
-                            success = bool(driver_release_result.get("ok")) and all(
-                                bool(release_entries_by_id.get(driver_id, {}).get("ok"))
-                                for driver_id in release_driver_region_ids
-                            )
-                            driver_release_success = success
-                            remote_executor = "driver_release_remote"
-                        else:
-                            remote_prepare_result = batch_prepare_ranges_for_native_remote_access_with_executor(  # noqa: E501
-                                [(ptr, size_bytes)],
-                                sync=self._uvm_stage_m_sync_enabled(),
-                                executor=self.uvm_weight_executor,
-                                device=device,
-                            )
-                            (
-                                remote_successes,
-                                remote_executor,
-                                remote_accessed_by_result,
-                                remote_prefetch_cpu_successes,
-                                remote_preferred_cpu_result,
-                            ) = remote_prepare_result
-                            success = remote_successes == 1
-                    elif (
-                        self.uvm_init_weight_offload_mode
-                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
-                    ):
-                        device = (
-                            int(torch.cuda.current_device())
-                            if torch.cuda.is_available()
-                            else 0
-                        )
-                        driver_release_result = driver_expert_offload_release_regions(
-                            release_driver_region_ids,
-                            device=device,
-                            subchunk_64k=(self._uvm_expert_release_uses_subchunk_64k()),
-                            prefer_existing=True,
-                            return_entries=True,
-                        )
-                        release_entries_by_id: dict[int, dict[str, object]] = {
-                            int(entry.get("region_id") or 0): entry
-                            for entry in (driver_release_result.get("entries") or [])
-                            if isinstance(entry, dict)
-                        }
-                        success = bool(driver_release_result.get("ok")) and all(
-                            bool(release_entries_by_id.get(driver_id, {}).get("ok"))
-                            for driver_id in release_driver_region_ids
-                        )
-                        driver_release_success = success
-
-                    if success:
-                        next_state = (
-                            "cpu"
-                            if self._uvm_stage_m_sync_enabled()
-                            else "prefetching_cpu"
-                        )
-                        mark_uvm_residency_state(
-                            region_id=region_id,
-                            state=next_state,
-                            metadata={
-                                **offload_metadata,
-                                "sync_offload": self._uvm_stage_m_sync_enabled(),
-                                "driver_release": driver_release_success,
-                                "access_mode": self.uvm_expert_offload_access_mode,
-                                "remote_prepare_mode": self.uvm_remote_prepare_mode,
-                                "executor": remote_executor or None,
-                                "accessed_by_result": remote_accessed_by_result,
-                                "prefetch_cpu_successes": (
-                                    remote_prefetch_cpu_successes
-                                ),
-                                "preferred_cpu_result": (remote_preferred_cpu_result),
-                                "driver_release_result": driver_release_result,
-                            },
-                        )
-                        self._uvm_update_weight_expert_role_cache(
-                            layer_id=layer_id,
-                            global_expert_id=global_expert_id,
-                            role=role,
-                            state=next_state,
-                            estimated_gpu_resident=False,
-                        )
-                        if self._uvm_stage_m_uses_remote_read():
-                            self._uvm_mark_remote_read_expert(global_expert_id)
-                        else:
-                            self._uvm_mark_slot_managed_expert(
-                                global_expert_id=global_expert_id,
-                                expert_class=expert_class,
-                            )
-                    elif self._uvm_stage_m_uses_remote_read():
-                        partial_release = bool(
-                            self._uvm_remote_prepare_uses_release()
-                            and driver_release_result
-                            and (
-                                int(driver_release_result.get("released_bytes") or 0)
-                                > 0
-                                or int(
-                                    driver_release_result.get("remote_mapped_bytes")
-                                    or 0
-                                )
-                                > 0
-                            )
-                        )
-                        mark_uvm_residency_state(
-                            region_id=region_id,
-                            state="unknown" if partial_release else "gpu",
-                            metadata={
-                                **offload_metadata,
-                                "placement": (
-                                    "MIXED_UNCOMMITTED"
-                                    if partial_release
-                                    else "GPU_RESIDENT"
-                                ),
-                                "cpu_remote_read": False,
-                                "remote_prepare_failed": True,
-                                "remote_prepare_mode": self.uvm_remote_prepare_mode,
-                                "driver_release_result": driver_release_result,
-                            },
-                        )
-            if batch_items:
-                driver_release_result: dict[str, object] | None = None
-                driver_release_entries_by_region: dict[int, dict[str, object]] = {}
-                remote_accessed_by_result = 0
-                remote_prefetch_cpu_successes = 0
-                remote_preferred_cpu_result = 0
+                )
+                result = self._uvm_release_expert_record(
+                    layer_id=layer_id,
+                    global_expert_id=global_expert_id,
+                    device=device,
+                )
+                if not bool(result.get("ok")):
+                    continue
                 if self._uvm_stage_m_uses_remote_read():
-                    device = (
-                        int(torch.cuda.current_device())
-                        if torch.cuda.is_available()
-                        else 0
-                    )
-                    if self._uvm_remote_prepare_uses_release():
-                        driver_region_ids: list[int] = []
-                        seen_driver_region_ids: set[int] = set()
-                        for item in batch_items:
-                            release_ids = item.get("release_driver_region_ids")
-                            if not isinstance(release_ids, list):
-                                release_ids = []
-                            for driver_id_value in release_ids:
-                                try:
-                                    driver_id = int(driver_id_value)
-                                except (TypeError, ValueError):
-                                    continue
-                                if (
-                                    driver_id <= 0
-                                    or driver_id in seen_driver_region_ids
-                                ):
-                                    continue
-                                seen_driver_region_ids.add(driver_id)
-                                driver_region_ids.append(driver_id)
-                        driver_release_result = (
-                            driver_prefetch_cpu_release_remote_512k_regions(
-                                driver_region_ids,
-                                device=device,
-                                prefer_existing=True,
-                            )
-                        )
-                        for entry in driver_release_result.get("entries") or []:
-                            if isinstance(entry, dict):
-                                driver_release_entries_by_region[
-                                    int(entry.get("region_id") or 0)
-                                ] = entry
-                        batch_successes = int(
-                            driver_release_result.get("success_count") or 0
-                        )
-                        executor_used = "driver_release_remote"
-                    else:
-                        ranges = [
-                            (int(item["ptr"]), int(item["bytes"]))
-                            for item in batch_items
-                        ]
-                        (
-                            batch_successes,
-                            executor_used,
-                            remote_accessed_by_result,
-                            remote_prefetch_cpu_successes,
-                            remote_preferred_cpu_result,
-                        ) = batch_prepare_ranges_for_native_remote_access_with_executor(
-                            ranges,
-                            sync=self._uvm_stage_m_sync_enabled(),
-                            executor=self.uvm_weight_executor,
-                            device=device,
-                        )
-                elif (
-                    self.uvm_init_weight_offload_mode
-                    in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
-                ):
-                    device = (
-                        int(torch.cuda.current_device())
-                        if torch.cuda.is_available()
-                        else 0
-                    )
-                    driver_region_ids = []
-                    seen_driver_region_ids: set[int] = set()
-                    for item in batch_items:
-                        release_ids = item.get("release_driver_region_ids")
-                        if not isinstance(release_ids, list) or not release_ids:
-                            release_ids = [int(item.get("driver_region_id") or 0)]
-                        for driver_id_value in release_ids:
-                            try:
-                                driver_id = int(driver_id_value)
-                            except (TypeError, ValueError):
-                                continue
-                            if driver_id <= 0 or driver_id in seen_driver_region_ids:
-                                continue
-                            seen_driver_region_ids.add(driver_id)
-                            driver_region_ids.append(driver_id)
-                    driver_release_result = driver_expert_offload_release_regions(
-                        driver_region_ids,
-                        device=device,
-                        subchunk_64k=(self._uvm_expert_release_uses_subchunk_64k()),
-                        prefer_existing=True,
-                        return_entries=True,
-                    )
-                    for entry in driver_release_result.get("entries") or []:
-                        if isinstance(entry, dict):
-                            driver_release_entries_by_region[
-                                int(entry.get("region_id") or 0)
-                            ] = entry
-                    batch_successes = int(
-                        driver_release_result.get("success_count") or 0
-                    )
-                    executor_used = "driver_offload_release"
+                    self._uvm_mark_remote_read_expert(global_expert_id)
                 else:
-                    batch_successes = 0
-                    executor_used = "unsupported_init_weight_offload_mode"
-                for batch_index, item in enumerate(batch_items):
-                    driver_release_entry: dict[str, object] | None = None
-                    if (
-                        self._uvm_stage_m_uses_remote_read()
-                        and not self._uvm_remote_prepare_uses_release()
-                    ):
-                        success = batch_index < batch_successes
-                    elif self._uvm_remote_prepare_uses_release() or (
-                        self.uvm_init_weight_offload_mode
-                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
-                    ):
-                        release_ids = item.get("release_driver_region_ids")
-                        if not isinstance(release_ids, list) or not release_ids:
-                            release_ids = [int(item.get("driver_region_id") or 0)]
-                        release_driver_ids: list[int] = []
-                        for driver_id_value in release_ids:
-                            try:
-                                driver_id = int(driver_id_value)
-                            except (TypeError, ValueError):
-                                continue
-                            if driver_id > 0:
-                                release_driver_ids.append(driver_id)
-                        release_entries = [
-                            driver_release_entries_by_region.get(driver_id)
-                            for driver_id in release_driver_ids
-                        ]
-                        if self._uvm_remote_prepare_uses_release():
-                            self._uvm_record_release_remote_envelope_states(
-                                item.get("envelope_records"),
-                                driver_release_entries_by_region,
-                            )
-                        success = bool(release_entries) and all(
-                            bool(entry and entry.get("ok")) for entry in release_entries
-                        )
-                        driver_release_entry = {
-                            "release_driver_region_ids": release_driver_ids,
-                            "entries": release_entries,
-                            "envelope_records": item.get("envelope_records"),
-                        }
-                    else:
-                        success = batch_index < batch_successes
-                    driver_release_success = (
-                        success
-                        if self.uvm_init_weight_offload_mode
-                        in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
-                        and (
-                            not self._uvm_stage_m_uses_remote_read()
-                            or self._uvm_remote_prepare_uses_release()
-                        )
-                        else False
+                    self._uvm_mark_slot_managed_expert(
+                        global_expert_id=global_expert_id,
+                        expert_class=expert_class,
                     )
-                    if success:
-                        next_state = (
-                            "cpu"
-                            if self._uvm_stage_m_sync_enabled()
-                            else "prefetching_cpu"
-                        )
-                        mark_uvm_residency_state(
-                            region_id=str(item["residency_region_id"]),
-                            state=next_state,
-                            metadata={
-                                **cast(dict[str, object], item["residency_metadata"]),
-                                "sync_offload": self._uvm_stage_m_sync_enabled(),
-                                "executor": executor_used,
-                                "driver_release": driver_release_success,
-                                "access_mode": self.uvm_expert_offload_access_mode,
-                                "remote_prepare_mode": self.uvm_remote_prepare_mode,
-                                "accessed_by_result": remote_accessed_by_result,
-                                "prefetch_cpu_successes": (
-                                    remote_prefetch_cpu_successes
-                                ),
-                                "preferred_cpu_result": (remote_preferred_cpu_result),
-                                "driver_release_entry": driver_release_entry,
-                            },
-                        )
-                        self._uvm_update_weight_expert_role_cache(
-                            layer_id=layer_id,
-                            global_expert_id=int(item["global_expert_id"]),
-                            role=str(item["role"]),
-                            state=next_state,
-                            estimated_gpu_resident=False,
-                        )
-                        if self._uvm_stage_m_uses_remote_read():
-                            self._uvm_mark_remote_read_expert(
-                                int(item["global_expert_id"])
-                            )
-                        else:
-                            self._uvm_mark_slot_managed_expert(
-                                global_expert_id=int(item["global_expert_id"]),
-                                expert_class=str(item["expert_init_class"]),
-                            )
-                    elif self._uvm_stage_m_uses_remote_read():
-                        partial_release = bool(
-                            self._uvm_remote_prepare_uses_release()
-                            and driver_release_entry
-                            and any(
-                                int(entry.get("released_bytes") or 0) > 0
-                                or int(entry.get("remote_mapped_bytes") or 0) > 0
-                                for entry in (driver_release_entry.get("entries") or [])
-                                if isinstance(entry, dict)
-                            )
-                        )
-                        mark_uvm_residency_state(
-                            region_id=str(item["residency_region_id"]),
-                            state="unknown" if partial_release else "gpu",
-                            metadata={
-                                **cast(dict[str, object], item["residency_metadata"]),
-                                "placement": (
-                                    "MIXED_UNCOMMITTED"
-                                    if partial_release
-                                    else "GPU_RESIDENT"
-                                ),
-                                "cpu_remote_read": False,
-                                "remote_prepare_failed": True,
-                                "remote_prepare_mode": self.uvm_remote_prepare_mode,
-                                "driver_release_entry": driver_release_entry,
-                            },
-                        )
+            return
+
         except Exception:
             self._uvm_init_weight_offload_done = False
             logger.warning("Failed to run Stage M init weight offload", exc_info=True)
@@ -7550,6 +6959,31 @@ class FusedMoE(CustomOp):
         cleanup_already_done: bool = False,
     ) -> None:
         if not self.uvm_weight_prefetch_enabled:
+            return
+        explicit_records = getattr(self, "_uvm_expert_records", {})
+        if explicit_records and layer_id is None:
+            layer_id = self._uvm_layer_id()
+        if explicit_records and layer_id is not None:
+            pairs = (
+                reserved_expert_pairs
+                if reserved_expert_pairs is not None
+                else active_expert_pairs
+                if active_expert_pairs is not None
+                else self._uvm_active_expert_pairs(topk_ids)
+            )
+            device = (
+                int(torch.cuda.current_device())
+                if self.uvm_weight_prefetch_device < 0
+                else self.uvm_weight_prefetch_device
+            )
+            for global_expert_id, _ in pairs or []:
+                key = (int(layer_id), int(global_expert_id))
+                if key in explicit_records:
+                    self._uvm_restore_expert_record(
+                        layer_id=int(layer_id),
+                        global_expert_id=int(global_expert_id),
+                        device=device,
+                    )
             return
         if not self.uvm_expert_reserved_enable:
             return

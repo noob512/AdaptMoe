@@ -17,13 +17,21 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from vllm.device_allocator.uvm import (
+    batch_prefetch_ranges_to_device_with_executor,
     driver_batch_query_ranges_residency_bytes,
     driver_get_pool_state,
+    driver_expert_offload_release_regions,
     driver_reclaim_pool,
     driver_register_region,
     driver_set_pool_budget,
     driver_unregister_region,
     driver_update_region_state,
+)
+from vllm.device_allocator.uvm_region import (
+    ExplicitRegionRegistry,
+    KernelRegion,
+    RegionState,
+    normalize_region_state,
 )
 from vllm.logger import init_logger
 
@@ -47,48 +55,13 @@ DRIVER_POOL_IDS = {
     "scratch": 3,
 }
 
-DRIVER_ROLE_IDS = {
-    "unknown": 0,
-    "kv_block": 1,
-    "dense_weight": 2,
-    "moe_expert_w13": 3,
-    "moe_expert_w2": 4,
-    "scratch": 5,
-    "workspace": 6,
-}
-
-DRIVER_FLAG_EVICTABLE = 1 << 0
-DRIVER_FLAG_PROTECTED = 1 << 1
-DRIVER_FLAG_ACTIVE = 1 << 2
-DRIVER_FLAG_PREFETCHABLE = 1 << 3
-DRIVER_FLAG_PINNED = 1 << 4
-DRIVER_FLAG_TRANSIENT = 1 << 5
-DRIVER_FLAG_HOT_SUBPOOL = 1 << 11
-DRIVER_FLAG_STREAMING_SUBPOOL = 1 << 12
-DRIVER_FLAG_COLD_SUBPOOL = 1 << 13
-DRIVER_FLAG_CPU_OFFLOADED_RESERVED = 1 << 14
-DRIVER_FLAG_EXPERT_ENVELOPE = 1 << 15
-DRIVER_FLAG_MASK = (
-    DRIVER_FLAG_EVICTABLE
-    | DRIVER_FLAG_PROTECTED
-    | DRIVER_FLAG_ACTIVE
-    | DRIVER_FLAG_PREFETCHABLE
-    | DRIVER_FLAG_PINNED
-    | DRIVER_FLAG_TRANSIENT
-    | DRIVER_FLAG_HOT_SUBPOOL
-    | DRIVER_FLAG_STREAMING_SUBPOOL
-    | DRIVER_FLAG_COLD_SUBPOOL
-    | DRIVER_FLAG_CPU_OFFLOADED_RESERVED
-    | DRIVER_FLAG_EXPERT_ENVELOPE
-)
-
 DRIVER_REGION_STATES = {
     "unknown": 0,
     "cpu": 1,
     "released": 1,
     "prefetching_cpu": 2,
     "gpu": 3,
-    "prefetching_gpu": 3,
+    "prefetching_gpu": 4,
     "active": 4,
 }
 
@@ -100,6 +73,9 @@ DRIVER_BUDGET_MODE_IDS = {
 }
 
 DEFAULT_DRIVER_TEMP_BUFFER_BYTES = 100 * 1024 * 1024
+
+_EXPLICIT_REGION_REGISTRY = ExplicitRegionRegistry()
+_EXPLICIT_REGION_LOCK = threading.Lock()
 
 
 def _empty_real_residency_totals() -> dict[str, int]:
@@ -210,100 +186,6 @@ def _stable_driver_region_id(region_id: str) -> int:
     return (int.from_bytes(digest, "little") & 0x7FFFFFFFFFFFFFFF) or 1
 
 
-def _metadata_int(metadata: dict[str, Any], key: str, default: int = 0) -> int:
-    value = metadata.get(key, default)
-    try:
-        if isinstance(value, str) and value.startswith("0x"):
-            return int(value, 16)
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _driver_role_id(pool: str, metadata: dict[str, Any]) -> int:
-    explicit = metadata.get("driver_role_id")
-    if explicit is not None:
-        return _metadata_int(metadata, "driver_role_id", 0)
-    role = str(metadata.get("role") or "").strip().lower()
-    source = str(metadata.get("source") or "").strip().lower()
-    if pool == "kv":
-        return DRIVER_ROLE_IDS["kv_block"]
-    if pool == "scratch":
-        if "workspace" in role or "workspace" in source:
-            return DRIVER_ROLE_IDS["workspace"]
-        return DRIVER_ROLE_IDS["scratch"]
-    if pool == "weights":
-        if role in ("moe_gate_up", "w13", "w13_weight", "moe_expert_w13"):
-            return DRIVER_ROLE_IDS["moe_expert_w13"]
-        if role in ("moe_down", "w2", "w2_weight", "moe_expert_w2"):
-            return DRIVER_ROLE_IDS["moe_expert_w2"]
-        return DRIVER_ROLE_IDS["dense_weight"]
-    return DRIVER_ROLE_IDS["unknown"]
-
-
-def _driver_flags(
-    *,
-    pool: str,
-    state: str,
-    evictable: bool,
-    active: bool,
-    metadata: dict[str, Any],
-) -> int:
-    flags = _metadata_int(metadata, "driver_flags", 0)
-    if evictable:
-        flags |= DRIVER_FLAG_EVICTABLE
-    if active:
-        flags |= DRIVER_FLAG_ACTIVE | DRIVER_FLAG_PROTECTED
-    if bool(metadata.get("protected")):
-        flags |= DRIVER_FLAG_PROTECTED
-    if bool(metadata.get("prefetchable")):
-        flags |= DRIVER_FLAG_PREFETCHABLE
-    if bool(metadata.get("pinned")):
-        flags |= DRIVER_FLAG_PINNED
-    if pool == "scratch" or bool(metadata.get("transient")):
-        flags |= DRIVER_FLAG_TRANSIENT
-    pool_class = str(
-        metadata.get("pool_class")
-        or metadata.get("driver_subpool")
-        or metadata.get("subpool")
-        or ""
-    ).strip().lower()
-    if pool_class == "hot" or bool(metadata.get("init_hot")):
-        flags |= (
-            DRIVER_FLAG_HOT_SUBPOOL
-            | DRIVER_FLAG_PROTECTED
-            | DRIVER_FLAG_PINNED
-            | DRIVER_FLAG_PREFETCHABLE
-        )
-    if pool_class == "streaming" or bool(metadata.get("streaming")):
-        flags |= (
-            DRIVER_FLAG_STREAMING_SUBPOOL
-            | DRIVER_FLAG_EVICTABLE
-            | DRIVER_FLAG_PREFETCHABLE
-            | DRIVER_FLAG_TRANSIENT
-        )
-    if (
-        pool_class in ("cold", "init_cold", "cold_init")
-        or bool(metadata.get("init_cold"))
-    ):
-        flags |= DRIVER_FLAG_COLD_SUBPOOL | DRIVER_FLAG_EVICTABLE
-    if (
-        bool(metadata.get("cpu_offloaded_reserved"))
-        or str(metadata.get("placement") or "").strip().upper()
-        == "CPU_OFFLOADED_RESERVED"
-    ):
-        flags |= (
-            DRIVER_FLAG_CPU_OFFLOADED_RESERVED
-            | DRIVER_FLAG_PREFETCHABLE
-            | DRIVER_FLAG_PROTECTED
-        )
-    if bool(metadata.get("expert_envelope")):
-        flags |= DRIVER_FLAG_EXPERT_ENVELOPE
-    if state == "gpu" and pool == "weights" and not evictable:
-        flags |= DRIVER_FLAG_PROTECTED
-    return flags
-
-
 def _driver_region_state_id(
     state: str,
     *,
@@ -385,7 +267,7 @@ class UvmPoolResidencyManager:
         }
         self.driver_pool_budget_enable = _read_bool_env(
             "VLLM_UVM_DRIVER_POOL_BUDGET_ENABLE",
-            self.driver_tag_enable,
+            False,
         )
         self.driver_pool_budget_mode = _read_driver_budget_mode_env()
         self.driver_pool_budget_overrides = _parse_pool_budget_overrides(
@@ -836,27 +718,14 @@ class UvmPoolResidencyManager:
         self,
         region: UvmResidencyRegion,
     ) -> int:
-        metadata = region.metadata
-        pool_id = DRIVER_POOL_IDS[region.pool]
-        role_id = _driver_role_id(region.pool, metadata)
-        flags = _driver_flags(
-            pool=region.pool,
-            state=region.state,
-            evictable=region.evictable,
-            active=region.active,
-            metadata=metadata,
-        )
-        layer_id = _metadata_int(metadata, "layer_id", 0)
-        expert_id = _metadata_int(metadata, "global_expert_id", 0)
+        if region.ptr is None or int(region.ptr) <= 0 or int(region.bytes) <= 0:
+            region.driver_register_status = -2
+            region.driver_registered = False
+            return -2
         status = driver_register_region(
             region_id=region.driver_region_id,
             ptr=int(region.ptr),
             nbytes=int(region.bytes),
-            pool=pool_id,
-            layer_id=layer_id,
-            expert_id=expert_id,
-            role=role_id,
-            flags=flags,
         )
         region.driver_register_status = status
         if status >= 0:
@@ -893,20 +762,9 @@ class UvmPoolResidencyManager:
         region: UvmResidencyRegion,
     ) -> int:
         state_id = _driver_region_state_id(region.state, active=region.active)
-        flags = _driver_flags(
-            pool=region.pool,
-            state=region.state,
-            evictable=region.evictable,
-            active=region.active,
-            metadata=region.metadata,
-        )
         return driver_update_region_state(
             region_id=region.driver_region_id,
             state=state_id,
-            flags_set=flags,
-            flags_clear=DRIVER_FLAG_MASK & ~flags,
-            priority=_metadata_int(region.metadata, "priority", 0),
-            last_access_epoch=max(int(region.last_access_step or 0), 0),
         )
 
     def _snapshot_locked(self) -> dict[str, Any]:
@@ -1057,6 +915,150 @@ class UvmPoolResidencyManager:
 
 _RESIDENCY_MANAGER: UvmPoolResidencyManager | None = None
 _RESIDENCY_MANAGER_LOCK = threading.Lock()
+
+
+def register_uvm_region(
+    region_id: str,
+    base: int,
+    length: int,
+    *,
+    state: str = "gpu",
+) -> KernelRegion:
+    """Register the minimal region contract in application and driver tables."""
+    with _EXPLICIT_REGION_LOCK:
+        region = _EXPLICIT_REGION_REGISTRY.register_region(
+            region_id,
+            base,
+            length,
+            state,
+        )
+        driver_region_id = _stable_driver_region_id(region.region_id)
+        status = driver_register_region(
+            region_id=driver_region_id,
+            ptr=region.base,
+            nbytes=region.length,
+        )
+        if status < 0:
+            region.state = RegionState.UNKNOWN
+        else:
+            driver_update_region_state(
+                region_id=driver_region_id,
+                state=_driver_region_state_id(region.state.value),
+            )
+        return region
+
+
+def release_uvm_regions(
+    region_ids: list[str] | tuple[str, ...],
+    *,
+    device: int = 0,
+) -> dict[str, Any]:
+    """Release only the explicitly named regions, with idempotent state checks."""
+    requested = [str(region_id) for region_id in region_ids]
+    statuses: dict[str, bool] = {}
+    pending: list[KernelRegion] = []
+    with _EXPLICIT_REGION_LOCK:
+        for region_id in requested:
+            region = _EXPLICIT_REGION_REGISTRY.regions.get(region_id)
+            if region is None or region.state == RegionState.UNKNOWN:
+                statuses[region_id] = False
+            elif region.state == RegionState.CPU:
+                statuses[region_id] = True
+            else:
+                region.state = RegionState.PREFETCHING_CPU
+                pending.append(region)
+
+    if pending:
+        numeric_to_region = {
+            _stable_driver_region_id(region.region_id): region for region in pending
+        }
+        result = driver_expert_offload_release_regions(
+            list(numeric_to_region),
+            device=device,
+            require_expert=False,
+            return_entries=True,
+        )
+        entries = {
+            int(entry.get("region_id") or 0): bool(entry.get("ok"))
+            for entry in (result.get("entries") or [])
+            if isinstance(entry, dict)
+        }
+        aggregate_ok = bool(result.get("ok"))
+        with _EXPLICIT_REGION_LOCK:
+            for numeric_id, region in numeric_to_region.items():
+                ok = entries.get(numeric_id, aggregate_ok)
+                region.state = RegionState.CPU if ok else RegionState.UNKNOWN
+                statuses[region.region_id] = ok
+                driver_update_region_state(
+                    region_id=numeric_id,
+                    state=_driver_region_state_id(region.state.value),
+                )
+
+    return {
+        "ok": all(statuses.get(region_id, False) for region_id in requested),
+        "statuses": statuses,
+        "failed_region_ids": [
+            region_id for region_id in requested if not statuses.get(region_id, False)
+        ],
+    }
+
+
+def restore_uvm_regions(
+    region_ids: list[str] | tuple[str, ...],
+    *,
+    device: int = 0,
+    executor: str = "auto",
+) -> dict[str, Any]:
+    """Restore only the explicitly named regions using their registered ranges."""
+    requested = [str(region_id) for region_id in region_ids]
+    statuses: dict[str, bool] = {}
+    pending: list[KernelRegion] = []
+    with _EXPLICIT_REGION_LOCK:
+        for region_id in requested:
+            region = _EXPLICIT_REGION_REGISTRY.regions.get(region_id)
+            if region is None or region.state == RegionState.UNKNOWN:
+                statuses[region_id] = False
+            elif region.state == RegionState.GPU:
+                statuses[region_id] = True
+            else:
+                region.state = RegionState.PREFETCHING_GPU
+                pending.append(region)
+
+    if pending:
+        ranges = [(region.base, region.length) for region in pending]
+        successes, _, _ = batch_prefetch_ranges_to_device_with_executor(
+            ranges,
+            device,
+            executor=executor,
+        )
+        complete = int(successes) == len(pending)
+        with _EXPLICIT_REGION_LOCK:
+            for region in pending:
+                region.state = RegionState.GPU if complete else RegionState.UNKNOWN
+                statuses[region.region_id] = complete
+                driver_update_region_state(
+                    region_id=_stable_driver_region_id(region.region_id),
+                    state=_driver_region_state_id(region.state.value),
+                )
+
+    return {
+        "ok": all(statuses.get(region_id, False) for region_id in requested),
+        "statuses": statuses,
+        "failed_region_ids": [
+            region_id for region_id in requested if not statuses.get(region_id, False)
+        ],
+    }
+
+
+def query_uvm_region_states(
+    region_ids: list[str] | tuple[str, ...],
+) -> dict[str, str]:
+    with _EXPLICIT_REGION_LOCK:
+        return {
+            region_id: region.state.value
+            for region_id in (str(value) for value in region_ids)
+            if (region := _EXPLICIT_REGION_REGISTRY.regions.get(region_id)) is not None
+        }
 
 
 def get_uvm_pool_residency_manager() -> UvmPoolResidencyManager:

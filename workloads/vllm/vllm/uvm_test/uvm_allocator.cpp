@@ -974,15 +974,22 @@ int uvm_driver_phase_f_register_region_fd(int fd,
                                           uint32_t expert_id,
                                           uint32_t role,
                                           uint32_t flags) {
+    (void)pool;
+    (void)layer_id;
+    (void)expert_id;
+    (void)role;
+    (void)flags;
     PhaseFRegisterRegionParams params{};
     params.region.region_id = region_id;
     params.region.base = static_cast<uint64_t>(base);
     params.region.length = static_cast<uint64_t>(length);
-    params.region.pool = pool;
-    params.region.layer_id = layer_id;
-    params.region.expert_id = expert_id;
-    params.region.role = role;
-    params.region.flags = flags;
+    // The legacy ABI still carries these fields, but explicit regions are
+    // intentionally opaque to the driver. Keep them zero for compatibility.
+    params.region.pool = 0;
+    params.region.layer_id = 0;
+    params.region.expert_id = 0;
+    params.region.role = 0;
+    params.region.flags = 0;
 
     phase_f_debug_log("driver_register_region cmd=%u id=%llu base=0x%llx length=%llu ioctl_begin",
                       UVM_PHASE_F_REGISTER_REGION_IOCTL,

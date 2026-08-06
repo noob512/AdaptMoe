@@ -20,9 +20,6 @@ from vllm.device_allocator.uvm import (
 )
 from vllm.device_allocator.uvm_pool_coordinator import request_uvm_pool_action
 from vllm.device_allocator.uvm_pool_residency import (
-    get_uvm_residency_region_snapshot,
-    mark_uvm_residency_state,
-    register_uvm_residency_region,
     request_uvm_gpu_residency,
 )
 from vllm.logger import init_logger
@@ -84,8 +81,6 @@ class UvmPolicyRuntime:
         size_bytes = max(int(bytes or 0), 0)
         ranges = list(ranges or [])
         ptr = int(ranges[0][0]) if ranges else None
-        existing = get_uvm_residency_region_snapshot(region_id)
-        existing_state = str((existing or {}).get("state") or "gpu")
         action_metadata = {
             **metadata,
             "source": "uvm_policy_runtime",
@@ -98,24 +93,6 @@ class UvmPolicyRuntime:
             "ptr_present": ptr is not None,
         }
 
-        if existing is None:
-            register_uvm_residency_region(
-                pool="kv",
-                region_id=region_id,
-                ptr=ptr,
-                bytes=size_bytes,
-                state=existing_state,
-                evictable=False,
-                active=True,
-                driver_register=ptr is not None,
-                metadata=action_metadata,
-            )
-        else:
-            mark_uvm_residency_state(
-                region_id=region_id,
-                state=existing_state,
-                metadata={**action_metadata, "active": True, "evictable": False},
-            )
         residency_decision = request_uvm_gpu_residency(
             pool="kv",
             region_id=region_id,
@@ -158,11 +135,6 @@ class UvmPolicyRuntime:
             )
 
         if mode == "trace_only":
-            mark_uvm_residency_state(
-                region_id=region_id,
-                state="gpu",
-                metadata=action_metadata,
-            )
             return UvmPolicyActionResult(
                 enabled=self.active,
                 allowed=True,
@@ -184,11 +156,6 @@ class UvmPolicyRuntime:
                 range_count=0,
             )
 
-        mark_uvm_residency_state(
-            region_id=region_id,
-            state="prefetching_gpu",
-            metadata=action_metadata,
-        )
         try:
             advised = True
             prefetched = True
@@ -208,11 +175,6 @@ class UvmPolicyRuntime:
                          exc_info=True)
             issued = False
 
-        mark_uvm_residency_state(
-            region_id=region_id,
-            state="gpu" if issued else existing_state,
-            metadata=action_metadata,
-        )
         return UvmPolicyActionResult(
             enabled=self.active,
             allowed=True,

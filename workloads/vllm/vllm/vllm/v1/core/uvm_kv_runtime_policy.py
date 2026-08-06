@@ -22,13 +22,8 @@ from vllm.device_allocator.uvm_policy_runtime import get_uvm_policy_runtime
 from vllm.device_allocator.uvm_pool_coordinator import (
     request_uvm_pool_action,
 )
-from vllm.device_allocator.uvm_pool_residency import (
-    get_uvm_pool_residency_manager,
-    get_uvm_residency_region_snapshot,
-    mark_uvm_residency_state,
-    register_uvm_residency_region,
-    request_uvm_gpu_residency,
-)
+from vllm.device_allocator.uvm_pool_residency import request_uvm_gpu_residency
+from vllm.device_allocator.uvm_region import LogicalKVBlock, PhysicalKVSpan, RegionState
 from vllm.device_allocator.uvm_unified_residency_controller import (
     get_uvm_unified_residency_controller,
     record_unified_kv_target,
@@ -40,7 +35,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 logger = init_logger(__name__)
 
 _KV_PHYSICAL_RANGE_LOCK = threading.Lock()
-_KV_PHYSICAL_RANGE_RECORDS: dict[tuple[int, str, int, int], dict[str, Any]] = {}
+_KV_PHYSICAL_RANGE_RECORDS: dict[str, PhysicalKVSpan] = {}
 
 
 def _coalesce_block_ids(block_ids: list[int]) -> list[tuple[int, int]]:
@@ -63,166 +58,55 @@ def register_uvm_kv_cache_physical_ranges(
     records: list[dict[str, Any]],
     *,
     clear_existing: bool = False,
-) -> dict[str, Any]:
-    """Register physical KV tensor spans used to derive block VA ranges."""
-    valid_records: list[dict[str, Any]] = []
-    skipped = 0
+) -> None:
+    """Store application-only KV spans used to derive block VA ranges."""
+    spans: list[PhysicalKVSpan] = []
     for record in records:
         try:
-            group_id = int(record.get("group_id", -1))
-            tensor_index = int(record.get("tensor_index", 0))
             ptr = int(record.get("ptr") or 0)
             size_bytes = int(record.get("size_bytes") or 0)
             page_size = int(record.get("page_size") or 0)
-            total_blocks = int(record.get("total_blocks") or 0)
-            layer_name = str(record.get("layer_name") or "")
+            max_block_id = int(record.get("max_block_id") or 0)
+            span_id = str(record.get("span_id") or record.get("region_id") or "")
         except (TypeError, ValueError):
-            skipped += 1
             continue
-        if (
-            group_id < 0
-            or not layer_name
-            or ptr <= 0
-            or size_bytes <= 0
-            or page_size <= 0
-            or total_blocks <= 0
-        ):
-            skipped += 1
+        if not span_id or ptr <= 0 or size_bytes <= 0 or page_size <= 0:
             continue
-        allocation_blocks = size_bytes // page_size
-        max_block_id = min(total_blocks, allocation_blocks - 1)
         if max_block_id <= 0:
-            skipped += 1
             continue
-        valid = {
-            **record,
-            "group_id": group_id,
-            "layer_name": layer_name,
-            "tensor_index": tensor_index,
-            "ptr": ptr,
-            "size_bytes": size_bytes,
-            "page_size": page_size,
-            "total_blocks": total_blocks,
-            "allocation_blocks": allocation_blocks,
-            "max_block_id": max_block_id,
-        }
-        valid_records.append(valid)
+        spans.append(
+            PhysicalKVSpan(
+                span_id=span_id,
+                ptr=ptr,
+                size_bytes=size_bytes,
+                page_size=page_size,
+                max_block_id=min(max_block_id, size_bytes // page_size - 1),
+            )
+        )
 
     with _KV_PHYSICAL_RANGE_LOCK:
         if clear_existing:
             _KV_PHYSICAL_RANGE_RECORDS.clear()
-        for record in valid_records:
-            key = (
-                int(record["group_id"]),
-                str(record["layer_name"]),
-                int(record["tensor_index"]),
-                int(record["ptr"]),
-            )
-            _KV_PHYSICAL_RANGE_RECORDS[key] = record
-
-    manager = get_uvm_pool_residency_manager()
-    if manager.active:
-        for record in valid_records:
-            region_id = (
-                f"kv_phys:{record['group_id']}:{record['layer_name']}:"
-                f"{record['tensor_index']}"
-            )
-            if get_uvm_residency_region_snapshot(region_id) is not None:
-                continue
-            register_uvm_residency_region(
-                pool="kv",
-                region_id=region_id,
-                ptr=int(record["ptr"]),
-                bytes=int(record["size_bytes"]),
-                state="gpu",
-                evictable=True,
-                active=False,
-                driver_register=True,
-                metadata={
-                    "stage": "stage_l5_physical",
-                    "source": "kv_cache_physical_range_map",
-                    "group_id": int(record["group_id"]),
-                    "layer_name": str(record["layer_name"]),
-                    "tensor_index": int(record["tensor_index"]),
-                    "page_size": int(record["page_size"]),
-                    "total_blocks": int(record["total_blocks"]),
-                    "max_block_id": int(record["max_block_id"]),
-                    "block_addressable": True,
-                    "metadata_only": False,
-                },
-            )
-
-    return {
-        "registered": len(valid_records),
-        "skipped": skipped,
-        "clear_existing": bool(clear_existing),
-    }
+        for span in spans:
+            _KV_PHYSICAL_RANGE_RECORDS[span.span_id] = span
 
 
 def collect_uvm_kv_cache_physical_ranges_for_blocks(
     block_ids: list[int],
-) -> dict[str, Any]:
+) -> list[tuple[int, int]]:
     """Collect deduplicated physical ranges covering the given KV block ids."""
-    intervals = _coalesce_block_ids(block_ids)
-    if not intervals:
-        return {
-            "ok": True,
-            "reason": "no_blocks",
-            "ranges": [],
-            "range_records": [],
-            "registered_spans": 0,
-        }
-
     with _KV_PHYSICAL_RANGE_LOCK:
-        records = list(_KV_PHYSICAL_RANGE_RECORDS.values())
+        spans = list(_KV_PHYSICAL_RANGE_RECORDS.values())
 
     ranges: list[tuple[int, int]] = []
-    range_records: list[dict[str, Any]] = []
     seen_ranges: set[tuple[int, int]] = set()
-    for record in records:
-        ptr = int(record["ptr"])
-        page_size = int(record["page_size"])
-        max_block_id = int(record["max_block_id"])
-        for first_block, last_block in intervals:
-            first = max(int(first_block), 1)
-            last = min(int(last_block), max_block_id)
-            if first > last:
+    for span in spans:
+        for span_range in span.ranges_for_blocks(block_ids):
+            if span_range in seen_ranges:
                 continue
-            range_ptr = ptr + first * page_size
-            range_bytes = (last - first + 1) * page_size
-            range_key = (range_ptr, range_bytes)
-            if range_key in seen_ranges:
-                continue
-            seen_ranges.add(range_key)
-            ranges.append(range_key)
-            range_records.append(
-                {
-                    "group_id": int(record["group_id"]),
-                    "layer_name": str(record["layer_name"]),
-                    "tensor_index": int(record["tensor_index"]),
-                    "ptr": f"0x{range_ptr:x}",
-                    "ptr_int": range_ptr,
-                    "bytes": range_bytes,
-                    "page_size": page_size,
-                    "first_block": first,
-                    "last_block": last,
-                }
-            )
-
-    return {
-        "ok": True,
-        "reason": "ranges_collected" if ranges else "no_registered_ranges",
-        "requested_block_count": len({int(block_id) for block_id in block_ids}),
-        "block_intervals": [
-            {"first_block": first, "last_block": last}
-            for first, last in intervals
-        ],
-        "registered_spans": len(records),
-        "range_count": len(ranges),
-        "range_bytes": sum(size for _, size in ranges),
-        "ranges": ranges,
-        "range_records": range_records,
-    }
+            seen_ranges.add(span_range)
+            ranges.append(span_range)
+    return ranges
 
 
 def _read_bool_env(name: str, default: bool = False) -> bool:
@@ -434,6 +318,7 @@ class UvmKvRuntimePolicy:
         self._dynamic_pool_control_mtime_ns: int | None = None
         self._dynamic_pool_generation = 0
         self._dynamic_pool_saved_lifecycle: dict[int, str] = {}
+        self._logical_kv_blocks: dict[tuple[int, int], LogicalKVBlock] = {}
         if self.policy not in ("lru_prefix_cache", "scheduler_aware"):
             logger.warning(
                 "Ignoring invalid VLLM_UVM_KV_RUNTIME_EVICTION_POLICY=%r; "
@@ -603,30 +488,20 @@ class UvmKvRuntimePolicy:
                     ref_cnt = None
             for group_id in group_ids:
                 region_id = f"kv:{group_id}:{block_id}"
-                before = get_uvm_residency_region_snapshot(region_id) or {}
-                mark_uvm_residency_state(
-                    region_id=region_id,
-                    state="gpu",
-                    metadata={
-                        **dict(before.get("metadata") or {}),
-                        "stage": "stage_j",
-                        "source": "unified_control_prefetch",
-                        "reason": reason,
-                        "block_id": block_id,
-                        "group_id": group_id,
-                        "ref_cnt": ref_cnt,
-                        "metadata_only": True,
-                    },
+                logical = self._logical_kv_blocks.setdefault(
+                    (group_id, block_id),
+                    LogicalKVBlock(group_id, block_id, state=RegionState.UNKNOWN),
                 )
-                after = get_uvm_residency_region_snapshot(region_id) or {}
+                before_state = logical.state.value
+                logical.state = RegionState.GPU
                 records.append(
                     {
-                        "region_id": region_id,
+                        "span_id": region_id,
                         "group_id": group_id,
                         "block_id": block_id,
-                        "before_state": before.get("state"),
-                        "after_state": after.get("state"),
-                        "bytes": int(after.get("bytes") or before.get("bytes") or 0),
+                        "before_state": before_state,
+                        "after_state": logical.state.value,
+                        "bytes": self.bytes_per_group_block,
                         "metadata": metadata,
                     }
                 )
@@ -845,15 +720,13 @@ class UvmKvRuntimePolicy:
                 "block_count": len(unique_block_ids),
             }
 
-        collection = collect_uvm_kv_cache_physical_ranges_for_blocks(unique_block_ids)
-        ranges = list(collection.get("ranges") or [])
+        ranges = collect_uvm_kv_cache_physical_ranges_for_blocks(unique_block_ids)
         if not ranges:
             return {
                 "ok": False,
-                "reason": str(collection.get("reason") or "no_registered_ranges"),
+                "reason": "no_registered_ranges",
                 "direction": direction,
                 "block_count": len(unique_block_ids),
-                "registered_spans": int(collection.get("registered_spans") or 0),
             }
 
         start = time.monotonic()
@@ -901,21 +774,17 @@ class UvmKvRuntimePolicy:
                 else self.dynamic_pool_physical_migration_device
             ),
             "range_count": len(ranges),
-            "range_bytes": int(collection.get("range_bytes") or 0),
+            "range_bytes": sum(size for _, size in ranges),
             "successes": int(successes),
             **driver_result,
         }
         for block_id in unique_block_ids:
             for group_id in range(self.num_kv_cache_groups):
-                mark_uvm_residency_state(
-                    region_id=f"kv:{group_id}:{block_id}",
-                    state=state,
-                    metadata={
-                        **metadata,
-                        "group_id": group_id,
-                        "block_id": block_id,
-                    },
+                logical = self._logical_kv_blocks.setdefault(
+                    (group_id, block_id),
+                    LogicalKVBlock(group_id, block_id),
                 )
+                logical.state = RegionState(state)
 
         record_unified_residency_snapshot(
             reason="kv_dynamic_pool_physical_migration",
@@ -931,7 +800,7 @@ class UvmKvRuntimePolicy:
             "direction": direction,
             "block_count": len(unique_block_ids),
             "range_count": len(ranges),
-            "range_bytes": int(collection.get("range_bytes") or 0),
+            "range_bytes": sum(size for _, size in ranges),
             "successes": int(successes),
             "executor": executor_used,
             "elapsed_seconds": elapsed,
@@ -1162,38 +1031,16 @@ class UvmKvRuntimePolicy:
         block.lifecycle_state = "cpu_offloaded"
         issued = False
         for group_id in range(self.num_kv_cache_groups):
-            region_id = f"kv:{group_id}:{block_id}"
-            snapshot = get_uvm_residency_region_snapshot(region_id)
-            snapshot_metadata = dict((snapshot or {}).get("metadata") or {})
-            state = str((snapshot or {}).get("state") or "unknown")
-            if state == "cpu":
+            logical = self._logical_kv_blocks.setdefault(
+                (group_id, block_id),
+                LogicalKVBlock(group_id, block_id),
+            )
+            if logical.state == RegionState.CPU:
                 issued = True
                 continue
-            metadata = {
-                **snapshot_metadata,
-                "stage": "stage_j",
-                "source": "kv_dynamic_pool_resize",
-                "direction": "shrink",
-                "reason": reason,
-                "block_id": block_id,
-                "group_id": group_id,
-                "old_target_blocks": old_target,
-                "new_target_blocks": new_target,
-                "ref_cnt": getattr(block, "ref_cnt", None),
-                "previous_lifecycle_state": previous_lifecycle,
-                "previous_state": state,
-                "requested_mode": "logical_dynamic_pool",
-                "physical_migration_requested": (
-                    self.dynamic_pool_physical_migration_enable
-                ),
-                "physical_migration_issued": False,
-                "metadata_only": True,
-            }
-            mark_uvm_residency_state(
-                region_id=region_id,
-                state="cpu",
-                metadata=metadata,
-            )
+            logical.state = RegionState.CPU
+            logical.lifecycle_state = "cpu_offloaded"
+            logical.ref_cnt = getattr(block, "ref_cnt", None)
             issued = True
         return issued
 
@@ -1215,43 +1062,16 @@ class UvmKvRuntimePolicy:
         block.lifecycle_state = restored_lifecycle
         issued = False
         for group_id in range(self.num_kv_cache_groups):
-            region_id = f"kv:{group_id}:{block_id}"
-            snapshot = get_uvm_residency_region_snapshot(region_id)
-            snapshot_metadata = dict((snapshot or {}).get("metadata") or {})
-            state = str((snapshot or {}).get("state") or "unknown")
-            if state == "gpu":
+            logical = self._logical_kv_blocks.setdefault(
+                (group_id, block_id),
+                LogicalKVBlock(group_id, block_id),
+            )
+            if logical.state == RegionState.GPU:
                 issued = True
                 continue
-            metadata = {
-                **snapshot_metadata,
-                "stage": "stage_j",
-                "source": "kv_dynamic_pool_resize",
-                "direction": "grow",
-                "reason": reason,
-                "block_id": block_id,
-                "group_id": group_id,
-                "old_target_blocks": old_target,
-                "new_target_blocks": new_target,
-                "ref_cnt": getattr(block, "ref_cnt", None),
-                "restored_lifecycle_state": restored_lifecycle,
-                "previous_state": state,
-                "requested_mode": "logical_dynamic_pool",
-                "physical_migration_requested": (
-                    self.dynamic_pool_physical_migration_enable
-                ),
-                "physical_migration_issued": False,
-                "metadata_only": True,
-            }
-            mark_uvm_residency_state(
-                region_id=region_id,
-                state="prefetching_gpu",
-                metadata=metadata,
-            )
-            mark_uvm_residency_state(
-                region_id=region_id,
-                state="gpu",
-                metadata=metadata,
-            )
+            logical.state = RegionState.GPU
+            logical.lifecycle_state = restored_lifecycle
+            logical.ref_cnt = getattr(block, "ref_cnt", None)
             issued = True
         return issued
 
@@ -1264,25 +1084,20 @@ class UvmKvRuntimePolicy:
     def _kv_block_residency_class(self, block_id: int) -> str:
         saw_unknown = False
         for group_id in range(self.num_kv_cache_groups):
-            snapshot = get_uvm_residency_region_snapshot(f"kv:{group_id}:{block_id}")
-            state = str((snapshot or {}).get("state") or "unknown")
-            if state in ("cpu", "prefetching_cpu", "released"):
+            logical = self._logical_kv_blocks.get((group_id, block_id))
+            state = (
+                logical.state
+                if logical is not None
+                else RegionState.UNKNOWN
+            )
+            if state in (RegionState.CPU, RegionState.PREFETCHING_CPU):
                 return "cpu"
-            if state not in ("gpu", "prefetching_gpu"):
+            if state not in (RegionState.GPU, RegionState.PREFETCHING_GPU):
                 saw_unknown = True
         return "unknown" if saw_unknown else "gpu"
 
     def register_stage_l5_kv_blocks(self, block_pool: Any) -> None:
-        """Register KV block metadata in Stage L residency.
-
-        The post-warmup path handles physical KV migration directly from the
-        model runner; the runtime policy keeps only scheduler-side metadata.
-        """
-        if not self.active or not self.stage_l5_metadata_enable:
-            return
-        if not get_uvm_pool_residency_manager().active:
-            return
-        bytes_per_region = max(self.bytes_per_group_block, 1)
+        """Track logical scheduler state without creating driver regions."""
         for group_id in range(self.num_kv_cache_groups):
             for block in getattr(block_pool, "blocks", []):
                 if getattr(block, "is_null", False):
@@ -1290,38 +1105,12 @@ class UvmKvRuntimePolicy:
                 block_id = int(getattr(block, "block_id", -1))
                 if block_id < 0:
                     continue
-                region_id = f"kv:{group_id}:{block_id}"
-                if get_uvm_residency_region_snapshot(region_id) is not None:
-                    continue
-                register_uvm_residency_region(
-                    pool="kv",
-                    region_id=region_id,
-                    ptr=None,
-                    bytes=bytes_per_region,
-                    state="gpu",
-                    evictable=True,
-                    active=False,
-                    driver_register=False,
-                    metadata={
-                        "stage": "stage_l5",
-                        "source": "kv_block_metadata",
-                        "group_id": group_id,
-                        "block_id": block_id,
-                        "bytes_per_block": bytes_per_region,
-                        "ref_cnt": getattr(block, "ref_cnt", None),
-                        "lifecycle_state": self._kv_block_lifecycle_class(block),
-                        "ever_used": (
-                            self._kv_block_lifecycle_class(block) != "never_used"
-                        ),
-                        "is_prefix_cache": getattr(block, "block_hash", None)
-                        is not None,
-                        "in_free_queue": True,
-                        "block_hash": _block_hash_to_text(
-                            getattr(block, "block_hash", None)
-                        ),
-                        "offload_capable": False,
-                        "metadata_only": True,
-                    },
+                self._logical_kv_blocks[(group_id, block_id)] = LogicalKVBlock(
+                    group_id=group_id,
+                    block_id=block_id,
+                    state=RegionState.GPU,
+                    lifecycle_state=self._kv_block_lifecycle_class(block),
+                    ref_cnt=getattr(block, "ref_cnt", None),
                 )
 
     def should_allow_allocation(
@@ -1455,14 +1244,15 @@ class UvmKvRuntimePolicy:
             return
 
         for group_id, block_id, block, region_id in candidates:
-            snapshot = get_uvm_residency_region_snapshot(region_id)
-            size_bytes = int(
-                (snapshot or {}).get("bytes")
-                or self.bytes_per_group_block
+            size_bytes = int(self.bytes_per_group_block)
+            logical = self._logical_kv_blocks.setdefault(
+                (group_id, block_id),
+                LogicalKVBlock(group_id, block_id),
             )
-            metadata = dict((snapshot or {}).get("metadata") or {})
+            logical.state = RegionState.GPU
+            logical.lifecycle_state = self._kv_block_lifecycle_class(block)
+            logical.ref_cnt = getattr(block, "ref_cnt", None)
             protect_metadata = {
-                **metadata,
                 "stage": "stage_m",
                 "source": "kv_active_protection",
                 "request_id": request_id,

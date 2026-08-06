@@ -3112,13 +3112,17 @@ def driver_register_region(
     region_id: int,
     ptr: int,
     nbytes: int,
-    pool: int,
+    pool: int = UVM_REGION_POOL_UNKNOWN,
     layer_id: int = 0,
     expert_id: int = 0,
     role: int = UVM_REGION_ROLE_UNKNOWN,
     flags: int = 0,
 ) -> int:
-    """Register a tagged managed range in the Phase F driver region table."""
+    """Register a managed range using the compatibility Phase-F ABI.
+
+    The ABI still has semantic fields, but the explicit-region path must not
+    communicate or depend on them.  They are therefore always sent as zero.
+    """
     try:
         lib = ensure_uvm_runtime_library()
     except Exception:
@@ -3132,11 +3136,11 @@ def driver_register_region(
                 ctypes.c_uint64(region_id),
                 ctypes.c_uint64(ptr),
                 ctypes.c_size_t(nbytes),
-                ctypes.c_uint32(max(int(pool), 0)),
-                ctypes.c_uint32(max(int(layer_id), 0)),
-                ctypes.c_uint32(max(int(expert_id), 0)),
-                ctypes.c_uint32(max(int(role), 0)),
-                ctypes.c_uint32(max(int(flags), 0)),
+                ctypes.c_uint32(0),
+                ctypes.c_uint32(0),
+                ctypes.c_uint32(0),
+                ctypes.c_uint32(0),
+                ctypes.c_uint32(0),
             )
         )
     except Exception:
@@ -3423,6 +3427,34 @@ def driver_query_region(region_id: int) -> dict[str, int] | None:
     return _driver_region_values_to_dict(values)
 
 
+def driver_release_regions(
+    region_ids: Sequence[int],
+    *,
+    device: int = 0,
+) -> dict[str, object]:
+    """Generic explicit-region release; no expert/pool validation is applied."""
+    return driver_expert_offload_release_regions(
+        region_ids,
+        device=device,
+        require_expert=False,
+        return_entries=True,
+    )
+
+
+def driver_query_region_states(region_ids: Sequence[int]) -> dict[int, int]:
+    """Return only the state of explicitly queried numeric region IDs."""
+    result: dict[int, int] = {}
+    for value in region_ids:
+        try:
+            region_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        snapshot = driver_query_region(region_id)
+        if snapshot is not None:
+            result[region_id] = int(snapshot.get("state", UVM_REGION_STATE_UNKNOWN))
+    return result
+
+
 
 
 
@@ -3669,3 +3701,45 @@ def batch_offload_ranges_to_cpu(
             logger.debug("Failed to synchronize after batch UVM CPU offload",
                          exc_info=True)
     return successes
+
+
+def driver_restore_regions(
+    region_ids: Sequence[int],
+    *,
+    device: int = 0,
+    executor: str = "auto",
+) -> dict[str, object]:
+    """Restore explicitly registered regions by their recorded VA ranges."""
+    ranges: list[tuple[int, int]] = []
+    valid_ids: list[int] = []
+    for value in region_ids:
+        try:
+            region_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        snapshot = driver_query_region(region_id)
+        if snapshot is None:
+            continue
+        base = int(snapshot.get("base") or 0)
+        length = int(snapshot.get("length") or 0)
+        if base > 0 and length > 0:
+            valid_ids.append(region_id)
+            ranges.append((base, length))
+    successes, executor_used, driver_status = (
+        batch_prefetch_ranges_to_device_with_executor(
+            ranges,
+            device,
+            executor=executor,
+        )
+        if ranges
+        else (0, executor, 0)
+    )
+    complete = int(successes) == len(ranges)
+    return {
+        "ok": complete,
+        "region_ids": valid_ids,
+        "success_count": int(successes),
+        "failure_count": len(ranges) - int(successes),
+        "executor": executor_used,
+        "driver_status": driver_status,
+    }

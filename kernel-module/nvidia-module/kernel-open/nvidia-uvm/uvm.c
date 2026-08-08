@@ -61,7 +61,7 @@ static uvm_phase_f_region_t *uvm_phase_f_region_from_node(uvm_range_tree_node_t 
     return container_of(node, uvm_phase_f_region_t, va_node);
 }
 
-static bool uvm_phase_f_registered_region_is_expert_weight(const uvm_phase_f_region_t *region);
+static bool uvm_phase_f_registered_region_is_valid(const uvm_phase_f_region_t *region);
 
 typedef struct
 {
@@ -614,7 +614,7 @@ static NV_STATUS uvm_expert_reserved_prefetch_resolve_entry_locked(uvm_va_space_
         if (!region)
             return NV_ERR_OBJECT_NOT_FOUND;
 
-        if (!uvm_phase_f_registered_region_is_expert_weight(region))
+        if (!uvm_phase_f_registered_region_is_valid(region))
             return NV_WARN_MORE_PROCESSING_REQUIRED;
 
         if (region->base == 0 || region->length == 0 || uvm_api_range_invalid(region->base, region->length))
@@ -3763,15 +3763,8 @@ static void uvm_phase_n_copy_region_to_query(uvm_phase_f_region_t *region,
     params->region_id = region->region_id;
     params->base = region->base;
     params->length = region->length;
-    params->pool = region->pool;
-    params->layer_id = region->layer_id;
-    params->expert_id = region->expert_id;
-    params->role = region->role;
-    params->flags = region->flags;
     params->state = region->state;
-    params->priority = region->priority;
     params->found_by_va = found_by_va;
-    params->last_access_epoch = region->last_access_epoch;
 }
 
 static void uvm_phase_n_copy_region_to_query_by_va(uvm_phase_f_region_t *region,
@@ -3780,15 +3773,8 @@ static void uvm_phase_n_copy_region_to_query_by_va(uvm_phase_f_region_t *region,
     params->region_id = region->region_id;
     params->base = region->base;
     params->length = region->length;
-    params->pool = region->pool;
-    params->layer_id = region->layer_id;
-    params->expert_id = region->expert_id;
-    params->role = region->role;
-    params->flags = region->flags;
     params->state = region->state;
-    params->priority = region->priority;
     params->found_by_va = 1;
-    params->last_access_epoch = region->last_access_epoch;
 }
 
 bool uvm_file_is_nvidia_uvm(struct file *filp)
@@ -5993,7 +5979,7 @@ static NV_STATUS uvm_phase_f_expert_batch_fill_entries(uvm_va_space_t *va_space,
     return NV_OK;
 }
 
-static bool uvm_phase_f_registered_region_is_expert_weight(const uvm_phase_f_region_t *region)
+static bool uvm_phase_f_registered_region_is_valid(const uvm_phase_f_region_t *region)
 {
     return region && region->region_id != 0 && region->base != 0 && region->length != 0;
 }
@@ -6020,7 +6006,7 @@ static NV_STATUS uvm_phase_f_expert_batch_collect_region(uvm_va_space_t *va_spac
     if (!region)
         return NV_ERR_OBJECT_NOT_FOUND;
 
-    if (!uvm_phase_f_registered_region_is_expert_weight(region))
+    if (!uvm_phase_f_registered_region_is_valid(region))
         return NV_WARN_MORE_PROCESSING_REQUIRED;
 
     base = region->base;
@@ -6110,7 +6096,7 @@ static NV_STATUS uvm_phase_f_expert_batch_probe_single_va_range_region(uvm_va_sp
     if (!region)
         return NV_ERR_OBJECT_NOT_FOUND;
 
-    if (!uvm_phase_f_registered_region_is_expert_weight(region))
+    if (!uvm_phase_f_registered_region_is_valid(region))
         return NV_WARN_MORE_PROCESSING_REQUIRED;
 
     base = region->base;
@@ -6717,8 +6703,8 @@ static NV_STATUS uvm_api_phase_f_register_region(UVM_PHASE_F_REGISTER_REGION_PAR
     region->region_id = params->region.region_id;
     region->base = params->region.base;
     region->length = params->region.length;
-    // Compatibility ABI fields are intentionally ignored. Region identity,
-    // geometry and state are the complete kernel-side contract.
+    // Legacy Phase-N internals still share this allocation, but explicit
+    // registration never assigns them business semantics.
     region->pool = UVM_PHASE_N_POOL_UNKNOWN;
     region->layer_id = 0;
     region->expert_id = 0;
@@ -6781,6 +6767,41 @@ static NV_STATUS uvm_api_phase_f_unregister_region(UVM_PHASE_F_UNREGISTER_REGION
     return NV_OK;
 }
 
+// Batch region execution is the generic restore/release path. Keep the
+// residency state machine tied to the operation result, including an explicit
+// in-flight state for asynchronous submissions.
+static void uvm_phase_f_update_region_state_after_action(uvm_va_space_t *va_space,
+                                                          NvU64 region_id,
+                                                          NvU32 action,
+                                                          NvBool async,
+                                                          NV_STATUS status)
+{
+    NvU32 new_state;
+    uvm_phase_f_region_t *region;
+
+    if (status != NV_OK)
+        return;
+
+    if (action == UVM_PHASE_F_ACTION_PREFETCH_GPU) {
+        new_state = async ? UVM_PHASE_N_REGION_STATE_PREFETCHING_GPU :
+                            UVM_PHASE_N_REGION_STATE_GPU;
+    }
+    else if (action == UVM_PHASE_F_ACTION_PREFETCH_CPU ||
+             action == UVM_PHASE_F_ACTION_PREFETCH_CPU_NO_MAP) {
+        new_state = async ? UVM_PHASE_N_REGION_STATE_PREFETCHING_CPU :
+                            UVM_PHASE_N_REGION_STATE_CPU;
+    }
+    else {
+        return;
+    }
+
+    uvm_va_space_down_write(va_space);
+    region = radix_tree_lookup(&va_space->phase_f_regions, region_id);
+    if (region)
+        region->state = new_state;
+    uvm_va_space_up_write(va_space);
+}
+
 static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS *params, struct file *filp)
 {
     uvm_va_space_t *va_space = uvm_va_space_get(filp);
@@ -6820,10 +6841,6 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
         uvm_phase_f_region_t *region;
         NvU64 base = 0;
         NvU64 length = 0;
-        NvU32 layer_id = 0;
-        NvU32 expert_id = 0;
-        NvU32 role = 0;
-        NvU32 pool = 0;
         NV_STATUS status = NV_OK;
 
         params->results[i].status = NV_OK;
@@ -6845,10 +6862,6 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
             if (region) {
                 base = region->base;
                 length = region->length;
-                layer_id = region->layer_id;
-                expert_id = region->expert_id;
-                role = region->role;
-                pool = region->pool;
             }
             uvm_va_space_up_read(va_space);
 
@@ -6857,14 +6870,10 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
         }
 
         if (status == NV_OK) {
-            uvm_phase_f_route_log("phase_f_policy_batch_region_entry index=%u action=%u region=%llu pool=%u layer=%u expert=%u role=%u base=0x%llx end=0x%llx length=%llu async=%u\n",
+            uvm_phase_f_route_log("phase_f_policy_batch_region_entry index=%u action=%u region=%llu base=0x%llx end=0x%llx length=%llu async=%u\n",
                                   i,
                                   params->action,
                                   params->region_ids[i],
-                                  pool,
-                                  layer_id,
-                                  expert_id,
-                                  role,
                                   base,
                                   base + length,
                                   length,
@@ -6876,6 +6885,11 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
                                                length,
                                                &params->results[i],
                                                filp);
+            uvm_phase_f_update_region_state_after_action(va_space,
+                                                         params->region_ids[i],
+                                                         params->action,
+                                                         params->async,
+                                                         status);
         }
         else {
             params->results[i].status = status;
@@ -14540,22 +14554,17 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_F_REGISTER_REGION,        uvm_api_phase_f_register_region);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_F_UNREGISTER_REGION,      uvm_api_phase_f_unregister_region);
         UVM_ROUTE_CMD_ALLOC_INIT_CHECK(UVM_PHASE_F_BATCH_REGIONS,          uvm_api_phase_f_batch_regions);
-        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_N_SET_POOL_BUDGET,        uvm_api_phase_n_set_pool_budget);
-        UVM_ROUTE_CMD_HEAP_INIT_CHECK(UVM_PHASE_N_GET_POOL_STATE,          uvm_api_phase_n_get_pool_state);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_N_UPDATE_REGION_STATE,     uvm_api_phase_n_update_region_state);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_N_QUERY_REGION,            uvm_api_phase_n_query_region);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_N_QUERY_REGION_BY_VA,      uvm_api_phase_n_query_region_by_va);
-        UVM_ROUTE_CMD_ALLOC_INIT_CHECK(UVM_PHASE_N_RECLAIM_POOL,            uvm_api_phase_n_reclaim_pool);
-        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_N_SET_DYNAMIC_BUDGETS,      uvm_api_phase_n_set_dynamic_budgets);
-        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PHASE_N_PROTECT_ACTIVE_KV,        uvm_api_phase_n_protect_active_kv);
-        UVM_ROUTE_CMD_HEAP_INIT_CHECK(UVM_PHASE_N_QUERY_REGION_BLOCKS,       uvm_api_phase_n_query_region_blocks);
-        UVM_ROUTE_CMD_HEAP_INIT_CHECK(UVM_PHASE_N_RECLAIM_REGION,            uvm_api_phase_n_reclaim_region);
-        UVM_ROUTE_CMD_HEAP_INIT_CHECK(UVM_EXPERT_RESERVED_POOL,              uvm_api_expert_reserved_pool);
-        UVM_ROUTE_CMD_HEAP_INIT_CHECK(UVM_EXPERT_RESERVED_PREFETCH_BATCH,    uvm_api_expert_reserved_prefetch_batch);
+        // Phase-N pool policy ioctls are intentionally not routed. Explicit
+        // region/range migration owns all residency actions.
+        // Ioctls 98/99 (reserved expert pool/prefetch) are intentionally not
+        // routed. Explicit region/range migration is the supported API.
         UVM_ROUTE_CMD_HEAP_INIT_CHECK(UVM_EXPERT_OFFLOAD_RELEASE,            uvm_api_expert_offload_release);
         UVM_ROUTE_CMD_ALLOC_INIT_CHECK(UVM_MOE_SLOT_REMAP_BATCH,            uvm_api_moe_slot_remap_batch);
-        UVM_ROUTE_CMD_HEAP_INIT_CHECK(UVM_MOE_SLOT_POOL_QUERY,              uvm_api_moe_slot_pool_query);
-        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_MOE_SLOT_POOL_READBACK,           uvm_api_moe_slot_pool_readback);
+        // MoE slot-pool diagnostics are intentionally not routed on the
+        // explicit Region path.
     }
 
     // Try the test ioctls if none of the above matched

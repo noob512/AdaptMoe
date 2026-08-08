@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-
-import pytest
 
 from vllm.v1.core.uvm_kv_runtime_policy import UvmKvRuntimePolicy
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
@@ -39,24 +36,19 @@ def test_uvm_kv_tail_range_respects_block_boundaries() -> None:
     )
 
 
-def test_pre_kv_stage_orders_cold_placement_before_kv_and_hot_repair(
+def test_pre_kv_stage_orders_expert_placement_before_kv(
     monkeypatch: Any,
 ) -> None:
     events: list[str] = []
 
     class FakeModelRunner:
-        def run_uvm_init_time_weight_placement(self, **kwargs: Any) -> None:
-            assert kwargs == {"run_hot_repair": False}
+        def run_uvm_init_time_weight_placement(self) -> None:
             events.append("cold_placement")
 
         def initialize_kv_cache(self, kv_cache_config: object) -> None:
             events.append("kv_allocation")
 
-        def run_uvm_init_hot_weight_repair(self) -> None:
-            events.append("hot_repair")
-
     monkeypatch.setenv("VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE", "pre_kv")
-    monkeypatch.setenv("VLLM_UVM_EXPERT_RESERVED_ENABLE_AFTER_WARMUP", "0")
     monkeypatch.setattr(
         gpu_worker_module,
         "ensure_kv_transfer_initialized",
@@ -73,10 +65,10 @@ def test_pre_kv_stage_orders_cold_placement_before_kv_and_hot_repair(
 
     worker.initialize_from_config(object())
 
-    assert events == ["cold_placement", "kv_allocation", "hot_repair"]
+    assert events == ["cold_placement", "kv_allocation"]
 
 
-def test_post_warmup_rebalance_order_and_reserved_gate(
+def test_post_warmup_rebalance_orders_kv_before_experts(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -92,26 +84,13 @@ def test_post_warmup_rebalance_order_and_reserved_gate(
             events.append(f"kv:{target_blocks}")
             return {"offload_complete": True}
 
-        def run_uvm_init_time_weight_placement(
-            self,
-            *,
-            prealloc_reserved: bool,
-        ) -> None:
-            assert prealloc_reserved is False
+        def run_uvm_init_time_weight_placement(self) -> None:
             events.append("experts")
-
-        def _maybe_prealloc_uvm_expert_reserved_slots_after_stage_m(
-            self,
-        ) -> dict[str, Any]:
-            events.append("slots")
-            return {"requested": True, "ok": True}
 
     monkeypatch.setenv("VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE", "post_warmup")
     monkeypatch.setenv("VLLM_UVM_KV_POST_WARMUP_TARGET_BLOCKS", "4")
     monkeypatch.setenv("VLLM_UVM_KV_DYNAMIC_POOL_CONTROL_FILE", str(control_file))
     monkeypatch.setenv("VLLM_USE_UVM", "1")
-    monkeypatch.setenv("VLLM_UVM_WEIGHT_EXECUTOR", "expert_reserved_regions_async")
-    monkeypatch.delenv("VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY", raising=False)
 
     worker = object.__new__(Worker)
     worker.model_runner = FakeModelRunner()
@@ -119,11 +98,10 @@ def test_post_warmup_rebalance_order_and_reserved_gate(
 
     worker._run_uvm_post_warmup_rebalance()
 
-    assert events == ["kv:4", "experts", "slots"]
-    assert os.environ["VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY"] == "1"
+    assert events == ["kv:4", "experts"]
 
     worker._run_uvm_post_warmup_rebalance()
-    assert events == ["kv:4", "experts", "slots"]
+    assert events == ["kv:4", "experts"]
 
 
 def test_post_warmup_target_automatically_enables_dynamic_pool(
@@ -147,60 +125,18 @@ def test_post_warmup_target_automatically_enables_dynamic_pool(
     assert policy.total_blocks == 10
 
 
-def test_reserved_runtime_stays_closed_when_preallocation_fails(
-    monkeypatch: Any,
-) -> None:
-    class FakeModelRunner:
-        def run_uvm_init_time_weight_placement(
-            self,
-            *,
-            prealloc_reserved: bool,
-        ) -> None:
-            assert prealloc_reserved is False
-
-        def _maybe_prealloc_uvm_expert_reserved_slots_after_stage_m(
-            self,
-        ) -> dict[str, Any]:
-            return {"requested": True, "ok": False, "reason": "test_failure"}
-
-    monkeypatch.setenv("VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE", "post_warmup")
-    monkeypatch.setenv("VLLM_UVM_WEIGHT_EXECUTOR", "expert_reserved_regions_async")
-    monkeypatch.delenv("VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY", raising=False)
-
-    worker = object.__new__(Worker)
-    worker.model_runner = FakeModelRunner()
-
-    with pytest.raises(RuntimeError, match="preallocation was not ready"):
-        worker._run_uvm_post_warmup_rebalance()
-
-    assert os.environ["VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY"] == "0"
-
-
-def test_remote_read_skips_reserved_preallocation(
+def test_post_warmup_remote_read_runs_explicit_expert_placement(
     monkeypatch: Any,
 ) -> None:
     events: list[str] = []
 
     class FakeModelRunner:
-        def run_uvm_init_time_weight_placement(
-            self,
-            *,
-            prealloc_reserved: bool,
-        ) -> None:
-            assert prealloc_reserved is False
+        def run_uvm_init_time_weight_placement(self) -> None:
             events.append("experts")
-
-        def _maybe_prealloc_uvm_expert_reserved_slots_after_stage_m(
-            self,
-        ) -> dict[str, Any]:
-            events.append("slots")
-            return {"requested": True, "ok": True}
 
     monkeypatch.setenv("VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE", "post_warmup")
     monkeypatch.setenv("VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE", "1")
-    monkeypatch.setenv("VLLM_UVM_WEIGHT_EXECUTOR", "expert_reserved_regions_async")
     monkeypatch.setenv("VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE", "remote_read")
-    monkeypatch.delenv("VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY", raising=False)
 
     worker = object.__new__(Worker)
     worker.model_runner = FakeModelRunner()
@@ -208,4 +144,3 @@ def test_remote_read_skips_reserved_preallocation(
     worker._run_uvm_post_warmup_rebalance()
 
     assert events == ["experts"]
-    assert os.environ["VLLM_UVM_EXPERT_RESERVED_RUNTIME_READY"] == "0"

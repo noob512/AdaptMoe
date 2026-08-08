@@ -1046,11 +1046,6 @@ typedef struct
     NvU64 region_id NV_ALIGN_BYTES(8); // IN
     NvU64 base      NV_ALIGN_BYTES(8); // IN
     NvU64 length    NV_ALIGN_BYTES(8); // IN
-    NvU32 pool;                        // IN
-    NvU32 layer_id;                    // IN
-    NvU32 expert_id;                   // IN
-    NvU32 role;                        // IN
-    NvU32 flags;                       // IN
 } UVM_PHASE_F_REGION;
 
 typedef struct
@@ -1650,9 +1645,10 @@ typedef struct
 } UVM_PHASE_N_RECLAIM_REGION_PARAMS;
 
 //
-// UvmExpertReservedPool
+// UvmExpertReservedPool (removed)
 //
-// Experimental Phase-1 control plane for reserved-backed native residency.
+// Reserved-backed expert residency was removed. Ioctl number 98 is intentionally
+// left unassigned so stale user space receives an unsupported-command error.
 // This ioctl preallocates UVM PMM user chunks through the existing
 // uvm_pmm_gpu_alloc_user() path and keeps them TEMP_PINNED in a driver-owned
 // reserved pool. Phase 1 does not attach the chunks to VA blocks, install PTEs,
@@ -1827,10 +1823,6 @@ typedef struct
     NvProcessorUuid gpu_uuid;                // IN, target GPU
     NvU32 flags;                             // IN, UVM_EXPERT_OFFLOAD_RELEASE_FLAG_*
     NvU32 max_blocks;                        // IN, 0 means no explicit cap
-    NvU32 pool;                              // OUT
-    NvU32 layer_id;                          // OUT
-    NvU32 expert_id;                         // OUT
-    NvU32 role;                              // OUT
     NvU64 base NV_ALIGN_BYTES(8);            // OUT
     NvU64 length NV_ALIGN_BYTES(8);          // OUT
     NvU64 block_count NV_ALIGN_BYTES(8);     // OUT, existing VA blocks scanned

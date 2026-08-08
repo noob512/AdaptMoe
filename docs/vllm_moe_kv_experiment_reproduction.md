@@ -290,13 +290,14 @@ setup4,c4,c8,c16,c24,c32,c40,c48,c56,c64,c72,c80,c88,c96
 
 本表的“GB”是十进制显示；对应的 GiB 分别约为 3.80、6.54、9.49 GiB。不要把它们误写为 KV cache 大小。
 
-由于每个专家涉及 `moe_gate_up` 和 `moe_down` 两个目标 role，运行时 `remote_prepare_records` 预期为 cold plan 条目数的两倍：
+运行时不再按权重 role 生成两条逻辑 residency 记录。每个计划条目对应一个
+`ExpertRecord`，实际提交的是其 `envelope_region_ids`。envelope 数量取决于权重
+布局和 envelope 粒度，不能再用 cold plan 条目数乘以二推导。实验验收应检查：
 
-| 计划 | 预期 `remote_prepare_records` | 预期 `remote_prepare_bytes` |
-|---|---:|---:|
-| `k18` | 1728 | 4,076,863,488 |
-| `k31` | 2976 | 7,021,264,896 |
-| `k45` | 4320 | 10,192,158,720 |
+- cold plan 中的每个本地 expert 都生成了非空且独占的 envelope ID 集合；
+- release 只提交所选 expert 的 envelope ID；
+- 所有 envelope 成功后 expert 聚合状态为 `CPU`；
+- 三个计划的成功释放总字节数仍分别为表中的估算释放字节数。
 
 ---
 

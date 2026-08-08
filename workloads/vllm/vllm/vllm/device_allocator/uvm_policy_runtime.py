@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Application-layer UVM policy runtime facade.
 
-This module is intentionally thin.  It centralizes high-level residency actions
-while reusing the existing Stage K coordinator, Stage L residency ledger, and
-CUDA/UVM execution helpers.  The driver remains the migration backend; policy
-decisions stay at vLLM object boundaries.
+This module is intentionally thin. It centralizes high-level residency actions
+while using explicit CUDA/UVM range helpers. The driver remains the migration
+backend; policy decisions stay at vLLM object boundaries.
 """
 
 from __future__ import annotations
@@ -17,10 +16,6 @@ from typing import Any
 from vllm.device_allocator.uvm import (
     advise_range_preferred_location,
     prefetch_range_to_device,
-)
-from vllm.device_allocator.uvm_pool_coordinator import request_uvm_pool_action
-from vllm.device_allocator.uvm_pool_residency import (
-    request_uvm_gpu_residency,
 )
 from vllm.logger import init_logger
 
@@ -77,62 +72,8 @@ class UvmPolicyRuntime:
         - prefetch: prefetch active KV ranges to GPU.
         - advise_prefetch: apply advise then prefetch.
         """
-        metadata = dict(metadata or {})
         size_bytes = max(int(bytes or 0), 0)
         ranges = list(ranges or [])
-        ptr = int(ranges[0][0]) if ranges else None
-        action_metadata = {
-            **metadata,
-            "source": "uvm_policy_runtime",
-            "policy_action": "protect_kv_region",
-            "block_id": block_id,
-            "group_id": group_id,
-            "mode": mode,
-            "device": device,
-            "range_count": len(ranges),
-            "ptr_present": ptr is not None,
-        }
-
-        residency_decision = request_uvm_gpu_residency(
-            pool="kv",
-            region_id=region_id,
-            bytes=size_bytes,
-            scope_key=scope_key,
-            active_region_ids=active_region_ids,
-            metadata=action_metadata,
-        )
-        if not residency_decision.allowed:
-            return UvmPolicyActionResult(
-                enabled=self.active,
-                allowed=False,
-                issued=False,
-                mode=mode,
-                reason=residency_decision.reason,
-                bytes=size_bytes,
-                range_count=len(ranges),
-            )
-
-        coordinator_decision = request_uvm_pool_action(
-            pool="kv",
-            action=f"kv_active_protect_{mode}",
-            requested_bytes=size_bytes,
-            scope_key=scope_key,
-            metadata={
-                **action_metadata,
-                "stage": "stage_m_policy_runtime",
-                "region_id": region_id,
-            },
-        )
-        if not coordinator_decision.allowed:
-            return UvmPolicyActionResult(
-                enabled=self.active,
-                allowed=False,
-                issued=False,
-                mode=mode,
-                reason=coordinator_decision.reason,
-                bytes=size_bytes,
-                range_count=len(ranges),
-            )
 
         if mode == "trace_only":
             return UvmPolicyActionResult(

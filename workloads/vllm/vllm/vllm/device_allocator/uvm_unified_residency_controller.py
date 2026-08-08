@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unified HBM residency controller for KV and MoE experts.
 
-Phase U1 observes only. Phase U2 adds a manual control-file path that can
-delegate to existing KV dynamic-pool and driver pool-budget/reclaim primitives.
+Phase U1 observes only. Phase U2 can drive application-level KV controls. The
+old driver pool-budget/reclaim control plane is intentionally unsupported.
 """
 
 from __future__ import annotations
@@ -17,23 +17,15 @@ from typing import Any
 
 from vllm.logger import init_logger
 from vllm.device_allocator.uvm_pool_residency import (
-    get_uvm_driver_pool_state_snapshot,
     get_uvm_residency_regions_snapshot,
     get_uvm_residency_snapshot,
-    set_uvm_driver_pool_budget,
-    soft_reclaim_uvm_driver_pool,
 )
 
 logger = init_logger(__name__)
 
 
 _KV_REGION_RE = re.compile(r"^kv:(?P<group_id>\d+):(?P<block_id>\d+)(?::|$)")
-_BUDGET_MODE_IDS = {
-    "trace_only": 0,
-    "trace": 0,
-    "soft": 1,
-    "enforce": 2,
-}
+_UNSUPPORTED_DRIVER_POOL_POLICY_REASON = "unsupported_explicit_region_only"
 
 
 def _read_bool_env(name: str, default: bool = False) -> bool:
@@ -63,21 +55,6 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _metadata_bool(metadata: dict[str, Any], key: str) -> bool:
-    value = metadata.get(key)
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on")
-    return bool(value)
-
-
-def _read_budget_mode_env(name: str, default: str = "enforce") -> int:
-    raw = os.environ.get(name, default).strip().lower()
-    if raw not in _BUDGET_MODE_IDS:
-        logger.warning("Ignoring invalid %s=%r; using %s.", name, raw, default)
-        raw = default
-    return _BUDGET_MODE_IDS[raw]
-
-
 def _object_identity(record: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "object_type",
@@ -85,13 +62,10 @@ def _object_identity(record: dict[str, Any]) -> dict[str, Any]:
         "pool",
         "bytes",
         "residency_state",
-        "protection_state",
-        "priority",
         "group_id",
         "block_id",
         "layer_id",
         "expert_id",
-        "role",
     )
     return {key: record.get(key) for key in keys if record.get(key) is not None}
 
@@ -117,20 +91,8 @@ class UnifiedResidencyController:
             "VLLM_UVM_UNIFIED_RESIDENCY_MAX_OBJECTS_PER_SNAPSHOT",
             0,
         )
-        self.driver_pool_state_enable = _read_bool_env(
-            "VLLM_UVM_UNIFIED_RESIDENCY_DRIVER_POOL_STATE",
-            False,
-        )
-        self.driver_pool_state_device = _read_int_env(
-            "VLLM_UVM_UNIFIED_RESIDENCY_DRIVER_POOL_STATE_DEVICE",
-            0,
-        )
         self.managed_hbm_budget_override = _read_int_env(
             "VLLM_UVM_UNIFIED_MANAGED_HBM_BUDGET_BYTES",
-            0,
-        )
-        self.reserved_slot_budget_override = _read_int_env(
-            "VLLM_UVM_UNIFIED_RESERVED_SLOT_BYTES",
             0,
         )
         self.runtime_safety_margin_override = _read_int_env(
@@ -164,18 +126,6 @@ class UnifiedResidencyController:
         self.control_enabled = _read_bool_env(
             "VLLM_UVM_UNIFIED_RESIDENCY_CONTROL_ENABLE",
             bool(self.control_file),
-        )
-        self.control_driver_budget_mode = _read_budget_mode_env(
-            "VLLM_UVM_UNIFIED_DRIVER_BUDGET_MODE",
-            "enforce",
-        )
-        self.control_reclaim_async = _read_bool_env(
-            "VLLM_UVM_UNIFIED_RECLAIM_ASYNC",
-            False,
-        )
-        self.control_reclaim_max_victims = _read_int_env(
-            "VLLM_UVM_UNIFIED_RECLAIM_MAX_VICTIMS",
-            8,
         )
         self._lock = threading.Lock()
         self._config_recorded = False
@@ -306,10 +256,7 @@ class UnifiedResidencyController:
                 "routing_plan": routing_plan or {},
                 "kv_resident_bytes": snapshot.get("kv_resident_bytes", 0),
                 "expert_resident_bytes": snapshot.get("expert_resident_bytes", 0),
-                "reserved_slot_budget": snapshot.get("reserved_slot_budget", 0),
                 "runtime_safety_margin": snapshot.get("runtime_safety_margin", 0),
-                "protected_object_count": snapshot.get("protected_object_count", 0),
-                "evictable_object_count": snapshot.get("evictable_object_count", 0),
             }
         )
         return snapshot
@@ -460,21 +407,6 @@ class UnifiedResidencyController:
         objects = [record for record in objects if record is not None]
 
         totals = self._totals_from_objects(objects, residency)
-        driver_pool_state = (
-            get_uvm_driver_pool_state_snapshot(self.driver_pool_state_device)
-            if self.driver_pool_state_enable
-            else {}
-        )
-        protected_objects = [
-            _object_identity(record)
-            for record in objects
-            if record.get("protection_state") in ("active", "protected_next", "pinned")
-        ]
-        evictable_objects = [
-            _object_identity(record)
-            for record in objects
-            if record.get("protection_state") == "evictable"
-        ]
         object_limit = self.max_objects_per_snapshot
         visible_objects = objects
         truncated = False
@@ -488,13 +420,8 @@ class UnifiedResidencyController:
             "reason": reason,
             "object_count": len(objects),
             "objects_truncated": truncated,
-            "protected_object_count": len(protected_objects),
-            "evictable_object_count": len(evictable_objects),
-            "protected_objects": protected_objects,
-            "evictable_objects": evictable_objects,
             "kv_pressure": kv_pressure or {},
             "routing_plan": routing_plan or {},
-            "driver_pool_state": driver_pool_state,
             **totals,
         }
         if self.trace_objects:
@@ -517,18 +444,11 @@ class UnifiedResidencyController:
                 "trace_file": self.trace_file,
                 "trace_objects": self.trace_objects,
                 "max_objects_per_snapshot": self.max_objects_per_snapshot,
-                "driver_pool_state_enable": self.driver_pool_state_enable,
-                "driver_pool_state_device": self.driver_pool_state_device,
                 "control_enabled": self.control_enabled,
                 "control_file": self.control_file,
-                "control_driver_budget_mode": self.control_driver_budget_mode,
-                "control_reclaim_async": self.control_reclaim_async,
-                "control_reclaim_max_victims": self.control_reclaim_max_victims,
+                "driver_pool_policy": _UNSUPPORTED_DRIVER_POOL_POLICY_REASON,
                 "managed_hbm_budget_override": (
                     self.managed_hbm_budget_override
-                ),
-                "reserved_slot_budget_override": (
-                    self.reserved_slot_budget_override
                 ),
                 "runtime_safety_margin_override": (
                     self.runtime_safety_margin_override
@@ -619,17 +539,13 @@ class UnifiedResidencyController:
 
         if "weights_budget_bytes" in command:
             budget = _as_int(command.get("weights_budget_bytes"), 0)
-            update = set_uvm_driver_pool_budget(
-                "weights",
-                budget,
-                gpu_id=self.driver_pool_state_device,
-                mode=self.control_driver_budget_mode,
-                metadata={
-                    "source": "unified_control_file",
-                    "generation": generation,
-                    "command": command,
-                },
-            )
+            update = {
+                "ok": False,
+                "pool": "weights",
+                "budget_bytes": budget,
+                "status": -95,
+                "reason": _UNSUPPORTED_DRIVER_POOL_POLICY_REASON,
+            }
             result["results"].append({
                 "action": "weights_budget_bytes",
                 **update,
@@ -681,19 +597,12 @@ class UnifiedResidencyController:
                 command.get("required_bytes", command.get("target_bytes")),
                 0,
             )
-            reclaim = soft_reclaim_uvm_driver_pool(
-                pool,
-                gpu_id=self.driver_pool_state_device,
-                target_bytes=required_bytes,
-                current_epoch=generation,
-                max_victims=self.control_reclaim_max_victims,
-                async_reclaim=self.control_reclaim_async,
-            )
             reclaim_result = {
-                "ok": reclaim is not None,
+                "ok": False,
                 "pool": pool,
                 "required_bytes": required_bytes,
-                "result": reclaim,
+                "status": -95,
+                "reason": _UNSUPPORTED_DRIVER_POOL_POLICY_REASON,
             }
             result["results"].append({
                 "action": "reclaim_pool",
@@ -810,8 +719,7 @@ class UnifiedResidencyController:
     ) -> dict[str, Any] | None:
         pool = str(region.get("pool") or "unknown")
         region_id = str(region.get("region_id") or "")
-        metadata = dict(region.get("metadata") or {})
-        object_type = self._object_type(pool, region_id, metadata)
+        object_type = self._object_type(pool, region_id)
         if object_type not in ("kv", "expert", "weight"):
             return None
 
@@ -832,158 +740,45 @@ class UnifiedResidencyController:
             "active": bool(region.get("active")),
             "last_access_step": region.get("last_access_step"),
             "last_state_update_ts": region.get("last_state_update_ts"),
-            "protection_state": self._protection_state(region, metadata),
-            "priority": self._priority(metadata, pool, object_type),
-            "role": metadata.get("role"),
-            "source": metadata.get("source"),
-            "stage": metadata.get("stage"),
         }
         if object_type == "kv":
-            group_id, block_id = self._kv_ids(region_id, metadata)
+            group_id, block_id = self._kv_ids(region_id)
             record["group_id"] = group_id
             record["block_id"] = block_id
-            for key in (
-                "ref_cnt",
-                "lifecycle_state",
-                "is_prefix_cache",
-                "in_free_queue",
-                "offload_capable",
-                "metadata_only",
-                "range_count",
-            ):
-                if key in metadata:
-                    record[key] = metadata.get(key)
         elif object_type == "expert":
-            record["layer_id"] = self._expert_layer_id(metadata)
-            record["expert_id"] = self._expert_id(metadata)
-            for key in (
-                "global_expert_id",
-                "local_expert_id",
-                "shard_id",
-                "pool_class",
-                "placement",
-                "placement_policy",
-                "protected_next",
-                "prefetchable",
-            ):
-                if key in metadata:
-                    record[key] = metadata.get(key)
+            layer_id, expert_id = self._expert_ids_from_region_id(region_id)
+            record["layer_id"] = layer_id
+            record["expert_id"] = expert_id
         return record
 
     def _object_type(
         self,
         pool: str,
         region_id: str,
-        metadata: dict[str, Any],
     ) -> str:
         if pool == "kv" or region_id.startswith("kv:"):
             return "kv"
-        if pool != "weights":
-            return pool
-        role = str(metadata.get("role") or "").lower()
-        semantic_type = str(metadata.get("semantic_type") or "").lower()
-        weight_class = str(metadata.get("weight_class") or "").lower()
-        expert_id = self._expert_id(metadata)
-        if (
-            _metadata_bool(metadata, "is_moe_expert")
-            or expert_id is not None
-            or "expert" in role
-            or "moe" in role
-            or role in ("w13", "w13_weight", "w2", "w2_weight")
-            or "expert" in semantic_type
-            or "moe" in semantic_type
-            or "expert" in weight_class
-        ):
+        if pool == "weights" and region_id.startswith("weights:") and ":envelope:" in region_id:
             return "expert"
-        return "weight"
+        return "weight" if pool == "weights" else pool
 
     def _kv_ids(
         self,
         region_id: str,
-        metadata: dict[str, Any],
     ) -> tuple[int | None, int | None]:
-        group_id = metadata.get("group_id")
-        block_id = metadata.get("block_id")
-        if group_id is not None or block_id is not None:
-            return (
-                _as_int(group_id) if group_id is not None else None,
-                _as_int(block_id) if block_id is not None else None,
-            )
         match = _KV_REGION_RE.match(region_id)
         if not match:
             return None, None
         return int(match.group("group_id")), int(match.group("block_id"))
 
-    def _expert_id(self, metadata: dict[str, Any]) -> int | None:
-        for key in ("global_expert_id", "local_expert_id", "expert_id"):
-            value = metadata.get(key)
-            if value is None:
-                continue
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                continue
-        return None
-
-    def _expert_layer_id(self, metadata: dict[str, Any]) -> int | None:
-        for key in ("layer_id", "layer"):
-            value = metadata.get(key)
-            if value is None:
-                continue
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                continue
-        return None
-
-    def _priority(
+    def _expert_ids_from_region_id(
         self,
-        metadata: dict[str, Any],
-        pool: str,
-        object_type: str,
-    ) -> str:
-        explicit = metadata.get("priority")
-        if explicit is not None:
-            text = str(explicit).strip().lower()
-            if text in ("hot", "warm", "cold"):
-                return text
-        pool_class = str(
-            metadata.get("pool_class")
-            or metadata.get("driver_subpool")
-            or metadata.get("subpool")
-            or ""
-        ).strip().lower()
-        if pool_class in ("hot", "warm", "cold", "streaming"):
-            return "warm" if pool_class == "streaming" else pool_class
-        if _metadata_bool(metadata, "init_hot"):
-            return "hot"
-        if _metadata_bool(metadata, "init_cold"):
-            return "cold"
-        if object_type == "kv":
-            lifecycle = str(metadata.get("lifecycle_state") or "").lower()
-            return "cold" if lifecycle == "never_used" else "warm"
-        if pool == "weights" and _metadata_bool(metadata, "protected"):
-            return "hot"
-        return "warm"
-
-    def _protection_state(
-        self,
-        region: dict[str, Any],
-        metadata: dict[str, Any],
-    ) -> str:
-        if bool(region.get("active")) or _metadata_bool(metadata, "active"):
-            return "active"
-        if _metadata_bool(metadata, "protected_next"):
-            return "protected_next"
-        if _metadata_bool(metadata, "pinned"):
-            return "pinned"
-        if _metadata_bool(metadata, "protected") and not bool(region.get("evictable")):
-            return "pinned"
-        if bool(region.get("evictable")):
-            return "evictable"
-        if _metadata_bool(metadata, "protected"):
-            return "pinned"
-        return "unknown"
+        region_id: str,
+    ) -> tuple[int | None, int | None]:
+        parts = region_id.split(":")
+        if len(parts) < 4 or parts[0] != "weights" or parts[3] != "envelope":
+            return None, None
+        return _as_int(parts[1], None), _as_int(parts[2], None)
 
     def _totals_from_objects(
         self,
@@ -1016,13 +811,7 @@ class UnifiedResidencyController:
             self.runtime_safety_margin_override
             or _as_int(residency.get("safety_margin_bytes"), 0)
         )
-        reserved_slot_budget = self._reserved_slot_budget()
-        managed_used = (
-            kv_resident
-            + expert_resident
-            + reserved_slot_budget
-            + runtime_safety_margin
-        )
+        managed_used = kv_resident + expert_resident + runtime_safety_margin
         object_counts: dict[str, int] = {}
         for record in objects:
             object_type = str(record.get("object_type") or "unknown")
@@ -1030,8 +819,6 @@ class UnifiedResidencyController:
         return {
             "managed_hbm_budget": managed_hbm_budget,
             "runtime_safety_margin": runtime_safety_margin,
-            "reserved_slot_budget": reserved_slot_budget,
-            "reserved_slot_bytes": reserved_slot_budget,
             "kv_min_resident_budget": self.kv_min_resident_budget,
             "kv_target_resident_budget": self.kv_target_resident_budget,
             "kv_max_resident_budget": self.kv_max_resident_budget,
@@ -1069,13 +856,6 @@ class UnifiedResidencyController:
                 "region_records": _as_int(residency.get("region_records"), 0),
             },
         }
-
-    def _reserved_slot_budget(self) -> int:
-        if self.reserved_slot_budget_override > 0:
-            return self.reserved_slot_budget_override
-        count = _read_int_env("VLLM_UVM_EXPERT_RESERVED_SLOT_COUNT", 0)
-        slot_bytes = _read_int_env("VLLM_UVM_EXPERT_RESERVED_SLOT_BYTES", 0)
-        return count * slot_bytes
 
     def _write(self, record: dict[str, Any]) -> None:
         if not self.trace_file:

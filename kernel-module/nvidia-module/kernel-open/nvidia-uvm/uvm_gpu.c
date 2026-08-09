@@ -2046,51 +2046,16 @@ static void update_stats_parent_gpu_fault_instance(uvm_parent_gpu_t *parent_gpu,
     ++parent_gpu->stats.num_replayable_faults;
 }
 
-static uvm_phase_f_region_t *uvm_phase_n_fault_region_from_address(uvm_va_space_t *va_space, NvU64 fault_address)
-{
-    uvm_range_tree_node_t *node;
-
-    UVM_ASSERT(va_space);
-    uvm_assert_rwsem_locked(&va_space->lock);
-
-    node = uvm_range_tree_find(&va_space->phase_f_region_ranges, fault_address);
-    if (!node)
-        return NULL;
-
-    return container_of(node, uvm_phase_f_region_t, va_node);
-}
-
 static void update_stats_parent_gpu_phase_n_fault_instance(uvm_parent_gpu_t *parent_gpu,
                                                            uvm_va_space_t *va_space,
                                                            const uvm_fault_buffer_entry_t *fault_entry,
                                                            bool is_duplicate)
 {
-    uvm_phase_f_region_t *region;
-    NvU32 pool_index;
-    NvU32 role_index;
-
-    if (!fault_entry->is_replayable || !fault_entry->is_virtual)
-        return;
-
-    region = uvm_phase_n_fault_region_from_address(va_space, fault_entry->fault_address);
-    if (!region) {
-        if (is_duplicate || fault_entry->filtered)
-            ++parent_gpu->fault_buffer.replayable.stats.num_phase_n_unregistered_duplicate_faults;
-        else
-            ++parent_gpu->fault_buffer.replayable.stats.num_phase_n_unregistered_faults;
-        return;
-    }
-
-    pool_index = region->pool < UVM_GPU_FAULT_STATS_PHASE_N_POOL_MAX ? region->pool : 0;
-    role_index = region->role < UVM_GPU_FAULT_STATS_PHASE_N_ROLE_MAX ? region->role : 0;
-
-    ++parent_gpu->fault_buffer.replayable.stats.num_phase_n_faults_by_pool[pool_index];
-    ++parent_gpu->fault_buffer.replayable.stats.num_phase_n_faults_by_role[role_index];
-
-    if (is_duplicate || fault_entry->filtered) {
-        ++parent_gpu->fault_buffer.replayable.stats.num_phase_n_duplicate_faults_by_pool[pool_index];
-        ++parent_gpu->fault_buffer.replayable.stats.num_phase_n_duplicate_faults_by_role[role_index];
-    }
+    /* Explicit regions are not classified by pool/role in the fault path. */
+    (void)parent_gpu;
+    (void)va_space;
+    (void)fault_entry;
+    (void)is_duplicate;
 }
 
 static void update_stats_fault_cb(uvm_va_space_t *va_space,

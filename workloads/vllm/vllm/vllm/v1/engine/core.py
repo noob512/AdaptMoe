@@ -488,7 +488,27 @@ class EngineCore:
         policy, block_pool = components
         old_target = int(policy._dynamic_pool_applied_target_blocks)
         target = min(max(int(target_blocks), 0), int(policy.total_blocks))
-        if target == old_target:
+        dirty_getter = getattr(
+            policy,
+            "get_dynamic_pool_reconciliation_block_ids",
+            None,
+        )
+        dirty_block_ids = sorted(
+            {
+                int(block_id)
+                for block_id in (
+                    dirty_getter()
+                    if callable(dirty_getter)
+                    else getattr(
+                        policy,
+                        "_dynamic_pool_reconciliation_block_ids",
+                        set(),
+                    )
+                )
+                if int(block_id) > 0
+            }
+        )
+        if target == old_target and not dirty_block_ids:
             return {
                 "ok": True,
                 "reason": "already_at_target",
@@ -587,15 +607,204 @@ class EngineCore:
                 logger.error("Adaptive expert offload wave failed: %s", result)
                 return result
 
-        worker_results = self.collective_rpc(
-            "resize_uvm_kv_cache_target",
-            args=(old_target, target, reason),
+        if not bool(
+            getattr(policy, "dynamic_pool_physical_migration_enable", True)
+        ) and not bool(
+            getattr(
+                policy,
+                "_dynamic_pool_external_reconciliation_required",
+                False,
+            )
+        ):
+            apply_result = self._apply_uvm_kv_dynamic_pool_target(
+                target,
+                policy=policy,
+                block_pool=block_pool,
+                reason=reason,
+                metadata={"source": "engine_core_logical_only_resize"},
+            )
+            return {
+                **apply_result,
+                "worker_results": [],
+                "expert_candidate_results": expert_candidate_results,
+                "selected_expert_class": selected_expert_class,
+                "selected_experts_by_layer": selected_experts_by_layer,
+                "expert_release_missing_layers": expert_release_missing_layers,
+                "expert_results": expert_results,
+            }
+
+        prepare_resize = getattr(
+            policy,
+            "prepare_external_dynamic_pool_resize",
+            None,
         )
-        physical_ok = bool(worker_results) and all(
-            isinstance(result, dict) and bool(result.get("ok"))
-            for result in worker_results
+        finalize_resize = getattr(
+            policy,
+            "finalize_external_dynamic_pool_resize",
+            None,
         )
-        if not physical_ok:
+        if not callable(prepare_resize) or not callable(finalize_resize):
+            return {"ok": False, "reason": "external_resize_protocol_unavailable"}
+        preparation = prepare_resize(
+            target,
+            block_pool=block_pool,
+            reason=reason,
+        )
+        if not bool(preparation.get("ok")):
+            return {
+                "ok": False,
+                "reason": "external_resize_prepare_failed",
+                "preparation": preparation,
+            }
+
+        expected_block_ids = {
+            int(block_id)
+            for block_id in preparation.get("expected_block_ids", [])
+        }
+        expected_cpu_block_ids = {
+            int(block_id)
+            for block_id in preparation.get("expected_cpu_block_ids", [])
+        }
+        expected_gpu_block_ids = {
+            int(block_id)
+            for block_id in preparation.get("expected_gpu_block_ids", [])
+        }
+        plan_token = str(preparation.get("plan_token") or "")
+        worker_results: list[Any] = []
+        rpc_exception: Exception | None = None
+        try:
+            worker_results = self.collective_rpc(
+                "resize_uvm_kv_cache_target",
+                args=(
+                    old_target,
+                    target,
+                    reason,
+                    list(preparation.get("dirty_block_ids", [])),
+                    plan_token,
+                ),
+            )
+        except Exception as exc:
+            rpc_exception = exc
+
+        rank_completed: list[set[int]] = []
+        rank_completed_cpu: list[set[int]] = []
+        rank_completed_gpu: list[set[int]] = []
+        protocol_unknown = rpc_exception is not None or not worker_results
+        reported_progress = False
+        physical_ok = rpc_exception is None and bool(worker_results)
+        for worker_result in worker_results:
+            if not isinstance(worker_result, dict):
+                protocol_unknown = True
+                physical_ok = False
+                rank_completed.append(set())
+                rank_completed_cpu.append(set())
+                rank_completed_gpu.append(set())
+                continue
+            try:
+                requested = {
+                    int(value)
+                    for value in worker_result["requested_block_ids"]
+                }
+                requested_cpu = {
+                    int(value)
+                    for value in worker_result["requested_cpu_block_ids"]
+                }
+                requested_gpu = {
+                    int(value)
+                    for value in worker_result["requested_gpu_block_ids"]
+                }
+                completed = {
+                    int(value)
+                    for value in worker_result["completed_block_ids"]
+                }
+                completed_cpu = {
+                    int(value)
+                    for value in worker_result["completed_cpu_block_ids"]
+                }
+                completed_gpu = {
+                    int(value)
+                    for value in worker_result["completed_gpu_block_ids"]
+                }
+                made_progress_value = worker_result["made_progress"]
+                synchronized_value = worker_result["synchronized"]
+                worker_old_target = int(
+                    worker_result.get("old_target_blocks", -1)
+                )
+                worker_new_target = int(
+                    worker_result.get("new_target_blocks", -1)
+                )
+            except (KeyError, TypeError, ValueError):
+                protocol_unknown = True
+                physical_ok = False
+                rank_completed.append(set())
+                rank_completed_cpu.append(set())
+                rank_completed_gpu.append(set())
+                continue
+
+            schema_valid = (
+                requested == expected_block_ids
+                and requested_cpu == expected_cpu_block_ids
+                and requested_gpu == expected_gpu_block_ids
+                and completed == completed_cpu | completed_gpu
+                and not completed_cpu & completed_gpu
+                and completed <= expected_block_ids
+                and completed_cpu <= expected_cpu_block_ids
+                and completed_gpu <= expected_gpu_block_ids
+                and str(worker_result.get("plan_token") or "") == plan_token
+                and worker_old_target == old_target
+                and worker_new_target == target
+                and isinstance(made_progress_value, bool)
+                and isinstance(synchronized_value, bool)
+            )
+            if not schema_valid:
+                protocol_unknown = True
+            reported_progress = (
+                reported_progress
+                or bool(made_progress_value)
+                or bool(completed)
+            )
+            rank_completed.append(completed)
+            rank_completed_cpu.append(completed_cpu)
+            rank_completed_gpu.append(completed_gpu)
+            rank_complete = (
+                schema_valid
+                and bool(worker_result.get("ok"))
+                and bool(synchronized_value)
+                and bool(made_progress_value)
+                and completed == expected_block_ids
+                and completed_cpu == expected_cpu_block_ids
+                and completed_gpu == expected_gpu_block_ids
+            )
+            physical_ok = physical_ok and rank_complete
+
+        completed_intersection = (
+            set.intersection(*rank_completed) if rank_completed else set()
+        )
+        completed_cpu_intersection = (
+            set.intersection(*rank_completed_cpu)
+            if rank_completed_cpu
+            else set()
+        )
+        completed_gpu_intersection = (
+            set.intersection(*rank_completed_gpu)
+            if rank_completed_gpu
+            else set()
+        )
+        finalize_result = finalize_resize(
+            preparation,
+            block_pool=block_pool,
+            worker_ok=physical_ok,
+            worker_made_progress=(reported_progress or protocol_unknown),
+            completed_block_ids=sorted(completed_intersection),
+            completed_cpu_block_ids=sorted(completed_cpu_intersection),
+            completed_gpu_block_ids=sorted(completed_gpu_intersection),
+            reason=reason,
+            metadata={
+                "source": "engine_core_worker_coordinated_resize",
+                "worker_results": worker_results,
+            },
+        )
+        if not physical_ok or not bool(finalize_result.get("ok")):
             result = {
                 "ok": False,
                 "reason": "worker_physical_migration_failed",
@@ -607,28 +816,21 @@ class EngineCore:
                 "selected_experts_by_layer": selected_experts_by_layer,
                 "expert_release_missing_layers": expert_release_missing_layers,
                 "expert_results": expert_results,
+                "preparation": preparation,
+                "finalize_result": finalize_result,
             }
             if self._uvm_env_flag(
                 "VLLM_UVM_KV_ADAPTIVE_FAIL_FAST",
                 default=True,
             ):
-                raise RuntimeError(f"Adaptive KV resize failed: {result!r}")
+                raise RuntimeError(
+                    f"Adaptive KV resize failed: {result!r}"
+                ) from rpc_exception
             logger.error("Adaptive KV resize failed: %s", result)
             return result
 
-        apply_result = self._apply_uvm_kv_dynamic_pool_target(
-            target,
-            policy=policy,
-            block_pool=block_pool,
-            reason=reason,
-            metadata={
-                "source": "engine_core_worker_coordinated_resize",
-                "physical_migration_complete": True,
-                "worker_results": worker_results,
-            },
-        )
         return {
-            **apply_result,
+            **finalize_result,
             "worker_results": worker_results,
             "expert_candidate_results": expert_candidate_results,
             "selected_expert_class": selected_expert_class,

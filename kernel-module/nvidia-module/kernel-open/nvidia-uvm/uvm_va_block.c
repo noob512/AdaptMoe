@@ -16761,104 +16761,20 @@ static uvm_phase_f_region_t *block_stage_a_region_from_address(uvm_va_space_t *v
     return container_of(node, uvm_phase_f_region_t, va_node);
 }
 
-static const char *block_stage_a_pool_name(NvU32 pool)
-{
-    switch (pool) {
-        case UVM_PHASE_N_POOL_KV:
-            return "kv";
-        case UVM_PHASE_N_POOL_WEIGHT:
-            return "weight";
-        case UVM_PHASE_N_POOL_SCRATCH:
-            return "scratch";
-        case UVM_PHASE_N_POOL_ACTIVATION:
-            return "activation";
-        default:
-            return "other";
-    }
-}
-
-static bool block_stage_a_region_is_gpu_only_candidate(const uvm_phase_f_region_t *region)
-{
-    const NvU32 gpu_only_flags = UVM_PHASE_N_REGION_FLAG_GPU_ONLY_SOFT |
-                                 UVM_PHASE_N_REGION_FLAG_GPU_ONLY_HARD |
-                                 UVM_PHASE_N_REGION_FLAG_CPU_NO_USER_MAPPING |
-                                 UVM_PHASE_N_REGION_FLAG_GPU_READ_ONLY |
-                                 UVM_PHASE_N_REGION_FLAG_GPU_READ_WRITE;
-
-    if (region->flags & gpu_only_flags)
-        return true;
-
-    return region->pool == UVM_PHASE_N_POOL_WEIGHT || region->pool == UVM_PHASE_N_POOL_KV;
-}
-
 static void block_stage_a_observe_cpu_fault(uvm_va_block_t *va_block,
                                             uvm_va_space_t *va_space,
                                             NvU64 fault_addr,
                                             uvm_fault_access_type_t fault_access_type,
                                             uvm_service_block_context_t *service_context)
 {
-    uvm_phase_f_region_t *region;
-    bool is_write;
-    bool is_candidate;
-
-    if (!uvm_stage_a_cpu_fault_observe_enable)
-        return;
-
-    if (service_context->num_retries != 0)
-        return;
-
-    atomic64_inc(&g_uvm_stage_a_cpu_faults_total);
-
-    region = block_stage_a_region_from_address(va_space, fault_addr);
-    if (!region)
-        return;
-
-    is_write = fault_access_type > UVM_FAULT_ACCESS_TYPE_READ;
-    is_candidate = block_stage_a_region_is_gpu_only_candidate(region);
-
-    atomic64_inc(&g_uvm_stage_a_cpu_faults_registered);
-    atomic64_inc(is_write ? &g_uvm_stage_a_cpu_write_faults : &g_uvm_stage_a_cpu_read_faults);
-    if (is_candidate) {
-        atomic64_inc(&g_uvm_stage_a_cpu_faults_candidate);
-        atomic64_inc(&g_uvm_stage_a_cpu_fault_fallbacks);
-    }
-
-    switch (region->pool) {
-        case UVM_PHASE_N_POOL_WEIGHT:
-            atomic64_inc(&g_uvm_stage_a_cpu_faults_weight);
-            break;
-        case UVM_PHASE_N_POOL_KV:
-            atomic64_inc(&g_uvm_stage_a_cpu_faults_kv);
-            break;
-        case UVM_PHASE_N_POOL_SCRATCH:
-            atomic64_inc(&g_uvm_stage_a_cpu_faults_scratch);
-            break;
-        default:
-            atomic64_inc(&g_uvm_stage_a_cpu_faults_other);
-            break;
-    }
-
-    atomic64_set(&g_uvm_stage_a_last_region_id, region->region_id);
-    atomic64_set(&g_uvm_stage_a_last_pool, region->pool);
-    atomic64_set(&g_uvm_stage_a_last_fault_addr, fault_addr);
-    atomic64_set(&g_uvm_stage_a_last_is_write, is_write ? 1 : 0);
-
-    if (uvm_stage_a_cpu_fault_log_enable) {
-        uvm_phase_f_route_log("stage_a_cpu_fault region_id=%llu pool=%u pool_name=%s fault_addr=0x%llx access=%s is_candidate=%u fallback=normal flags=0x%x role=%u layer=%u expert=%u block_start=0x%llx block_end=0x%llx pid=%d\n",
-                              region->region_id,
-                              region->pool,
-                              block_stage_a_pool_name(region->pool),
-                              fault_addr,
-                              is_write ? "write" : "read",
-                              is_candidate ? 1 : 0,
-                              region->flags,
-                              region->role,
-                              region->layer_id,
-                              region->expert_id,
-                              va_block->start,
-                              va_block->end,
-                              current->pid);
-    }
+    // The compact Region ABI has no Phase-N pool/role/flags metadata. Do not
+    // infer a fault class from registration alone; normal fault handling is
+    // the conservative fallback.
+    (void)va_block;
+    (void)va_space;
+    (void)fault_addr;
+    (void)fault_access_type;
+    (void)service_context;
 }
 
 static void block_gpu_only_soft_break_cpu_fault(uvm_va_block_t *va_block,
@@ -16904,14 +16820,13 @@ static void block_gpu_only_soft_break_cpu_fault(uvm_va_block_t *va_block,
     atomic64_inc(&g_uvm_gpu_only_soft_breaks);
     atomic64_add(cleared_pages, &g_uvm_gpu_only_soft_break_pages);
     atomic64_set(&g_uvm_gpu_only_last_region_id, region ? region->region_id : 0);
-    atomic64_set(&g_uvm_gpu_only_last_pool, region ? region->pool : UVM_PHASE_N_POOL_UNKNOWN);
+    atomic64_set(&g_uvm_gpu_only_last_pool, UVM_PHASE_N_POOL_UNKNOWN);
     atomic64_set(&g_uvm_gpu_only_last_fault_addr, fault_addr);
     atomic64_set(&g_uvm_gpu_only_last_is_write, is_write ? 1 : 0);
 
-    uvm_phase_f_route_log("gpu_only_soft_break region_id=%llu pool=%u pool_name=%s fault_addr=0x%llx access=%s had_read=%u had_write=%u cleared_pages=%u fallback=normal block_start=0x%llx block_end=0x%llx pid=%d\n",
+    uvm_phase_f_route_log("gpu_only_soft_break region_id=%llu pool=%u pool_name=unknown fault_addr=0x%llx access=%s had_read=%u had_write=%u cleared_pages=%u fallback=normal block_start=0x%llx block_end=0x%llx pid=%d\n",
                           region ? region->region_id : 0,
-                          region ? region->pool : UVM_PHASE_N_POOL_UNKNOWN,
-                          region ? block_stage_a_pool_name(region->pool) : "unknown",
+                          UVM_PHASE_N_POOL_UNKNOWN,
                           fault_addr,
                           is_write ? "write" : "read",
                           had_read_policy ? 1 : 0,

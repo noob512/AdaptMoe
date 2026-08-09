@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
 from typing import Any
 
 from vllm.device_allocator.uvm import (
@@ -295,10 +294,6 @@ class UvmKvRuntimePolicy:
                 "VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_DEVICE; using 0."
             )
             self.dynamic_pool_physical_migration_device = 0
-        self.dynamic_pool_debug_records_enable = _read_bool_env(
-            "VLLM_UVM_KV_DYNAMIC_POOL_DEBUG_RECORDS_ENABLE",
-            False,
-        )
         # The residency ledger starts with all registered KV regions on GPU.
         # Applying the target later lets the initial shrink be traced as a
         # safe, explicit pool-size transition.
@@ -306,6 +301,9 @@ class UvmKvRuntimePolicy:
         self._dynamic_pool_control_mtime_ns: int | None = None
         self._dynamic_pool_generation = 0
         self._dynamic_pool_saved_lifecycle: dict[int, str] = {}
+        self._dynamic_pool_reconciliation_needed = False
+        self._dynamic_pool_reconciliation_block_ids: set[int] = set()
+        self._dynamic_pool_external_reconciliation_required = False
         self._logical_kv_blocks: dict[tuple[int, int], LogicalKVBlock] = {}
         if self.policy not in ("lru_prefix_cache", "scheduler_aware"):
             logger.warning(
@@ -347,9 +345,6 @@ class UvmKvRuntimePolicy:
                     ),
                     "dynamic_pool_physical_migration_device": (
                         self.dynamic_pool_physical_migration_device
-                    ),
-                    "dynamic_pool_debug_records_enable": (
-                        self.dynamic_pool_debug_records_enable
                     ),
                     "num_kv_cache_groups": self.num_kv_cache_groups,
                 },
@@ -425,6 +420,9 @@ class UvmKvRuntimePolicy:
             external_physical_ready=bool(
                 metadata.get("physical_migration_complete", False)
             ),
+            external_physical_ready_block_ids=(
+                metadata.get("physical_migration_complete_block_ids")
+            ),
         )
         return {
             "ok": bool(apply_result.get("ok")),
@@ -468,15 +466,13 @@ class UvmKvRuntimePolicy:
                 if group_value is not None
                 else list(range(self.num_kv_cache_groups))
             )
-            ref_cnt = None
             if block_pool is not None:
                 try:
                     block = getattr(block_pool, "blocks", [])[block_id]
-                    ref_cnt = getattr(block, "ref_cnt", None)
                     if getattr(block, "lifecycle_state", None) == "cpu_offloaded":
                         block.lifecycle_state = "used_free"
                 except Exception:
-                    ref_cnt = None
+                    pass
             for group_id in group_ids:
                 region_id = f"kv:{group_id}:{block_id}"
                 logical = self._logical_kv_blocks.setdefault(
@@ -689,9 +685,6 @@ class UvmKvRuntimePolicy:
         *,
         block_ids: list[int],
         direction: str,
-        reason: str,
-        old_target: int,
-        new_target: int,
     ) -> dict[str, Any]:
         unique_block_ids = sorted(
             {int(block_id) for block_id in block_ids if block_id > 0}
@@ -700,15 +693,13 @@ class UvmKvRuntimePolicy:
             return {
                 "ok": True,
                 "reason": "no_blocks",
-                "direction": direction,
-                "block_count": 0,
+                "made_progress": False,
             }
         if not self.dynamic_pool_physical_migration_enable:
             return {
                 "ok": False,
                 "reason": "physical_migration_disabled",
-                "direction": direction,
-                "block_count": len(unique_block_ids),
+                "made_progress": False,
             }
 
         ranges = collect_uvm_kv_cache_physical_ranges_for_blocks(unique_block_ids)
@@ -716,82 +707,169 @@ class UvmKvRuntimePolicy:
             return {
                 "ok": False,
                 "reason": "no_registered_ranges",
-                "direction": direction,
-                "block_count": len(unique_block_ids),
+                "made_progress": False,
             }
 
-        start = time.monotonic()
         if direction == "shrink":
-            successes, executor_used, advise_result, prefetch_result = (
+            successes, _, _, _ = (
                 batch_offload_ranges_to_cpu_with_executor(
                     ranges,
                     sync=self.dynamic_pool_physical_migration_sync,
                     executor=self.dynamic_pool_physical_migration_executor,
                 )
             )
-            driver_result = {
-                "advise_result": advise_result,
-                "prefetch_result": prefetch_result,
-            }
-            state = "cpu"
         else:
-            successes, executor_used, prefetch_result = (
+            successes, _, _ = (
                 batch_prefetch_ranges_to_device_with_executor(
                     ranges,
                     self.dynamic_pool_physical_migration_device,
                     executor=self.dynamic_pool_physical_migration_executor,
                 )
             )
-            driver_result = {"prefetch_result": prefetch_result}
-            state = "gpu"
 
-        elapsed = time.monotonic() - start
-        complete = int(successes) == len(ranges)
-        pressure_record: dict[str, Any] = {
-            "direction": direction,
-            "reason": reason,
-            "old_target_blocks": old_target,
-            "new_target_blocks": new_target,
-            "complete": complete,
-            "block_count": len(unique_block_ids),
-        }
-        if self.dynamic_pool_debug_records_enable:
-            pressure_record.update({
-                "range_count": len(ranges),
-                "range_bytes": sum(size for _, size in ranges),
-                "successes": int(successes),
-                "executor": executor_used,
-                "elapsed_seconds": elapsed,
-                "driver_result": driver_result,
-            })
-        for block_id in unique_block_ids:
-            for group_id in range(self.num_kv_cache_groups):
-                logical = self._logical_kv_blocks.setdefault(
-                    (group_id, block_id),
-                    LogicalKVBlock(group_id, block_id),
-                )
-                logical.state = RegionState(state)
-
-        record_unified_residency_snapshot(
-            reason="kv_dynamic_pool_physical_migration",
-            kv_pressure=pressure_record,
-        )
-        result = {
+        success_count = int(successes)
+        complete = success_count == len(ranges)
+        return {
             "ok": complete,
             "reason": "complete" if complete else "partial",
-            "direction": direction,
-            "block_count": len(unique_block_ids),
+            "made_progress": success_count > 0,
         }
-        if self.dynamic_pool_debug_records_enable:
-            result.update({
-                "range_count": len(ranges),
-                "range_bytes": sum(size for _, size in ranges),
-                "successes": int(successes),
-                "executor": executor_used,
-                "elapsed_seconds": elapsed,
-                "driver_result": driver_result,
-            })
-        return result
+
+    def _dynamic_pool_migration_outcome(
+        self,
+        *,
+        block_ids: list[int],
+        direction: str,
+        external_physical_ready: bool,
+    ) -> dict[str, Any]:
+        if external_physical_ready:
+            return {
+                "ok": True,
+                "reason": "external_complete",
+                "made_progress": True,
+            }
+        if not self.dynamic_pool_physical_migration_enable:
+            return {
+                "ok": True,
+                "reason": "logical_only",
+                "made_progress": False,
+            }
+        return self._migrate_dynamic_pool_physical_blocks(
+            block_ids=block_ids,
+            direction=direction,
+        )
+
+    def get_dynamic_pool_reconciliation_block_ids(self) -> list[int]:
+        """Return block IDs whose physical placement is still uncertain."""
+        return sorted(
+            {
+                int(block_id)
+                for block_id in getattr(
+                    self,
+                    "_dynamic_pool_reconciliation_block_ids",
+                    set(),
+                )
+                if int(block_id) > 0
+            }
+        )
+
+    def _dynamic_pool_resize_plan(
+        self,
+        *,
+        block_pool: Any,
+        target: int,
+        old_target: int,
+    ) -> dict[str, Any]:
+        blocks = getattr(block_pool, "blocks", [])
+        dirty_block_ids = {
+            block_id
+            for block_id in self.get_dynamic_pool_reconciliation_block_ids()
+            if block_id < len(blocks)
+        }
+        reconciliation_needed = bool(dirty_block_ids) or bool(
+            getattr(self, "_dynamic_pool_reconciliation_needed", False)
+        )
+        if reconciliation_needed and not dirty_block_ids:
+            # Compatibility for an in-memory policy created before dirty IDs
+            # were tracked explicitly. Partial paths mark every uncertain
+            # logical block UNKNOWN, so recover their identities here.
+            dirty_block_ids = {
+                block_id
+                for block_id in range(1, len(blocks))
+                if any(
+                    (
+                        logical := self._logical_kv_blocks.get(
+                            (group_id, block_id)
+                        )
+                    )
+                    is not None
+                    and logical.state == RegionState.UNKNOWN
+                    for group_id in range(self.num_kv_cache_groups)
+                )
+            }
+        if old_target == target and not dirty_block_ids:
+            return {
+                "ok": not reconciliation_needed,
+                "reason": (
+                    "reconciliation_incomplete"
+                    if reconciliation_needed
+                    else "already_applied"
+                ),
+                "blocks": blocks,
+                "dirty_block_ids": [],
+                "transition_ids": [],
+                "gpu_block_ids": [],
+                "cpu_block_ids": [],
+            }
+
+        first_block = min(old_target, target) + 1
+        last_block = max(old_target, target)
+        target_delta_ids = {
+            block_id
+            for block_id in range(first_block, last_block + 1)
+            if 0 < block_id < len(blocks)
+        }
+        transition_ids = sorted(dirty_block_ids | target_delta_ids)
+        if not transition_ids:
+            return {
+                "ok": False,
+                "reason": "reconciliation_incomplete",
+                "blocks": blocks,
+                "dirty_block_ids": sorted(dirty_block_ids),
+                "transition_ids": [],
+                "gpu_block_ids": [],
+                "cpu_block_ids": [],
+            }
+        candidates = [blocks[block_id] for block_id in transition_ids]
+        if any(
+            not self._dynamic_pool_block_safe_for_resize(block)
+            for block in candidates
+        ):
+            direction = "grow" if target > old_target else "shrink"
+            return {
+                "ok": False,
+                "reason": f"active_blocks_must_drain_before_{direction}",
+                "blocks": blocks,
+                "dirty_block_ids": sorted(dirty_block_ids),
+                "transition_ids": transition_ids,
+                "gpu_block_ids": [],
+                "cpu_block_ids": [],
+            }
+
+        return {
+            "ok": True,
+            "reason": "planned",
+            "blocks": blocks,
+            "dirty_block_ids": sorted(dirty_block_ids),
+            "transition_ids": transition_ids,
+            "gpu_block_ids": [
+                block_id for block_id in transition_ids if block_id <= target
+            ],
+            "cpu_block_ids": [
+                block_id for block_id in transition_ids if block_id > target
+            ],
+            "target_delta_ids": sorted(target_delta_ids),
+        }
 
     def _ensure_dynamic_pool_applied(
         self,
@@ -799,208 +877,400 @@ class UvmKvRuntimePolicy:
         block_pool: Any | None,
         reason: str,
         external_physical_ready: bool = False,
+        external_physical_ready_block_ids: (
+            list[int] | tuple[int, ...] | set[int] | None
+        ) = None,
     ) -> dict[str, Any]:
         if not self.dynamic_pool_active() or block_pool is None:
             return {"ok": False, "reason": "dynamic_pool_or_block_pool_unavailable"}
         target = self.dynamic_pool_target_blocks
         old_target = self._dynamic_pool_applied_target_blocks
-        if old_target == target:
+        plan = self._dynamic_pool_resize_plan(
+            block_pool=block_pool,
+            target=target,
+            old_target=old_target,
+        )
+        if plan["reason"] != "planned":
+            return {"ok": bool(plan["ok"]), "reason": str(plan["reason"])}
+        blocks = plan["blocks"]
+        dirty_block_ids = set(plan["dirty_block_ids"])
+        transition_ids = list(plan["transition_ids"])
+        gpu_block_ids = list(plan["gpu_block_ids"])
+        cpu_block_ids = list(plan["cpu_block_ids"])
+        target_delta_ids = set(plan["target_delta_ids"])
+        candidates = [blocks[block_id] for block_id in transition_ids]
+        explicit_external_ids: set[int] | None = None
+        if external_physical_ready_block_ids is not None:
+            try:
+                explicit_external_ids = {
+                    int(block_id)
+                    for block_id in external_physical_ready_block_ids
+                    if int(block_id) > 0
+                }
+            except (TypeError, ValueError):
+                explicit_external_ids = set()
+        if (
+            getattr(
+                self,
+                "_dynamic_pool_external_reconciliation_required",
+                False,
+            )
+            and explicit_external_ids is None
+        ):
+            return {"ok": False, "reason": "external_reconciliation_required"}
+
+        # Every block involved in a reconciliation remains quarantined until
+        # both physical directions have completed. This prevents a successful
+        # half of a mixed resize from becoming allocatable while the other
+        # half is still UNKNOWN.
+        self._set_dynamic_pool_queue_membership(
+            block_pool=block_pool,
+            blocks=blocks,
+            block_ids=transition_ids,
+            gpu=False,
+        )
+        if (
+            explicit_external_ids is not None
+            and explicit_external_ids != set(transition_ids)
+        ):
+            dirty_block_ids.update(transition_ids)
+            self._dynamic_pool_reconciliation_block_ids = dirty_block_ids
+            self._dynamic_pool_reconciliation_needed = True
+            self._dynamic_pool_external_reconciliation_required = True
+            for block in candidates:
+                self._mark_dynamic_pool_block_unknown(block=block)
+            return {"ok": False, "reason": "external_completion_ids_mismatch"}
+
+        outcomes: list[dict[str, Any]] = []
+        for direction, block_ids in (
+            ("shrink", cpu_block_ids),
+            ("grow", gpu_block_ids),
+        ):
+            if not block_ids:
+                continue
+            if explicit_external_ids is not None:
+                externally_ready_ids = set(block_ids) & explicit_external_ids
+            else:
+                externally_ready_ids = (
+                    set(block_ids) & target_delta_ids
+                    if external_physical_ready
+                    else set()
+                )
+            locally_reconciled_ids = [
+                block_id
+                for block_id in block_ids
+                if block_id not in externally_ready_ids
+            ]
+            group_external_ready = (
+                explicit_external_ids is not None
+                or (external_physical_ready and not locally_reconciled_ids)
+            )
+            outcome = self._dynamic_pool_migration_outcome(
+                block_ids=locally_reconciled_ids or block_ids,
+                direction=direction,
+                external_physical_ready=group_external_ready,
+            )
+            if externally_ready_ids:
+                outcome = {
+                    **outcome,
+                    "made_progress": True,
+                }
+            outcomes.append(outcome)
+            if not outcome["ok"]:
+                break
+
+        failed_outcome = next(
+            (outcome for outcome in outcomes if not outcome["ok"]),
+            None,
+        )
+        if failed_outcome is not None:
+            made_progress = any(
+                bool(outcome["made_progress"]) for outcome in outcomes
+            )
+            if dirty_block_ids or made_progress:
+                dirty_block_ids.update(transition_ids)
+                self._dynamic_pool_reconciliation_block_ids = dirty_block_ids
+                self._dynamic_pool_reconciliation_needed = True
+                for block in candidates:
+                    self._mark_dynamic_pool_block_unknown(block=block)
+            else:
+                # With no prior uncertainty and no physical progress, restore
+                # the exact old queue boundary. This is the only safe rollback.
+                rollback_gpu_ids = [
+                    block_id
+                    for block_id in transition_ids
+                    if block_id <= old_target
+                ]
+                self._set_dynamic_pool_queue_membership(
+                    block_pool=block_pool,
+                    blocks=blocks,
+                    block_ids=rollback_gpu_ids,
+                    gpu=True,
+                )
+            return {"ok": False, "reason": str(failed_outcome["reason"])}
+
+        for block_id in cpu_block_ids:
+            self._mark_dynamic_pool_block_cpu(block=blocks[block_id])
+        for block_id in gpu_block_ids:
+            self._mark_dynamic_pool_block_gpu(block=blocks[block_id])
+        # Grow only exposes blocks after both physical groups have committed.
+        self._set_dynamic_pool_queue_membership(
+            block_pool=block_pool,
+            blocks=blocks,
+            block_ids=gpu_block_ids,
+            gpu=True,
+        )
+
+        self._dynamic_pool_applied_target_blocks = target
+        self._dynamic_pool_reconciliation_block_ids = set()
+        self._dynamic_pool_reconciliation_needed = False
+        self._dynamic_pool_external_reconciliation_required = False
+        return {"ok": True, "reason": "applied"}
+
+    def prepare_external_dynamic_pool_resize(
+        self,
+        target_blocks: int,
+        *,
+        block_pool: Any | None,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Quarantine a worker-coordinated resize before physical migration."""
+        if not self.dynamic_pool_active() or block_pool is None:
             return {
-                "ok": True,
-                "reason": "already_applied",
-                "applied_target_blocks": old_target,
+                "ok": False,
+                "reason": "dynamic_pool_or_block_pool_unavailable",
+            }
+        target = self._clamp_dynamic_pool_target(target_blocks)
+        old_target = self._dynamic_pool_applied_target_blocks
+        plan = self._dynamic_pool_resize_plan(
+            block_pool=block_pool,
+            target=target,
+            old_target=old_target,
+        )
+        if plan["reason"] != "planned":
+            return {
+                "ok": bool(plan["ok"]),
+                "reason": str(plan["reason"]),
+                "old_target_blocks": old_target,
+                "new_target_blocks": target,
+                "expected_block_ids": [],
+                "expected_cpu_block_ids": [],
+                "expected_gpu_block_ids": [],
             }
 
-        direction = "grow" if target > old_target else "shrink"
-        offloaded = 0
-        prefetched = 0
-        skipped_active = 0
-        physical_offload_block_ids: list[int] = []
-        physical_prefetch_block_ids: list[int] = []
-        blocks = getattr(block_pool, "blocks", [])
-        first_block = min(old_target, target) + 1
-        last_block = max(old_target, target)
-        candidates = [
-            blocks[block_id]
-            for block_id in range(first_block, last_block + 1)
-            if 0 < block_id < len(blocks)
+        blocks = plan["blocks"]
+        transition_ids = list(plan["transition_ids"])
+        newly_quarantined_ids = [
+            block_id
+            for block_id in transition_ids
+            if getattr(blocks[block_id], "free_queue_kind", None) == "gpu"
         ]
-
-        if direction == "shrink":
-            active_candidates = [
-                block
-                for block in candidates
-                if not self._dynamic_pool_block_safe_for_resize(block)
-            ]
-            if active_candidates:
-                skipped_active = len(active_candidates)
-                queue_result = {
-                    "moved_gpu": 0,
-                    "moved_offline": 0,
-                    "deferred_active": skipped_active,
-                    "gpu_free_blocks": (
-                        block_pool.free_block_queue.num_free_blocks
-                    ),
-                    "offline_free_blocks": (
-                        block_pool.offline_block_queue.num_free_blocks
-                    ),
-                }
-                physical_result = {
-                    "ok": False,
-                    "reason": "active_blocks_must_drain_before_shrink",
-                    "direction": direction,
-                    "block_count": 0,
-                    "active_block_ids": [
-                        int(getattr(block, "block_id", -1))
-                        for block in active_candidates
-                    ],
-                }
-                committed = False
-                physical_complete = False
-            else:
-                physical_complete = False
-            # Quarantine before migration. A partial migration stays
-            # quarantined; a zero-progress failure can safely roll back.
-            if not active_candidates:
-                queue_result = block_pool.apply_uvm_dynamic_pool_target(
-                    target,
-                    old_target_blocks=old_target,
-                )
-                for block in candidates:
-                    physical_offload_block_ids.append(
-                        int(getattr(block, "block_id", -1))
-                    )
-                if external_physical_ready:
-                    physical_result = {
-                        "ok": True,
-                        "reason": "external_physical_migration_complete",
-                        "direction": direction,
-                        "block_count": len(physical_offload_block_ids),
-                    }
-                else:
-                    physical_result = self._migrate_dynamic_pool_physical_blocks(
-                        block_ids=physical_offload_block_ids,
-                        direction="shrink",
-                        reason=reason,
-                        old_target=old_target,
-                        new_target=target,
-                    )
-                physical_complete = bool(physical_result.get("ok")) or not (
-                    self.dynamic_pool_physical_migration_enable
-                )
-                if physical_complete:
-                    for block in candidates:
-                        if self._mark_dynamic_pool_block_cpu(
-                            block=block,
-                            reason=reason,
-                            old_target=old_target,
-                            new_target=target,
-                        ):
-                            offloaded += 1
-                    self._dynamic_pool_applied_target_blocks = target
-                    committed = True
-                else:
-                    committed = False
-                    if int(physical_result.get("successes") or 0) == 0:
-                        queue_result = block_pool.apply_uvm_dynamic_pool_target(
-                            old_target,
-                            old_target_blocks=target,
-                        )
-        else:
-            for block in candidates:
-                block_id = int(getattr(block, "block_id", -1))
-                if not self._dynamic_pool_block_safe_for_resize(block):
-                    skipped_active += 1
-                    continue
-                physical_prefetch_block_ids.append(block_id)
-            if external_physical_ready:
-                physical_result = {
-                    "ok": True,
-                    "reason": "external_physical_migration_complete",
-                    "direction": direction,
-                    "block_count": len(physical_prefetch_block_ids),
-                }
-            else:
-                physical_result = self._migrate_dynamic_pool_physical_blocks(
-                    block_ids=physical_prefetch_block_ids,
-                    direction="grow",
-                    reason=reason,
-                    old_target=old_target,
-                    new_target=target,
-                )
-            physical_complete = bool(physical_result.get("ok")) or not (
-                self.dynamic_pool_physical_migration_enable
+        self._set_dynamic_pool_queue_membership(
+            block_pool=block_pool,
+            blocks=blocks,
+            block_ids=transition_ids,
+            gpu=False,
+        )
+        if any(
+            getattr(blocks[block_id], "free_queue_kind", None) != "offline"
+            for block_id in transition_ids
+        ):
+            self._set_dynamic_pool_queue_membership(
+                block_pool=block_pool,
+                blocks=blocks,
+                block_ids=newly_quarantined_ids,
+                gpu=True,
             )
-            if physical_complete:
-                for block in candidates:
-                    if not self._dynamic_pool_block_safe_for_resize(block):
-                        continue
-                    if self._mark_dynamic_pool_block_gpu(
-                        block=block,
-                        reason=reason,
-                        old_target=old_target,
-                        new_target=target,
-                    ):
-                        prefetched += 1
-                queue_result = block_pool.apply_uvm_dynamic_pool_target(
-                    target,
-                    old_target_blocks=old_target,
-                )
-                self._dynamic_pool_applied_target_blocks = target
-                committed = True
-            else:
-                queue_result = {
-                    "moved_gpu": 0,
-                    "moved_offline": 0,
-                    "deferred_active": skipped_active,
-                    "gpu_free_blocks": block_pool.free_block_queue.num_free_blocks,
-                    "offline_free_blocks": (
-                        block_pool.offline_block_queue.num_free_blocks
-                    ),
-                }
-                committed = False
+            return {
+                "ok": False,
+                "reason": "queue_quarantine_incomplete",
+                "old_target_blocks": old_target,
+                "new_target_blocks": target,
+                "expected_block_ids": transition_ids,
+                "expected_cpu_block_ids": list(plan["cpu_block_ids"]),
+                "expected_gpu_block_ids": list(plan["gpu_block_ids"]),
+            }
 
-        pressure_record: dict[str, Any] = {
-            "direction": direction,
+        generation = int(getattr(self, "_dynamic_pool_generation", 0))
+        plan_token = (
+            f"{generation}:{old_target}:{target}:"
+            + ",".join(str(block_id) for block_id in transition_ids)
+        )
+        return {
+            "ok": True,
+            "reason": "prepared",
+            "generation": generation,
+            "plan_token": plan_token,
+            "request_reason": reason,
             "old_target_blocks": old_target,
             "new_target_blocks": target,
-            "committed": committed,
-            "generation": self._dynamic_pool_generation,
-            "reason": reason,
-        }
-        if self.dynamic_pool_debug_records_enable:
-            pressure_record.update({
-                "offloaded_blocks": offloaded,
-                "prefetched_blocks": prefetched,
-                "deferred_active_blocks": skipped_active,
-                "queue_transition": queue_result,
-                "physical_migration": physical_result,
-            })
-        record_unified_residency_snapshot(
-            reason="kv_dynamic_pool_resize",
-            kv_pressure=pressure_record,
-        )
-        result = {
-            "ok": committed,
-            "reason": (
-                "applied"
-                if committed
-                else str(
-                    physical_result.get("reason")
-                    or "physical_migration_incomplete"
+            "dirty_block_ids": list(plan["dirty_block_ids"]),
+            "external_reconciliation_required": bool(
+                getattr(
+                    self,
+                    "_dynamic_pool_external_reconciliation_required",
+                    False,
                 )
             ),
-            "direction": direction,
-            "desired_target_blocks": target,
-            "applied_target_blocks": self._dynamic_pool_applied_target_blocks,
+            "newly_quarantined_block_ids": newly_quarantined_ids,
+            "expected_block_ids": transition_ids,
+            "expected_cpu_block_ids": list(plan["cpu_block_ids"]),
+            "expected_gpu_block_ids": list(plan["gpu_block_ids"]),
         }
-        if self.dynamic_pool_debug_records_enable:
-            result.update({
-                "queue_transition": queue_result,
-                "physical_migration": physical_result,
-                "deferred_active_blocks": skipped_active,
-            })
-        return result
+
+    def finalize_external_dynamic_pool_resize(
+        self,
+        preparation: dict[str, Any],
+        *,
+        block_pool: Any | None,
+        worker_ok: bool,
+        worker_made_progress: bool,
+        completed_block_ids: list[int],
+        completed_cpu_block_ids: list[int],
+        completed_gpu_block_ids: list[int],
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Commit or abort a prepared worker resize using exact completion IDs."""
+        if block_pool is None or not bool(preparation.get("ok")):
+            return {"ok": False, "reason": "external_resize_not_prepared"}
+        expected = {
+            int(block_id)
+            for block_id in preparation.get("expected_block_ids", [])
+        }
+        expected_cpu = {
+            int(block_id)
+            for block_id in preparation.get("expected_cpu_block_ids", [])
+        }
+        expected_gpu = {
+            int(block_id)
+            for block_id in preparation.get("expected_gpu_block_ids", [])
+        }
+        completed = {int(block_id) for block_id in completed_block_ids}
+        completed_cpu = {int(block_id) for block_id in completed_cpu_block_ids}
+        completed_gpu = {int(block_id) for block_id in completed_gpu_block_ids}
+        target = self._clamp_dynamic_pool_target(
+            int(preparation.get("new_target_blocks", 0))
+        )
+        old_target = int(preparation.get("old_target_blocks", 0))
+        token_valid = (
+            old_target == self._dynamic_pool_applied_target_blocks
+            and int(preparation.get("generation", -1))
+            == int(getattr(self, "_dynamic_pool_generation", 0))
+        )
+        current_plan = self._dynamic_pool_resize_plan(
+            block_pool=block_pool,
+            target=target,
+            old_target=old_target,
+        )
+        plan_valid = (
+            current_plan.get("reason") == "planned"
+            and set(current_plan.get("transition_ids", [])) == expected
+            and set(current_plan.get("cpu_block_ids", [])) == expected_cpu
+            and set(current_plan.get("gpu_block_ids", [])) == expected_gpu
+        )
+        completion_valid = (
+            worker_ok
+            and completed == expected
+            and completed_cpu == expected_cpu
+            and completed_gpu == expected_gpu
+        )
+        if token_valid and plan_valid and completion_valid:
+            return self.apply_unified_kv_target_blocks(
+                target,
+                block_pool=block_pool,
+                reason=reason,
+                metadata={
+                    **(metadata or {}),
+                    "physical_migration_complete_block_ids": sorted(expected),
+                },
+            )
+
+        # A stale token or changed plan invalidates the worker's zero-progress
+        # claim: the response can no longer be proven to describe this exact
+        # quarantine. Keep every transition block offline and UNKNOWN until an
+        # external reconciliation completes instead of exposing it again.
+        made_progress = bool(
+            worker_made_progress
+            or completed
+            or not token_valid
+            or not plan_valid
+        )
+        blocks = getattr(block_pool, "blocks", [])
+        dirty_block_ids = {
+            int(block_id)
+            for block_id in preparation.get("dirty_block_ids", [])
+            if 0 < int(block_id) < len(blocks)
+        }
+        valid_expected = {
+            block_id for block_id in expected if 0 < block_id < len(blocks)
+        }
+        if made_progress:
+            dirty_block_ids.update(valid_expected)
+            self._dynamic_pool_reconciliation_block_ids = dirty_block_ids
+            self._dynamic_pool_reconciliation_needed = bool(dirty_block_ids)
+            self._dynamic_pool_external_reconciliation_required = True
+            for block_id in valid_expected:
+                self._mark_dynamic_pool_block_unknown(block=blocks[block_id])
+        else:
+            rollback_ids = [
+                int(block_id)
+                for block_id in preparation.get(
+                    "newly_quarantined_block_ids",
+                    [],
+                )
+                if 0 < int(block_id) < len(blocks)
+            ]
+            self._set_dynamic_pool_queue_membership(
+                block_pool=block_pool,
+                blocks=blocks,
+                block_ids=rollback_ids,
+                gpu=True,
+            )
+            self._dynamic_pool_reconciliation_block_ids = dirty_block_ids
+            self._dynamic_pool_reconciliation_needed = bool(dirty_block_ids)
+            self._dynamic_pool_external_reconciliation_required = bool(
+                preparation.get("external_reconciliation_required", False)
+            )
+
+        return {
+            "ok": False,
+            "reason": (
+                "external_resize_plan_changed"
+                if not token_valid or not plan_valid
+                else "worker_physical_migration_failed"
+            ),
+            "made_progress": made_progress,
+            "expected_block_ids": sorted(expected),
+            "completed_block_ids": sorted(completed),
+        }
+
+    @staticmethod
+    def _set_dynamic_pool_queue_membership(
+        *,
+        block_pool: Any,
+        blocks: list[Any],
+        block_ids: list[int],
+        gpu: bool,
+    ) -> None:
+        desired_queue = "gpu" if gpu else "offline"
+        for first_block, last_block in _coalesce_block_ids(block_ids):
+            if not any(
+                getattr(blocks[block_id], "free_queue_kind", None)
+                != desired_queue
+                for block_id in range(first_block, last_block + 1)
+            ):
+                continue
+            if gpu:
+                block_pool.apply_uvm_dynamic_pool_target(
+                    last_block,
+                    old_target_blocks=first_block - 1,
+                )
+            else:
+                block_pool.apply_uvm_dynamic_pool_target(
+                    first_block - 1,
+                    old_target_blocks=last_block,
+                )
 
     def _dynamic_pool_block_safe_for_resize(self, block: Any) -> bool:
         return (
@@ -1013,60 +1283,57 @@ class UvmKvRuntimePolicy:
         self,
         *,
         block: Any,
-        reason: str,
-        old_target: int,
-        new_target: int,
-    ) -> bool:
+    ) -> None:
         block_id = int(getattr(block, "block_id", -1))
         previous_lifecycle = self._kv_block_lifecycle_class(block)
         if previous_lifecycle != "cpu_offloaded":
             self._dynamic_pool_saved_lifecycle[block_id] = previous_lifecycle
         block.lifecycle_state = "cpu_offloaded"
-        issued = False
         for group_id in range(self.num_kv_cache_groups):
             logical = self._logical_kv_blocks.setdefault(
                 (group_id, block_id),
                 LogicalKVBlock(group_id, block_id),
             )
             if logical.state == RegionState.CPU:
-                issued = True
                 continue
             logical.state = RegionState.CPU
             logical.lifecycle_state = "cpu_offloaded"
             logical.ref_cnt = getattr(block, "ref_cnt", None)
-            issued = True
-        return issued
 
     def _mark_dynamic_pool_block_gpu(
         self,
         *,
         block: Any,
-        reason: str,
-        old_target: int,
-        new_target: int,
-    ) -> bool:
+    ) -> None:
         block_id = int(getattr(block, "block_id", -1))
         restored_lifecycle = self._dynamic_pool_saved_lifecycle.pop(
             block_id,
-            "used_free",
+            self._kv_block_lifecycle_class(block),
         )
         if restored_lifecycle not in ("never_used", "used_free"):
             restored_lifecycle = "used_free"
         block.lifecycle_state = restored_lifecycle
-        issued = False
         for group_id in range(self.num_kv_cache_groups):
             logical = self._logical_kv_blocks.setdefault(
                 (group_id, block_id),
                 LogicalKVBlock(group_id, block_id),
             )
             if logical.state == RegionState.GPU:
-                issued = True
                 continue
             logical.state = RegionState.GPU
             logical.lifecycle_state = restored_lifecycle
             logical.ref_cnt = getattr(block, "ref_cnt", None)
-            issued = True
-        return issued
+
+    def _mark_dynamic_pool_block_unknown(self, *, block: Any) -> None:
+        block_id = int(getattr(block, "block_id", -1))
+        for group_id in range(self.num_kv_cache_groups):
+            logical = self._logical_kv_blocks.setdefault(
+                (group_id, block_id),
+                LogicalKVBlock(group_id, block_id),
+            )
+            logical.state = RegionState.UNKNOWN
+            logical.lifecycle_state = self._kv_block_lifecycle_class(block)
+            logical.ref_cnt = getattr(block, "ref_cnt", None)
 
     def _kv_block_lifecycle_class(self, block: Any) -> str:
         state = str(getattr(block, "lifecycle_state", "never_used") or "never_used")
@@ -1256,7 +1523,6 @@ class UvmKvRuntimePolicy:
         if max_blocks <= 0:
             return
 
-        requested_bytes = max_blocks * int(pressure.get("bytes_per_block") or 0)
         try:
             block_pool.evict_cached_free_blocks(max_blocks)
         except Exception:  # pragma: no cover - defensive eviction path.

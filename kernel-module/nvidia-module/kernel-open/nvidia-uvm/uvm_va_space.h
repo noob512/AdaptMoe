@@ -65,14 +65,7 @@ typedef struct
     NvU64 base;
     NvU64 length;
     uvm_range_tree_node_t va_node;
-    NvU32 pool;
-    NvU32 layer_id;
-    NvU32 expert_id;
-    NvU32 role;
-    NvU32 flags;
     NvU32 state;
-    NvU32 priority;
-    NvU64 last_access_epoch;
 } uvm_phase_f_region_t;
 
 #ifndef UVM_PHASE_N_TRACE_VICTIM_MAX

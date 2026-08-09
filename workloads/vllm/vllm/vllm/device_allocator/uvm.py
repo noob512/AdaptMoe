@@ -508,10 +508,6 @@ def load_uvm_library() -> ctypes.CDLL:
         lib.uvm_driver_phase_n_update_region_state.argtypes = [
             ctypes.c_uint64,
             ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint64,
         ]
 
     if hasattr(lib, "uvm_driver_phase_n_query_region"):
@@ -1076,13 +1072,36 @@ def _region_release_entry_to_dict(
     remote_read = bool(
         int(params.flags) & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ
     )
+    activity_counters = (
+        int(params.block_count),
+        int(params.attempted_blocks),
+        int(params.success_blocks),
+        int(params.failure_blocks),
+        int(params.skipped_blocks),
+        int(params.attempted_bytes),
+        int(params.released_bytes),
+        int(params.failed_bytes),
+        int(params.remote_map_blocks),
+        int(params.remote_map_failure_blocks),
+        int(params.cpu_resident_bytes),
+        int(params.remote_mapped_bytes),
+        int(params.newly_remote_mapped_bytes),
+    )
+    idempotent = (
+        raw_ok
+        and not remote_read
+        and int(params.length) > 0
+        and int(params.first_error) == 0
+        and not any(activity_counters)
+    )
     effective_ok = raw_ok and (
-        int(params.block_count) > 0
+        idempotent
+        or int(params.block_count) > 0
         or int(params.attempted_blocks) > 0
         or int(params.skipped_blocks) > 0
         or int(params.released_bytes) > 0
     )
-    if remote_read:
+    if remote_read and not idempotent:
         effective_ok = (
             effective_ok
             and int(params.remote_map_failure_blocks) == 0
@@ -1101,6 +1120,7 @@ def _region_release_entry_to_dict(
     return {
         "ok": effective_ok,
         "raw_ok": raw_ok,
+        "idempotent": idempotent,
         "reason": reason,
         "fd_source": fd_source,
         "ioctl_ret": int(ret),
@@ -1794,12 +1814,8 @@ def driver_update_region_state(
     *,
     region_id: int,
     state: int = UVM_REGION_STATE_UNKNOWN,
-    flags_set: int = 0,
-    flags_clear: int = 0,
-    priority: int = 0,
-    last_access_epoch: int = 0,
 ) -> int:
-    """Update Stage N region state metadata in the driver."""
+    """Update the minimal explicit-region state in the driver."""
     if not has_region_state_ioctl():
         return -1
     if region_id <= 0:
@@ -1809,10 +1825,6 @@ def driver_update_region_state(
             _uvm_lib.uvm_driver_phase_n_update_region_state(
                 ctypes.c_uint64(int(region_id)),
                 ctypes.c_uint32(max(int(state), 0)),
-                ctypes.c_uint32(max(int(flags_set), 0)),
-                ctypes.c_uint32(max(int(flags_clear), 0)),
-                ctypes.c_uint32(max(int(priority), 0)),
-                ctypes.c_uint64(max(int(last_access_epoch), 0)),
             )
         )
     except Exception:
@@ -1826,7 +1838,7 @@ def _driver_region_values_to_dict(values: ctypes.Array) -> dict[str, int]:
         "region_id": int(values[0]),
         "base": int(values[1]),
         "length": int(values[2]),
-        "state": int(values[8]),
+        "state": int(values[3]),
     }
 
 
@@ -1834,7 +1846,7 @@ def driver_query_region(region_id: int) -> dict[str, int] | None:
     """Query Stage N region metadata by region id."""
     if not has_region_state_ioctl() or region_id <= 0:
         return None
-    values = (ctypes.c_uint64 * 11)()
+    values = (ctypes.c_uint64 * 4)()
     try:
         status = int(
             _uvm_lib.uvm_driver_phase_n_query_region(

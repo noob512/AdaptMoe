@@ -4,6 +4,9 @@ from collections import deque
 from types import SimpleNamespace
 from typing import Any
 
+from vllm.device_allocator.uvm_region import RegionState
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.uvm_kv_runtime_policy import UvmKvRuntimePolicy
 from vllm.v1.engine.core import EngineCore
 
 
@@ -14,12 +17,19 @@ class _FakeScheduler:
             block_pool=object(),
         )
 
+    @staticmethod
+    def has_unfinished_requests() -> bool:
+        return False
+
 
 def _make_core(*, applied_target: int = 8, total_blocks: int = 32) -> EngineCore:
     core = object.__new__(EngineCore)
     policy = SimpleNamespace(
         _dynamic_pool_applied_target_blocks=applied_target,
+        _dynamic_pool_reconciliation_block_ids=set(),
+        _dynamic_pool_external_reconciliation_required=False,
         total_blocks=total_blocks,
+        dynamic_pool_physical_migration_enable=True,
         dynamic_pool_active=lambda: True,
     )
     core.scheduler = _FakeScheduler(policy)  # type: ignore[assignment]
@@ -27,6 +37,85 @@ def _make_core(*, applied_target: int = 8, total_blocks: int = 32) -> EngineCore
     core._uvm_pending_kv_grow_target_blocks = None
     core._uvm_pending_kv_grow_reason = ""
     return core
+
+
+def _make_real_policy_core() -> tuple[EngineCore, UvmKvRuntimePolicy, BlockPool]:
+    policy = object.__new__(UvmKvRuntimePolicy)
+    policy.dynamic_pool_enable = True
+    policy.dynamic_pool_target_blocks = 6
+    policy.dynamic_pool_physical_migration_enable = True
+    policy.dynamic_pool_physical_migration_sync = True
+    policy.dynamic_pool_physical_migration_executor = "auto"
+    policy.dynamic_pool_physical_migration_device = 0
+    policy.num_kv_cache_groups = 1
+    policy.total_blocks = 6
+    policy._dynamic_pool_applied_target_blocks = 6
+    policy._dynamic_pool_generation = 0
+    policy._dynamic_pool_saved_lifecycle = {}
+    policy._dynamic_pool_reconciliation_needed = False
+    policy._dynamic_pool_reconciliation_block_ids = set()
+    policy._dynamic_pool_external_reconciliation_required = False
+    policy._logical_kv_blocks = {}
+    pool = BlockPool(
+        num_gpu_blocks=7,
+        enable_caching=False,
+        hash_block_size=16,
+        uvm_kv_runtime_policy=policy,
+    )
+    policy.register_stage_l5_kv_blocks(pool)
+    core = object.__new__(EngineCore)
+    core.scheduler = _FakeScheduler(policy)  # type: ignore[assignment]
+    core.scheduler.kv_cache_manager.block_pool = pool
+    core.batch_queue = None
+    core._uvm_pending_kv_grow_target_blocks = None
+    core._uvm_pending_kv_grow_reason = ""
+    return core, policy, pool
+
+
+def _seed_partial_shrink(
+    policy: UvmKvRuntimePolicy,
+    pool: BlockPool,
+) -> None:
+    pool.apply_uvm_dynamic_pool_target(3, old_target_blocks=6)
+    for block_id in (4, 5, 6):
+        policy._mark_dynamic_pool_block_unknown(block=pool.blocks[block_id])
+    policy.dynamic_pool_target_blocks = 3
+    policy._dynamic_pool_reconciliation_needed = True
+    policy._dynamic_pool_reconciliation_block_ids = {4, 5, 6}
+
+
+def _worker_resize_result(
+    *,
+    old_target: int,
+    new_target: int,
+    plan_token: str,
+    requested: list[int],
+    requested_cpu: list[int],
+    requested_gpu: list[int],
+    completed: list[int],
+    completed_cpu: list[int],
+    completed_gpu: list[int],
+    ok: bool,
+    made_progress: bool,
+) -> dict[str, object]:
+    return {
+        "ok": ok,
+        "old_target_blocks": old_target,
+        "new_target_blocks": new_target,
+        "plan_token": plan_token,
+        "requested_block_ids": requested,
+        "requested_cpu_block_ids": requested_cpu,
+        "requested_gpu_block_ids": requested_gpu,
+        "completed_block_ids": completed,
+        "completed_cpu_block_ids": completed_cpu,
+        "completed_gpu_block_ids": completed_gpu,
+        "made_progress": made_progress,
+        "synchronized": made_progress,
+    }
+
+
+def _queue_ids(queue: Any) -> list[int]:
+    return [block.block_id for block in queue.get_all_free_blocks()]
 
 
 def test_preemption_grows_per_preempted_request(
@@ -101,6 +190,41 @@ def test_worker_resize_commits_target_after_expert_and_physical_steps(
     core = _make_core()
     policy = core.scheduler.kv_cache_manager.uvm_kv_runtime_policy
     events: list[str] = []
+    plan_token = "test-plan"
+
+    def prepare(
+        target_blocks: int,
+        *,
+        block_pool: object,
+        reason: str,
+    ) -> dict[str, object]:
+        assert target_blocks == 12
+        assert block_pool is core.scheduler.kv_cache_manager.block_pool
+        assert reason == "test_pressure"
+        events.append("prepare")
+        return {
+            "ok": True,
+            "plan_token": plan_token,
+            "dirty_block_ids": [],
+            "expected_block_ids": [9, 10, 11, 12],
+            "expected_cpu_block_ids": [],
+            "expected_gpu_block_ids": [9, 10, 11, 12],
+        }
+
+    def finalize(
+        preparation: dict[str, object],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        assert preparation["plan_token"] == plan_token
+        assert kwargs["worker_ok"] is True
+        assert kwargs["completed_block_ids"] == [9, 10, 11, 12]
+        assert kwargs["completed_cpu_block_ids"] == []
+        assert kwargs["completed_gpu_block_ids"] == [9, 10, 11, 12]
+        events.append("apply")
+        return {"ok": True, "applied_target_blocks": 12}
+
+    policy.prepare_external_dynamic_pool_resize = prepare
+    policy.finalize_external_dynamic_pool_resize = finalize
 
     def fake_collective_rpc(
         method: str,
@@ -139,26 +263,26 @@ def test_worker_resize_commits_target_after_expert_and_physical_steps(
                 }
             ]
         assert method == "resize_uvm_kv_cache_target"
-        assert args == (8, 12, "test_pressure")
+        assert args == (8, 12, "test_pressure", [], plan_token)
         events.append("physical")
-        return [{"ok": True}]
-
-    def fake_apply(
-        target_blocks: int,
-        *,
-        block_pool: object,
-        reason: str,
-        metadata: dict[str, object],
-    ) -> dict[str, object]:
-        assert target_blocks == 12
-        assert block_pool is core.scheduler.kv_cache_manager.block_pool
-        assert reason == "test_pressure"
-        assert metadata["physical_migration_complete"] is True
-        events.append("apply")
-        return {"ok": True, "applied_target_blocks": 12}
+        return [
+            {
+                "ok": True,
+                "old_target_blocks": 8,
+                "new_target_blocks": 12,
+                "plan_token": plan_token,
+                "requested_block_ids": [9, 10, 11, 12],
+                "requested_cpu_block_ids": [],
+                "requested_gpu_block_ids": [9, 10, 11, 12],
+                "completed_block_ids": [9, 10, 11, 12],
+                "completed_cpu_block_ids": [],
+                "completed_gpu_block_ids": [9, 10, 11, 12],
+                "made_progress": True,
+                "synchronized": True,
+            }
+        ]
 
     monkeypatch.setattr(core, "collective_rpc", fake_collective_rpc)
-    policy.apply_unified_kv_target_blocks = fake_apply
 
     result = core._resize_uvm_kv_target_with_workers(
         12,
@@ -170,7 +294,254 @@ def test_worker_resize_commits_target_after_expert_and_physical_steps(
     assert result["selected_experts_by_layer"] == {
         "model.layers.7.mlp.experts": 6
     }
-    assert events == ["candidates", "expert", "physical", "apply"]
+    assert events == [
+        "candidates",
+        "expert",
+        "prepare",
+        "physical",
+        "apply",
+    ]
+
+
+def test_equal_applied_target_with_dirty_blocks_runs_workers_and_reconciles(
+    monkeypatch: Any,
+) -> None:
+    core, policy, pool = _make_real_policy_core()
+    _seed_partial_shrink(policy, pool)
+    rpc_calls: list[tuple[object, ...]] = []
+
+    def collective_rpc(
+        method: str,
+        args: tuple[object, ...] = (),
+        **_kwargs: object,
+    ) -> list[dict[str, object]]:
+        assert method == "resize_uvm_kv_cache_target"
+        assert _queue_ids(pool.free_block_queue) == [1, 2, 3]
+        assert _queue_ids(pool.offline_block_queue) == [4, 5, 6]
+        rpc_calls.append(args)
+        plan_token = str(args[4])
+        return [
+            _worker_resize_result(
+                old_target=6,
+                new_target=6,
+                plan_token=plan_token,
+                requested=[4, 5, 6],
+                requested_cpu=[],
+                requested_gpu=[4, 5, 6],
+                completed=[4, 5, 6],
+                completed_cpu=[],
+                completed_gpu=[4, 5, 6],
+                ok=True,
+                made_progress=True,
+            )
+        ]
+
+    monkeypatch.setattr(core, "collective_rpc", collective_rpc)
+
+    result = core._resize_uvm_kv_target_with_workers(
+        6,
+        reason="cross-entry-revert",
+        release_expert_wave=False,
+    )
+
+    assert result["ok"] is True
+    assert rpc_calls and rpc_calls[0][3] == [4, 5, 6]
+    assert policy._dynamic_pool_applied_target_blocks == 6
+    assert policy._dynamic_pool_reconciliation_block_ids == set()
+    assert not policy._dynamic_pool_reconciliation_needed
+    assert not policy._dynamic_pool_external_reconciliation_required
+    assert _queue_ids(pool.free_block_queue) == [4, 5, 6, 1, 2, 3]
+    assert _queue_ids(pool.offline_block_queue) == []
+    assert all(
+        policy._logical_kv_blocks[(0, block_id)].state == RegionState.GPU
+        for block_id in (4, 5, 6)
+    )
+
+
+def test_worker_partial_does_not_commit_and_requires_external_retry(
+    monkeypatch: Any,
+) -> None:
+    core, policy, pool = _make_real_policy_core()
+    _seed_partial_shrink(policy, pool)
+    monkeypatch.setenv("VLLM_UVM_KV_ADAPTIVE_FAIL_FAST", "0")
+
+    def collective_rpc(
+        _method: str,
+        args: tuple[object, ...] = (),
+        **_kwargs: object,
+    ) -> list[dict[str, object]]:
+        return [
+            _worker_resize_result(
+                old_target=6,
+                new_target=6,
+                plan_token=str(args[4]),
+                requested=[4, 5, 6],
+                requested_cpu=[],
+                requested_gpu=[4, 5, 6],
+                completed=[],
+                completed_cpu=[],
+                completed_gpu=[],
+                ok=False,
+                made_progress=True,
+            )
+        ]
+
+    monkeypatch.setattr(core, "collective_rpc", collective_rpc)
+
+    result = core._resize_uvm_kv_target_with_workers(
+        6,
+        reason="worker-partial",
+        release_expert_wave=False,
+    )
+
+    assert result["ok"] is False
+    assert policy._dynamic_pool_applied_target_blocks == 6
+    assert policy._dynamic_pool_reconciliation_block_ids == {4, 5, 6}
+    assert policy._dynamic_pool_external_reconciliation_required
+    assert _queue_ids(pool.free_block_queue) == [1, 2, 3]
+    assert _queue_ids(pool.offline_block_queue) == [4, 5, 6]
+    assert all(
+        policy._logical_kv_blocks[(0, block_id)].state == RegionState.UNKNOWN
+        for block_id in (4, 5, 6)
+    )
+    assert policy._ensure_dynamic_pool_applied(
+        block_pool=pool,
+        reason="ordinary-refresh",
+    ) == {"ok": False, "reason": "external_reconciliation_required"}
+
+
+def test_worker_rank_completion_mismatch_keeps_entire_plan_quarantined(
+    monkeypatch: Any,
+) -> None:
+    core, policy, pool = _make_real_policy_core()
+    _seed_partial_shrink(policy, pool)
+    monkeypatch.setenv("VLLM_UVM_KV_ADAPTIVE_FAIL_FAST", "0")
+
+    def collective_rpc(
+        _method: str,
+        args: tuple[object, ...] = (),
+        **_kwargs: object,
+    ) -> list[dict[str, object]]:
+        token = str(args[4])
+        complete = _worker_resize_result(
+            old_target=6,
+            new_target=6,
+            plan_token=token,
+            requested=[4, 5, 6],
+            requested_cpu=[],
+            requested_gpu=[4, 5, 6],
+            completed=[4, 5, 6],
+            completed_cpu=[],
+            completed_gpu=[4, 5, 6],
+            ok=True,
+            made_progress=True,
+        )
+        incomplete = _worker_resize_result(
+            old_target=6,
+            new_target=6,
+            plan_token=token,
+            requested=[4, 5, 6],
+            requested_cpu=[],
+            requested_gpu=[4, 5, 6],
+            completed=[],
+            completed_cpu=[],
+            completed_gpu=[],
+            ok=False,
+            made_progress=True,
+        )
+        return [complete, incomplete]
+
+    monkeypatch.setattr(core, "collective_rpc", collective_rpc)
+
+    result = core._resize_uvm_kv_target_with_workers(
+        6,
+        reason="rank-mismatch",
+        release_expert_wave=False,
+    )
+
+    assert result["ok"] is False
+    assert result["finalize_result"]["completed_block_ids"] == []
+    assert policy._dynamic_pool_applied_target_blocks == 6
+    assert policy._dynamic_pool_reconciliation_block_ids == {4, 5, 6}
+    assert policy._dynamic_pool_external_reconciliation_required
+    assert _queue_ids(pool.free_block_queue) == [1, 2, 3]
+    assert _queue_ids(pool.offline_block_queue) == [4, 5, 6]
+
+
+def test_worker_rpc_exception_marks_clean_shrink_dirty_before_return(
+    monkeypatch: Any,
+) -> None:
+    core, policy, pool = _make_real_policy_core()
+    monkeypatch.setenv("VLLM_UVM_KV_ADAPTIVE_FAIL_FAST", "0")
+
+    def collective_rpc(*_args: object, **_kwargs: object) -> list[object]:
+        assert _queue_ids(pool.free_block_queue) == [1, 2, 3]
+        assert _queue_ids(pool.offline_block_queue) == [4, 5, 6]
+        raise RuntimeError("mock worker transport failure")
+
+    monkeypatch.setattr(core, "collective_rpc", collective_rpc)
+
+    result = core._resize_uvm_kv_target_with_workers(
+        3,
+        reason="rpc-exception",
+        release_expert_wave=False,
+    )
+
+    assert result["ok"] is False
+    assert result["finalize_result"]["made_progress"] is True
+    assert policy._dynamic_pool_applied_target_blocks == 6
+    assert policy._dynamic_pool_reconciliation_block_ids == {4, 5, 6}
+    assert policy._dynamic_pool_external_reconciliation_required
+    assert _queue_ids(pool.free_block_queue) == [1, 2, 3]
+    assert _queue_ids(pool.offline_block_queue) == [4, 5, 6]
+    assert all(
+        policy._logical_kv_blocks[(0, block_id)].state == RegionState.UNKNOWN
+        for block_id in (4, 5, 6)
+    )
+
+
+def test_zero_progress_worker_failure_rolls_back_new_quarantine(
+    monkeypatch: Any,
+) -> None:
+    core, policy, pool = _make_real_policy_core()
+    monkeypatch.setenv("VLLM_UVM_KV_ADAPTIVE_FAIL_FAST", "0")
+
+    def collective_rpc(
+        _method: str,
+        args: tuple[object, ...] = (),
+        **_kwargs: object,
+    ) -> list[dict[str, object]]:
+        assert _queue_ids(pool.offline_block_queue) == [4, 5, 6]
+        return [
+            _worker_resize_result(
+                old_target=6,
+                new_target=3,
+                plan_token=str(args[4]),
+                requested=[4, 5, 6],
+                requested_cpu=[4, 5, 6],
+                requested_gpu=[],
+                completed=[],
+                completed_cpu=[],
+                completed_gpu=[],
+                ok=False,
+                made_progress=False,
+            )
+        ]
+
+    monkeypatch.setattr(core, "collective_rpc", collective_rpc)
+
+    result = core._resize_uvm_kv_target_with_workers(
+        3,
+        reason="worker-zero-progress",
+        release_expert_wave=False,
+    )
+
+    assert result["ok"] is False
+    assert policy._dynamic_pool_applied_target_blocks == 6
+    assert policy._dynamic_pool_reconciliation_block_ids == set()
+    assert not policy._dynamic_pool_external_reconciliation_required
+    assert _queue_ids(pool.free_block_queue) == [4, 5, 6, 1, 2, 3]
+    assert _queue_ids(pool.offline_block_queue) == []
 
 
 def test_incremental_candidate_merge_selects_one_global_expert_per_layer() -> None:

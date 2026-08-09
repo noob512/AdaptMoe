@@ -459,11 +459,15 @@ class Worker(WorkerBase):
         old_target_blocks: int,
         new_target_blocks: int,
         reason: str = "adaptive_runtime",
+        reconciliation_block_ids: list[int] | tuple[int, ...] | None = None,
+        plan_token: str = "",
     ) -> dict[str, Any]:
         return self.model_runner.resize_uvm_kv_cache_target(
             old_target_blocks,
             new_target_blocks,
             reason,
+            reconciliation_block_ids,
+            plan_token,
         )
 
     def get_uvm_incremental_expert_offload_candidates(

@@ -1435,16 +1435,9 @@ static void uvm_phase_n_va_block_init_from_range(uvm_va_block_t *block,
     memset(&block->phase_n, 0, sizeof(block->phase_n));
     INIT_LIST_HEAD(&block->phase_n.queue_node);
 
-    if (!managed_range->phase_n_tag.valid)
-        return;
-
-    block->phase_n.region_id = managed_range->phase_n_tag.region_id;
-    block->phase_n.allocation_id = managed_range->phase_n_tag.allocation_id;
-    block->phase_n.pool = managed_range->phase_n_tag.pool;
-    block->phase_n.role = managed_range->phase_n_tag.role;
-    block->phase_n.flags = managed_range->phase_n_tag.flags;
-    block->phase_n.tag_valid = managed_range->phase_n_tag.valid;
-    block->phase_n.mixed_pool = managed_range->phase_n_tag.mixed;
+    // Phase-N semantic range tags are no longer populated from the compact
+    // Region registry. Leave the legacy per-block accounting state inactive.
+    (void)managed_range;
 }
 
 NV_STATUS uvm_va_range_block_create(uvm_va_range_managed_t *managed_range, size_t index, uvm_va_block_t **out_block)

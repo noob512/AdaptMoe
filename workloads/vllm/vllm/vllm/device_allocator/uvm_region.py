@@ -242,7 +242,9 @@ class ExplicitRegionRegistry:
             return True
         if target == RegionState.GPU and region.state == RegionState.GPU:
             return True
-        if region.state == RegionState.UNKNOWN:
+        # UNKNOWN must run a conservative physical operation.  Without an
+        # executor there is no evidence that placement succeeded.
+        if region.state == RegionState.UNKNOWN and executor is None:
             return False
         region.state = RegionState.PREFETCHING_CPU if target == RegionState.CPU else RegionState.PREFETCHING_GPU
         try:

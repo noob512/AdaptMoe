@@ -58,13 +58,10 @@ module_param(uvm_perf_migrate_cpu_preunmap_enable, int, S_IRUGO);
 static unsigned uvm_perf_migrate_cpu_preunmap_block_order = UVM_PERF_MIGRATE_CPU_PREUNMAP_BLOCK_ORDER_DEFAULT;
 module_param(uvm_perf_migrate_cpu_preunmap_block_order, uint, S_IRUGO);
 
-#define UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W13 3
-#define UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W2 4
-
 static unsigned uvm_phase_n_expert_migrate_fastpath_enable = 0;
 module_param(uvm_phase_n_expert_migrate_fastpath_enable, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_phase_n_expert_migrate_fastpath_enable,
-                 "Use expert-tagged single-va_range read-duplicate fast path for GPU UVM_MIGRATE. Default: 0.");
+                 "Deprecated no-op: Expert identity is no longer inferred from Region tags.");
 
 static unsigned uvm_phase_n_expert_migrate_fastpath_align_blocks_enable = 1;
 module_param(uvm_phase_n_expert_migrate_fastpath_align_blocks_enable, uint, S_IRUGO | S_IWUSR);
@@ -116,39 +113,22 @@ static NV_STATUS uvm_migrate_expert_make_batch_entries(uvm_migrate_expert_block_
 
 static bool phase_n_migrate_tag_is_expert_weight(const uvm_phase_n_range_tag_t *tag)
 {
-    return tag &&
-           tag->valid &&
-           !tag->mixed &&
-           tag->pool == UVM_PHASE_N_POOL_WEIGHT &&
-           (tag->role == UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W13 ||
-            tag->role == UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W2);
-}
-
-static bool phase_n_migrate_tag_is_cpu_offloaded_reserved_expert(const uvm_phase_n_range_tag_t *tag)
-{
-    return phase_n_migrate_tag_is_expert_weight(tag) &&
-           (tag->flags & UVM_PHASE_N_REGION_FLAG_CPU_OFFLOADED_RESERVED);
+    // Expert identity is no longer encoded in Region/range-tag metadata.
+    // Explicit Region operations select Expert ranges; generic UVM_MIGRATE
+    // requests therefore remain on the normal migration path.
+    (void)tag;
+    return false;
 }
 
 static bool phase_n_migrate_range_has_cpu_offloaded_reserved_expert(uvm_va_space_t *va_space,
                                                                     NvU64 base,
                                                                     NvU64 length)
 {
-    uvm_va_range_managed_t *managed_range;
-    NvU64 end;
-
-    if (length == 0)
-        return false;
-
-    if (uvm_va_space_range_has_cpu_offloaded_reserved_expert(va_space, base, length))
-        return true;
-
-    end = base + length - 1;
-    uvm_for_each_va_range_managed_in(managed_range, va_space, base, end) {
-        if (phase_n_migrate_tag_is_cpu_offloaded_reserved_expert(&managed_range->phase_n_tag))
-            return true;
-    }
-
+    // CPU-offloaded/reserved is not a kernel Region classification anymore.
+    // Do not reject an otherwise valid generic migration based on stale tags.
+    (void)va_space;
+    (void)base;
+    (void)length;
     return false;
 }
 

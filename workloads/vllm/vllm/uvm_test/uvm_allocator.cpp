@@ -280,11 +280,6 @@ struct PhaseNReclaimRegionParams {
 struct PhaseNUpdateRegionStateParams {
     uint64_t region_id;
     uint32_t state;
-    uint32_t flags_set;
-    uint32_t flags_clear;
-    uint32_t priority;
-    uint32_t reserved;
-    uint64_t last_access_epoch;
     uint32_t rmStatus;
 };
 
@@ -292,15 +287,8 @@ struct PhaseNQueryRegionParams {
     uint64_t region_id;
     uint64_t base;
     uint64_t length;
-    uint32_t pool;
-    uint32_t layer_id;
-    uint32_t expert_id;
-    uint32_t role;
-    uint32_t flags;
     uint32_t state;
-    uint32_t priority;
     uint32_t found_by_va;
-    uint64_t last_access_epoch;
     uint32_t rmStatus;
 };
 
@@ -309,15 +297,8 @@ struct PhaseNQueryRegionByVaParams {
     uint64_t region_id;
     uint64_t base;
     uint64_t length;
-    uint32_t pool;
-    uint32_t layer_id;
-    uint32_t expert_id;
-    uint32_t role;
-    uint32_t flags;
     uint32_t state;
-    uint32_t priority;
     uint32_t found_by_va;
-    uint64_t last_access_epoch;
     uint32_t rmStatus;
 };
 
@@ -1516,32 +1497,20 @@ int uvm_driver_phase_n_reclaim_pool_internal(uint32_t pool,
 }
 
 int uvm_driver_phase_n_update_region_state_internal(uint64_t region_id,
-                                                    uint32_t state,
-                                                    uint32_t flags_set,
-                                                    uint32_t flags_clear,
-                                                    uint32_t priority,
-                                                    uint64_t last_access_epoch) {
+                                                    uint32_t state) {
     auto update_state_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
         PhaseNUpdateRegionStateParams params{};
         params.region_id = region_id;
         params.state = state;
-        params.flags_set = flags_set;
-        params.flags_clear = flags_clear;
-        params.priority = priority;
-        params.last_access_epoch = last_access_epoch;
 
-        phase_f_debug_log("driver_phase_n_update_region_state cmd=%u fd_source=%s source_fd=%d fd=%d path=%s id=%llu state=%u flags_set=0x%x flags_clear=0x%x priority=%u epoch=%llu ioctl_begin",
+        phase_f_debug_log("driver_phase_n_update_region_state cmd=%u fd_source=%s source_fd=%d fd=%d path=%s id=%llu state=%u ioctl_begin",
                           UVM_PHASE_N_UPDATE_REGION_STATE_IOCTL,
                           fd_source,
                           source_fd,
                           fd,
                           path ? path : "",
                           static_cast<unsigned long long>(region_id),
-                          state,
-                          flags_set,
-                          flags_clear,
-                          priority,
-                          static_cast<unsigned long long>(last_access_epoch));
+                          state);
         int ret = ioctl(fd, UVM_PHASE_N_UPDATE_REGION_STATE_IOCTL, &params);
         int saved_errno = errno;
         phase_f_debug_log("driver_phase_n_update_region_state cmd=%u fd_source=%s source_fd=%d fd=%d id=%llu ioctl_done ret=%d errno=%d rmStatus=%u",
@@ -1612,10 +1581,6 @@ int uvm_driver_phase_n_metadata_state_smoke_internal(uint32_t pool,
     PhaseNUpdateRegionStateParams state_params{};
     state_params.region_id = region_id;
     state_params.state = 3;
-    state_params.flags_set = 1u;
-    state_params.flags_clear = 0;
-    state_params.priority = 7;
-    state_params.last_access_epoch = 42;
     ret = ioctl(fd, UVM_PHASE_N_UPDATE_REGION_STATE_IOCTL, &state_params);
     if (ret != 0 || state_params.rmStatus != 0) {
         (void)uvm_driver_phase_f_unregister_region_fd(fd, region_id);
@@ -1666,7 +1631,7 @@ int uvm_driver_phase_n_metadata_state_smoke_internal(uint32_t pool,
 int uvm_driver_phase_n_query_region_internal(uint64_t region_id,
                                              uint64_t* values_out,
                                              size_t values_count) {
-    if (values_out == nullptr || values_count < 11) return -2;
+    if (values_out == nullptr || values_count < 4) return -2;
 
     PhaseNQueryRegionParams params{};
     params.region_id = region_id;
@@ -1686,7 +1651,7 @@ int uvm_driver_phase_n_query_region_internal(uint64_t region_id,
                           static_cast<unsigned long long>(region_id));
         int ret = ioctl(fd, UVM_PHASE_N_QUERY_REGION_IOCTL, &attempt);
         int saved_errno = errno;
-        phase_f_debug_log("driver_phase_n_query_region cmd=%u fd_source=%s source_fd=%d fd=%d id=%llu ioctl_done ret=%d errno=%d rmStatus=%u base=0x%llx length=%llu pool=%u flags=0x%x state=%u",
+        phase_f_debug_log("driver_phase_n_query_region cmd=%u fd_source=%s source_fd=%d fd=%d id=%llu ioctl_done ret=%d errno=%d rmStatus=%u base=0x%llx length=%llu state=%u",
                           UVM_PHASE_N_QUERY_REGION_IOCTL,
                           fd_source,
                           source_fd,
@@ -1697,8 +1662,6 @@ int uvm_driver_phase_n_query_region_internal(uint64_t region_id,
                           attempt.rmStatus,
                           static_cast<unsigned long long>(attempt.base),
                           static_cast<unsigned long long>(attempt.length),
-                          attempt.pool,
-                          attempt.flags,
                           attempt.state);
         final_ret = ret;
         final_errno = saved_errno;
@@ -1724,7 +1687,7 @@ int uvm_driver_phase_n_query_region_internal(uint64_t region_id,
             persistent_result = query_on_fd(fd, "persistent", -1, "/dev/nvidia-uvm:persistent");
     }
 
-    phase_f_debug_log("driver_phase_n_query_region cmd=%u id=%llu ioctl_done ret=%d errno=%d rmStatus=%u base=0x%llx length=%llu pool=%u flags=0x%x state=%u",
+    phase_f_debug_log("driver_phase_n_query_region cmd=%u id=%llu ioctl_done ret=%d errno=%d rmStatus=%u base=0x%llx length=%llu state=%u",
                       UVM_PHASE_N_QUERY_REGION_IOCTL,
                       static_cast<unsigned long long>(region_id),
                       final_ret,
@@ -1732,8 +1695,6 @@ int uvm_driver_phase_n_query_region_internal(uint64_t region_id,
                       params.rmStatus,
                       static_cast<unsigned long long>(params.base),
                       static_cast<unsigned long long>(params.length),
-                      params.pool,
-                      params.flags,
                       params.state);
 
     if (existing_result <= 0 && persistent_result <= 0) {
@@ -1745,21 +1706,14 @@ int uvm_driver_phase_n_query_region_internal(uint64_t region_id,
     values_out[0] = params.region_id;
     values_out[1] = params.base;
     values_out[2] = params.length;
-    values_out[3] = params.pool;
-    values_out[4] = params.layer_id;
-    values_out[5] = params.expert_id;
-    values_out[6] = params.role;
-    values_out[7] = params.flags;
-    values_out[8] = params.state;
-    values_out[9] = params.priority;
-    values_out[10] = params.last_access_epoch;
+    values_out[3] = params.state;
     return 1;
 }
 
 int uvm_driver_phase_n_query_region_by_va_internal(uintptr_t address,
                                                    uint64_t* values_out,
                                                    size_t values_count) {
-    if (values_out == nullptr || values_count < 11) return -2;
+    if (values_out == nullptr || values_count < 4) return -2;
     int fd = open_initialized_uvm_fd("driver_phase_n_query_region_by_va", true);
     if (fd < 0) return -4;
 
@@ -1772,15 +1726,13 @@ int uvm_driver_phase_n_query_region_by_va_internal(uintptr_t address,
     int ret = ioctl(fd, UVM_PHASE_N_QUERY_REGION_BY_VA_IOCTL, &params);
     int saved_errno = errno;
     close(fd);
-    phase_f_debug_log("driver_phase_n_query_region_by_va cmd=%u address=0x%llx ioctl_done ret=%d errno=%d rmStatus=%u id=%llu pool=%u flags=0x%x state=%u",
+    phase_f_debug_log("driver_phase_n_query_region_by_va cmd=%u address=0x%llx ioctl_done ret=%d errno=%d rmStatus=%u id=%llu state=%u",
                       UVM_PHASE_N_QUERY_REGION_BY_VA_IOCTL,
                       static_cast<unsigned long long>(params.address),
                       ret,
                       saved_errno,
                       params.rmStatus,
                       static_cast<unsigned long long>(params.region_id),
-                      params.pool,
-                      params.flags,
                       params.state);
 
     if (ret != 0) return -6;
@@ -1789,14 +1741,7 @@ int uvm_driver_phase_n_query_region_by_va_internal(uintptr_t address,
     values_out[0] = params.region_id;
     values_out[1] = params.base;
     values_out[2] = params.length;
-    values_out[3] = params.pool;
-    values_out[4] = params.layer_id;
-    values_out[5] = params.expert_id;
-    values_out[6] = params.role;
-    values_out[7] = params.flags;
-    values_out[8] = params.state;
-    values_out[9] = params.priority;
-    values_out[10] = params.last_access_epoch;
+    values_out[3] = params.state;
     return 1;
 }
 
@@ -7976,18 +7921,10 @@ int uvm_driver_phase_n_reclaim_pool(uint32_t pool,
 }
 
 int uvm_driver_phase_n_update_region_state(uint64_t region_id,
-                                           uint32_t state,
-                                           uint32_t flags_set,
-                                           uint32_t flags_clear,
-                                           uint32_t priority,
-                                           uint64_t last_access_epoch) {
+                                           uint32_t state) {
     return uvm_driver_phase_n_update_region_state_internal(
         region_id,
-        state,
-        flags_set,
-        flags_clear,
-        priority,
-        last_access_epoch);
+        state);
 }
 
 int uvm_driver_phase_n_query_region(uint64_t region_id,

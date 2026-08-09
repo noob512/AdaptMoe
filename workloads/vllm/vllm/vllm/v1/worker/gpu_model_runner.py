@@ -54,6 +54,10 @@ from vllm.device_allocator.uvm_kv_init_probe import (
     record_kv_init_probe_event,
     synchronize_kv_init_probe_tensor,
 )
+from vllm.device_allocator.uvm_pool_residency import (
+    commit_uvm_regions_gpu_placement,
+    prepare_uvm_regions_for_gpu_placement,
+)
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -4976,35 +4980,68 @@ class GPUModelRunner(
         old_target_blocks: int,
         new_target_blocks: int,
         reason: str = "adaptive_runtime",
+        reconciliation_block_ids: list[int] | tuple[int, ...] | None = None,
+        plan_token: str = "",
     ) -> dict[str, Any]:
-        """Physically migrate a KV target delta in the worker process."""
+        """Physically converge an exact worker-coordinated KV resize plan."""
         kv_cache_config = getattr(self, "kv_cache_config", None)
         if kv_cache_config is None:
-            return {"ok": False, "reason": "kv_cache_not_initialized"}
+            return {
+                "ok": False,
+                "reason": "kv_cache_not_initialized",
+                "made_progress": False,
+                "requested_block_ids": [],
+                "requested_cpu_block_ids": [],
+                "requested_gpu_block_ids": [],
+                "completed_block_ids": [],
+                "completed_cpu_block_ids": [],
+                "completed_gpu_block_ids": [],
+                "synchronized": False,
+                "plan_token": str(plan_token),
+            }
         total_blocks = max(int(kv_cache_config.num_blocks) - 1, 0)
         old_target = min(max(int(old_target_blocks), 0), total_blocks)
         new_target = min(max(int(new_target_blocks), 0), total_blocks)
-        if old_target == new_target:
+        first_block = min(old_target, new_target) + 1
+        last_block = max(old_target, new_target)
+        target_delta_ids = set(range(first_block, last_block + 1))
+        requested_block_ids = sorted(
+            target_delta_ids
+            | {
+                int(block_id)
+                for block_id in (reconciliation_block_ids or ())
+                if 0 < int(block_id) <= total_blocks
+            }
+        )
+        requested_cpu_block_ids = [
+            block_id
+            for block_id in requested_block_ids
+            if block_id > new_target
+        ]
+        requested_gpu_block_ids = [
+            block_id
+            for block_id in requested_block_ids
+            if block_id <= new_target
+        ]
+        result_base: dict[str, Any] = {
+            "old_target_blocks": old_target,
+            "new_target_blocks": new_target,
+            "block_count": len(requested_block_ids),
+            "requested_block_ids": requested_block_ids,
+            "requested_cpu_block_ids": requested_cpu_block_ids,
+            "requested_gpu_block_ids": requested_gpu_block_ids,
+            "plan_token": str(plan_token),
+        }
+        if not requested_block_ids:
             return {
                 "ok": True,
                 "reason": "already_at_target",
-                "old_target_blocks": old_target,
-                "new_target_blocks": new_target,
-            }
-
-        direction = "grow" if new_target > old_target else "shrink"
-        first_block = min(old_target, new_target) + 1
-        last_block = max(old_target, new_target)
-        block_ids = list(range(first_block, last_block + 1))
-        ranges = collect_uvm_kv_cache_physical_ranges_for_blocks(block_ids)
-        if not ranges:
-            return {
-                "ok": False,
-                "reason": "no_registered_ranges",
-                "direction": direction,
-                "old_target_blocks": old_target,
-                "new_target_blocks": new_target,
-                "block_count": len(block_ids),
+                "made_progress": False,
+                **result_base,
+                "completed_block_ids": [],
+                "completed_cpu_block_ids": [],
+                "completed_gpu_block_ids": [],
+                "synchronized": True,
             }
 
         executor = os.environ.get(
@@ -5012,54 +5049,142 @@ class GPUModelRunner(
             "auto",
         ).strip().lower()
         start = time.monotonic()
-        if direction == "grow":
-            device = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
-            successes, executor_used, driver_result = (
-                batch_prefetch_ranges_to_device_with_executor(
-                    ranges,
-                    device,
-                    executor=executor,
-                )
-            )
-            if os.environ.get(
-                "VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_SYNC", "1"
-            ).strip().lower() in ("1", "true", "yes", "on"):
-                torch.cuda.synchronize(device)
-            result_fields: dict[str, Any] = {"driver_result": driver_result}
-        else:
-            successes, executor_used, advise_result, prefetch_result = (
-                batch_offload_ranges_to_cpu_with_executor(
-                    ranges,
-                    sync=True,
-                    executor=executor,
-                )
-            )
-            result_fields = {
-                "driver_advise_result": advise_result,
-                "driver_prefetch_result": prefetch_result,
-            }
+        device = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
+        made_progress = False
+        completed_cpu_block_ids: list[int] = []
+        completed_gpu_block_ids: list[int] = []
+        direction_results: list[dict[str, Any]] = []
+        failure_reason = ""
+        synchronized = True
 
-        complete = int(successes) == len(ranges)
+        for direction, block_ids in (
+            ("shrink", requested_cpu_block_ids),
+            ("grow", requested_gpu_block_ids),
+        ):
+            if not block_ids:
+                continue
+            ranges = collect_uvm_kv_cache_physical_ranges_for_blocks(block_ids)
+            if not ranges:
+                failure_reason = "no_registered_ranges"
+                direction_results.append(
+                    {
+                        "direction": direction,
+                        "ok": False,
+                        "reason": failure_reason,
+                        "block_ids": list(block_ids),
+                        "made_progress": False,
+                        "synchronized": False,
+                    }
+                )
+                synchronized = False
+                break
+
+            try:
+                if direction == "grow":
+                    successes, executor_used, driver_result = (
+                        batch_prefetch_ranges_to_device_with_executor(
+                            ranges,
+                            device,
+                            executor=executor,
+                        )
+                    )
+                    debug_result: dict[str, Any] = {
+                        "driver_result": driver_result
+                    }
+                else:
+                    successes, executor_used, advise_result, prefetch_result = (
+                        batch_offload_ranges_to_cpu_with_executor(
+                            ranges,
+                            sync=True,
+                            executor=executor,
+                        )
+                    )
+                    debug_result = {
+                        "driver_advise_result": advise_result,
+                        "driver_prefetch_result": prefetch_result,
+                    }
+                success_count = int(successes)
+                group_made_progress = success_count > 0
+                made_progress = made_progress or group_made_progress
+                group_synchronized = not group_made_progress
+                if group_made_progress:
+                    if not torch.cuda.is_available():
+                        raise RuntimeError(
+                            "CUDA unavailable during worker KV resize sync"
+                        )
+                    # Completion IDs are only valid after an explicit worker
+                    # synchronization, independently of debug/env settings.
+                    torch.cuda.synchronize(device)
+                    group_synchronized = True
+                complete = success_count == len(ranges)
+                group_reason = "complete" if complete else "partial"
+            except Exception:
+                logger.warning(
+                    "Worker KV resize %s failed",
+                    direction,
+                    exc_info=True,
+                )
+                complete = False
+                group_reason = "migration_or_sync_exception"
+                # Submission may have happened before an exception surfaced.
+                made_progress = True
+                group_made_progress = True
+                success_count = 0
+                executor_used = executor
+                debug_result = {}
+                group_synchronized = False
+
+            group_result: dict[str, Any] = {
+                "direction": direction,
+                "ok": complete,
+                "reason": group_reason,
+                "block_ids": list(block_ids),
+                "made_progress": group_made_progress,
+                "synchronized": group_synchronized,
+            }
+            synchronized = synchronized and group_synchronized
+            if self._env_flag_enabled(
+                "VLLM_UVM_KV_DYNAMIC_POOL_DEBUG_RECORDS_ENABLE",
+                default=False,
+            ):
+                group_result.update(
+                    {
+                        "range_count": len(ranges),
+                        "range_bytes": sum(size for _, size in ranges),
+                        "successes": success_count,
+                        "executor": executor_used,
+                        **debug_result,
+                    }
+                )
+            direction_results.append(group_result)
+            if not complete:
+                failure_reason = group_reason
+                break
+            if direction == "shrink":
+                completed_cpu_block_ids.extend(block_ids)
+            else:
+                completed_gpu_block_ids.extend(block_ids)
+
+        completed_block_ids = sorted(
+            completed_cpu_block_ids + completed_gpu_block_ids
+        )
+        complete = not failure_reason and completed_block_ids == requested_block_ids
         result = {
             "ok": complete,
-            "reason": "complete" if complete else "partial",
-            "direction": direction,
-            "old_target_blocks": old_target,
-            "new_target_blocks": new_target,
-            "block_count": len(block_ids),
+            "reason": "complete" if complete else failure_reason,
+            "made_progress": made_progress,
+            **result_base,
+            "completed_block_ids": completed_block_ids,
+            "completed_cpu_block_ids": sorted(completed_cpu_block_ids),
+            "completed_gpu_block_ids": sorted(completed_gpu_block_ids),
+            "direction_results": direction_results,
+            "synchronized": synchronized,
         }
         if self._env_flag_enabled(
             "VLLM_UVM_KV_DYNAMIC_POOL_DEBUG_RECORDS_ENABLE",
             default=False,
         ):
-            result.update({
-                "range_count": len(ranges),
-                "range_bytes": sum(size for _, size in ranges),
-                "successes": int(successes),
-                "executor": executor_used,
-                "elapsed_seconds": time.monotonic() - start,
-                **result_fields,
-            })
+            result["elapsed_seconds"] = time.monotonic() - start
         return result
 
     def load_model(self, eep_scale_up: bool = False) -> None:
@@ -6327,7 +6452,7 @@ class GPUModelRunner(
                 self._log_model_weight_addresses("after_profile_run")
 
     def run_uvm_init_time_weight_placement(self) -> None:
-        """Run the explicit ExpertRecord Stage-M release pass."""
+        """Finalize cold and Hot Expert placement after model warmup."""
         started = time.monotonic()
         matched_issued = self._run_uvm_matched_cpu_offload_manifest()
         if not self._env_flag_enabled(
@@ -6337,21 +6462,118 @@ class GPUModelRunner(
             return
         if getattr(self, "_uvm_init_weight_placement_done", False):
             return
-        self._uvm_init_weight_placement_done = True
 
         issued_modules = 0
-        with uvm_enabled_allocation_phase("enabled:init_weight_offload"):
-            for module in self.get_model().modules():
-                init_offload = getattr(module, "run_uvm_init_weight_offload", None)
-                if callable(init_offload):
+        expert_modules: list[Any] = []
+        hot_modules: list[Any] = []
+        hot_region_ids: list[str] = []
+        hot_executors: set[str] = set()
+        try:
+            # Complete every module's cold release before submitting any Hot
+            # Expert prefetch.  This establishes the final HBM layout first.
+            with uvm_enabled_allocation_phase("enabled:init_weight_offload"):
+                for module in self.get_model().modules():
+                    init_offload = getattr(
+                        module, "run_uvm_init_weight_offload", None
+                    )
+                    if not callable(init_offload):
+                        continue
                     init_offload()
                     issued_modules += 1
+                    expert_modules.append(module)
 
-        if (
-            self._env_flag_enabled("VLLM_UVM_INIT_WEIGHT_SYNC", default=True)
-            and torch.cuda.is_available()
-        ):
-            torch.cuda.synchronize()
+                # Only inspect survivors after every module has completed its
+                # cold release pass.
+                for module in expert_modules:
+                    collect_hot = getattr(
+                        module, "get_uvm_init_hot_expert_region_ids", None
+                    )
+                    if not callable(collect_hot):
+                        continue
+                    module_region_ids = [
+                        str(region_id) for region_id in collect_hot()
+                    ]
+                    if not module_region_ids:
+                        continue
+                    mark_hot = getattr(
+                        module, "set_uvm_init_hot_expert_state", None
+                    )
+                    if not callable(mark_hot):
+                        raise RuntimeError(
+                            "Hot Expert module cannot commit aggregate state"
+                        )
+                    hot_modules.append(module)
+                    hot_region_ids.extend(module_region_ids)
+                    hot_executors.add(
+                        str(getattr(module, "uvm_weight_executor", "auto"))
+                    )
+
+            hot_region_ids = list(dict.fromkeys(hot_region_ids))
+            if hot_region_ids:
+                if len(hot_executors) != 1:
+                    raise RuntimeError(
+                        "Hot Expert modules selected incompatible UVM executors: "
+                        f"{sorted(hot_executors)!r}"
+                    )
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "CUDA is unavailable for final Hot Expert placement"
+                    )
+
+                device = int(torch.cuda.current_device())
+                for module in hot_modules:
+                    module.set_uvm_init_hot_expert_state("prefetching_gpu")
+
+                prepare_result = prepare_uvm_regions_for_gpu_placement(
+                    hot_region_ids,
+                    device=device,
+                    executor=next(iter(hot_executors)),
+                )
+                if not bool(prepare_result.get("ok")):
+                    raise RuntimeError(
+                        "Failed to prefetch all Hot Expert regions: "
+                        f"{prepare_result!r}"
+                    )
+
+                # This is the sole synchronization point for the aggregate
+                # Hot batch.  GPU state is forbidden before it succeeds.
+                torch.cuda.synchronize(device)
+                commit_result = commit_uvm_regions_gpu_placement(
+                    hot_region_ids,
+                    synchronized=True,
+                )
+                if not bool(commit_result.get("ok")):
+                    raise RuntimeError(
+                        "Failed to commit Hot Expert GPU placement: "
+                        f"{commit_result!r}"
+                    )
+                for module in hot_modules:
+                    module.set_uvm_init_hot_expert_state("gpu")
+            elif (
+                self._env_flag_enabled(
+                    "VLLM_UVM_INIT_WEIGHT_SYNC", default=True
+                )
+                and torch.cuda.is_available()
+            ):
+                # Preserve synchronization for an all-cold/legacy placement,
+                # while never adding a second sync to the Hot path above.
+                torch.cuda.synchronize()
+
+            self._uvm_init_weight_placement_done = True
+        except Exception:
+            if hot_region_ids:
+                commit_uvm_regions_gpu_placement(
+                    hot_region_ids,
+                    synchronized=False,
+                )
+            for module in hot_modules:
+                module.set_uvm_init_hot_expert_state("unknown")
+            self._uvm_init_weight_placement_done = False
+            logger.warning(
+                "Failed to finalize explicit Expert placement", exc_info=True
+            )
+            raise
+
         if issued_modules:
             logger.info(
                 "Stage M explicit expert placement visited %d MoE modules.",

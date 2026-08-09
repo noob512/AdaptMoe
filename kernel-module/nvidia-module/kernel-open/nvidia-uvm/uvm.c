@@ -582,9 +582,9 @@ static void uvm_expert_reserved_prefetch_fill_entry_from_region(UVM_EXPERT_RESER
 {
     entry->resolved_base = region->base;
     entry->resolved_bytes = bytes;
-    entry->layer_id = region->layer_id;
-    entry->expert_id = region->expert_id;
-    entry->role = region->role;
+    entry->layer_id = 0;
+    entry->expert_id = 0;
+    entry->role = 0;
 }
 
 static NV_STATUS uvm_expert_reserved_prefetch_resolve_entry_locked(uvm_va_space_t *va_space,
@@ -641,10 +641,10 @@ static NV_STATUS uvm_expert_reserved_prefetch_resolve_entry_locked(uvm_va_space_
                               region->base + bytes,
                               region->length,
                               bytes,
-                              region->layer_id,
-                              region->expert_id,
-                              region->role,
-                              region->flags,
+                              0,
+                              0,
+                              0,
+                              0,
                               va_space);
     }
 
@@ -705,9 +705,9 @@ static NV_STATUS uvm_expert_reserved_prefetch_resolve_entry_locked(uvm_va_space_
         slot->owner_va_base = region->base;
         slot->owner_bytes = bytes;
         slot->owner_slot_offset = entry->slot_offset;
-        slot->owner_layer_id = region->layer_id;
-        slot->owner_expert_id = region->expert_id;
-        slot->owner_role = region->role;
+        slot->owner_layer_id = 0;
+        slot->owner_expert_id = 0;
+        slot->owner_role = 0;
         slot->state = UVM_EXPERT_RESERVED_POOL_SLOT_ASSIGNED;
         slot->epoch = ++g_uvm_expert_reserved_pool_current_epoch;
         slot->owner_epoch = slot->epoch;
@@ -721,9 +721,9 @@ static NV_STATUS uvm_expert_reserved_prefetch_resolve_entry_locked(uvm_va_space_
                               region->base + bytes,
                               bytes,
                               entry->slot_offset,
-                              region->layer_id,
-                              region->expert_id,
-                              region->role,
+                              0,
+                              0,
+                              0,
                               slot->physical_bytes,
                               slot->epoch);
     }
@@ -1002,6 +1002,13 @@ static NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_release_locked(uvm_v
                                                                            NvU64 base,
                                                                            NvU64 bytes);
 
+/*
+ * The old Phase-N pool policy selected victims and classified ranges in the
+ * kernel using pool/role/flag metadata. Explicit regions deliberately carry
+ * no such metadata, so keep the historical implementation out of the build.
+ * Selection, protection, and budget policy now live in userspace.
+ */
+#if 0
 static int uvm_phase_n_auto_reclaim_enable __read_mostly = 0;
 module_param(uvm_phase_n_auto_reclaim_enable, int, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_phase_n_auto_reclaim_enable,
@@ -3756,6 +3763,8 @@ static void uvm_phase_n_sync_region_residency_state(uvm_va_space_t *va_space,
     uvm_va_space_up_write(va_space);
 }
 
+#endif
+
 static void uvm_phase_n_copy_region_to_query(uvm_phase_f_region_t *region,
                                              UVM_PHASE_N_QUERY_REGION_PARAMS *params,
                                              NvU32 found_by_va)
@@ -5443,13 +5452,8 @@ out:
 
 static bool uvm_phase_f_managed_range_is_expert_weight(uvm_va_range_managed_t *managed_range)
 {
-    const uvm_phase_n_range_tag_t *tag = &managed_range->phase_n_tag;
-
-    return tag->valid &&
-           !tag->mixed &&
-           tag->pool == UVM_PHASE_N_POOL_WEIGHT &&
-           (tag->role == UVM_PHASE_N_ROLE_MOE_EXPERT_W13 ||
-            tag->role == UVM_PHASE_N_ROLE_MOE_EXPERT_W2);
+    /* The caller already supplied an explicit VA range/region id. */
+    return managed_range != NULL;
 }
 
 static NV_STATUS uvm_phase_f_expert_read_dup_fast(const NvProcessorUuid *gpu_uuid,
@@ -6451,7 +6455,7 @@ static NV_STATUS uvm_phase_f_expert_read_dup_fast_batch_regions(const NvProcesso
         goto out;
     }
 
-    if (uvm_phase_n_expert_migrate_single_va_range_batch_enable) {
+    if (false) {
         NV_STATUS fast_status = NV_OK;
 
         for (range_index = 0; range_index < params->count; ++range_index) {
@@ -6526,7 +6530,7 @@ static NV_STATUS uvm_phase_f_expert_read_dup_fast_batch_regions(const NvProcesso
                                                                               &batch_tracker,
                                                                               involved_processors);
     }
-    else if (uvm_phase_n_expert_migrate_batch_skip_revalidate_enable) {
+    else if (false) {
         status = uvm_va_block_expert_promote_read_duplicate_batch_trusted(va_space,
                                                                           mm,
                                                                           gpu,
@@ -6703,16 +6707,7 @@ static NV_STATUS uvm_api_phase_f_register_region(UVM_PHASE_F_REGISTER_REGION_PAR
     region->region_id = params->region.region_id;
     region->base = params->region.base;
     region->length = params->region.length;
-    // Legacy Phase-N internals still share this allocation, but explicit
-    // registration never assigns them business semantics.
-    region->pool = UVM_PHASE_N_POOL_UNKNOWN;
-    region->layer_id = 0;
-    region->expert_id = 0;
-    region->role = 0;
-    region->flags = 0;
     region->state = UVM_PHASE_N_REGION_STATE_UNKNOWN;
-    region->priority = 0;
-    region->last_access_epoch = 0;
     region->va_node.start = region->base;
     region->va_node.end = region->base + region->length - 1;
 
@@ -6779,17 +6774,18 @@ static void uvm_phase_f_update_region_state_after_action(uvm_va_space_t *va_spac
     NvU32 new_state;
     uvm_phase_f_region_t *region;
 
-    if (status != NV_OK)
-        return;
-
     if (action == UVM_PHASE_F_ACTION_PREFETCH_GPU) {
-        new_state = async ? UVM_PHASE_N_REGION_STATE_PREFETCHING_GPU :
-                            UVM_PHASE_N_REGION_STATE_GPU;
+        new_state = status == NV_OK ?
+                        (async ? UVM_PHASE_N_REGION_STATE_PREFETCHING_GPU :
+                                 UVM_PHASE_N_REGION_STATE_GPU) :
+                        UVM_PHASE_N_REGION_STATE_UNKNOWN;
     }
     else if (action == UVM_PHASE_F_ACTION_PREFETCH_CPU ||
              action == UVM_PHASE_F_ACTION_PREFETCH_CPU_NO_MAP) {
-        new_state = async ? UVM_PHASE_N_REGION_STATE_PREFETCHING_CPU :
-                            UVM_PHASE_N_REGION_STATE_CPU;
+        new_state = status == NV_OK ?
+                        (async ? UVM_PHASE_N_REGION_STATE_PREFETCHING_CPU :
+                                 UVM_PHASE_N_REGION_STATE_CPU) :
+                        UVM_PHASE_N_REGION_STATE_UNKNOWN;
     }
     else {
         return;
@@ -6800,6 +6796,36 @@ static void uvm_phase_f_update_region_state_after_action(uvm_va_space_t *va_spac
     if (region)
         region->state = new_state;
     uvm_va_space_up_write(va_space);
+}
+
+static bool uvm_phase_f_region_action_is_idempotent(NvU32 action,
+                                                     NvU32 state)
+{
+    if (action == UVM_PHASE_F_ACTION_PREFETCH_GPU)
+        return state == UVM_PHASE_N_REGION_STATE_GPU;
+
+    if (action == UVM_PHASE_F_ACTION_PREFETCH_CPU)
+        return state == UVM_PHASE_N_REGION_STATE_CPU;
+
+    return false;
+}
+
+static void uvm_phase_f_result_set_idempotent(UVM_PHASE_F_RANGE_RESULT *result,
+                                               NvU32 action,
+                                               NvU64 length)
+{
+    uvm_phase_f_result_init(result, length);
+    result->resident_on_count = 1;
+    result->resident_any_bytes = length;
+
+    if (action == UVM_PHASE_F_ACTION_PREFETCH_GPU) {
+        result->resident_on_gpu = NV_TRUE;
+        result->resident_gpu_bytes = length;
+    }
+    else {
+        result->resident_on_cpu = NV_TRUE;
+        result->resident_cpu_bytes = length;
+    }
 }
 
 static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS *params, struct file *filp)
@@ -6841,6 +6867,8 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
         uvm_phase_f_region_t *region;
         NvU64 base = 0;
         NvU64 length = 0;
+        NvU32 state = UVM_PHASE_N_REGION_STATE_UNKNOWN;
+        bool idempotent = false;
         NV_STATUS status = NV_OK;
 
         params->results[i].status = NV_OK;
@@ -6862,6 +6890,7 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
             if (region) {
                 base = region->base;
                 length = region->length;
+                state = region->state;
             }
             uvm_va_space_up_read(va_space);
 
@@ -6870,6 +6899,14 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
         }
 
         if (status == NV_OK) {
+            idempotent = uvm_phase_f_region_action_is_idempotent(params->action, state);
+            if (idempotent) {
+                uvm_phase_f_result_set_idempotent(&params->results[i],
+                                                   params->action,
+                                                   length);
+                goto note_status;
+            }
+
             uvm_phase_f_route_log("phase_f_policy_batch_region_entry index=%u action=%u region=%llu base=0x%llx end=0x%llx length=%llu async=%u\n",
                                   i,
                                   params->action,
@@ -6895,6 +6932,7 @@ static NV_STATUS uvm_api_phase_f_batch_regions(UVM_PHASE_F_BATCH_REGIONS_PARAMS 
             params->results[i].status = status;
         }
 
+note_status:
         uvm_phase_f_note_status(status,
                                 &params->success_count,
                                 &params->failure_count,
@@ -11046,45 +11084,27 @@ static void uvm_expert_offload_release_zero(UVM_EXPERT_OFFLOAD_RELEASE_PARAMS *p
     params->max_blocks = max_blocks;
 }
 
+static void uvm_expert_offload_release_record_failure(UVM_EXPERT_OFFLOAD_RELEASE_PARAMS *params,
+                                                       NvU64 failed_address,
+                                                       NvU64 failed_bytes,
+                                                       NV_STATUS status)
+{
+    ++params->failure_blocks;
+    params->failed_bytes += failed_bytes;
+
+    if (params->first_error == NV_OK) {
+        params->first_error = status;
+        params->first_failed_block = failed_address;
+    }
+}
+
 static void uvm_expert_offload_release_finish_phase_n_block(uvm_va_space_t *va_space,
                                                             uvm_va_block_t *block,
                                                             const uvm_phase_f_region_t *region)
 {
-    uvm_phase_n_block_pool_t *block_pool;
-    unsigned long irq_flags;
-    NvU32 pool;
-
-    uvm_assert_rwsem_locked_write(&va_space->lock);
-
-    if (!block->phase_n.tag_valid ||
-        block->phase_n.region_id != region->region_id ||
-        !uvm_phase_n_valid_tagged_pool(block->phase_n.pool)) {
-        return;
-    }
-
-    pool = block->phase_n.pool;
-    block_pool = &va_space->phase_n_block_pools[pool];
-
-    spin_lock_irqsave(&va_space->phase_n_native_block_pool_locks[pool], irq_flags);
-
-    block->phase_n.in_reclaim = NV_FALSE;
-    block->phase_n.gpu_resident_pending = NV_FALSE;
-
-    if (block->phase_n.queued) {
-        list_del_init(&block->phase_n.queue_node);
-        block->phase_n.queued = NV_FALSE;
-    }
-
-    if (block->phase_n.gpu_resident) {
-        block->phase_n.gpu_resident = NV_FALSE;
-        block->phase_n.resident_epoch = 0;
-        if (block_pool->resident_blocks > 0)
-            --block_pool->resident_blocks;
-    }
-
-    uvm_phase_n_update_block_pressure(va_space, pool, block_pool);
-
-    spin_unlock_irqrestore(&va_space->phase_n_native_block_pool_locks[pool], irq_flags);
+    (void)va_space;
+    (void)block;
+    (void)region;
 }
 
 static NV_STATUS uvm_expert_offload_release_block(uvm_va_space_t *va_space,
@@ -11151,7 +11171,7 @@ static NV_STATUS uvm_expert_offload_release_subchunk_block(uvm_va_space_t *va_sp
                                                            const uvm_phase_f_region_t *region,
                                                            UVM_EXPERT_OFFLOAD_RELEASE_PARAMS *params)
 {
-    NvU64 region_end = uvm_phase_n_range_end(region->base, region->length);
+    NvU64 region_end = region->base + region->length - 1;
     NvU64 release_start = max(region->base, block->start);
     NvU64 release_end = min(region_end, block->end);
     uvm_va_block_region_t block_region;
@@ -11270,6 +11290,8 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
     uvm_va_block_context_t *block_context = NULL;
     NvU64 region_end;
     NvU64 addr;
+    bool placement_complete = false;
+    bool remote_map_only = false;
     NV_STATUS status = NV_OK;
 
     if (params->flags & ~(UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT |
@@ -11307,12 +11329,19 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
     params->base = region->base;
     params->length = region->length;
 
-    if (region->state == UVM_PHASE_N_REGION_STATE_CPU)
-        goto done_unlock;
-    if (region->state == UVM_PHASE_N_REGION_STATE_UNKNOWN) {
-        status = NV_ERR_INVALID_STATE;
-        goto done_unlock;
+    if (region->state == UVM_PHASE_N_REGION_STATE_CPU) {
+        if (!(params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ)) {
+            placement_complete = true;
+            goto done_unlock;
+        }
+
+        /* CPU placement does not prove that GPU remote-read PTEs exist. Avoid
+         * re-running the release primitive, which rejects already-installed
+         * remote PTEs, and instead establish and validate those PTEs below. */
+        remote_map_only = true;
     }
+    /* UNKNOWN is not an idempotent success, but it is safe to converge by
+     * executing the explicitly requested release. */
     region->state = UVM_PHASE_N_REGION_STATE_PREFETCHING_CPU;
 
     if (region->length == 0) {
@@ -11320,7 +11349,7 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
         goto done_unlock;
     }
 
-    region_end = uvm_phase_n_range_end(region->base, region->length);
+    region_end = region->base + region->length - 1;
     if (region_end < region->base) {
         status = NV_ERR_INVALID_ARGUMENT;
         goto done_unlock;
@@ -11343,15 +11372,25 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
         size_t block_index;
         NvU64 managed_start;
         NvU64 managed_end;
-        NvU64 next;
+        NvU64 covered_end;
 
-        if (!va_range)
+        if (!va_range) {
+            uvm_expert_offload_release_record_failure(params,
+                                                       addr,
+                                                       region_end - addr + 1,
+                                                       NV_ERR_INVALID_ADDRESS);
             break;
+        }
 
-        next = va_range->node.end == ULLONG_MAX ? ULLONG_MAX : va_range->node.end + 1;
+        covered_end = min(region_end, va_range->node.end);
         managed_range = uvm_va_range_to_managed_or_null(va_range);
-        if (!managed_range)
+        if (!managed_range) {
+            uvm_expert_offload_release_record_failure(params,
+                                                       addr,
+                                                       covered_end - addr + 1,
+                                                       NV_ERR_INVALID_ADDRESS);
             goto next_range;
+        }
 
         managed_start = max(region->base, managed_range->va_range.node.start);
         managed_end = min(region_end, managed_range->va_range.node.end);
@@ -11380,12 +11419,24 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
                                                                min(region_end, block->end));
 
             if (params->max_blocks != 0 &&
-                params->attempted_blocks >= params->max_blocks) {
+                params->block_count > params->max_blocks) {
                 ++params->skipped_blocks;
+                uvm_expert_offload_release_record_failure(params,
+                                                           block->start +
+                                                               (NvU64)block_region.first * PAGE_SIZE,
+                                                           uvm_va_block_region_size(block_region),
+                                                           NV_ERR_INSUFFICIENT_RESOURCES);
                 continue;
             }
 
-            if (params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K) {
+            if (remote_map_only) {
+                block_status = uvm_expert_offload_remote_map_block(gpu,
+                                                                   block,
+                                                                   block_context,
+                                                                   block_region,
+                                                                   params);
+            }
+            else if (params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K) {
                 block_status = uvm_expert_offload_release_subchunk_block(va_space,
                                                                          mm,
                                                                          gpu,
@@ -11411,7 +11462,8 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
                                                                 params);
             }
 
-            if ((params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ) &&
+            if (!remote_map_only &&
+                (params->flags & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ) &&
                 (block_status == NV_OK || block_status == NV_WARN_NOTHING_TO_DO)) {
                 block_status = uvm_expert_offload_remote_map_block(gpu,
                                                                    block,
@@ -11426,16 +11478,24 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
         }
 
 next_range:
-        if (next == ULLONG_MAX || next == 0)
+        if (covered_end == region_end) {
+            placement_complete = true;
             break;
-        addr = next;
+        }
+
+        addr = covered_end + 1;
     }
 
 done_unlock:
+    if (status == NV_OK && !placement_complete) {
+        status = params->first_error != NV_OK ?
+                 params->first_error :
+                 NV_ERR_INVALID_ADDRESS;
+    }
     if (status == NV_OK && params->first_error != NV_OK)
         status = params->first_error;
     if (region) {
-        region->state = status == NV_OK ?
+        region->state = status == NV_OK && placement_complete ?
                         UVM_PHASE_N_REGION_STATE_CPU :
                         UVM_PHASE_N_REGION_STATE_UNKNOWN;
     }
@@ -12201,6 +12261,7 @@ done:
     return status;
 }
 
+#if 0
 static NV_STATUS uvm_api_phase_n_set_pool_budget(UVM_PHASE_N_SET_POOL_BUDGET_PARAMS *params, struct file *filp)
 {
     uvm_va_space_t *va_space = uvm_va_space_get(filp);
@@ -12848,15 +12909,8 @@ static NV_STATUS uvm_api_phase_n_query_region(UVM_PHASE_N_QUERY_REGION_PARAMS *p
 
     params->base = 0;
     params->length = 0;
-    params->pool = 0;
-    params->layer_id = 0;
-    params->expert_id = 0;
-    params->role = 0;
-    params->flags = 0;
     params->state = 0;
-    params->priority = 0;
     params->found_by_va = 0;
-    params->last_access_epoch = 0;
 
     uvm_va_space_down_read(va_space);
     region = radix_tree_lookup(&va_space->phase_f_regions, params->region_id);
@@ -12882,15 +12936,8 @@ static NV_STATUS uvm_api_phase_n_query_region_by_va(UVM_PHASE_N_QUERY_REGION_BY_
     params->region_id = 0;
     params->base = 0;
     params->length = 0;
-    params->pool = 0;
-    params->layer_id = 0;
-    params->expert_id = 0;
-    params->role = 0;
-    params->flags = 0;
     params->state = 0;
-    params->priority = 0;
     params->found_by_va = 0;
-    params->last_access_epoch = 0;
 
     uvm_va_space_down_read(va_space);
     node = uvm_range_tree_find(&va_space->phase_f_region_ranges, params->address);
@@ -14497,6 +14544,136 @@ NV_STATUS uvm_phase_n_reclaim_pool_over_budget(uvm_va_space_t *va_space,
     params.async = async;
 
     return uvm_phase_n_reclaim_pool_execute(va_space, &params);
+}
+
+#endif
+
+static NV_STATUS uvm_api_phase_n_update_region_state(UVM_PHASE_N_UPDATE_REGION_STATE_PARAMS *params,
+                                                      struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_phase_f_region_t *region;
+
+    if (params->region_id == 0 || params->state > UVM_PHASE_N_REGION_STATE_PREFETCHING_GPU)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    uvm_va_space_down_write(va_space);
+    region = radix_tree_lookup(&va_space->phase_f_regions, params->region_id);
+    if (region)
+        region->state = params->state;
+    uvm_va_space_up_write(va_space);
+
+    return region ? NV_OK : NV_ERR_OBJECT_NOT_FOUND;
+}
+
+static NV_STATUS uvm_api_phase_n_query_region(UVM_PHASE_N_QUERY_REGION_PARAMS *params,
+                                               struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_phase_f_region_t *region;
+
+    if (params->region_id == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    params->base = 0;
+    params->length = 0;
+    params->state = UVM_PHASE_N_REGION_STATE_UNKNOWN;
+    params->found_by_va = 0;
+
+    uvm_va_space_down_read(va_space);
+    region = radix_tree_lookup(&va_space->phase_f_regions, params->region_id);
+    if (region)
+        uvm_phase_n_copy_region_to_query(region, params, 0);
+    uvm_va_space_up_read(va_space);
+
+    return region ? NV_OK : NV_ERR_OBJECT_NOT_FOUND;
+}
+
+static NV_STATUS uvm_api_phase_n_query_region_by_va(UVM_PHASE_N_QUERY_REGION_BY_VA_PARAMS *params,
+                                                     struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_phase_f_region_t *region;
+    uvm_range_tree_node_t *node;
+
+    if (params->address == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    params->region_id = 0;
+    params->base = 0;
+    params->length = 0;
+    params->state = UVM_PHASE_N_REGION_STATE_UNKNOWN;
+    params->found_by_va = 0;
+
+    uvm_va_space_down_read(va_space);
+    node = uvm_range_tree_find(&va_space->phase_f_region_ranges, params->address);
+    region = uvm_phase_f_region_from_node(node);
+    if (region)
+        uvm_phase_n_copy_region_to_query_by_va(region, params);
+    uvm_va_space_up_read(va_space);
+
+    return region ? NV_OK : NV_ERR_OBJECT_NOT_FOUND;
+}
+
+NV_STATUS uvm_phase_n_admit_gpu_chunk(uvm_va_space_t *va_space,
+                                      uvm_va_block_t *va_block,
+                                      uvm_va_block_region_t chunk_region,
+                                      uvm_processor_id_t dest_id,
+                                      NvU64 chunk_bytes)
+{
+    return NV_OK;
+}
+
+void uvm_phase_n_abort_gpu_chunk(uvm_va_space_t *va_space,
+                                 uvm_va_block_t *va_block,
+                                 uvm_va_block_region_t chunk_region,
+                                 uvm_processor_id_t dest_id,
+                                 NvU64 chunk_bytes,
+                                 NV_STATUS status,
+                                 const char *reason)
+{
+}
+
+void uvm_phase_n_make_resident_reclaim_hook(uvm_va_space_t *va_space,
+                                             NvU64 address,
+                                             NvU64 length,
+                                             NvU32 gpu_id,
+                                             NvU32 cause,
+                                             NvBool execute_allowed)
+{
+}
+
+void uvm_phase_n_va_block_make_resident_hook(uvm_va_space_t *va_space,
+                                              uvm_va_block_t *va_block,
+                                              uvm_va_block_region_t region,
+                                              uvm_processor_id_t dest_id,
+                                              NvU32 cause,
+                                              NvBool execute_allowed)
+{
+}
+
+void uvm_phase_n_va_block_destroy_hook(uvm_va_block_t *va_block)
+{
+}
+
+NV_STATUS uvm_phase_n_auto_reclaim_outer_hook(uvm_va_space_t *va_space,
+                                               NvU64 address,
+                                               NvU64 length,
+                                               NvU32 gpu_id,
+                                               NvU32 cause)
+{
+    return NV_OK;
+}
+
+NV_STATUS uvm_phase_n_reclaim_pool_over_budget(uvm_va_space_t *va_space,
+                                                NvU32 pool,
+                                                NvU32 gpu_id,
+                                                NvU64 current_epoch,
+                                                NvU64 cooldown_epochs,
+                                                NvU32 max_victims,
+                                                NvBool async)
+{
+    return NV_ERR_NOT_SUPPORTED;
 }
 
 static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)

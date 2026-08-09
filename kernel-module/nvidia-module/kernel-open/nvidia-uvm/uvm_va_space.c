@@ -45,9 +45,6 @@
 #include "nv-kthread-q.h"
 #include <linux/mmzone.h>
 
-#define UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W13 3
-#define UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W2 4
-
 static void uvm_phase_f_region_radix_tree_destroy(uvm_va_space_t *va_space)
 {
     uvm_phase_f_region_t *region = NULL;
@@ -67,26 +64,12 @@ bool uvm_va_space_range_has_cpu_offloaded_reserved_expert(uvm_va_space_t *va_spa
                                                           NvU64 base,
                                                           NvU64 length)
 {
-    uvm_range_tree_node_t *node;
-    NvU64 end;
-
     uvm_assert_rwsem_locked(&va_space->lock);
 
-    if (length == 0 || base + length - 1 < base)
-        return false;
-
-    end = base + length - 1;
-    uvm_range_tree_for_each_in(node, &va_space->phase_f_region_ranges, base, end) {
-        uvm_phase_f_region_t *region = container_of(node, uvm_phase_f_region_t, va_node);
-
-        if (region->pool == UVM_PHASE_N_POOL_WEIGHT &&
-            (region->role == UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W13 ||
-             region->role == UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W2) &&
-            (region->flags & UVM_PHASE_N_REGION_FLAG_EXPERT_ENVELOPE) &&
-            (region->flags & UVM_PHASE_N_REGION_FLAG_CPU_OFFLOADED_RESERVED)) {
-            return true;
-        }
-    }
+    // Region registration no longer carries Phase-N pool/role/flags metadata,
+    // so a registered range cannot be classified as a reserved expert here.
+    (void)base;
+    (void)length;
 
     return false;
 }

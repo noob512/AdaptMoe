@@ -128,19 +128,15 @@ module_param(uvm_perf_fault_mmap_lock_yield_interval, uint, S_IRUGO);
 static unsigned uvm_perf_fault_coalesce = 1;
 module_param(uvm_perf_fault_coalesce, uint, S_IRUGO);
 
-#define UVM_PHASE_N_EXPERT_WEIGHT_POOL 2
-#define UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W13 3
-#define UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W2 4
-
 static unsigned uvm_phase_n_expert_fault_readdup_enable = 0;
 module_param(uvm_phase_n_expert_fault_readdup_enable, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_phase_n_expert_fault_readdup_enable,
-                 "Force expert-tagged W13/W2 GPU read faults through read-duplicate service. Default: 0.");
+                 "Deprecated no-op: Expert identity is no longer inferred from Region tags.");
 
 static unsigned uvm_phase_n_expert_fault_fastpath_enable = 0;
 module_param(uvm_phase_n_expert_fault_fastpath_enable, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_phase_n_expert_fault_fastpath_enable,
-                 "Service eligible expert-tagged GPU read faults with a dedicated read-duplicate fast path. Default: 0.");
+                 "Deprecated no-op: Expert identity is no longer inferred from Region tags.");
 
 #define UVM_MANUAL_MIGRATION_FAULT_MODE_OFF       0
 #define UVM_MANUAL_MIGRATION_FAULT_MODE_OBSERVE   1
@@ -155,8 +151,8 @@ MODULE_PARM_DESC(uvm_manual_migration_fault_mode,
 static unsigned uvm_manual_migration_fault_pool_mask = 0;
 module_param(uvm_manual_migration_fault_pool_mask, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_manual_migration_fault_pool_mask,
-                 "Phase-N pool bitmask for manual migration fault mode. "
-                 "0 applies to all managed ranges; otherwise bit N applies to pool N. Default: 0.");
+                 "Legacy Phase-N pool filter. 0 applies to all managed ranges; "
+                 "non-zero masks match no ranges because semantic Region tags are disabled.");
 
 static unsigned uvm_manual_migration_fault_log_enable = 1;
 module_param(uvm_manual_migration_fault_log_enable, uint, S_IRUGO | S_IWUSR);
@@ -165,35 +161,28 @@ MODULE_PARM_DESC(uvm_manual_migration_fault_log_enable,
 
 static bool phase_n_range_tag_is_expert_weight(const uvm_phase_n_range_tag_t *tag)
 {
-    return tag &&
-           tag->valid &&
-           !tag->mixed &&
-           tag->pool == UVM_PHASE_N_EXPERT_WEIGHT_POOL &&
-           (tag->role == UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W13 ||
-            tag->role == UVM_PHASE_N_EXPERT_WEIGHT_ROLE_W2);
+    // Region registration no longer carries pool/role metadata. Faults must
+    // use the generic service path instead of inferring an Expert fast path.
+    (void)tag;
+    return false;
 }
 
 static bool phase_n_range_tag_is_cpu_offloaded_reserved_expert(const uvm_phase_n_range_tag_t *tag)
 {
-    return phase_n_range_tag_is_expert_weight(tag) &&
-           (tag->flags & UVM_PHASE_N_REGION_FLAG_CPU_OFFLOADED_RESERVED);
+    // Reserved/offloaded status is now an application-side decision expressed
+    // through explicit Region operations, not persistent range-tag flags.
+    (void)tag;
+    return false;
 }
 
 static bool manual_migration_fault_pool_matches(uvm_va_range_managed_t *managed_range)
 {
-    const uvm_phase_n_range_tag_t *tag;
-
     if (!managed_range)
         return false;
 
-    if (uvm_manual_migration_fault_pool_mask == 0)
-        return true;
-
-    tag = &managed_range->phase_n_tag;
-    if (!tag->valid || tag->mixed || tag->pool >= 32)
-        return false;
-
-    return (uvm_manual_migration_fault_pool_mask & (1U << tag->pool)) != 0;
+    // A zero mask remains the generic "all managed ranges" mode. Non-zero
+    // legacy pool filters cannot be resolved without semantic range tags.
+    return uvm_manual_migration_fault_pool_mask == 0;
 }
 
 static bool manual_migration_fault_mode_enabled(void)
@@ -217,7 +206,7 @@ static void manual_migration_fault_log(uvm_gpu_t *gpu,
     if (!uvm_manual_migration_fault_log_enable)
         return;
 
-    uvm_phase_f_route_log("manual_migration_fault mode=%u action=%s fault_addr=0x%llx access=%s gpu_id=%u pid=%d region_id=%llu allocation_id=%llu pool=%u role=%u flags=0x%x tag_valid=%u mixed=%u range_base=0x%llx range_len=%llu\n",
+    uvm_phase_f_route_log("manual_migration_fault mode=%u action=%s fault_addr=0x%llx access=%s gpu_id=%u pid=%d region_id=%llu allocation_id=%llu tag_valid=%u mixed=%u range_base=0x%llx range_len=%llu\n",
                           uvm_manual_migration_fault_mode,
                           block_fault ? "block" : "observe",
                           fault_entry->fault_address,
@@ -226,9 +215,6 @@ static void manual_migration_fault_log(uvm_gpu_t *gpu,
                           task_tgid_nr(current),
                           tag ? tag->region_id : 0,
                           tag ? tag->allocation_id : 0,
-                          tag ? tag->pool : 0,
-                          tag ? tag->role : 0,
-                          tag ? tag->flags : 0,
                           tag ? tag->valid : 0,
                           tag ? tag->mixed : 0,
                           tag ? tag->base : 0,

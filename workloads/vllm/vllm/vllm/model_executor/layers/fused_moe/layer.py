@@ -32,6 +32,7 @@ from vllm.device_allocator.uvm_region import (
     ExpertRecord,
     RegionState,
     compile_expert_envelopes,
+    normalize_region_state,
 )
 from vllm.distributed import (
     get_dp_group,
@@ -2562,19 +2563,59 @@ class FusedMoE(CustomOp):
                     int(base_text, 16),
                     int(length_text, 16),
                 )
-            record.aggregate_state = RegionState.GPU
+            # Registration records geometry, not physical residency.  Final
+            # post-warmup placement is the first operation allowed to commit
+            # survivor experts to GPU.
+            record.aggregate_state = RegionState.UNKNOWN
             records[record.key] = record
 
         for region_id, (base, length) in geometry_by_region.items():
-            registered = register_uvm_region(region_id, base, length, state="gpu")
-            if registered.state != RegionState.GPU:
-                records_for_region = [
-                    record for record in records.values()
-                    if region_id in record.envelope_region_ids
-                ]
-                for record in records_for_region:
-                    record.aggregate_state = RegionState.UNKNOWN
+            try:
+                register_uvm_region(region_id, base, length, state="unknown")
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to register explicit UVM Expert envelope: "
+                    f"layer_id={layer_id}, region_id={region_id!r}, "
+                    f"base=0x{base:x}, length={length}"
+                ) from exc
         self._uvm_expert_records = records
+
+    def _uvm_init_hot_expert_records(self) -> list[ExpertRecord]:
+        """Return records surviving the complete initial cold-release pass."""
+        if (
+            getattr(self, "uvm_init_weight_offload_mode", "trace_only")
+            not in _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES
+        ):
+            return []
+        cold_expert_ids = set(
+            getattr(self, "_uvm_offloaded_global_expert_ids", set())
+        ) | set(getattr(self, "_uvm_remote_read_global_expert_ids", set()))
+        return [
+            record
+            for _, record in sorted(self._uvm_expert_records.items())
+            if record.global_expert_id not in cold_expert_ids
+        ]
+
+    def get_uvm_init_hot_expert_region_ids(self) -> list[str]:
+        """Collect every envelope owned by post-release survivor experts."""
+        return list(
+            dict.fromkeys(
+                region_id
+                for record in self._uvm_init_hot_expert_records()
+                for region_id in record.envelope_region_ids
+            )
+        )
+
+    def set_uvm_init_hot_expert_state(
+        self,
+        state: RegionState | str,
+    ) -> int:
+        """Update survivor aggregate state after the global placement phase."""
+        target = normalize_region_state(state)
+        records = self._uvm_init_hot_expert_records()
+        for record in records:
+            record.aggregate_state = target
+        return len(records)
 
     def _uvm_record_expert_state(
         self,

@@ -1433,11 +1433,6 @@ typedef struct
 {
     NvU64     region_id NV_ALIGN_BYTES(8);  // IN
     NvU32     state;                        // IN
-    NvU32     flags_set;                    // IN
-    NvU32     flags_clear;                  // IN
-    NvU32     priority;                     // IN
-    NvU32     reserved;                     // IN
-    NvU64     last_access_epoch NV_ALIGN_BYTES(8); // IN
     NV_STATUS rmStatus;                     // OUT
 } UVM_PHASE_N_UPDATE_REGION_STATE_PARAMS;
 
@@ -1447,15 +1442,8 @@ typedef struct
     NvU64     region_id NV_ALIGN_BYTES(8);  // IN
     NvU64     base NV_ALIGN_BYTES(8);       // OUT
     NvU64     length NV_ALIGN_BYTES(8);     // OUT
-    NvU32     pool;                         // OUT
-    NvU32     layer_id;                     // OUT
-    NvU32     expert_id;                    // OUT
-    NvU32     role;                         // OUT
-    NvU32     flags;                        // OUT
     NvU32     state;                        // OUT
-    NvU32     priority;                     // OUT
     NvU32     found_by_va;                  // OUT
-    NvU64     last_access_epoch NV_ALIGN_BYTES(8); // OUT
     NV_STATUS rmStatus;                     // OUT
 } UVM_PHASE_N_QUERY_REGION_PARAMS;
 
@@ -1466,15 +1454,8 @@ typedef struct
     NvU64     region_id NV_ALIGN_BYTES(8);  // OUT
     NvU64     base NV_ALIGN_BYTES(8);       // OUT
     NvU64     length NV_ALIGN_BYTES(8);     // OUT
-    NvU32     pool;                         // OUT
-    NvU32     layer_id;                     // OUT
-    NvU32     expert_id;                    // OUT
-    NvU32     role;                         // OUT
-    NvU32     flags;                        // OUT
     NvU32     state;                        // OUT
-    NvU32     priority;                     // OUT
     NvU32     found_by_va;                  // OUT
-    NvU64     last_access_epoch NV_ALIGN_BYTES(8); // OUT
     NV_STATUS rmStatus;                     // OUT
 } UVM_PHASE_N_QUERY_REGION_BY_VA_PARAMS;
 

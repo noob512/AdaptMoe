@@ -60,42 +60,6 @@ static void uvm_phase_f_region_radix_tree_destroy(uvm_va_space_t *va_space)
     }
 }
 
-bool uvm_va_space_range_has_cpu_offloaded_reserved_expert(uvm_va_space_t *va_space,
-                                                          NvU64 base,
-                                                          NvU64 length)
-{
-    uvm_assert_rwsem_locked(&va_space->lock);
-
-    // Region registration no longer carries Phase-N pool/role/flags metadata,
-    // so a registered range cannot be classified as a reserved expert here.
-    (void)base;
-    (void)length;
-
-    return false;
-}
-
-static void uvm_phase_n_block_radix_tree_destroy(uvm_va_space_t *va_space)
-{
-    uvm_phase_n_block_t *block = NULL;
-    struct radix_tree_root *root = &va_space->phase_n_blocks;
-    unsigned long index = 0;
-
-    while (radix_tree_gang_lookup(root, (void **)&block, index, 1)) {
-        unsigned long next_index;
-
-        UVM_ASSERT(block);
-        radix_tree_delete(root, block->radix_key);
-        if (block->queued)
-            list_del(&block->queue_node);
-
-        next_index = block->radix_key + 1;
-        uvm_kvfree(block);
-        if (next_index == 0)
-            break;
-        index = next_index;
-    }
-}
-
 static bool processor_mask_array_test(const uvm_processor_mask_t *mask,
                                       uvm_processor_id_t mask_id,
                                       uvm_processor_id_t id)
@@ -234,7 +198,6 @@ NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va
     NV_STATUS status;
     uvm_va_space_t *va_space = uvm_kvmalloc_zero(sizeof(*va_space));
     uvm_gpu_id_t gpu_id;
-    NvU32 pool;
 
     *va_space_ptr = NULL;
     if (!va_space)
@@ -262,11 +225,6 @@ NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va
     uvm_range_tree_init(&va_space->range_group_ranges);
     INIT_RADIX_TREE(&va_space->phase_f_regions, NV_UVM_GFP_FLAGS);
     uvm_range_tree_init(&va_space->phase_f_region_ranges);
-    INIT_RADIX_TREE(&va_space->phase_n_blocks, NV_UVM_GFP_FLAGS);
-    for (pool = 0; pool < UVM_PHASE_N_POOL_STATE_MAX; ++pool) {
-        INIT_LIST_HEAD(&va_space->phase_n_block_pools[pool].resident_queue);
-        spin_lock_init(&va_space->phase_n_native_block_pool_locks[pool]);
-    }
 
     bitmap_zero(va_space->enabled_peers, UVM_MAX_UNIQUE_GPU_PAIRS);
 
@@ -562,7 +520,6 @@ void uvm_va_space_destroy(uvm_va_space_t *va_space)
     }
 
     uvm_range_group_radix_tree_destroy(va_space);
-    uvm_phase_n_block_radix_tree_destroy(va_space);
     uvm_phase_f_region_radix_tree_destroy(va_space);
 
     // Unregister all GPUs in the VA space. Note that this does not release the

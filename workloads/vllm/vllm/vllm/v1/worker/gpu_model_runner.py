@@ -5,7 +5,6 @@ import gc
 import itertools
 import json
 import os
-import re
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -45,14 +44,9 @@ from vllm.device_allocator.uvm import (
     batch_prefetch_ranges_to_device_with_executor,
     batch_prepare_ranges_for_native_remote_access_with_executor,
     batch_prepare_ranges_for_remote_read_with_executor,
-    driver_batch_query_ranges_residency_bytes,
     probe_driver_capable_range,
     uvm_allocation_phase,
     uvm_enabled_allocation_phase,
-)
-from vllm.device_allocator.uvm_kv_init_probe import (
-    record_kv_init_probe_event,
-    synchronize_kv_init_probe_tensor,
 )
 from vllm.device_allocator.uvm_pool_residency import (
     commit_uvm_regions_gpu_placement,
@@ -66,7 +60,6 @@ from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
     get_tp_group,
-    get_world_group,
     graph_capture,
     is_global_first_rank,
     prepare_communication_buffer_for_model,
@@ -661,14 +654,8 @@ class GPUModelRunner(
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
-        self._layer_timing_hooks: list[Any] = []
-        self._layer_timing_step_id = 0
-        self._layer_timing_context: dict[str, object] = {}
         self.kv_connector_output: KVConnectorOutput | None = None
-        self._logged_weight_ptrs: set[int] = set()
-        self._logged_kv_ptrs: set[int] = set()
-        self._uvm_address_log_prepared = False
-        self._uvm_weight_map_prepared = False
+        self._uvm_init_weight_placement_done = False
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -2889,106 +2876,6 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
-    def _layer_timing_phase(
-        self,
-        num_scheduled_tokens_np: np.ndarray,
-        max_num_scheduled_tokens: int,
-        num_reqs: int,
-    ) -> str:
-        if num_reqs > 0 and (
-            max_num_scheduled_tokens == self.uniform_decode_query_len
-        ) and int(num_scheduled_tokens_np.sum()) == (
-            num_reqs * max_num_scheduled_tokens
-        ):
-            return "decode"
-        if max_num_scheduled_tokens == int(num_scheduled_tokens_np.sum()):
-            return "prefill"
-        return "mixed"
-
-    def _setup_layer_timing_hooks(self) -> None:
-        if os.environ.get("VLLM_LAYER_TIMING_ENABLE", "0") != "1":
-            return
-        if self._layer_timing_hooks:
-            return
-        timing_file = os.environ.get("VLLM_LAYER_TIMING_FILE", "")
-        if not timing_file:
-            logger.warning(
-                "VLLM_LAYER_TIMING_ENABLE=1 but VLLM_LAYER_TIMING_FILE is empty"
-            )
-            return
-        os.makedirs(os.path.dirname(timing_file) or ".", exist_ok=True)
-        pattern_text = os.environ.get(
-            "VLLM_LAYER_TIMING_PATTERN",
-            r"model\.layers\.\d+$|model\.layers\.\d+\.(self_attn|mlp)$",
-        )
-        try:
-            pattern = re.compile(pattern_text)
-        except re.error as exc:
-            logger.warning("Invalid VLLM_LAYER_TIMING_PATTERN=%r: %s",
-                           pattern_text, exc)
-            return
-        sync = os.environ.get("VLLM_LAYER_TIMING_SYNC", "1") == "1"
-        min_ms = float(os.environ.get("VLLM_LAYER_TIMING_MIN_MS", "0") or "0")
-        max_records = int(os.environ.get(
-            "VLLM_LAYER_TIMING_MAX_RECORDS", "0"
-        ) or "0")
-        record_count = 0
-
-        def append_record(record: dict[str, object]) -> None:
-            nonlocal record_count
-            if max_records > 0 and record_count >= max_records:
-                return
-            record_count += 1
-            try:
-                with open(timing_file, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(record, sort_keys=True) + "\n")
-            except OSError as exc:
-                logger.warning("Failed to write layer timing trace %s: %s",
-                               timing_file, exc)
-
-        def pre_hook(module: nn.Module, args: tuple[object, ...]) -> None:
-            if sync and torch.cuda.is_available():
-                torch.cuda.synchronize()
-            stack = getattr(module, "_vllm_layer_timing_stack", None)
-            if stack is None:
-                stack = []
-                setattr(module, "_vllm_layer_timing_stack", stack)
-            stack.append(time.perf_counter_ns())
-
-        def post_hook(
-            module: nn.Module,
-            args: tuple[object, ...],
-            output: object,
-        ) -> None:
-            stack = getattr(module, "_vllm_layer_timing_stack", None)
-            if not stack:
-                return
-            if sync and torch.cuda.is_available():
-                torch.cuda.synchronize()
-            elapsed_ms = (time.perf_counter_ns() - stack.pop()) / 1_000_000.0
-            if elapsed_ms < min_ms:
-                return
-            append_record({
-                "event": "layer_timing",
-                "timestamp": time.time(),
-                "pid": os.getpid(),
-                "module_name": getattr(module, "_vllm_layer_timing_name", ""),
-                "module_class": module.__class__.__name__,
-                "elapsed_ms": elapsed_ms,
-                "sync": sync,
-                **self._layer_timing_context,
-            })
-
-        model = self.get_model()
-        for name, module in model.named_modules():
-            if not name or not pattern.search(name):
-                continue
-            setattr(module, "_vllm_layer_timing_name", name)
-            self._layer_timing_hooks.append(module.register_forward_pre_hook(pre_hook))
-            self._layer_timing_hooks.append(module.register_forward_hook(post_hook))
-        logger.info("Layer timing hooks installed for %d modules; trace=%s",
-                    len(self._layer_timing_hooks) // 2, timing_file)
-
     @torch.inference_mode()
     def execute_model(
         self,
@@ -3060,11 +2947,6 @@ class GPUModelRunner(
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-                layer_timing_phase = self._layer_timing_phase(
-                    num_scheduled_tokens_np,
-                    max_num_scheduled_tokens,
-                    num_reqs,
-                )
 
                 (
                     logits_indices,
@@ -3152,19 +3034,6 @@ class GPUModelRunner(
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         enabled_step_phase = self._uvm_enabled_step_phase(scheduler_output)
-        self._layer_timing_step_id += 1
-        self._layer_timing_context = {
-            "step_id": self._layer_timing_step_id,
-            "phase": layer_timing_phase,
-            "enabled_step_phase": enabled_step_phase,
-            "num_reqs": int(num_reqs),
-            "num_input_tokens": int(num_input_tokens),
-            "total_num_scheduled_tokens": int(total_num_scheduled_tokens),
-            "max_num_scheduled_tokens": int(max_num_scheduled_tokens),
-            "num_scheduled_tokens": [
-                int(value) for value in num_scheduled_tokens_np.tolist()
-            ],
-        }
         with (
             uvm_allocation_phase(enabled_step_phase),
             set_forward_context(
@@ -3656,183 +3525,10 @@ class GPUModelRunner(
             return default
         return env_value.lower() in ("1", "true", "yes", "on")
 
-    @staticmethod
-    def _env_int_value(env_name: str, default: int = 0) -> int:
-        env_value = os.environ.get(env_name)
-        if env_value is None or env_value == "":
-            return default
-        try:
-            return int(env_value)
-        except ValueError:
-            logger.warning("Ignoring invalid integer env %s=%r", env_name, env_value)
-            return default
-
-    def _is_uvm_address_logging_enabled(self) -> bool:
-        return self._env_flag_enabled("VLLM_UVM_ADDRESS_LOG_ENABLE", default=False)
-
-    def _uvm_address_log_file(self) -> str:
-        return os.environ.get(
-            "VLLM_UVM_ADDRESS_LOG_FILE", "vllm_uvm_address_regions.log"
-        )
-
-    def _is_uvm_weight_map_enabled(self) -> bool:
-        return self._env_flag_enabled("VLLM_UVM_WEIGHT_MAP_ENABLE", default=False)
-
-    def _uvm_weight_map_file(self) -> str:
-        return os.environ.get(
-            "VLLM_UVM_WEIGHT_MAP_FILE", "vllm_uvm_weight_regions.jsonl"
-        )
-
-    def _uvm_weight_map_include_aliases(self) -> bool:
-        return self._env_flag_enabled(
-            "VLLM_UVM_WEIGHT_MAP_INCLUDE_ALIASES", default=False
-        )
-
-    def _uvm_weight_map_probe_managed(self) -> bool:
-        return self._env_flag_enabled(
-            "VLLM_UVM_WEIGHT_MAP_PROBE_MANAGED", default=True
-        )
-
-    def _uvm_weight_map_include_expert_slices(self) -> bool:
-        return self._env_flag_enabled(
-            "VLLM_UVM_WEIGHT_MAP_INCLUDE_EXPERT_SLICES", default=False
-        )
-
-    def _uvm_weight_map_query_expert_slices(self) -> bool:
-        return self._env_flag_enabled(
-            "VLLM_UVM_WEIGHT_MAP_QUERY_EXPERT_SLICES", default=False
-        )
-
-    def _uvm_weight_map_query_residency_enabled(self) -> bool:
-        return self._env_flag_enabled(
-            "VLLM_UVM_WEIGHT_MAP_QUERY_RESIDENCY_ENABLE", default=False
-        )
-
-    def _uvm_weight_map_query_residency_device(self) -> int:
-        return self._env_int_value("VLLM_UVM_WEIGHT_MAP_QUERY_RESIDENCY_DEVICE", 0)
-
-    def _uvm_weight_map_query_residency_round_pages(self) -> bool:
-        return self._env_flag_enabled(
-            "VLLM_UVM_WEIGHT_MAP_QUERY_RESIDENCY_ROUND_PAGES", default=True
-        )
-
     def _uvm_fixed_weight_device_direct_enabled(self) -> bool:
         return self._env_flag_enabled(
             "VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_ENABLE", default=False
         )
-
-    def _uvm_fixed_weight_device_direct_trace_file(self) -> str:
-        return os.environ.get(
-            "VLLM_UVM_FIXED_WEIGHT_DEVICE_DIRECT_TRACE_FILE",
-            "vllm_uvm_fixed_weight_device_direct.jsonl",
-        )
-
-    def _prepare_uvm_address_log(self) -> None:
-        if self._uvm_address_log_prepared or not self._is_uvm_address_logging_enabled():
-            return
-
-        log_path = self._uvm_address_log_file()
-
-        try:
-            if is_global_first_rank():
-                # 每次新的 vLLM 运行开始记录地址日志前，先清空旧文件内容。
-                with open(log_path, "w", encoding="utf-8"):
-                    pass
-        except OSError as exc:
-            logger.warning("Failed to reset UVM address log %s: %s", log_path, exc)
-        finally:
-            if torch.distributed.is_initialized():
-                try:
-                    get_world_group().barrier()
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to synchronize UVM address log reset for %s: %s",
-                        log_path,
-                        exc,
-                    )
-
-        self._uvm_address_log_prepared = True
-
-    def _prepare_uvm_weight_map_log(self) -> None:
-        if self._uvm_weight_map_prepared or not self._is_uvm_weight_map_enabled():
-            return
-
-        log_path = self._uvm_weight_map_file()
-        try:
-            if is_global_first_rank():
-                with open(log_path, "w", encoding="utf-8"):
-                    pass
-        except OSError as exc:
-            logger.warning("Failed to reset UVM weight map %s: %s", log_path, exc)
-        finally:
-            if torch.distributed.is_initialized():
-                try:
-                    get_world_group().barrier()
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to synchronize UVM weight map reset for %s: %s",
-                        log_path,
-                        exc,
-                    )
-
-        self._uvm_weight_map_prepared = True
-
-    def _append_uvm_address_log(
-        self, phase: str, rows: list[tuple[str, str, int, int, int]]
-    ) -> None:
-        """
-        将统一虚拟内存 (UVM) 的地址记录追加写入到指定的日志文件中。
-        
-        Args:
-            phase: 字符串，表示当前记录所处的阶段（例如 "load_model", "prefill" 等）。
-            rows: 包含具体地址信息的列表。每个元素是一个包含 5 个元素的元组：
-                  (类型 kind, 名称 name, 起始地址 start, 结束地址 end, 字节大小 size_bytes)
-        """
-        # 前置检查：如果传入的记录列表为空，或者系统配置中未开启 UVM 地址记录功能，
-        # 则直接返回，不执行任何写入操作，以避免不必要的性能开销。
-        if not rows or not self._is_uvm_address_logging_enabled():
-            return
-
-        # 按照内存起始地址 (即元组中的索引 2 'start') 对所有记录进行升序排序。
-        # 排序后的日志能直观反映内存块在物理/虚拟空间中的排列情况，便于分析内存碎片化。
-        rows.sort(key=lambda item: item[2])
-        
-        # 获取用于存储日志的目标文件路径
-        log_path = self._uvm_address_log_file()
-        # 获取当前时间，并格式化为标准的时间字符串，用于日志时间戳
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-
-        try:
-            # 以追加模式 ("a") 打开日志文件。使用 utf-8 编码防止特殊字符乱码。
-            with open(log_path, "a", encoding="utf-8") as log_file:
-                # 写入区块头部信息，包含时间戳、执行阶段、当前进程 ID (pid) 以及模型名称。
-                # 这有助于在多进程（如张量并行）或多次运行的环境中区分日志来源。
-                log_file.write(
-                    f"[{timestamp}] phase={phase} pid={os.getpid()} "
-                    f"model={self.model_config.model}\n"
-                )
-                
-                # 写入类似 CSV 格式的列名表头
-                log_file.write(
-                    "kind,name,start,end,size_bytes,size_mb\n"
-                )
-                
-                # 遍历排序好的地址记录
-                for kind, name, start, end, size_bytes in rows:
-                    # 将地址信息格式化为十六进制 (0x{start:x} 和 0x{end:x})，这是内存地址的标准表示法。
-                    # 同时将字节大小转换为 MB (保留三位小数) 方便人类阅读，并写入文件。
-                    log_file.write(
-                        f"{kind},{name},0x{start:x},0x{end:x},"
-                        f"{size_bytes},{size_bytes / (1024 * 1024):.3f}\n"
-                    )
-                    
-                # 在当前 phase 的记录块末尾写入一个空行，使其与下一次写入的日志块在视觉上分隔开
-                log_file.write("\n")
-                
-        # 捕获由于权限不足、磁盘空间满或路径不存在等导致的系统级 I/O 异常
-        except OSError as exc:
-            # 仅记录警告日志而不是抛出异常导致程序崩溃，因为日志记录失败不应影响主推理流程的执行
-            logger.warning("Failed to write UVM address log %s: %s", log_path, exc)
 
     @staticmethod
     def _uvm_weight_semantic_tags(name: str) -> dict[str, Any]:
@@ -3920,646 +3616,6 @@ class GPUModelRunner(
             "placement_policy": "fixed_gpu" if fixed_weight else "expert_policy",
         }
 
-    @staticmethod
-    def _uvm_tensor_address_span(tensor: torch.Tensor) -> dict[str, Any] | None:
-        numel = int(tensor.numel())
-        element_size = int(tensor.element_size())
-        tensor_bytes = numel * element_size
-        data_ptr = int(tensor.data_ptr())
-        if data_ptr <= 0 or tensor_bytes <= 0:
-            return None
-
-        storage_ptr = data_ptr
-        storage_nbytes = tensor_bytes
-        try:
-            storage = tensor.untyped_storage()
-            storage_ptr = int(storage.data_ptr())
-            storage_nbytes = int(storage.nbytes())
-        except Exception:
-            storage_ptr = data_ptr
-            storage_nbytes = tensor_bytes
-
-        try:
-            storage_offset = int(tensor.storage_offset())
-        except Exception:
-            storage_offset = 0
-
-        shape = [int(dim) for dim in tensor.shape]
-        stride = [int(item) for item in tensor.stride()]
-        min_offset = storage_offset
-        max_offset = storage_offset
-        if shape and len(shape) == len(stride):
-            for dim, dim_stride in zip(shape, stride):
-                if dim <= 1:
-                    continue
-                delta = (dim - 1) * dim_stride
-                if delta >= 0:
-                    max_offset += delta
-                else:
-                    min_offset += delta
-        else:
-            max_offset = storage_offset + numel - 1
-
-        span_start = storage_ptr + min_offset * element_size
-        span_end = storage_ptr + max_offset * element_size + element_size - 1
-        if span_end < span_start:
-            span_start = data_ptr
-            span_end = data_ptr + tensor_bytes - 1
-
-        storage_end = storage_ptr + storage_nbytes - 1
-        if storage_ptr > 0 and storage_nbytes > 0:
-            span_start = max(span_start, storage_ptr)
-            span_end = min(span_end, storage_end)
-            if span_end < span_start:
-                span_start = data_ptr
-                span_end = data_ptr + tensor_bytes - 1
-        else:
-            storage_end = data_ptr + tensor_bytes - 1
-
-        return {
-            "data_ptr": data_ptr,
-            "data_end": data_ptr + tensor_bytes - 1,
-            "storage_ptr": storage_ptr,
-            "storage_end": storage_end,
-            "storage_nbytes": storage_nbytes,
-            "storage_offset": storage_offset,
-            "start": span_start,
-            "end": span_end,
-            "size_bytes": span_end - span_start + 1,
-            "tensor_bytes": tensor_bytes,
-            "shape": shape,
-            "stride": stride,
-        }
-
-    def _append_uvm_weight_map_log(
-        self, phase: str, records: list[dict[str, Any]]
-    ) -> None:
-        if not records or not self._is_uvm_weight_map_enabled():
-            return
-
-        self._prepare_uvm_weight_map_log()
-        log_path = self._uvm_weight_map_file()
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        try:
-            with open(log_path, "a", encoding="utf-8") as log_file:
-                for record in records:
-                    record = dict(record)
-                    record["timestamp"] = timestamp
-                    record["phase"] = phase
-                    record["pid"] = os.getpid()
-                    record["model"] = self.model_config.model
-                    log_file.write(json.dumps(record, sort_keys=True) + "\n")
-        except OSError as exc:
-            logger.warning("Failed to write UVM weight map %s: %s", log_path, exc)
-
-    def _collect_weight_address_rows(
-        self,
-    ) -> tuple[list[tuple[str, str, int, int, int]], list[dict[str, Any]]]:
-        """
-        收集当前模型中所有权重和缓冲区的底层显存地址信息。
-        
-        Returns:
-            返回一个列表，包含多个元组。每个元组的格式为：
-            (数据类型, 张量名称, 起始内存地址, 结束内存地址, 字节大小)
-        """
-        # 初始化用于存储结果的列表
-        rows: list[tuple[str, str, int, int, int]] = []
-        semantic_records: list[dict[str, Any]] = []
-        primary_name_by_range: dict[tuple[int, int], str] = {}
-        include_aliases = self._uvm_weight_map_include_aliases()
-        probe_managed = self._uvm_weight_map_probe_managed()
-        query_residency = self._uvm_weight_map_query_residency_enabled()
-        query_residency_device = self._uvm_weight_map_query_residency_device()
-        query_residency_round_pages = (
-            self._uvm_weight_map_query_residency_round_pages()
-        )
-
-        def query_tensor_residency(
-            ptr: int,
-            size_bytes: int,
-            *,
-            driver_capable: bool,
-            tensor_is_cuda: bool,
-        ) -> dict[str, Any]:
-            result: dict[str, Any] = {
-                "residency_query_enabled": bool(query_residency),
-                "residency_query_ok": False,
-                "residency_query_status": -1,
-                "residency_query_device": query_residency_device,
-                "residency_queried_bytes": 0,
-                "resident_gpu_bytes": 0,
-                "resident_cpu_bytes": 0,
-                "resident_any_bytes": 0,
-                "resident_unknown_bytes": 0,
-                "resident_gpu_ratio": None,
-                "resident_cpu_ratio": None,
-                "resident_unknown_ratio": None,
-                "residency_state": "not_queried",
-                "residency_query_granularity": (
-                    "page_rounded" if query_residency_round_pages else "exact"
-                ),
-                "residency_query_start_int": ptr,
-                "residency_query_size_bytes": size_bytes,
-            }
-            if ptr <= 0 or size_bytes <= 0:
-                result["residency_state"] = "invalid_range"
-                return result
-            query_ptr = ptr
-            query_size = size_bytes
-            if query_residency_round_pages:
-                try:
-                    page_size = int(os.sysconf("SC_PAGE_SIZE"))
-                except (ValueError, OSError, AttributeError):
-                    page_size = 4096
-                if page_size <= 0:
-                    page_size = 4096
-                query_start = ptr - (ptr % page_size)
-                query_end = (
-                    ((ptr + size_bytes + page_size - 1) // page_size) * page_size
-                )
-                query_ptr = query_start
-                query_size = max(query_end - query_start, size_bytes)
-                result["residency_query_start_int"] = query_ptr
-                result["residency_query_size_bytes"] = query_size
-            if not query_residency:
-                if not driver_capable and tensor_is_cuda:
-                    result["residency_state"] = "cuda_non_uvm_assumed_gpu_resident"
-                return result
-            if not driver_capable:
-                if tensor_is_cuda:
-                    result.update(
-                        {
-                            "residency_query_ok": True,
-                            "residency_query_status": 0,
-                            "residency_queried_bytes": query_size,
-                            "resident_gpu_bytes": query_size,
-                            "resident_gpu_ratio": 1.0,
-                            "resident_cpu_ratio": 0.0,
-                            "resident_unknown_ratio": 0.0,
-                            "residency_state": "cuda_non_uvm_assumed_gpu_resident",
-                        }
-                    )
-                else:
-                    result["residency_state"] = "not_cuda"
-                return result
-            try:
-                residency = driver_batch_query_ranges_residency_bytes(
-                    [(query_ptr, query_size)], device=query_residency_device
-                )
-            except Exception:
-                logger.debug("Failed to query weight tensor residency", exc_info=True)
-                result["residency_state"] = "query_exception"
-                return result
-
-            queried_bytes = int(residency.get("queried_bytes") or 0)
-            gpu_bytes = int(residency.get("gpu_bytes") or 0)
-            cpu_bytes = int(residency.get("cpu_bytes") or 0)
-            unknown_bytes = int(residency.get("unknown_bytes") or 0)
-            result.update(
-                {
-                    "residency_query_ok": bool(residency.get("ok")),
-                    "residency_query_status": int(residency.get("status") or 0),
-                    "residency_queried_bytes": queried_bytes,
-                    "resident_gpu_bytes": gpu_bytes,
-                    "resident_cpu_bytes": cpu_bytes,
-                    "resident_any_bytes": int(residency.get("any_bytes") or 0),
-                    "resident_unknown_bytes": unknown_bytes,
-                }
-            )
-            denom = queried_bytes if queried_bytes > 0 else size_bytes
-            result["resident_gpu_ratio"] = (
-                float(gpu_bytes) / float(denom) if denom > 0 else None
-            )
-            result["resident_cpu_ratio"] = (
-                float(cpu_bytes) / float(denom) if denom > 0 else None
-            )
-            result["resident_unknown_ratio"] = (
-                float(unknown_bytes) / float(denom) if denom > 0 else None
-            )
-            if not bool(residency.get("ok")):
-                result["residency_state"] = "query_failed"
-            elif queried_bytes <= 0:
-                result["residency_state"] = "query_empty"
-            elif gpu_bytes >= queried_bytes:
-                result["residency_state"] = "gpu_full"
-            elif gpu_bytes > 0:
-                result["residency_state"] = "gpu_partial"
-            elif cpu_bytes >= queried_bytes:
-                result["residency_state"] = "cpu_full"
-            elif cpu_bytes > 0:
-                result["residency_state"] = "cpu_partial"
-            elif unknown_bytes > 0:
-                result["residency_state"] = "unknown"
-            else:
-                result["residency_state"] = "not_resident_reported"
-            return result
-
-        def make_record(
-            *,
-            kind: str,
-            name: str,
-            tensor: torch.Tensor,
-            span: dict[str, Any],
-            semantic: dict[str, Any],
-            is_alias: bool,
-            alias_of: str | None,
-            accounted_size_bytes: int,
-            driver_capable: bool = False,
-            driver_reason: str = "not_probed",
-            driver_probe_result: int = 0,
-            residency: dict[str, Any] | None = None,
-        ) -> dict[str, Any]:
-            ptr = int(span["start"])
-            end = int(span["end"])
-            semantic_type = str(semantic.get("semantic_type") or "other")
-            residency = residency or {}
-            if kind == "weight:expert_slice":
-                tensor_kind = "logical_expert_slice"
-            elif kind.endswith("param"):
-                tensor_kind = "parameter"
-            else:
-                tensor_kind = "buffer"
-            return {
-                "schema_version": 2,
-                "kind": kind,
-                "tensor_kind": tensor_kind,
-                "name": name,
-                "region_id": f"weight:{semantic_type}:{name}:{ptr:x}",
-                "start": f"0x{ptr:x}",
-                "end": f"0x{end:x}",
-                "start_int": ptr,
-                "end_int": end,
-                "size_bytes": int(span["size_bytes"]),
-                "accounted_size_bytes": accounted_size_bytes,
-                "tensor_bytes": int(span["tensor_bytes"]),
-                "data_ptr": f"0x{int(span['data_ptr']):x}",
-                "data_start_int": int(span["data_ptr"]),
-                "data_end": f"0x{int(span['data_end']):x}",
-                "data_end_int": int(span["data_end"]),
-                "storage_ptr": f"0x{int(span['storage_ptr']):x}",
-                "storage_start_int": int(span["storage_ptr"]),
-                "storage_end": f"0x{int(span['storage_end']):x}",
-                "storage_end_int": int(span["storage_end"]),
-                "storage_nbytes": int(span["storage_nbytes"]),
-                "storage_offset": int(span["storage_offset"]),
-                "numel": int(tensor.numel()),
-                "element_size": int(tensor.element_size()),
-                "dtype": str(tensor.dtype),
-                "shape": list(span["shape"]),
-                "stride": list(span["stride"]),
-                "is_contiguous": bool(tensor.is_contiguous()),
-                "requires_grad": bool(getattr(tensor, "requires_grad", False)),
-                "device": str(tensor.device),
-                "is_cuda": bool(tensor.is_cuda),
-                "is_alias": is_alias,
-                "alias_of": alias_of,
-                "is_logical_slice": kind == "weight:expert_slice",
-                "driver_capable": driver_capable,
-                "driver_capability_reason": driver_reason,
-                "driver_probe_result": driver_probe_result,
-                **residency,
-                **semantic,
-            }
-
-        # 定义一个内部辅助函数，用于处理和记录单个张量 (Tensor) 的信息
-        def record_tensor(kind: str, name: str, tensor: torch.Tensor) -> None:
-            # 过滤检查 1：如果张量不在 GPU (CUDA) 上，则忽略。
-            # 这里只关心显存的占用情况，驻留在 CPU 的权重不需要记录。
-            if not tensor.is_cuda:
-                return
-
-            span = self._uvm_tensor_address_span(tensor)
-            if span is None:
-                return
-
-            ptr = int(span["start"])
-            end = int(span["end"])
-            size_bytes = int(span["size_bytes"])
-            range_key = (ptr, end)
-            
-            # 过滤检查 2：
-            # ptr == 0: 表示该张量尚未分配实际的物理内存。
-            # ptr in self._logged_weight_ptrs: 使用一个集合来进行去重操作。
-            # 在某些模型架构中（如权重绑定 weight tying），多个参数名称可能指向同一块物理内存。
-            # 确保同一块内存地址只被记录一次，避免重复统计。
-            if ptr == 0 or ptr in self._logged_weight_ptrs:
-                if include_aliases and ptr != 0 and size_bytes > 0:
-                    semantic = self._uvm_weight_semantic_tags(name)
-                    semantic_records.append(
-                        make_record(
-                            kind=kind,
-                            name=name,
-                            tensor=tensor,
-                            span=span,
-                            semantic=semantic,
-                            is_alias=True,
-                            alias_of=primary_name_by_range.get(range_key),
-                            accounted_size_bytes=0,
-                            residency={
-                                "residency_query_enabled": bool(query_residency),
-                                "residency_state": "alias_not_queried",
-                            },
-                        )
-                    )
-                return
-            
-            # 过滤检查 3：忽略大小为 0 的空张量
-            if size_bytes <= 0:
-                return
-                
-            # 将该指针地址加入已记录集合，防止后续出现指向同地址的张量被重复记录
-            self._logged_weight_ptrs.add(ptr)
-            primary_name_by_range[range_key] = name
-            
-            # 将收集到的信息打包为元组并添加到列表中。
-            # 结束地址计算方式为：起始地址 + 总字节数 - 1
-            rows.append((kind, name, ptr, end, size_bytes))
-            semantic = self._uvm_weight_semantic_tags(name)
-            driver_capable = False
-            driver_reason = "not_probed"
-            driver_probe_result = 0
-            if probe_managed:
-                driver_capable, driver_reason, driver_probe_result = (
-                    probe_driver_capable_range(ptr, size_bytes)
-                )
-            residency = query_tensor_residency(
-                ptr,
-                size_bytes,
-                driver_capable=driver_capable,
-                tensor_is_cuda=bool(tensor.is_cuda),
-            )
-            semantic_records.append(
-                make_record(
-                    kind=kind,
-                    name=name,
-                    tensor=tensor,
-                    span=span,
-                    semantic=semantic,
-                    is_alias=False,
-                    alias_of=None,
-                    accounted_size_bytes=size_bytes,
-                    driver_capable=driver_capable,
-                    driver_reason=driver_reason,
-                    driver_probe_result=driver_probe_result,
-                    residency=residency,
-                )
-            )
-
-            if (
-                self._uvm_weight_map_include_expert_slices()
-                and bool(semantic.get("is_moe_expert_main_weight"))
-                and len(span["shape"]) >= 2
-                and int(span["shape"][0]) > 0
-            ):
-                expert_count = int(span["shape"][0])
-                parent_region_id = f"weight:{semantic.get('semantic_type')}:{name}:{ptr:x}"
-                query_slices = (
-                    query_residency
-                    and self._uvm_weight_map_query_expert_slices()
-                )
-                for expert_id in range(expert_count):
-                    try:
-                        expert_tensor = tensor[expert_id]
-                    except Exception:
-                        logger.debug(
-                            "Failed to create expert slice view for %s[%d]",
-                            name,
-                            expert_id,
-                            exc_info=True,
-                        )
-                        continue
-                    expert_span = self._uvm_tensor_address_span(expert_tensor)
-                    if expert_span is None:
-                        continue
-                    expert_size_bytes = int(expert_span["size_bytes"])
-                    if expert_size_bytes <= 0:
-                        continue
-                    expert_semantic = dict(semantic)
-                    expert_semantic["expert_id"] = expert_id
-                    expert_semantic["is_logical_expert_slice"] = True
-                    expert_semantic["logical_parent_name"] = name
-                    expert_semantic["logical_parent_region_id"] = parent_region_id
-                    expert_semantic["logical_parent_start_int"] = ptr
-                    expert_semantic["logical_parent_end_int"] = end
-                    expert_semantic["logical_slice_axis"] = 0
-                    expert_semantic["logical_slice_index"] = expert_id
-                    expert_semantic["logical_slice_count"] = expert_count
-                    expert_semantic["logical_slice_bytes"] = expert_size_bytes
-                    expert_residency = {
-                        "residency_query_enabled": bool(query_slices),
-                        "residency_query_ok": None,
-                        "residency_state": "expert_slice_not_queried",
-                    }
-                    if query_slices:
-                        expert_residency = query_tensor_residency(
-                            int(expert_span["start"]),
-                            expert_size_bytes,
-                            driver_capable=driver_capable,
-                            tensor_is_cuda=bool(expert_tensor.is_cuda),
-                        )
-                    semantic_records.append(
-                        make_record(
-                            kind="weight:expert_slice",
-                            name=f"{name}.expert_{expert_id}",
-                            tensor=expert_tensor,
-                            span=expert_span,
-                            semantic=expert_semantic,
-                            is_alias=True,
-                            alias_of=name,
-                            accounted_size_bytes=0,
-                            driver_capable=driver_capable,
-                            driver_reason=driver_reason,
-                            driver_probe_result=driver_probe_result,
-                            residency=expert_residency,
-                        )
-                    )
-
-        # 获取底层的 PyTorch 模型实例
-        model = self.get_model()
-        
-        # 遍历模型中所有注册的参数 (Parameters)
-        # recurse=True 表示会递归遍历所有子模块 (Sub-modules)
-        # Parameters 通常是模型中需要计算梯度、参与训练的权重 (如 Linear 层的 weight 和 bias)
-        try:
-            parameter_iter = model.named_parameters(
-                recurse=True, remove_duplicate=not include_aliases
-            )
-        except TypeError:
-            parameter_iter = model.named_parameters(recurse=True)
-        for name, param in parameter_iter:
-            if param is not None:
-                record_tensor("weight:param", name, param)
-                
-        # 遍历模型中所有注册的缓冲区 (Buffers)
-        # Buffers 通常是模型状态的一部分，但在训练过程中不需要计算梯度的张量
-        # (例如 BatchNorm 中的 running_mean/running_var，或者大模型中预先计算好的位置编码如 RoPE 缓存)
-        try:
-            buffer_iter = model.named_buffers(
-                recurse=True, remove_duplicate=not include_aliases
-            )
-        except TypeError:
-            buffer_iter = model.named_buffers(recurse=True)
-        for name, buffer in buffer_iter:
-            record_tensor("weight:buffer", name, buffer)
-
-        # 返回旧 CSV 地址行和 Stage E2 语义 sidecar 记录
-        return rows, semantic_records
-
-    def _collect_kv_cache_address_rows(
-        self, kv_caches: dict[str, Any]
-    ) -> list[tuple[str, str, int, int, int]]:
-        """
-        收集当前模型所有 KV Cache (键值缓存) 相关的底层物理显存地址信息，并分析其内存连续性。
-        KV Cache 用于在自回归解码阶段保存历史 token 的计算状态，避免重复计算。
-        
-        Args:
-            kv_caches: 包含层级 KV 缓存的字典。键通常是层名称 (layer_name)，
-                       值是对应的 KV 缓存张量 (Tensor) 或张量列表 (List[Tensor])。
-                       
-        Returns:
-            返回一个列表，包含多个描述内存块的元组。每个元组的格式为：
-            (数据类型/标签, 缓存层名称/标识, 起始内存地址, 结束内存地址, 字节大小)
-        """
-        # rows 用于按行记录每一块被识别到的 KV Cache 的物理内存分布信息
-        rows: list[tuple[str, str, int, int, int]] = []
-
-        # ==========================================
-        # 内部辅助函数：处理并记录单个张量的地址信息
-        # ==========================================
-        def record_tensor(kind: str, name: str, tensor: torch.Tensor) -> None:
-            # 过滤 1: 仅追踪驻留在 GPU (CUDA) 上的显存。如果被 Offload 到 CPU，则跳过记录
-            if not tensor.is_cuda:
-                return
-                
-            # 获取张量底层数据在物理显存中的首字节指针地址
-            ptr = tensor.data_ptr()
-            
-            # 过滤 2: 
-            # - ptr == 0: 忽略未分配内存的空张量/空指针
-            # - self._logged_kv_ptrs: 显存去重。针对 PagedAttention 等机制，
-            #   不同逻辑块可能指向同一块物理内存，防止重复统计。
-            if ptr == 0 or ptr in self._logged_kv_ptrs:
-                return
-                
-            # 计算该缓存张量当前占据的实际物理字节数 (元素总数 * 单个元素的字节数)
-            size_bytes = tensor.numel() * tensor.element_size()
-            
-            # 过滤 3: 忽略实际大小为 0 的异常张量
-            if size_bytes <= 0:
-                return
-                
-            # 注册该指针地址，标记为“已处理”
-            self._logged_kv_ptrs.add(ptr)
-            
-            # 将该内存块的信息 (类型, 名称, 起始地址, 结束地址, 总字节) 存入结果集
-            # 结束地址 = 起始地址 + 大小 - 1
-            rows.append((kind, name, ptr, ptr + size_bytes - 1, size_bytes))
-
-        # ==========================================
-        # 第一阶段：遍历并提取基础层级 KV Cache 内存块
-        # ==========================================
-        for layer_name, cache_tensor in kv_caches.items():
-            # 情况 A: 某些框架将 K 和 V 拼接为一个整张量 (例如形状为 [2, ...])
-            if isinstance(cache_tensor, torch.Tensor):
-                record_tensor("kv_cache", layer_name, cache_tensor)
-                
-            # 情况 B: 某些框架将 Key 和 Value 分开，存为列表如 [K_tensor, V_tensor]
-            elif isinstance(cache_tensor, list):
-                for idx, tensor in enumerate(cache_tensor):
-                    if isinstance(tensor, torch.Tensor):
-                        # 在层名称后附加索引 (如 layer_0[0], layer_0[1]) 用于区分 K 和 V
-                        record_tensor("kv_cache", f"{layer_name}[{idx}]", tensor)
-
-        # ==========================================
-        # 第二阶段：处理跨层共享 KV Cache (针对特殊架构)
-        # ==========================================
-        # 例如 DeepSeek 的 MLA 架构会将 KV 状态高度压缩，甚至跨层复用以减少显存开销
-        if isinstance(getattr(self, "cross_layers_kv_cache", None), torch.Tensor):
-            record_tensor(
-                "kv_cache:cross_layers", "cross_layers_kv_cache", self.cross_layers_kv_cache
-            )
-
-        # ==========================================
-        # 第三阶段：内存连续性分析与整体跨度统计
-        # ==========================================
-        # 筛选出所有属于常规 KV Cache 的行（排除 cross_layers 等特殊项，避免干扰分析）
-        kv_rows = [row for row in rows if row[0].startswith("kv_cache")]
-        
-        if kv_rows:
-            # 按照起始物理地址 (下标 2) 从小到大对内存块进行排序
-            kv_rows.sort(key=lambda item: item[2])
-            
-            # 获取整个模型常规 KV Cache 在显存分布中的下界和上界
-            kv_start = kv_rows[0][2]     # 第一块内存的首地址
-            kv_end = kv_rows[-1][3]      # 最后一块内存的末地址
-            
-            # 连续性检查变量初始化
-            merged_end = kv_rows[0][3]   # 追踪当前已扫描区块能连贯到的最远地址
-            is_contiguous = True         # 假设内存是完全连续的（无碎片、无 Gap）
-
-            # 从第二个内存块开始遍历检查
-            for _, _, start, end, _ in kv_rows[1:]:
-                # 检查断层：如果下一个块的起点 > 当前已记录末尾 + 1
-                # 说明这两块内存中间夹杂了其他数据（如权重张量或 Activation），显存被碎片化了
-                if start > merged_end + 1:
-                    is_contiguous = False
-                    break  # 发现断层，直接结束连续性判断
-                    
-                # 如果没有断层，且当前块更往后延伸，则更新连贯的最远地址
-                if end > merged_end:
-                    merged_end = end
-
-            # 汇总一条全局记录，反映整个 KV Cache 的内存占用跨度
-            rows.append(
-                (
-                    # 根据连续性检测结果打上对应的 Tag
-                    # contiguous_range: 完美连续块；span_range: 有碎片的跨度范围
-                    "kv_cache:contiguous_range" if is_contiguous else "kv_cache:span_range",
-                    "all_layers",               # 作用域：所有层
-                    kv_start,                   # 整体起始地址
-                    kv_end,                     # 整体结束地址
-                    kv_end - kv_start + 1,      # 整体跨越的地址空间大小（包含碎片空间的跨度）
-                )
-            )
-
-        return rows
-
-    def _log_model_weight_addresses(self, phase: str) -> None:
-        """
-        记录模型权重的底层内存/显存地址信息。
-        这通常用于调试、排查内存泄漏，或者分析模型权重在统一虚拟内存 (UVM) 中的分布情况。
-        
-        Args:
-            phase: 字符串，表示当前系统所处的执行阶段（例如："load_model" 模型加载阶段、"warmup" 预热阶段等）。
-        """
-        self._prepare_uvm_address_log()
-
-        # 调用辅助方法，遍历模型的所有层，收集各个权重张量 (tensors) 的底层指针地址或页表信息，
-        # 并将其整理为可记录的行结构 (rows)。
-        rows, semantic_records = self._collect_weight_address_rows()
-        
-        # 将收集到的权重地址行追加写入到 UVM (统一虚拟内存) 地址专属的日志或记录表中，
-        # 同时打上当前所属的 phase (阶段) 标签，方便后续按时间线进行内存变化追踪。
-        self._append_uvm_address_log(phase, rows)
-        self._append_uvm_weight_map_log(phase, semantic_records)
-
-    def _write_fixed_weight_device_direct_record(
-        self, record: dict[str, Any]
-    ) -> None:
-        trace_file = self._uvm_fixed_weight_device_direct_trace_file()
-        if not trace_file:
-            return
-        try:
-            os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
-            with open(trace_file, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, sort_keys=True) + "\n")
-        except OSError as exc:
-            logger.warning(
-                "Failed to write fixed weight device-direct trace %s: %s",
-                trace_file,
-                exc,
-            )
-
     def _materialize_fixed_weights_device_direct(self) -> None:
         if not self._uvm_fixed_weight_device_direct_enabled():
             return
@@ -4578,26 +3634,7 @@ class GPUModelRunner(
         except TypeError:
             parameter_iter = model.named_parameters(recurse=True)
 
-        trace_file = self._uvm_fixed_weight_device_direct_trace_file()
-        if trace_file:
-            try:
-                os.makedirs(os.path.dirname(trace_file) or ".", exist_ok=True)
-                if is_global_first_rank():
-                    with open(trace_file, "w", encoding="utf-8"):
-                        pass
-            except OSError as exc:
-                logger.warning(
-                    "Failed to reset fixed weight device-direct trace %s: %s",
-                    trace_file,
-                    exc,
-                )
-
         processed_params: set[int] = set()
-        converted_count = 0
-        skipped_count = 0
-        converted_bytes = 0
-        failed_count = 0
-        start_time = time.perf_counter()
 
         with torch.no_grad():
             for name, param in parameter_iter:
@@ -4605,7 +3642,6 @@ class GPUModelRunner(
                     continue
                 param_id = id(param)
                 if param_id in processed_params:
-                    skipped_count += 1
                     continue
                 processed_params.add(param_id)
 
@@ -4617,18 +3653,7 @@ class GPUModelRunner(
                     or not tensor.is_cuda
                     or int(tensor.numel()) <= 0
                 ):
-                    skipped_count += 1
                     continue
-
-                span_before = self._uvm_tensor_address_span(tensor)
-                if span_before is None:
-                    skipped_count += 1
-                    continue
-                size_bytes = int(span_before["tensor_bytes"])
-                old_ptr = int(span_before["data_ptr"])
-                old_driver_capable, old_driver_reason, old_probe_result = (
-                    probe_driver_capable_range(old_ptr, size_bytes)
-                )
 
                 try:
                     with uvm_allocation_phase("fixed_weight_device_direct"):
@@ -4640,45 +3665,7 @@ class GPUModelRunner(
                         )
                     native_tensor.copy_(tensor, non_blocking=False)
                     param.data = native_tensor
-                    span_after = self._uvm_tensor_address_span(param.data)
-                    if span_after is None:
-                        raise RuntimeError("missing span after materialization")
-                    new_ptr = int(span_after["data_ptr"])
-                    new_driver_capable, new_driver_reason, new_probe_result = (
-                        probe_driver_capable_range(new_ptr, size_bytes)
-                    )
-                    converted_count += 1
-                    converted_bytes += size_bytes
-                    self._write_fixed_weight_device_direct_record(
-                        {
-                            "event": "fixed_weight_device_direct_materialized",
-                            "name": name,
-                            "kind": "weight:param",
-                            "bytes": size_bytes,
-                            "old_ptr": old_ptr,
-                            "old_ptr_hex": f"0x{old_ptr:x}",
-                            "new_ptr": new_ptr,
-                            "new_ptr_hex": f"0x{new_ptr:x}",
-                            "old_driver_capable": bool(old_driver_capable),
-                            "old_driver_capability_reason": old_driver_reason,
-                            "old_driver_probe_result": int(old_probe_result),
-                            "new_driver_capable": bool(new_driver_capable),
-                            "new_driver_capability_reason": new_driver_reason,
-                            "new_driver_probe_result": int(new_probe_result),
-                            **semantic,
-                        }
-                    )
                 except Exception as exc:
-                    failed_count += 1
-                    self._write_fixed_weight_device_direct_record(
-                        {
-                            "event": "fixed_weight_device_direct_failed",
-                            "name": name,
-                            "bytes": size_bytes,
-                            "error": str(exc),
-                            **semantic,
-                        }
-                    )
                     logger.warning(
                         "Failed to materialize fixed weight %s with "
                         "device-direct allocation: %s",
@@ -4696,47 +3683,6 @@ class GPUModelRunner(
                 "device-direct materialization",
                 exc_info=True,
             )
-
-        elapsed = time.perf_counter() - start_time
-        summary = {
-            "event": "fixed_weight_device_direct_summary",
-            "converted_count": converted_count,
-            "skipped_count": skipped_count,
-            "failed_count": failed_count,
-            "converted_bytes": converted_bytes,
-            "converted_gib": converted_bytes / GiB_bytes,
-            "elapsed_seconds": elapsed,
-        }
-        self._write_fixed_weight_device_direct_record(summary)
-        logger.info_once(
-            "Materialized %d fixed non-expert weights (%.3f GiB) with "
-            "device-direct allocation in %.3f s; skipped=%d failed=%d",
-            converted_count,
-            converted_bytes / GiB_bytes,
-            elapsed,
-            skipped_count,
-            failed_count,
-            scope="local",
-        )
-
-    def _log_kv_cache_addresses(self, kv_caches: dict[str, Any], phase: str) -> None:
-        """
-        记录 KV Cache (键值缓存) 的底层内存/显存地址信息。
-        KV Cache 是大语言模型推理时保存历史上下文注意力状态的核心数据结构，其内存通常是动态分配和分页的 (如 PagedAttention)。
-        
-        Args:
-            kv_caches: 一个字典，包含了当前分配给模型的 KV Cache 对象（通常按层 (layer) 作为 key 进行映射）。
-            phase: 字符串，表示当前的生成阶段（例如："prefill" 预填充阶段，"decode" 逐字解码阶段等）。
-        """
-        self._prepare_uvm_address_log()
-
-        # 调用辅助方法，解析传入的 kv_caches 字典，
-        # 提取其中各个 KV Cache 物理块 (blocks) 或张量底层的内存地址，整理成数据行。
-        rows = self._collect_kv_cache_address_rows(kv_caches)
-        
-        # 将这些 KV Cache 的地址信息追加写入到 UVM 日志中，打上当前的 phase 标签。
-        # 这一步对于监控长文本生成时显存池的碎片化 (fragmentation) 或页面换入换出 (swapping) 非常关键。
-        self._append_uvm_address_log(phase, rows)
 
     def _register_uvm_kv_cache_physical_ranges(
         self,
@@ -4804,12 +3750,9 @@ class GPUModelRunner(
         total_blocks = max(int(kv_cache_config.num_blocks) - 1, 0)
         clamped_target = min(max(int(target_blocks), 0), total_blocks)
         ranges: list[tuple[int, int]] = []
-        range_records: list[dict[str, Any]] = []
         seen_ranges: set[tuple[int, int]] = set()
-        skipped_non_tensor = 0
-        skipped_noncontiguous = 0
 
-        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        for group in kv_cache_config.kv_cache_groups:
             page_size = int(group.kv_cache_spec.page_size_bytes)
             if page_size <= 0:
                 continue
@@ -4818,12 +3761,10 @@ class GPUModelRunner(
                 tensors = (
                     cache_value if isinstance(cache_value, list) else [cache_value]
                 )
-                for tensor_index, tensor in enumerate(tensors):
+                for tensor in tensors:
                     if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
-                        skipped_non_tensor += 1
                         continue
                     if not tensor.is_contiguous():
-                        skipped_noncontiguous += 1
                         continue
                     ptr = int(tensor.data_ptr())
                     size_bytes = int(tensor.numel() * tensor.element_size())
@@ -4836,45 +3777,19 @@ class GPUModelRunner(
                     )
                     if tail_range is None:
                         continue
-                    tail_ptr, tail_bytes, first_cpu_block, max_block_id = tail_range
+                    tail_ptr, tail_bytes, _, _ = tail_range
                     range_key = (tail_ptr, tail_bytes)
                     if tail_bytes <= 0 or range_key in seen_ranges:
                         continue
                     seen_ranges.add(range_key)
                     ranges.append(range_key)
-                    range_records.append(
-                        {
-                            "group_id": group_id,
-                            "layer_name": layer_name,
-                            "tensor_index": tensor_index,
-                            "ptr": f"0x{tail_ptr:x}",
-                            "bytes": tail_bytes,
-                            "page_size": page_size,
-                            "first_cpu_block": first_cpu_block,
-                            "last_cpu_block": max_block_id,
-                        }
-                    )
 
         collection: dict[str, Any] = {
             "ok": True,
             "reason": "ranges_collected" if ranges else "target_covers_all_ranges",
-            "requested_target_blocks": int(target_blocks),
             "target_blocks": clamped_target,
-            "total_blocks": total_blocks,
         }
-        if self._env_flag_enabled(
-            "VLLM_UVM_POST_WARMUP_KV_DEBUG_RECORDS_ENABLE",
-            default=False,
-        ):
-            collection.update({
-                "range_count": len(ranges),
-                "range_bytes": sum(size for _, size in ranges),
-                "skipped_non_tensor": skipped_non_tensor,
-                "skipped_noncontiguous": skipped_noncontiguous,
-                "ranges": range_records,
-            })
         return ranges, collection
-
 
     def rebalance_uvm_kv_cache_after_warmup(
         self,
@@ -4882,29 +3797,16 @@ class GPUModelRunner(
     ) -> dict[str, Any]:
         """Move KV tails past the scheduler target without freeing their tensors."""
         ranges, collection = self._collect_uvm_post_warmup_kv_tail_ranges(target_blocks)
-        debug_records = self._env_flag_enabled(
-            "VLLM_UVM_POST_WARMUP_KV_DEBUG_RECORDS_ENABLE",
-            default=False,
-        )
         record: dict[str, Any] = {
-            "action": "post_warmup_kv_rebalance",
             "ok": bool(collection.get("ok")),
             "reason": str(collection.get("reason") or "unknown"),
             "target_blocks": int(collection.get("target_blocks") or target_blocks),
             "offload_complete": False,
         }
-        if debug_records:
-            record.update({
-                "timestamp": time.time(),
-                "pid": os.getpid(),
-                **collection,
-            })
         if not collection.get("ok"):
             return record
         if not ranges:
             record["offload_complete"] = True
-            if debug_records:
-                record["offload_successes"] = 0
             return record
 
         executor = (
@@ -4923,82 +3825,26 @@ class GPUModelRunner(
             )
             executor = "auto"
 
-        start = time.monotonic()
-        successes, executor_used, advise_result, prefetch_result = (
+        successes, _, _, _ = (
             batch_offload_ranges_to_cpu_with_executor(
                 ranges,
                 sync=True,
                 executor=executor,
             )
         )
-        elapsed_seconds = time.monotonic() - start
         record["offload_complete"] = successes == len(ranges)
-        if debug_records:
-            record.update(
-                {
-                    "offload_successes": successes,
-                    "executor": executor_used,
-                    "requested_executor": executor,
-                    "driver_advise_result": advise_result,
-                    "driver_prefetch_result": prefetch_result,
-                    "elapsed_seconds": elapsed_seconds,
-                }
-            )
-
-        if self._env_flag_enabled(
-            "VLLM_UVM_POST_WARMUP_KV_RESIDENCY_QUERY_ENABLE",
-            default=False,
-        ):
-            try:
-                query_device = (
-                    int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
-                )
-                record["residency_after"] = driver_batch_query_ranges_residency_bytes(
-                    ranges,
-                    query_device,
-                )
-            except Exception:
-                logger.debug(
-                    "Failed to query KV residency after post-warmup rebalance",
-                    exc_info=True,
-                )
-
-        logger.info(
-            "UVM post-warmup KV rebalance target_blocks=%d ranges=%d "
-            "bytes=%d successes=%d executor=%s elapsed=%.3fs",
-            int(collection["target_blocks"]),
-            len(ranges),
-            sum(size for _, size in ranges),
-            successes,
-            executor_used,
-            elapsed_seconds,
-        )
         return record
 
     def resize_uvm_kv_cache_target(
         self,
         old_target_blocks: int,
         new_target_blocks: int,
-        reason: str = "adaptive_runtime",
         reconciliation_block_ids: list[int] | tuple[int, ...] | None = None,
-        plan_token: str = "",
     ) -> dict[str, Any]:
-        """Physically converge an exact worker-coordinated KV resize plan."""
+        """Physically converge the only worker's complete KV resize plan."""
         kv_cache_config = getattr(self, "kv_cache_config", None)
         if kv_cache_config is None:
-            return {
-                "ok": False,
-                "reason": "kv_cache_not_initialized",
-                "made_progress": False,
-                "requested_block_ids": [],
-                "requested_cpu_block_ids": [],
-                "requested_gpu_block_ids": [],
-                "completed_block_ids": [],
-                "completed_cpu_block_ids": [],
-                "completed_gpu_block_ids": [],
-                "synchronized": False,
-                "plan_token": str(plan_token),
-            }
+            return {"ok": False, "made_progress": False}
         total_blocks = max(int(kv_cache_config.num_blocks) - 1, 0)
         old_target = min(max(int(old_target_blocks), 0), total_blocks)
         new_target = min(max(int(new_target_blocks), 0), total_blocks)
@@ -5023,39 +3869,16 @@ class GPUModelRunner(
             for block_id in requested_block_ids
             if block_id <= new_target
         ]
-        result_base: dict[str, Any] = {
-            "old_target_blocks": old_target,
-            "new_target_blocks": new_target,
-            "block_count": len(requested_block_ids),
-            "requested_block_ids": requested_block_ids,
-            "requested_cpu_block_ids": requested_cpu_block_ids,
-            "requested_gpu_block_ids": requested_gpu_block_ids,
-            "plan_token": str(plan_token),
-        }
         if not requested_block_ids:
-            return {
-                "ok": True,
-                "reason": "already_at_target",
-                "made_progress": False,
-                **result_base,
-                "completed_block_ids": [],
-                "completed_cpu_block_ids": [],
-                "completed_gpu_block_ids": [],
-                "synchronized": True,
-            }
+            return {"ok": True, "made_progress": False}
 
         executor = os.environ.get(
             "VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_EXECUTOR",
             "auto",
         ).strip().lower()
-        start = time.monotonic()
-        device = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
+        device = int(torch.cuda.current_device())
         made_progress = False
-        completed_cpu_block_ids: list[int] = []
-        completed_gpu_block_ids: list[int] = []
-        direction_results: list[dict[str, Any]] = []
-        failure_reason = ""
-        synchronized = True
+        complete = True
 
         for direction, block_ids in (
             ("shrink", requested_cpu_block_ids),
@@ -5065,127 +3888,39 @@ class GPUModelRunner(
                 continue
             ranges = collect_uvm_kv_cache_physical_ranges_for_blocks(block_ids)
             if not ranges:
-                failure_reason = "no_registered_ranges"
-                direction_results.append(
-                    {
-                        "direction": direction,
-                        "ok": False,
-                        "reason": failure_reason,
-                        "block_ids": list(block_ids),
-                        "made_progress": False,
-                        "synchronized": False,
-                    }
-                )
-                synchronized = False
+                complete = False
                 break
 
             try:
+                made_progress = True
                 if direction == "grow":
-                    successes, executor_used, driver_result = (
+                    successes, _, _ = (
                         batch_prefetch_ranges_to_device_with_executor(
                             ranges,
                             device,
                             executor=executor,
                         )
                     )
-                    debug_result: dict[str, Any] = {
-                        "driver_result": driver_result
-                    }
                 else:
-                    successes, executor_used, advise_result, prefetch_result = (
+                    successes, _, _, _ = (
                         batch_offload_ranges_to_cpu_with_executor(
                             ranges,
-                            sync=True,
+                            sync=False,
                             executor=executor,
                         )
                     )
-                    debug_result = {
-                        "driver_advise_result": advise_result,
-                        "driver_prefetch_result": prefetch_result,
-                    }
-                success_count = int(successes)
-                group_made_progress = success_count > 0
-                made_progress = made_progress or group_made_progress
-                group_synchronized = not group_made_progress
-                if group_made_progress:
-                    if not torch.cuda.is_available():
-                        raise RuntimeError(
-                            "CUDA unavailable during worker KV resize sync"
-                        )
-                    # Completion IDs are only valid after an explicit worker
-                    # synchronization, independently of debug/env settings.
-                    torch.cuda.synchronize(device)
-                    group_synchronized = True
-                complete = success_count == len(ranges)
-                group_reason = "complete" if complete else "partial"
+                complete = int(successes) == len(ranges)
             except Exception:
-                logger.warning(
-                    "Worker KV resize %s failed",
-                    direction,
-                    exc_info=True,
-                )
                 complete = False
-                group_reason = "migration_or_sync_exception"
-                # Submission may have happened before an exception surfaced.
-                made_progress = True
-                group_made_progress = True
-                success_count = 0
-                executor_used = executor
-                debug_result = {}
-                group_synchronized = False
-
-            group_result: dict[str, Any] = {
-                "direction": direction,
-                "ok": complete,
-                "reason": group_reason,
-                "block_ids": list(block_ids),
-                "made_progress": group_made_progress,
-                "synchronized": group_synchronized,
-            }
-            synchronized = synchronized and group_synchronized
-            if self._env_flag_enabled(
-                "VLLM_UVM_KV_DYNAMIC_POOL_DEBUG_RECORDS_ENABLE",
-                default=False,
-            ):
-                group_result.update(
-                    {
-                        "range_count": len(ranges),
-                        "range_bytes": sum(size for _, size in ranges),
-                        "successes": success_count,
-                        "executor": executor_used,
-                        **debug_result,
-                    }
-                )
-            direction_results.append(group_result)
             if not complete:
-                failure_reason = group_reason
                 break
-            if direction == "shrink":
-                completed_cpu_block_ids.extend(block_ids)
-            else:
-                completed_gpu_block_ids.extend(block_ids)
 
-        completed_block_ids = sorted(
-            completed_cpu_block_ids + completed_gpu_block_ids
-        )
-        complete = not failure_reason and completed_block_ids == requested_block_ids
-        result = {
-            "ok": complete,
-            "reason": "complete" if complete else failure_reason,
-            "made_progress": made_progress,
-            **result_base,
-            "completed_block_ids": completed_block_ids,
-            "completed_cpu_block_ids": sorted(completed_cpu_block_ids),
-            "completed_gpu_block_ids": sorted(completed_gpu_block_ids),
-            "direction_results": direction_results,
-            "synchronized": synchronized,
-        }
-        if self._env_flag_enabled(
-            "VLLM_UVM_KV_DYNAMIC_POOL_DEBUG_RECORDS_ENABLE",
-            default=False,
-        ):
-            result["elapsed_seconds"] = time.monotonic() - start
-        return result
+        if made_progress:
+            try:
+                torch.cuda.synchronize(device)
+            except Exception:
+                complete = False
+        return {"ok": complete, "made_progress": made_progress}
 
     def load_model(self, eep_scale_up: bool = False) -> None:
         """
@@ -5313,7 +4048,6 @@ class GPUModelRunner(
 
         # 为分布式训练/推理准备通信缓冲区（例如为张量并行分配 All-Reduce 缓冲区）
         prepare_communication_buffer_for_model(self.model)
-        self._setup_layer_timing_hooks()
         # 如果存在草稿模型，同样为其准备通信缓冲区
         if (drafter := getattr(self, "drafter", None)) and (
             drafter_model := getattr(drafter, "model", None)
@@ -5353,8 +4087,6 @@ class GPUModelRunner(
                 self.eplb_state.start_async_loop(rank_mapping=rank_mapping)
 
         self._materialize_fixed_weights_device_direct()
-        # 记录模型权重的内存地址（通常用于调试或低级别内存管理验证）
-        self._log_model_weight_addresses("load_model")
 
         # 处理模型图编译加速
         # 1. 尝试使用原生的 PyTorch 图编译 (torch.compile)
@@ -5422,7 +4154,6 @@ class GPUModelRunner(
         model_loader = get_model_loader(self.load_config)
         logger.info("Reloading weights inplace...")
         model_loader.load_weights(self.get_model(), model_config=self.model_config)
-        self._log_model_weight_addresses("reload_weights")
 
     def save_tensorized_model(
         self,
@@ -5637,10 +4368,6 @@ class GPUModelRunner(
         remove_lora: bool = True,
         activate_lora: bool = False,
         is_graph_capturing: bool = False,
-        forward_timing_events: (
-            tuple[torch.cuda.Event, torch.cuda.Event] | None
-        ) = None,
-        single_request_prefill: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5662,8 +4389,6 @@ class GPUModelRunner(
             is_profile: If True, this is a profile run.
             create_mixed_batch: If True, create a mixed batch with both decode
                 (1 token) and prefill (multiple tokens) requests.
-            single_request_prefill: If True, construct one causal prefill
-                request containing all ``num_tokens`` tokens.
             remove_lora: If False, dummy LoRAs are not destroyed after the run
             activate_lora: If False, dummy_run is performed without LoRAs.
         """
@@ -5685,9 +4410,6 @@ class GPUModelRunner(
         # When setting max_query_len = 1, we switch to and capture the optimized
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
-        if single_request_prefill:
-            assert not uniform_decode
-            assert not create_mixed_batch
         max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
 
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
@@ -5695,10 +4417,7 @@ class GPUModelRunner(
         # has num_tokens in total.
         assert num_tokens <= self.scheduler_config.max_num_batched_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if single_request_prefill:
-            num_reqs = 1
-            num_scheduled_tokens_list = [num_tokens]
-        elif create_mixed_batch:
+        if create_mixed_batch:
             assert not uniform_decode
             # Create mixed batch:
             # first half decode tokens, second half one prefill
@@ -5777,22 +4496,7 @@ class GPUModelRunner(
         # If force_attention is True, we always capture attention. Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.
         if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            if single_request_prefill:
-                seq_lens = [num_tokens]
-                self.input_batch.num_computed_tokens_cpu[0] = 0
-                positions_np = self.positions.np[:num_tokens]
-                positions_np[:] = np.arange(num_tokens, dtype=positions_np.dtype)
-                self.positions.copy_to_gpu(num_tokens)
-
-                req_indices = np.zeros(num_tokens, dtype=np.int32)
-                for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
-                    block_table = self.input_batch.block_table[kv_cache_gid]
-                    num_blocks = cdiv(num_tokens, block_table.block_size)
-                    block_table.add_row(list(range(num_blocks)), 0)
-                    block_table.commit_block_table(1)
-                    block_table.compute_slot_mapping(req_indices, positions_np)
-                    block_table.commit_slot_mapping(num_tokens)
-            elif create_mixed_batch:
+            if create_mixed_batch:
                 # In the mixed batch mode (used for FI warmup), we use
                 # shorter sequence lengths to run faster.
                 # TODO(luka) better system for describing dummy batches
@@ -5812,7 +4516,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_query_len,
                 num_reqs=num_reqs,
                 ubatch_slices=ubatch_slices,
-                for_cudagraph_capture=not single_request_prefill,
+                for_cudagraph_capture=True,
             )
 
         with self.maybe_dummy_run_with_lora(
@@ -5883,8 +4587,6 @@ class GPUModelRunner(
                     ubatch_slices=ubatch_slices,
                 ),
             ):
-                if forward_timing_events is not None:
-                    forward_timing_events[0].record()
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -5892,8 +4594,6 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
-                if forward_timing_events is not None:
-                    forward_timing_events[1].record()
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -5935,245 +4635,6 @@ class GPUModelRunner(
             self.device, non_blocking=True
         )
         return hidden_states, hidden_states[logit_indices_device]
-
-    @torch.inference_mode()
-    def run_forward_token_benchmark(self) -> None:
-        """Benchmark the full-model forward for synthetic token batches."""
-        enabled = os.environ.get("VLLM_FORWARD_TOKEN_BENCH_ENABLE", "0")
-        if enabled.strip().lower() not in ("1", "true", "yes", "on"):
-            return
-
-        sizes = sorted(
-            {
-                int(value.strip())
-                for value in os.environ.get(
-                    "VLLM_FORWARD_TOKEN_BENCH_SIZES", "1,4,8,32,64,128"
-                ).split(",")
-                if value.strip()
-            }
-        )
-        patterns = [
-            value.strip().lower()
-            for value in os.environ.get(
-                "VLLM_FORWARD_TOKEN_BENCH_PATTERNS", "identical,diverse"
-            ).split(",")
-            if value.strip()
-        ]
-        warmups = int(os.environ.get("VLLM_FORWARD_TOKEN_BENCH_WARMUPS", "5"))
-        iterations = int(os.environ.get("VLLM_FORWARD_TOKEN_BENCH_ITERS", "20"))
-        burst_iterations = int(
-            os.environ.get("VLLM_FORWARD_TOKEN_BENCH_BURST_ITERS", "10")
-        )
-        burst_rounds = int(
-            os.environ.get("VLLM_FORWARD_TOKEN_BENCH_BURST_ROUNDS", "3")
-        )
-        label = os.environ.get("VLLM_FORWARD_TOKEN_BENCH_LABEL", "unspecified")
-        mode = (
-            os.environ.get("VLLM_FORWARD_TOKEN_BENCH_MODE", "decode")
-            .strip()
-            .lower()
-        )
-
-        if not sizes or sizes[0] <= 0:
-            raise ValueError("forward token benchmark sizes must be positive")
-        if sizes[-1] > self.scheduler_config.max_num_batched_tokens:
-            raise ValueError(
-                "forward token benchmark maximum size exceeds "
-                f"max_num_batched_tokens: {sizes[-1]} > "
-                f"{self.scheduler_config.max_num_batched_tokens}"
-            )
-        if mode == "decode" and sizes[-1] > self.scheduler_config.max_num_seqs:
-            raise ValueError(
-                "uniform-decode forward token benchmark requires "
-                f"max_num_seqs >= {sizes[-1]}"
-            )
-        if (
-            warmups < 0
-            or iterations <= 0
-            or burst_iterations <= 0
-            or burst_rounds <= 0
-        ):
-            raise ValueError(
-                "benchmark warmups must be nonnegative and iteration counts positive"
-            )
-        unsupported_patterns = set(patterns) - {"identical", "diverse"}
-        if not patterns or unsupported_patterns:
-            raise ValueError(
-                f"unsupported forward token benchmark patterns: {unsupported_patterns}"
-            )
-        if mode not in ("decode", "prefill"):
-            raise ValueError(f"unsupported forward token benchmark mode: {mode}")
-        uniform_decode = mode == "decode"
-        single_request_prefill = mode == "prefill"
-
-        max_size = sizes[-1]
-        input_ids = self.input_ids.gpu[:max_size]
-        saved_input_ids = input_ids.clone()
-        diverse_input_ids = (
-            torch.arange(max_size, device=self.device, dtype=input_ids.dtype) * 7919
-            + 17
-        ) % self.model_config.get_vocab_size()
-
-        logger.info(
-            "VLLM_FORWARD_TOKEN_BENCH_BEGIN %s",
-            json.dumps(
-                {
-                    "event": "forward_token_benchmark_begin",
-                    "burst_iterations": burst_iterations,
-                    "burst_rounds": burst_rounds,
-                    "iterations": iterations,
-                    "label": label,
-                    "mode": mode,
-                    "patterns": patterns,
-                    "sizes": sizes,
-                    "warmups": warmups,
-                },
-                sort_keys=True,
-            ),
-        )
-
-        try:
-            for pattern in patterns:
-                if pattern == "identical":
-                    input_ids.fill_(17)
-                else:
-                    input_ids.copy_(diverse_input_ids)
-
-                for num_tokens in sizes:
-                    for _ in range(warmups):
-                        hidden_states, last_hidden_states = self._dummy_run(
-                            num_tokens,
-                            force_attention=True,
-                            uniform_decode=uniform_decode,
-                            allow_microbatching=False,
-                            skip_eplb=True,
-                            is_profile=True,
-                            remove_lora=False,
-                            single_request_prefill=single_request_prefill,
-                        )
-                        del hidden_states, last_hidden_states
-                    torch.cuda.synchronize(self.device)
-
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-                    samples_ms: list[float] = []
-                    synchronized_samples_ms: list[float] = []
-                    for _ in range(iterations):
-                        torch.cuda.synchronize(self.device)
-                        synchronized_start = time.perf_counter()
-                        hidden_states, last_hidden_states = self._dummy_run(
-                            num_tokens,
-                            force_attention=True,
-                            uniform_decode=uniform_decode,
-                            allow_microbatching=False,
-                            skip_eplb=True,
-                            is_profile=True,
-                            remove_lora=False,
-                            forward_timing_events=(start_event, end_event),
-                            single_request_prefill=single_request_prefill,
-                        )
-                        torch.cuda.synchronize(self.device)
-                        synchronized_samples_ms.append(
-                            (time.perf_counter() - synchronized_start) * 1000.0
-                        )
-                        samples_ms.append(start_event.elapsed_time(end_event))
-                        del hidden_states, last_hidden_states
-
-                    sample_array = np.asarray(samples_ms, dtype=np.float64)
-                    synchronized_sample_array = np.asarray(
-                        synchronized_samples_ms, dtype=np.float64
-                    )
-                    median_ms = float(np.median(sample_array))
-                    synchronized_median_ms = float(
-                        np.median(synchronized_sample_array)
-                    )
-
-                    burst_round_total_ms: list[float] = []
-                    for _ in range(burst_rounds):
-                        torch.cuda.synchronize(self.device)
-                        burst_start = time.perf_counter()
-                        for _ in range(burst_iterations):
-                            hidden_states, last_hidden_states = self._dummy_run(
-                                num_tokens,
-                                force_attention=True,
-                                uniform_decode=uniform_decode,
-                                allow_microbatching=False,
-                                skip_eplb=True,
-                                is_profile=True,
-                                remove_lora=False,
-                                single_request_prefill=single_request_prefill,
-                            )
-                            del hidden_states, last_hidden_states
-                        torch.cuda.synchronize(self.device)
-                        burst_round_total_ms.append(
-                            (time.perf_counter() - burst_start) * 1000.0
-                        )
-                    burst_round_ms_per_forward = [
-                        value / burst_iterations for value in burst_round_total_ms
-                    ]
-                    burst_median_ms_per_forward = float(
-                        np.median(burst_round_ms_per_forward)
-                    )
-                    result = {
-                        "burst_iterations": burst_iterations,
-                        "burst_median_ms_per_forward": (
-                            burst_median_ms_per_forward
-                        ),
-                        "burst_round_ms_per_forward": [
-                            round(value, 6) for value in burst_round_ms_per_forward
-                        ],
-                        "burst_round_total_ms": [
-                            round(value, 6) for value in burst_round_total_ms
-                        ],
-                        "burst_rounds": burst_rounds,
-                        "burst_tokens_per_second": (
-                            num_tokens * 1000.0 / burst_median_ms_per_forward
-                        ),
-                        "event": "forward_token_benchmark_result",
-                        "iterations": iterations,
-                        "label": label,
-                        "max_ms": float(np.max(sample_array)),
-                        "mean_ms": float(np.mean(sample_array)),
-                        "median_ms": median_ms,
-                        "min_ms": float(np.min(sample_array)),
-                        "mode": mode,
-                        "ms_per_token": median_ms / num_tokens,
-                        "num_tokens": num_tokens,
-                        "p95_ms": float(np.percentile(sample_array, 95)),
-                        "pattern": pattern,
-                        "samples_ms": [round(value, 6) for value in samples_ms],
-                        "synchronized_mean_ms": float(
-                            np.mean(synchronized_sample_array)
-                        ),
-                        "synchronized_median_ms": synchronized_median_ms,
-                        "synchronized_p95_ms": float(
-                            np.percentile(synchronized_sample_array, 95)
-                        ),
-                        "synchronized_samples_ms": [
-                            round(value, 6) for value in synchronized_samples_ms
-                        ],
-                        "tokens_per_second": num_tokens * 1000.0 / median_ms,
-                        "synchronized_tokens_per_second": (
-                            num_tokens * 1000.0 / synchronized_median_ms
-                        ),
-                        "uniform_decode": uniform_decode,
-                        "warmups": warmups,
-                    }
-                    logger.info(
-                        "VLLM_FORWARD_TOKEN_BENCH_RESULT %s",
-                        json.dumps(result, sort_keys=True),
-                    )
-        finally:
-            input_ids.copy_(saved_input_ids)
-            torch.cuda.synchronize(self.device)
-
-        logger.info(
-            "VLLM_FORWARD_TOKEN_BENCH_END %s",
-            json.dumps(
-                {"event": "forward_token_benchmark_end", "label": label},
-                sort_keys=True,
-            ),
-        )
 
     @torch.inference_mode()
     def _dummy_sampler_run(
@@ -6349,10 +4810,6 @@ class GPUModelRunner(
 
     def profile_run(self) -> None:
         with uvm_allocation_phase("enabled:warmup"):
-            logger.debug(
-                "UVM controlled remap boundary: Stage M profile_run placement "
-                "disabled; final placement runs after KV initialization and warmup"
-            )
             # Profile with multimodal encoder & encoder cache.
             if self.supports_mm_inputs:
                 mm_config = self.model_config.multimodal_config
@@ -6429,12 +4886,7 @@ class GPUModelRunner(
                 hidden_states, last_hidden_states = self._dummy_run(
                     self.max_num_tokens, is_profile=True
                 )
-            forward_only_benchmark = os.environ.get(
-                "VLLM_FORWARD_TOKEN_BENCH_ENABLE", "0"
-            ).strip().lower() in ("1", "true", "yes", "on")
-            if forward_only_benchmark:
-                output = None
-            elif get_pp_group().is_last_rank:
+            if get_pp_group().is_last_rank:
                 if self.is_pooling_model:
                     output = self._dummy_pooler_run(hidden_states)
                 else:
@@ -6445,32 +4897,23 @@ class GPUModelRunner(
             del hidden_states, output
             self.encoder_cache.clear()
             gc.collect()
-            if (
-                self._is_uvm_weight_map_enabled()
-                or self._is_uvm_address_logging_enabled()
-            ):
-                self._log_model_weight_addresses("after_profile_run")
 
     def run_uvm_init_time_weight_placement(self) -> None:
         """Finalize cold and Hot Expert placement after model warmup."""
-        started = time.monotonic()
-        matched_issued = self._run_uvm_matched_cpu_offload_manifest()
+        self._run_uvm_matched_cpu_offload_manifest()
         if not self._env_flag_enabled(
             "VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE",
             default=False,
         ):
             return
-        if getattr(self, "_uvm_init_weight_placement_done", False):
+        if self._uvm_init_weight_placement_done:
             return
 
-        issued_modules = 0
         expert_modules: list[Any] = []
         hot_modules: list[Any] = []
         hot_region_ids: list[str] = []
-        hot_executors: set[str] = set()
         try:
-            # Complete every module's cold release before submitting any Hot
-            # Expert prefetch.  This establishes the final HBM layout first.
+            # Complete all Cold releases before placing the remaining Hot Experts.
             with uvm_enabled_allocation_phase("enabled:init_weight_offload"):
                 for module in self.get_model().modules():
                     init_offload = getattr(
@@ -6479,85 +4922,34 @@ class GPUModelRunner(
                     if not callable(init_offload):
                         continue
                     init_offload()
-                    issued_modules += 1
                     expert_modules.append(module)
 
-                # Only inspect survivors after every module has completed its
-                # cold release pass.
                 for module in expert_modules:
-                    collect_hot = getattr(
-                        module, "get_uvm_init_hot_expert_region_ids", None
-                    )
-                    if not callable(collect_hot):
-                        continue
-                    module_region_ids = [
-                        str(region_id) for region_id in collect_hot()
-                    ]
-                    if not module_region_ids:
-                        continue
-                    mark_hot = getattr(
-                        module, "set_uvm_init_hot_expert_state", None
-                    )
-                    if not callable(mark_hot):
-                        raise RuntimeError(
-                            "Hot Expert module cannot commit aggregate state"
-                        )
-                    hot_modules.append(module)
-                    hot_region_ids.extend(module_region_ids)
-                    hot_executors.add(
-                        str(getattr(module, "uvm_weight_executor", "auto"))
-                    )
+                    region_ids = module.get_uvm_init_hot_expert_region_ids()
+                    if region_ids:
+                        hot_modules.append(module)
+                        hot_region_ids.extend(region_ids)
 
-            hot_region_ids = list(dict.fromkeys(hot_region_ids))
             if hot_region_ids:
-                if len(hot_executors) != 1:
-                    raise RuntimeError(
-                        "Hot Expert modules selected incompatible UVM executors: "
-                        f"{sorted(hot_executors)!r}"
-                    )
-                if not torch.cuda.is_available():
-                    raise RuntimeError(
-                        "CUDA is unavailable for final Hot Expert placement"
-                    )
-
                 device = int(torch.cuda.current_device())
-                for module in hot_modules:
-                    module.set_uvm_init_hot_expert_state("prefetching_gpu")
-
-                prepare_result = prepare_uvm_regions_for_gpu_placement(
+                result = prepare_uvm_regions_for_gpu_placement(
                     hot_region_ids,
                     device=device,
-                    executor=next(iter(hot_executors)),
+                    executor=hot_modules[0].uvm_weight_executor,
                 )
-                if not bool(prepare_result.get("ok")):
-                    raise RuntimeError(
-                        "Failed to prefetch all Hot Expert regions: "
-                        f"{prepare_result!r}"
-                    )
+                if not result["ok"]:
+                    raise RuntimeError("Hot Expert prefetch failed")
 
-                # This is the sole synchronization point for the aggregate
-                # Hot batch.  GPU state is forbidden before it succeeds.
                 torch.cuda.synchronize(device)
-                commit_result = commit_uvm_regions_gpu_placement(
+                result = commit_uvm_regions_gpu_placement(
                     hot_region_ids,
                     synchronized=True,
                 )
-                if not bool(commit_result.get("ok")):
-                    raise RuntimeError(
-                        "Failed to commit Hot Expert GPU placement: "
-                        f"{commit_result!r}"
-                    )
+                if not result["ok"]:
+                    raise RuntimeError("Hot Expert placement commit failed")
+
                 for module in hot_modules:
                     module.set_uvm_init_hot_expert_state("gpu")
-            elif (
-                self._env_flag_enabled(
-                    "VLLM_UVM_INIT_WEIGHT_SYNC", default=True
-                )
-                and torch.cuda.is_available()
-            ):
-                # Preserve synchronization for an all-cold/legacy placement,
-                # while never adding a second sync to the Hot path above.
-                torch.cuda.synchronize()
 
             self._uvm_init_weight_placement_done = True
         except Exception:
@@ -6569,25 +4961,7 @@ class GPUModelRunner(
             for module in hot_modules:
                 module.set_uvm_init_hot_expert_state("unknown")
             self._uvm_init_weight_placement_done = False
-            logger.warning(
-                "Failed to finalize explicit Expert placement", exc_info=True
-            )
             raise
-
-        if issued_modules:
-            logger.info(
-                "Stage M explicit expert placement visited %d MoE modules.",
-                issued_modules,
-            )
-        if matched_issued:
-            logger.info(
-                "Stage M matched CPU offload issued %d parameter ranges.",
-                matched_issued,
-            )
-        logger.info(
-            "Stage M explicit expert placement completed in %.3fs.",
-            time.monotonic() - started,
-        )
 
     @staticmethod
     def _uvm_incremental_expert_layer_key(module: Any) -> str:
@@ -6605,13 +4979,8 @@ class GPUModelRunner(
         """Return one local candidate for each MoE layer."""
         normalized_class = str(expert_class).strip().lower()
         if normalized_class not in ("cold", "warm"):
-            return {
-                "ok": False,
-                "reason": "invalid_expert_class",
-                "expert_class": normalized_class,
-                "candidates": {},
-            }
-        candidates: dict[str, dict[str, Any]] = {}
+            return {"ok": False, "candidates": {}}
+        candidates: dict[str, int] = {}
         for module in self.get_model().modules():
             next_candidate = getattr(
                 module,
@@ -6624,21 +4993,8 @@ class GPUModelRunner(
             if global_expert_id is None:
                 continue
             layer_key = self._uvm_incremental_expert_layer_key(module)
-            layer_id_fn = getattr(module, "_uvm_layer_id", None)
-            candidates[layer_key] = {
-                "layer_name": str(getattr(module, "layer_name", "") or ""),
-                "layer_id": (
-                    layer_id_fn() if callable(layer_id_fn) else None
-                ),
-                "global_expert_id": int(global_expert_id),
-            }
-        return {
-            "ok": True,
-            "reason": "candidates_collected",
-            "expert_class": normalized_class,
-            "candidate_count": len(candidates),
-            "candidates": candidates,
-        }
+            candidates[layer_key] = int(global_expert_id)
+        return {"ok": True, "candidates": candidates}
 
     def run_uvm_incremental_expert_offload(
         self,
@@ -6650,7 +5006,7 @@ class GPUModelRunner(
             "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE",
             default=False,
         ):
-            return {"ok": True, "reason": "disabled", "released_count": 0}
+            return {"ok": True}
 
         modules = [
             module
@@ -6666,7 +5022,8 @@ class GPUModelRunner(
         effective_allow_warm = (
             not has_cold if allow_warm is None else bool(allow_warm)
         )
-        results: list[dict[str, object]] = []
+        released_all = True
+        visited_layers: set[str] = set()
         with uvm_enabled_allocation_phase("enabled:incremental_weight_offload"):
             for module in modules:
                 selected_global_expert_id: int | None = None
@@ -6676,33 +5033,26 @@ class GPUModelRunner(
                     if selected_value is None:
                         continue
                     selected_global_expert_id = int(selected_value)
+                    visited_layers.add(layer_key)
                 result = module.run_uvm_incremental_weight_offload(
                     allow_warm=effective_allow_warm,
                     selected_global_expert_id=selected_global_expert_id,
                 )
-                results.append(
-                    {
-                        **result,
-                        "layer_key": self._uvm_incremental_expert_layer_key(
-                            module
-                        ),
-                    }
-                )
-        if os.environ.get("VLLM_UVM_INIT_WEIGHT_SYNC", "1") == "1":
-            torch.cuda.synchronize()
-        released_count = sum(
-            int(result.get("released_count") or 0) for result in results
-        )
-        return {
-            "ok": all(bool(result.get("ok", True)) for result in results),
-            "reason": "warm_wave" if effective_allow_warm else "cold_wave",
-            "allow_warm": effective_allow_warm,
-            "visited_layers": len(modules),
-            "selected_layers": len(selected_experts_by_layer or {}),
-            "selected_experts_by_layer": selected_experts_by_layer or {},
-            "released_count": released_count,
-            "results": results,
-        }
+                released = {
+                    int(expert_id)
+                    for expert_id in result.get("released_experts", [])
+                }
+                released_all = released_all and bool(result.get("ok"))
+                if selected_global_expert_id is not None:
+                    released_all = (
+                        released_all
+                        and selected_global_expert_id in released
+                    )
+        if selected_experts_by_layer is not None:
+            released_all = released_all and visited_layers == set(
+                selected_experts_by_layer
+            )
+        return {"ok": released_all}
 
     def get_uvm_dynamic_expert_heat(
         self,
@@ -7567,42 +5917,9 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for index, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
-            record_kv_init_probe_event(
-                "kv_zeros_begin",
-                path="general",
-                index=index,
-                size_bytes=int(kv_cache_tensor.size),
-                device=self.device,
-                shape=(int(kv_cache_tensor.size),),
-                extra={
-                    "shared_by": list(kv_cache_tensor.shared_by),
-                },
-            )
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             tensor = torch.zeros(
                 kv_cache_tensor.size, dtype=torch.int8, device=self.device
-            )
-            record_kv_init_probe_event(
-                "kv_zeros_return",
-                path="general",
-                index=index,
-                tensor=tensor,
-                size_bytes=int(kv_cache_tensor.size),
-                device=self.device,
-            )
-            synchronize_kv_init_probe_tensor(
-                path="general",
-                index=index,
-                tensor=tensor,
-            )
-            record_kv_init_probe_event(
-                "kv_tensor_ready",
-                path="general",
-                index=index,
-                tensor=tensor,
-                extra={
-                    "shared_by": list(kv_cache_tensor.shared_by),
-                },
             )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
@@ -7817,19 +6134,8 @@ class GPUModelRunner(
         """
 
         # Try creating KV caches optimized for kv-connector transfers
-        debug_start = time.monotonic()
         cache_dtype = self.cache_config.cache_dtype
-        logger.debug(
-            "UVM controlled remap debug: model_runner initialize_kv_cache_tensors "
-            "entered uniform=%s groups=%d tensors=%d",
-            self.use_uniform_kv_cache(self.attn_groups, cache_dtype),
-            len(kv_cache_config.kv_cache_groups),
-            len(kv_cache_config.kv_cache_tensors),
-        )
         if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
-            section_start = time.monotonic()
-            logger.debug(
-                "UVM controlled remap debug: model_runner allocate_uniform_kv_caches begin")
             kv_caches, cross_layers_kv_cache, attn_backend = (
                 self.allocate_uniform_kv_caches(
                     kv_cache_config,
@@ -7841,48 +6147,17 @@ class GPUModelRunner(
             )
             self.cross_layers_kv_cache = cross_layers_kv_cache
             self.cross_layers_attn_backend = attn_backend
-            logger.debug(
-                "UVM controlled remap debug: model_runner allocate_uniform_kv_caches end "
-                "kv_caches=%d cross_layers=%s elapsed=%.3fs",
-                len(kv_caches),
-                cross_layers_kv_cache is not None,
-                time.monotonic() - section_start,
-            )
         else:
             # Fallback to the general case
             # Initialize the memory buffer for KV cache
-            section_start = time.monotonic()
-            logger.debug(
-                "UVM controlled remap debug: model_runner _allocate_kv_cache_tensors begin")
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
-            logger.debug(
-                "UVM controlled remap debug: model_runner _allocate_kv_cache_tensors end "
-                "raw_tensors=%d elapsed=%.3fs",
-                len(kv_cache_raw_tensors),
-                time.monotonic() - section_start,
-            )
 
             # Change the memory buffer to the desired shape
-            section_start = time.monotonic()
-            logger.debug(
-                "UVM controlled remap debug: model_runner _reshape_kv_cache_tensors begin")
             kv_caches = self._reshape_kv_cache_tensors(
                 kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes
             )
-            logger.debug(
-                "UVM controlled remap debug: model_runner _reshape_kv_cache_tensors end "
-                "kv_caches=%d elapsed=%.3fs",
-                len(kv_caches),
-                time.monotonic() - section_start,
-            )
 
         # Set up cross-layer KV cache sharing
-        section_start = time.monotonic()
-        logger.debug(
-            "UVM controlled remap debug: model_runner kv cache sharing/bind begin "
-            "shared_layers=%d",
-            len(self.shared_kv_cache_layers),
-        )
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
@@ -7897,20 +6172,9 @@ class GPUModelRunner(
             num_attn_module,
         )
         self._uvm_kv_caches_by_layer = kv_caches
-        logger.debug(
-            "UVM controlled remap debug: model_runner kv cache sharing/bind end "
-            "kv_caches=%d elapsed=%.3fs",
-            len(kv_caches),
-            time.monotonic() - section_start,
-        )
         self._register_uvm_kv_cache_physical_ranges(
             kv_cache_config,
             kv_caches,
-        )
-        logger.debug(
-            "UVM controlled remap debug: model_runner initialize_kv_cache_tensors returning "
-            "elapsed=%.3fs",
-            time.monotonic() - debug_start,
         )
         return kv_caches
 
@@ -7950,102 +6214,34 @@ class GPUModelRunner(
             cache size of each layer
         """
         with uvm_allocation_phase("initialize_kv_cache"):
-            debug_start = time.monotonic()
-            logger.debug("UVM controlled remap debug: model_runner initialize_kv_cache entered")
             kv_cache_config = deepcopy(kv_cache_config)
-            logger.debug("UVM controlled remap debug: model_runner initialize_kv_cache deepcopy end")
             self.kv_cache_config = kv_cache_config
-            section_start = time.monotonic()
-            logger.debug(
-                "UVM controlled remap debug: model_runner may_add_encoder_only_layers begin")
             self.may_add_encoder_only_layers_to_kv_cache_config()
-            logger.debug(
-                "UVM controlled remap debug: model_runner may_add_encoder_only_layers end "
-                "elapsed=%.3fs",
-                time.monotonic() - section_start,
-            )
-            section_start = time.monotonic()
-            logger.debug(
-                "UVM controlled remap debug: model_runner maybe_add_kv_sharing_layers begin")
             self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
-            logger.debug(
-                "UVM controlled remap debug: model_runner maybe_add_kv_sharing_layers end "
-                "elapsed=%.3fs",
-                time.monotonic() - section_start,
-            )
-            section_start = time.monotonic()
-            logger.debug("UVM controlled remap debug: model_runner initialize_attn_backend begin")
             self.initialize_attn_backend(kv_cache_config)
-            logger.debug(
-                "UVM controlled remap debug: model_runner initialize_attn_backend end "
-                "elapsed=%.3fs",
-                time.monotonic() - section_start,
-            )
             # The kernel block size for all KV cache groups. For example, if
             # kv_cache_manager uses block_size 256 for a given group, but the attention
             # backends for that group only supports block_size 64, we will return
             # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
             # tokens each.
-            section_start = time.monotonic()
-            logger.debug("UVM controlled remap debug: model_runner _prepare_kernel_block_sizes begin")
             kernel_block_sizes = self._prepare_kernel_block_sizes(kv_cache_config)
-            logger.debug(
-                "UVM controlled remap debug: model_runner _prepare_kernel_block_sizes end "
-                "count=%d elapsed=%.3fs",
-                len(kernel_block_sizes),
-                time.monotonic() - section_start,
-            )
 
             # create metadata builders
-            section_start = time.monotonic()
-            logger.debug("UVM controlled remap debug: model_runner initialize_metadata_builders begin")
             self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
-            logger.debug(
-                "UVM controlled remap debug: model_runner initialize_metadata_builders end "
-                "elapsed=%.3fs",
-                time.monotonic() - section_start,
-            )
 
             # Reinitialize need to after initialize_attn_backend
-            section_start = time.monotonic()
-            logger.debug("UVM controlled remap debug: model_runner may_reinitialize_input_batch begin")
             self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-            logger.debug(
-                "UVM controlled remap debug: model_runner may_reinitialize_input_batch end "
-                "elapsed=%.3fs",
-                time.monotonic() - section_start,
-            )
-            section_start = time.monotonic()
-            logger.debug("UVM controlled remap debug: model_runner initialize_kv_cache_tensors begin")
             kv_caches = self.initialize_kv_cache_tensors(
                 kv_cache_config, kernel_block_sizes
             )
-            logger.debug(
-                "UVM controlled remap debug: model_runner initialize_kv_cache_tensors end "
-                "elapsed=%.3fs",
-                time.monotonic() - section_start,
-            )
 
             if self.speculative_config and self.speculative_config.use_eagle():
-                section_start = time.monotonic()
-                logger.debug("UVM controlled remap debug: model_runner drafter validate begin")
                 assert isinstance(self.drafter, EagleProposer)
                 # validate all draft model layers belong to the same kv cache
                 # group
                 self.drafter.validate_same_kv_cache_group(kv_cache_config)
-                logger.debug(
-                    "UVM controlled remap debug: model_runner drafter validate end "
-                    "elapsed=%.3fs",
-                    time.monotonic() - section_start,
-                )
 
             if has_kv_transfer_group():
-                section_start = time.monotonic()
-                logger.debug(
-                    "UVM controlled remap debug: model_runner kv_transfer_group register begin "
-                    "cross_layers=%s",
-                    self.cross_layers_kv_cache is not None,
-                )
                 kv_transfer_group = get_kv_transfer_group()
                 if self.cross_layers_kv_cache is not None:
                     assert self.cross_layers_attn_backend is not None
@@ -8055,17 +6251,8 @@ class GPUModelRunner(
                 else:
                     kv_transfer_group.register_kv_caches(kv_caches)
                 kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
-                logger.debug(
-                    "UVM controlled remap debug: model_runner kv_transfer_group register end "
-                    "elapsed=%.3fs",
-                    time.monotonic() - section_start,
-                )
-            else:
-                logger.debug("UVM controlled remap debug: model_runner kv_transfer_group skipped")
 
             if self.dcp_world_size > 1:
-                section_start = time.monotonic()
-                logger.debug("UVM controlled remap debug: model_runner dcp validation begin")
                 layer_type = cast(type[Any], AttentionLayerBase)
                 layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
                 for layer in layers.values():
@@ -8078,16 +6265,6 @@ class GPUModelRunner(
                         f"{layer_impl.__class__.__name__} "
                         "does not return the softmax lse for decode."
                     )
-                logger.debug(
-                    "UVM controlled remap debug: model_runner dcp validation end "
-                    "elapsed=%.3fs",
-                    time.monotonic() - section_start,
-                )
-            logger.debug(
-                "UVM controlled remap debug: model_runner initialize_kv_cache returning "
-                "elapsed=%.3fs",
-                time.monotonic() - debug_start,
-            )
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

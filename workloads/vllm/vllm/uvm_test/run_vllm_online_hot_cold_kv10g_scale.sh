@@ -33,8 +33,6 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.97}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-3600}"
 RUN_CASES="${RUN_CASES:-pilot,adaptive,static_custom,native_uva}"
-RESIDENCY_TRACE_ENABLE="${RESIDENCY_TRACE_ENABLE:-1}"
-RESIDENCY_KV_METADATA_ENABLE="${RESIDENCY_KV_METADATA_ENABLE:-1}"
 MAINTENANCE_WAVES_PER_PHASE_LIST="${MAINTENANCE_WAVES_PER_PHASE_LIST:-}"
 
 PHASE_NAMES="${PHASE_NAMES:-low,stage1,stage2,stage3,stage4,stage5,stage6,stage7,stage8,stage9}"
@@ -188,9 +186,6 @@ run_case() {
     "${dir}/run.log" \
     "${dir}/returncode.txt" \
     "${dir}/routing_trace.jsonl" \
-    "${dir}/kv_runtime_trace.jsonl" \
-    "${dir}/kv_physical_trace.jsonl" \
-    "${dir}/residency_trace.jsonl" \
     "${dir}/cpu_offload_manifest.jsonl"
   wait_for_clean_gpu "${name}"
 
@@ -228,20 +223,15 @@ run_case() {
         VLLM_UVM_INIT_WEIGHT_OFFLOAD_MODE=driver_release_cpu
         VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE=post_warmup
         VLLM_UVM_INIT_WEIGHT_PLAN_FILE="${PLAN}"
-        VLLM_UVM_INIT_WEIGHT_SYNC=1
         VLLM_UVM_INIT_WEIGHT_COMPLETE_EXPERT_PLAN=1
         VLLM_UVM_WEIGHT_EXECUTOR=cpp_batch
         VLLM_UVM_KV_RUNTIME_ENABLE=1
         VLLM_UVM_KV_RUNTIME_MODE=trace_only
-        VLLM_UVM_KV_RUNTIME_TRACE_FILE="${dir}/kv_runtime_trace.jsonl"
         VLLM_UVM_KV_DYNAMIC_POOL_ENABLE=1
         VLLM_UVM_KV_DYNAMIC_POOL_INITIAL_BLOCKS="${INITIAL_KV_BLOCKS}"
         VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_ENABLE=1
         VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_EXECUTOR=cpp_batch
         VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_SYNC=1
-        VLLM_UVM_RESIDENCY_TRACE_ENABLE="${RESIDENCY_TRACE_ENABLE}"
-        VLLM_UVM_RESIDENCY_TRACE_FILE="${dir}/residency_trace.jsonl"
-        VLLM_UVM_RESIDENCY_KV_METADATA_ENABLE="${RESIDENCY_KV_METADATA_ENABLE}"
       )
       if [[ "${mode}" == "adaptive" ]]; then
         env_args+=(

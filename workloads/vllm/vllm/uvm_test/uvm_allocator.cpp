@@ -37,8 +37,6 @@
 
 namespace {
 
-constexpr int UVM_DRIVER_UNSUPPORTED_EXPLICIT_REGION_ONLY = -95;
-
 constexpr unsigned int UVM_INITIALIZE_IOCTL = 0x30000001;
 constexpr unsigned int UVM_TEST_PHASE_F_PING_IOCTL =
     200 + 115;
@@ -49,19 +47,10 @@ constexpr unsigned int UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL =
 constexpr unsigned int UVM_PHASE_F_BATCH_EXECUTOR_IOCTL = 81;
 constexpr unsigned int UVM_PHASE_F_REGISTER_REGION_IOCTL = 82;
 constexpr unsigned int UVM_PHASE_F_UNREGISTER_REGION_IOCTL = 83;
-constexpr unsigned int UVM_PHASE_N_SET_POOL_BUDGET_IOCTL = 85;
-constexpr unsigned int UVM_PHASE_N_GET_POOL_STATE_IOCTL = 86;
-constexpr unsigned int UVM_PHASE_N_UPDATE_REGION_STATE_IOCTL = 87;
-constexpr unsigned int UVM_PHASE_N_QUERY_REGION_IOCTL = 88;
-constexpr unsigned int UVM_PHASE_N_QUERY_REGION_BY_VA_IOCTL = 89;
-constexpr unsigned int UVM_PHASE_N_RECLAIM_POOL_IOCTL = 90;
-constexpr unsigned int UVM_PHASE_N_SET_DYNAMIC_BUDGETS_IOCTL = 94;
-constexpr unsigned int UVM_PHASE_N_PROTECT_ACTIVE_KV_IOCTL = 95;
-constexpr unsigned int UVM_PHASE_N_QUERY_REGION_BLOCKS_IOCTL = 96;
-constexpr unsigned int UVM_PHASE_N_RECLAIM_REGION_IOCTL = 97;
+constexpr unsigned int UVM_UPDATE_REGION_STATE_IOCTL = 87;
+constexpr unsigned int UVM_QUERY_REGION_IOCTL = 88;
+constexpr unsigned int UVM_QUERY_REGION_BY_VA_IOCTL = 89;
 constexpr size_t UVM_TEST_PHASE_F_MAX_RANGES = 64;
-constexpr size_t UVM_PHASE_N_TRACE_VICTIM_MAX = 8;
-constexpr size_t UVM_PHASE_N_REGION_BLOCK_TRACE_MAX = 16;
 constexpr uint32_t UVM_TEST_PHASE_F_PING_MAGIC = 0x50464e47;  // "PFNG"
 
 constexpr uint32_t UVM_TEST_PHASE_F_ACTION_PREFETCH_CPU = 1;
@@ -131,159 +120,13 @@ struct PhaseFUnregisterRegionParams {
     uint32_t rmStatus;
 };
 
-struct PhaseNSetPoolBudgetParams {
-    uint32_t pool;
-    uint32_t gpu_id;
-    uint64_t budget_bytes;
-    uint32_t mode;
-    uint32_t flags;
-    uint32_t rmStatus;
-};
-
-struct PhaseNGetPoolStateParams {
-    uint32_t pool;
-    uint32_t gpu_id;
-    uint64_t budget_bytes;
-    uint64_t resident_gpu_bytes;
-    uint64_t pending_gpu_bytes;
-    uint64_t resident_cpu_bytes;
-    uint64_t reclaim_bytes;
-    uint64_t protected_bytes;
-    uint64_t evictable_bytes;
-    uint64_t over_budget_bytes;
-    uint64_t reclaim_target_bytes;
-    uint64_t victim_candidate_bytes;
-    uint64_t victim_candidate_regions;
-    uint64_t selected_victim_region_id;
-    uint64_t selected_victim_bytes;
-    uint32_t victim_count;
-    uint32_t reserved;
-    uint64_t victim_region_ids[UVM_PHASE_N_TRACE_VICTIM_MAX];
-    uint64_t victim_bytes[UVM_PHASE_N_TRACE_VICTIM_MAX];
-    uint64_t over_budget_events;
-    uint64_t reclaim_success_events;
-    uint64_t reclaim_failed_events;
-    uint64_t accounting_corrections;
-    uint32_t mode;
-    uint32_t flags;
-    uint32_t rmStatus;
-};
-
-struct PhaseNSetDynamicBudgetsParams {
-    uint32_t gpu_id;
-    uint32_t mode;
-    uint32_t flags;
-    uint32_t reserved;
-    uint64_t epoch;
-    uint64_t managed_hbm_budget_bytes;
-    uint64_t safety_margin_bytes;
-    uint64_t scratch_workspace_bytes;
-    uint64_t kv_budget_bytes;
-    uint64_t expert_hot_budget_bytes;
-    uint64_t expert_streaming_budget_bytes;
-    uint64_t kv_resident_gpu_bytes;
-    uint64_t kv_pending_gpu_bytes;
-    uint64_t expert_resident_gpu_bytes;
-    uint64_t expert_pending_gpu_bytes;
-    uint64_t shared_over_budget_bytes;
-    uint64_t kv_over_budget_bytes;
-    uint64_t expert_over_budget_bytes;
-    uint32_t rmStatus;
-};
-
-struct PhaseNProtectActiveKvParams {
-    uint32_t gpu_id;
-    uint32_t mode;
-    uint32_t flags;
-    uint32_t reserved;
-    uint64_t epoch;
-    uint64_t active_kv_bytes;
-    uint64_t managed_hbm_budget_bytes;
-    uint64_t safety_margin_bytes;
-    uint64_t scratch_workspace_bytes;
-    uint64_t region_id;
-    uint64_t old_kv_budget_bytes;
-    uint64_t new_kv_budget_bytes;
-    uint64_t old_expert_budget_bytes;
-    uint64_t new_expert_budget_bytes;
-    uint64_t kv_resident_gpu_bytes;
-    uint64_t kv_pending_gpu_bytes;
-    uint64_t expert_resident_gpu_bytes;
-    uint64_t expert_pending_gpu_bytes;
-    uint64_t shared_over_budget_bytes;
-    uint64_t kv_over_budget_bytes;
-    uint64_t expert_over_budget_bytes;
-    uint32_t rmStatus;
-};
-
-struct PhaseNQueryRegionBlocksParams {
-    uint64_t region_id;
-    uint32_t gpu_id;
-    uint32_t reserved;
-    uint64_t base;
-    uint64_t length;
-    uint32_t pool;
-    uint32_t layer_id;
-    uint32_t expert_id;
-    uint32_t role;
-    uint32_t flags;
-    uint32_t state;
-    uint32_t priority;
-    uint32_t va_range_count;
-    uint64_t logical_block_count;
-    uint64_t populated_block_count;
-    uint64_t resident_block_count;
-    uint64_t pending_block_count;
-    uint64_t materialized_block_count;
-    uint64_t mixed_block_count;
-    uint64_t resident_gpu_bytes;
-    uint64_t pending_gpu_bytes;
-    uint64_t first_block_start;
-    uint64_t last_block_end;
-    uint32_t sampled_block_count;
-    uint32_t reserved_out;
-    uint64_t block_starts[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
-    uint64_t block_ends[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
-    uint64_t block_bytes[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
-    uint32_t block_states[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
-    uint32_t block_status[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
-    uint32_t rmStatus;
-};
-
-struct PhaseNReclaimRegionParams {
-    uint64_t region_id;
-    uint32_t gpu_id;
-    uint32_t async;
-    uint32_t flags;
-    uint32_t max_blocks;
-    uint64_t current_epoch;
-    uint32_t pool;
-    uint32_t skipped_protected;
-    uint64_t block_count;
-    uint64_t resident_blocks_before;
-    uint64_t resident_blocks_after;
-    uint64_t pending_blocks;
-    uint32_t attempted_blocks;
-    uint32_t success_blocks;
-    uint32_t failure_blocks;
-    uint32_t traced_blocks;
-    uint64_t attempted_bytes;
-    uint64_t reclaimed_bytes;
-    uint64_t failed_bytes;
-    uint64_t block_starts[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
-    uint64_t block_ends[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
-    uint64_t block_bytes[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
-    uint32_t block_status[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX];
-    uint32_t rmStatus;
-};
-
-struct PhaseNUpdateRegionStateParams {
+struct UpdateRegionStateParams {
     uint64_t region_id;
     uint32_t state;
     uint32_t rmStatus;
 };
 
-struct PhaseNQueryRegionParams {
+struct QueryRegionParams {
     uint64_t region_id;
     uint64_t base;
     uint64_t length;
@@ -292,47 +135,13 @@ struct PhaseNQueryRegionParams {
     uint32_t rmStatus;
 };
 
-struct PhaseNQueryRegionByVaParams {
+struct QueryRegionByVaParams {
     uint64_t address;
     uint64_t region_id;
     uint64_t base;
     uint64_t length;
     uint32_t state;
     uint32_t found_by_va;
-    uint32_t rmStatus;
-};
-
-struct PhaseNReclaimPoolParams {
-    uint32_t pool;
-    uint32_t gpu_id;
-    uint64_t target_bytes;
-    uint64_t current_epoch;
-    uint64_t cooldown_epochs;
-    uint32_t max_victims;
-    uint8_t async;
-    uint32_t flags;
-    uint32_t attempted_regions;
-    uint32_t success_regions;
-    uint32_t failure_regions;
-    uint32_t victim_count;
-    uint64_t budget_bytes;
-    uint64_t resident_gpu_bytes_before;
-    uint64_t over_budget_bytes;
-    uint64_t reclaim_target_bytes;
-    uint64_t attempted_bytes;
-    uint64_t reclaimed_bytes;
-    uint64_t failed_bytes;
-    uint64_t victim_candidate_bytes;
-    uint64_t victim_candidate_regions;
-    uint64_t cooldown_skipped_bytes;
-    uint64_t cooldown_skipped_regions;
-    uint64_t victim_region_ids[UVM_PHASE_N_TRACE_VICTIM_MAX];
-    uint64_t victim_bytes[UVM_PHASE_N_TRACE_VICTIM_MAX];
-    uint32_t victim_status[UVM_PHASE_N_TRACE_VICTIM_MAX];
-    uint64_t reclaim_success_events;
-    uint64_t reclaim_failed_events;
-    uint32_t mode;
-    uint32_t pool_flags;
     uint32_t rmStatus;
 };
 
@@ -365,8 +174,8 @@ struct UvmFdCandidate {
     std::string path;
 };
 
-std::mutex g_phase_n_persistent_fd_mutex;
-int g_phase_n_persistent_fd = -1;
+std::mutex g_region_persistent_fd_mutex;
+int g_region_persistent_fd = -1;
 std::mutex g_phase_f_region_cache_mutex;
 std::unordered_map<uint64_t, PhaseFRange> g_phase_f_region_cache;
 std::mutex g_cuda_device_uuid_cache_mutex;
@@ -550,18 +359,18 @@ int open_initialized_uvm_fd(const char* op_name, bool prefer_existing = false) {
     return fd;
 }
 
-int get_phase_n_persistent_fd(const char* op_name) {
-    std::lock_guard<std::mutex> lock(g_phase_n_persistent_fd_mutex);
-    if (g_phase_n_persistent_fd >= 0)
-        return g_phase_n_persistent_fd;
+int get_region_persistent_fd(const char* op_name) {
+    std::lock_guard<std::mutex> lock(g_region_persistent_fd_mutex);
+    if (g_region_persistent_fd >= 0)
+        return g_region_persistent_fd;
 
-    g_phase_n_persistent_fd = open_initialized_uvm_fd(op_name, false);
-    if (g_phase_n_persistent_fd >= 0) {
+    g_region_persistent_fd = open_initialized_uvm_fd(op_name, false);
+    if (g_region_persistent_fd >= 0) {
         phase_f_debug_log("%s persistent_fd_opened fd=%d",
                           op_name,
-                          g_phase_n_persistent_fd);
+                          g_region_persistent_fd);
     }
-    return g_phase_n_persistent_fd;
+    return g_region_persistent_fd;
 }
 
 template <typename Fn>
@@ -874,7 +683,7 @@ int uvm_driver_phase_f_register_region_internal(uint64_t region_id,
             return uvm_driver_phase_f_register_region_fd(fd, region_id, base, length);
         });
 
-    int fd = get_phase_n_persistent_fd("driver_register_region_persistent");
+    int fd = get_region_persistent_fd("driver_register_region_persistent");
     int persistent_result = -4;
 
     if (fd >= 0) {
@@ -945,576 +754,25 @@ int uvm_driver_phase_f_unregister_region_internal(uint64_t region_id) {
     return result;
 }
 
-int uvm_driver_phase_n_set_pool_budget_internal(uint32_t pool,
-                                                uint32_t gpu_id,
-                                                uint64_t budget_bytes,
-                                                uint32_t mode,
-                                                uint32_t flags) {
-    auto set_budget_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
-        PhaseNSetPoolBudgetParams params{};
-        params.pool = pool;
-        params.gpu_id = gpu_id;
-        params.budget_bytes = budget_bytes;
-        params.mode = mode;
-        params.flags = flags;
-
-        phase_f_debug_log("driver_phase_n_set_pool_budget cmd=%u fd_source=%s source_fd=%d fd=%d path=%s pool=%u gpu_id=%u budget=%llu mode=%u flags=0x%x ioctl_begin",
-                          UVM_PHASE_N_SET_POOL_BUDGET_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          path ? path : "",
-                          pool,
-                          gpu_id,
-                          static_cast<unsigned long long>(budget_bytes),
-                          mode,
-                          flags);
-        int ret = ioctl(fd, UVM_PHASE_N_SET_POOL_BUDGET_IOCTL, &params);
-        int saved_errno = errno;
-        phase_f_debug_log("driver_phase_n_set_pool_budget cmd=%u fd_source=%s source_fd=%d fd=%d pool=%u ioctl_done ret=%d errno=%d rmStatus=%u",
-                          UVM_PHASE_N_SET_POOL_BUDGET_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          pool,
-                          ret,
-                          saved_errno,
-                          params.rmStatus);
-
-        if (ret != 0) return -6;
-        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
-        return 1;
-    };
-
-    int existing_result = apply_to_existing_uvm_fds(
-        "driver_phase_n_set_pool_budget",
-        [&](int fd, int source_fd, const char* path) {
-            return set_budget_on_fd(fd, "adopted", source_fd, path);
-        });
-    if (existing_result > 0)
-        return existing_result;
-
-    int fd = open_initialized_uvm_fd("driver_phase_n_set_pool_budget", false);
-    int result;
-    if (fd < 0) return -4;
-    result = set_budget_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
-    close(fd);
-    return result;
-}
-
-int uvm_driver_phase_n_set_dynamic_budgets_internal(uint32_t gpu_id,
-                                                    uint64_t epoch,
-                                                    uint64_t managed_hbm_budget_bytes,
-                                                    uint64_t safety_margin_bytes,
-                                                    uint64_t scratch_workspace_bytes,
-                                                    uint64_t kv_budget_bytes,
-                                                    uint64_t expert_hot_budget_bytes,
-                                                    uint64_t expert_streaming_budget_bytes,
-                                                    uint32_t mode,
-                                                    uint32_t flags,
-                                                    uint64_t* values_out,
-                                                    size_t values_count) {
-    if (values_out == nullptr || values_count < 8) return -2;
-    PhaseNSetDynamicBudgetsParams best_params{};
-    bool have_best = false;
-    int best_score = -1;
-
-    auto copy_values = [&](const PhaseNSetDynamicBudgetsParams& params) {
-        values_out[0] = params.kv_resident_gpu_bytes;
-        values_out[1] = params.kv_pending_gpu_bytes;
-        values_out[2] = params.expert_resident_gpu_bytes;
-        values_out[3] = params.expert_pending_gpu_bytes;
-        values_out[4] = params.shared_over_budget_bytes;
-        values_out[5] = params.kv_over_budget_bytes;
-        values_out[6] = params.expert_over_budget_bytes;
-        values_out[7] = params.rmStatus;
-    };
-
-    auto set_dynamic_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
-        PhaseNSetDynamicBudgetsParams params{};
-        params.gpu_id = gpu_id;
-        params.mode = mode;
-        params.flags = flags;
-        params.epoch = epoch;
-        params.managed_hbm_budget_bytes = managed_hbm_budget_bytes;
-        params.safety_margin_bytes = safety_margin_bytes;
-        params.scratch_workspace_bytes = scratch_workspace_bytes;
-        params.kv_budget_bytes = kv_budget_bytes;
-        params.expert_hot_budget_bytes = expert_hot_budget_bytes;
-        params.expert_streaming_budget_bytes = expert_streaming_budget_bytes;
-
-        phase_f_debug_log("driver_phase_n_set_dynamic_budgets cmd=%u fd_source=%s source_fd=%d fd=%d path=%s gpu_id=%u epoch=%llu managed=%llu safety=%llu scratch=%llu kv=%llu expert_hot=%llu expert_streaming=%llu mode=%u flags=0x%x ioctl_begin",
-                          UVM_PHASE_N_SET_DYNAMIC_BUDGETS_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          path ? path : "",
-                          gpu_id,
-                          static_cast<unsigned long long>(epoch),
-                          static_cast<unsigned long long>(managed_hbm_budget_bytes),
-                          static_cast<unsigned long long>(safety_margin_bytes),
-                          static_cast<unsigned long long>(scratch_workspace_bytes),
-                          static_cast<unsigned long long>(kv_budget_bytes),
-                          static_cast<unsigned long long>(expert_hot_budget_bytes),
-                          static_cast<unsigned long long>(expert_streaming_budget_bytes),
-                          mode,
-                          flags);
-        int ret = ioctl(fd, UVM_PHASE_N_SET_DYNAMIC_BUDGETS_IOCTL, &params);
-        int saved_errno = errno;
-        phase_f_debug_log("driver_phase_n_set_dynamic_budgets cmd=%u fd_source=%s source_fd=%d fd=%d ioctl_done ret=%d errno=%d rmStatus=%u kv_resident=%llu kv_pending=%llu expert_resident=%llu expert_pending=%llu shared_over=%llu kv_over=%llu expert_over=%llu",
-                          UVM_PHASE_N_SET_DYNAMIC_BUDGETS_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          ret,
-                          saved_errno,
-                          params.rmStatus,
-                          static_cast<unsigned long long>(params.kv_resident_gpu_bytes),
-                          static_cast<unsigned long long>(params.kv_pending_gpu_bytes),
-                          static_cast<unsigned long long>(params.expert_resident_gpu_bytes),
-                          static_cast<unsigned long long>(params.expert_pending_gpu_bytes),
-                          static_cast<unsigned long long>(params.shared_over_budget_bytes),
-                          static_cast<unsigned long long>(params.kv_over_budget_bytes),
-                          static_cast<unsigned long long>(params.expert_over_budget_bytes));
-
-        if (ret != 0) return -6;
-        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
-
-        int score = 0;
-        if (params.kv_resident_gpu_bytes > 0 ||
-            params.kv_pending_gpu_bytes > 0 ||
-            params.expert_resident_gpu_bytes > 0 ||
-            params.expert_pending_gpu_bytes > 0)
-            score += 100;
-        if (params.kv_over_budget_bytes > 0 ||
-            params.expert_over_budget_bytes > 0 ||
-            params.shared_over_budget_bytes > 0)
-            score += 50;
-        if (!have_best || score > best_score) {
-            best_params = params;
-            best_score = score;
-            have_best = true;
-        }
-        return 1;
-    };
-
-    int existing_result = apply_to_existing_uvm_fds(
-        "driver_phase_n_set_dynamic_budgets",
-        [&](int fd, int source_fd, const char* path) {
-            return set_dynamic_on_fd(fd, "adopted", source_fd, path);
-        });
-    if (existing_result > 0) {
-        if (have_best)
-            copy_values(best_params);
-        return existing_result;
-    }
-
-    int fd = open_initialized_uvm_fd("driver_phase_n_set_dynamic_budgets", false);
-    int result;
-    if (fd < 0) return -4;
-    result = set_dynamic_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
-    if (result > 0 && have_best)
-        copy_values(best_params);
-    close(fd);
-    return result;
-}
-
-int uvm_driver_phase_n_protect_active_kv_internal(uint32_t gpu_id,
-                                                  uint64_t epoch,
-                                                  uint64_t active_kv_bytes,
-                                                  uint64_t managed_hbm_budget_bytes,
-                                                  uint64_t safety_margin_bytes,
-                                                  uint64_t scratch_workspace_bytes,
-                                                  uint64_t region_id,
-                                                  uint32_t mode,
-                                                  uint32_t flags,
-                                                  uint64_t* values_out,
-                                                  size_t values_count) {
-    if (values_out == nullptr || values_count < 12) return -2;
-    PhaseNProtectActiveKvParams best_params{};
-    bool have_best = false;
-    int best_score = -1;
-
-    auto copy_values = [&](const PhaseNProtectActiveKvParams& params) {
-        values_out[0] = params.old_kv_budget_bytes;
-        values_out[1] = params.new_kv_budget_bytes;
-        values_out[2] = params.old_expert_budget_bytes;
-        values_out[3] = params.new_expert_budget_bytes;
-        values_out[4] = params.kv_resident_gpu_bytes;
-        values_out[5] = params.kv_pending_gpu_bytes;
-        values_out[6] = params.expert_resident_gpu_bytes;
-        values_out[7] = params.expert_pending_gpu_bytes;
-        values_out[8] = params.shared_over_budget_bytes;
-        values_out[9] = params.kv_over_budget_bytes;
-        values_out[10] = params.expert_over_budget_bytes;
-        values_out[11] = params.rmStatus;
-    };
-
-    auto protect_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
-        PhaseNProtectActiveKvParams params{};
-        params.gpu_id = gpu_id;
-        params.mode = mode;
-        params.flags = flags;
-        params.epoch = epoch;
-        params.active_kv_bytes = active_kv_bytes;
-        params.managed_hbm_budget_bytes = managed_hbm_budget_bytes;
-        params.safety_margin_bytes = safety_margin_bytes;
-        params.scratch_workspace_bytes = scratch_workspace_bytes;
-        params.region_id = region_id;
-
-        phase_f_debug_log("driver_phase_n_protect_active_kv cmd=%u fd_source=%s source_fd=%d fd=%d path=%s gpu_id=%u epoch=%llu active_kv=%llu managed=%llu safety=%llu scratch=%llu region_id=%llu mode=%u flags=0x%x ioctl_begin",
-                          UVM_PHASE_N_PROTECT_ACTIVE_KV_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          path ? path : "",
-                          gpu_id,
-                          static_cast<unsigned long long>(epoch),
-                          static_cast<unsigned long long>(active_kv_bytes),
-                          static_cast<unsigned long long>(managed_hbm_budget_bytes),
-                          static_cast<unsigned long long>(safety_margin_bytes),
-                          static_cast<unsigned long long>(scratch_workspace_bytes),
-                          static_cast<unsigned long long>(region_id),
-                          mode,
-                          flags);
-        int ret = ioctl(fd, UVM_PHASE_N_PROTECT_ACTIVE_KV_IOCTL, &params);
-        int saved_errno = errno;
-        phase_f_debug_log("driver_phase_n_protect_active_kv cmd=%u fd_source=%s source_fd=%d fd=%d ioctl_done ret=%d errno=%d rmStatus=%u old_kv=%llu new_kv=%llu old_expert=%llu new_expert=%llu kv_resident=%llu kv_pending=%llu expert_resident=%llu expert_pending=%llu shared_over=%llu kv_over=%llu expert_over=%llu",
-                          UVM_PHASE_N_PROTECT_ACTIVE_KV_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          ret,
-                          saved_errno,
-                          params.rmStatus,
-                          static_cast<unsigned long long>(params.old_kv_budget_bytes),
-                          static_cast<unsigned long long>(params.new_kv_budget_bytes),
-                          static_cast<unsigned long long>(params.old_expert_budget_bytes),
-                          static_cast<unsigned long long>(params.new_expert_budget_bytes),
-                          static_cast<unsigned long long>(params.kv_resident_gpu_bytes),
-                          static_cast<unsigned long long>(params.kv_pending_gpu_bytes),
-                          static_cast<unsigned long long>(params.expert_resident_gpu_bytes),
-                          static_cast<unsigned long long>(params.expert_pending_gpu_bytes),
-                          static_cast<unsigned long long>(params.shared_over_budget_bytes),
-                          static_cast<unsigned long long>(params.kv_over_budget_bytes),
-                          static_cast<unsigned long long>(params.expert_over_budget_bytes));
-
-        if (ret != 0) return -6;
-        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
-
-        int score = 0;
-        if (params.new_kv_budget_bytes > 0 || params.new_expert_budget_bytes > 0)
-            score += 50;
-        if (params.kv_resident_gpu_bytes > 0 ||
-            params.expert_resident_gpu_bytes > 0 ||
-            params.expert_over_budget_bytes > 0)
-            score += 100;
-        if (!have_best || score > best_score) {
-            best_params = params;
-            best_score = score;
-            have_best = true;
-        }
-        return 1;
-    };
-
-    int existing_result = apply_to_existing_uvm_fds(
-        "driver_phase_n_protect_active_kv",
-        [&](int fd, int source_fd, const char* path) {
-            return protect_on_fd(fd, "adopted", source_fd, path);
-        });
-    if (existing_result > 0) {
-        if (have_best)
-            copy_values(best_params);
-        return existing_result;
-    }
-
-    int fd = open_initialized_uvm_fd("driver_phase_n_protect_active_kv", false);
-    int result;
-    if (fd < 0) return -4;
-    result = protect_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
-    if (result > 0 && have_best)
-        copy_values(best_params);
-    close(fd);
-    return result;
-}
-
-int uvm_driver_phase_n_get_pool_state_internal(uint32_t pool,
-                                               uint32_t gpu_id,
-                                               uint64_t* values_out,
-                                               size_t values_count) {
-    if (values_out == nullptr || values_count < 36) return -2;
-    PhaseNGetPoolStateParams best_params{};
-    bool have_best = false;
-    int best_score = -1;
-    int last_error = -4;
-
-    auto copy_state_values = [&]() {
-        values_out[0] = best_params.budget_bytes;
-        values_out[1] = best_params.resident_gpu_bytes;
-        values_out[2] = best_params.resident_cpu_bytes;
-        values_out[3] = best_params.reclaim_bytes;
-        values_out[4] = best_params.protected_bytes;
-        values_out[5] = best_params.evictable_bytes;
-        values_out[6] = best_params.over_budget_bytes;
-        values_out[7] = best_params.reclaim_target_bytes;
-        values_out[8] = best_params.victim_candidate_bytes;
-        values_out[9] = best_params.victim_candidate_regions;
-        values_out[10] = best_params.selected_victim_region_id;
-        values_out[11] = best_params.selected_victim_bytes;
-        values_out[12] = best_params.victim_count;
-        values_out[13] = best_params.reserved;
-        for (size_t i = 0; i < 8; ++i) {
-            values_out[14 + i] = best_params.victim_region_ids[i];
-            values_out[22 + i] = best_params.victim_bytes[i];
-        }
-        values_out[30] = best_params.over_budget_events;
-        values_out[31] = best_params.reclaim_success_events;
-        values_out[32] = best_params.reclaim_failed_events;
-        values_out[33] = best_params.accounting_corrections;
-        values_out[34] = best_params.mode;
-        values_out[35] = best_params.flags;
-        if (values_count > 36)
-            values_out[36] = best_params.pending_gpu_bytes;
-    };
-
-    auto query_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
-        PhaseNGetPoolStateParams params{};
-        params.pool = pool;
-        params.gpu_id = gpu_id;
-
-        phase_f_debug_log("driver_phase_n_get_pool_state cmd=%u fd_source=%s source_fd=%d fd=%d path=%s pool=%u gpu_id=%u ioctl_begin",
-                          UVM_PHASE_N_GET_POOL_STATE_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          path ? path : "",
-                          pool,
-                          gpu_id);
-        int ret = ioctl(fd, UVM_PHASE_N_GET_POOL_STATE_IOCTL, &params);
-        int saved_errno = errno;
-        phase_f_debug_log("driver_phase_n_get_pool_state cmd=%u fd_source=%s source_fd=%d fd=%d pool=%u ioctl_done ret=%d errno=%d rmStatus=%u budget=%llu gpu=%llu pending=%llu cpu=%llu reclaim=%llu evictable=%llu protected=%llu over=%llu target=%llu candidate=%llu candidate_regions=%llu selected_id=%llu selected_bytes=%llu victim_count=%u metadata_only=%u",
-                          UVM_PHASE_N_GET_POOL_STATE_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          pool,
-                          ret,
-                          saved_errno,
-                          params.rmStatus,
-                          static_cast<unsigned long long>(params.budget_bytes),
-                          static_cast<unsigned long long>(params.resident_gpu_bytes),
-                          static_cast<unsigned long long>(params.pending_gpu_bytes),
-                          static_cast<unsigned long long>(params.resident_cpu_bytes),
-                          static_cast<unsigned long long>(params.reclaim_bytes),
-                          static_cast<unsigned long long>(params.evictable_bytes),
-                          static_cast<unsigned long long>(params.protected_bytes),
-                          static_cast<unsigned long long>(params.over_budget_bytes),
-                          static_cast<unsigned long long>(params.reclaim_target_bytes),
-                          static_cast<unsigned long long>(params.victim_candidate_bytes),
-                          static_cast<unsigned long long>(params.victim_candidate_regions),
-                          static_cast<unsigned long long>(params.selected_victim_region_id),
-                          static_cast<unsigned long long>(params.selected_victim_bytes),
-                          params.victim_count,
-                          params.reserved);
-
-        if (ret != 0) return -6;
-        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
-
-        int score = 0;
-        if (params.reserved == 0)
-            score += 100;
-        if (params.budget_bytes > 0)
-            score += 20;
-        if (params.resident_gpu_bytes > 0 ||
-            params.victim_candidate_bytes > 0 ||
-            params.victim_count > 0)
-            score += 10;
-        if (!have_best || score > best_score) {
-            best_params = params;
-            best_score = score;
-            have_best = true;
-        }
-        return 1;
-    };
-
-    int existing_result = apply_to_existing_uvm_fds(
-        "driver_phase_n_get_pool_state",
-        [&](int fd, int source_fd, const char* path) {
-            return query_on_fd(fd, "adopted", source_fd, path);
-        });
-    if (existing_result > 0 && have_best) {
-        copy_state_values();
-        return 1;
-    }
-    if (existing_result < 0)
-        last_error = existing_result;
-
-    int fd = open_initialized_uvm_fd("driver_phase_n_get_pool_state", false);
-    if (fd < 0)
-        return last_error;
-    int result = query_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
-    close(fd);
-    if (result < 0)
-        return result;
-    copy_state_values();
-    return 1;
-}
-
-int uvm_driver_phase_n_reclaim_pool_internal(uint32_t pool,
-                                             uint32_t gpu_id,
-                                             uint64_t target_bytes,
-                                             uint64_t current_epoch,
-                                             uint64_t cooldown_epochs,
-                                             uint32_t max_victims,
-                                             uint32_t async,
-                                             uint32_t flags,
-                                             uint64_t* values_out,
-                                             size_t values_count) {
-    if (values_out == nullptr || values_count < 45) return -2;
-    PhaseNReclaimPoolParams best_params{};
-    bool have_best = false;
-    int last_error = -4;
-
-    auto copy_reclaim_values = [&]() {
-        values_out[0] = best_params.attempted_regions;
-        values_out[1] = best_params.success_regions;
-        values_out[2] = best_params.failure_regions;
-        values_out[3] = best_params.victim_count;
-        values_out[4] = best_params.budget_bytes;
-        values_out[5] = best_params.resident_gpu_bytes_before;
-        values_out[6] = best_params.over_budget_bytes;
-        values_out[7] = best_params.reclaim_target_bytes;
-        values_out[8] = best_params.attempted_bytes;
-        values_out[9] = best_params.reclaimed_bytes;
-        values_out[10] = best_params.failed_bytes;
-        values_out[11] = best_params.victim_candidate_bytes;
-        values_out[12] = best_params.victim_candidate_regions;
-        values_out[13] = best_params.cooldown_skipped_bytes;
-        values_out[14] = best_params.cooldown_skipped_regions;
-        for (size_t i = 0; i < UVM_PHASE_N_TRACE_VICTIM_MAX; ++i) {
-            values_out[15 + i] = best_params.victim_region_ids[i];
-            values_out[23 + i] = best_params.victim_bytes[i];
-            values_out[31 + i] = best_params.victim_status[i];
-        }
-        values_out[39] = best_params.reclaim_success_events;
-        values_out[40] = best_params.reclaim_failed_events;
-        values_out[41] = best_params.mode;
-        values_out[42] = best_params.pool_flags;
-        values_out[43] = best_params.rmStatus;
-        values_out[44] = best_params.flags;
-    };
-
-    auto reclaim_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
-        PhaseNReclaimPoolParams params{};
-        params.pool = pool;
-        params.gpu_id = gpu_id;
-        params.target_bytes = target_bytes;
-        params.current_epoch = current_epoch;
-        params.cooldown_epochs = cooldown_epochs;
-        params.max_victims = max_victims;
-        params.async = async ? 1 : 0;
-        params.flags = flags;
-
-        phase_f_debug_log("driver_phase_n_reclaim_pool cmd=%u fd_source=%s source_fd=%d fd=%d path=%s pool=%u gpu_id=%u target=%llu epoch=%llu cooldown=%llu max_victims=%u async=%u flags=0x%x ioctl_begin",
-                          UVM_PHASE_N_RECLAIM_POOL_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          path ? path : "",
-                          pool,
-                          gpu_id,
-                          static_cast<unsigned long long>(target_bytes),
-                          static_cast<unsigned long long>(current_epoch),
-                          static_cast<unsigned long long>(cooldown_epochs),
-                          max_victims,
-                          async,
-                          flags);
-        int ret = ioctl(fd, UVM_PHASE_N_RECLAIM_POOL_IOCTL, &params);
-        int saved_errno = errno;
-        phase_f_debug_log("driver_phase_n_reclaim_pool cmd=%u fd_source=%s source_fd=%d fd=%d pool=%u ioctl_done ret=%d errno=%d rmStatus=%u budget=%llu resident=%llu over=%llu attempted=%u success=%u failure=%u reclaimed=%llu target=%llu candidates=%llu",
-                          UVM_PHASE_N_RECLAIM_POOL_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          pool,
-                          ret,
-                          saved_errno,
-                          params.rmStatus,
-                          static_cast<unsigned long long>(params.budget_bytes),
-                          static_cast<unsigned long long>(params.resident_gpu_bytes_before),
-                          static_cast<unsigned long long>(params.over_budget_bytes),
-                          params.attempted_regions,
-                          params.success_regions,
-                          params.failure_regions,
-                          static_cast<unsigned long long>(params.reclaimed_bytes),
-                          static_cast<unsigned long long>(params.reclaim_target_bytes),
-                          static_cast<unsigned long long>(params.victim_candidate_bytes));
-
-        if (ret != 0) return -6;
-        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
-
-        best_params = params;
-        have_best = true;
-        return 1;
-    };
-
-    if (phase_f_adopt_cuda_uvm_fd_enabled()) {
-        std::vector<UvmFdCandidate> candidates =
-            collect_existing_uvm_fd_candidates("driver_phase_n_reclaim_pool");
-        for (const UvmFdCandidate& candidate : candidates) {
-            int fd = duplicate_uvm_fd_candidate("driver_phase_n_reclaim_pool", candidate);
-            if (fd < 0)
-                continue;
-            int result = reclaim_on_fd(fd, "adopted", candidate.source_fd, candidate.path.c_str());
-            close(fd);
-            if (result < 0) {
-                last_error = result;
-                continue;
-            }
-            if (best_params.budget_bytes > 0 ||
-                best_params.resident_gpu_bytes_before > 0 ||
-                best_params.victim_candidate_bytes > 0 ||
-                best_params.attempted_regions > 0) {
-                copy_reclaim_values();
-                return 1;
-            }
-        }
-        if (have_best) {
-            copy_reclaim_values();
-            return 1;
-        }
-    }
-
-    int fd = open_initialized_uvm_fd("driver_phase_n_reclaim_pool", false);
-    if (fd < 0)
-        return last_error;
-    int result = reclaim_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
-    close(fd);
-    if (result < 0)
-        return result;
-    copy_reclaim_values();
-    return 1;
-}
-
-int uvm_driver_phase_n_update_region_state_internal(uint64_t region_id,
-                                                    uint32_t state) {
+int uvm_driver_update_region_state_internal(uint64_t region_id,
+                                            uint32_t state) {
     auto update_state_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
-        PhaseNUpdateRegionStateParams params{};
+        UpdateRegionStateParams params{};
         params.region_id = region_id;
         params.state = state;
 
-        phase_f_debug_log("driver_phase_n_update_region_state cmd=%u fd_source=%s source_fd=%d fd=%d path=%s id=%llu state=%u ioctl_begin",
-                          UVM_PHASE_N_UPDATE_REGION_STATE_IOCTL,
+        phase_f_debug_log("driver_update_region_state cmd=%u fd_source=%s source_fd=%d fd=%d path=%s id=%llu state=%u ioctl_begin",
+                          UVM_UPDATE_REGION_STATE_IOCTL,
                           fd_source,
                           source_fd,
                           fd,
                           path ? path : "",
                           static_cast<unsigned long long>(region_id),
                           state);
-        int ret = ioctl(fd, UVM_PHASE_N_UPDATE_REGION_STATE_IOCTL, &params);
+        int ret = ioctl(fd, UVM_UPDATE_REGION_STATE_IOCTL, &params);
         int saved_errno = errno;
-        phase_f_debug_log("driver_phase_n_update_region_state cmd=%u fd_source=%s source_fd=%d fd=%d id=%llu ioctl_done ret=%d errno=%d rmStatus=%u",
-                          UVM_PHASE_N_UPDATE_REGION_STATE_IOCTL,
+        phase_f_debug_log("driver_update_region_state cmd=%u fd_source=%s source_fd=%d fd=%d id=%llu ioctl_done ret=%d errno=%d rmStatus=%u",
+                          UVM_UPDATE_REGION_STATE_IOCTL,
                           fd_source,
                           source_fd,
                           fd,
@@ -1529,12 +787,12 @@ int uvm_driver_phase_n_update_region_state_internal(uint64_t region_id,
     };
 
     int existing_result = apply_to_existing_uvm_fds(
-        "driver_phase_n_update_region_state",
+        "driver_update_region_state",
         [&](int fd, int source_fd, const char* path) {
             return update_state_on_fd(fd, "adopted", source_fd, path);
         });
 
-    int fd = get_phase_n_persistent_fd("driver_phase_n_update_region_state_persistent");
+    int fd = get_region_persistent_fd("driver_update_region_state_persistent");
     int persistent_result = -4;
     if (fd >= 0)
         persistent_result = update_state_on_fd(fd, "persistent", -1, "/dev/nvidia-uvm:persistent");
@@ -1546,113 +804,31 @@ int uvm_driver_phase_n_update_region_state_internal(uint64_t region_id,
     return existing_result;
 }
 
-int uvm_driver_phase_n_metadata_state_smoke_internal(uint32_t pool,
-                                                     uint64_t budget_bytes,
-                                                     uint64_t* values_out,
-                                                     size_t values_count) {
-    if (values_out == nullptr || values_count < 36) return -2;
-
-    int fd = open_initialized_uvm_fd("driver_phase_n_metadata_state_smoke", false);
-    if (fd < 0) return -4;
-
-    const uint64_t region_id = 0x6d65746100000000ULL | static_cast<uint64_t>(pool);
-    const uint64_t base = 0x100000000000ULL + (static_cast<uint64_t>(pool) << 32);
-    const uint64_t length = 1ULL << 20;
-    int result = uvm_driver_phase_f_register_region_fd(
-        fd, region_id, static_cast<uintptr_t>(base), static_cast<size_t>(length));
-    if (result < 0) {
-        close(fd);
-        return result;
-    }
-
-    PhaseNSetPoolBudgetParams budget_params{};
-    budget_params.pool = pool;
-    budget_params.gpu_id = 0;
-    budget_params.budget_bytes = budget_bytes;
-    budget_params.mode = 0;
-    budget_params.flags = 0;
-    int ret = ioctl(fd, UVM_PHASE_N_SET_POOL_BUDGET_IOCTL, &budget_params);
-    if (ret != 0 || budget_params.rmStatus != 0) {
-        (void)uvm_driver_phase_f_unregister_region_fd(fd, region_id);
-        close(fd);
-        return ret != 0 ? -6 : -static_cast<int>(budget_params.rmStatus);
-    }
-
-    PhaseNUpdateRegionStateParams state_params{};
-    state_params.region_id = region_id;
-    state_params.state = 3;
-    ret = ioctl(fd, UVM_PHASE_N_UPDATE_REGION_STATE_IOCTL, &state_params);
-    if (ret != 0 || state_params.rmStatus != 0) {
-        (void)uvm_driver_phase_f_unregister_region_fd(fd, region_id);
-        close(fd);
-        return ret != 0 ? -6 : -static_cast<int>(state_params.rmStatus);
-    }
-
-    PhaseNGetPoolStateParams state{};
-    state.pool = pool;
-    state.gpu_id = 0;
-    ret = ioctl(fd, UVM_PHASE_N_GET_POOL_STATE_IOCTL, &state);
-    if (ret != 0 || state.rmStatus != 0) {
-        (void)uvm_driver_phase_f_unregister_region_fd(fd, region_id);
-        close(fd);
-        return ret != 0 ? -6 : -static_cast<int>(state.rmStatus);
-    }
-
-    values_out[0] = state.budget_bytes;
-    values_out[1] = state.resident_gpu_bytes;
-    values_out[2] = state.resident_cpu_bytes;
-    values_out[3] = state.reclaim_bytes;
-    values_out[4] = state.protected_bytes;
-    values_out[5] = state.evictable_bytes;
-    values_out[6] = state.over_budget_bytes;
-    values_out[7] = state.reclaim_target_bytes;
-    values_out[8] = state.victim_candidate_bytes;
-    values_out[9] = state.victim_candidate_regions;
-    values_out[10] = state.selected_victim_region_id;
-    values_out[11] = state.selected_victim_bytes;
-    values_out[12] = state.victim_count;
-    values_out[13] = state.reserved;
-    for (size_t i = 0; i < 8; ++i) {
-        values_out[14 + i] = state.victim_region_ids[i];
-        values_out[22 + i] = state.victim_bytes[i];
-    }
-    values_out[30] = state.over_budget_events;
-    values_out[31] = state.reclaim_success_events;
-    values_out[32] = state.reclaim_failed_events;
-    values_out[33] = state.accounting_corrections;
-    values_out[34] = state.mode;
-    values_out[35] = state.flags;
-
-    (void)uvm_driver_phase_f_unregister_region_fd(fd, region_id);
-    close(fd);
-    return 1;
-}
-
-int uvm_driver_phase_n_query_region_internal(uint64_t region_id,
-                                             uint64_t* values_out,
-                                             size_t values_count) {
+int uvm_driver_query_region_internal(uint64_t region_id,
+                                     uint64_t* values_out,
+                                     size_t values_count) {
     if (values_out == nullptr || values_count < 4) return -2;
 
-    PhaseNQueryRegionParams params{};
+    QueryRegionParams params{};
     params.region_id = region_id;
     int final_ret = -1;
     int final_errno = 0;
 
     auto query_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
-        PhaseNQueryRegionParams attempt{};
+        QueryRegionParams attempt{};
         attempt.region_id = region_id;
 
-        phase_f_debug_log("driver_phase_n_query_region cmd=%u fd_source=%s source_fd=%d fd=%d path=%s id=%llu ioctl_begin",
-                          UVM_PHASE_N_QUERY_REGION_IOCTL,
+        phase_f_debug_log("driver_query_region cmd=%u fd_source=%s source_fd=%d fd=%d path=%s id=%llu ioctl_begin",
+                          UVM_QUERY_REGION_IOCTL,
                           fd_source,
                           source_fd,
                           fd,
                           path ? path : "",
                           static_cast<unsigned long long>(region_id));
-        int ret = ioctl(fd, UVM_PHASE_N_QUERY_REGION_IOCTL, &attempt);
+        int ret = ioctl(fd, UVM_QUERY_REGION_IOCTL, &attempt);
         int saved_errno = errno;
-        phase_f_debug_log("driver_phase_n_query_region cmd=%u fd_source=%s source_fd=%d fd=%d id=%llu ioctl_done ret=%d errno=%d rmStatus=%u base=0x%llx length=%llu state=%u",
-                          UVM_PHASE_N_QUERY_REGION_IOCTL,
+        phase_f_debug_log("driver_query_region cmd=%u fd_source=%s source_fd=%d fd=%d id=%llu ioctl_done ret=%d errno=%d rmStatus=%u base=0x%llx length=%llu state=%u",
+                          UVM_QUERY_REGION_IOCTL,
                           fd_source,
                           source_fd,
                           fd,
@@ -1675,20 +851,20 @@ int uvm_driver_phase_n_query_region_internal(uint64_t region_id,
     };
 
     int existing_result = apply_to_existing_uvm_fds(
-        "driver_phase_n_query_region",
+        "driver_query_region",
         [&](int fd, int source_fd, const char* path) {
             return query_on_fd(fd, "adopted", source_fd, path);
         });
 
     int persistent_result = -4;
     if (existing_result <= 0) {
-        int fd = get_phase_n_persistent_fd("driver_phase_n_query_region_persistent");
+        int fd = get_region_persistent_fd("driver_query_region_persistent");
         if (fd >= 0)
             persistent_result = query_on_fd(fd, "persistent", -1, "/dev/nvidia-uvm:persistent");
     }
 
-    phase_f_debug_log("driver_phase_n_query_region cmd=%u id=%llu ioctl_done ret=%d errno=%d rmStatus=%u base=0x%llx length=%llu state=%u",
-                      UVM_PHASE_N_QUERY_REGION_IOCTL,
+    phase_f_debug_log("driver_query_region cmd=%u id=%llu ioctl_done ret=%d errno=%d rmStatus=%u base=0x%llx length=%llu state=%u",
+                      UVM_QUERY_REGION_IOCTL,
                       static_cast<unsigned long long>(region_id),
                       final_ret,
                       final_errno,
@@ -1710,24 +886,24 @@ int uvm_driver_phase_n_query_region_internal(uint64_t region_id,
     return 1;
 }
 
-int uvm_driver_phase_n_query_region_by_va_internal(uintptr_t address,
-                                                   uint64_t* values_out,
-                                                   size_t values_count) {
+int uvm_driver_query_region_by_va_internal(uintptr_t address,
+                                           uint64_t* values_out,
+                                           size_t values_count) {
     if (values_out == nullptr || values_count < 4) return -2;
-    int fd = open_initialized_uvm_fd("driver_phase_n_query_region_by_va", true);
+    int fd = open_initialized_uvm_fd("driver_query_region_by_va", true);
     if (fd < 0) return -4;
 
-    PhaseNQueryRegionByVaParams params{};
+    QueryRegionByVaParams params{};
     params.address = static_cast<uint64_t>(address);
 
-    phase_f_debug_log("driver_phase_n_query_region_by_va cmd=%u address=0x%llx ioctl_begin",
-                      UVM_PHASE_N_QUERY_REGION_BY_VA_IOCTL,
+    phase_f_debug_log("driver_query_region_by_va cmd=%u address=0x%llx ioctl_begin",
+                      UVM_QUERY_REGION_BY_VA_IOCTL,
                       static_cast<unsigned long long>(params.address));
-    int ret = ioctl(fd, UVM_PHASE_N_QUERY_REGION_BY_VA_IOCTL, &params);
+    int ret = ioctl(fd, UVM_QUERY_REGION_BY_VA_IOCTL, &params);
     int saved_errno = errno;
     close(fd);
-    phase_f_debug_log("driver_phase_n_query_region_by_va cmd=%u address=0x%llx ioctl_done ret=%d errno=%d rmStatus=%u id=%llu state=%u",
-                      UVM_PHASE_N_QUERY_REGION_BY_VA_IOCTL,
+    phase_f_debug_log("driver_query_region_by_va cmd=%u address=0x%llx ioctl_done ret=%d errno=%d rmStatus=%u id=%llu state=%u",
+                      UVM_QUERY_REGION_BY_VA_IOCTL,
                       static_cast<unsigned long long>(params.address),
                       ret,
                       saved_errno,
@@ -1745,277 +921,6 @@ int uvm_driver_phase_n_query_region_by_va_internal(uintptr_t address,
     return 1;
 }
 
-int uvm_driver_phase_n_query_region_blocks_internal(uint64_t region_id,
-                                                    uint32_t gpu_id,
-                                                    uint64_t* values_out,
-                                                    size_t values_count) {
-    if (values_out == nullptr || values_count < 87) return -2;
-
-    PhaseNQueryRegionBlocksParams best_params{};
-    bool have_best = false;
-    int last_error = -4;
-
-    auto copy_values = [&]() {
-        values_out[0] = best_params.region_id;
-        values_out[1] = best_params.base;
-        values_out[2] = best_params.length;
-        values_out[3] = best_params.pool;
-        values_out[4] = best_params.layer_id;
-        values_out[5] = best_params.expert_id;
-        values_out[6] = best_params.role;
-        values_out[7] = best_params.flags;
-        values_out[8] = best_params.state;
-        values_out[9] = best_params.priority;
-        values_out[10] = best_params.va_range_count;
-        values_out[11] = best_params.logical_block_count;
-        values_out[12] = best_params.populated_block_count;
-        values_out[13] = best_params.resident_block_count;
-        values_out[14] = best_params.pending_block_count;
-        values_out[15] = best_params.materialized_block_count;
-        values_out[16] = best_params.mixed_block_count;
-        values_out[17] = best_params.resident_gpu_bytes;
-        values_out[18] = best_params.pending_gpu_bytes;
-        values_out[19] = best_params.first_block_start;
-        values_out[20] = best_params.last_block_end;
-        values_out[21] = best_params.sampled_block_count;
-        values_out[22] = best_params.rmStatus;
-        for (size_t i = 0; i < UVM_PHASE_N_REGION_BLOCK_TRACE_MAX; ++i) {
-            values_out[23 + i] = best_params.block_starts[i];
-            values_out[39 + i] = best_params.block_ends[i];
-            values_out[55 + i] = best_params.block_bytes[i];
-            values_out[71 + i] = best_params.block_states[i];
-        }
-    };
-
-    auto query_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
-        PhaseNQueryRegionBlocksParams params{};
-        params.region_id = region_id;
-        params.gpu_id = gpu_id;
-
-        phase_f_debug_log("driver_phase_n_query_region_blocks cmd=%u fd_source=%s source_fd=%d fd=%d path=%s id=%llu gpu_id=%u ioctl_begin",
-                          UVM_PHASE_N_QUERY_REGION_BLOCKS_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          path ? path : "",
-                          static_cast<unsigned long long>(region_id),
-                          gpu_id);
-        int ret = ioctl(fd, UVM_PHASE_N_QUERY_REGION_BLOCKS_IOCTL, &params);
-        int saved_errno = errno;
-        phase_f_debug_log("driver_phase_n_query_region_blocks cmd=%u fd_source=%s source_fd=%d fd=%d id=%llu ioctl_done ret=%d errno=%d rmStatus=%u pool=%u logical=%llu populated=%llu resident=%llu pending=%llu sampled=%u",
-                          UVM_PHASE_N_QUERY_REGION_BLOCKS_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          static_cast<unsigned long long>(region_id),
-                          ret,
-                          saved_errno,
-                          params.rmStatus,
-                          params.pool,
-                          static_cast<unsigned long long>(params.logical_block_count),
-                          static_cast<unsigned long long>(params.populated_block_count),
-                          static_cast<unsigned long long>(params.resident_block_count),
-                          static_cast<unsigned long long>(params.pending_block_count),
-                          params.sampled_block_count);
-
-        if (ret != 0) return -6;
-        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
-
-        best_params = params;
-        have_best = true;
-        return 1;
-    };
-
-    if (phase_f_adopt_cuda_uvm_fd_enabled()) {
-        std::vector<UvmFdCandidate> candidates =
-            collect_existing_uvm_fd_candidates("driver_phase_n_query_region_blocks");
-        for (const UvmFdCandidate& candidate : candidates) {
-            int fd = duplicate_uvm_fd_candidate("driver_phase_n_query_region_blocks", candidate);
-            if (fd < 0)
-                continue;
-            if (!initialize_duplicated_uvm_fd("driver_phase_n_query_region_blocks", fd, candidate)) {
-                close(fd);
-                continue;
-            }
-            int result = query_on_fd(fd, "adopted", candidate.source_fd, candidate.path.c_str());
-            close(fd);
-            if (result < 0) {
-                last_error = result;
-                continue;
-            }
-            if (best_params.populated_block_count > 0 ||
-                best_params.resident_block_count > 0 ||
-                best_params.pending_block_count > 0) {
-                copy_values();
-                return 1;
-            }
-        }
-        if (have_best) {
-            copy_values();
-            return 1;
-        }
-    }
-
-    int fd = get_phase_n_persistent_fd("driver_phase_n_query_region_blocks_persistent");
-    if (fd >= 0) {
-        int result = query_on_fd(fd, "persistent", -1, "/dev/nvidia-uvm:persistent");
-        if (result > 0 && have_best) {
-            copy_values();
-            return 1;
-        }
-        if (result < 0)
-            last_error = result;
-    }
-
-    fd = open_initialized_uvm_fd("driver_phase_n_query_region_blocks", false);
-    if (fd < 0)
-        return last_error;
-    int result = query_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
-    close(fd);
-    if (result < 0)
-        return result;
-    copy_values();
-    return 1;
-}
-
-int uvm_driver_phase_n_reclaim_region_internal(uint64_t region_id,
-                                               uint32_t gpu_id,
-                                               uint32_t async,
-                                               uint32_t flags,
-                                               uint32_t max_blocks,
-                                               uint64_t current_epoch,
-                                               uint64_t* values_out,
-                                               size_t values_count) {
-    if (values_out == nullptr || values_count < 79) return -2;
-
-    PhaseNReclaimRegionParams best_params{};
-    bool have_best = false;
-    int last_error = -4;
-
-    auto copy_values = [&]() {
-        values_out[0] = best_params.region_id;
-        values_out[1] = best_params.pool;
-        values_out[2] = best_params.skipped_protected;
-        values_out[3] = best_params.block_count;
-        values_out[4] = best_params.resident_blocks_before;
-        values_out[5] = best_params.resident_blocks_after;
-        values_out[6] = best_params.pending_blocks;
-        values_out[7] = best_params.attempted_blocks;
-        values_out[8] = best_params.success_blocks;
-        values_out[9] = best_params.failure_blocks;
-        values_out[10] = best_params.traced_blocks;
-        values_out[11] = best_params.attempted_bytes;
-        values_out[12] = best_params.reclaimed_bytes;
-        values_out[13] = best_params.failed_bytes;
-        values_out[14] = best_params.rmStatus;
-        for (size_t i = 0; i < UVM_PHASE_N_REGION_BLOCK_TRACE_MAX; ++i) {
-            values_out[15 + i] = best_params.block_starts[i];
-            values_out[31 + i] = best_params.block_ends[i];
-            values_out[47 + i] = best_params.block_bytes[i];
-            values_out[63 + i] = best_params.block_status[i];
-        }
-    };
-
-    auto reclaim_on_fd = [&](int fd, const char* fd_source, int source_fd, const char* path) {
-        PhaseNReclaimRegionParams params{};
-        params.region_id = region_id;
-        params.gpu_id = gpu_id;
-        params.async = async ? 1 : 0;
-        params.flags = flags;
-        params.max_blocks = max_blocks;
-        params.current_epoch = current_epoch;
-
-        phase_f_debug_log("driver_phase_n_reclaim_region cmd=%u fd_source=%s source_fd=%d fd=%d path=%s id=%llu gpu_id=%u async=%u flags=0x%x max_blocks=%u epoch=%llu ioctl_begin",
-                          UVM_PHASE_N_RECLAIM_REGION_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          path ? path : "",
-                          static_cast<unsigned long long>(region_id),
-                          gpu_id,
-                          async,
-                          flags,
-                          max_blocks,
-                          static_cast<unsigned long long>(current_epoch));
-        int ret = ioctl(fd, UVM_PHASE_N_RECLAIM_REGION_IOCTL, &params);
-        int saved_errno = errno;
-        phase_f_debug_log("driver_phase_n_reclaim_region cmd=%u fd_source=%s source_fd=%d fd=%d id=%llu ioctl_done ret=%d errno=%d rmStatus=%u pool=%u before=%llu after=%llu attempted=%u success=%u failure=%u reclaimed=%llu",
-                          UVM_PHASE_N_RECLAIM_REGION_IOCTL,
-                          fd_source,
-                          source_fd,
-                          fd,
-                          static_cast<unsigned long long>(region_id),
-                          ret,
-                          saved_errno,
-                          params.rmStatus,
-                          params.pool,
-                          static_cast<unsigned long long>(params.resident_blocks_before),
-                          static_cast<unsigned long long>(params.resident_blocks_after),
-                          params.attempted_blocks,
-                          params.success_blocks,
-                          params.failure_blocks,
-                          static_cast<unsigned long long>(params.reclaimed_bytes));
-
-        if (ret != 0) return -6;
-        if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
-
-        best_params = params;
-        have_best = true;
-        return 1;
-    };
-
-    if (phase_f_adopt_cuda_uvm_fd_enabled()) {
-        std::vector<UvmFdCandidate> candidates =
-            collect_existing_uvm_fd_candidates("driver_phase_n_reclaim_region");
-        for (const UvmFdCandidate& candidate : candidates) {
-            int fd = duplicate_uvm_fd_candidate("driver_phase_n_reclaim_region", candidate);
-            if (fd < 0)
-                continue;
-            if (!initialize_duplicated_uvm_fd("driver_phase_n_reclaim_region", fd, candidate)) {
-                close(fd);
-                continue;
-            }
-            int result = reclaim_on_fd(fd, "adopted", candidate.source_fd, candidate.path.c_str());
-            close(fd);
-            if (result < 0) {
-                last_error = result;
-                continue;
-            }
-            if (best_params.attempted_blocks > 0 ||
-                best_params.success_blocks > 0 ||
-                best_params.resident_blocks_before > 0) {
-                copy_values();
-                return 1;
-            }
-        }
-        if (have_best) {
-            copy_values();
-            return 1;
-        }
-    }
-
-    int fd = get_phase_n_persistent_fd("driver_phase_n_reclaim_region_persistent");
-    if (fd >= 0) {
-        int result = reclaim_on_fd(fd, "persistent", -1, "/dev/nvidia-uvm:persistent");
-        if (result > 0 && have_best) {
-            copy_values();
-            return 1;
-        }
-        if (result < 0)
-            last_error = result;
-    }
-
-    fd = open_initialized_uvm_fd("driver_phase_n_reclaim_region", false);
-    if (fd < 0)
-        return last_error;
-    int result = reclaim_on_fd(fd, "new", -1, "/dev/nvidia-uvm");
-    close(fd);
-    if (result < 0)
-        return result;
-    copy_values();
-    return 1;
-}
-
 int uvm_driver_phase_f_probe_existing_uvm_fd_internal() {
     int fd = adopt_existing_uvm_fd("driver_probe_existing_uvm_fd");
 
@@ -2027,52 +932,21 @@ int uvm_driver_phase_f_probe_existing_uvm_fd_internal() {
 }
 
 int uvm_driver_phase_f_ping_internal() {
-    // 构造正式 Phase F batch executor ioctl 的最小参数。
-    //
-    // 这里刻意设置 count=0：
-    //   - 不传任何 user pointer；
-    //   - 不访问 cudaMallocManaged allocation；
-    //   - 不进入 per-range query/prefetch/advise 逻辑；
-    //   - 只验证 batch executor ioctl 的空请求路径能否安全进入内核并返回。
-    //
-    // action 仍设置为 QUERY_RESIDENCY，是为了复用 batch executor 的标准参数格式；
-    // 由于 count=0，内核侧不会真正查询任何 range residency。
     phase_f_debug_log("driver_ping before_params_init");
     PhaseFBatchExecutorParams params{};
     params.action = UVM_TEST_PHASE_F_ACTION_QUERY_RESIDENCY;
     params.count = 0;
     params.async = 0;
-
-    // count=0 时 gpu_uuid 理论上不会被内核使用。
-    // 这里填 CPU_UUID 是一个安全占位，避免结构体字段未初始化。
     params.gpu_uuid = CPU_UUID;
     phase_f_debug_log("driver_ping after_gpu_uuid_init action=%u count=%u async=%u",
                       params.action, params.count, params.async);
 
-    // 打开 UVM 设备节点。
-    //
-    // 如果失败，通常说明：
-    //   - nvidia_uvm 模块没有加载；
-    //   - /dev/nvidia-uvm 不存在；
-    //   - 当前用户没有权限；
-    //   - driver 状态异常。
-    //
-    // 返回 -4 给 phase_f_smoke；shell 日志中会看到 step result 为负数。
-    
     int fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         phase_f_debug_log("driver_ping open_failed errno=%d", errno);
         return -4;
     }
 
-    // 初始化当前 fd 对应的 UVM file/VA space 状态。
-    //
-    // UVM_INITIALIZE_IOCTL 是普通 UVM 初始化入口，不是 Phase F 自定义 ioctl。
-    // 后续 test ioctl 使用 UVM_ROUTE_CMD_*_INIT_CHECK 路由时，需要这个初始化状态。
-    //
-    // 如果这里失败，函数会记录：
-    //   driver_ping init_failed errno=<errno> rmStatus=<rmStatus>
-    // 然后 close fd 并返回 -5。
     UvmInitializeParams init_params{};
     if (ioctl(fd, UVM_INITIALIZE_IOCTL, &init_params) != 0 ||
         init_params.rmStatus != 0) {
@@ -2083,63 +957,19 @@ int uvm_driver_phase_f_ping_internal() {
         return -5;
     }
 
-    // 到这里说明：
-    //   - /dev/nvidia-uvm 已经打开；
-    //   - UVM_INITIALIZE_IOCTL 已经成功；
-    //   - 接下来即将进入 Phase F batch executor test ioctl。
-    //
-    // 如果 crash 诊断日志最后停在 "driver_ping ioctl_begin"，
-    // 但没有 "driver_ping ioctl_done"，重点怀疑下面这个 ioctl
-    // 或其内核侧处理函数 uvm_test_phase_f_batch_executor()。
     unsigned int ioctl_cmd = phase_f_batch_ioctl_cmd();
     const char* ioctl_name = phase_f_batch_ioctl_name();
-
     phase_f_debug_log("driver_ping ioctl=%s cmd=%u ioctl_begin", ioctl_name, ioctl_cmd);
 
-    // 正式进入 Phase F batch executor ioctl。
-    //
-    // UVM_TEST_PHASE_F_BATCH_EXECUTOR_IOCTL 对应内核侧：
-    //   uvm_test_ioctl()
-    //     -> UVM_TEST_PHASE_F_BATCH_EXECUTOR
-    //     -> uvm_test_phase_f_batch_executor()
-    //
-    // 由于 params.count=0，内核侧期望行为是：
-    //   - 检查 count <= UVM_TEST_PHASE_F_MAX_RANGES；
-    //   - 清零 success_count/failure_count；
-    //   - 打印 begin/end；
-    //   - for 循环不执行；
-    //   - 返回 NV_OK。
     int ret = ioctl(fd, ioctl_cmd, &params);
-
-    // ioctl 返回后立刻保存 errno，因为 close() 或后续调用可能覆盖 errno。
     int saved_errno = errno;
-
-    // ioctl 已返回，关闭 fd。
     close(fd);
-
-    // 记录 ioctl 返回结果和内核写回的参数。
-    //
-    // 正常成功期望：
-    //   ret=0
-    //   errno 通常不重要
-    //   rmStatus=0
-    //   success_count=0
-    //   failure_count=0
-    //
-    // 如果日志能看到 ioctl_done，说明至少 ioctl 没有永久卡死或直接导致系统立刻崩溃。
     phase_f_debug_log("driver_ping ioctl=%s cmd=%u ioctl_done ret=%d errno=%d rmStatus=%u success=%u failure=%u",
                       ioctl_name, ioctl_cmd, ret, saved_errno, params.rmStatus,
                       params.success_count, params.failure_count);
 
-    // Linux ioctl 系统调用本身失败，例如返回 -1。
-    // 这里统一映射为 -6。
     if (ret != 0) return -6;
-
-    // ioctl 系统调用成功，但内核侧通过 rmStatus 返回 NVIDIA/UVM 错误。
-    // 这里转成负数返回，方便 run_step() 判定失败。
     if (params.rmStatus != 0) return -static_cast<int>(params.rmStatus);
-
-    // 完整成功：open、UVM initialize、Phase F batch executor 空 ioctl 都成功。
     return 0;
 }
 
@@ -2311,15 +1141,10 @@ static size_t weight_budget_bytes = 0;
 static std::string weight_budget_mode = "trace_only";
 static int weight_budget_cpu_offload_enable = 0;
 static int pool_registry_enabled = 0;
-static int driver_kv_tag_enable = 0;
 static int driver_scratch_tag_enable = 0;
 static int driver_scratch_budget_enforce = 0;
 static int driver_scratch_budget_enforce_warmup = 0;
 static size_t driver_scratch_budget_bytes = 0;
-static int driver_pool_state_snapshot_on_scratch_free = 0;
-static size_t driver_pool_state_snapshot_on_scratch_free_every = 1;
-static size_t driver_pool_state_snapshot_on_scratch_free_max = 4;
-static std::atomic<size_t> driver_pool_state_snapshot_records{0};
 static int scratch_pool_enable = 0;
 static size_t scratch_pool_budget_bytes = 1 * 1024 * 1024;
 static std::string scratch_pool_mode = "trace_only";
@@ -2537,15 +1362,6 @@ static std::atomic<size_t> driver_scratch_budget_over_allocs{0};
 /// @brief Stage N：driver scratch tag budget reservations released on free.
 static std::atomic<size_t> driver_scratch_budget_release_allocs{0};
 
-/// @brief Stage N P8e-a：allocator-side KV driver tag registrations.
-static std::atomic<size_t> driver_kv_tag_allocs{0};
-
-/// @brief Stage N P8e-a：allocator-side KV driver tag registration failures.
-static std::atomic<size_t> driver_kv_tag_failures{0};
-
-/// @brief Stage N P8e-a：allocator-side KV driver tag unregister calls.
-static std::atomic<size_t> driver_kv_untag_allocs{0};
-
 /// @brief Stage G：runtime scratch pool 准入控制参与评估的分配次数。
 static std::atomic<size_t> scratch_pool_trace_allocs{0};
 
@@ -2674,9 +1490,6 @@ struct AllocationInfo {
     bool pool_registry_tracked;      ///< Stage F：此分配是否纳入统一 pool registry。
     std::string pool_kind_name;      ///< Stage F：统一 pool 名称，如 kv_cache/weights/runtime_scratch。
     std::string pool_object_state;   ///< Stage F：对象状态，当前仅 telemetry active/freed。
-    bool driver_kv_region_registered; ///< Stage N P8e-a：是否已向 UVM driver 早注册 KV tag。
-    uint64_t driver_kv_region_id;     ///< Stage N P8e-a：allocator-side KV driver region id。
-    int driver_kv_register_status;    ///< Stage N P8e-a：KV driver register 返回值。
     bool driver_scratch_region_registered; ///< Stage N：是否已向 UVM driver 注册 scratch tag。
     uint64_t driver_scratch_region_id; ///< Stage N：scratch driver region id。
     int driver_scratch_register_status; ///< Stage N：driver register 返回值。
@@ -3193,7 +2006,7 @@ static PoolKind pool_kind_from_string(const std::string& value) {
     return PoolKind::OtherManaged;
 }
 
-static uint64_t phase_n_allocator_region_id(void* ptr, size_t alloc_id) {
+static uint64_t allocator_region_id(void* ptr, size_t alloc_id) {
     uint64_t value = reinterpret_cast<uintptr_t>(ptr);
     value ^= (static_cast<uint64_t>(alloc_id) + 0x9e3779b97f4a7c15ULL +
               (value << 6) + (value >> 2));
@@ -4563,11 +3376,6 @@ static void init_log_file() {
             ) ? 1 : 0;
         pool_registry_enabled =
             read_bool_from_env("VLLM_UVM_POOL_REGISTRY_ENABLE", false) ? 1 : 0;
-        driver_kv_tag_enable =
-            read_bool_from_env(
-                "VLLM_UVM_DRIVER_KV_TAG_ENABLE",
-                false
-            ) ? 1 : 0;
         driver_scratch_tag_enable =
             read_bool_from_env(
                 "VLLM_UVM_DRIVER_SCRATCH_TAG_ENABLE",
@@ -4587,23 +3395,6 @@ static void init_log_file() {
                 "VLLM_UVM_DRIVER_SCRATCH_BUDGET_ENFORCE_WARMUP",
                 false
             ) ? 1 : 0;
-        driver_pool_state_snapshot_on_scratch_free =
-            read_bool_from_env(
-                "VLLM_UVM_DRIVER_POOL_STATE_SNAPSHOT_ON_SCRATCH_FREE",
-                false
-            ) ? 1 : 0;
-        driver_pool_state_snapshot_on_scratch_free_every =
-            read_size_from_env(
-                "VLLM_UVM_DRIVER_POOL_STATE_SNAPSHOT_ON_SCRATCH_FREE_EVERY",
-                driver_pool_state_snapshot_on_scratch_free_every
-            );
-        if (driver_pool_state_snapshot_on_scratch_free_every == 0)
-            driver_pool_state_snapshot_on_scratch_free_every = 1;
-        driver_pool_state_snapshot_on_scratch_free_max =
-            read_size_from_env_allow_zero(
-                "VLLM_UVM_DRIVER_POOL_STATE_SNAPSHOT_ON_SCRATCH_FREE_MAX",
-                driver_pool_state_snapshot_on_scratch_free_max
-            );
         scratch_pool_enable =
             read_bool_from_env("VLLM_UVM_SCRATCH_POOL_ENABLE", false) ? 1 : 0;
         scratch_pool_budget_bytes = read_size_from_env_allow_zero(
@@ -4694,14 +3485,11 @@ static void init_log_file() {
                 "kv_budget_bytes=%zu kv_budget_mode=%s "
                 "weight_budget_bytes=%zu weight_budget_mode=%s "
                 "weight_budget_cpu_offload_enable=%d "
-                "pool_registry_enabled=%d driver_kv_tag_enable=%d "
+                "pool_registry_enabled=%d "
                 "driver_scratch_tag_enable=%d "
                 "driver_scratch_budget_enforce=%d "
                 "driver_scratch_budget_enforce_warmup=%d "
                 "driver_scratch_budget_bytes=%zu "
-                "driver_pool_state_snapshot_on_scratch_free=%d "
-                "driver_pool_state_snapshot_on_scratch_free_every=%zu "
-                "driver_pool_state_snapshot_on_scratch_free_max=%zu "
                 "scratch_pool_enable=%d scratch_pool_budget_bytes=%zu "
                 "scratch_pool_mode=%s scratch_pool_target_phases=%s "
                 "scratch_pool_reuse_cache_enable=%d "
@@ -4744,14 +3532,10 @@ static void init_log_file() {
                 weight_budget_mode.c_str(),
                 weight_budget_cpu_offload_enable,
                 pool_registry_enabled,
-                driver_kv_tag_enable,
                 driver_scratch_tag_enable,
                 driver_scratch_budget_enforce,
                 driver_scratch_budget_enforce_warmup,
                 driver_scratch_budget_bytes,
-                driver_pool_state_snapshot_on_scratch_free,
-                driver_pool_state_snapshot_on_scratch_free_every,
-                driver_pool_state_snapshot_on_scratch_free_max,
                 scratch_pool_enable,
                 scratch_pool_budget_bytes,
                 scratch_pool_mode.c_str(),
@@ -4906,60 +3690,6 @@ static void trace_free_event(void* ptr,
         current_total
     );
     fflush(log_file);
-}
-
-static void trace_driver_pool_state_snapshot(const char* trigger,
-                                             size_t event_id,
-                                             uint64_t scratch_region_id) {
-    if (!log_file) return;
-
-    constexpr uint32_t pools[] = {1, 2, 3};
-    constexpr const char* pool_names[] = {"kv", "weights", "scratch"};
-    uint64_t states[3][36] = {};
-    int statuses[3] = {
-        UVM_DRIVER_UNSUPPORTED_EXPLICIT_REGION_ONLY,
-        UVM_DRIVER_UNSUPPORTED_EXPLICIT_REGION_ONLY,
-        UVM_DRIVER_UNSUPPORTED_EXPLICIT_REGION_ONLY
-    };
-
-    {
-        std::lock_guard<std::mutex> lock(log_mutex);
-        for (size_t i = 0; i < 3; ++i) {
-            fprintf(
-                log_file,
-                "[%.3fs] TRACE_DRIVER_POOL_STATE_SNAPSHOT trigger=%s "
-                "event_id=%zu pool=%s pool_id=%u status=%d "
-                "budget_bytes=%llu resident_gpu_bytes=%llu "
-                "resident_cpu_bytes=%llu evictable_bytes=%llu "
-                "protected_bytes=%llu candidate_bytes=%llu "
-                "candidate_regions=%llu selected_victim_region_id=%llu "
-                "selected_victim_bytes=%llu victim_count=%llu "
-                "metadata_only=%llu "
-                "scratch_region_id=%llu\n",
-                get_elapsed_seconds(),
-                trigger ? trigger : "unknown",
-                event_id,
-                pool_names[i],
-                pools[i],
-                statuses[i],
-                static_cast<unsigned long long>(states[i][0]),
-                static_cast<unsigned long long>(states[i][1]),
-                static_cast<unsigned long long>(states[i][2]),
-                static_cast<unsigned long long>(states[i][5]),
-                static_cast<unsigned long long>(states[i][4]),
-                static_cast<unsigned long long>(states[i][8]),
-                static_cast<unsigned long long>(states[i][9]),
-                static_cast<unsigned long long>(states[i][10]),
-                static_cast<unsigned long long>(states[i][11]),
-                static_cast<unsigned long long>(states[i][12]),
-                static_cast<unsigned long long>(states[i][13]),
-                static_cast<unsigned long long>(scratch_region_id)
-            );
-        }
-        fflush(log_file);
-    }
-
-    driver_pool_state_snapshot_records.fetch_add(1);
 }
 
 static void trace_policy_event(void* ptr,
@@ -5805,9 +4535,6 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
     int driver_scratch_register_status = 0;
     bool driver_scratch_budget_reserved = false;
     bool driver_scratch_hard_reject = false;
-    bool driver_kv_region_registered = false;
-    uint64_t driver_kv_region_id = 0;
-    int driver_kv_register_status = 0;
     if (driver_scratch_tag_enable &&
             pool_registry_tracked &&
             pool_kind == PoolKind::RuntimeScratch &&
@@ -5823,7 +4550,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             (alloc_class != AllocationClass::WarmupWorkspace ||
              driver_scratch_budget_enforce_warmup != 0);
 
-        driver_scratch_region_id = phase_n_allocator_region_id(ptr, alloc_count);
+        driver_scratch_region_id = allocator_region_id(ptr, alloc_count);
         driver_scratch_budget_reserved = reserve_driver_scratch_budget(
             static_cast<size_t>(size),
             driver_scratch_enforce_this_alloc,
@@ -6298,48 +5025,6 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         }
     }
 
-    if (driver_kv_tag_enable &&
-            pool_kind == PoolKind::KvCache &&
-            strcmp(placement_backend, "managed") == 0 &&
-            ptr != NULL &&
-            static_cast<size_t>(size) > 0) {
-        driver_kv_region_id = phase_n_allocator_region_id(ptr, alloc_count);
-        driver_kv_register_status = uvm_driver_phase_f_register_region_internal(
-            driver_kv_region_id,
-            reinterpret_cast<uintptr_t>(ptr),
-            static_cast<size_t>(size)
-        );
-        driver_kv_region_registered = driver_kv_register_status >= 0;
-        if (driver_kv_region_registered) {
-            driver_kv_tag_allocs.fetch_add(1);
-        } else {
-            driver_kv_tag_failures.fetch_add(1);
-        }
-
-        if (log_file) {
-            std::lock_guard<std::mutex> lock(log_mutex);
-            fprintf(log_file,
-                    "[%.3fs] TRACE_DRIVER_KV_TAG alloc_id=%zu ptr=0x%llx "
-                    "size_bytes=%zu region_id=%llu status=%d registered=%d "
-                    "phase=%s predicted_class=%s pool_kind=%s placement_backend=%s "
-                    "role=kv_block flags=0x%x\n",
-                    get_elapsed_seconds(),
-                    alloc_count,
-                    static_cast<unsigned long long>(
-                        reinterpret_cast<uintptr_t>(ptr)),
-                    static_cast<size_t>(size),
-                    static_cast<unsigned long long>(driver_kv_region_id),
-                    driver_kv_register_status,
-                    driver_kv_region_registered ? 1 : 0,
-                    phase_snapshot.c_str(),
-                    allocation_class_to_string(alloc_class),
-                    pool_kind_to_string(pool_kind),
-                    placement_backend,
-                    (1u << 0));
-            fflush(log_file);
-        }
-    }
-
     if (weight_budget_tracked &&
             weight_budget_over_budget &&
             weight_budget_mode == "enforce" &&
@@ -6383,8 +5068,7 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         strcmp(placement_backend, "device_direct") == 0 ||
         kv_budget_tracked ||
         weight_budget_tracked ||
-        pool_registry_tracked ||
-        driver_kv_region_registered;
+        pool_registry_tracked;
 
     // 7.1 记录活跃分配元数据，供 free / gap watch / unknown detail 使用
     if (store_active_info) {
@@ -6426,9 +5110,6 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             pool_registry_tracked,
             pool_kind_to_string(pool_kind),
             pool_object_state,
-            driver_kv_region_registered,
-            driver_kv_region_id,
-            driver_kv_register_status,
             driver_scratch_region_registered,
             driver_scratch_region_id,
             driver_scratch_register_status,
@@ -6571,11 +5252,6 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
             it->second.pool_registry_tracked = pool_registry_tracked;
             it->second.pool_kind_name = pool_kind_to_string(pool_kind);
             it->second.pool_object_state = pool_object_state;
-            it->second.driver_kv_region_registered =
-                driver_kv_region_registered;
-            it->second.driver_kv_region_id = driver_kv_region_id;
-            it->second.driver_kv_register_status =
-                driver_kv_register_status;
             it->second.driver_scratch_region_registered =
                 driver_scratch_region_registered;
             it->second.driver_scratch_region_id = driver_scratch_region_id;
@@ -6832,54 +5508,8 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
         }
 
         if (has_info &&
-                info.driver_kv_region_registered &&
-                info.driver_kv_region_id != 0) {
-            int unregister_status = uvm_driver_phase_f_unregister_region_internal(
-                info.driver_kv_region_id
-            );
-            driver_kv_untag_allocs.fetch_add(1);
-            if (log_file) {
-                std::lock_guard<std::mutex> lock(log_mutex);
-                fprintf(log_file,
-                        "[%.3fs] TRACE_DRIVER_KV_UNTAG free_id=%zu "
-                        "ptr=0x%llx size_bytes=%zu region_id=%llu status=%d "
-                        "alloc_id=%zu phase=%s\n",
-                        get_elapsed_seconds(),
-                        free_count,
-                        static_cast<unsigned long long>(
-                            reinterpret_cast<uintptr_t>(ptr)),
-                        info.size,
-                        static_cast<unsigned long long>(
-                            info.driver_kv_region_id),
-                        unregister_status,
-                        info.alloc_id,
-                        phase_snapshot.c_str());
-                fflush(log_file);
-            }
-        }
-
-        if (has_info &&
                 info.driver_scratch_region_registered &&
                 info.driver_scratch_region_id != 0) {
-            if (driver_pool_state_snapshot_on_scratch_free) {
-                size_t snapshot_records =
-                    driver_pool_state_snapshot_records.load();
-                bool under_max =
-                    driver_pool_state_snapshot_on_scratch_free_max == 0 ||
-                    snapshot_records <
-                        driver_pool_state_snapshot_on_scratch_free_max;
-                bool on_interval =
-                    driver_pool_state_snapshot_on_scratch_free_every == 1 ||
-                    free_count %
-                        driver_pool_state_snapshot_on_scratch_free_every == 0;
-                if (under_max && on_interval) {
-                    trace_driver_pool_state_snapshot(
-                        "scratch_free_before_untag",
-                        free_count,
-                        info.driver_scratch_region_id
-                    );
-                }
-            }
             int unregister_status = uvm_driver_phase_f_unregister_region_internal(
                 info.driver_scratch_region_id
             );
@@ -7076,7 +5706,6 @@ void uvm_reset_all_stats(void) {
     pool_registry_free_success_allocs.store(0);
     pool_registry_live_objects.store(0);
     pool_registry_peak_live_objects.store(0);
-    driver_pool_state_snapshot_records.store(0);
     pool_kv_allocs.store(0);
     pool_kv_requested_bytes.store(0);
     pool_kv_live_bytes.store(0);
@@ -7097,9 +5726,6 @@ void uvm_reset_all_stats(void) {
     driver_scratch_budget_reject_allocs.store(0);
     driver_scratch_budget_over_allocs.store(0);
     driver_scratch_budget_release_allocs.store(0);
-    driver_kv_tag_allocs.store(0);
-    driver_kv_tag_failures.store(0);
-    driver_kv_untag_allocs.store(0);
     scratch_pool_trace_allocs.store(0);
     scratch_pool_eligible_allocs.store(0);
     scratch_pool_device_direct_allocs.store(0);
@@ -7220,14 +5846,6 @@ void uvm_close_log(void) {
             weight_budget_cpu_offload_failures.load());
     fprintf(log_file, "  Weight free success: %zu\n", weight_free_success_allocs.load());
     fprintf(log_file, "  Pool registry enabled: %d\n", pool_registry_enabled);
-    fprintf(log_file, "  Driver KV tag enabled: %d\n",
-            driver_kv_tag_enable);
-    fprintf(log_file, "  Driver KV tag allocations: %zu\n",
-            driver_kv_tag_allocs.load());
-    fprintf(log_file, "  Driver KV tag failures: %zu\n",
-            driver_kv_tag_failures.load());
-    fprintf(log_file, "  Driver KV untag allocations: %zu\n",
-            driver_kv_untag_allocs.load());
     fprintf(log_file, "  Driver scratch budget enforce: %d\n",
             driver_scratch_budget_enforce);
     fprintf(log_file, "  Driver scratch budget enforce warmup: %d\n",
@@ -7244,14 +5862,6 @@ void uvm_close_log(void) {
             driver_scratch_budget_reject_allocs.load());
     fprintf(log_file, "  Driver scratch budget release allocations: %zu\n",
             driver_scratch_budget_release_allocs.load());
-    fprintf(log_file, "  Driver pool state snapshot on scratch free: %d\n",
-            driver_pool_state_snapshot_on_scratch_free);
-    fprintf(log_file, "  Driver pool state snapshot on scratch free every: %zu\n",
-            driver_pool_state_snapshot_on_scratch_free_every);
-    fprintf(log_file, "  Driver pool state snapshot on scratch free max: %zu\n",
-            driver_pool_state_snapshot_on_scratch_free_max);
-    fprintf(log_file, "  Driver pool state snapshot records: %zu\n",
-            driver_pool_state_snapshot_records.load());
     fprintf(log_file, "  Pool registry tracked allocations: %zu\n",
             pool_registry_tracked_allocs.load());
     fprintf(log_file, "  Pool registry free success: %zu\n",
@@ -7799,184 +6409,29 @@ int uvm_is_managed_pointer(uintptr_t ptr, size_t size) {
 
 
 
-__attribute__((visibility("default")))
-int uvm_driver_phase_n_set_pool_budget(uint32_t pool,
-                                       uint32_t gpu_id,
-                                       uint64_t budget_bytes,
-                                       uint32_t mode,
-                                       uint32_t flags) {
-    (void)pool;
-    (void)gpu_id;
-    (void)budget_bytes;
-    (void)mode;
-    (void)flags;
-    return UVM_DRIVER_UNSUPPORTED_EXPLICIT_REGION_ONLY;
-}
-
-int uvm_driver_phase_n_get_pool_state(uint32_t pool,
-                                      uint32_t gpu_id,
-                                      uint64_t* values_out,
-                                      size_t values_count) {
-    (void)pool;
-    (void)gpu_id;
-    if (values_out != nullptr) {
-        for (size_t i = 0; i < values_count; ++i)
-            values_out[i] = 0;
-    }
-    return UVM_DRIVER_UNSUPPORTED_EXPLICIT_REGION_ONLY;
-}
-
-int uvm_driver_phase_n_set_dynamic_budgets(uint32_t gpu_id,
-                                           uint64_t epoch,
-                                           uint64_t managed_hbm_budget_bytes,
-                                           uint64_t safety_margin_bytes,
-                                           uint64_t scratch_workspace_bytes,
-                                           uint64_t kv_budget_bytes,
-                                           uint64_t expert_hot_budget_bytes,
-                                           uint64_t expert_streaming_budget_bytes,
-                                           uint32_t mode,
-                                           uint32_t flags,
-                                           uint64_t* values_out,
-                                           size_t values_count) {
-    (void)gpu_id;
-    (void)epoch;
-    (void)managed_hbm_budget_bytes;
-    (void)safety_margin_bytes;
-    (void)scratch_workspace_bytes;
-    (void)kv_budget_bytes;
-    (void)expert_hot_budget_bytes;
-    (void)expert_streaming_budget_bytes;
-    (void)mode;
-    (void)flags;
-    if (values_out != nullptr) {
-        for (size_t i = 0; i < values_count; ++i)
-            values_out[i] = 0;
-    }
-    return UVM_DRIVER_UNSUPPORTED_EXPLICIT_REGION_ONLY;
-}
-
-int uvm_driver_phase_n_protect_active_kv(uint32_t gpu_id,
-                                         uint64_t epoch,
-                                         uint64_t active_kv_bytes,
-                                         uint64_t managed_hbm_budget_bytes,
-                                         uint64_t safety_margin_bytes,
-                                         uint64_t scratch_workspace_bytes,
-                                         uint64_t region_id,
-                                         uint32_t mode,
-                                         uint32_t flags,
-                                         uint64_t* values_out,
-                                         size_t values_count) {
-    (void)gpu_id;
-    (void)epoch;
-    (void)active_kv_bytes;
-    (void)managed_hbm_budget_bytes;
-    (void)safety_margin_bytes;
-    (void)scratch_workspace_bytes;
-    (void)region_id;
-    (void)mode;
-    (void)flags;
-    if (values_out != nullptr) {
-        for (size_t i = 0; i < values_count; ++i)
-            values_out[i] = 0;
-    }
-    return UVM_DRIVER_UNSUPPORTED_EXPLICIT_REGION_ONLY;
-}
-
-int uvm_driver_phase_n_metadata_state_smoke(uint32_t pool,
-                                            uint64_t budget_bytes,
-                                            uint64_t* values_out,
-                                            size_t values_count) {
-    (void)pool;
-    (void)budget_bytes;
-    if (values_out != nullptr) {
-        for (size_t i = 0; i < values_count; ++i)
-            values_out[i] = 0;
-    }
-    return UVM_DRIVER_UNSUPPORTED_EXPLICIT_REGION_ONLY;
-}
-
-int uvm_driver_phase_n_reclaim_pool(uint32_t pool,
-                                    uint32_t gpu_id,
-                                    uint64_t target_bytes,
-                                    uint64_t current_epoch,
-                                    uint64_t cooldown_epochs,
-                                    uint32_t max_victims,
-                                    uint32_t async,
-                                    uint32_t flags,
-                                    uint64_t* values_out,
-                                    size_t values_count) {
-    (void)pool;
-    (void)gpu_id;
-    (void)target_bytes;
-    (void)current_epoch;
-    (void)cooldown_epochs;
-    (void)max_victims;
-    (void)async;
-    (void)flags;
-    if (values_out != nullptr) {
-        for (size_t i = 0; i < values_count; ++i)
-            values_out[i] = 0;
-    }
-    return UVM_DRIVER_UNSUPPORTED_EXPLICIT_REGION_ONLY;
-}
-
-int uvm_driver_phase_n_update_region_state(uint64_t region_id,
-                                           uint32_t state) {
-    return uvm_driver_phase_n_update_region_state_internal(
+int uvm_driver_update_region_state(uint64_t region_id,
+                                   uint32_t state) {
+    return uvm_driver_update_region_state_internal(
         region_id,
         state);
 }
 
-int uvm_driver_phase_n_query_region(uint64_t region_id,
-                                    uint64_t* values_out,
-                                    size_t values_count) {
-    return uvm_driver_phase_n_query_region_internal(
+int uvm_driver_query_region(uint64_t region_id,
+                            uint64_t* values_out,
+                            size_t values_count) {
+    return uvm_driver_query_region_internal(
         region_id,
         values_out,
         values_count);
 }
 
-int uvm_driver_phase_n_query_region_by_va(uintptr_t address,
-                                          uint64_t* values_out,
-                                          size_t values_count) {
-    return uvm_driver_phase_n_query_region_by_va_internal(
+int uvm_driver_query_region_by_va(uintptr_t address,
+                                  uint64_t* values_out,
+                                  size_t values_count) {
+    return uvm_driver_query_region_by_va_internal(
         address,
         values_out,
         values_count);
-}
-
-int uvm_driver_phase_n_query_region_blocks(uint64_t region_id,
-                                           uint32_t gpu_id,
-                                           uint64_t* values_out,
-                                           size_t values_count) {
-    (void)region_id;
-    (void)gpu_id;
-    if (values_out != nullptr) {
-        for (size_t i = 0; i < values_count; ++i)
-            values_out[i] = 0;
-    }
-    return UVM_DRIVER_UNSUPPORTED_EXPLICIT_REGION_ONLY;
-}
-
-int uvm_driver_phase_n_reclaim_region(uint64_t region_id,
-                                      uint32_t gpu_id,
-                                      uint32_t async,
-                                      uint32_t flags,
-                                      uint32_t max_blocks,
-                                      uint64_t current_epoch,
-                                      uint64_t* values_out,
-                                      size_t values_count) {
-    (void)region_id;
-    (void)gpu_id;
-    (void)async;
-    (void)flags;
-    (void)max_blocks;
-    (void)current_epoch;
-    if (values_out != nullptr) {
-        for (size_t i = 0; i < values_count; ++i)
-            values_out[i] = 0;
-    }
-    return UVM_DRIVER_UNSUPPORTED_EXPLICIT_REGION_ONLY;
 }
 
 int uvm_driver_phase_f_probe_existing_uvm_fd() {

@@ -42,6 +42,38 @@ def test_uvm_kv_tail_range_respects_block_boundaries() -> None:
     )
 
 
+def test_post_warmup_kv_rebalance_returns_control_fields_only(
+    monkeypatch: Any,
+) -> None:
+    runner = object.__new__(GPUModelRunner)
+    runner._collect_uvm_post_warmup_kv_tail_ranges = (  # type: ignore[method-assign]
+        lambda _target: (
+            [(0x100000, 0x2000)],
+            {"ok": True, "reason": "ranges_collected", "target_blocks": 4},
+        )
+    )
+    monkeypatch.setenv("VLLM_UVM_POST_WARMUP_KV_OFFLOAD_EXECUTOR", "cpp_batch")
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_offload_ranges_to_cpu_with_executor",
+        lambda ranges, *, sync, executor: (
+            len(ranges),
+            executor,
+            {"diagnostic": "unused"},
+            {"diagnostic": "unused"},
+        ),
+    )
+
+    result = runner.rebalance_uvm_kv_cache_after_warmup(4)
+
+    assert result == {
+        "ok": True,
+        "reason": "ranges_collected",
+        "target_blocks": 4,
+        "offload_complete": True,
+    }
+
+
 def test_pre_kv_stage_orders_expert_placement_before_kv(
     monkeypatch: Any,
 ) -> None:
@@ -152,38 +184,71 @@ def test_post_warmup_remote_read_runs_explicit_expert_placement(
     assert events == ["experts"]
 
 
+class _FakeExpertModule:
+    uvm_weight_executor = "cpp_batch"
+
+    def __init__(
+        self,
+        name: str,
+        region_ids: list[str],
+        events: list[str],
+        *,
+        release_error: Exception | None = None,
+    ) -> None:
+        self.name = name
+        self.region_ids = region_ids
+        self.events = events
+        self.release_error = release_error
+
+    def run_uvm_init_weight_offload(self) -> None:
+        self.events.append(f"release:{self.name}")
+        if self.release_error is not None:
+            raise self.release_error
+
+    def get_uvm_init_hot_expert_region_ids(self) -> list[str]:
+        self.events.append(f"collect:{self.name}")
+        return list(self.region_ids)
+
+    def set_uvm_init_hot_expert_state(self, state: str) -> None:
+        self.events.append(f"state:{self.name}:{state}")
+
+
+def _make_init_weight_placement_runner(
+    modules: list[object],
+    *,
+    matched_offload: Any | None = None,
+) -> Any:
+    return SimpleNamespace(
+        _uvm_init_weight_placement_done=False,
+        _run_uvm_matched_cpu_offload_manifest=(
+            matched_offload if matched_offload is not None else lambda: None
+        ),
+        _env_flag_enabled=lambda _name, default=False: True,
+        get_model=lambda: SimpleNamespace(modules=lambda: modules),
+    )
+
+
+def _patch_init_weight_placement_phase(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "uvm_enabled_allocation_phase",
+        lambda _reason: nullcontext(),
+    )
+
+
+def _unexpected_call(*_args: object, **_kwargs: object) -> None:
+    raise AssertionError("unexpected call")
+
+
 def test_init_weight_placement_releases_all_modules_before_one_hot_batch(
     monkeypatch: Any,
 ) -> None:
     events: list[str] = []
-
-    class FakeExpertModule:
-        uvm_weight_executor = "cpp_batch"
-
-        def __init__(self, name: str, region_ids: list[str]) -> None:
-            self.name = name
-            self.region_ids = region_ids
-
-        def run_uvm_init_weight_offload(self) -> None:
-            events.append(f"release:{self.name}")
-
-        def get_uvm_init_hot_expert_region_ids(self) -> list[str]:
-            events.append(f"collect:{self.name}")
-            return list(self.region_ids)
-
-        def set_uvm_init_hot_expert_state(self, state: str) -> None:
-            events.append(f"state:{self.name}:{state}")
-
     modules = [
-        FakeExpertModule("a", ["hot-a"]),
-        FakeExpertModule("b", ["hot-b"]),
+        _FakeExpertModule("a", ["hot-a"], events),
+        _FakeExpertModule("b", ["hot-b"], events),
     ]
-    model = SimpleNamespace(modules=lambda: modules)
-    runner = SimpleNamespace(
-        _run_uvm_matched_cpu_offload_manifest=lambda: 0,
-        _env_flag_enabled=lambda _name, default=False: True,
-        get_model=lambda: model,
-    )
+    runner = _make_init_weight_placement_runner(modules)
 
     def prepare(
         region_ids: list[str],
@@ -191,7 +256,7 @@ def test_init_weight_placement_releases_all_modules_before_one_hot_batch(
         device: int,
         executor: str,
     ) -> dict[str, object]:
-        assert events[:4] == [
+        assert events == [
             "release:a",
             "release:b",
             "collect:a",
@@ -208,11 +273,7 @@ def test_init_weight_placement_releases_all_modules_before_one_hot_batch(
         events.append(f"commit:{','.join(region_ids)}:{synchronized}")
         return {"ok": True}
 
-    monkeypatch.setattr(
-        gpu_model_runner_module,
-        "uvm_enabled_allocation_phase",
-        lambda _reason: nullcontext(),
-    )
+    _patch_init_weight_placement_phase(monkeypatch)
     monkeypatch.setattr(
         gpu_model_runner_module,
         "prepare_uvm_regions_for_gpu_placement",
@@ -223,14 +284,11 @@ def test_init_weight_placement_releases_all_modules_before_one_hot_batch(
         "commit_uvm_regions_gpu_placement",
         commit,
     )
-    monkeypatch.setattr(
-        gpu_model_runner_module.torch.cuda, "is_available", lambda: True
-    )
     monkeypatch.setattr(gpu_model_runner_module.torch.cuda, "current_device", lambda: 2)
     monkeypatch.setattr(
         gpu_model_runner_module.torch.cuda,
         "synchronize",
-        lambda device=None: events.append(f"sync:{device}"),
+        lambda device: events.append(f"sync:{device}"),
     )
 
     GPUModelRunner.run_uvm_init_time_weight_placement(runner)
@@ -240,8 +298,6 @@ def test_init_weight_placement_releases_all_modules_before_one_hot_batch(
         "release:b",
         "collect:a",
         "collect:b",
-        "state:a:prefetching_gpu",
-        "state:b:prefetching_gpu",
         "prepare:hot-a,hot-b:2:cpp_batch",
         "sync:2",
         "commit:hot-a,hot-b:True",
@@ -251,54 +307,141 @@ def test_init_weight_placement_releases_all_modules_before_one_hot_batch(
     assert runner._uvm_init_weight_placement_done is True
 
 
-def test_init_weight_placement_sync_failure_marks_hot_unknown(
-    monkeypatch: Any,
-) -> None:
-    states: list[str] = []
-    commits: list[bool] = []
-
-    module = SimpleNamespace(
-        uvm_weight_executor="cpp_batch",
-        run_uvm_init_weight_offload=lambda: None,
-        get_uvm_init_hot_expert_region_ids=lambda: ["hot"],
-        set_uvm_init_hot_expert_state=lambda state: states.append(state),
-    )
-    runner = SimpleNamespace(
-        _run_uvm_matched_cpu_offload_manifest=lambda: 0,
-        _env_flag_enabled=lambda _name, default=False: True,
-        get_model=lambda: SimpleNamespace(modules=lambda: [module]),
+def test_init_weight_placement_is_idempotent(monkeypatch: Any) -> None:
+    events: list[str] = []
+    module = _FakeExpertModule("a", ["hot"], events)
+    runner = _make_init_weight_placement_runner(
+        [module],
+        matched_offload=lambda: events.append("matched"),
     )
 
+    _patch_init_weight_placement_phase(monkeypatch)
+    monkeypatch.setattr(gpu_model_runner_module.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
-        gpu_model_runner_module,
-        "uvm_enabled_allocation_phase",
-        lambda _reason: nullcontext(),
+        gpu_model_runner_module.torch.cuda,
+        "synchronize",
+        lambda _device: events.append("sync"),
     )
     monkeypatch.setattr(
         gpu_model_runner_module,
         "prepare_uvm_regions_for_gpu_placement",
-        lambda *_args, **_kwargs: {"ok": True},
+        lambda *_args, **_kwargs: events.append("prepare") or {"ok": True},
     )
-
-    def commit(
-        _region_ids: list[str],
-        *,
-        synchronized: bool,
-    ) -> dict[str, object]:
-        commits.append(synchronized)
-        return {"ok": synchronized}
-
     monkeypatch.setattr(
         gpu_model_runner_module,
         "commit_uvm_regions_gpu_placement",
-        commit,
+        lambda *_args, **_kwargs: events.append("commit") or {"ok": True},
+    )
+
+    GPUModelRunner.run_uvm_init_time_weight_placement(runner)
+    GPUModelRunner.run_uvm_init_time_weight_placement(runner)
+
+    assert events == [
+        "matched",
+        "release:a",
+        "collect:a",
+        "prepare",
+        "sync",
+        "commit",
+        "state:a:gpu",
+        "matched",
+    ]
+
+
+def test_init_weight_placement_without_hot_experts_does_not_sync(
+    monkeypatch: Any,
+) -> None:
+    events: list[str] = []
+    runner = _make_init_weight_placement_runner([_FakeExpertModule("cold", [], events)])
+
+    _patch_init_weight_placement_phase(monkeypatch)
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda, "current_device", _unexpected_call
     )
     monkeypatch.setattr(
-        gpu_model_runner_module.torch.cuda, "is_available", lambda: True
+        gpu_model_runner_module.torch.cuda, "synchronize", _unexpected_call
     )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "prepare_uvm_regions_for_gpu_placement",
+        _unexpected_call,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "commit_uvm_regions_gpu_placement",
+        _unexpected_call,
+    )
+
+    GPUModelRunner.run_uvm_init_time_weight_placement(runner)
+
+    assert events == ["release:cold", "collect:cold"]
+    assert runner._uvm_init_weight_placement_done is True
+
+
+def test_init_weight_placement_prepare_failure_rolls_back_without_sync(
+    monkeypatch: Any,
+) -> None:
+    events: list[str] = []
+    runner = _make_init_weight_placement_runner(
+        [_FakeExpertModule("a", ["hot"], events)]
+    )
+
+    _patch_init_weight_placement_phase(monkeypatch)
     monkeypatch.setattr(gpu_model_runner_module.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda, "synchronize", _unexpected_call
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "prepare_uvm_regions_for_gpu_placement",
+        lambda *_args, **_kwargs: events.append("prepare") or {"ok": False},
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "commit_uvm_regions_gpu_placement",
+        lambda *_args, synchronized: (
+            events.append(f"commit:{synchronized}") or {"ok": False}
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Hot Expert prefetch failed"):
+        GPUModelRunner.run_uvm_init_time_weight_placement(runner)
+
+    assert events == [
+        "release:a",
+        "collect:a",
+        "prepare",
+        "commit:False",
+        "state:a:unknown",
+    ]
+    assert runner._uvm_init_weight_placement_done is False
+
+
+def test_init_weight_placement_sync_failure_marks_hot_unknown(
+    monkeypatch: Any,
+) -> None:
+    events: list[str] = []
+    runner = _make_init_weight_placement_runner(
+        [_FakeExpertModule("a", ["hot"], events)]
+    )
+
+    _patch_init_weight_placement_phase(monkeypatch)
+    monkeypatch.setattr(gpu_model_runner_module.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "prepare_uvm_regions_for_gpu_placement",
+        lambda *_args, **_kwargs: events.append("prepare") or {"ok": True},
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "commit_uvm_regions_gpu_placement",
+        lambda *_args, synchronized: (
+            events.append(f"commit:{synchronized}") or {"ok": False}
+        ),
+    )
 
     def fail_sync(_device: int) -> None:
+        events.append("sync")
         raise RuntimeError("mock sync failure")
 
     monkeypatch.setattr(gpu_model_runner_module.torch.cuda, "synchronize", fail_sync)
@@ -306,48 +449,138 @@ def test_init_weight_placement_sync_failure_marks_hot_unknown(
     with pytest.raises(RuntimeError, match="mock sync failure"):
         GPUModelRunner.run_uvm_init_time_weight_placement(runner)
 
-    assert commits == [False]
-    assert states == ["prefetching_gpu", "unknown"]
+    assert events == [
+        "release:a",
+        "collect:a",
+        "prepare",
+        "sync",
+        "commit:False",
+        "state:a:unknown",
+    ]
     assert runner._uvm_init_weight_placement_done is False
 
 
-def test_init_weight_placement_registration_failure_skips_hot_prefetch(
+def test_init_weight_placement_commit_failure_marks_hot_unknown(
     monkeypatch: Any,
 ) -> None:
     events: list[str] = []
-
-    def fail_registration() -> None:
-        events.append("register")
-        raise RuntimeError("Explicit UVM driver region registration failed")
-
-    module = SimpleNamespace(
-        uvm_weight_executor="cpp_batch",
-        run_uvm_init_weight_offload=fail_registration,
-        get_uvm_init_hot_expert_region_ids=lambda: events.append("collect") or ["hot"],
-        set_uvm_init_hot_expert_state=lambda state: events.append(f"state:{state}"),
-    )
-    runner = SimpleNamespace(
-        _run_uvm_matched_cpu_offload_manifest=lambda: 0,
-        _env_flag_enabled=lambda _name, default=False: True,
-        get_model=lambda: SimpleNamespace(modules=lambda: [module]),
+    runner = _make_init_weight_placement_runner(
+        [_FakeExpertModule("a", ["hot"], events)]
     )
 
+    _patch_init_weight_placement_phase(monkeypatch)
+    monkeypatch.setattr(gpu_model_runner_module.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda,
+        "synchronize",
+        lambda _device: events.append("sync"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "prepare_uvm_regions_for_gpu_placement",
+        lambda *_args, **_kwargs: events.append("prepare") or {"ok": True},
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "commit_uvm_regions_gpu_placement",
+        lambda *_args, synchronized: (
+            events.append(f"commit:{synchronized}") or {"ok": False}
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Hot Expert placement commit failed"):
+        GPUModelRunner.run_uvm_init_time_weight_placement(runner)
+
+    assert events == [
+        "release:a",
+        "collect:a",
+        "prepare",
+        "sync",
+        "commit:True",
+        "commit:False",
+        "state:a:unknown",
+    ]
+    assert runner._uvm_init_weight_placement_done is False
+
+
+def test_init_weight_placement_cold_failure_skips_hot_prefetch(
+    monkeypatch: Any,
+) -> None:
+    events: list[str] = []
+    modules = [
+        _FakeExpertModule("a", ["hot-a"], events),
+        _FakeExpertModule(
+            "b",
+            ["hot-b"],
+            events,
+            release_error=RuntimeError("Cold Expert release failed"),
+        ),
+    ]
+    runner = _make_init_weight_placement_runner(modules)
+
+    _patch_init_weight_placement_phase(monkeypatch)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "prepare_uvm_regions_for_gpu_placement",
+        _unexpected_call,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "commit_uvm_regions_gpu_placement",
+        _unexpected_call,
+    )
+
+    with pytest.raises(RuntimeError, match="Cold Expert release failed"):
+        GPUModelRunner.run_uvm_init_time_weight_placement(runner)
+
+    assert events == ["release:a", "release:b"]
+    assert runner._uvm_init_weight_placement_done is False
+
+
+def test_incremental_expert_worker_protocol_is_minimal(
+    monkeypatch: Any,
+) -> None:
+    class ExpertModule:
+        layer_name = "layer.7"
+        uvm_incremental_expert_offload_enable = True
+
+        @staticmethod
+        def uvm_next_incremental_expert(expert_class: str) -> int | None:
+            return 6 if expert_class == "cold" else None
+
+        @staticmethod
+        def has_remaining_uvm_incremental_experts(expert_class: str) -> bool:
+            return expert_class == "cold"
+
+        @staticmethod
+        def run_uvm_incremental_weight_offload(
+            *, allow_warm: bool, selected_global_expert_id: int | None
+        ) -> dict[str, object]:
+            assert allow_warm is False
+            return {
+                "ok": True,
+                "released_experts": [selected_global_expert_id],
+            }
+
+    module = ExpertModule()
+    runner = object.__new__(GPUModelRunner)
+    runner.get_model = lambda: SimpleNamespace(modules=lambda: [module])  # type: ignore[method-assign]
+    runner._env_flag_enabled = lambda *_args, **_kwargs: True  # type: ignore[method-assign]
     monkeypatch.setattr(
         gpu_model_runner_module,
         "uvm_enabled_allocation_phase",
         lambda _reason: nullcontext(),
     )
-    monkeypatch.setattr(
-        gpu_model_runner_module,
-        "prepare_uvm_regions_for_gpu_placement",
-        lambda *_args, **_kwargs: events.append("prefetch") or {"ok": True},
+
+    candidates = GPUModelRunner.get_uvm_incremental_expert_offload_candidates(
+        runner, "cold"
     )
-
-    with pytest.raises(RuntimeError, match="driver region registration failed"):
-        GPUModelRunner.run_uvm_init_time_weight_placement(runner)
-
-    assert events == ["register"]
-    assert runner._uvm_init_weight_placement_done is False
+    assert candidates == {"ok": True, "candidates": {"layer.7": 6}}
+    assert GPUModelRunner.run_uvm_incremental_expert_offload(
+        runner,
+        False,
+        {"layer.7": 6},
+    ) == {"ok": True}
 
 
 def _make_worker_resize_runner() -> GPUModelRunner:
@@ -420,22 +653,13 @@ def test_worker_exact_kv_resize_runs_shrink_before_grow(
     result = runner.resize_uvm_kv_cache_target(
         3,
         5,
-        "mixed-reconciliation",
         [4, 5, 6],
-        "plan-token",
     )
 
-    assert result["ok"] is True
-    assert result["plan_token"] == "plan-token"
-    assert result["requested_cpu_block_ids"] == [6]
-    assert result["requested_gpu_block_ids"] == [4, 5]
-    assert result["completed_cpu_block_ids"] == [6]
-    assert result["completed_gpu_block_ids"] == [4, 5]
-    assert result["synchronized"] is True
+    assert result == {"ok": True, "made_progress": True}
     assert events == [
         ("collect", (6,)),
         ("offload", 1),
-        ("sync", 0),
         ("collect", (4, 5)),
         ("prefetch", 2),
         ("sync", 0),
@@ -483,18 +707,10 @@ def test_worker_partial_kv_resize_only_reports_complete_direction(
     result = runner.resize_uvm_kv_cache_target(
         3,
         5,
-        "partial-reconciliation",
         [4, 5, 6],
-        "partial-token",
     )
 
-    assert result["ok"] is False
-    assert result["reason"] == "partial"
-    assert result["made_progress"] is True
-    assert result["completed_block_ids"] == [6]
-    assert result["completed_cpu_block_ids"] == [6]
-    assert result["completed_gpu_block_ids"] == []
-    assert result["synchronized"] is True
+    assert result == {"ok": False, "made_progress": True}
 
 
 def test_worker_kv_resize_sync_failure_never_reports_completion(
@@ -537,13 +753,7 @@ def test_worker_kv_resize_sync_failure_never_reports_completion(
     result = runner.resize_uvm_kv_cache_target(
         3,
         5,
-        "sync-failure",
         [],
-        "sync-token",
     )
 
-    assert result["ok"] is False
-    assert result["reason"] == "migration_or_sync_exception"
-    assert result["made_progress"] is True
-    assert result["completed_block_ids"] == []
-    assert result["synchronized"] is False
+    assert result == {"ok": False, "made_progress": True}

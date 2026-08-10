@@ -11,7 +11,6 @@ from vllm.device_allocator.uvm_region import (
     KernelRegion,
     RegionState,
     compile_expert_envelopes,
-    update_aggregate_state,
 )
 from vllm.model_executor.layers.fused_moe import layer as layer_module
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
@@ -62,78 +61,6 @@ def test_compile_expert_envelopes_rejects_shared_ownership() -> None:
         )
 
 
-def test_aggregate_state_requires_every_envelope() -> None:
-    record = ExpertRecord(
-        layer_id=7,
-        global_expert_id=3,
-        envelope_region_ids=["first", "second"],
-    )
-
-    state = update_aggregate_state(
-        record,
-        {"first": RegionState.CPU, "second": RegionState.UNKNOWN},
-        target=RegionState.CPU,
-    )
-    assert state == RegionState.UNKNOWN
-
-    state = update_aggregate_state(
-        record,
-        {"first": RegionState.CPU, "second": RegionState.CPU},
-        target=RegionState.CPU,
-    )
-    assert state == RegionState.CPU
-
-
-def test_registry_moves_only_named_expert_regions() -> None:
-    registry = ExplicitRegionRegistry()
-    first = registry.register_region("first", 0x100000, 0x80000, "gpu")
-    second = registry.register_region("second", 0x180000, 0x80000, "gpu")
-    untouched = registry.register_region("untouched", 0x200000, 0x80000, "gpu")
-    record = ExpertRecord(
-        layer_id=7,
-        global_expert_id=3,
-        aggregate_state=RegionState.GPU,
-        envelope_region_ids=[first.region_id, second.region_id],
-    )
-    registry.register_expert(record)
-    moved: list[tuple[int, int]] = []
-
-    result = registry.release_regions(
-        record.envelope_region_ids,
-        lambda base, length: moved.append((base, length)) or True,
-    )
-    registry.update_expert_state(record.key, RegionState.CPU)
-
-    assert result["ok"] is True
-    assert record.aggregate_state == RegionState.CPU
-    assert moved == [(first.base, first.length), (second.base, second.length)]
-    assert untouched.state == RegionState.GPU
-
-
-def test_registry_marks_partial_move_unknown() -> None:
-    registry = ExplicitRegionRegistry()
-    first = registry.register_region("first", 0x100000, 0x80000, "gpu")
-    second = registry.register_region("second", 0x180000, 0x80000, "gpu")
-    record = ExpertRecord(
-        layer_id=7,
-        global_expert_id=3,
-        aggregate_state=RegionState.GPU,
-        envelope_region_ids=[first.region_id, second.region_id],
-    )
-    registry.register_expert(record)
-
-    result = registry.release_regions(
-        record.envelope_region_ids,
-        lambda base, _length: base == first.base,
-    )
-    registry.update_expert_state(record.key, RegionState.CPU)
-
-    assert result["ok"] is False
-    assert record.aggregate_state == RegionState.UNKNOWN
-    assert first.state == RegionState.CPU
-    assert second.state == RegionState.UNKNOWN
-
-
 def test_registry_unknown_requires_conservative_executor() -> None:
     registry = ExplicitRegionRegistry()
     region = registry.register_region("unknown", 0x100000, 0x80000)
@@ -171,9 +98,7 @@ def test_pool_unknown_release_and_restore_issue_physical_ops(
         release_calls.append({"region_ids": list(region_ids), **kwargs})
         return {
             "ok": True,
-            "entries": [
-                {"region_id": region_id, "ok": True} for region_id in region_ids
-            ],
+            "statuses": {region_id: True for region_id in region_ids},
         }
 
     monkeypatch.setattr(residency_module, "driver_release_regions", release)
@@ -188,6 +113,7 @@ def test_pool_unknown_release_and_restore_issue_physical_ops(
     assert released["ok"] is True
     assert release_calls[0]["device"] == 2
     assert release_calls[0]["remote_read"] is True
+    assert "return_entries" not in release_calls[0]
     assert region.state == RegionState.CPU
 
     # CPU residency alone does not prove that remote-read PTEs still exist, so
@@ -229,6 +155,38 @@ def test_pool_unknown_release_and_restore_issue_physical_ops(
     assert restored["ok"] is True
     assert prefetch_calls == [([(region.base, region.length)], 3, "cpp_batch")]
     assert region.state == RegionState.GPU
+
+
+def test_pool_release_commits_each_driver_status_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        residency_module,
+        "_EXPLICIT_REGION_REGISTRY",
+        ExplicitRegionRegistry(),
+    )
+    monkeypatch.setattr(residency_module, "driver_register_region", lambda **_: 0)
+    monkeypatch.setattr(residency_module, "driver_update_region_state", lambda **_: 0)
+    first = residency_module.register_uvm_region("release-first", 0x100000, 0x80000)
+    second = residency_module.register_uvm_region("release-second", 0x180000, 0x80000)
+
+    def release(
+        region_ids: list[int],
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        return {"ok": False, "statuses": {region_ids[0]: True}}
+
+    monkeypatch.setattr(residency_module, "driver_release_regions", release)
+
+    result = residency_module.release_uvm_regions([first.region_id, second.region_id])
+
+    assert result["ok"] is False
+    assert result["statuses"] == {
+        first.region_id: True,
+        second.region_id: False,
+    }
+    assert first.state == RegionState.CPU
+    assert second.state == RegionState.UNKNOWN
 
 
 def test_driver_region_registration_failure_is_fail_fast(
@@ -313,7 +271,7 @@ def test_layer_propagates_driver_region_registration_failure(
     assert registry.regions == {}
 
 
-def test_hot_prepare_merges_ranges_and_commits_only_after_sync(
+def test_hot_prepare_preserves_adjacent_allocation_boundaries_until_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -348,8 +306,8 @@ def test_hot_prepare_merges_ranges_and_commits_only_after_sync(
         executor="cpp_batch",
     )
 
-    assert prepared["ok"] is True
-    assert batches == [[(0x100000, 0x100000)]]
+    assert prepared == {"ok": True, "reason": "prefetch_submitted"}
+    assert batches == [[(0x100000, 0x80000), (0x180000, 0x80000)]]
     assert residency_module.query_uvm_region_states(
         [first.region_id, second.region_id]
     ) == {
@@ -361,7 +319,7 @@ def test_hot_prepare_merges_ranges_and_commits_only_after_sync(
         [first.region_id, second.region_id], synchronized=True
     )
 
-    assert committed["ok"] is True
+    assert committed == {"ok": True, "reason": "committed"}
     assert residency_module.query_uvm_region_states(
         [first.region_id, second.region_id]
     ) == {
@@ -392,8 +350,7 @@ def test_hot_prepare_partial_batch_marks_every_region_unknown(
         [first.region_id, second.region_id], executor="cpp_batch"
     )
 
-    assert result["ok"] is False
-    assert result["range_count"] == 2
+    assert result == {"ok": False, "reason": "prefetch_incomplete"}
     assert residency_module.query_uvm_region_states(
         [first.region_id, second.region_id]
     ) == {
@@ -437,8 +394,7 @@ def test_hot_prepare_driver_state_failure_rolls_every_region_unknown(
         [first.region_id, second.region_id]
     )
 
-    assert result["ok"] is False
-    assert result["reason"] == "driver_state_update_failed"
+    assert result == {"ok": False, "reason": "driver_state_update_failed"}
     assert prefetch_calls == []
     assert update_states == [4, 4, 0, 0]
     assert first.state == RegionState.UNKNOWN
@@ -481,9 +437,8 @@ def test_hot_commit_driver_state_exception_rolls_every_region_unknown(
         synchronized=True,
     )
 
-    assert prepared["ok"] is True
-    assert committed["ok"] is False
-    assert committed["reason"] == "driver_state_update_failed"
+    assert prepared == {"ok": True, "reason": "prefetch_submitted"}
+    assert committed == {"ok": False, "reason": "driver_state_update_failed"}
     assert update_states == [4, 4, 3, 3, 0, 0]
     assert first.state == RegionState.UNKNOWN
     assert second.state == RegionState.UNKNOWN

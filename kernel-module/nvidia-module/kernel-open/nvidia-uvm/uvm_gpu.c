@@ -723,9 +723,6 @@ gpu_fault_stats_print_common(uvm_parent_gpu_t *parent_gpu, struct seq_file *s)
     NvU64 kv_ratio_x100 = replayable_faults > 0 ? (kv_faults * 10000ULL) / replayable_faults : 0;
     NvU64 kv_after_dedup_ratio_x100 = replayable_after_dedup > 0 ?
                                       (kv_after_dedup * 10000ULL) / replayable_after_dedup : 0;
-    NvU32 pool;
-    NvU32 role;
-
     UVM_ASSERT(uvm_procfs_is_debug_enabled());
 
     UVM_SEQ_OR_DBG_PRINT(s, "replayable_faults      %llu\n", replayable_faults);
@@ -740,72 +737,6 @@ gpu_fault_stats_print_common(uvm_parent_gpu_t *parent_gpu, struct seq_file *s)
     UVM_SEQ_OR_DBG_PRINT(s, "kv_after_dedup_ratio   %llu.%02llu%%\n",
                          kv_after_dedup_ratio_x100 / 100ULL,
                          kv_after_dedup_ratio_x100 % 100ULL);
-    UVM_SEQ_OR_DBG_PRINT(s, "faults_by_phase_n_pool:\n");
-    for (pool = 0; pool < UVM_GPU_FAULT_STATS_PHASE_N_POOL_MAX; ++pool) {
-        UVM_SEQ_OR_DBG_PRINT(s, "  pool_%u               %llu\n",
-                             pool,
-                             parent_gpu->fault_buffer.replayable.stats.num_phase_n_faults_by_pool[pool]);
-    }
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_duplicate_faults_by_pool:\n");
-    for (pool = 0; pool < UVM_GPU_FAULT_STATS_PHASE_N_POOL_MAX; ++pool) {
-        UVM_SEQ_OR_DBG_PRINT(s, "  pool_%u               %llu\n",
-                             pool,
-                             parent_gpu->fault_buffer.replayable.stats.num_phase_n_duplicate_faults_by_pool[pool]);
-    }
-    UVM_SEQ_OR_DBG_PRINT(s, "faults_by_phase_n_role:\n");
-    for (role = 0; role < UVM_GPU_FAULT_STATS_PHASE_N_ROLE_MAX; ++role) {
-        UVM_SEQ_OR_DBG_PRINT(s, "  role_%u               %llu\n",
-                             role,
-                             parent_gpu->fault_buffer.replayable.stats.num_phase_n_faults_by_role[role]);
-    }
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_duplicate_faults_by_role:\n");
-    for (role = 0; role < UVM_GPU_FAULT_STATS_PHASE_N_ROLE_MAX; ++role) {
-        UVM_SEQ_OR_DBG_PRINT(s, "  role_%u               %llu\n",
-                             role,
-                             parent_gpu->fault_buffer.replayable.stats.num_phase_n_duplicate_faults_by_role[role]);
-    }
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_unregistered_faults %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_unregistered_faults);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_unregistered_duplicate_faults %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_unregistered_duplicate_faults);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_dispatches %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_dispatches);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_faults_serviced %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_faults_serviced);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_forced_readdup_faults %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_forced_readdup_faults);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_forced_readdup_pages %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_forced_readdup_pages);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_fastpath_dispatches %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_dispatches);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_fastpath_faults_serviced %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_faults_serviced);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_fastpath_pages %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_pages);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_fastpath_fallbacks %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_fallbacks);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_migrate_fastpath_ranges %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_migrate_fastpath_ranges);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_migrate_fastpath_pages %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_migrate_fastpath_pages);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_migrate_fastpath_fallbacks %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_migrate_fastpath_fallbacks);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_prefetch_waits %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_prefetch_waits);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_prefetch_wait_successes %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_prefetch_wait_successes);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_expert_prefetch_wait_timeouts %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_expert_prefetch_wait_timeouts);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_reserved_fault_policy_violations %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_reserved_fault_policy_violations);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_reserved_migrate_policy_violations %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_reserved_migrate_policy_violations);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_reserved_pool_external_alloc_attempts %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_reserved_pool_external_alloc_attempts);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_non_expert_managed_dispatches %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_non_expert_managed_dispatches);
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_non_expert_managed_faults_serviced %llu\n",
-                         parent_gpu->fault_buffer.replayable.stats.num_phase_n_non_expert_managed_faults_serviced);
     UVM_SEQ_OR_DBG_PRINT(s, "faults_by_access_type:\n");
     UVM_SEQ_OR_DBG_PRINT(s, "  prefetch             %llu\n",
                          parent_gpu->fault_buffer.replayable.stats.num_prefetch_faults);
@@ -2046,18 +1977,6 @@ static void update_stats_parent_gpu_fault_instance(uvm_parent_gpu_t *parent_gpu,
     ++parent_gpu->stats.num_replayable_faults;
 }
 
-static void update_stats_parent_gpu_phase_n_fault_instance(uvm_parent_gpu_t *parent_gpu,
-                                                           uvm_va_space_t *va_space,
-                                                           const uvm_fault_buffer_entry_t *fault_entry,
-                                                           bool is_duplicate)
-{
-    /* Explicit regions are not classified by pool/role in the fault path. */
-    (void)parent_gpu;
-    (void)va_space;
-    (void)fault_entry;
-    (void)is_duplicate;
-}
-
 static void update_stats_fault_cb(uvm_va_space_t *va_space,
                                   uvm_perf_event_t event_id,
                                   uvm_perf_event_data_t *event_data)
@@ -2081,17 +2000,9 @@ static void update_stats_fault_cb(uvm_va_space_t *va_space,
     // Update the stats using the representative fault entry and the rest of
     // instances
     update_stats_parent_gpu_fault_instance(parent_gpu, fault_entry, event_data->fault.gpu.is_duplicate);
-    update_stats_parent_gpu_phase_n_fault_instance(parent_gpu,
-                                                   va_space,
-                                                   fault_entry,
-                                                   event_data->fault.gpu.is_duplicate);
 
     list_for_each_entry(fault_instance, &fault_entry->merged_instances_list, merged_instances_list) {
         update_stats_parent_gpu_fault_instance(parent_gpu, fault_instance, event_data->fault.gpu.is_duplicate);
-        update_stats_parent_gpu_phase_n_fault_instance(parent_gpu,
-                                                       va_space,
-                                                       fault_instance,
-                                                       event_data->fault.gpu.is_duplicate);
     }
 }
 

@@ -74,26 +74,6 @@ struct seq_file;
 // Note that this means user space will get best allocation efficiency if it
 // allocates memory in 2^UVM_VA_BLOCK_BITS naturally-aligned chunks.
 
-typedef struct
-{
-    struct list_head queue_node;
-    NvU64 region_id;
-    NvU64 allocation_id;
-    NvU64 resident_epoch;
-    NvU64 last_access_epoch;
-    NvU32 pool;
-    NvU32 role;
-    NvU32 flags;
-    NvBool tag_valid;
-    NvBool materialized;
-    NvBool gpu_resident;
-    NvBool gpu_resident_pending;
-    NvBool queued;
-    NvBool in_reclaim;
-    NvBool mixed_pool;
-    NvBool stale;
-} uvm_phase_n_va_block_state_t;
-
 // enums used for indexing into the array of pte_bits bitmaps in the VA block
 // which hold the current state of each PTE. For a given {processor, PTE}, the
 // bits represented here must be enough to re-create the non-address portion of
@@ -346,23 +326,6 @@ struct uvm_va_block_struct
     // write mode.
     NvU64 start;
     NvU64 end;
-
-    // Stage N native fast-path state. This is active only when
-    // uvm_phase_n_native_block_enable is set, and is otherwise inert.
-    uvm_phase_n_va_block_state_t phase_n;
-
-    // Experimental expert-prefetch handoff. When enabled, API prefetch marks
-    // expert-tagged blocks before walking them. Replayable faults hitting the
-    // same block can wait for the prefetch path instead of launching their own
-    // make-resident work.
-    struct
-    {
-        uvm_page_mask_t pages;
-        uvm_processor_id_t dst_id;
-        wait_queue_head_t wait_queue;
-        bool active;
-        bool submitted;
-    } phase_n_expert_prefetch;
 
     // Per-processor residency bit vector, used for fast lookup of which
     // processors are active in this block.
@@ -1795,28 +1758,6 @@ NV_STATUS uvm_va_block_migrate_locked(uvm_va_block_t *va_block,
                                       uvm_processor_id_t dest_id,
                                       uvm_migrate_mode_t mode,
                                       uvm_tracker_t *out_tracker);
-
-extern unsigned uvm_phase_n_expert_prefetch_wait_enable;
-extern unsigned uvm_phase_n_expert_prefetch_wait_timeout_ms;
-
-void uvm_va_block_expert_prefetch_mark_pending(uvm_va_block_t *va_block,
-                                               uvm_processor_id_t dst_id,
-                                               uvm_va_block_region_t region);
-
-void uvm_va_block_expert_prefetch_mark_submitted(uvm_va_block_t *va_block,
-                                                 uvm_processor_id_t dst_id);
-
-void uvm_va_block_expert_prefetch_clear_pending(uvm_va_block_t *va_block,
-                                                uvm_processor_id_t dst_id,
-                                                uvm_va_block_region_t region);
-
-bool uvm_va_block_expert_prefetch_page_pending(uvm_va_block_t *va_block,
-                                               uvm_processor_id_t dst_id,
-                                               uvm_page_index_t page_index);
-
-bool uvm_va_block_expert_prefetch_wait(uvm_va_block_t *va_block,
-                                       uvm_processor_id_t dst_id,
-                                       unsigned timeout_ms);
 
 // Write block's data from a CPU buffer
 //

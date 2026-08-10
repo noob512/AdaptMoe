@@ -68,80 +68,6 @@ typedef struct
     NvU32 state;
 } uvm_phase_f_region_t;
 
-#ifndef UVM_PHASE_N_TRACE_VICTIM_MAX
-#define UVM_PHASE_N_TRACE_VICTIM_MAX 8
-#endif
-
-#define UVM_PHASE_N_POOL_STATE_MAX 5
-
-typedef struct
-{
-    NvU64 budget_bytes;
-    NvU64 resident_gpu_bytes;
-    NvU64 pending_gpu_bytes;
-    NvU64 resident_cpu_bytes;
-    NvU64 reclaim_bytes;
-    NvU64 protected_bytes;
-    NvU64 evictable_bytes;
-    NvU64 over_budget_bytes;
-    NvU64 reclaim_target_bytes;
-    NvU64 victim_candidate_bytes;
-    NvU64 victim_candidate_regions;
-    NvU64 selected_victim_region_id;
-    NvU64 selected_victim_bytes;
-    NvU64 victim_region_ids[UVM_PHASE_N_TRACE_VICTIM_MAX];
-    NvU64 victim_bytes[UVM_PHASE_N_TRACE_VICTIM_MAX];
-    NvU32 victim_count;
-    NvU64 over_budget_events;
-    NvU64 reclaim_success_events;
-    NvU64 reclaim_failed_events;
-    NvU64 accounting_corrections;
-    NvU32 mode;
-    NvU32 flags;
-} uvm_phase_n_pool_state_t;
-
-typedef struct uvm_phase_n_block
-{
-    uvm_va_range_managed_t *managed_range;
-    NvU64 tagged_region_id;
-    NvU64 native_block_index;
-    NvU64 radix_key;
-    NvU64 block_start;
-    NvU64 block_end;
-    NvU64 covered_start;
-    NvU64 covered_end;
-    NvU32 pool;
-    NvU32 flags;
-    NvBool mixed_pool;
-    NvBool gpu_resident;
-    NvBool queued;
-    NvBool in_reclaim;
-    NvBool stale;
-    NvU64 resident_epoch;
-    NvU64 last_access_epoch;
-    struct list_head queue_node;
-} uvm_phase_n_block_t;
-
-typedef struct
-{
-    NvU64 budget_bytes;
-    NvU64 budget_blocks;
-    NvU64 resident_blocks;
-    NvU64 pending_blocks;
-    NvU64 materialized_blocks;
-    NvU64 mixed_blocks;
-    NvU64 reservation_success;
-    NvU64 reservation_aborts;
-    NvU64 reclaim_attempts;
-    NvU64 reclaim_success;
-    NvU64 reclaim_failures;
-    NvU64 same_pool_victims;
-    NvU64 cross_pool_victim_errors;
-    NvU64 quota_over_events;
-    NvU64 max_over_blocks;
-    struct list_head resident_queue;
-} uvm_phase_n_block_pool_t;
-
 typedef struct
 {
     uvm_deferred_free_object_type_t type;
@@ -307,21 +233,6 @@ struct uvm_va_space_struct
     // Phase F policy regions, indexed by userspace-provided region IDs.
     struct radix_tree_root phase_f_regions;
     uvm_range_tree_t phase_f_region_ranges;
-    uvm_phase_n_pool_state_t phase_n_pools[UVM_PHASE_N_POOL_STATE_MAX];
-    struct radix_tree_root phase_n_blocks;
-    uvm_phase_n_block_pool_t phase_n_block_pools[UVM_PHASE_N_POOL_STATE_MAX];
-    spinlock_t phase_n_native_block_pool_locks[UVM_PHASE_N_POOL_STATE_MAX];
-    NvU64 phase_n_dynamic_epoch;
-    NvU64 phase_n_managed_hbm_budget_bytes;
-    NvU64 phase_n_safety_margin_bytes;
-    NvU64 phase_n_scratch_workspace_bytes;
-    NvU64 phase_n_expert_hot_budget_bytes;
-    NvU64 phase_n_expert_streaming_budget_bytes;
-    NvU64 phase_n_shared_over_budget_bytes;
-    NvU32 phase_n_auto_reclaim_pending_mask;
-    NvU64 phase_n_auto_reclaim_request_epoch;
-    NvU64 phase_n_active_kv_required_bytes;
-    NvU64 phase_n_active_kv_protect_epoch;
 
     // Peer to peer table
     // A bitmask of peer to peer pairs enabled in this va_space
@@ -964,10 +875,6 @@ bool uvm_va_space_pageable_mem_access_enabled(uvm_va_space_t *va_space);
 // Returns true when any registered driver-visible expert envelope overlapping
 // the range is managed through reserved-slot restore. The caller must hold the
 // VA space lock in at least read mode.
-bool uvm_va_space_range_has_cpu_offloaded_reserved_expert(uvm_va_space_t *va_space,
-                                                          NvU64 base,
-                                                          NvU64 length);
-
 NV_STATUS uvm_test_get_pageable_mem_access_type(UVM_TEST_GET_PAGEABLE_MEM_ACCESS_TYPE_PARAMS *params,
                                                  struct file *filp);
 NV_STATUS uvm_test_enable_static_peer_access(UVM_TEST_ENABLE_STATIC_PEER_ACCESS_PARAMS *params, struct file *filp);

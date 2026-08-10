@@ -1141,7 +1141,7 @@ typedef enum
     UVM_MOE_SLOT_REMAP_MODE_VIDMEM_PREALLOC = 8,
     // Submit a CPU-to-GPU copy into an existing or newly allocated
     // driver-owned VIDMEM slot and return without waiting for the copy engine.
-    // UVM_MOE_SLOT_POOL_QUERY polls completion and finalizes copy counters.
+    // Completion is finalized when the slot is next reused or released.
     UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ASYNC_SUBMIT = 9,
 } UVM_MOE_SLOT_REMAP_MODE;
 
@@ -1190,22 +1190,6 @@ typedef struct
     NV_STATUS rmStatus;                              // OUT
 } UVM_MOE_SLOT_REMAP_BATCH_PARAMS;
 
-//
-// UvmMoeSlotPoolQuery
-//
-// Experimental debug interface for the MoE cold slot pool state recorded by
-// UVM_MOE_SLOT_REMAP_BATCH in VALIDATE mode. This is metadata only: it tracks
-// slot ownership, epochs, VA ranges accepted by the driver validation path,
-// and COPY_ONLY/GPU_COPY_ONLY backing/copy counters. These modes prove
-// driver-owned physical slot page management and data movement; they still do
-// not imply that user PTE replacement or TLB invalidation have been performed.
-//
-#define UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES                            128
-
-#define UVM_MOE_SLOT_POOL_QUERY_FLAG_FILTER_LAYER                      (1U << 0)
-#define UVM_MOE_SLOT_POOL_QUERY_FLAG_FILTER_SLOT                       (1U << 1)
-#define UVM_MOE_SLOT_POOL_QUERY_FLAG_RESET                             (1U << 31)
-
 typedef enum
 {
     UVM_MOE_SLOT_POOL_STATE_EMPTY = 0,
@@ -1225,565 +1209,45 @@ typedef enum
     UVM_MOE_SLOT_POOL_BACKING_VIDMEM = 3,
 } UVM_MOE_SLOT_POOL_BACKING_KIND;
 
-typedef struct
-{
-    NvU32 layer_id;                       // OUT
-    NvU32 slot_id;                        // OUT
-    NvU32 owner_expert_id;                // OUT
-    NvU32 state;                          // OUT, UVM_MOE_SLOT_POOL_STATE
-    NvU32 range_count;                    // OUT
-    NvU32 last_role;                      // OUT
-    NvU32 flags;                          // OUT
-    NvU32 last_status;                    // OUT, UVM_MOE_SLOT_REMAP_ENTRY_STATUS
-    NvU64 epoch NV_ALIGN_BYTES(8);        // OUT
-    NvU64 batch_id NV_ALIGN_BYTES(8);     // OUT
-    NvU64 first_va_base NV_ALIGN_BYTES(8);// OUT
-    NvU64 last_va_base NV_ALIGN_BYTES(8); // OUT
-    NvU64 last_bytes NV_ALIGN_BYTES(8);   // OUT
-    NvU64 total_bytes NV_ALIGN_BYTES(8);  // OUT
-    NvU64 slot_bytes NV_ALIGN_BYTES(8);   // OUT, allocated logical slot backing bytes
-    NvU64 slot_physical_bytes NV_ALIGN_BYTES(8); // OUT, physical bytes backing slot_mem
-    NvU64 copy_count NV_ALIGN_BYTES(8);   // OUT
-    NvU64 copy_bytes NV_ALIGN_BYTES(8);   // OUT
-    NvU64 copy_failed_count NV_ALIGN_BYTES(8); // OUT
-    NvU64 pte_remap_bytes NV_ALIGN_BYTES(8); // OUT, smoke-only slot PTE mapping bytes
-    NvU64 pte_remap_count NV_ALIGN_BYTES(8); // OUT, successful smoke-only slot PTE writes
-    NvU64 pte_clear_count NV_ALIGN_BYTES(8); // OUT, smoke-only slot PTE clear operations
-    NvU64 pte_va_base NV_ALIGN_BYTES(8);     // OUT, last smoke-only slot PTE target VA
-    NvU64 pte_bytes NV_ALIGN_BYTES(8);       // OUT, last smoke-only slot PTE target bytes
-    NvU64 pte_block_unmap_count NV_ALIGN_BYTES(8); // OUT, VA-block-aware GPU unmaps before slot PTE writes
-    NvU64 pte_block_tracker_wait_count NV_ALIGN_BYTES(8); // OUT, VA block tracker waits before slot PTE writes
-    NvU64 pte_rollback_count NV_ALIGN_BYTES(8); // OUT, transactional slot PTE rollback operations
-    NvU64 pte_rollback_bytes NV_ALIGN_BYTES(8); // OUT, transactional slot PTE rollback bytes
-    NvU64 pte_failure_count NV_ALIGN_BYTES(8); // OUT, failed smoke-only slot PTE remap attempts
-    NvU64 pte_fault_clear_count NV_ALIGN_BYTES(8); // OUT, slot PTE clears before managed fault fallback
-    NvU64 pte_migrate_clear_count NV_ALIGN_BYTES(8); // OUT, slot PTE clears before native migrate/remap
-    NvU64 pte_unmap_clear_count NV_ALIGN_BYTES(8); // OUT, slot PTE clears before native unmap teardown
-    NvU64 pte_split_clear_count NV_ALIGN_BYTES(8); // OUT, slot PTE clears before VA block split
-    NvU64 pte_release_clear_count NV_ALIGN_BYTES(8); // OUT, slot PTE clears during VA/GPU VA-space release
-    NvU64 pte_evict_clear_count NV_ALIGN_BYTES(8); // OUT, slot PTE clears before backing eviction
-    NvU64 pte_dangerous_op_reject_count NV_ALIGN_BYTES(8); // OUT, read-only slot PTE dangerous op rejects
-    NvU32 backing_kind;                   // OUT, UVM_MOE_SLOT_POOL_BACKING_KIND
-    NvU32 copy_status;                    // OUT, last UVM_MOE_SLOT_REMAP_ENTRY_STATUS from COPY_ONLY/GPU_COPY_ONLY
-    NvU32 pte_mapped;                     // OUT, nonzero if smoke-only slot PTE mapping is installed
-    NvU32 pte_status;                     // OUT, last UVM_MOE_SLOT_REMAP_ENTRY_STATUS from SLOT_PTE_REMAP
-    NvU32 pte_mode;                       // OUT, UVM_MOE_SLOT_REMAP_MODE used for last PTE install
-    NvU32 pte_va_block_tracked;           // OUT, nonzero if VA block unmap/tracker path was used
-} UVM_MOE_SLOT_POOL_QUERY_ENTRY;
-
-#define UVM_MOE_SLOT_POOL_QUERY                                        UVM_IOCTL_BASE(92)
-typedef struct
-{
-    NvU32 flags;                                      // IN
-    NvU32 max_entries;                                // IN, clamped to UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES
-    NvU32 layer_id;                                   // IN, used with FILTER_LAYER
-    NvU32 slot_id;                                    // IN, used with FILTER_SLOT
-    NvU32 total_slots;                                // OUT, matching valid slots before max_entries truncation
-    NvU32 returned_slots;                             // OUT
-    NvU32 active_slots;                               // OUT, all valid slots in the driver pool
-    NvU32 backed_slots;                               // OUT, active slots with allocated backing
-    NvU64 current_epoch NV_ALIGN_BYTES(8);            // OUT
-    NvU64 validated_entries NV_ALIGN_BYTES(8);        // OUT
-    NvU64 overwrite_count NV_ALIGN_BYTES(8);          // OUT
-    NvU64 range_update_count NV_ALIGN_BYTES(8);       // OUT
-    NvU64 pool_full_count NV_ALIGN_BYTES(8);          // OUT
-    NvU64 slot_backing_bytes NV_ALIGN_BYTES(8);       // OUT, sum of active slot_bytes
-    NvU64 copy_count NV_ALIGN_BYTES(8);               // OUT, global successful copy range count
-    NvU64 copy_bytes NV_ALIGN_BYTES(8);               // OUT, global successful copy bytes
-    NvU64 copy_failed_count NV_ALIGN_BYTES(8);        // OUT, global failed copy range count
-    NvU64 vidmem_evict_count NV_ALIGN_BYTES(8);       // OUT, gpu_copy_only VIDMEM cache evictions
-    NvU64 pte_remap_count NV_ALIGN_BYTES(8);          // OUT, global smoke-only slot PTE writes
-    NvU64 pte_remap_bytes NV_ALIGN_BYTES(8);          // OUT, global smoke-only slot PTE bytes
-    NvU64 pte_clear_count NV_ALIGN_BYTES(8);          // OUT, global smoke-only slot PTE clears
-    NvU64 pte_block_unmap_count NV_ALIGN_BYTES(8);    // OUT, global VA-block-aware GPU unmaps before slot PTE writes
-    NvU64 pte_block_tracker_wait_count NV_ALIGN_BYTES(8); // OUT, global VA block tracker waits before slot PTE writes
-    NvU64 pte_rollback_count NV_ALIGN_BYTES(8);       // OUT, global transactional slot PTE rollbacks
-    NvU64 pte_rollback_bytes NV_ALIGN_BYTES(8);       // OUT, global transactional slot PTE rollback bytes
-    NvU64 pte_failure_count NV_ALIGN_BYTES(8);        // OUT, global failed smoke-only slot PTE remap attempts
-    NvU64 pte_fault_clear_count NV_ALIGN_BYTES(8);    // OUT, global slot PTE clears before managed fault fallback
-    NvU64 pte_migrate_clear_count NV_ALIGN_BYTES(8);  // OUT, global slot PTE clears before native migrate/remap
-    NvU64 pte_unmap_clear_count NV_ALIGN_BYTES(8);    // OUT, global slot PTE clears before native unmap teardown
-    NvU64 pte_split_clear_count NV_ALIGN_BYTES(8);    // OUT, global slot PTE clears before VA block split
-    NvU64 pte_release_clear_count NV_ALIGN_BYTES(8);  // OUT, global slot PTE clears during VA/GPU VA-space release
-    NvU64 pte_evict_clear_count NV_ALIGN_BYTES(8);    // OUT, global slot PTE clears before backing eviction
-    NvU64 pte_dangerous_op_reject_count NV_ALIGN_BYTES(8); // OUT, global read-only slot PTE dangerous op rejects
-    NvU64 pte_residual_va_block_count NV_ALIGN_BYTES(8); // OUT, VA blocks still carrying slot PTE metadata
-    NvU64 pte_residual_page_count NV_ALIGN_BYTES(8); // OUT, pages still carrying slot PTE metadata
-    NvU64 pte_residual_gpu_mask NV_ALIGN_BYTES(8);   // OUT, GPU id mask with residual slot PTE metadata
-    UVM_MOE_SLOT_POOL_QUERY_ENTRY entries[UVM_MOE_SLOT_POOL_MAX_QUERY_ENTRIES]; // OUT
-    NV_STATUS rmStatus;                               // OUT
-} UVM_MOE_SLOT_POOL_QUERY_PARAMS;
-
-//
-// UvmMoeSlotPoolReadback
-//
-// Debug-only verification interface for COPY_ONLY/GPU_COPY_ONLY. It copies
-// bytes from driver-owned slot backing into a user buffer without changing user
-// VA mappings. VIDMEM backing is read back through a GPU_TO_CPU CE copy into a
-// DMA-capable sysmem staging allocation.
-//
-#define UVM_MOE_SLOT_POOL_READBACK                                     UVM_IOCTL_BASE(93)
-typedef struct
-{
-    NvU32 layer_id;                                   // IN
-    NvU32 slot_id;                                    // IN
-    NvU32 backing_kind;                               // OUT, UVM_MOE_SLOT_POOL_BACKING_KIND
-    NvU32 reserved;                                   // Reserved, must be zero
-    NvU64 slot_offset NV_ALIGN_BYTES(8);              // IN
-    NvU64 bytes NV_ALIGN_BYTES(8);                    // IN
-    NvU64 buffer NV_ALIGN_BYTES(8);                   // IN, user destination pointer
-    NvU64 copied_bytes NV_ALIGN_BYTES(8);             // OUT
-    NV_STATUS rmStatus;                               // OUT
-} UVM_MOE_SLOT_POOL_READBACK_PARAMS;
-
 typedef enum
 {
-    UVM_PHASE_N_POOL_UNKNOWN = 0,
-    UVM_PHASE_N_POOL_KV = 1,
-    UVM_PHASE_N_POOL_WEIGHT = 2,
-    UVM_PHASE_N_POOL_SCRATCH = 3,
-    UVM_PHASE_N_POOL_ACTIVATION = 4,
-    UVM_PHASE_N_POOL_MAX = 5,
-} UVM_PHASE_N_POOL;
+    UVM_REGION_STATE_UNKNOWN = 0,
+    UVM_REGION_STATE_CPU = 1,
+    UVM_REGION_STATE_PREFETCHING_CPU = 2,
+    UVM_REGION_STATE_GPU = 3,
+    UVM_REGION_STATE_PREFETCHING_GPU = 4,
+} UVM_REGION_STATE;
 
-typedef enum
-{
-    UVM_PHASE_N_MODE_TRACE_ONLY = 0,
-    UVM_PHASE_N_MODE_SOFT = 1,
-    UVM_PHASE_N_MODE_ENFORCE = 2,
-} UVM_PHASE_N_BUDGET_MODE;
-
-typedef enum
-{
-    UVM_PHASE_N_REGION_STATE_UNKNOWN = 0,
-    UVM_PHASE_N_REGION_STATE_CPU = 1,
-    UVM_PHASE_N_REGION_STATE_COLD = UVM_PHASE_N_REGION_STATE_CPU,
-    UVM_PHASE_N_REGION_STATE_PREFETCHING_CPU = 2,
-    UVM_PHASE_N_REGION_STATE_WARM = UVM_PHASE_N_REGION_STATE_PREFETCHING_CPU,
-    UVM_PHASE_N_REGION_STATE_GPU = 3,
-    UVM_PHASE_N_REGION_STATE_HOT = UVM_PHASE_N_REGION_STATE_GPU,
-    UVM_PHASE_N_REGION_STATE_PREFETCHING_GPU = 4,
-    UVM_PHASE_N_REGION_STATE_ACTIVE = UVM_PHASE_N_REGION_STATE_PREFETCHING_GPU,
-    UVM_PHASE_N_REGION_STATE_INACTIVE = 5,
-} UVM_PHASE_N_REGION_STATE;
-
-#define UVM_PHASE_N_REGION_FLAG_EVICTABLE                            (1U << 0)
-#define UVM_PHASE_N_REGION_FLAG_PROTECTED                            (1U << 1)
-#define UVM_PHASE_N_REGION_FLAG_ACTIVE                               (1U << 2)
-#define UVM_PHASE_N_REGION_FLAG_PREFETCHABLE                         (1U << 3)
-#define UVM_PHASE_N_REGION_FLAG_PINNED                               (1U << 4)
-#define UVM_PHASE_N_REGION_FLAG_TRANSIENT                            (1U << 5)
-#define UVM_PHASE_N_REGION_FLAG_GPU_ONLY_SOFT                        (1U << 6)
-#define UVM_PHASE_N_REGION_FLAG_GPU_ONLY_HARD                        (1U << 7)
-#define UVM_PHASE_N_REGION_FLAG_CPU_NO_USER_MAPPING                  (1U << 8)
-#define UVM_PHASE_N_REGION_FLAG_GPU_READ_ONLY                        (1U << 9)
-#define UVM_PHASE_N_REGION_FLAG_GPU_READ_WRITE                       (1U << 10)
-#define UVM_PHASE_N_REGION_FLAG_HOT_SUBPOOL                          (1U << 11)
-#define UVM_PHASE_N_REGION_FLAG_STREAMING_SUBPOOL                    (1U << 12)
-#define UVM_PHASE_N_REGION_FLAG_COLD_SUBPOOL                         (1U << 13)
-#define UVM_PHASE_N_REGION_FLAG_CPU_OFFLOADED_RESERVED               (1U << 14)
-#define UVM_PHASE_N_REGION_FLAG_EXPERT_ENVELOPE                      (1U << 15)
-
-#define UVM_PHASE_N_TRACE_VICTIM_MAX                                 8
-
-#define UVM_PHASE_N_SET_POOL_BUDGET                                  UVM_IOCTL_BASE(85)
-typedef struct
-{
-    NvU32     pool;                         // IN
-    NvU32     gpu_id;                       // IN, reserved for future multi-GPU accounting
-    NvU64     budget_bytes NV_ALIGN_BYTES(8); // IN
-    NvU32     mode;                         // IN
-    NvU32     flags;                        // IN
-    NV_STATUS rmStatus;                     // OUT
-} UVM_PHASE_N_SET_POOL_BUDGET_PARAMS;
-
-#define UVM_PHASE_N_GET_POOL_STATE                                   UVM_IOCTL_BASE(86)
-typedef struct
-{
-    NvU32     pool;                         // IN
-    NvU32     gpu_id;                       // IN, reserved for future multi-GPU accounting
-    NvU64     budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     resident_gpu_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     pending_gpu_bytes NV_ALIGN_BYTES(8); // OUT, admitted but not committed
-    NvU64     resident_cpu_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     reclaim_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     protected_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     evictable_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     over_budget_bytes NV_ALIGN_BYTES(8); // OUT, trace-only pressure
-    NvU64     reclaim_target_bytes NV_ALIGN_BYTES(8); // OUT, trace-only target
-    NvU64     victim_candidate_bytes NV_ALIGN_BYTES(8); // OUT, resident candidate bytes
-    NvU64     victim_candidate_regions NV_ALIGN_BYTES(8); // OUT
-    NvU64     selected_victim_region_id NV_ALIGN_BYTES(8); // OUT, trace-only best candidate
-    NvU64     selected_victim_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU32     victim_count;                 // OUT, trace-only victim list length
-    NvU32     reserved;                     // OUT
-    NvU64     victim_region_ids[UVM_PHASE_N_TRACE_VICTIM_MAX] NV_ALIGN_BYTES(8); // OUT
-    NvU64     victim_bytes[UVM_PHASE_N_TRACE_VICTIM_MAX] NV_ALIGN_BYTES(8); // OUT
-    NvU64     over_budget_events NV_ALIGN_BYTES(8); // OUT
-    NvU64     reclaim_success_events NV_ALIGN_BYTES(8); // OUT
-    NvU64     reclaim_failed_events NV_ALIGN_BYTES(8); // OUT
-    NvU64     accounting_corrections NV_ALIGN_BYTES(8); // OUT
-    NvU32     mode;                         // OUT
-    NvU32     flags;                        // OUT
-    NV_STATUS rmStatus;                     // OUT
-} UVM_PHASE_N_GET_POOL_STATE_PARAMS;
-
-#define UVM_PHASE_N_UPDATE_REGION_STATE                              UVM_IOCTL_BASE(87)
+#define UVM_UPDATE_REGION_STATE                                      UVM_IOCTL_BASE(87)
 typedef struct
 {
     NvU64     region_id NV_ALIGN_BYTES(8);  // IN
-    NvU32     state;                        // IN
+    NvU32     state;                        // IN, UVM_REGION_STATE_*
     NV_STATUS rmStatus;                     // OUT
-} UVM_PHASE_N_UPDATE_REGION_STATE_PARAMS;
+} UVM_UPDATE_REGION_STATE_PARAMS;
 
-#define UVM_PHASE_N_QUERY_REGION                                     UVM_IOCTL_BASE(88)
+#define UVM_QUERY_REGION                                             UVM_IOCTL_BASE(88)
 typedef struct
 {
     NvU64     region_id NV_ALIGN_BYTES(8);  // IN
     NvU64     base NV_ALIGN_BYTES(8);       // OUT
     NvU64     length NV_ALIGN_BYTES(8);     // OUT
-    NvU32     state;                        // OUT
+    NvU32     state;                        // OUT, UVM_REGION_STATE_*
     NvU32     found_by_va;                  // OUT
     NV_STATUS rmStatus;                     // OUT
-} UVM_PHASE_N_QUERY_REGION_PARAMS;
+} UVM_QUERY_REGION_PARAMS;
 
-#define UVM_PHASE_N_QUERY_REGION_BY_VA                               UVM_IOCTL_BASE(89)
+#define UVM_QUERY_REGION_BY_VA                                       UVM_IOCTL_BASE(89)
 typedef struct
 {
     NvU64     address NV_ALIGN_BYTES(8);    // IN
     NvU64     region_id NV_ALIGN_BYTES(8);  // OUT
     NvU64     base NV_ALIGN_BYTES(8);       // OUT
     NvU64     length NV_ALIGN_BYTES(8);     // OUT
-    NvU32     state;                        // OUT
+    NvU32     state;                        // OUT, UVM_REGION_STATE_*
     NvU32     found_by_va;                  // OUT
     NV_STATUS rmStatus;                     // OUT
-} UVM_PHASE_N_QUERY_REGION_BY_VA_PARAMS;
-
-#define UVM_PHASE_N_RECLAIM_POOL                                     UVM_IOCTL_BASE(90)
-typedef struct
-{
-    NvU32     pool;                         // IN
-    NvU32     gpu_id;                       // IN
-    NvU64     target_bytes NV_ALIGN_BYTES(8); // IN, 0 uses over-budget + hysteresis
-    NvU64     current_epoch NV_ALIGN_BYTES(8); // IN, 0 disables epoch cooldown
-    NvU64     cooldown_epochs NV_ALIGN_BYTES(8); // IN, 0 disables epoch cooldown
-    NvU32     max_victims;                  // IN, 0 uses UVM_PHASE_N_TRACE_VICTIM_MAX
-    NvBool    async;                        // IN
-    NvU32     flags;                        // IN
-    NvU32     attempted_regions;            // OUT
-    NvU32     success_regions;              // OUT
-    NvU32     failure_regions;              // OUT
-    NvU32     victim_count;                 // OUT
-    NvU64     budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     resident_gpu_bytes_before NV_ALIGN_BYTES(8); // OUT
-    NvU64     over_budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     reclaim_target_bytes NV_ALIGN_BYTES(8); // OUT, effective target
-    NvU64     attempted_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     reclaimed_bytes NV_ALIGN_BYTES(8); // OUT, best-effort pre-scan bytes
-    NvU64     failed_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     victim_candidate_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     victim_candidate_regions NV_ALIGN_BYTES(8); // OUT
-    NvU64     cooldown_skipped_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     cooldown_skipped_regions NV_ALIGN_BYTES(8); // OUT
-    NvU64     victim_region_ids[UVM_PHASE_N_TRACE_VICTIM_MAX] NV_ALIGN_BYTES(8); // OUT
-    NvU64     victim_bytes[UVM_PHASE_N_TRACE_VICTIM_MAX] NV_ALIGN_BYTES(8); // OUT
-    NV_STATUS victim_status[UVM_PHASE_N_TRACE_VICTIM_MAX]; // OUT
-    NvU64     reclaim_success_events NV_ALIGN_BYTES(8); // OUT
-    NvU64     reclaim_failed_events NV_ALIGN_BYTES(8); // OUT
-    NvU32     mode;                         // OUT
-    NvU32     pool_flags;                   // OUT
-    NV_STATUS rmStatus;                     // OUT
-} UVM_PHASE_N_RECLAIM_POOL_PARAMS;
-
-#define UVM_PHASE_N_DYNAMIC_BUDGET_FLAG_AUTO_EXPERT                  (1U << 0)
-
-#define UVM_PHASE_N_SET_DYNAMIC_BUDGETS                              UVM_IOCTL_BASE(94)
-typedef struct
-{
-    NvU32     gpu_id;                       // IN, reserved for future multi-GPU accounting
-    NvU32     mode;                         // IN, applied to KV and WEIGHT pools
-    NvU32     flags;                        // IN
-    NvU32     reserved;                     // IN
-    NvU64     epoch NV_ALIGN_BYTES(8);      // IN
-    NvU64     managed_hbm_budget_bytes NV_ALIGN_BYTES(8); // IN
-    NvU64     safety_margin_bytes NV_ALIGN_BYTES(8); // IN
-    NvU64     scratch_workspace_bytes NV_ALIGN_BYTES(8); // IN
-    NvU64     kv_budget_bytes NV_ALIGN_BYTES(8); // IN
-    NvU64     expert_hot_budget_bytes NV_ALIGN_BYTES(8); // IN
-    NvU64     expert_streaming_budget_bytes NV_ALIGN_BYTES(8); // IN
-    NvU64     kv_resident_gpu_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     kv_pending_gpu_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     expert_resident_gpu_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     expert_pending_gpu_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     shared_over_budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     kv_over_budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     expert_over_budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NV_STATUS rmStatus;                     // OUT
-} UVM_PHASE_N_SET_DYNAMIC_BUDGETS_PARAMS;
-
-#define UVM_PHASE_N_PROTECT_ACTIVE_KV                                UVM_IOCTL_BASE(95)
-typedef struct
-{
-    NvU32     gpu_id;                       // IN, reserved for future multi-GPU accounting
-    NvU32     mode;                         // IN, applied to KV and WEIGHT pools
-    NvU32     flags;                        // IN, pool flags plus dynamic-budget flags
-    NvU32     reserved;                     // IN
-    NvU64     epoch NV_ALIGN_BYTES(8);      // IN
-    NvU64     active_kv_bytes NV_ALIGN_BYTES(8); // IN, minimum KV budget required by active KV
-    NvU64     managed_hbm_budget_bytes NV_ALIGN_BYTES(8); // IN, 0 reuses current dynamic budget
-    NvU64     safety_margin_bytes NV_ALIGN_BYTES(8); // IN, 0 reuses current value
-    NvU64     scratch_workspace_bytes NV_ALIGN_BYTES(8); // IN, 0 reuses current value
-    NvU64     region_id NV_ALIGN_BYTES(8);  // IN, optional KV region to mark active/protected
-    NvU64     old_kv_budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     new_kv_budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     old_expert_budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     new_expert_budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     kv_resident_gpu_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     kv_pending_gpu_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     expert_resident_gpu_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     expert_pending_gpu_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     shared_over_budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     kv_over_budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     expert_over_budget_bytes NV_ALIGN_BYTES(8); // OUT
-    NV_STATUS rmStatus;                     // OUT
-} UVM_PHASE_N_PROTECT_ACTIVE_KV_PARAMS;
-
-#define UVM_PHASE_N_REGION_BLOCK_TRACE_MAX                           16
-
-#define UVM_PHASE_N_REGION_BLOCK_STATE_TAGGED                        (1U << 0)
-#define UVM_PHASE_N_REGION_BLOCK_STATE_GPU_RESIDENT                  (1U << 1)
-#define UVM_PHASE_N_REGION_BLOCK_STATE_GPU_PENDING                   (1U << 2)
-#define UVM_PHASE_N_REGION_BLOCK_STATE_QUEUED                        (1U << 3)
-#define UVM_PHASE_N_REGION_BLOCK_STATE_IN_RECLAIM                    (1U << 4)
-#define UVM_PHASE_N_REGION_BLOCK_STATE_MATERIALIZED                  (1U << 5)
-#define UVM_PHASE_N_REGION_BLOCK_STATE_MIXED                         (1U << 6)
-
-#define UVM_PHASE_N_QUERY_REGION_BLOCKS                              UVM_IOCTL_BASE(96)
-typedef struct
-{
-    NvU64     region_id NV_ALIGN_BYTES(8);  // IN
-    NvU32     gpu_id;                       // IN, reserved for future multi-GPU residency filters
-    NvU32     reserved;                     // IN, must be zero
-    NvU64     base NV_ALIGN_BYTES(8);       // OUT
-    NvU64     length NV_ALIGN_BYTES(8);     // OUT
-    NvU32     pool;                         // OUT
-    NvU32     layer_id;                     // OUT
-    NvU32     expert_id;                    // OUT
-    NvU32     role;                         // OUT
-    NvU32     flags;                        // OUT
-    NvU32     state;                        // OUT
-    NvU32     priority;                     // OUT
-    NvU32     va_range_count;               // OUT, managed va_ranges covered by this semantic region
-    NvU64     logical_block_count NV_ALIGN_BYTES(8); // OUT, UVM_VA_BLOCK_SIZE chunks covered by region VA
-    NvU64     populated_block_count NV_ALIGN_BYTES(8); // OUT, existing va_block objects carrying this region tag
-    NvU64     resident_block_count NV_ALIGN_BYTES(8); // OUT, populated blocks currently GPU resident
-    NvU64     pending_block_count NV_ALIGN_BYTES(8); // OUT, admission-reserved but not committed
-    NvU64     materialized_block_count NV_ALIGN_BYTES(8); // OUT
-    NvU64     mixed_block_count NV_ALIGN_BYTES(8); // OUT
-    NvU64     resident_gpu_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     pending_gpu_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     first_block_start NV_ALIGN_BYTES(8); // OUT
-    NvU64     last_block_end NV_ALIGN_BYTES(8); // OUT
-    NvU32     sampled_block_count;           // OUT
-    NvU32     reserved_out;                  // OUT
-    NvU64     block_starts[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX] NV_ALIGN_BYTES(8); // OUT
-    NvU64     block_ends[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX] NV_ALIGN_BYTES(8); // OUT
-    NvU64     block_bytes[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX] NV_ALIGN_BYTES(8); // OUT
-    NvU32     block_states[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX]; // OUT, UVM_PHASE_N_REGION_BLOCK_STATE_*
-    NV_STATUS block_status[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX]; // OUT
-    NV_STATUS rmStatus;                     // OUT
-} UVM_PHASE_N_QUERY_REGION_BLOCKS_PARAMS;
-
-#define UVM_PHASE_N_RECLAIM_REGION_FLAG_FORCE                        (1U << 0)
-
-#define UVM_PHASE_N_RECLAIM_REGION                                   UVM_IOCTL_BASE(97)
-typedef struct
-{
-    NvU64     region_id NV_ALIGN_BYTES(8);  // IN
-    NvU32     gpu_id;                       // IN, reserved for future multi-GPU filters
-    NvU32     async;                        // IN
-    NvU32     flags;                        // IN, UVM_PHASE_N_RECLAIM_REGION_FLAG_*
-    NvU32     max_blocks;                   // IN, 0 means no explicit cap
-    NvU64     current_epoch NV_ALIGN_BYTES(8); // IN, 0 leaves region epoch unchanged
-    NvU32     pool;                         // OUT
-    NvU32     skipped_protected;            // OUT
-    NvU64     block_count NV_ALIGN_BYTES(8); // OUT, populated blocks in the region
-    NvU64     resident_blocks_before NV_ALIGN_BYTES(8); // OUT
-    NvU64     resident_blocks_after NV_ALIGN_BYTES(8); // OUT
-    NvU64     pending_blocks NV_ALIGN_BYTES(8); // OUT
-    NvU32     attempted_blocks;             // OUT
-    NvU32     success_blocks;               // OUT
-    NvU32     failure_blocks;               // OUT
-    NvU32     traced_blocks;                // OUT
-    NvU64     attempted_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     reclaimed_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     failed_bytes NV_ALIGN_BYTES(8); // OUT
-    NvU64     block_starts[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX] NV_ALIGN_BYTES(8); // OUT
-    NvU64     block_ends[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX] NV_ALIGN_BYTES(8); // OUT
-    NvU64     block_bytes[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX] NV_ALIGN_BYTES(8); // OUT
-    NV_STATUS block_status[UVM_PHASE_N_REGION_BLOCK_TRACE_MAX]; // OUT
-    NV_STATUS rmStatus;                     // OUT
-} UVM_PHASE_N_RECLAIM_REGION_PARAMS;
-
-//
-// UvmExpertReservedPool (removed)
-//
-// Reserved-backed expert residency was removed. Ioctl number 98 is intentionally
-// left unassigned so stale user space receives an unsupported-command error.
-// This ioctl preallocates UVM PMM user chunks through the existing
-// uvm_pmm_gpu_alloc_user() path and keeps them TEMP_PINNED in a driver-owned
-// reserved pool. Phase 1 does not attach the chunks to VA blocks, install PTEs,
-// or update residency metadata; later phases consume these slots as the backing
-// source for ordinary UVM residency.
-//
-#define UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES                         128
-
-#define UVM_EXPERT_RESERVED_POOL_ENTRY_FLAG_ALLOW_EVICT              (1U << 0)
-
-typedef enum
-{
-    UVM_EXPERT_RESERVED_POOL_MODE_QUERY = 0,
-    UVM_EXPERT_RESERVED_POOL_MODE_PREALLOC = 1,
-    UVM_EXPERT_RESERVED_POOL_MODE_RESET = 2,
-} UVM_EXPERT_RESERVED_POOL_MODE;
-
-typedef enum
-{
-    UVM_EXPERT_RESERVED_POOL_SLOT_EMPTY = 0,
-    UVM_EXPERT_RESERVED_POOL_SLOT_RESERVED = 1,
-    UVM_EXPERT_RESERVED_POOL_SLOT_LOADING = 2,
-    UVM_EXPERT_RESERVED_POOL_SLOT_ASSIGNED = 3,
-    UVM_EXPERT_RESERVED_POOL_SLOT_ERROR = 4,
-} UVM_EXPERT_RESERVED_POOL_SLOT_STATE;
-
-typedef enum
-{
-    UVM_EXPERT_RESERVED_POOL_ENTRY_OK = 0,
-    UVM_EXPERT_RESERVED_POOL_ENTRY_INVALID_ARGUMENT = 1,
-    UVM_EXPERT_RESERVED_POOL_ENTRY_INVALID_DEVICE = 2,
-    UVM_EXPERT_RESERVED_POOL_ENTRY_SLOT_IN_USE = 3,
-    UVM_EXPERT_RESERVED_POOL_ENTRY_BACKING_ALLOC_FAILED = 4,
-    UVM_EXPERT_RESERVED_POOL_ENTRY_POOL_FULL = 5,
-} UVM_EXPERT_RESERVED_POOL_ENTRY_STATUS;
-
-typedef struct
-{
-    NvU32 pool_id;                         // IN/OUT
-    NvU32 slot_id;                         // IN/OUT
-    NvU32 flags;                           // IN, UVM_EXPERT_RESERVED_POOL_ENTRY_FLAG_*
-    NvU32 status;                          // OUT, UVM_EXPERT_RESERVED_POOL_ENTRY_STATUS
-    NvU32 state;                           // OUT, UVM_EXPERT_RESERVED_POOL_SLOT_STATE
-    NvU32 chunk_count;                     // OUT, number of PMM chunks backing the slot
-    NvU64 slot_bytes NV_ALIGN_BYTES(8);    // IN/OUT, logical bytes requested for this slot
-    NvU64 physical_bytes NV_ALIGN_BYTES(8);// OUT, chunk_count * PMM chunk size
-    NvU64 epoch NV_ALIGN_BYTES(8);         // OUT, pool epoch when this slot was last updated
-    NvU64 first_chunk_address NV_ALIGN_BYTES(8); // OUT, debug physical address of first chunk
-    NvU64 last_chunk_address NV_ALIGN_BYTES(8);  // OUT, debug physical address of last chunk
-} UVM_EXPERT_RESERVED_POOL_ENTRY;
-
-#define UVM_EXPERT_RESERVED_POOL                                      UVM_IOCTL_BASE(98)
-typedef struct
-{
-    NvU32 mode;                                      // IN, UVM_EXPERT_RESERVED_POOL_MODE
-    NvU32 count;                                     // IN, number of entries for PREALLOC
-    NvProcessorUuid gpu_uuid;                        // IN, target GPU for PREALLOC
-    NvU32 max_entries;                               // IN, clamped for QUERY output
-    NvU32 success_count;                             // OUT
-    NvU32 failure_count;                             // OUT
-    NvU32 total_slots;                               // OUT, matching valid slots before truncation
-    NvU32 returned_slots;                            // OUT
-    NvU32 active_slots;                              // OUT, all valid slots in the reserved pool
-    NvU32 backed_slots;                              // OUT, active slots with allocated PMM chunks
-    NvU32 chunk_size;                                // OUT, PMM chunk size used by this pool
-    NvU32 reserved;                                  // Reserved, must be zero
-    NvU64 reserved_backing_bytes NV_ALIGN_BYTES(8);  // OUT, sum of physical backing bytes
-    NvU64 logical_slot_bytes NV_ALIGN_BYTES(8);      // OUT, sum of requested slot bytes
-    NvU64 current_epoch NV_ALIGN_BYTES(8);           // OUT
-    NvU64 prealloc_count NV_ALIGN_BYTES(8);          // OUT
-    NvU64 reset_count NV_ALIGN_BYTES(8);             // OUT
-    NvU64 alloc_failed_count NV_ALIGN_BYTES(8);      // OUT
-    UVM_EXPERT_RESERVED_POOL_ENTRY entries[UVM_EXPERT_RESERVED_POOL_MAX_ENTRIES]; // IN/OUT
-    NV_STATUS rmStatus;                              // OUT
-} UVM_EXPERT_RESERVED_POOL_PARAMS;
-
-//
-// UvmExpertReservedPrefetchBatch
-//
-// Experimental Phase-2 control/data plane for reserved-backed expert prefetch.
-// This ioctl binds registered expert regions to reserved pool slots, validates
-// the fixed-footprint contract, and can install a short-term readonly
-// slot-backed GPU PTE mapping. The slot-backed mapping copies CPU-resident
-// managed pages into reserved PMM chunks, but intentionally does not attach
-// those chunks to gpu_state->chunks[] or update ordinary UVM residency metadata.
-//
-#define UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES                    128
-
-#define UVM_EXPERT_RESERVED_PREFETCH_ENTRY_FLAG_STRICT_FOOTPRINT    (1U << 0)
-
-typedef enum
-{
-    UVM_EXPERT_RESERVED_PREFETCH_MODE_DRY_RUN = 0,
-    UVM_EXPERT_RESERVED_PREFETCH_MODE_RESOLVE = 1,
-    UVM_EXPERT_RESERVED_PREFETCH_MODE_INVALIDATE = 2,
-    UVM_EXPERT_RESERVED_PREFETCH_MODE_RESERVED_PREFETCH = 3,
-} UVM_EXPERT_RESERVED_PREFETCH_MODE;
-
-typedef enum
-{
-    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_OK = 0,
-    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_INVALID_ARGUMENT = 1,
-    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_INVALID_DEVICE = 2,
-    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_REGION_NOT_FOUND = 3,
-    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_REGION_UNSUPPORTED = 4,
-    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_NOT_FOUND = 5,
-    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_UNBACKED = 6,
-    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_TOO_SMALL = 7,
-    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_SLOT_IN_USE = 8,
-    UVM_EXPERT_RESERVED_PREFETCH_ENTRY_NATIVE_POPULATE_UNSUPPORTED = 9,
-} UVM_EXPERT_RESERVED_PREFETCH_ENTRY_STATUS;
-
-typedef struct
-{
-    NvU64 region_id NV_ALIGN_BYTES(8);       // IN, phase_f registered region id
-    NvU32 pool_id;                           // IN, reserved pool id
-    NvU32 slot_id;                           // IN, reserved slot id
-    NvU32 flags;                             // IN, UVM_EXPERT_RESERVED_PREFETCH_ENTRY_FLAG_*
-    NvU32 status;                            // OUT, UVM_EXPERT_RESERVED_PREFETCH_ENTRY_STATUS
-    NvU64 slot_offset NV_ALIGN_BYTES(8);     // IN, byte offset inside reserved slot
-    NvU64 bytes_override NV_ALIGN_BYTES(8);  // IN, 0 means registered region length
-    NvU64 resolved_base NV_ALIGN_BYTES(8);   // OUT, registered region base
-    NvU64 resolved_bytes NV_ALIGN_BYTES(8);  // OUT, bytes accepted for this mapping
-    NvU32 layer_id;                          // OUT
-    NvU32 expert_id;                         // OUT
-    NvU32 role;                              // OUT
-    NvU32 reserved;                          // Reserved, must be zero
-    NvU64 slot_epoch NV_ALIGN_BYTES(8);      // OUT, slot epoch after this operation
-    NvU64 physical_bytes NV_ALIGN_BYTES(8);  // OUT, slot physical backing bytes
-} UVM_EXPERT_RESERVED_PREFETCH_ENTRY;
-
-#define UVM_EXPERT_RESERVED_PREFETCH_BATCH                           UVM_IOCTL_BASE(99)
-typedef struct
-{
-    NvU32 mode;                                      // IN, UVM_EXPERT_RESERVED_PREFETCH_MODE
-    NvU32 count;                                     // IN
-    NvProcessorUuid gpu_uuid;                        // IN, target GPU
-    NvU32 async;                                     // IN, reserved for future native populate
-    NvU32 success_count;                             // OUT
-    NvU32 failure_count;                             // OUT
-    NvU32 reserved;                                  // Reserved, must be zero
-    NvU64 requested_bytes NV_ALIGN_BYTES(8);         // OUT, sum of requested region bytes
-    NvU64 accepted_bytes NV_ALIGN_BYTES(8);          // OUT, sum of successfully assigned bytes
-    NvU64 resolved_regions NV_ALIGN_BYTES(8);        // OUT
-    NvU64 assigned_slots NV_ALIGN_BYTES(8);          // OUT
-    NvU64 invalidated_slots NV_ALIGN_BYTES(8);       // OUT
-    NvU64 reserved_backing_bytes NV_ALIGN_BYTES(8);  // OUT, current pool physical bytes
-    NvU64 ordinary_resident_bytes NV_ALIGN_BYTES(8); // OUT, must remain 0 in strict slot-backed Phase 2
-    NvU64 pool_external_alloc_count NV_ALIGN_BYTES(8); // OUT, must remain 0 in strict slot-backed Phase 2
-    NvU64 footprint_contract_broken NV_ALIGN_BYTES(8); // OUT, strict contract violation counter
-    NvU64 current_epoch NV_ALIGN_BYTES(8);           // OUT
-    UVM_EXPERT_RESERVED_PREFETCH_ENTRY entries[UVM_EXPERT_RESERVED_PREFETCH_MAX_ENTRIES]; // IN/OUT
-    NV_STATUS rmStatus;                              // OUT
-} UVM_EXPERT_RESERVED_PREFETCH_BATCH_PARAMS;
+} UVM_QUERY_REGION_BY_VA_PARAMS;
 
 //
 // UvmExpertOffloadRelease
@@ -1793,7 +1257,6 @@ typedef struct
 // evicted through normal VA-block eviction and returned to PMM free lists.
 //
 #define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT                (1U << 0)
-#define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_STRICT_2M_BLOCKS              (1U << 1)
 #define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K                  (1U << 2) // region must be 64KiB aligned
 #define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ                   (1U << 3)
 
@@ -1803,7 +1266,6 @@ typedef struct
     NvU64 region_id NV_ALIGN_BYTES(8);       // IN, phase_f registered region id
     NvProcessorUuid gpu_uuid;                // IN, target GPU
     NvU32 flags;                             // IN, UVM_EXPERT_OFFLOAD_RELEASE_FLAG_*
-    NvU32 max_blocks;                        // IN, 0 means no explicit cap
     NvU64 base NV_ALIGN_BYTES(8);            // OUT
     NvU64 length NV_ALIGN_BYTES(8);          // OUT
     NvU64 block_count NV_ALIGN_BYTES(8);     // OUT, existing VA blocks scanned

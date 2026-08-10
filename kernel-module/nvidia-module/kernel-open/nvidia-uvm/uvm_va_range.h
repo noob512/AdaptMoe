@@ -234,19 +234,6 @@ struct uvm_va_range_struct
     uvm_va_range_type_t type;
 };
 
-typedef struct
-{
-    NvBool valid;
-    NvBool mixed;
-    NvU64 region_id;
-    NvU64 allocation_id;
-    NvU64 base;
-    NvU64 length;
-    NvU32 pool;
-    NvU32 role;
-    NvU32 flags;
-} uvm_phase_n_range_tag_t;
-
 // Subclass of va_range state for va_range.type == UVM_VA_RANGE_TYPE_MANAGED
 struct uvm_va_range_managed_struct
 {
@@ -282,10 +269,6 @@ struct uvm_va_range_managed_struct
     // Managed allocations only use this policy and never use the policy
     // stored in the va_block for HMM allocations.
     uvm_va_policy_t policy;
-
-    // Stage N native fast-path semantic tag. This mirrors the Phase F
-    // registered region for performance-sensitive KV/WEIGHT pool accounting.
-    uvm_phase_n_range_tag_t phase_n_tag;
 
     // Force the next split on this range to fail. Set by error injection ioctl
     // (testing purposes only).

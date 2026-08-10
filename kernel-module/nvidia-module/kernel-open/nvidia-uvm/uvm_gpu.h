@@ -60,9 +60,6 @@
 
 #define UVM_GPU_MAGIC_VALUE 0xc001d00d12341993ULL
 
-#define UVM_GPU_FAULT_STATS_PHASE_N_POOL_MAX 5
-#define UVM_GPU_FAULT_STATS_PHASE_N_ROLE_MAX 8
-
 typedef struct
 {
     // Number of faults from this uTLB that have been fetched but have not been
@@ -408,56 +405,6 @@ typedef struct
             NvU64 num_kv_faults;
 
             NvU64 num_kv_duplicate_faults;
-
-            NvU64 num_phase_n_faults_by_pool[UVM_GPU_FAULT_STATS_PHASE_N_POOL_MAX];
-
-            NvU64 num_phase_n_duplicate_faults_by_pool[UVM_GPU_FAULT_STATS_PHASE_N_POOL_MAX];
-
-            NvU64 num_phase_n_faults_by_role[UVM_GPU_FAULT_STATS_PHASE_N_ROLE_MAX];
-
-            NvU64 num_phase_n_duplicate_faults_by_role[UVM_GPU_FAULT_STATS_PHASE_N_ROLE_MAX];
-
-            NvU64 num_phase_n_unregistered_faults;
-
-            NvU64 num_phase_n_unregistered_duplicate_faults;
-
-            NvU64 num_phase_n_expert_dispatches;
-
-            NvU64 num_phase_n_expert_faults_serviced;
-
-            NvU64 num_phase_n_expert_forced_readdup_faults;
-
-            NvU64 num_phase_n_expert_forced_readdup_pages;
-
-            NvU64 num_phase_n_expert_fastpath_dispatches;
-
-            NvU64 num_phase_n_expert_fastpath_faults_serviced;
-
-            NvU64 num_phase_n_expert_fastpath_pages;
-
-            NvU64 num_phase_n_expert_fastpath_fallbacks;
-
-            NvU64 num_phase_n_expert_migrate_fastpath_ranges;
-
-            NvU64 num_phase_n_expert_migrate_fastpath_pages;
-
-            NvU64 num_phase_n_expert_migrate_fastpath_fallbacks;
-
-            NvU64 num_phase_n_expert_prefetch_waits;
-
-            NvU64 num_phase_n_expert_prefetch_wait_successes;
-
-            NvU64 num_phase_n_expert_prefetch_wait_timeouts;
-
-            NvU64 num_phase_n_reserved_fault_policy_violations;
-
-            NvU64 num_phase_n_reserved_migrate_policy_violations;
-
-            NvU64 num_phase_n_reserved_pool_external_alloc_attempts;
-
-            NvU64 num_phase_n_non_expert_managed_dispatches;
-
-            NvU64 num_phase_n_non_expert_managed_faults_serviced;
 
             atomic64_t num_pages_out;
 

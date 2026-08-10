@@ -112,12 +112,8 @@ class Executor(ABC):
         Initialize the KV caches and begin the model execution loop of the
         underlying workers.
         """
-        logger.debug("UVM controlled remap boundary: worker initialize_from_config RPC begin")
         self.collective_rpc("initialize_from_config", args=(kv_cache_configs,))
-        logger.debug("UVM controlled remap boundary: worker initialize_from_config RPC end")
-        logger.debug("UVM controlled remap boundary: compile_or_warm_up_model RPC begin")
         self.collective_rpc("compile_or_warm_up_model")
-        logger.debug("UVM controlled remap boundary: compile_or_warm_up_model RPC end")
 
     def register_failure_callback(self, callback: FailureCallback):  # noqa: B027
         """

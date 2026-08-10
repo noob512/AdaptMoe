@@ -1335,8 +1335,6 @@ NV_STATUS uvm_va_range_split(uvm_va_range_managed_t *existing_managed_range,
     new_policy->preferred_nid = existing_policy->preferred_nid;
     uvm_processor_mask_copy(&new_policy->accessed_by,
                             &existing_policy->accessed_by);
-    new->phase_n_tag = existing_managed_range->phase_n_tag;
-
     status = uvm_va_range_split_blocks(existing_managed_range, new);
     if (status != NV_OK) {
         uvm_va_range_destroy(&new->va_range, NULL);
@@ -1429,17 +1427,6 @@ size_t uvm_va_range_block_index(uvm_va_range_managed_t *managed_range, NvU64 add
     return index;
 }
 
-static void uvm_phase_n_va_block_init_from_range(uvm_va_block_t *block,
-                                                 uvm_va_range_managed_t *managed_range)
-{
-    memset(&block->phase_n, 0, sizeof(block->phase_n));
-    INIT_LIST_HEAD(&block->phase_n.queue_node);
-
-    // Phase-N semantic range tags are no longer populated from the compact
-    // Region registry. Leave the legacy per-block accounting state inactive.
-    (void)managed_range;
-}
-
 NV_STATUS uvm_va_range_block_create(uvm_va_range_managed_t *managed_range, size_t index, uvm_va_block_t **out_block)
 {
     uvm_va_block_t *block, *old;
@@ -1459,8 +1446,6 @@ NV_STATUS uvm_va_range_block_create(uvm_va_range_managed_t *managed_range, size_
                                      &block);
         if (status != NV_OK)
             return status;
-
-        uvm_phase_n_va_block_init_from_range(block, managed_range);
 
         // Try to insert it
         old = (uvm_va_block_t *)atomic_long_cmpxchg(&managed_range->blocks[index], (long)NULL, (long)block);

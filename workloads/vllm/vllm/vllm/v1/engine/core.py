@@ -99,63 +99,22 @@ class EngineCore:
         self.log_stats = log_stats
 
         # Setup Model.
-        self.structured_output_manager = None
-        if os.environ.get(
-            "VLLM_UVM_CONTROLLED_REMAP_EARLY_STRUCTURED_OUTPUT_MANAGER"
-        ) == "1":
-            logger.debug(
-                "UVM controlled remap boundary: "
-                "early structured_output_manager begin"
-            )
-            self.structured_output_manager = StructuredOutputManager(vllm_config)
-            logger.debug(
-                "UVM controlled remap boundary: "
-                "early structured_output_manager end"
-            )
-
-        logger.debug("UVM controlled remap boundary: executor_class init begin")
         self.model_executor = executor_class(vllm_config)
-        logger.debug("UVM controlled remap boundary: executor_class init end")
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
         self.available_gpu_memory_for_kv_cache = -1
 
         # Setup KV Caches and update CacheConfig after profiling.
-        logger.debug("UVM controlled remap boundary: _initialize_kv_caches call begin")
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
             vllm_config
-        )
-        logger.debug(
-            "UVM controlled remap boundary: _initialize_kv_caches call end "
-            "num_gpu_blocks=%s num_cpu_blocks=%s",
-            num_gpu_blocks,
-            num_cpu_blocks,
         )
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
-        if os.environ.get("VLLM_UVM_CONTROLLED_REMAP_SKIP_ENGINE_CACHE_RPC") == "1":
-            logger.warning(
-                "Skipping EngineCore initialize_cache RPC for "
-                "VLLM_UVM_CONTROLLED_REMAP_SKIP_ENGINE_CACHE_RPC=1"
-            )
-        else:
-            logger.debug("UVM controlled remap boundary: initialize_cache RPC begin")
-            self.collective_rpc(
-                "initialize_cache", args=(num_gpu_blocks, num_cpu_blocks)
-            )
-            logger.debug("UVM controlled remap boundary: initialize_cache RPC end")
+        self.collective_rpc("initialize_cache", args=(num_gpu_blocks, num_cpu_blocks))
 
-        if self.structured_output_manager is None:
-            logger.debug("UVM controlled remap boundary: structured_output_manager begin")
-            self.structured_output_manager = StructuredOutputManager(vllm_config)
-            logger.debug("UVM controlled remap boundary: structured_output_manager end")
-        else:
-            logger.debug(
-                "UVM controlled remap boundary: "
-                "structured_output_manager already initialized"
-            )
+        self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
         Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
@@ -172,7 +131,6 @@ class EngineCore:
             * vllm_config.parallel_config.prefill_context_parallel_size
         )
 
-        logger.debug("UVM controlled remap boundary: scheduler init begin")
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
@@ -181,19 +139,19 @@ class EngineCore:
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
         )
-        logger.debug("UVM controlled remap boundary: scheduler init end")
+        kv_cache_manager = getattr(self.scheduler, "kv_cache_manager", None)
+        self._validate_uvm_dynamic_pool_single_gpu(
+            vllm_config,
+            getattr(kv_cache_manager, "uvm_kv_runtime_policy", None),
+        )
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
-            logger.debug("UVM controlled remap boundary: init_kv_output_aggregator begin")
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
-            logger.debug("UVM controlled remap boundary: init_kv_output_aggregator end")
 
         self.mm_registry = mm_registry = MULTIMODAL_REGISTRY
-        logger.debug("UVM controlled remap boundary: mm_receiver_cache begin")
         self.mm_receiver_cache = engine_receiver_cache_from_config(
             vllm_config, mm_registry
         )
-        logger.debug("UVM controlled remap boundary: mm_receiver_cache end")
 
         # If a KV connector is initialized for scheduler, we want to collect
         # handshake metadata from all workers so the connector in the scheduler
@@ -202,11 +160,9 @@ class EngineCore:
         if kv_connector is not None:
             # Collect and store KV connector xfer metadata from workers
             # (after KV cache registration)
-            logger.debug("UVM controlled remap boundary: kv connector metadata begin")
             xfer_handshake_metadata = (
                 self.model_executor.get_kv_connector_handshake_metadata()
             )
-            logger.debug("UVM controlled remap boundary: kv connector metadata end")
 
             if xfer_handshake_metadata:
                 # xfer_handshake_metadata is list of dicts from workers
@@ -240,7 +196,6 @@ class EngineCore:
 
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
         if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
-            logger.debug("UVM controlled remap boundary: request_block_hasher begin")
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo
             )
@@ -249,7 +204,6 @@ class EngineCore:
             self.request_block_hasher = get_request_block_hasher(
                 scheduler_block_size, caching_hash_fn
             )
-            logger.debug("UVM controlled remap boundary: request_block_hasher end")
 
         self._maybe_apply_pre_service_uvm_kv_dynamic_pool()
 
@@ -260,13 +214,9 @@ class EngineCore:
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
-        logger.debug("UVM controlled remap boundary: freeze_gc_heap begin")
         freeze_gc_heap()
-        logger.debug("UVM controlled remap boundary: freeze_gc_heap end")
         # If enable, attach GC debugger after static variable freeze.
-        logger.debug("UVM controlled remap boundary: maybe_attach_gc_debug_callback begin")
         maybe_attach_gc_debug_callback()
-        logger.debug("UVM controlled remap boundary: maybe_attach_gc_debug_callback end")
 
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
@@ -306,9 +256,7 @@ class EngineCore:
         num_cpu_blocks = 0
 
         # Initialize kv cache and warmup the execution
-        logger.debug("UVM controlled remap boundary: initialize_from_config begin")
         self.model_executor.initialize_from_config(kv_cache_configs)
-        logger.debug("UVM controlled remap boundary: initialize_from_config end")
 
         elapsed = time.time() - start
         logger.info_once(
@@ -377,31 +325,21 @@ class EngineCore:
             )
             return
 
-        logger.debug(
-            "UVM controlled remap boundary: pre-service KV dynamic pool apply "
-            "begin target_blocks=%d",
-            target_blocks,
-        )
-        result = self._apply_uvm_kv_dynamic_pool_target(
+        self._apply_uvm_kv_dynamic_pool_target(
             target_blocks,
             policy=policy,
             block_pool=block_pool,
             reason="pre_service_before_ready",
-            metadata={
-                "source": "engine_core_pre_ready",
-                "ready_handshake_sent": False,
-                "physical_migration_complete": True,
-            },
-        )
-        logger.debug(
-            "UVM controlled remap boundary: pre-service KV dynamic pool apply "
-            "end result=%s",
-            result,
+            metadata={"physical_migration_complete": True},
         )
 
         grow_text = (
-            os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_PRE_SERVICE_GROW_TARGET_BLOCKS", "")
-            or os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_POST_STAGE_M_GROW_TARGET_BLOCKS", "")
+            os.environ.get(
+                "VLLM_UVM_KV_DYNAMIC_POOL_PRE_SERVICE_GROW_TARGET_BLOCKS", ""
+            )
+            or os.environ.get(
+                "VLLM_UVM_KV_DYNAMIC_POOL_POST_STAGE_M_GROW_TARGET_BLOCKS", ""
+            )
         ).strip()
         if not grow_text:
             return
@@ -421,20 +359,10 @@ class EngineCore:
         if grow_target_blocks == target_blocks:
             return
 
-        logger.debug(
-            "UVM controlled remap boundary: pre-service KV dynamic pool grow "
-            "begin target_blocks=%d",
-            grow_target_blocks,
-        )
-        grow_result = self._resize_uvm_kv_target_with_workers(
+        self._resize_uvm_kv_target(
             grow_target_blocks,
             reason="pre_service_before_ready_grow",
             release_expert_wave=False,
-        )
-        logger.debug(
-            "UVM controlled remap boundary: pre-service KV dynamic pool grow "
-            "end result=%s",
-            grow_result,
         )
 
     def _apply_uvm_kv_dynamic_pool_target(
@@ -475,7 +403,28 @@ class EngineCore:
             return None
         return policy, block_pool
 
-    def _resize_uvm_kv_target_with_workers(
+    @staticmethod
+    def _validate_uvm_dynamic_pool_single_gpu(
+        vllm_config: VllmConfig,
+        policy: Any | None,
+    ) -> None:
+        if policy is None or not policy.dynamic_pool_active():
+            return
+        if int(vllm_config.parallel_config.world_size) != 1:
+            raise RuntimeError("Current UVM dynamic KV resize supports one GPU only")
+
+    def _uvm_single_worker_rpc(
+        self,
+        method: str,
+        *,
+        args: tuple[Any, ...],
+    ) -> Any:
+        results = self.collective_rpc(method, args=args)
+        if len(results) != 1:
+            raise RuntimeError("UVM dynamic KV resize requires one GPU worker")
+        return results[0]
+
+    def _resize_uvm_kv_target(
         self,
         target_blocks: int,
         *,
@@ -488,124 +437,59 @@ class EngineCore:
         policy, block_pool = components
         old_target = int(policy._dynamic_pool_applied_target_blocks)
         target = min(max(int(target_blocks), 0), int(policy.total_blocks))
-        dirty_getter = getattr(
-            policy,
-            "get_dynamic_pool_reconciliation_block_ids",
-            None,
-        )
-        dirty_block_ids = sorted(
-            {
-                int(block_id)
-                for block_id in (
-                    dirty_getter()
-                    if callable(dirty_getter)
-                    else getattr(
-                        policy,
-                        "_dynamic_pool_reconciliation_block_ids",
-                        set(),
-                    )
-                )
-                if int(block_id) > 0
-            }
-        )
+        dirty_block_ids = policy.get_dynamic_pool_reconciliation_block_ids()
         if target == old_target and not dirty_block_ids:
-            return {
-                "ok": True,
-                "reason": "already_at_target",
-                "applied_target_blocks": old_target,
-            }
+            return {"ok": True, "reason": "already_at_target"}
         if target < old_target and self.scheduler.has_unfinished_requests():
-            return {
-                "ok": False,
-                "reason": "shrink_requires_idle_scheduler",
-                "old_target_blocks": old_target,
-                "new_target_blocks": target,
-            }
+            return {"ok": False, "reason": "scheduler_busy"}
 
-        expert_results: list[Any] = []
-        expert_candidate_results: dict[str, list[Any]] = {}
-        selected_experts_by_layer: dict[str, int] = {}
-        selected_expert_class: str | None = None
-        expert_release_missing_layers: list[str] = []
         if release_expert_wave and target > old_target:
-            selected_expert_class = "cold"
-            candidate_results = self.collective_rpc(
-                "get_uvm_incremental_expert_offload_candidates",
-                args=(selected_expert_class,),
-            )
-            expert_candidate_results[selected_expert_class] = candidate_results
-            candidate_query_ok = bool(candidate_results) and all(
-                isinstance(result, dict) and bool(result.get("ok"))
-                for result in candidate_results
-            )
-            if candidate_query_ok:
-                selected_experts_by_layer = (
-                    self._select_uvm_incremental_experts_by_layer(
-                        candidate_results
-                    )
-                )
-            if candidate_query_ok and not selected_experts_by_layer:
-                selected_expert_class = "warm"
-                candidate_results = self.collective_rpc(
+            try:
+                candidates = self._uvm_single_worker_rpc(
                     "get_uvm_incremental_expert_offload_candidates",
-                    args=(selected_expert_class,),
+                    args=("cold",),
                 )
-                expert_candidate_results[selected_expert_class] = candidate_results
-                candidate_query_ok = bool(candidate_results) and all(
-                    isinstance(result, dict) and bool(result.get("ok"))
-                    for result in candidate_results
-                )
-                if candidate_query_ok:
-                    selected_experts_by_layer = (
-                        self._select_uvm_incremental_experts_by_layer(
-                            candidate_results
-                        )
+            except Exception:
+                candidates = {"ok": False, "candidates": {}}
+            if not isinstance(candidates, dict) or not bool(candidates.get("ok")):
+                if self._uvm_env_flag("VLLM_UVM_KV_ADAPTIVE_FAIL_FAST", default=True):
+                    raise RuntimeError("Adaptive expert selection failed")
+                return {"ok": False, "reason": "expert_selection_failed"}
+
+            allow_warm = not bool(candidates.get("candidates"))
+            if allow_warm:
+                try:
+                    candidates = self._uvm_single_worker_rpc(
+                        "get_uvm_incremental_expert_offload_candidates",
+                        args=("warm",),
                     )
-            if candidate_query_ok and selected_experts_by_layer:
-                expert_results = self.collective_rpc(
-                    "run_uvm_incremental_expert_offload",
-                    args=(
-                        selected_expert_class == "warm",
-                        selected_experts_by_layer,
-                    ),
-                )
-                expert_release_missing_layers = (
-                    self._uvm_incremental_release_missing_layers(
-                        selected_experts_by_layer,
-                        expert_results,
+                except Exception:
+                    candidates = {"ok": False, "candidates": {}}
+                if not isinstance(candidates, dict) or not bool(candidates.get("ok")):
+                    if self._uvm_env_flag(
+                        "VLLM_UVM_KV_ADAPTIVE_FAIL_FAST", default=True
+                    ):
+                        raise RuntimeError("Adaptive expert selection failed")
+                    return {
+                        "ok": False,
+                        "reason": "expert_selection_failed",
+                    }
+
+            selected_experts = candidates.get("candidates") or {}
+            if selected_experts:
+                try:
+                    released = self._uvm_single_worker_rpc(
+                        "run_uvm_incremental_expert_offload",
+                        args=(allow_warm, selected_experts),
                     )
-                )
-            expert_execution_ok = bool(expert_results) and all(
-                isinstance(result, dict) and bool(result.get("ok"))
-                for result in expert_results
-            )
-            expert_wave_ok = candidate_query_ok and (
-                not selected_experts_by_layer
-                or (expert_execution_ok and not expert_release_missing_layers)
-            )
-            if not expert_wave_ok:
-                result = {
-                    "ok": False,
-                    "reason": "incremental_expert_wave_failed",
-                    "old_target_blocks": old_target,
-                    "new_target_blocks": target,
-                    "expert_candidate_results": expert_candidate_results,
-                    "selected_expert_class": selected_expert_class,
-                    "selected_experts_by_layer": selected_experts_by_layer,
-                    "expert_release_missing_layers": (
-                        expert_release_missing_layers
-                    ),
-                    "expert_results": expert_results,
-                }
-                if self._uvm_env_flag(
-                    "VLLM_UVM_KV_ADAPTIVE_FAIL_FAST",
-                    default=True,
-                ):
-                    raise RuntimeError(
-                        f"Adaptive expert offload wave failed: {result!r}"
-                    )
-                logger.error("Adaptive expert offload wave failed: %s", result)
-                return result
+                except Exception:
+                    released = {"ok": False}
+                if not isinstance(released, dict) or not bool(released.get("ok")):
+                    if self._uvm_env_flag(
+                        "VLLM_UVM_KV_ADAPTIVE_FAIL_FAST", default=True
+                    ):
+                        raise RuntimeError("Adaptive expert release failed")
+                    return {"ok": False, "reason": "expert_release_failed"}
 
         if not bool(
             getattr(policy, "dynamic_pool_physical_migration_enable", True)
@@ -616,283 +500,50 @@ class EngineCore:
                 False,
             )
         ):
-            apply_result = self._apply_uvm_kv_dynamic_pool_target(
+            applied = self._apply_uvm_kv_dynamic_pool_target(
                 target,
                 policy=policy,
                 block_pool=block_pool,
                 reason=reason,
-                metadata={"source": "engine_core_logical_only_resize"},
             )
             return {
-                **apply_result,
-                "worker_results": [],
-                "expert_candidate_results": expert_candidate_results,
-                "selected_expert_class": selected_expert_class,
-                "selected_experts_by_layer": selected_experts_by_layer,
-                "expert_release_missing_layers": expert_release_missing_layers,
-                "expert_results": expert_results,
+                "ok": bool(applied.get("ok")),
+                "reason": str(applied.get("reason") or "apply_failed"),
             }
 
-        prepare_resize = getattr(
-            policy,
-            "prepare_external_dynamic_pool_resize",
-            None,
-        )
-        finalize_resize = getattr(
-            policy,
-            "finalize_external_dynamic_pool_resize",
-            None,
-        )
-        if not callable(prepare_resize) or not callable(finalize_resize):
-            return {"ok": False, "reason": "external_resize_protocol_unavailable"}
-        preparation = prepare_resize(
+        preparation = policy.prepare_dynamic_pool_resize(
             target,
             block_pool=block_pool,
             reason=reason,
         )
         if not bool(preparation.get("ok")):
-            return {
-                "ok": False,
-                "reason": "external_resize_prepare_failed",
-                "preparation": preparation,
-            }
+            return {"ok": False, "reason": "prepare_failed"}
 
-        expected_block_ids = {
-            int(block_id)
-            for block_id in preparation.get("expected_block_ids", [])
-        }
-        expected_cpu_block_ids = {
-            int(block_id)
-            for block_id in preparation.get("expected_cpu_block_ids", [])
-        }
-        expected_gpu_block_ids = {
-            int(block_id)
-            for block_id in preparation.get("expected_gpu_block_ids", [])
-        }
-        plan_token = str(preparation.get("plan_token") or "")
-        worker_results: list[Any] = []
-        rpc_exception: Exception | None = None
         try:
-            worker_results = self.collective_rpc(
+            worker = self._uvm_single_worker_rpc(
                 "resize_uvm_kv_cache_target",
-                args=(
-                    old_target,
-                    target,
-                    reason,
-                    list(preparation.get("dirty_block_ids", [])),
-                    plan_token,
-                ),
+                args=(old_target, target, dirty_block_ids),
             )
-        except Exception as exc:
-            rpc_exception = exc
+            if not isinstance(worker, dict):
+                worker = {"ok": False, "made_progress": True}
+        except Exception:
+            # An RPC error cannot prove that no migration was submitted.
+            worker = {"ok": False, "made_progress": True}
 
-        rank_completed: list[set[int]] = []
-        rank_completed_cpu: list[set[int]] = []
-        rank_completed_gpu: list[set[int]] = []
-        protocol_unknown = rpc_exception is not None or not worker_results
-        reported_progress = False
-        physical_ok = rpc_exception is None and bool(worker_results)
-        for worker_result in worker_results:
-            if not isinstance(worker_result, dict):
-                protocol_unknown = True
-                physical_ok = False
-                rank_completed.append(set())
-                rank_completed_cpu.append(set())
-                rank_completed_gpu.append(set())
-                continue
-            try:
-                requested = {
-                    int(value)
-                    for value in worker_result["requested_block_ids"]
-                }
-                requested_cpu = {
-                    int(value)
-                    for value in worker_result["requested_cpu_block_ids"]
-                }
-                requested_gpu = {
-                    int(value)
-                    for value in worker_result["requested_gpu_block_ids"]
-                }
-                completed = {
-                    int(value)
-                    for value in worker_result["completed_block_ids"]
-                }
-                completed_cpu = {
-                    int(value)
-                    for value in worker_result["completed_cpu_block_ids"]
-                }
-                completed_gpu = {
-                    int(value)
-                    for value in worker_result["completed_gpu_block_ids"]
-                }
-                made_progress_value = worker_result["made_progress"]
-                synchronized_value = worker_result["synchronized"]
-                worker_old_target = int(
-                    worker_result.get("old_target_blocks", -1)
-                )
-                worker_new_target = int(
-                    worker_result.get("new_target_blocks", -1)
-                )
-            except (KeyError, TypeError, ValueError):
-                protocol_unknown = True
-                physical_ok = False
-                rank_completed.append(set())
-                rank_completed_cpu.append(set())
-                rank_completed_gpu.append(set())
-                continue
-
-            schema_valid = (
-                requested == expected_block_ids
-                and requested_cpu == expected_cpu_block_ids
-                and requested_gpu == expected_gpu_block_ids
-                and completed == completed_cpu | completed_gpu
-                and not completed_cpu & completed_gpu
-                and completed <= expected_block_ids
-                and completed_cpu <= expected_cpu_block_ids
-                and completed_gpu <= expected_gpu_block_ids
-                and str(worker_result.get("plan_token") or "") == plan_token
-                and worker_old_target == old_target
-                and worker_new_target == target
-                and isinstance(made_progress_value, bool)
-                and isinstance(synchronized_value, bool)
-            )
-            if not schema_valid:
-                protocol_unknown = True
-            reported_progress = (
-                reported_progress
-                or bool(made_progress_value)
-                or bool(completed)
-            )
-            rank_completed.append(completed)
-            rank_completed_cpu.append(completed_cpu)
-            rank_completed_gpu.append(completed_gpu)
-            rank_complete = (
-                schema_valid
-                and bool(worker_result.get("ok"))
-                and bool(synchronized_value)
-                and bool(made_progress_value)
-                and completed == expected_block_ids
-                and completed_cpu == expected_cpu_block_ids
-                and completed_gpu == expected_gpu_block_ids
-            )
-            physical_ok = physical_ok and rank_complete
-
-        completed_intersection = (
-            set.intersection(*rank_completed) if rank_completed else set()
-        )
-        completed_cpu_intersection = (
-            set.intersection(*rank_completed_cpu)
-            if rank_completed_cpu
-            else set()
-        )
-        completed_gpu_intersection = (
-            set.intersection(*rank_completed_gpu)
-            if rank_completed_gpu
-            else set()
-        )
-        finalize_result = finalize_resize(
+        finalized = policy.finalize_dynamic_pool_resize(
             preparation,
             block_pool=block_pool,
-            worker_ok=physical_ok,
-            worker_made_progress=(reported_progress or protocol_unknown),
-            completed_block_ids=sorted(completed_intersection),
-            completed_cpu_block_ids=sorted(completed_cpu_intersection),
-            completed_gpu_block_ids=sorted(completed_gpu_intersection),
-            reason=reason,
-            metadata={
-                "source": "engine_core_worker_coordinated_resize",
-                "worker_results": worker_results,
-            },
+            worker_ok=bool(worker.get("ok")),
+            worker_made_progress=bool(worker.get("made_progress")),
         )
-        if not physical_ok or not bool(finalize_result.get("ok")):
-            result = {
-                "ok": False,
-                "reason": "worker_physical_migration_failed",
-                "old_target_blocks": old_target,
-                "new_target_blocks": target,
-                "worker_results": worker_results,
-                "expert_candidate_results": expert_candidate_results,
-                "selected_expert_class": selected_expert_class,
-                "selected_experts_by_layer": selected_experts_by_layer,
-                "expert_release_missing_layers": expert_release_missing_layers,
-                "expert_results": expert_results,
-                "preparation": preparation,
-                "finalize_result": finalize_result,
-            }
+        if not bool(finalized.get("ok")):
             if self._uvm_env_flag(
                 "VLLM_UVM_KV_ADAPTIVE_FAIL_FAST",
                 default=True,
             ):
-                raise RuntimeError(
-                    f"Adaptive KV resize failed: {result!r}"
-                ) from rpc_exception
-            logger.error("Adaptive KV resize failed: %s", result)
-            return result
-
-        return {
-            **finalize_result,
-            "worker_results": worker_results,
-            "expert_candidate_results": expert_candidate_results,
-            "selected_expert_class": selected_expert_class,
-            "selected_experts_by_layer": selected_experts_by_layer,
-            "expert_release_missing_layers": expert_release_missing_layers,
-            "expert_results": expert_results,
-        }
-
-    @staticmethod
-    def _select_uvm_incremental_experts_by_layer(
-        candidate_results: list[Any],
-    ) -> dict[str, int]:
-        """Choose one deterministic global expert id per logical layer."""
-        selected: dict[str, int] = {}
-        for result in candidate_results:
-            if not isinstance(result, dict):
-                continue
-            candidates = result.get("candidates")
-            if not isinstance(candidates, dict):
-                continue
-            for layer_key, candidate in candidates.items():
-                if not isinstance(candidate, dict):
-                    continue
-                try:
-                    global_expert_id = int(candidate["global_expert_id"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                normalized_key = str(layer_key)
-                previous = selected.get(normalized_key)
-                if previous is None or global_expert_id < previous:
-                    selected[normalized_key] = global_expert_id
-        return selected
-
-    @staticmethod
-    def _uvm_incremental_release_missing_layers(
-        selected_experts_by_layer: dict[str, int],
-        worker_results: list[Any],
-    ) -> list[str]:
-        released_layers: set[str] = set()
-        for worker_result in worker_results:
-            if not isinstance(worker_result, dict):
-                continue
-            layer_results = worker_result.get("results")
-            if not isinstance(layer_results, list):
-                continue
-            for layer_result in layer_results:
-                if not isinstance(layer_result, dict):
-                    continue
-                layer_key = str(layer_result.get("layer_key") or "")
-                selected_expert = selected_experts_by_layer.get(layer_key)
-                if selected_expert is None:
-                    continue
-                released_experts = layer_result.get("released_experts")
-                if not isinstance(released_experts, list):
-                    continue
-                try:
-                    released_ids = {int(value) for value in released_experts}
-                except (TypeError, ValueError):
-                    continue
-                if selected_expert in released_ids:
-                    released_layers.add(layer_key)
-        return sorted(set(selected_experts_by_layer) - released_layers)
+                raise RuntimeError("Adaptive KV resize failed")
+            return {"ok": False, "reason": "physical_migration_failed"}
+        return {"ok": True, "reason": "applied"}
 
     def _maybe_handle_uvm_kv_preemption_pressure(
         self,
@@ -949,7 +600,7 @@ class EngineCore:
                 preemption_count,
             )
             return
-        self._resize_uvm_kv_target_with_workers(
+        self._resize_uvm_kv_target(
             new_target,
             reason="scheduler_preemption_pressure",
             release_expert_wave=self._uvm_env_flag(
@@ -972,7 +623,7 @@ class EngineCore:
         )
         self._uvm_pending_kv_grow_target_blocks = None
         self._uvm_pending_kv_grow_reason = ""
-        result = self._resize_uvm_kv_target_with_workers(
+        result = self._resize_uvm_kv_target(
             int(target),
             reason=reason,
             release_expert_wave=self._uvm_env_flag(
@@ -998,28 +649,19 @@ class EngineCore:
             return {
                 "ok": False,
                 "reason": "policy_or_block_pool_unavailable",
-                "requested_target_blocks": int(target_blocks),
             }
 
-        logger.debug(
-            "UVM controlled remap boundary: utility KV dynamic pool apply "
-            "begin target_blocks=%d reason=%s",
-            int(target_blocks),
-            reason,
-        )
-        result = self._resize_uvm_kv_target_with_workers(
+        result = self._resize_uvm_kv_target(
             int(target_blocks),
             reason=reason,
             release_expert_wave=bool(
                 (metadata or {}).get("release_expert_wave", False)
             ),
         )
-        logger.debug(
-            "UVM controlled remap boundary: utility KV dynamic pool apply "
-            "end result=%s",
-            result,
-        )
-        return result
+        return {
+            "ok": bool(result.get("ok")),
+            "reason": str(result.get("reason") or "apply_failed"),
+        }
 
     @staticmethod
     def _plan_uvm_dynamic_expert_swaps(
@@ -1031,9 +673,7 @@ class EngineCore:
         aggregated: dict[str, dict[str, Any]] = {}
         errors: list[str] = []
         for worker_index, worker_result in enumerate(snapshot_results):
-            if not isinstance(worker_result, dict) or not bool(
-                worker_result.get("ok")
-            ):
+            if not isinstance(worker_result, dict) or not bool(worker_result.get("ok")):
                 errors.append(f"worker:{worker_index}:snapshot_failed")
                 continue
             layers = worker_result.get("layers")
@@ -1048,12 +688,9 @@ class EngineCore:
                     global_count = int(layer_value["global_num_experts"])
                     local_count = int(layer_value["local_num_experts"])
                     counts = [
-                        int(value)
-                        for value in layer_value["expert_token_counts"]
+                        int(value) for value in layer_value["expert_token_counts"]
                     ]
-                    remote = {
-                        int(value) for value in layer_value["remote_experts"]
-                    }
+                    remote = {int(value) for value in layer_value["remote_experts"]}
                 except (KeyError, TypeError, ValueError):
                     errors.append(f"worker:{worker_index}:{layer_key}:malformed")
                     continue
@@ -1086,8 +723,7 @@ class EngineCore:
                     )
                     continue
                 current["counts"] = [
-                    left + right
-                    for left, right in zip(current["counts"], counts)
+                    left + right for left, right in zip(current["counts"], counts)
                 ]
 
         swaps_by_layer: dict[str, list[dict[str, object]]] = {}
@@ -1487,7 +1123,7 @@ class EngineCore:
                     0,
                 )
                 if sleep_target < int(policy._dynamic_pool_applied_target_blocks):
-                    self._resize_uvm_kv_target_with_workers(
+                    self._resize_uvm_kv_target(
                         sleep_target,
                         reason="engine_sleep_shrink",
                         release_expert_wave=False,
@@ -1591,7 +1227,6 @@ class EngineCoreProc(EngineCore):
             vllm_config,
             client_handshake_address,
         ) as addresses:
-            logger.debug("UVM controlled remap boundary: engine handshake HELLO/INIT complete")
             self.client_count = len(addresses.outputs)
 
             # Set up data parallel environment.
@@ -1613,11 +1248,9 @@ class EngineCoreProc(EngineCore):
 
             self._init_data_parallel(vllm_config)
 
-            logger.debug("UVM controlled remap boundary: EngineCore super init begin")
             super().__init__(
                 vllm_config, executor_class, log_stats, executor_fail_callback
             )
-            logger.debug("UVM controlled remap boundary: EngineCore super init end")
 
             # Background Threads and Queues for IO. These enable us to
             # overlap ZMQ socket IO with GPU since they release the GIL,
@@ -1635,9 +1268,7 @@ class EngineCoreProc(EngineCore):
                 ),
                 daemon=True,
             )
-            logger.debug("UVM controlled remap boundary: EngineCore input thread start begin")
             input_thread.start()
-            logger.debug("UVM controlled remap boundary: EngineCore input thread started")
 
             self.output_thread = threading.Thread(
                 target=self.process_output_sockets,
@@ -1648,9 +1279,7 @@ class EngineCoreProc(EngineCore):
                 ),
                 daemon=True,
             )
-            logger.debug("UVM controlled remap boundary: EngineCore output thread start begin")
             self.output_thread.start()
-            logger.debug("UVM controlled remap boundary: EngineCore output thread started")
 
             # Don't complete handshake until DP coordinator ready message is
             # received.
@@ -1659,8 +1288,6 @@ class EngineCoreProc(EngineCore):
                     raise RuntimeError("Input socket thread died during startup")
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
-
-        logger.debug("UVM controlled remap boundary: EngineCore READY handshake sent")
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
@@ -1745,15 +1372,12 @@ class EngineCoreProc(EngineCore):
             bind=False,
         ) as handshake_socket:
             # Register engine with front-end.
-            logger.debug("UVM controlled remap boundary: EngineCore startup HELLO begin")
             addresses = self.startup_handshake(
                 handshake_socket, local_client, headless, parallel_config_to_update
             )
-            logger.debug("UVM controlled remap boundary: EngineCore startup HELLO/INIT end")
             yield addresses
 
             # Send ready message.
-            logger.debug("UVM controlled remap boundary: EngineCore READY send begin")
             num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
             # We pass back the coordinator stats update address here for the
             # external LB case for our colocated front-end to use (coordinator
@@ -1774,7 +1398,6 @@ class EngineCoreProc(EngineCore):
                 )
 
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
-            logger.debug("UVM controlled remap boundary: EngineCore READY send end")
 
     @staticmethod
     def startup_handshake(
@@ -1993,7 +1616,6 @@ class EngineCoreProc(EngineCore):
         generic_decoder = MsgpackDecoder()
 
         with ExitStack() as stack, zmq.Context() as ctx:
-            logger.debug("UVM controlled remap boundary: input socket thread enter")
             input_sockets = [
                 stack.enter_context(
                     make_zmq_socket(
@@ -2023,22 +1645,16 @@ class EngineCoreProc(EngineCore):
                 # Send initial message to each input socket - this is required
                 # before the front-end ROUTER socket can send input messages
                 # back to us.
-                logger.debug("UVM controlled remap boundary: input socket initial send begin")
                 input_socket.send(b"")
-                logger.debug("UVM controlled remap boundary: input socket initial send end")
                 poller.register(input_socket, zmq.POLLIN)
 
             if coord_socket is not None:
                 # Wait for ready message from coordinator.
-                logger.debug("UVM controlled remap boundary: coordinator READY recv begin")
                 assert coord_socket.recv() == b"READY"
-                logger.debug("UVM controlled remap boundary: coordinator READY recv end")
                 poller.register(coord_socket, zmq.POLLIN)
 
-            logger.debug("UVM controlled remap boundary: input socket ready_event set")
             ready_event.set()
             del ready_event
-            logger.debug("UVM controlled remap boundary: input socket poll loop begin")
             while True:
                 for input_socket, _ in poller.poll():
                     # (RequestType, RequestData)
@@ -2075,7 +1691,6 @@ class EngineCoreProc(EngineCore):
         # We must set linger to ensure the ENGINE_CORE_DEAD
         # message is sent prior to closing the socket.
         with ExitStack() as stack, zmq.Context() as ctx:
-            logger.debug("UVM controlled remap boundary: output socket thread enter")
             sockets = [
                 stack.enter_context(
                     make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000)
@@ -2093,7 +1708,6 @@ class EngineCoreProc(EngineCore):
             )
             max_reuse_bufs = len(sockets) + 1
 
-            logger.debug("UVM controlled remap boundary: output socket loop begin")
             while True:
                 output = self.output_queue.get()
                 if output == EngineCoreProc.ENGINE_CORE_DEAD:

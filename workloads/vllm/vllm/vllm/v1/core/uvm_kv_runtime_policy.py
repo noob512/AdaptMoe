@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Stage J UVM KV runtime pressure policy.
 
-This module intentionally stays at the vLLM block-manager boundary.  It traces
-and optionally denies new KV block admission; it does not migrate raw allocator
-pointers or alter active request block tables behind the scheduler's back.
+This module intentionally stays at the vLLM block-manager boundary. It tracks
+pressure and optionally denies new KV block admission; it does not alter active
+request block tables behind the scheduler's back.
 """
 
 from __future__ import annotations
@@ -21,8 +21,6 @@ from vllm.device_allocator.uvm_policy_runtime import get_uvm_policy_runtime
 from vllm.device_allocator.uvm_region import LogicalKVBlock, PhysicalKVSpan, RegionState
 from vllm.device_allocator.uvm_unified_residency_controller import (
     get_uvm_unified_residency_controller,
-    record_unified_kv_target,
-    record_unified_residency_snapshot,
 )
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -295,8 +293,7 @@ class UvmKvRuntimePolicy:
             )
             self.dynamic_pool_physical_migration_device = 0
         # The residency ledger starts with all registered KV regions on GPU.
-        # Applying the target later lets the initial shrink be traced as a
-        # safe, explicit pool-size transition.
+        # Apply the target later as a safe, explicit pool-size transition.
         self._dynamic_pool_applied_target_blocks = self.total_blocks
         self._dynamic_pool_control_mtime_ns: int | None = None
         self._dynamic_pool_generation = 0
@@ -313,42 +310,10 @@ class UvmKvRuntimePolicy:
             )
             self.policy = "lru_prefix_cache"
         self._lock = threading.Lock()
-        self._unified_config_recorded = False
 
     @property
     def active(self) -> bool:
         return self.enabled
-
-    def record_config(self) -> None:
-        if not self._unified_config_recorded:
-            self._unified_config_recorded = True
-            record_unified_residency_snapshot(
-                reason="kv_runtime_config",
-                kv_pressure={
-                    "runtime_enabled": self.enabled,
-                    "runtime_mode": self.mode,
-                    "budget_bytes": self.budget_bytes,
-                    "budget_blocks": self.budget_blocks,
-                    "bytes_per_block": self.bytes_per_block,
-                    "total_bytes": self.total_bytes,
-                    "total_blocks": self.total_blocks,
-                    "dynamic_pool_enable": self.dynamic_pool_enable,
-                    "dynamic_pool_target_blocks": self.dynamic_pool_target_blocks,
-                    "dynamic_pool_physical_migration_enable": (
-                        self.dynamic_pool_physical_migration_enable
-                    ),
-                    "dynamic_pool_physical_migration_executor": (
-                        self.dynamic_pool_physical_migration_executor
-                    ),
-                    "dynamic_pool_physical_migration_sync": (
-                        self.dynamic_pool_physical_migration_sync
-                    ),
-                    "dynamic_pool_physical_migration_device": (
-                        self.dynamic_pool_physical_migration_device
-                    ),
-                    "num_kv_cache_groups": self.num_kv_cache_groups,
-                },
-            )
 
     def dynamic_pool_active(self) -> bool:
         return self.dynamic_pool_enable
@@ -404,16 +369,6 @@ class UvmKvRuntimePolicy:
         if target != old_target:
             self.dynamic_pool_target_blocks = target
             self._dynamic_pool_generation += 1
-            record_unified_kv_target(
-                target,
-                old_target_blocks=old_target,
-                reason=reason,
-                metadata={
-                    "source": "unified_control_file",
-                    "generation": self._dynamic_pool_generation,
-                    **metadata,
-                },
-            )
         apply_result = self._ensure_dynamic_pool_applied(
             block_pool=block_pool,
             reason=reason,
@@ -450,7 +405,6 @@ class UvmKvRuntimePolicy:
                 "reason": "kv_runtime_inactive",
                 "requested_blocks": block_specs,
             }
-        self.record_config()
         records: list[dict[str, Any]] = []
         for spec in block_specs:
             block_id = int(
@@ -638,20 +592,8 @@ class UvmKvRuntimePolicy:
                 except Exception:  # pragma: no cover - optional control file.
                     pass
         if target != self.dynamic_pool_target_blocks:
-            old_target = self.dynamic_pool_target_blocks
             self.dynamic_pool_target_blocks = target
             self._dynamic_pool_generation += 1
-            record_unified_kv_target(
-                target,
-                old_target_blocks=old_target,
-                reason=reason,
-                metadata={
-                    "source": "kv_dynamic_pool_target_update",
-                    "generation": self._dynamic_pool_generation,
-                    "control_file": self.dynamic_pool_control_file,
-                    "raw_value": raw_value,
-                },
-            )
         self._ensure_dynamic_pool_applied(block_pool=block_pool, reason=reason)
 
     def _parse_dynamic_pool_control(self, raw_value: str) -> int | None:
@@ -1027,7 +969,7 @@ class UvmKvRuntimePolicy:
         self._dynamic_pool_external_reconciliation_required = False
         return {"ok": True, "reason": "applied"}
 
-    def prepare_external_dynamic_pool_resize(
+    def prepare_dynamic_pool_resize(
         self,
         target_blocks: int,
         *,
@@ -1092,15 +1034,10 @@ class UvmKvRuntimePolicy:
             }
 
         generation = int(getattr(self, "_dynamic_pool_generation", 0))
-        plan_token = (
-            f"{generation}:{old_target}:{target}:"
-            + ",".join(str(block_id) for block_id in transition_ids)
-        )
         return {
             "ok": True,
             "reason": "prepared",
             "generation": generation,
-            "plan_token": plan_token,
             "request_reason": reason,
             "old_target_blocks": old_target,
             "new_target_blocks": target,
@@ -1118,20 +1055,15 @@ class UvmKvRuntimePolicy:
             "expected_gpu_block_ids": list(plan["gpu_block_ids"]),
         }
 
-    def finalize_external_dynamic_pool_resize(
+    def finalize_dynamic_pool_resize(
         self,
         preparation: dict[str, Any],
         *,
         block_pool: Any | None,
         worker_ok: bool,
         worker_made_progress: bool,
-        completed_block_ids: list[int],
-        completed_cpu_block_ids: list[int],
-        completed_gpu_block_ids: list[int],
-        reason: str,
-        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Commit or abort a prepared worker resize using exact completion IDs."""
+        """Commit or abort a resize performed by the only GPU worker."""
         if block_pool is None or not bool(preparation.get("ok")):
             return {"ok": False, "reason": "external_resize_not_prepared"}
         expected = {
@@ -1146,9 +1078,6 @@ class UvmKvRuntimePolicy:
             int(block_id)
             for block_id in preparation.get("expected_gpu_block_ids", [])
         }
-        completed = {int(block_id) for block_id in completed_block_ids}
-        completed_cpu = {int(block_id) for block_id in completed_cpu_block_ids}
-        completed_gpu = {int(block_id) for block_id in completed_gpu_block_ids}
         target = self._clamp_dynamic_pool_target(
             int(preparation.get("new_target_blocks", 0))
         )
@@ -1169,21 +1098,12 @@ class UvmKvRuntimePolicy:
             and set(current_plan.get("cpu_block_ids", [])) == expected_cpu
             and set(current_plan.get("gpu_block_ids", [])) == expected_gpu
         )
-        completion_valid = (
-            worker_ok
-            and completed == expected
-            and completed_cpu == expected_cpu
-            and completed_gpu == expected_gpu
-        )
-        if token_valid and plan_valid and completion_valid:
+        if token_valid and plan_valid and worker_ok:
             return self.apply_unified_kv_target_blocks(
                 target,
                 block_pool=block_pool,
-                reason=reason,
-                metadata={
-                    **(metadata or {}),
-                    "physical_migration_complete_block_ids": sorted(expected),
-                },
+                reason=str(preparation.get("request_reason") or "dynamic_resize"),
+                metadata={"physical_migration_complete_block_ids": sorted(expected)},
             )
 
         # A stale token or changed plan invalidates the worker's zero-progress
@@ -1191,10 +1111,7 @@ class UvmKvRuntimePolicy:
         # quarantine. Keep every transition block offline and UNKNOWN until an
         # external reconciliation completes instead of exposing it again.
         made_progress = bool(
-            worker_made_progress
-            or completed
-            or not token_valid
-            or not plan_valid
+            worker_made_progress or not token_valid or not plan_valid
         )
         blocks = getattr(block_pool, "blocks", [])
         dirty_block_ids = {
@@ -1236,13 +1153,10 @@ class UvmKvRuntimePolicy:
         return {
             "ok": False,
             "reason": (
-                "external_resize_plan_changed"
+                "dynamic_resize_plan_changed"
                 if not token_valid or not plan_valid
                 else "worker_physical_migration_failed"
             ),
-            "made_progress": made_progress,
-            "expected_block_ids": sorted(expected),
-            "completed_block_ids": sorted(completed),
         }
 
     @staticmethod
@@ -1380,19 +1294,10 @@ class UvmKvRuntimePolicy:
         num_blocks_to_allocate: int,
         block_pool: Any,
     ) -> bool:
-        """Trace pressure and decide whether new KV block admission is allowed."""
+        """Decide whether new KV block admission is allowed."""
         if num_blocks_to_allocate <= 0:
             return True
-        self.record_config()
         pressure = self._pressure_snapshot(block_pool, num_blocks_to_allocate)
-        record_unified_residency_snapshot(
-            reason="kv_allocation_pressure",
-            kv_pressure={
-                "request_id": request_id,
-                "num_blocks_to_allocate": num_blocks_to_allocate,
-                **pressure,
-            },
-        )
         if not self.active:
             return True
         over_budget = bool(pressure["over_budget"])
@@ -1464,7 +1369,6 @@ class UvmKvRuntimePolicy:
         """Mark active request KV blocks as protected GPU-resident regions."""
         if not self.active or not self.active_protect_enable:
             return
-        self.record_config()
 
         runtime = get_uvm_policy_runtime()
         if not runtime.active:

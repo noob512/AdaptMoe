@@ -732,13 +732,12 @@ def test_stale_external_resize_keeps_zero_progress_plan_quarantined() -> None:
     policy = _make_policy(applied_target=6, target=3)
     pool = _make_pool(policy)
 
-    preparation = policy.prepare_external_dynamic_pool_resize(
+    preparation = policy.prepare_dynamic_pool_resize(
         3,
         block_pool=pool,
         reason="test",
     )
     assert preparation["ok"] is True
-    assert preparation["plan_token"]
     assert _queue_ids(pool.free_block_queue) == [1, 2, 3]
     assert _queue_ids(pool.offline_block_queue) == [4, 5, 6]
 
@@ -746,20 +745,15 @@ def test_stale_external_resize_keeps_zero_progress_plan_quarantined() -> None:
     # response. Even a reported zero-progress failure is no longer safe to
     # roll back because it belongs to a stale generation.
     policy._dynamic_pool_generation = 1
-    result = policy.finalize_external_dynamic_pool_resize(
+    result = policy.finalize_dynamic_pool_resize(
         preparation,
         block_pool=pool,
         worker_ok=False,
         worker_made_progress=False,
-        completed_block_ids=[],
-        completed_cpu_block_ids=[],
-        completed_gpu_block_ids=[],
-        reason="test",
     )
 
     assert result["ok"] is False
-    assert result["reason"] == "external_resize_plan_changed"
-    assert result["made_progress"] is True
+    assert result["reason"] == "dynamic_resize_plan_changed"
     assert policy._dynamic_pool_reconciliation_block_ids == {4, 5, 6}
     assert policy._dynamic_pool_reconciliation_needed
     assert policy._dynamic_pool_external_reconciliation_required

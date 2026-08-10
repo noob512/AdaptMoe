@@ -115,7 +115,6 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
 
         self.uvm_kv_runtime_policy = UvmKvRuntimePolicy(kv_cache_config)
-        self.uvm_kv_runtime_policy.record_config()
 
         self.coordinator = get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,

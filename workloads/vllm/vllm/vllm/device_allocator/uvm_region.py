@@ -10,9 +10,9 @@ tests and CPU-only startup paths.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Iterable, Mapping, MutableMapping, Sequence
 
 
 class RegionState(str, Enum):
@@ -133,25 +133,6 @@ def normalize_region_state(state: RegionState | str | None) -> RegionState:
         return RegionState.UNKNOWN
 
 
-def update_aggregate_state(
-    record: ExpertRecord,
-    states: Mapping[str, RegionState | str],
-    *,
-    target: RegionState | str,
-) -> RegionState:
-    """Commit an ExpertRecord state only when every envelope reached target."""
-    target_state = normalize_region_state(target)
-    if not record.envelope_region_ids:
-        record.aggregate_state = RegionState.UNKNOWN
-        return record.aggregate_state
-    resolved = [normalize_region_state(states.get(region_id)) for region_id in record.envelope_region_ids]
-    if all(state == target_state for state in resolved):
-        record.aggregate_state = target_state
-    else:
-        record.aggregate_state = RegionState.UNKNOWN
-    return record.aggregate_state
-
-
 def compile_expert_envelopes(
     *,
     layer_id: int,
@@ -187,7 +168,8 @@ def compile_expert_envelopes(
             owner = owners.get(geometry_key)
             if owner is not None and owner != record.key:
                 raise ValueError(
-                    f"envelope {region_id} is shared by experts {owner} and {record.key}"
+                    f"envelope {region_id} is shared by experts "
+                    f"{owner} and {record.key}"
                 )
             owners[geometry_key] = record.key
             if region_id not in record.envelope_region_ids:
@@ -202,35 +184,31 @@ class ExplicitRegionRegistry:
 
     The optional executor receives ``(base, length)`` ranges and returns either
     a truthy value or a result object containing ``ok``.  A failed item is
-    always recorded as ``UNKNOWN``; callers cannot accidentally claim that an
-    Expert was atomically moved when one envelope failed.
+    always recorded as ``UNKNOWN``.
     """
 
     def __init__(self) -> None:
         self.regions: dict[str, KernelRegion] = {}
-        self.experts: dict[tuple[int, int], ExpertRecord] = {}
 
-    def register_region(self, region_id: str, base: int, length: int, state: RegionState | str = RegionState.UNKNOWN) -> KernelRegion:
+    def register_region(
+        self,
+        region_id: str,
+        base: int,
+        length: int,
+        state: RegionState | str = RegionState.UNKNOWN,
+    ) -> KernelRegion:
         candidate = KernelRegion(region_id, base, length, normalize_region_state(state))
         current = self.regions.get(candidate.region_id)
-        if current is not None and (current.base, current.length) != (candidate.base, candidate.length):
+        if current is not None and (current.base, current.length) != (
+            candidate.base,
+            candidate.length,
+        ):
             raise ValueError(f"region geometry changed: {candidate.region_id}")
         if current is not None:
             current.state = candidate.state
             return current
         self.regions[candidate.region_id] = candidate
         return candidate
-
-    def register_expert(self, record: ExpertRecord) -> None:
-        if not record.envelope_region_ids:
-            raise ValueError("expert must own at least one envelope")
-        for region_id in record.envelope_region_ids:
-            if region_id not in self.regions:
-                raise KeyError(f"unregistered expert envelope: {region_id}")
-            for other in self.experts.values():
-                if other.key != record.key and region_id in other.envelope_region_ids:
-                    raise ValueError(f"envelope {region_id} is shared by experts")
-        self.experts[record.key] = record
 
     @staticmethod
     def _execute(
@@ -246,7 +224,11 @@ class ExplicitRegionRegistry:
         # executor there is no evidence that placement succeeded.
         if region.state == RegionState.UNKNOWN and executor is None:
             return False
-        region.state = RegionState.PREFETCHING_CPU if target == RegionState.CPU else RegionState.PREFETCHING_GPU
+        region.state = (
+            RegionState.PREFETCHING_CPU
+            if target == RegionState.CPU
+            else RegionState.PREFETCHING_GPU
+        )
         try:
             result = True if executor is None else executor(region.base, region.length)
             ok = bool(result.get("ok")) if isinstance(result, Mapping) else bool(result)
@@ -255,7 +237,12 @@ class ExplicitRegionRegistry:
         region.state = target if ok else RegionState.UNKNOWN
         return ok
 
-    def move_regions(self, region_ids: Iterable[str], target: RegionState | str, executor: Callable[[int, int], object] | None = None) -> dict[str, object]:
+    def move_regions(
+        self,
+        region_ids: Iterable[str],
+        target: RegionState | str,
+        executor: Callable[[int, int], object] | None = None,
+    ) -> dict[str, object]:
         destination = normalize_region_state(target)
         if destination not in (RegionState.GPU, RegionState.CPU):
             raise ValueError("target must be GPU or CPU")
@@ -263,19 +250,34 @@ class ExplicitRegionRegistry:
         statuses: dict[str, bool] = {}
         for region_id in ids:
             region = self.regions.get(region_id)
-            statuses[region_id] = False if region is None else self._execute(region, destination, executor)
-        return {"ok": all(statuses.values()), "statuses": statuses, "failed_region_ids": [key for key, value in statuses.items() if not value]}
+            statuses[region_id] = (
+                False
+                if region is None
+                else self._execute(region, destination, executor)
+            )
+        return {
+            "ok": all(statuses.values()),
+            "statuses": statuses,
+            "failed_region_ids": [key for key, value in statuses.items() if not value],
+        }
 
-    def release_regions(self, region_ids: Iterable[str], executor: Callable[[int, int], object] | None = None) -> dict[str, object]:
+    def release_regions(
+        self,
+        region_ids: Iterable[str],
+        executor: Callable[[int, int], object] | None = None,
+    ) -> dict[str, object]:
         return self.move_regions(region_ids, RegionState.CPU, executor)
 
-    def restore_regions(self, region_ids: Iterable[str], executor: Callable[[int, int], object] | None = None) -> dict[str, object]:
+    def restore_regions(
+        self,
+        region_ids: Iterable[str],
+        executor: Callable[[int, int], object] | None = None,
+    ) -> dict[str, object]:
         return self.move_regions(region_ids, RegionState.GPU, executor)
 
-    def update_expert_state(self, key: tuple[int, int], target: RegionState | str) -> RegionState:
-        record = self.experts[key]
-        update_aggregate_state(record, {region_id: self.regions[region_id].state for region_id in record.envelope_region_ids}, target=target)
-        return record.aggregate_state
-
     def query_region_states(self, region_ids: Iterable[str]) -> dict[str, RegionState]:
-        return {str(region_id): self.regions[str(region_id)].state for region_id in region_ids if str(region_id) in self.regions}
+        return {
+            str(region_id): self.regions[str(region_id)].state
+            for region_id in region_ids
+            if str(region_id) in self.regions
+        }

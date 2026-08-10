@@ -17,7 +17,8 @@ Usage:
     # Option 2: Set environment variable VLLM_USE_UVM=1
 
 Example:
-    VLLM_USE_UVM=1 python -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-2-7b-hf
+    VLLM_USE_UVM=1 python -m vllm.entrypoints.openai.api_server \
+        --model meta-llama/Llama-2-7b-hf
 
 Note:
     UVM allows running models larger than GPU memory, but with significant
@@ -36,12 +37,10 @@ Warning:
 
 import atexit
 import ctypes
-import gc
 import os
 import uuid as uuidlib
-from contextlib import contextmanager
 from collections.abc import Sequence
-from typing import Optional
+from contextlib import contextmanager, suppress
 
 import torch
 
@@ -51,7 +50,7 @@ logger = init_logger(__name__)
 
 # Global state
 _uvm_enabled = False
-_uvm_lib: Optional[ctypes.CDLL] = None
+_uvm_lib: ctypes.CDLL | None = None
 _uvm_log_close_registered = False
 _uvm_local_allocator = None
 _uvm_local_mem_pool = None
@@ -77,12 +76,6 @@ UVM_REGION_STATE_WARM = 2
 UVM_REGION_STATE_HOT = 3
 UVM_REGION_STATE_ACTIVE = 4
 UVM_REGION_STATE_INACTIVE = 5
-
-UVM_POOL_BUDGET_MODE_TRACE_ONLY = 0
-UVM_POOL_BUDGET_MODE_SOFT = 1
-UVM_POOL_BUDGET_MODE_ENFORCE = 2
-
-
 
 UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K = 1 << 2
 UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ = 1 << 3
@@ -134,16 +127,11 @@ class _PhaseFBatchExecutorParams(ctypes.Structure):
     ]
 
 
-
-
-
-
 class _ExpertOffloadReleaseParams(ctypes.Structure):
     _fields_ = [
         ("region_id", ctypes.c_uint64),
         ("gpu_uuid", _PhaseFUuid),
         ("flags", ctypes.c_uint32),
-        ("max_blocks", ctypes.c_uint32),
         ("base", ctypes.c_uint64),
         ("length", ctypes.c_uint64),
         ("block_count", ctypes.c_uint64),
@@ -170,11 +158,13 @@ _LIBC.ioctl.restype = ctypes.c_int
 
 
 def _libc_ioctl(fd: int, request: int, params: ctypes.Structure) -> int:
-    return int(_LIBC.ioctl(
-        ctypes.c_int(fd),
-        ctypes.c_ulong(request),
-        ctypes.byref(params),
-    ))
+    return int(
+        _LIBC.ioctl(
+            ctypes.c_int(fd),
+            ctypes.c_ulong(request),
+            ctypes.byref(params),
+        )
+    )
 
 
 def _phase_f_gpu_uuid(device: int) -> _PhaseFUuid:
@@ -240,7 +230,7 @@ def _iter_existing_uvm_fd_sources() -> list[int]:
     return sources
 
 
-def _initialize_duplicated_uvm_fd(source_fd: int) -> Optional[int]:
+def _initialize_duplicated_uvm_fd(source_fd: int) -> int | None:
     try:
         fd = os.dup(source_fd)
     except OSError:
@@ -251,14 +241,12 @@ def _initialize_duplicated_uvm_fd(source_fd: int) -> Optional[int]:
     if ret == 0 and int(params.rmStatus) == 0:
         return fd
 
-    try:
+    with suppress(OSError):
         os.close(fd)
-    except OSError:
-        pass
     return None
 
 
-def _adopt_existing_uvm_fd() -> Optional[int]:
+def _adopt_existing_uvm_fd() -> int | None:
     for source_fd in _iter_existing_uvm_fd_sources():
         fd = _initialize_duplicated_uvm_fd(source_fd)
         if fd is not None:
@@ -282,13 +270,7 @@ def _open_or_adopt_initialized_uvm_fd(*, prefer_existing: bool = False) -> int:
     return _open_initialized_uvm_fd()
 
 
-
-
-
-
-
-
-def find_uvm_allocator_library() -> Optional[str]:
+def find_uvm_allocator_library() -> str | None:
     """
     Find the UVM allocator shared library.
 
@@ -298,9 +280,7 @@ def find_uvm_allocator_library() -> Optional[str]:
     # Try to find the library in common locations. In local editable layouts,
     # ``import vllm`` may resolve as a namespace package with ``__file__`` set
     # to None, so derive the package path from this module first.
-    vllm_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), os.pardir)
-    )
+    vllm_path = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 
     # Possible library names and locations
     lib_names = [
@@ -503,24 +483,24 @@ def load_uvm_library() -> ctypes.CDLL:
     lib.uvm_driver_phase_f_unregister_region.restype = ctypes.c_int
     lib.uvm_driver_phase_f_unregister_region.argtypes = [ctypes.c_uint64]
 
-    if hasattr(lib, "uvm_driver_phase_n_update_region_state"):
-        lib.uvm_driver_phase_n_update_region_state.restype = ctypes.c_int
-        lib.uvm_driver_phase_n_update_region_state.argtypes = [
+    if hasattr(lib, "uvm_driver_update_region_state"):
+        lib.uvm_driver_update_region_state.restype = ctypes.c_int
+        lib.uvm_driver_update_region_state.argtypes = [
             ctypes.c_uint64,
             ctypes.c_uint32,
         ]
 
-    if hasattr(lib, "uvm_driver_phase_n_query_region"):
-        lib.uvm_driver_phase_n_query_region.restype = ctypes.c_int
-        lib.uvm_driver_phase_n_query_region.argtypes = [
+    if hasattr(lib, "uvm_driver_query_region"):
+        lib.uvm_driver_query_region.restype = ctypes.c_int
+        lib.uvm_driver_query_region.argtypes = [
             ctypes.c_uint64,
             ctypes.POINTER(ctypes.c_uint64),
             ctypes.c_size_t,
         ]
 
-    if hasattr(lib, "uvm_driver_phase_n_query_region_by_va"):
-        lib.uvm_driver_phase_n_query_region_by_va.restype = ctypes.c_int
-        lib.uvm_driver_phase_n_query_region_by_va.argtypes = [
+    if hasattr(lib, "uvm_driver_query_region_by_va"):
+        lib.uvm_driver_query_region_by_va.restype = ctypes.c_int
+        lib.uvm_driver_query_region_by_va.argtypes = [
             ctypes.c_uint64,
             ctypes.POINTER(ctypes.c_uint64),
             ctypes.c_size_t,
@@ -560,8 +540,6 @@ def ensure_uvm_runtime_library() -> ctypes.CDLL:
     _uvm_lib.uvm_set_prefetch(1 if _uvm_local_prefetch_enabled() else 0)
     _uvm_lib.uvm_set_verbose(0)
     return _uvm_lib
-
-
 
 
 def _uvm_local_prefetch_enabled() -> bool:
@@ -607,9 +585,7 @@ def uvm_local_memory_pool(enable_prefetch: bool | None = None):
         if _uvm_local_prefetch_stack:
             _uvm_local_prefetch_stack.pop()
         if _uvm_lib is not None:
-            _uvm_lib.uvm_set_prefetch(
-                1 if _uvm_local_prefetch_enabled() else 0
-            )
+            _uvm_lib.uvm_set_prefetch(1 if _uvm_local_prefetch_enabled() else 0)
 
 
 def enable_uvm_allocator(
@@ -658,7 +634,7 @@ def enable_uvm_allocator(
     try:
         # Create and enable the pluggable allocator
         allocator = torch.cuda.memory.CUDAPluggableAllocator(
-            lib_path, 'uvm_malloc', 'uvm_free'
+            lib_path, "uvm_malloc", "uvm_free"
         )
         torch.cuda.memory.change_current_allocator(allocator)
         _uvm_enabled = True
@@ -675,8 +651,8 @@ def enable_uvm_allocator(
         try:
             logger.info("Pre-initializing cuBLAS with UVM...")
             with uvm_allocation_phase("uvm_enable:cublas_preinit"):
-                a = torch.randn(512, 512, device='cuda', dtype=torch.bfloat16)
-                b = torch.randn(512, 512, device='cuda', dtype=torch.bfloat16)
+                a = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
+                b = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
                 _ = torch.matmul(a, b)
                 torch.cuda.synchronize()
                 del a, b
@@ -745,14 +721,6 @@ def uvm_enabled_allocation_phase(phase: str):
         yield
 
 
-
-
-
-
-
-
-
-
 def prefetch_range_to_device(ptr: int, size: int, device: int = 0) -> bool:
     """
     Prefetch a raw UVM address range to the specified GPU device.
@@ -768,8 +736,6 @@ def prefetch_range_to_device(ptr: int, size: int, device: int = 0) -> bool:
     if ptr <= 0 or size <= 0:
         return False
     return batch_prefetch_ranges_to_device(((ptr, size),), device=device) == 1
-
-
 
 
 def probe_driver_capable_range(ptr: int, size: int) -> tuple[bool, str, int]:
@@ -807,17 +773,11 @@ def _prepare_uvm_range_arrays(
     ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
 ) -> tuple[ctypes.Array[ctypes.c_uint64], ctypes.Array[ctypes.c_size_t], int]:
     valid_ranges = [
-        (int(ptr), int(size))
-        for ptr, size in ranges
-        if int(ptr) > 0 and int(size) > 0
+        (int(ptr), int(size)) for ptr, size in ranges if int(ptr) > 0 and int(size) > 0
     ]
     count = len(valid_ranges)
-    ptr_array = (ctypes.c_uint64 * count)(
-        *(ptr for ptr, _ in valid_ranges)
-    )
-    size_array = (ctypes.c_size_t * count)(
-        *(size for _, size in valid_ranges)
-    )
+    ptr_array = (ctypes.c_uint64 * count)(*(ptr for ptr, _ in valid_ranges))
+    size_array = (ctypes.c_size_t * count)(*(size for _, size in valid_ranges))
     return ptr_array, size_array, count
 
 
@@ -931,7 +891,7 @@ def _driver_phase_f_batch_execute_ranges_cpp_helper(
     total_failure = 0
     last_rm_status = 0
     for start in range(0, len(ranges), _UVM_DRIVER_BATCH_MAX_RANGES):
-        chunk = ranges[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
+        chunk = ranges[start : start + _UVM_DRIVER_BATCH_MAX_RANGES]
         ptr_array, size_array, count = _prepare_uvm_range_arrays(chunk)
         if count <= 0:
             continue
@@ -985,9 +945,7 @@ def driver_phase_f_batch_execute_ranges(
         return 0, 0, 0, 0
 
     range_list = [
-        (int(ptr), int(size))
-        for ptr, size in ranges
-        if int(ptr) > 0 and int(size) > 0
+        (int(ptr), int(size)) for ptr, size in ranges if int(ptr) > 0 and int(size) > 0
     ]
     if not range_list:
         return 0, 0, 0, 0
@@ -1004,8 +962,7 @@ def driver_phase_f_batch_execute_ranges(
     try:
         gpu_uuid = _phase_f_gpu_uuid(device)
     except Exception:
-        logger.debug("Failed to resolve CUDA UUID for Phase-F ioctl",
-                     exc_info=True)
+        logger.debug("Failed to resolve CUDA UUID for Phase-F ioctl", exc_info=True)
         return 0, len(range_list), 0, -3
 
     fd = -1
@@ -1016,7 +973,7 @@ def driver_phase_f_batch_execute_ranges(
         last_rm_status = 0
 
         for start in range(0, len(range_list), _UVM_PHASE_F_MAX_RANGES):
-            chunk = range_list[start:start + _UVM_PHASE_F_MAX_RANGES]
+            chunk = range_list[start : start + _UVM_PHASE_F_MAX_RANGES]
             params = _PhaseFBatchExecutorParams()
             params.action = int(action)
             params.count = len(chunk)
@@ -1055,24 +1012,18 @@ def driver_phase_f_batch_execute_ranges(
         return 0, len(range_list), 0, -4
     finally:
         if fd >= 0:
-            try:
+            with suppress(OSError):
                 os.close(fd)
-            except OSError:
-                pass
 
 
-def _region_release_entry_to_dict(
+def _region_release_outcome(
     params: _ExpertOffloadReleaseParams,
     *,
     ret: int,
-    saved_errno: int,
-    fd_source: str | None = None,
-) -> dict[str, object]:
+) -> tuple[bool, bool]:
     raw_ok = int(ret) == 0 and int(params.rmStatus) == 0
-    remote_read = bool(
-        int(params.flags) & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ
-    )
-    activity_counters = (
+    remote_read = bool(int(params.flags) & UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ)
+    activity = (
         int(params.block_count),
         int(params.attempted_blocks),
         int(params.success_blocks),
@@ -1092,60 +1043,29 @@ def _region_release_entry_to_dict(
         and not remote_read
         and int(params.length) > 0
         and int(params.first_error) == 0
-        and not any(activity_counters)
+        and not any(activity)
     )
-    effective_ok = raw_ok and (
+    ok = raw_ok and (
         idempotent
         or int(params.block_count) > 0
         or int(params.attempted_blocks) > 0
         or int(params.skipped_blocks) > 0
         or int(params.released_bytes) > 0
     )
-    if remote_read and not idempotent:
-        effective_ok = (
-            effective_ok
+    if remote_read:
+        ok = (
+            ok
             and int(params.remote_map_failure_blocks) == 0
             and int(params.cpu_resident_bytes) >= int(params.length)
             and int(params.remote_mapped_bytes) >= int(params.length)
         )
-    reason = None
-    if raw_ok and not effective_ok:
-        reason = (
-            "remote_mapping_incomplete"
-            if remote_read
-            else "no_va_blocks"
-        )
-    elif not raw_ok:
-        reason = "ioctl_or_rm_error"
-    return {
-        "ok": effective_ok,
-        "raw_ok": raw_ok,
-        "idempotent": idempotent,
-        "reason": reason,
-        "fd_source": fd_source,
-        "ioctl_ret": int(ret),
-        "errno": int(saved_errno),
-        "rm_status": int(params.rmStatus),
-        "remote_read": remote_read,
-        "region_id": int(params.region_id),
-        "base": int(params.base),
-        "length": int(params.length),
-        "block_count": int(params.block_count),
-        "attempted_blocks": int(params.attempted_blocks),
-        "success_blocks": int(params.success_blocks),
-        "failure_blocks": int(params.failure_blocks),
-        "skipped_blocks": int(params.skipped_blocks),
-        "attempted_bytes": int(params.attempted_bytes),
-        "released_bytes": int(params.released_bytes),
-        "failed_bytes": int(params.failed_bytes),
-        "remote_map_blocks": int(params.remote_map_blocks),
-        "remote_map_failure_blocks": int(params.remote_map_failure_blocks),
-        "cpu_resident_bytes": int(params.cpu_resident_bytes),
-        "remote_mapped_bytes": int(params.remote_mapped_bytes),
-        "newly_remote_mapped_bytes": int(params.newly_remote_mapped_bytes),
-        "first_failed_block": int(params.first_failed_block),
-        "first_error": int(params.first_error),
-    }
+
+    made_progress = (
+        int(params.attempted_blocks) > 0
+        or int(params.released_bytes) > 0
+        or int(params.newly_remote_mapped_bytes) > 0
+    )
+    return ok, made_progress
 
 
 def driver_release_regions(
@@ -1153,9 +1073,7 @@ def driver_release_regions(
     *,
     device: int = 0,
     remote_read: bool = False,
-    max_blocks: int = 0,
     prefer_existing: bool = True,
-    return_entries: bool = True,
 ) -> dict[str, object]:
     """Release explicitly named regions at 64 KiB subchunk granularity.
 
@@ -1171,32 +1089,16 @@ def driver_release_regions(
             continue
         if value > 0:
             normalized.append(value)
-    result: dict[str, object] = {
-        "ok": False,
-        "ioctl": _UVM_EXPERT_OFFLOAD_RELEASE_IOCTL,
-        "entry_count": len(normalized),
-        "success_count": 0,
-        "failure_count": 0,
-        "skipped_blocks": 0,
-        "attempted_blocks": 0,
-        "success_blocks": 0,
-        "failure_blocks": 0,
-        "attempted_bytes": 0,
-        "released_bytes": 0,
-        "failed_bytes": 0,
-        "remote_map_blocks": 0,
-        "remote_map_failure_blocks": 0,
-        "cpu_resident_bytes": 0,
-        "remote_mapped_bytes": 0,
-        "newly_remote_mapped_bytes": 0,
-        "first_error": 0,
-        "first_failed_region_id": 0,
-        "first_failed_block": 0,
-        "entries": [],
-    }
+
+    def _result(statuses: dict[int, bool]) -> dict[str, object]:
+        return {
+            "ok": all(statuses.get(region_id, False) for region_id in normalized),
+            "statuses": statuses,
+        }
+
+    failure = _result({region_id: False for region_id in normalized})
     if not normalized:
-        result["ok"] = True
-        return result
+        return _result({})
 
     flags = UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K
     if remote_read:
@@ -1205,88 +1107,23 @@ def driver_release_regions(
     try:
         gpu_uuid = _phase_f_gpu_uuid(device)
     except Exception:
-        logger.debug("Failed to resolve CUDA UUID for region release",
-                     exc_info=True)
-        result["failure_count"] = len(normalized)
-        result["first_error"] = -3
-        return result
+        logger.debug("Failed to resolve CUDA UUID for region release", exc_info=True)
+        return failure
 
-    def _run_release_on_fd(fd: int, fd_source: str) -> dict[str, object]:
-        candidate: dict[str, object] = {
-            "ok": False,
-            "ioctl": _UVM_EXPERT_OFFLOAD_RELEASE_IOCTL,
-            "entry_count": len(normalized),
-            "success_count": 0,
-            "failure_count": 0,
-            "skipped_blocks": 0,
-            "attempted_blocks": 0,
-            "success_blocks": 0,
-            "failure_blocks": 0,
-            "attempted_bytes": 0,
-            "released_bytes": 0,
-            "failed_bytes": 0,
-            "remote_map_blocks": 0,
-            "remote_map_failure_blocks": 0,
-            "cpu_resident_bytes": 0,
-            "remote_mapped_bytes": 0,
-            "newly_remote_mapped_bytes": 0,
-            "first_error": 0,
-            "first_failed_region_id": 0,
-            "first_failed_block": 0,
-            "fd_source": fd_source,
-            "entries": [],
-        }
-        entries: list[dict[str, object]] = []
+    def _run_release_on_fd(fd: int) -> tuple[dict[int, bool], bool]:
+        statuses: dict[int, bool] = {}
+        made_progress = False
         for region_id in normalized:
             params = _ExpertOffloadReleaseParams()
             params.region_id = int(region_id)
             params.gpu_uuid = gpu_uuid
             params.flags = int(flags)
-            params.max_blocks = max(int(max_blocks or 0), 0)
-            ctypes.set_errno(0)
             ret = _libc_ioctl(fd, _UVM_EXPERT_OFFLOAD_RELEASE_IOCTL, params)
-            saved_errno = ctypes.get_errno()
-            entry = _region_release_entry_to_dict(
-                params,
-                ret=int(ret),
-                saved_errno=int(saved_errno),
-                fd_source=fd_source,
-            )
-            if return_entries:
-                entries.append(entry)
+            ok, progressed = _region_release_outcome(params, ret=int(ret))
+            statuses[region_id] = ok
+            made_progress |= progressed
+        return statuses, made_progress
 
-            ok = bool(entry["ok"])
-            candidate["success_count"] = int(candidate["success_count"]) + (1 if ok else 0)
-            candidate["failure_count"] = int(candidate["failure_count"]) + (0 if ok else 1)
-            for key in (
-                "attempted_blocks",
-                "success_blocks",
-                "failure_blocks",
-                "skipped_blocks",
-                "attempted_bytes",
-                "released_bytes",
-                "failed_bytes",
-                "remote_map_blocks",
-                "remote_map_failure_blocks",
-                "cpu_resident_bytes",
-                "remote_mapped_bytes",
-                "newly_remote_mapped_bytes",
-            ):
-                candidate[key] = int(candidate[key]) + int(entry.get(key) or 0)
-            if not ok and int(candidate["first_error"]) == 0:
-                candidate["first_error"] = int(entry.get("rm_status") or 0) or int(
-                    entry.get("first_error") or 0
-                ) or -5
-                candidate["first_failed_region_id"] = int(region_id)
-                candidate["first_failed_block"] = int(
-                    entry.get("first_failed_block") or 0
-                )
-
-        candidate["ok"] = int(candidate["failure_count"]) == 0
-        candidate["entries"] = entries
-        return candidate
-
-    candidate_results: list[dict[str, object]] = []
     try:
         if prefer_existing:
             for source_fd in _iter_existing_uvm_fd_sources():
@@ -1294,58 +1131,24 @@ def driver_release_regions(
                 if fd is None:
                     continue
                 try:
-                    candidate = _run_release_on_fd(
-                        fd,
-                        f"existing:{source_fd}",
-                    )
+                    statuses, made_progress = _run_release_on_fd(fd)
                 finally:
-                    try:
+                    with suppress(OSError):
                         os.close(fd)
-                    except OSError:
-                        pass
-                candidate_results.append(candidate)
-                if bool(candidate.get("ok")) or int(
-                    candidate.get("released_bytes") or 0
-                ) > 0 or int(candidate.get("attempted_blocks") or 0) > 0:
-                    return candidate
+                result = _result(statuses)
+                if bool(result["ok"]) or made_progress:
+                    return result
 
         fd = _open_initialized_uvm_fd()
         try:
-            candidate = _run_release_on_fd(fd, "new")
+            statuses, _ = _run_release_on_fd(fd)
         finally:
-            try:
+            with suppress(OSError):
                 os.close(fd)
-            except OSError:
-                pass
-        candidate_results.append(candidate)
-        if bool(candidate.get("ok")):
-            return candidate
-
-        if candidate_results:
-            best = max(
-                candidate_results,
-                key=lambda item: (
-                    int(item.get("released_bytes") or 0),
-                    int(item.get("attempted_blocks") or 0),
-                    int(item.get("success_count") or 0),
-                    -int(item.get("failure_count") or 0),
-                ),
-            )
-            best["attempted_fd_count"] = len(candidate_results)
-            return best
-
-        return result
+        return _result(statuses)
     except Exception:
         logger.debug("Region release ioctl failed", exc_info=True)
-        result["failure_count"] = len(normalized)
-        if int(result["first_error"]) == 0:
-            result["first_error"] = -4
-        result["entries"] = (
-            candidate_results[-1].get("entries", [])
-            if candidate_results
-            else []
-        )
-        return result
+        return failure
 
 
 def driver_prepare_ranges_remote_read_bg_deferred(
@@ -1384,14 +1187,6 @@ def driver_start_ranges_bg_promotion(
         UVM_PHASE_F_ACTION_START_BG_PROMOTION,
         device=device,
     )
-
-
-
-
-
-
-
-
 
 
 def driver_pause_ranges_bg_promotion(
@@ -1573,7 +1368,7 @@ def driver_batch_prefetch_ranges_to_device(
         return 0
     total = 0
     for start in range(0, len(range_list), _UVM_DRIVER_BATCH_MAX_RANGES):
-        chunk = range_list[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
+        chunk = range_list[start : start + _UVM_DRIVER_BATCH_MAX_RANGES]
         ptr_array, size_array, count = _prepare_uvm_range_arrays(chunk)
         if count <= 0:
             continue
@@ -1615,21 +1410,21 @@ def driver_batch_advise_ranges_cpu(
         return 0
     total = 0
     for start in range(0, len(range_list), _UVM_DRIVER_BATCH_MAX_RANGES):
-        chunk = range_list[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
+        chunk = range_list[start : start + _UVM_DRIVER_BATCH_MAX_RANGES]
         ptr_array, size_array, count = _prepare_uvm_range_arrays(chunk)
         if count <= 0:
             continue
-        result = int(_uvm_lib.uvm_driver_batch_advise_cpu(
-            ptr_array,
-            size_array,
-            ctypes.c_size_t(count),
-        ))
+        result = int(
+            _uvm_lib.uvm_driver_batch_advise_cpu(
+                ptr_array,
+                size_array,
+                ctypes.c_size_t(count),
+            )
+        )
         if result < 0:
             return result
         total += result
     return total
-
-
 
 
 def driver_batch_query_ranges_residency_bytes(
@@ -1685,7 +1480,7 @@ def driver_batch_query_ranges_residency_bytes(
     total_queried_bytes = 0
 
     for start in range(0, len(range_list), _UVM_DRIVER_BATCH_MAX_RANGES):
-        chunk = range_list[start:start + _UVM_DRIVER_BATCH_MAX_RANGES]
+        chunk = range_list[start : start + _UVM_DRIVER_BATCH_MAX_RANGES]
         ptr_array, size_array, count = _prepare_uvm_range_arrays(chunk)
         if count <= 0:
             continue
@@ -1768,46 +1563,10 @@ def driver_unregister_region(region_id: int) -> int:
     if region_id <= 0:
         return -2
     try:
-        return int(
-            lib.uvm_driver_phase_f_unregister_region(
-                ctypes.c_uint64(region_id)
-            )
-        )
+        return int(lib.uvm_driver_phase_f_unregister_region(ctypes.c_uint64(region_id)))
     except Exception:
         logger.debug("Failed to unregister Phase F driver region", exc_info=True)
         return -3
-
-
-def driver_set_pool_budget(
-    *,
-    pool: int,
-    budget_bytes: int,
-    gpu_id: int = 0,
-    mode: int = UVM_POOL_BUDGET_MODE_TRACE_ONLY,
-    flags: int = 0,
-) -> int:
-    """Deprecated: driver-owned pool budgets are not used by explicit regions."""
-    return -95
-
-
-def driver_get_pool_state(pool: int, gpu_id: int = 0) -> dict[str, int] | None:
-    """Deprecated: Phase-N pool snapshots are unreachable in explicit mode."""
-    return None
-
-
-def driver_reclaim_pool(
-    pool: int,
-    *,
-    gpu_id: int = 0,
-    target_bytes: int = 0,
-    current_epoch: int = 0,
-    cooldown_epochs: int = 0,
-    max_victims: int = 8,
-    async_reclaim: bool = False,
-    flags: int = 0,
-) -> dict[str, int] | None:
-    """Deprecated: reclaim is application-selected explicit release only."""
-    return None
 
 
 def driver_update_region_state(
@@ -1822,14 +1581,13 @@ def driver_update_region_state(
         return -2
     try:
         return int(
-            _uvm_lib.uvm_driver_phase_n_update_region_state(
+            _uvm_lib.uvm_driver_update_region_state(
                 ctypes.c_uint64(int(region_id)),
                 ctypes.c_uint32(max(int(state), 0)),
             )
         )
     except Exception:
-        logger.debug("Failed to update Phase N driver region state",
-                     exc_info=True)
+        logger.debug("Failed to update driver region state", exc_info=True)
         return -3
 
 
@@ -1843,20 +1601,20 @@ def _driver_region_values_to_dict(values: ctypes.Array) -> dict[str, int]:
 
 
 def driver_query_region(region_id: int) -> dict[str, int] | None:
-    """Query Stage N region metadata by region id."""
+    """Query explicit region metadata by region id."""
     if not has_region_state_ioctl() or region_id <= 0:
         return None
     values = (ctypes.c_uint64 * 4)()
     try:
         status = int(
-            _uvm_lib.uvm_driver_phase_n_query_region(
+            _uvm_lib.uvm_driver_query_region(
                 ctypes.c_uint64(int(region_id)),
                 values,
                 ctypes.c_size_t(len(values)),
             )
         )
     except Exception:
-        logger.debug("Failed to query Phase N driver region", exc_info=True)
+        logger.debug("Failed to query driver region", exc_info=True)
         return None
     if status < 0:
         return None
@@ -1877,21 +1635,16 @@ def driver_query_region_states(region_ids: Sequence[int]) -> dict[int, int]:
     return result
 
 
-def has_pool_budget_ioctl() -> bool:
-    return False
-
-
-def has_pool_reclaim_ioctl() -> bool:
-    return False
-
-
 def has_region_state_ioctl() -> bool:
-    return _uvm_enabled and _uvm_lib is not None and all(
-        hasattr(_uvm_lib, name)
-        for name in (
-            "uvm_driver_phase_n_update_region_state",
-            "uvm_driver_phase_n_query_region",
-            "uvm_driver_phase_n_query_region_by_va",
+    return (
+        _uvm_lib is not None
+        and all(
+            hasattr(_uvm_lib, name)
+            for name in (
+                "uvm_driver_update_region_state",
+                "uvm_driver_query_region",
+                "uvm_driver_query_region_by_va",
+            )
         )
     )
 
@@ -1941,8 +1694,9 @@ def batch_offload_ranges_to_cpu_with_executor(
             try:
                 torch.cuda.synchronize()
             except Exception:
-                logger.debug("Failed to synchronize after driver CPU offload",
-                             exc_info=True)
+                logger.debug(
+                    "Failed to synchronize after driver CPU offload", exc_info=True
+                )
         return successes, "driver_batch", advise_result, prefetch_result
     if executor == "auto":
         advise_result = driver_batch_advise_ranges_cpu(ranges)
@@ -1953,8 +1707,9 @@ def batch_offload_ranges_to_cpu_with_executor(
                 try:
                     torch.cuda.synchronize()
                 except Exception:
-                    logger.debug("Failed to synchronize after driver CPU offload",
-                                 exc_info=True)
+                    logger.debug(
+                        "Failed to synchronize after driver CPU offload", exc_info=True
+                    )
             return successes, "driver_batch", advise_result, prefetch_result
         return (
             batch_offload_ranges_to_cpu(ranges, sync=sync),
@@ -2067,8 +1822,9 @@ def batch_prepare_ranges_for_native_remote_access_with_executor(
         try:
             torch.cuda.synchronize()
         except Exception:
-            logger.debug("Failed to synchronize after native remote CPU prefetch",
-                         exc_info=True)
+            logger.debug(
+                "Failed to synchronize after native remote CPU prefetch", exc_info=True
+            )
 
     preferred_cpu_result = batch_advise_ranges_preferred_location(
         ranges,
@@ -2092,8 +1848,6 @@ def batch_prepare_ranges_for_native_remote_access_with_executor(
     )
 
 
-
-
 def batch_offload_ranges_to_cpu(
     ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
     *,
@@ -2109,8 +1863,9 @@ def batch_offload_ranges_to_cpu(
         try:
             torch.cuda.synchronize()
         except Exception:
-            logger.debug("Failed to synchronize after batch UVM CPU offload",
-                         exc_info=True)
+            logger.debug(
+                "Failed to synchronize after batch UVM CPU offload", exc_info=True
+            )
     return successes
 
 
@@ -2147,7 +1902,7 @@ def driver_restore_regions(
     )
     # The range executor does not know region identity. Reflect completed
     # restores back into the explicit-region state machine in submission order.
-    for region_id in valid_ids[:max(int(successes), 0)]:
+    for region_id in valid_ids[: max(int(successes), 0)]:
         driver_update_region_state(
             region_id=region_id,
             state=UVM_REGION_STATE_HOT,

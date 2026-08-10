@@ -353,43 +353,6 @@ NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_split_locked(uvm_va_space_t
 NV_STATUS uvm_moe_slot_pool_clear_gpu_va_space_mappings_locked(uvm_va_space_t *va_space,
                                                                uvm_gpu_t *gpu,
                                                                struct mm_struct *mm);
-NV_STATUS uvm_phase_n_reclaim_pool_over_budget(uvm_va_space_t *va_space,
-                                               NvU32 pool,
-                                               NvU32 gpu_id,
-                                               NvU64 current_epoch,
-                                               NvU64 cooldown_epochs,
-                                               NvU32 max_victims,
-                                               NvBool async);
-NV_STATUS uvm_phase_n_admit_gpu_chunk(uvm_va_space_t *va_space,
-                                      uvm_va_block_t *va_block,
-                                      uvm_va_block_region_t chunk_region,
-                                      uvm_processor_id_t dest_id,
-                                      NvU64 chunk_bytes);
-void uvm_phase_n_abort_gpu_chunk(uvm_va_space_t *va_space,
-                                 uvm_va_block_t *va_block,
-                                 uvm_va_block_region_t chunk_region,
-                                 uvm_processor_id_t dest_id,
-                                 NvU64 chunk_bytes,
-                                 NV_STATUS status,
-                                 const char *reason);
-void uvm_phase_n_make_resident_reclaim_hook(uvm_va_space_t *va_space,
-                                            NvU64 address,
-                                            NvU64 length,
-                                            NvU32 gpu_id,
-                                            NvU32 cause,
-                                            NvBool execute_allowed);
-void uvm_phase_n_va_block_make_resident_hook(uvm_va_space_t *va_space,
-                                             uvm_va_block_t *va_block,
-                                             uvm_va_block_region_t region,
-                                             uvm_processor_id_t dest_id,
-                                             NvU32 cause,
-                                             NvBool execute_allowed);
-void uvm_phase_n_va_block_destroy_hook(uvm_va_block_t *va_block);
-NV_STATUS uvm_phase_n_auto_reclaim_outer_hook(uvm_va_space_t *va_space,
-                                              NvU64 address,
-                                              NvU64 length,
-                                              NvU32 gpu_id,
-                                              NvU32 cause);
 NV_STATUS uvm_api_tools_init_event_tracker(UVM_TOOLS_INIT_EVENT_TRACKER_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_tools_init_event_tracker_v2(UVM_TOOLS_INIT_EVENT_TRACKER_V2_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_tools_set_notification_threshold(UVM_TOOLS_SET_NOTIFICATION_THRESHOLD_PARAMS *params, struct file *filp);

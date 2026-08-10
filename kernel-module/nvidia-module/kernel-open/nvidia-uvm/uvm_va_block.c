@@ -114,21 +114,6 @@ module_param(uvm_latency_bg_promote_reschedule_delay_ms, uint, S_IRUGO | S_IWUSR
 MODULE_PARM_DESC(uvm_latency_bg_promote_reschedule_delay_ms,
                  "Delay between read-only background promotion worker passes when pending work remains. Default: 0.");
 
-unsigned uvm_phase_n_expert_prefetch_wait_enable __read_mostly = 0;
-module_param(uvm_phase_n_expert_prefetch_wait_enable, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(uvm_phase_n_expert_prefetch_wait_enable,
-                 "Let expert-tagged replayable faults wait for in-flight API prefetch instead of migrating. Default: 0.");
-
-unsigned uvm_phase_n_expert_prefetch_wait_timeout_ms __read_mostly = 10;
-module_param(uvm_phase_n_expert_prefetch_wait_timeout_ms, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(uvm_phase_n_expert_prefetch_wait_timeout_ms,
-                 "Timeout for expert prefetch-pending waits before falling back to normal fault service. Default: 10 ms.");
-
-static unsigned uvm_phase_n_fault_prefetch_disable __read_mostly = 0;
-module_param(uvm_phase_n_fault_prefetch_disable, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(uvm_phase_n_fault_prefetch_disable,
-                 "Disable software prefetch expansion from replayable fault service. Default: 0.");
-
 static unsigned uvm_stage_a_cpu_fault_observe_enable __read_mostly = 0;
 module_param(uvm_stage_a_cpu_fault_observe_enable, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_stage_a_cpu_fault_observe_enable,
@@ -174,7 +159,6 @@ static atomic64_t g_uvm_latency_bg_promote_resume_calls = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_latency_bg_promote_paused_blocks = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_latency_bg_promote_resumed_blocks = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_latency_bg_promote_gate_skips = ATOMIC64_INIT(0);
-static atomic64_t g_uvm_phase_n_fault_prefetch_suppressed = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_cpu_faults_total = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_cpu_faults_registered = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_cpu_faults_candidate = ATOMIC64_INIT(0);
@@ -186,7 +170,6 @@ static atomic64_t g_uvm_stage_a_cpu_faults_scratch = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_cpu_faults_other = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_cpu_fault_fallbacks = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_last_region_id = ATOMIC64_INIT(0);
-static atomic64_t g_uvm_stage_a_last_pool = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_last_fault_addr = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_stage_a_last_is_write = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_gpu_only_apply_calls = ATOMIC64_INIT(0);
@@ -205,7 +188,6 @@ static atomic64_t g_uvm_gpu_only_soft_breaks = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_gpu_only_soft_break_pages = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_gpu_only_failed_pages = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_gpu_only_last_region_id = ATOMIC64_INIT(0);
-static atomic64_t g_uvm_gpu_only_last_pool = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_gpu_only_last_fault_addr = ATOMIC64_INIT(0);
 static atomic64_t g_uvm_gpu_only_last_is_write = ATOMIC64_INIT(0);
 
@@ -539,8 +521,6 @@ void uvm_va_block_print_latency_stats(struct seq_file *s)
                          (NvU64)atomic64_read(&g_uvm_latency_bg_promote_resumed_blocks));
     UVM_SEQ_OR_DBG_PRINT(s, "bg_promote_gate_skips           %llu\n",
                          (NvU64)atomic64_read(&g_uvm_latency_bg_promote_gate_skips));
-    UVM_SEQ_OR_DBG_PRINT(s, "phase_n_fault_prefetch_suppressed %llu\n",
-                         (NvU64)atomic64_read(&g_uvm_phase_n_fault_prefetch_suppressed));
     UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_total        %llu\n",
                          (NvU64)atomic64_read(&g_uvm_stage_a_cpu_faults_total));
     UVM_SEQ_OR_DBG_PRINT(s, "stage_a_cpu_faults_registered   %llu\n",
@@ -563,8 +543,6 @@ void uvm_va_block_print_latency_stats(struct seq_file *s)
                          (NvU64)atomic64_read(&g_uvm_stage_a_cpu_fault_fallbacks));
     UVM_SEQ_OR_DBG_PRINT(s, "stage_a_last_region_id          %llu\n",
                          (NvU64)atomic64_read(&g_uvm_stage_a_last_region_id));
-    UVM_SEQ_OR_DBG_PRINT(s, "stage_a_last_pool               %llu\n",
-                         (NvU64)atomic64_read(&g_uvm_stage_a_last_pool));
     UVM_SEQ_OR_DBG_PRINT(s, "stage_a_last_fault_addr         0x%llx\n",
                          (NvU64)atomic64_read(&g_uvm_stage_a_last_fault_addr));
     UVM_SEQ_OR_DBG_PRINT(s, "stage_a_last_is_write           %llu\n",
@@ -601,8 +579,6 @@ void uvm_va_block_print_latency_stats(struct seq_file *s)
                          (NvU64)atomic64_read(&g_uvm_gpu_only_failed_pages));
     UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_last_region_id         %llu\n",
                          (NvU64)atomic64_read(&g_uvm_gpu_only_last_region_id));
-    UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_last_pool              %llu\n",
-                         (NvU64)atomic64_read(&g_uvm_gpu_only_last_pool));
     UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_last_fault_addr        0x%llx\n",
                          (NvU64)atomic64_read(&g_uvm_gpu_only_last_fault_addr));
     UVM_SEQ_OR_DBG_PRINT(s, "gpu_only_last_is_write          %llu\n",
@@ -679,7 +655,6 @@ void uvm_va_block_reset_latency_stats(void)
     atomic64_set(&g_uvm_latency_bg_promote_paused_blocks, 0);
     atomic64_set(&g_uvm_latency_bg_promote_resumed_blocks, 0);
     atomic64_set(&g_uvm_latency_bg_promote_gate_skips, 0);
-    atomic64_set(&g_uvm_phase_n_fault_prefetch_suppressed, 0);
     atomic64_set(&g_uvm_stage_a_cpu_faults_total, 0);
     atomic64_set(&g_uvm_stage_a_cpu_faults_registered, 0);
     atomic64_set(&g_uvm_stage_a_cpu_faults_candidate, 0);
@@ -691,7 +666,6 @@ void uvm_va_block_reset_latency_stats(void)
     atomic64_set(&g_uvm_stage_a_cpu_faults_other, 0);
     atomic64_set(&g_uvm_stage_a_cpu_fault_fallbacks, 0);
     atomic64_set(&g_uvm_stage_a_last_region_id, 0);
-    atomic64_set(&g_uvm_stage_a_last_pool, 0);
     atomic64_set(&g_uvm_stage_a_last_fault_addr, 0);
     atomic64_set(&g_uvm_stage_a_last_is_write, 0);
     atomic64_set(&g_uvm_gpu_only_apply_calls, 0);
@@ -710,7 +684,6 @@ void uvm_va_block_reset_latency_stats(void)
     atomic64_set(&g_uvm_gpu_only_soft_break_pages, 0);
     atomic64_set(&g_uvm_gpu_only_failed_pages, 0);
     atomic64_set(&g_uvm_gpu_only_last_region_id, 0);
-    atomic64_set(&g_uvm_gpu_only_last_pool, 0);
     atomic64_set(&g_uvm_gpu_only_last_fault_addr, 0);
     atomic64_set(&g_uvm_gpu_only_last_is_write, 0);
 }
@@ -1927,119 +1900,6 @@ static void uvm_va_block_free(uvm_va_block_t *block)
     }
 }
 
-void uvm_va_block_expert_prefetch_mark_pending(uvm_va_block_t *va_block,
-                                               uvm_processor_id_t dst_id,
-                                               uvm_va_block_region_t region)
-{
-    uvm_page_mask_t pending_pages;
-
-    uvm_assert_mutex_locked(&va_block->lock);
-
-    if (!uvm_phase_n_expert_prefetch_wait_enable || !UVM_ID_IS_GPU(dst_id))
-        return;
-
-    uvm_page_mask_init_from_region(&pending_pages, region, NULL);
-    uvm_page_mask_or(&va_block->phase_n_expert_prefetch.pages,
-                     &va_block->phase_n_expert_prefetch.pages,
-                     &pending_pages);
-    va_block->phase_n_expert_prefetch.dst_id = dst_id;
-    WRITE_ONCE(va_block->phase_n_expert_prefetch.submitted, false);
-    WRITE_ONCE(va_block->phase_n_expert_prefetch.active, true);
-}
-
-void uvm_va_block_expert_prefetch_mark_submitted(uvm_va_block_t *va_block,
-                                                 uvm_processor_id_t dst_id)
-{
-    uvm_assert_mutex_locked(&va_block->lock);
-
-    if (!uvm_phase_n_expert_prefetch_wait_enable || !UVM_ID_IS_GPU(dst_id))
-        return;
-
-    if (!va_block->phase_n_expert_prefetch.active ||
-        !uvm_id_equal(va_block->phase_n_expert_prefetch.dst_id, dst_id))
-        return;
-
-    WRITE_ONCE(va_block->phase_n_expert_prefetch.submitted, true);
-    wake_up_all(&va_block->phase_n_expert_prefetch.wait_queue);
-}
-
-void uvm_va_block_expert_prefetch_clear_pending(uvm_va_block_t *va_block,
-                                                uvm_processor_id_t dst_id,
-                                                uvm_va_block_region_t region)
-{
-    uvm_page_mask_t clear_pages;
-
-    uvm_assert_mutex_locked(&va_block->lock);
-
-    if (!uvm_phase_n_expert_prefetch_wait_enable || !UVM_ID_IS_GPU(dst_id))
-        return;
-
-    if (!va_block->phase_n_expert_prefetch.active ||
-        !uvm_id_equal(va_block->phase_n_expert_prefetch.dst_id, dst_id))
-        return;
-
-    uvm_page_mask_init_from_region(&clear_pages, region, NULL);
-    if (!uvm_page_mask_andnot(&va_block->phase_n_expert_prefetch.pages,
-                              &va_block->phase_n_expert_prefetch.pages,
-                              &clear_pages)) {
-        va_block->phase_n_expert_prefetch.dst_id = UVM_ID_INVALID;
-        WRITE_ONCE(va_block->phase_n_expert_prefetch.submitted, false);
-        WRITE_ONCE(va_block->phase_n_expert_prefetch.active, false);
-        wake_up_all(&va_block->phase_n_expert_prefetch.wait_queue);
-    }
-}
-
-bool uvm_va_block_expert_prefetch_page_pending(uvm_va_block_t *va_block,
-                                               uvm_processor_id_t dst_id,
-                                               uvm_page_index_t page_index)
-{
-    uvm_assert_mutex_locked(&va_block->lock);
-
-    if (!uvm_phase_n_expert_prefetch_wait_enable ||
-        !UVM_ID_IS_GPU(dst_id) ||
-        !va_block->phase_n_expert_prefetch.active ||
-        !uvm_id_equal(va_block->phase_n_expert_prefetch.dst_id, dst_id) ||
-        !uvm_page_mask_test(&va_block->phase_n_expert_prefetch.pages, page_index))
-        return false;
-
-    if (va_block->phase_n_expert_prefetch.submitted &&
-        uvm_tracker_is_completed(&va_block->tracker)) {
-        uvm_page_mask_zero(&va_block->phase_n_expert_prefetch.pages);
-        va_block->phase_n_expert_prefetch.dst_id = UVM_ID_INVALID;
-        WRITE_ONCE(va_block->phase_n_expert_prefetch.submitted, false);
-        WRITE_ONCE(va_block->phase_n_expert_prefetch.active, false);
-        wake_up_all(&va_block->phase_n_expert_prefetch.wait_queue);
-        return false;
-    }
-
-    return true;
-}
-
-bool uvm_va_block_expert_prefetch_wait(uvm_va_block_t *va_block,
-                                       uvm_processor_id_t dst_id,
-                                       unsigned timeout_ms)
-{
-    long timeout = msecs_to_jiffies(timeout_ms);
-
-    if (!uvm_phase_n_expert_prefetch_wait_enable || !UVM_ID_IS_GPU(dst_id))
-        return false;
-
-    if (timeout == 0)
-        timeout = 1;
-
-    if (wait_event_timeout(va_block->phase_n_expert_prefetch.wait_queue,
-                           !READ_ONCE(va_block->phase_n_expert_prefetch.active) ||
-                           READ_ONCE(va_block->phase_n_expert_prefetch.submitted),
-                           timeout) == 0)
-        return false;
-
-    if (!READ_ONCE(va_block->phase_n_expert_prefetch.active) ||
-        !READ_ONCE(va_block->phase_n_expert_prefetch.submitted))
-        return false;
-
-    return uvm_tracker_wait(&va_block->tracker) == NV_OK;
-}
-
 NV_STATUS uvm_va_block_create(uvm_va_range_managed_t *managed_range,
                               NvU64 start,
                               NvU64 end,
@@ -2099,9 +1959,6 @@ NV_STATUS uvm_va_block_create(uvm_va_range_managed_t *managed_range,
     block->managed_range = managed_range;
     uvm_tracker_init(&block->tracker);
     block->prefetch_info.last_migration_proc_id = UVM_ID_INVALID;
-    block->phase_n_expert_prefetch.dst_id = UVM_ID_INVALID;
-    init_waitqueue_head(&block->phase_n_expert_prefetch.wait_queue);
-    block->phase_n_expert_prefetch.submitted = false;
 
     nv_kthread_q_item_init(&block->eviction_mappings_q_item, block_add_eviction_mappings_entry, block);
     nv_kthread_q_item_init(&block->bg_promote_q_item, block_bg_promote_entry, block);
@@ -3737,27 +3594,9 @@ static NV_STATUS block_populate_gpu_chunk(uvm_va_block_t *block,
 
     UVM_ASSERT(uvm_page_mask_region_empty(&gpu_state->resident, chunk_region));
 
-    status = uvm_phase_n_admit_gpu_chunk(uvm_va_block_get_va_space(block),
-                                         block,
-                                         chunk_region,
-                                         gpu->id,
-                                         chunk_size);
+    status = block_alloc_gpu_chunk(block, retry, gpu, chunk_size, &chunk);
     if (status != NV_OK)
         return status;
-
-    status = block_alloc_gpu_chunk(block, retry, gpu, chunk_size, &chunk);
-    if (status != NV_OK) {
-        if (status != NV_ERR_MORE_PROCESSING_REQUIRED) {
-            uvm_phase_n_abort_gpu_chunk(uvm_va_block_get_va_space(block),
-                                        block,
-                                        chunk_region,
-                                        gpu->id,
-                                        chunk_size,
-                                        status,
-                                        "alloc_failed");
-        }
-        return status;
-    }
 
     // In some configurations such as SR-IOV heavy, the chunk cannot be
     // referenced using its physical address. Create a virtual mapping.
@@ -3803,14 +3642,6 @@ chunk_free:
     // block_zero_new_gpu_chunk may have pushed memsets on this chunk which it
     // placed in the block tracker.
     uvm_pmm_gpu_free(&gpu->pmm, chunk, &block->tracker);
-
-    uvm_phase_n_abort_gpu_chunk(uvm_va_block_get_va_space(block),
-                                block,
-                                chunk_region,
-                                gpu->id,
-                                chunk_size,
-                                status,
-                                "populate_failed");
 
     return status;
 }
@@ -5988,23 +5819,6 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
                             region_bytes / PAGE_SIZE,
                             region_bytes);
 
-    if (UVM_ID_IS_GPU(dest_id)) {
-        uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
-
-        uvm_phase_n_va_block_make_resident_hook(va_space,
-                                                va_block,
-                                                region,
-                                                dest_id,
-                                                cause,
-                                                NV_FALSE);
-        uvm_phase_n_make_resident_reclaim_hook(va_space,
-                                               uvm_va_block_region_start(va_block, region),
-                                               uvm_va_block_region_size(region),
-                                               uvm_id_value(dest_id),
-                                               cause,
-                                               NV_FALSE);
-    }
-
     return NV_OK;
 }
 
@@ -6252,17 +6066,6 @@ NV_STATUS uvm_va_block_make_resident_read_duplicate(uvm_va_block_t *va_block,
 
     if (UVM_ID_IS_GPU(dest_id) && uvm_page_mask_full(uvm_va_block_resident_mask_get(va_block, dest_id, NUMA_NO_NODE)))
         uvm_processor_mask_set(&va_block->ever_fully_resident, dest_id);
-
-    if (UVM_ID_IS_GPU(dest_id) && uvm_processor_mask_test(&va_block->resident, dest_id)) {
-        uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
-
-        uvm_phase_n_va_block_make_resident_hook(va_space,
-                                                va_block,
-                                                region,
-                                                dest_id,
-                                                cause,
-                                                NV_FALSE);
-    }
 
     // Check state of all chunks after residency change.
     // TODO: Bug 4207783: Check both CPU and GPU chunks.
@@ -11473,12 +11276,6 @@ static NV_STATUS block_expert_batch_update_residency_locked(uvm_va_block_expert_
         uvm_processor_mask_set(&va_block->ever_fully_resident, dest_gpu->id);
 
     block_mark_memory_used(va_block, dest_gpu->id);
-    uvm_phase_n_va_block_make_resident_hook(uvm_va_block_get_va_space(va_block),
-                                            va_block,
-                                            state->region,
-                                            dest_gpu->id,
-                                            UVM_MAKE_RESIDENT_CAUSE_PREFETCH,
-                                            NV_FALSE);
     UVM_ASSERT(block_check_cpu_chunks(va_block));
 
     return NV_OK;
@@ -12278,13 +12075,6 @@ static NV_STATUS block_bg_promote_readonly_locked(uvm_va_block_t *va_block,
     uvm_bg_promote_profile_add(UVM_BG_PROMOTE_PROFILE_METADATA,
                                NV_GETTIME() - stage_start,
                                copied_pages);
-
-    uvm_phase_n_va_block_make_resident_hook(uvm_va_block_get_va_space(va_block),
-                                            va_block,
-                                            region,
-                                            gpu_id,
-                                            UVM_MAKE_RESIDENT_CAUSE_PREFETCH,
-                                            NV_FALSE);
 
     stage_start = NV_GETTIME();
     status = block_bg_promote_map_local_locked(va_block, block_context, gpu_id, region, migrated_pages);
@@ -13518,8 +13308,6 @@ void uvm_va_block_destroy(nv_kref_t *nv_kref)
     // Nobody else should have a reference when freeing
     uvm_assert_mutex_unlocked(&block->lock);
 
-    uvm_phase_n_va_block_destroy_hook(block);
-
     uvm_mutex_lock(&block->lock);
     block_kill(block);
     uvm_mutex_unlock(&block->lock);
@@ -13528,8 +13316,6 @@ void uvm_va_block_destroy(nv_kref_t *nv_kref)
 
 void uvm_va_block_kill(uvm_va_block_t *va_block)
 {
-    uvm_phase_n_va_block_destroy_hook(va_block);
-
     uvm_mutex_lock(&va_block->lock);
     block_kill(va_block);
     uvm_mutex_unlock(&va_block->lock);
@@ -14736,20 +14522,6 @@ NV_STATUS uvm_va_block_split(uvm_va_block_t *existing_va_block,
     if (status != NV_OK)
         uvm_va_block_release(new_block);
     else {
-        NvBool tag_valid = existing_va_block->phase_n.tag_valid;
-
-        memset(&new_block->phase_n, 0, sizeof(new_block->phase_n));
-        INIT_LIST_HEAD(&new_block->phase_n.queue_node);
-        if (tag_valid) {
-            new_block->phase_n.region_id = existing_va_block->phase_n.region_id;
-            new_block->phase_n.allocation_id = existing_va_block->phase_n.allocation_id;
-            new_block->phase_n.pool = existing_va_block->phase_n.pool;
-            new_block->phase_n.role = existing_va_block->phase_n.role;
-            new_block->phase_n.flags = existing_va_block->phase_n.flags;
-            new_block->phase_n.tag_valid = existing_va_block->phase_n.tag_valid;
-            new_block->phase_n.mixed_pool = existing_va_block->phase_n.mixed_pool;
-        }
-
         new_block->bg_promote_pause_count = existing_va_block->bg_promote_pause_count;
 
         if (new_va_block)
@@ -15689,14 +15461,6 @@ static void uvm_va_block_get_prefetch_hint(uvm_va_block_t *va_block,
 {
     uvm_processor_id_t new_residency;
 
-    if (uvm_phase_n_fault_prefetch_disable &&
-        service_context->operation == UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS) {
-        service_context->prefetch_hint.residency = UVM_ID_INVALID;
-        uvm_page_mask_zero(&service_context->prefetch_hint.prefetch_pages_mask);
-        atomic64_inc(&g_uvm_phase_n_fault_prefetch_suppressed);
-        return;
-    }
-
     // Performance heuristics policy: we only consider prefetching when there
     // are migrations to a single processor, only.
     if (uvm_processor_mask_get_count(&service_context->resident_processors) == 1) {
@@ -16281,7 +16045,6 @@ NV_STATUS uvm_va_block_service_finish(uvm_processor_id_t processor_id,
     uvm_prot_t new_prot;
     uvm_page_index_t page_index;
     NV_STATUS status = NV_OK;
-    bool finished_residency_update = false;
 
     // Update residency.
     if (service_context->read_duplicate_count == 0 || !uvm_page_mask_empty(caller_page_mask)) {
@@ -16289,24 +16052,6 @@ NV_STATUS uvm_va_block_service_finish(uvm_processor_id_t processor_id,
                                           service_context->block_context,
                                           service_context->region,
                                           caller_page_mask);
-        finished_residency_update = true;
-    }
-
-    if (finished_residency_update && UVM_ID_IS_GPU(new_residency)) {
-        uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
-
-        uvm_phase_n_va_block_make_resident_hook(va_space,
-                                                va_block,
-                                                service_context->region,
-                                                new_residency,
-                                                service_context->block_context->make_resident.cause,
-                                                NV_FALSE);
-        uvm_phase_n_make_resident_reclaim_hook(va_space,
-                                               uvm_va_block_region_start(va_block, service_context->region),
-                                               uvm_va_block_region_size(service_context->region),
-                                               uvm_id_value(new_residency),
-                                               service_context->block_context->make_resident.cause,
-                                               NV_FALSE);
     }
 
     uvm_page_mask_andnot(&service_context->did_not_migrate_mask, new_residency_mask, did_migrate_mask);
@@ -16767,7 +16512,7 @@ static void block_stage_a_observe_cpu_fault(uvm_va_block_t *va_block,
                                             uvm_fault_access_type_t fault_access_type,
                                             uvm_service_block_context_t *service_context)
 {
-    // The compact Region ABI has no Phase-N pool/role/flags metadata. Do not
+    // The compact Region ABI has no pool/role/flags metadata. Do not
     // infer a fault class from registration alone; normal fault handling is
     // the conservative fallback.
     (void)va_block;
@@ -16820,13 +16565,11 @@ static void block_gpu_only_soft_break_cpu_fault(uvm_va_block_t *va_block,
     atomic64_inc(&g_uvm_gpu_only_soft_breaks);
     atomic64_add(cleared_pages, &g_uvm_gpu_only_soft_break_pages);
     atomic64_set(&g_uvm_gpu_only_last_region_id, region ? region->region_id : 0);
-    atomic64_set(&g_uvm_gpu_only_last_pool, UVM_PHASE_N_POOL_UNKNOWN);
     atomic64_set(&g_uvm_gpu_only_last_fault_addr, fault_addr);
     atomic64_set(&g_uvm_gpu_only_last_is_write, is_write ? 1 : 0);
 
-    uvm_phase_f_route_log("gpu_only_soft_break region_id=%llu pool=%u pool_name=unknown fault_addr=0x%llx access=%s had_read=%u had_write=%u cleared_pages=%u fallback=normal block_start=0x%llx block_end=0x%llx pid=%d\n",
+    uvm_phase_f_route_log("gpu_only_soft_break region_id=%llu fault_addr=0x%llx access=%s had_read=%u had_write=%u cleared_pages=%u fallback=normal block_start=0x%llx block_end=0x%llx pid=%d\n",
                           region ? region->region_id : 0,
-                          UVM_PHASE_N_POOL_UNKNOWN,
                           fault_addr,
                           is_write ? "write" : "read",
                           had_read_policy ? 1 : 0,

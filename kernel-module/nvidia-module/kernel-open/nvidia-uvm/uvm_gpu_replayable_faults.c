@@ -47,8 +47,6 @@
 // provides some background for understanding replayable faults, non-replayable
 // faults, and how UVM services each fault type.
 
-#define UVM_PHASE_N_AUTO_RECLAIM_OUTER_MAX_PER_BATCH 8
-
 // The HW fault buffer flush mode instructs RM on how to flush the hardware
 // replayable fault buffer; it is only used in Confidential Computing.
 //
@@ -128,16 +126,6 @@ module_param(uvm_perf_fault_mmap_lock_yield_interval, uint, S_IRUGO);
 static unsigned uvm_perf_fault_coalesce = 1;
 module_param(uvm_perf_fault_coalesce, uint, S_IRUGO);
 
-static unsigned uvm_phase_n_expert_fault_readdup_enable = 0;
-module_param(uvm_phase_n_expert_fault_readdup_enable, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(uvm_phase_n_expert_fault_readdup_enable,
-                 "Deprecated no-op: Expert identity is no longer inferred from Region tags.");
-
-static unsigned uvm_phase_n_expert_fault_fastpath_enable = 0;
-module_param(uvm_phase_n_expert_fault_fastpath_enable, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(uvm_phase_n_expert_fault_fastpath_enable,
-                 "Deprecated no-op: Expert identity is no longer inferred from Region tags.");
-
 #define UVM_MANUAL_MIGRATION_FAULT_MODE_OFF       0
 #define UVM_MANUAL_MIGRATION_FAULT_MODE_OBSERVE   1
 #define UVM_MANUAL_MIGRATION_FAULT_MODE_FAIL_FAST 2
@@ -148,42 +136,10 @@ MODULE_PARM_DESC(uvm_manual_migration_fault_mode,
                  "Manual migration fault mode for managed GPU replayable faults: "
                  "0=normal UVM service, 1=observe/log and continue, 2=log and cancel instead of migrating. Default: 0.");
 
-static unsigned uvm_manual_migration_fault_pool_mask = 0;
-module_param(uvm_manual_migration_fault_pool_mask, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(uvm_manual_migration_fault_pool_mask,
-                 "Legacy Phase-N pool filter. 0 applies to all managed ranges; "
-                 "non-zero masks match no ranges because semantic Region tags are disabled.");
-
 static unsigned uvm_manual_migration_fault_log_enable = 1;
 module_param(uvm_manual_migration_fault_log_enable, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_manual_migration_fault_log_enable,
                  "Log manual migration GPU fault observations to phase_f_route_log. Default: 1.");
-
-static bool phase_n_range_tag_is_expert_weight(const uvm_phase_n_range_tag_t *tag)
-{
-    // Region registration no longer carries pool/role metadata. Faults must
-    // use the generic service path instead of inferring an Expert fast path.
-    (void)tag;
-    return false;
-}
-
-static bool phase_n_range_tag_is_cpu_offloaded_reserved_expert(const uvm_phase_n_range_tag_t *tag)
-{
-    // Reserved/offloaded status is now an application-side decision expressed
-    // through explicit Region operations, not persistent range-tag flags.
-    (void)tag;
-    return false;
-}
-
-static bool manual_migration_fault_pool_matches(uvm_va_range_managed_t *managed_range)
-{
-    if (!managed_range)
-        return false;
-
-    // A zero mask remains the generic "all managed ranges" mode. Non-zero
-    // legacy pool filters cannot be resolved without semantic range tags.
-    return uvm_manual_migration_fault_pool_mask == 0;
-}
 
 static bool manual_migration_fault_mode_enabled(void)
 {
@@ -201,164 +157,18 @@ static void manual_migration_fault_log(uvm_gpu_t *gpu,
                                        uvm_fault_buffer_entry_t *fault_entry,
                                        bool block_fault)
 {
-    const uvm_phase_n_range_tag_t *tag = managed_range ? &managed_range->phase_n_tag : NULL;
-
     if (!uvm_manual_migration_fault_log_enable)
         return;
 
-    uvm_phase_f_route_log("manual_migration_fault mode=%u action=%s fault_addr=0x%llx access=%s gpu_id=%u pid=%d region_id=%llu allocation_id=%llu tag_valid=%u mixed=%u range_base=0x%llx range_len=%llu\n",
+    uvm_phase_f_route_log("manual_migration_fault mode=%u action=%s fault_addr=0x%llx access=%s gpu_id=%u pid=%d range_base=0x%llx range_len=%llu\n",
                           uvm_manual_migration_fault_mode,
                           block_fault ? "block" : "observe",
                           fault_entry->fault_address,
                           uvm_fault_access_type_string(fault_entry->fault_access_type),
                           uvm_id_value(gpu->id),
                           task_tgid_nr(current),
-                          tag ? tag->region_id : 0,
-                          tag ? tag->allocation_id : 0,
-                          tag ? tag->valid : 0,
-                          tag ? tag->mixed : 0,
-                          tag ? tag->base : 0,
-                          tag ? tag->length : 0);
-}
-
-static bool phase_n_expert_fault_readdup_allowed(uvm_va_block_t *va_block,
-                                                 uvm_page_index_t page_index,
-                                                 uvm_gpu_id_t gpu_id,
-                                                 uvm_fault_access_type_t service_access_type,
-                                                 const uvm_perf_thrashing_hint_t *thrashing_hint,
-                                                 const bool hmm_migratable)
-{
-    uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
-    uvm_va_block_gpu_state_t *gpu_state;
-
-    if (!uvm_phase_n_expert_fault_readdup_enable)
-        return false;
-
-    if (uvm_va_block_is_hmm(va_block) || !hmm_migratable)
-        return false;
-
-    if (!phase_n_range_tag_is_expert_weight(&va_block->managed_range->phase_n_tag))
-        return false;
-
-    if (service_access_type > UVM_FAULT_ACCESS_TYPE_READ)
-        return false;
-
-    if (thrashing_hint->type == UVM_PERF_THRASHING_HINT_TYPE_PIN)
-        return false;
-
-    if (!uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index))
-        return false;
-
-    gpu_state = uvm_va_block_gpu_state_get(va_block, gpu_id);
-    if (gpu_state && uvm_page_mask_test(&gpu_state->resident, page_index))
-        return false;
-
-    if (!uvm_processor_mask_test(&va_space->accessible_from[uvm_id_value(UVM_ID_CPU)], gpu_id))
-        return false;
-
-    return true;
-}
-
-static void phase_n_record_managed_fault_dispatch(uvm_gpu_t *gpu,
-                                                  uvm_va_range_managed_t *managed_range,
-                                                  NvU32 block_faults)
-{
-    if (!managed_range || block_faults == 0)
-        return;
-
-    if (phase_n_range_tag_is_expert_weight(&managed_range->phase_n_tag)) {
-        ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_dispatches;
-        gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_faults_serviced += block_faults;
-    }
-    else {
-        ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_non_expert_managed_dispatches;
-        gpu->parent->fault_buffer.replayable.stats.num_phase_n_non_expert_managed_faults_serviced += block_faults;
-    }
-}
-
-static bool phase_n_expert_prefetch_wait_if_pending(uvm_gpu_t *gpu,
-                                                    uvm_va_block_t *va_block,
-                                                    uvm_fault_buffer_entry_t *fault_entry)
-{
-    uvm_page_index_t page_index;
-    bool pending;
-    bool waited;
-
-    if (!uvm_phase_n_expert_prefetch_wait_enable)
-        return false;
-
-    if (uvm_va_block_is_hmm(va_block) || !va_block->managed_range)
-        return false;
-
-    if (!phase_n_range_tag_is_expert_weight(&va_block->managed_range->phase_n_tag))
-        return false;
-
-    if (fault_entry->fault_access_type > UVM_FAULT_ACCESS_TYPE_READ)
-        return false;
-
-    page_index = uvm_va_block_cpu_page_index(va_block, fault_entry->fault_address);
-
-    uvm_mutex_lock(&va_block->lock);
-    pending = uvm_va_block_expert_prefetch_page_pending(va_block, gpu->id, page_index);
-    uvm_mutex_unlock(&va_block->lock);
-
-    if (!pending)
-        return false;
-
-    ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_prefetch_waits;
-    waited = uvm_va_block_expert_prefetch_wait(va_block, gpu->id, uvm_phase_n_expert_prefetch_wait_timeout_ms);
-    if (waited)
-        ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_prefetch_wait_successes;
-    else
-        ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_prefetch_wait_timeouts;
-
-    return waited;
-}
-
-static bool phase_n_expert_prefetch_authorized_after_wait(uvm_gpu_t *gpu,
-                                                          uvm_va_block_t *va_block,
-                                                          uvm_fault_service_batch_context_t *batch_context,
-                                                          NvU32 first_fault_index,
-                                                          NvU32 *block_faults)
-{
-    uvm_fault_buffer_entry_t **ordered_fault_cache = batch_context->ordered_fault_cache;
-    uvm_fault_buffer_entry_t *first_fault_entry = ordered_fault_cache[first_fault_index];
-    uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
-    NvU32 i;
-
-    *block_faults = 0;
-
-    if (!phase_n_expert_prefetch_wait_if_pending(gpu, va_block, first_fault_entry))
-        return false;
-
-    uvm_mutex_lock(&va_block->lock);
-
-    for (i = first_fault_index;
-         i < batch_context->num_coalesced_faults &&
-         ordered_fault_cache[i]->va_space == va_space &&
-         ordered_fault_cache[i]->gpu == gpu &&
-         ordered_fault_cache[i]->fault_address <= va_block->end;
-         ++i) {
-        uvm_fault_buffer_entry_t *current_entry = ordered_fault_cache[i];
-        uvm_page_index_t page_index;
-
-        if (current_entry->is_fatal ||
-            current_entry->fault_access_type > UVM_FAULT_ACCESS_TYPE_READ ||
-            uvm_fault_access_type_mask_highest(current_entry->access_type_mask) > UVM_FAULT_ACCESS_TYPE_READ)
-            break;
-
-        page_index = uvm_va_block_cpu_page_index(va_block, current_entry->fault_address);
-        if (!uvm_va_block_page_is_gpu_authorized(va_block, page_index, gpu->id, UVM_PROT_READ_ONLY))
-            break;
-    }
-
-    uvm_mutex_unlock(&va_block->lock);
-
-    if (i == first_fault_index)
-        return false;
-
-    *block_faults = i - first_fault_index;
-    return true;
+                          managed_range ? managed_range->va_range.node.start : 0,
+                          managed_range ? uvm_va_range_size(&managed_range->va_range) : 0);
 }
 
 static unsigned uvm_perf_fault_log_addresses;
@@ -1926,20 +1736,6 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_t *gpu,
                                                       hmm_migratable,
                                                       &read_duplicate);
 
-        // 专家模式覆盖机制：检查是否强制开启 Read Duplication (读复制)
-        if (phase_n_expert_fault_readdup_allowed(va_block,
-                                                 page_index,
-                                                 gpu->id,
-                                                 service_access_type,
-                                                 &thrashing_hint,
-                                                 hmm_migratable)) {
-            new_residency = gpu->id;
-            read_duplicate = true;
-            // 更新统计信息
-            ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_forced_readdup_faults;
-            ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_forced_readdup_pages;
-        }
-
         // 记录新驻留位置的映射掩码，如果该驻留位置第一次出现，先清空其页面掩码
         if (!uvm_processor_mask_test_and_set(&block_context->resident_processors, new_residency))
             uvm_page_mask_zero(&block_context->per_processor_masks[uvm_id_value(new_residency)].new_residency);
@@ -2025,179 +1821,6 @@ static NV_STATUS service_fault_batch_block(uvm_gpu_t *gpu,
         uvm_hmm_migrate_finish(va_block);
 
     return status == NV_OK? tracker_status: status;
-}
-
-static bool phase_n_expert_fault_fastpath_candidate(uvm_va_block_t *va_block,
-                                                    uvm_va_range_managed_t *managed_range,
-                                                    const bool hmm_migratable)
-{
-    if (!uvm_phase_n_expert_fault_fastpath_enable)
-        return false;
-
-    if (!managed_range)
-        return false;
-
-    if (uvm_va_block_is_hmm(va_block) || !hmm_migratable)
-        return false;
-
-    if (uvm_va_range_is_managed_zombie(&managed_range->va_range))
-        return false;
-
-    return phase_n_range_tag_is_expert_weight(&managed_range->phase_n_tag);
-}
-
-static NV_STATUS service_fault_batch_block_expert_readdup_locked(uvm_gpu_t *gpu,
-                                                                 uvm_va_block_t *va_block,
-                                                                 uvm_va_block_retry_t *va_block_retry,
-                                                                 uvm_fault_service_batch_context_t *batch_context,
-                                                                 NvU32 first_fault_index,
-                                                                 NvU32 *block_faults)
-{
-    NV_STATUS status;
-    NvU32 i;
-    uvm_page_index_t page_index;
-    NvU32 readdup_page_count = 0;
-    uvm_replayable_fault_buffer_t *replayable_faults = &gpu->parent->fault_buffer.replayable;
-    uvm_fault_buffer_entry_t **ordered_fault_cache = batch_context->ordered_fault_cache;
-    uvm_fault_buffer_entry_t *first_fault_entry = ordered_fault_cache[first_fault_index];
-    uvm_service_block_context_t *service_context = &replayable_faults->block_service_context;
-    uvm_page_mask_t *new_residency_mask =
-        &service_context->per_processor_masks[uvm_id_value(gpu->id)].new_residency;
-    uvm_page_mask_t demand_fault_mask;
-    uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
-    uvm_va_block_gpu_state_t *gpu_state;
-
-    uvm_assert_mutex_locked(&va_block->lock);
-
-    *block_faults = 0;
-
-    UVM_ASSERT(first_fault_entry->va_space == va_space);
-    UVM_ASSERT(first_fault_entry->gpu == gpu);
-    UVM_ASSERT(first_fault_entry->fault_address >= va_block->start);
-    UVM_ASSERT(first_fault_entry->fault_address <= va_block->end);
-    UVM_ASSERT(!uvm_va_block_is_hmm(va_block));
-    UVM_ASSERT(phase_n_range_tag_is_expert_weight(&va_block->managed_range->phase_n_tag));
-
-    if (!uvm_processor_mask_test(&va_space->accessible_from[uvm_id_value(UVM_ID_CPU)], gpu->id))
-        return NV_WARN_NOTHING_TO_DO;
-
-    gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
-
-    uvm_processor_mask_zero(&service_context->resident_processors);
-    uvm_processor_mask_set(&service_context->resident_processors, gpu->id);
-    uvm_page_mask_zero(new_residency_mask);
-    uvm_page_mask_zero(&demand_fault_mask);
-    uvm_page_mask_zero(&service_context->read_duplicate_mask);
-    service_context->read_duplicate_count = 0;
-    service_context->thrashing_pin_count = 0;
-    service_context->prefetch_hint.residency = UVM_ID_INVALID;
-    uvm_page_mask_zero(&service_context->prefetch_hint.prefetch_pages_mask);
-    service_context->block_context->make_resident.dest_nid = NUMA_NO_NODE;
-
-    for (i = first_fault_index;
-         i < batch_context->num_coalesced_faults &&
-         ordered_fault_cache[i]->va_space == va_space &&
-         ordered_fault_cache[i]->gpu == gpu &&
-         ordered_fault_cache[i]->fault_address <= va_block->end;
-         ++i) {
-        uvm_fault_buffer_entry_t *current_entry = ordered_fault_cache[i];
-        uvm_page_index_t page_index;
-
-        if (current_entry->is_fatal)
-            return NV_WARN_NOTHING_TO_DO;
-
-        if (current_entry->fault_access_type != UVM_FAULT_ACCESS_TYPE_READ)
-            return NV_WARN_NOTHING_TO_DO;
-
-        if (uvm_fault_access_type_mask_highest(current_entry->access_type_mask) != UVM_FAULT_ACCESS_TYPE_READ)
-            return NV_WARN_NOTHING_TO_DO;
-
-        page_index = uvm_va_block_cpu_page_index(va_block, current_entry->fault_address);
-
-        if (uvm_va_block_page_is_gpu_authorized(va_block, page_index, gpu->id, UVM_PROT_READ_ONLY))
-            continue;
-
-        if (!uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index))
-            return NV_WARN_NOTHING_TO_DO;
-
-        if (gpu_state && uvm_page_mask_test(&gpu_state->resident, page_index))
-            return NV_WARN_NOTHING_TO_DO;
-
-        uvm_page_mask_set(&demand_fault_mask, page_index);
-    }
-
-    *block_faults = i - first_fault_index;
-
-    for_each_va_block_page(page_index, va_block) {
-        if (uvm_va_block_page_is_gpu_authorized(va_block, page_index, gpu->id, UVM_PROT_READ_ONLY))
-            continue;
-
-        if (!uvm_va_block_cpu_is_page_resident_on(va_block, NUMA_NO_NODE, page_index))
-            continue;
-
-        if (gpu_state && uvm_page_mask_test(&gpu_state->resident, page_index))
-            continue;
-
-        uvm_page_mask_set(new_residency_mask, page_index);
-        uvm_page_mask_set(&service_context->read_duplicate_mask, page_index);
-        service_context->access_type[page_index] =
-            uvm_page_mask_test(&demand_fault_mask, page_index) ?
-                UVM_FAULT_ACCESS_TYPE_READ :
-                UVM_FAULT_ACCESS_TYPE_PREFETCH;
-        ++service_context->read_duplicate_count;
-        ++readdup_page_count;
-    }
-
-    if (readdup_page_count == 0)
-        return NV_OK;
-
-    service_context->region = uvm_va_block_region_from_mask(va_block, new_residency_mask);
-
-    status = uvm_va_block_service_copy(gpu->id, gpu->id, va_block, va_block_retry, service_context);
-    if (status != NV_OK)
-        return status;
-
-    status = uvm_va_block_service_finish(gpu->id, va_block, service_context);
-    if (status != NV_OK)
-        return status;
-
-    ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_dispatches;
-    gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_faults_serviced += *block_faults;
-    gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_pages += readdup_page_count;
-
-    return NV_OK;
-}
-
-static NV_STATUS service_fault_batch_block_expert_readdup(uvm_gpu_t *gpu,
-                                                          uvm_va_block_t *va_block,
-                                                          uvm_fault_service_batch_context_t *batch_context,
-                                                          NvU32 first_fault_index,
-                                                          NvU32 *block_faults)
-{
-    NV_STATUS status;
-    uvm_va_block_retry_t va_block_retry;
-    NV_STATUS tracker_status;
-    uvm_replayable_fault_buffer_t *replayable_faults = &gpu->parent->fault_buffer.replayable;
-    uvm_service_block_context_t *fault_block_context = &replayable_faults->block_service_context;
-
-    fault_block_context->operation = UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS;
-    fault_block_context->num_retries = 0;
-
-    uvm_mutex_lock(&va_block->lock);
-
-    status = UVM_VA_BLOCK_RETRY_LOCKED(va_block, &va_block_retry,
-                                       service_fault_batch_block_expert_readdup_locked(gpu,
-                                                                                      va_block,
-                                                                                      &va_block_retry,
-                                                                                      batch_context,
-                                                                                      first_fault_index,
-                                                                                      block_faults));
-
-    tracker_status = uvm_tracker_add_tracker_safe(&batch_context->tracker, &va_block->tracker);
-
-    uvm_mutex_unlock(&va_block->lock);
-
-    return status == NV_OK ? tracker_status : status;
 }
 
 typedef enum
@@ -2542,7 +2165,7 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
         uvm_va_range_managed_t *managed_range = uvm_va_range_to_managed_or_null(va_range);
         bool block_manual_fault = false;
 
-        if (manual_migration_fault_mode_enabled() && manual_migration_fault_pool_matches(managed_range)) {
+        if (manual_migration_fault_mode_enabled() && managed_range) {
             block_manual_fault = manual_migration_fault_should_block();
 
             manual_migration_fault_log(gpu, managed_range, current_entry, block_manual_fault);
@@ -2557,46 +2180,8 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
                 status = NV_OK;
             }
         }
-        if (!block_manual_fault &&
-            managed_range &&
-            (phase_n_range_tag_is_cpu_offloaded_reserved_expert(&managed_range->phase_n_tag) ||
-             uvm_va_space_range_has_cpu_offloaded_reserved_expert(va_space,
-                                                                  fault_address,
-                                                                  1))) {
-            ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_reserved_fault_policy_violations;
-            ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_reserved_pool_external_alloc_attempts;
-            service_fault_batch_fatal_notify(gpu,
-                                             batch_context,
-                                             fault_index,
-                                             NV_ERR_INVALID_ACCESS_TYPE,
-                                             UVM_FAULT_CANCEL_VA_MODE_ALL,
-                                             block_faults);
-            status = NV_OK;
-        }
-        else if (!block_manual_fault &&
-            managed_range &&
-            phase_n_range_tag_is_expert_weight(&managed_range->phase_n_tag) &&
-            phase_n_expert_prefetch_authorized_after_wait(gpu, va_block, batch_context, fault_index, block_faults)) {
-            status = NV_OK;
-        }
-        else if (!block_manual_fault &&
-            phase_n_expert_fault_fastpath_candidate(va_block, managed_range, hmm_migratable)) {
-            status = service_fault_batch_block_expert_readdup(gpu,
-                                                              va_block,
-                                                              batch_context,
-                                                              fault_index,
-                                                              block_faults);
-            if (status == NV_WARN_NOTHING_TO_DO) {
-                ++gpu->parent->fault_buffer.replayable.stats.num_phase_n_expert_fastpath_fallbacks;
-                status = service_fault_batch_block(gpu, va_block, batch_context, fault_index, hmm_migratable, block_faults);
-            }
-        }
-        else if (!block_manual_fault) {
+        if (!block_manual_fault)
             status = service_fault_batch_block(gpu, va_block, batch_context, fault_index, hmm_migratable, block_faults);
-        }
-
-        if (status == NV_OK)
-            phase_n_record_managed_fault_dispatch(gpu, managed_range, *block_faults);
     }
     else if ((status == NV_ERR_INVALID_ADDRESS) && uvm_ats_can_service_faults(gpu_va_space, mm)) {
         NvU64 outer = ~0ULL;
@@ -3554,34 +3139,6 @@ static void enable_disable_prefetch_faults(uvm_parent_gpu_t *parent_gpu,
     }
 }
 
-static NV_STATUS phase_n_auto_reclaim_after_replayable_batch(uvm_fault_service_batch_context_t *batch_context)
-{
-    NvU32 i;
-    NvU32 attempts = 0;
-    NV_STATUS first_error = NV_OK;
-
-    for (i = 0;
-         i < batch_context->num_coalesced_faults && attempts < UVM_PHASE_N_AUTO_RECLAIM_OUTER_MAX_PER_BATCH;
-         ++i) {
-        uvm_fault_buffer_entry_t *entry = batch_context->ordered_fault_cache[i];
-        NV_STATUS status;
-
-        if (!entry || !entry->va_space || !entry->gpu || entry->is_fatal)
-            continue;
-
-        status = uvm_phase_n_auto_reclaim_outer_hook(entry->va_space,
-                                                     entry->fault_address,
-                                                     PAGE_SIZE,
-                                                     uvm_id_value(entry->gpu->id),
-                                                     0);
-        if (status != NV_OK && first_error == NV_OK)
-            first_error = status;
-        ++attempts;
-    }
-
-    return first_error;
-}
-
 // 处理指定 GPU 上的可重放缺页异常（Replayable Page Faults）。
 // 该函数是 UVM 处理 GPU 缺页的顶层循环，它会从硬件的缺页缓冲区中按批次（Batch）
 // 提取、预处理并服务缺页异常，最后根据配置的策略触发硬件重放（Replay）。
@@ -3649,10 +3206,6 @@ void uvm_parent_gpu_service_replayable_faults(uvm_parent_gpu_t *parent_gpu)
 
         // 如果采用了 BLOCK 级别的重放策略，或者缓冲区被刷新，服务过程中可能已经触发了重放
         num_replays += batch_context->num_replays;
-
-        // 4. 后处理阶段：内存回收和预取调整
-        if (status == NV_OK)
-            status = phase_n_auto_reclaim_after_replayable_batch(batch_context);
 
         enable_disable_prefetch_faults(parent_gpu, batch_context);
 

@@ -240,6 +240,12 @@ struct uvm_va_range_managed_struct
     // Base class
     uvm_va_range_t va_range;
 
+    // Module-lifetime allocation identity used by immutable MoE slot plans.
+    // VA-range splits inherit this value, while a new mmap at a recycled VA
+    // receives a new value. This avoids treating a raw VA as an allocation
+    // lifetime token.
+    NvU64 moe_slot_allocation_id;
+
     // This is a uvm_va_block_t ** array of all VA block pointers under this
     // range. The pointers can be accessed using the functions
     // uvm_va_range_block() and uvm_va_range_block_create(). The latter

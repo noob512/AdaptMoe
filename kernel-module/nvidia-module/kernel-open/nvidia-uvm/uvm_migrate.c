@@ -807,6 +807,392 @@ static NV_STATUS uvm_migrate(uvm_va_space_t *va_space,
     return status;
 }
 
+typedef struct
+{
+    uvm_va_range_managed_t *first_managed_range;
+    bool is_multi_block;
+} uvm_prefetch_gpu_batch_range_state_t;
+
+static void prefetch_gpu_batch_result_init(UVM_PHASE_F_RANGE_RESULT *result, NvU64 requested_bytes)
+{
+    result->status = NV_OK;
+    result->resident_on_count = 0;
+    result->resident_on_cpu = NV_FALSE;
+    result->resident_on_gpu = NV_FALSE;
+    result->queried_bytes = requested_bytes;
+    result->resident_gpu_bytes = 0;
+    result->resident_cpu_bytes = 0;
+    result->resident_any_bytes = 0;
+    result->resident_unknown_bytes = 0;
+}
+
+static void prefetch_gpu_batch_set_first_error(NV_STATUS range_status, NV_STATUS *first_error)
+{
+    if (range_status != NV_OK && *first_error == NV_OK)
+        *first_error = range_status;
+}
+
+// One batch-core entry owns both global phases. The underlying managed-memory
+// primitive remains block based, but no range re-enters the public migrate API
+// or performs a per-range tracker wait.
+static NV_STATUS prefetch_gpu_batch_core(uvm_va_space_t *va_space,
+                                         uvm_service_block_context_t *service_context,
+                                         uvm_processor_id_t dest_id,
+                                         uvm_prefetch_gpu_batch_range_state_t *range_states,
+                                         UVM_PHASE_F_PREFETCH_GPU_BATCH_V2_PARAMS *params,
+                                         uvm_tracker_t *batch_tracker)
+{
+    NV_STATUS first_error = NV_OK;
+    NvU32 i;
+
+    // Phase one submits residency work for every multi-block range before any
+    // range enters the mapping phase. Single-block ranges only need phase two.
+    for (i = 0; i < params->count; ++i) {
+        UVM_PHASE_F_RANGE *range = &params->ranges[i];
+        NV_STATUS range_status;
+
+        if (!range_states[i].is_multi_block)
+            continue;
+
+        range_status = uvm_migrate_ranges(va_space,
+                                          service_context,
+                                          range_states[i].first_managed_range,
+                                          range->base,
+                                          range->length,
+                                          dest_id,
+                                          UVM_MIGRATE_MODE_MAKE_RESIDENT,
+                                          migration_should_do_cpu_preunmap(va_space,
+                                                                          UVM_MIGRATE_PASS_FIRST,
+                                                                          false),
+                                          batch_tracker);
+        if (range_status != NV_OK) {
+            params->results[i].status = range_status;
+            prefetch_gpu_batch_set_first_error(range_status, &first_error);
+        }
+    }
+
+    // Phase two revalidates residency and installs mappings for all ranges.
+    for (i = 0; i < params->count; ++i) {
+        UVM_PHASE_F_RANGE *range = &params->ranges[i];
+        NV_STATUS range_status;
+
+        if (params->results[i].status != NV_OK)
+            continue;
+
+        range_status = uvm_migrate_ranges(va_space,
+                                          service_context,
+                                          range_states[i].first_managed_range,
+                                          range->base,
+                                          range->length,
+                                          dest_id,
+                                          UVM_MIGRATE_MODE_MAKE_RESIDENT_AND_MAP,
+                                          false,
+                                          batch_tracker);
+        if (range_status != NV_OK) {
+            params->results[i].status = range_status;
+            prefetch_gpu_batch_set_first_error(range_status, &first_error);
+        }
+    }
+
+    return first_error;
+}
+
+NV_STATUS uvm_api_phase_f_prefetch_gpu_batch_v2(UVM_PHASE_F_PREFETCH_GPU_BATCH_V2_PARAMS *params,
+                                                struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_prefetch_gpu_batch_range_state_t *range_states = NULL;
+    uvm_service_block_context_t *service_context = NULL;
+    uvm_processor_mask_t *gpus_to_check_for_nvlink_errors = NULL;
+    uvm_tracker_t batch_tracker = UVM_TRACKER_INIT();
+    uvm_gpu_t *dest_gpu = NULL;
+    struct mm_struct *mm = NULL;
+    NV_STATUS status = NV_OK;
+    NV_STATUS tracker_status = NV_OK;
+    NV_STATUS nvlink_status = NV_OK;
+    NvU32 i;
+    bool mmap_locked = false;
+    bool va_space_write_locked = false;
+    bool va_space_read_locked = false;
+    bool tracker_initialized = true;
+    bool gpus_retained = false;
+    bool core_entered = false;
+
+    params->success_count = 0;
+    params->failure_count = 0;
+    params->core_calls = 0;
+    params->tracker_waits = 0;
+    params->requested_bytes = 0;
+    params->completed_bytes = 0;
+
+    if (params->count == 0 || params->count > UVM_PHASE_F_PREFETCH_GPU_BATCH_V2_MAX_RANGES) {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto out;
+    }
+
+    // Validate the wire ranges before taking any lock or changing mappings.
+    for (i = 0; i < params->count; ++i) {
+        UVM_PHASE_F_RANGE *range = &params->ranges[i];
+        NvU32 j;
+
+        prefetch_gpu_batch_result_init(&params->results[i], range->length);
+
+        if (uvm_api_range_invalid(range->base, range->length)) {
+            params->results[i].status = NV_ERR_INVALID_ADDRESS;
+            prefetch_gpu_batch_set_first_error(params->results[i].status, &status);
+            continue;
+        }
+
+        if (params->requested_bytes > ~0ULL - range->length) {
+            params->results[i].status = NV_ERR_INVALID_ARGUMENT;
+            prefetch_gpu_batch_set_first_error(params->results[i].status, &status);
+            continue;
+        }
+
+        params->requested_bytes += range->length;
+
+        // Overlapping ranges would double-count completion and can migrate the
+        // same pages twice. Adjacent ranges, including ranges in one VA block,
+        // remain valid.
+        for (j = 0; j < i; ++j) {
+            UVM_PHASE_F_RANGE *previous = &params->ranges[j];
+
+            if (uvm_api_range_invalid(previous->base, previous->length))
+                continue;
+
+            if (range->base < previous->base + previous->length &&
+                previous->base < range->base + range->length) {
+                params->results[i].status = NV_ERR_INVALID_ARGUMENT;
+                prefetch_gpu_batch_set_first_error(params->results[i].status, &status);
+                break;
+            }
+        }
+    }
+
+    if (params->flags != 0)
+        prefetch_gpu_batch_set_first_error(NV_ERR_INVALID_ARGUMENT, &status);
+
+    if (status != NV_OK)
+        goto out;
+
+    range_states = uvm_kvmalloc_zero(sizeof(*range_states) * params->count);
+    gpus_to_check_for_nvlink_errors = uvm_processor_mask_cache_alloc();
+    if (!range_states || !gpus_to_check_for_nvlink_errors) {
+        status = NV_ERR_NO_MEMORY;
+        goto out;
+    }
+    uvm_processor_mask_zero(gpus_to_check_for_nvlink_errors);
+
+    // Retain and lock the mm once for validation, slot-PTE cleanup, both
+    // migration passes, and tracker submission.
+    mm = uvm_va_space_mm_or_current_retain_lock(va_space);
+    mmap_locked = mm != NULL;
+
+    service_context = uvm_service_block_context_alloc(mm);
+    if (!service_context) {
+        status = NV_ERR_NO_MEMORY;
+        goto out;
+    }
+
+    service_context->prefetch_hint.residency = UVM_ID_INVALID;
+    service_context->block_context->make_resident.dest_nid = NUMA_NO_NODE;
+    uvm_processor_mask_zero(&service_context->gpus_to_check_for_nvlink_errors);
+
+    // Start in write mode so experimental slot mappings can be removed once
+    // for the whole batch. Downgrade in place before normal migration.
+    uvm_va_space_down_write(va_space);
+    va_space_write_locked = true;
+
+    dest_gpu = uvm_va_space_get_gpu_by_uuid_with_gpu_va_space(va_space, &params->gpu_uuid);
+    if (!dest_gpu) {
+        status = NV_ERR_INVALID_DEVICE;
+        goto out;
+    }
+
+    // The V2 ABI is explicitly GPU-only. An integrated GPU migration resolves
+    // to CPU residency in the generic API, so reject it instead of changing the
+    // requested semantics silently.
+    if (dest_gpu->parent->is_integrated_gpu || !uvm_processor_has_memory(dest_gpu->id)) {
+        status = NV_ERR_NOT_SUPPORTED;
+        goto out;
+    }
+
+    for (i = 0; i < params->count; ++i) {
+        UVM_PHASE_F_RANGE *range = &params->ranges[i];
+        uvm_va_range_managed_t *first_managed_range;
+
+        if (!uvm_gpu_can_address(dest_gpu, range->base, range->length)) {
+            params->results[i].status = NV_ERR_OUT_OF_RANGE;
+            prefetch_gpu_batch_set_first_error(params->results[i].status, &status);
+            continue;
+        }
+
+        if (uvm_api_range_type_check(va_space, mm, range->base, range->length) != UVM_API_RANGE_TYPE_MANAGED) {
+            params->results[i].status = NV_ERR_INVALID_ADDRESS;
+            prefetch_gpu_batch_set_first_error(params->results[i].status, &status);
+            continue;
+        }
+
+        first_managed_range = uvm_va_space_iter_managed_first(va_space, range->base, range->base);
+        if (!first_managed_range) {
+            params->results[i].status = NV_ERR_INVALID_ADDRESS;
+            prefetch_gpu_batch_set_first_error(params->results[i].status, &status);
+            continue;
+        }
+
+        range_states[i].first_managed_range = first_managed_range;
+        range_states[i].is_multi_block = !is_migration_single_block(first_managed_range,
+                                                                     range->base,
+                                                                     range->length);
+    }
+
+    // Validation is all-or-nothing so no migration begins after a bad range.
+    if (status != NV_OK)
+        goto out;
+
+    status = uvm_moe_slot_pool_clear_ranges_mappings_for_migrate_locked(va_space,
+                                                                        mm,
+                                                                        params->ranges,
+                                                                        params->count);
+    if (status != NV_OK)
+        goto out;
+
+    uvm_va_space_downgrade_write(va_space);
+    va_space_write_locked = false;
+    va_space_read_locked = true;
+
+    params->core_calls = 1;
+    core_entered = true;
+
+    status = prefetch_gpu_batch_core(va_space,
+                                     service_context,
+                                     dest_gpu->id,
+                                     range_states,
+                                     params,
+                                     &batch_tracker);
+
+    uvm_processor_mask_copy(gpus_to_check_for_nvlink_errors,
+                            &service_context->gpus_to_check_for_nvlink_errors);
+    uvm_service_block_context_free(service_context);
+    service_context = NULL;
+
+    uvm_global_gpu_retain(gpus_to_check_for_nvlink_errors);
+    gpus_retained = true;
+
+    // Drop mmap_lock before the one aggregate wait, matching the generic
+    // synchronous migrate lock ordering while retaining the VA-space read lock.
+    if (mmap_locked) {
+        uvm_up_read_mmap_lock_out_of_order(mm);
+        mmap_locked = false;
+    }
+
+    params->tracker_waits = 1;
+    tracker_status = uvm_tracker_wait(&batch_tracker);
+    uvm_tracker_deinit(&batch_tracker);
+    tracker_initialized = false;
+
+    if (tracker_status != NV_OK) {
+        prefetch_gpu_batch_set_first_error(tracker_status, &status);
+        for (i = 0; i < params->count; ++i) {
+            if (params->results[i].status == NV_OK)
+                params->results[i].status = tracker_status;
+        }
+    }
+
+out:
+    if (va_space_write_locked) {
+        uvm_va_space_up_write(va_space);
+        va_space_write_locked = false;
+    }
+    else if (va_space_read_locked) {
+        uvm_va_space_up_read(va_space);
+        va_space_read_locked = false;
+    }
+
+    if (mm) {
+        if (mmap_locked)
+            uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+        else
+            uvm_va_space_mm_or_current_release(va_space, mm);
+        mm = NULL;
+    }
+
+    if (gpus_retained) {
+        if (!uvm_processor_mask_empty(gpus_to_check_for_nvlink_errors))
+            nvlink_status = uvm_global_gpu_check_nvlink_error(gpus_to_check_for_nvlink_errors);
+
+        uvm_global_gpu_release(gpus_to_check_for_nvlink_errors);
+        gpus_retained = false;
+
+        if (nvlink_status != NV_OK) {
+            prefetch_gpu_batch_set_first_error(nvlink_status, &status);
+            for (i = 0; i < params->count; ++i) {
+                if (params->results[i].status == NV_OK)
+                    params->results[i].status = nvlink_status;
+            }
+        }
+    }
+
+    if (tracker_initialized)
+        uvm_tracker_deinit(&batch_tracker);
+
+    if (service_context)
+        uvm_service_block_context_free(service_context);
+
+    // Before core entry, every otherwise-valid range was aborted by the same
+    // batch-level error. Once core starts, retain the individual range status.
+    if (!core_entered && status != NV_OK && params->count <= UVM_PHASE_F_PREFETCH_GPU_BATCH_V2_MAX_RANGES) {
+        for (i = 0; i < params->count; ++i) {
+            if (params->results[i].status == NV_OK)
+                params->results[i].status = status;
+        }
+    }
+
+    if (params->count <= UVM_PHASE_F_PREFETCH_GPU_BATCH_V2_MAX_RANGES) {
+        NV_STATUS first_result_error = NV_OK;
+
+        params->success_count = 0;
+        params->failure_count = 0;
+        params->completed_bytes = 0;
+
+        for (i = 0; i < params->count; ++i) {
+            UVM_PHASE_F_RANGE_RESULT *result = &params->results[i];
+
+            if (result->status == NV_OK) {
+                ++params->success_count;
+                params->completed_bytes += params->ranges[i].length;
+                result->resident_gpu_bytes = params->ranges[i].length;
+                result->resident_any_bytes = params->ranges[i].length;
+            }
+            else {
+                ++params->failure_count;
+                result->resident_unknown_bytes = params->ranges[i].length;
+                prefetch_gpu_batch_set_first_error(result->status, &first_result_error);
+            }
+        }
+
+        prefetch_gpu_batch_set_first_error(first_result_error, &status);
+    }
+
+    if (core_entered)
+        uvm_tools_flush_events();
+
+    uvm_va_block_note_prefetch_gpu_batch_fast(params->core_calls,
+                                               params->count <= UVM_PHASE_F_PREFETCH_GPU_BATCH_V2_MAX_RANGES ?
+                                                   params->count : 0,
+                                               params->success_count,
+                                               params->requested_bytes,
+                                               params->completed_bytes,
+                                               params->tracker_waits,
+                                               0,
+                                               status == NV_OK ? 0 : 1);
+
+    uvm_processor_mask_cache_free(gpus_to_check_for_nvlink_errors);
+    uvm_kvfree(range_states);
+
+    return status;
+}
+
 NV_STATUS uvm_migrate_managed_range_to_cpu(uvm_va_space_t *va_space,
                                            NvU64 base,
                                            NvU64 length,
@@ -973,6 +1359,174 @@ static void semaphore_release_from_cpu(uvm_mem_t *semaphore_mem, NvU64 semaphore
     semaphore_cpu_va = (char *) uvm_mem_get_cpu_addr_kernel(semaphore_mem) + semaphore_offset;
 
     WRITE_ONCE(*(NvU32 *)semaphore_cpu_va, semaphore_payload);
+}
+
+static NV_STATUS user_semaphore_validate_locked(
+    uvm_va_space_t *va_space,
+    uvm_gpu_t *gpu,
+    NvU64 user_addr,
+    uvm_va_range_semaphore_pool_t **pool_out,
+    NvU64 *gpu_va_out)
+{
+    uvm_va_range_semaphore_pool_t *pool;
+    NvU64 offset;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    if (!IS_ALIGNED(user_addr, sizeof(NvU32)))
+        return NV_ERR_INVALID_ADDRESS;
+
+    pool = uvm_va_range_semaphore_pool_find(va_space, user_addr);
+    if (!pool || user_addr > pool->va_range.node.end - (sizeof(NvU32) - 1))
+        return NV_ERR_INVALID_ADDRESS;
+
+    if (!uvm_mem_mapped_on_cpu_kernel(pool->mem) ||
+        !uvm_mem_mapped_on_cpu_user(pool->mem) ||
+        !pool->mem->user ||
+        (NvU64)(uintptr_t)pool->mem->user->addr != pool->va_range.node.start) {
+        return NV_ERR_INVALID_STATE;
+    }
+
+    offset = user_addr - pool->va_range.node.start;
+    if (gpu) {
+        if (!uvm_mem_mapped_on_gpu_kernel(pool->mem, gpu))
+            return NV_ERR_INVALID_DEVICE;
+        if (gpu_va_out)
+            *gpu_va_out = uvm_mem_get_gpu_va_kernel(pool->mem, gpu) + offset;
+    }
+
+    if (pool_out)
+        *pool_out = pool;
+    return NV_OK;
+}
+
+static NV_STATUS user_semaphore_validate_pair_locked(
+    uvm_va_space_t *va_space,
+    uvm_gpu_t *gpu,
+    NvU64 compute_addr,
+    NvU64 completion_addr,
+    NvU64 *compute_gpu_va_out)
+{
+    uvm_va_range_semaphore_pool_t *compute_pool = NULL;
+    uvm_va_range_semaphore_pool_t *completion_pool = NULL;
+    NV_STATUS status;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    status = user_semaphore_validate_locked(va_space,
+                                            gpu,
+                                            compute_addr,
+                                            &compute_pool,
+                                            compute_gpu_va_out);
+    if (status != NV_OK)
+        return status;
+
+    status = user_semaphore_validate_locked(va_space,
+                                            gpu,
+                                            completion_addr,
+                                            &completion_pool,
+                                            NULL);
+    if (status != NV_OK)
+        return status;
+
+    // Requiring one allocation makes the lifetime/binding contract auditable
+    // and prevents a caller from swapping only the completion allocation.
+    if (compute_pool != completion_pool)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    return NV_OK;
+}
+
+static NV_STATUS user_semaphore_submit_acquire_locked(
+    uvm_gpu_t *gpu,
+    NvU64 compute_addr,
+    NvU64 compute_gpu_va,
+    NvU32 payload)
+{
+    uvm_push_t push;
+    NV_STATUS status;
+
+    status = uvm_push_begin(gpu->channel_manager,
+                            UVM_CHANNEL_TYPE_MEMOPS,
+                            &push,
+                            "Wait for registered MoE compute fence 0x%llx=%u",
+                            compute_addr,
+                            payload);
+    if (status != NV_OK)
+        return status;
+
+    gpu->parent->host_hal->semaphore_acquire(&push, compute_gpu_va, payload);
+    uvm_push_end(&push);
+
+    // The caller keeps the VA-space read lock held until the acquire is done,
+    // so UVM_FREE cannot tear down the semaphore-pool mapping in flight.
+    return uvm_push_wait(&push);
+}
+
+NV_STATUS uvm_user_semaphore_wait_and_validate(uvm_va_space_t *va_space,
+                                               const NvProcessorUuid *gpu_uuid,
+                                               NvU64 compute_addr,
+                                               NvU64 completion_addr,
+                                               NvU32 payload)
+{
+    uvm_gpu_t *gpu;
+    NvU64 compute_gpu_va = 0;
+    NV_STATUS status;
+
+    if (!va_space || !gpu_uuid || payload == 0 || compute_addr == completion_addr)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    uvm_va_space_down_read(va_space);
+    gpu = uvm_va_space_get_gpu_by_uuid_with_gpu_va_space(va_space, gpu_uuid);
+    if (!gpu) {
+        status = NV_ERR_INVALID_DEVICE;
+        goto unlock;
+    }
+
+    status = user_semaphore_validate_pair_locked(va_space,
+                                                 gpu,
+                                                 compute_addr,
+                                                 completion_addr,
+                                                 &compute_gpu_va);
+    if (status != NV_OK)
+        goto unlock;
+
+    status = user_semaphore_submit_acquire_locked(gpu,
+                                                  compute_addr,
+                                                  compute_gpu_va,
+                                                  payload);
+
+unlock:
+    uvm_va_space_up_read(va_space);
+    return status;
+}
+
+NV_STATUS uvm_user_semaphore_release_from_cpu(uvm_va_space_t *va_space,
+                                              NvU64 completion_addr,
+                                              NvU32 payload)
+{
+    uvm_va_range_semaphore_pool_t *pool = NULL;
+    NV_STATUS status;
+
+    if (!va_space || payload == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    uvm_va_space_down_read(va_space);
+    status = user_semaphore_validate_locked(va_space,
+                                            NULL,
+                                            completion_addr,
+                                            &pool,
+                                            NULL);
+    if (status == NV_OK) {
+        // Order the completion publication after every CPU owner/generation
+        // store performed by the registered-plan commit. This semaphore is
+        // consumed by a GPU, so use the device-visible write barrier rather
+        // than the CPU-only SMP barrier.
+        wmb();
+        semaphore_release_from_cpu(pool->mem, completion_addr, payload);
+    }
+    uvm_va_space_up_read(va_space);
+    return status;
 }
 
 static NV_STATUS semaphore_release(NvU64 semaphore_address,

@@ -226,6 +226,17 @@ struct uvm_va_space_struct
     // Monotonically increasing counter for range groups IDs
     atomic64_t range_group_id_counter;
 
+    // Invalidates immutable MoE slot plans when an operation outside the
+    // registered-plan transaction changes managed VA or GPU mapping state.
+    // Writers increment this while holding the VA-space lock; compact plan
+    // execution samples it under the same lock before touching slot/PTE state.
+    atomic64_t moe_slot_plan_invalidation_epoch;
+    // Aggregate version for CPU chunk/DMA source topology cached by registered
+    // copy plans. Any block-level source mutation bumps both the block epoch
+    // and this VA-space epoch, allowing execute to reject stale physical runs
+    // with one comparison.
+    atomic64_t moe_slot_copy_source_epoch;
+
     // Range groups
     struct radix_tree_root range_groups;
     uvm_range_tree_t range_group_ranges;
@@ -437,6 +448,26 @@ struct uvm_va_space_struct
     // Queue item for deferred f_ops->release() handling
     nv_kthread_q_item_t deferred_release_q_item;
 };
+
+static inline NvU64 uvm_va_space_moe_slot_plan_invalidation_epoch(uvm_va_space_t *va_space)
+{
+    return (NvU64)atomic64_read(&va_space->moe_slot_plan_invalidation_epoch);
+}
+
+static inline void uvm_va_space_moe_slot_plan_invalidate(uvm_va_space_t *va_space)
+{
+    atomic64_inc(&va_space->moe_slot_plan_invalidation_epoch);
+}
+
+static inline NvU64 uvm_va_space_moe_slot_copy_source_epoch(uvm_va_space_t *va_space)
+{
+    return (NvU64)atomic64_read(&va_space->moe_slot_copy_source_epoch);
+}
+
+static inline void uvm_va_space_moe_slot_copy_source_invalidate(uvm_va_space_t *va_space)
+{
+    atomic64_inc(&va_space->moe_slot_copy_source_epoch);
+}
 
 NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va_space_ptr, NvU64 flags);
 void uvm_va_space_destroy(uvm_va_space_t *va_space);

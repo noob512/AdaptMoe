@@ -4,8 +4,9 @@ CUDA_INCLUDE = $(CUDA_HOME)/include
 CUDA_LIB = $(CUDA_HOME)/lib64
 
 NVCCFLAGS = -Xcompiler -fPIC -O2 -std=c++17
+CUDA_ARCH ?= native
 
-all: uvm uvm_to_uvm_reuse_probe
+all: uvm uvm_to_uvm_reuse_probe libuvm_slot_cuda_fence_kernels.so
 
 uvm: uvm_allocator.so
 
@@ -17,7 +18,12 @@ uvm_to_uvm_reuse_probe: uvm_to_uvm_reuse_probe.cu uvm_allocator.so
 		-Xlinker -rpath,'$$ORIGIN' -o $@ $< \
 		-l:uvm_allocator.so -L$(CUDA_LIB) -lcudart -ldl
 
+libuvm_slot_cuda_fence_kernels.so: uvm_slot_cuda_fence_kernels.cu
+	$(NVCC) -O2 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler -fPIC \
+		-shared -o $@ $< -L$(CUDA_LIB) -lcudart
+
 clean:
-	rm -f uvm_allocator.so uvm_to_uvm_reuse_probe
+	rm -f uvm_allocator.so uvm_to_uvm_reuse_probe \
+		libuvm_slot_cuda_fence_kernels.so
 
 .PHONY: all uvm clean

@@ -220,6 +220,8 @@ NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va
     // Init to 0 since we rely on atomic_inc_return behavior to return 1 as the
     // first ID.
     atomic64_set(&va_space->range_group_id_counter, 0);
+    atomic64_set(&va_space->moe_slot_plan_invalidation_epoch, 0);
+    atomic64_set(&va_space->moe_slot_copy_source_epoch, 0);
 
     INIT_RADIX_TREE(&va_space->range_groups, NV_UVM_GFP_FLAGS);
     uvm_range_tree_init(&va_space->range_group_ranges);
@@ -1045,6 +1047,11 @@ NV_STATUS uvm_va_space_unregister_gpu(uvm_va_space_t *va_space, const NvProcesso
     if (uvm_processor_mask_test(&va_space->registered_gpu_va_spaces, gpu->id))
         UVM_ASSERT(uvm_gpu_va_space_get(va_space, gpu) == gpu_va_space);
 
+    // Serialize compact-plan invalidation with its locked execution-time
+    // epoch check. No slot/PTE state has been changed in this write section
+    // yet, so an executing plan either completes first or observes this bump.
+    uvm_va_space_moe_slot_plan_invalidate(va_space);
+
     peers_to_release = va_space->peers_to_release[uvm_id_value(gpu->id)];
 
     va_space->peers_to_release[uvm_id_value(gpu->id)] = NULL;
@@ -1823,6 +1830,7 @@ NV_STATUS uvm_va_space_unregister_gpu_va_space(uvm_va_space_t *va_space, const N
         UVM_ASSERT(gpu == uvm_va_space_get_gpu_by_uuid_with_gpu_va_space(va_space, gpu_uuid));
         UVM_ASSERT(gpu_va_space == uvm_gpu_va_space_get(va_space, gpu));
 
+        uvm_va_space_moe_slot_plan_invalidate(va_space);
         remove_gpu_va_space(gpu_va_space, mm, &deferred_free_list);
     }
 

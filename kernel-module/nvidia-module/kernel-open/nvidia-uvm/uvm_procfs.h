@@ -50,7 +50,27 @@ bool uvm_procfs_is_debug_enabled(void);
 struct proc_dir_entry *uvm_procfs_get_gpu_base_dir(void);
 struct proc_dir_entry *uvm_procfs_get_cpu_base_dir(void);
 
-void uvm_phase_f_route_log(const char *fmt, ...);
+// High-frequency route tracing is disabled by default in production. Keep the
+// gate in this header so a disabled call does not evaluate its format
+// arguments. The emit function repeats the check to close a concurrent module
+// parameter disable race before taking a timestamp, formatting, or locking.
+extern unsigned int uvm_phase_f_route_log_enable;
+
+static inline bool uvm_phase_f_route_log_is_enabled(void)
+{
+    return READ_ONCE(uvm_phase_f_route_log_enable) != 0;
+}
+
+void uvm_phase_f_route_log_emit(const char *fmt, ...)
+    __attribute__ ((format(printf, 1, 2)));
+void uvm_phase_f_route_log_always(const char *fmt, ...)
+    __attribute__ ((format(printf, 1, 2)));
+
+#define uvm_phase_f_route_log(fmt, ...)                                \
+    do {                                                               \
+        if (unlikely(uvm_phase_f_route_log_is_enabled()))              \
+            uvm_phase_f_route_log_emit(fmt, ##__VA_ARGS__);            \
+    } while (0)
 
 int uvm_procfs_open_callback(void);
 void uvm_procfs_close_callback(void);

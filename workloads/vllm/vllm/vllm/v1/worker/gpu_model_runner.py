@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+import hashlib
 import itertools
 import json
 import os
@@ -49,8 +50,16 @@ from vllm.device_allocator.uvm import (
     uvm_enabled_allocation_phase,
 )
 from vllm.device_allocator.uvm_pool_residency import (
+    close_uvm_slot_direct_policy_session,
     commit_uvm_regions_gpu_placement,
+    freeze_uvm_slot_direct_session_contract,
+    preallocate_uvm_expert_groups_to_slots,
+    preallocate_uvm_registered_plan_second_bank,
     prepare_uvm_regions_for_gpu_placement,
+    query_uvm_regions_physical_residency,
+    register_uvm_slot_direct_layer_plans,
+    snapshot_uvm_region_registry,
+    transition_uvm_regions_to_remote_read,
 )
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -2699,6 +2708,246 @@ class GPUModelRunner(
             return "enabled:prefill_step"
         return "enabled:decode_step"
 
+    def _uvm_prefill_p3_decode_remote_enabled(self) -> bool:
+        return self._env_flag_enabled(
+            "VLLM_UVM_PREFILL_P3_DECODE_REMOTE_READ", default=False
+        )
+
+    def _poison_uvm_prefill_p3_decode_remote(self, reason: str) -> None:
+        self._uvm_prefill_p3_decode_remote_state = "poisoned"
+        self._uvm_prefill_p3_decode_remote_poison_reason = str(reason)
+        model = self.get_model()
+        for module in model.modules():
+            if getattr(module, "uvm_expert_offload_access_mode", None) in (
+                "slot_restore",
+                "remote_read",
+            ):
+                # No subsequent fused-MoE forward may use either a stale slot
+                # mapping or a partially established remote mapping.
+                module.uvm_expert_offload_access_mode = "poisoned"
+
+    def _switch_uvm_prefill_p3_to_decode_remote_read(self) -> dict[str, Any]:
+        """Close P3 and establish remote READ PTEs before the first decode.
+
+        The feature is deliberately scoped to one eager, single-GPU request.
+        The device synchronization is the proof that the last prefill kernel
+        stopped touching slot backing; close and remote-map then run before
+        any decode kernel can be submitted.
+        """
+        started_ns = time.perf_counter_ns()
+        if getattr(self, "_uvm_prefill_p3_decode_remote_state", None) == "poisoned":
+            raise RuntimeError(
+                "P3-to-remote transition is poisoned: "
+                + str(
+                    getattr(
+                        self,
+                        "_uvm_prefill_p3_decode_remote_poison_reason",
+                        "unknown",
+                    )
+                )
+            )
+
+        modules: list[Any] = []
+        all_region_ids: list[str] = []
+        module_experts: list[tuple[Any, set[int]]] = []
+        for module in self.get_model().modules():
+            if getattr(module, "uvm_expert_offload_access_mode", None) != "slot_restore":
+                continue
+            expert_ids = set(
+                int(value)
+                for value in getattr(module, "_uvm_offloaded_global_expert_ids", set())
+            )
+            if not expert_ids:
+                continue
+            layer_id_fn = getattr(module, "_uvm_layer_id", None)
+            layer_id = layer_id_fn() if callable(layer_id_fn) else None
+            records = getattr(module, "_uvm_expert_records", None)
+            if layer_id is None or not isinstance(records, dict):
+                self._poison_uvm_prefill_p3_decode_remote(
+                    "cold expert metadata is incomplete"
+                )
+                raise RuntimeError("P3-to-remote cold expert metadata is incomplete")
+            region_ids: list[str] = []
+            for expert_id in sorted(expert_ids):
+                record = records.get((int(layer_id), int(expert_id)))
+                lanes = getattr(record, "envelope_region_ids", None)
+                if not lanes:
+                    self._poison_uvm_prefill_p3_decode_remote(
+                        f"missing region lanes for layer={layer_id}, expert={expert_id}"
+                    )
+                    raise RuntimeError("P3-to-remote region lanes are incomplete")
+                region_ids.extend(str(value) for value in lanes)
+            modules.append(module)
+            module_experts.append((module, expert_ids))
+            all_region_ids.extend(region_ids)
+
+        all_region_ids = list(dict.fromkeys(all_region_ids))
+        if not modules or not all_region_ids:
+            self._poison_uvm_prefill_p3_decode_remote("no active P3 cold regions")
+            raise RuntimeError("P3-to-remote transition has no cold regions")
+
+        device = int(torch.cuda.current_device())
+        try:
+            torch.cuda.synchronize(device)
+            synchronized_ns = time.perf_counter_ns()
+            close_result = close_uvm_slot_direct_policy_session(device=device)
+            closed_ns = time.perf_counter_ns()
+            if not bool(close_result.get("ok")):
+                raise RuntimeError(f"P3 session close failed: {close_result!r}")
+            driver_close = close_result.get("result")
+            abort_audit = (
+                driver_close.get("abort")
+                if isinstance(driver_close, dict)
+                else None
+            )
+            close_contract_ok = (
+                isinstance(abort_audit, dict)
+                and abort_audit.get("ok") is True
+                and abort_audit.get("contract_ok") is True
+                and abort_audit.get("session_cleared") is True
+                and int(abort_audit.get("remaining_slot_count", -1)) == 0
+                and int(abort_audit.get("remaining_bytes", -1)) == 0
+            )
+            if not close_contract_ok:
+                raise RuntimeError(
+                    "P3 close did not prove every slot unmapped: "
+                    f"{close_result!r}"
+                )
+            remote_result = transition_uvm_regions_to_remote_read(
+                all_region_ids,
+                device=device,
+            )
+            remote_ns = time.perf_counter_ns()
+            if not bool(remote_result.get("ok")):
+                raise RuntimeError(
+                    f"remote-read mapping failed: {remote_result!r}"
+                )
+
+            # All fallible driver work and all metadata validation completed.
+            # No model forward runs concurrently with these plain Python state
+            # updates, so this is the logical commit point for every layer.
+            for module, expert_ids in module_experts:
+                module._uvm_remote_read_global_expert_ids = set(expert_ids)
+                module._uvm_offloaded_global_expert_ids.clear()
+                module.uvm_expert_offload_access_mode = "remote_read"
+            self._uvm_slot_init_bank_done = False
+            self._uvm_slot_init_bank_result = None
+            self._uvm_slot_registered_plan_result = None
+            self._uvm_slot_session_contract = None
+            self._uvm_prefill_p3_decode_remote_state = "decode_remote_read"
+            remote_batch_result = (
+                remote_result.get("batch_result")
+                if isinstance(remote_result.get("batch_result"), dict)
+                else {}
+            )
+            remote_mapping_ioctl_calls = int(
+                remote_batch_result.get("mapping_ioctl_calls", 0)
+            )
+            remote_total_ioctl_calls = int(
+                remote_batch_result.get("ioctl_calls", 0)
+            )
+            result = {
+                "schema": "vllm_prefill_p3_decode_remote_transition_v1",
+                "ok": True,
+                "reason": "ok",
+                "module_count": len(modules),
+                "expert_count": sum(len(values) for _, values in module_experts),
+                "region_count": len(all_region_ids),
+                "sync_ns": synchronized_ns - started_ns,
+                "close_ns": closed_ns - synchronized_ns,
+                "remote_map_ns": remote_ns - closed_ns,
+                "wall_ns": remote_ns - started_ns,
+                "close_contract_verified": close_contract_ok,
+                "remote_batch": bool(remote_result.get("batch", False)),
+                "remote_batch_ioctl_calls": remote_mapping_ioctl_calls,
+                "remote_batch_total_ioctl_calls": remote_total_ioctl_calls,
+                "remote_batch_fd_probe_ioctl_calls": (
+                    remote_total_ioctl_calls - remote_mapping_ioctl_calls
+                ),
+                "remote_batch_fd_candidate_attempts": int(
+                    remote_batch_result.get("fd_candidate_attempts", 0)
+                ),
+                "remote_mapped_bytes": int(
+                    remote_batch_result.get("remote_mapped_bytes", 0)
+                ),
+            }
+            result_path = os.environ.get(
+                "VLLM_UVM_PREFILL_P3_DECODE_REMOTE_RESULT_FILE", ""
+            ).strip()
+            if result_path:
+                absolute = os.path.abspath(result_path)
+                os.makedirs(os.path.dirname(absolute), exist_ok=True)
+                temporary = f"{absolute}.tmp.{os.getpid()}"
+                try:
+                    with open(temporary, "w", encoding="utf-8") as handle:
+                        json.dump(result, handle, indent=2, sort_keys=True)
+                        handle.write("\n")
+                    os.replace(temporary, absolute)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            self._uvm_prefill_p3_decode_remote_result = result
+            logger.info("P3 prefill to remote-read decode transition: %s", result)
+            return result
+        except Exception as exc:
+            self._poison_uvm_prefill_p3_decode_remote(repr(exc))
+            raise RuntimeError(
+                "P3 prefill to remote-read decode transition failed; "
+                "the worker is poisoned and must be torn down"
+            ) from exc
+
+    def _maybe_switch_uvm_prefill_p3_to_decode_remote_read(
+        self,
+        scheduler_output: "SchedulerOutput",
+        step_phase: str,
+    ) -> None:
+        if not self._uvm_prefill_p3_decode_remote_enabled():
+            return
+        state = getattr(
+            self, "_uvm_prefill_p3_decode_remote_state", "prefill_p3"
+        )
+        if state == "poisoned":
+            raise RuntimeError(
+                "P3-to-remote worker is poisoned: "
+                + str(
+                    getattr(
+                        self,
+                        "_uvm_prefill_p3_decode_remote_poison_reason",
+                        "unknown",
+                    )
+                )
+            )
+        if step_phase == "enabled:mixed_step":
+            self._poison_uvm_prefill_p3_decode_remote(
+                "mixed prefill/decode batches are unsupported"
+            )
+            raise RuntimeError(
+                "P3 prefill/remote-read decode requires an unmixed single request"
+            )
+        if step_phase == "enabled:prefill_step":
+            if state != "prefill_p3":
+                self._poison_uvm_prefill_p3_decode_remote(
+                    "a prefill step arrived after decode cutover"
+                )
+                raise RuntimeError("P3 prefill arrived after remote-read cutover")
+            self._uvm_prefill_p3_seen = True
+            return
+        if step_phase != "enabled:decode_step":
+            return
+        if state == "decode_remote_read":
+            return
+        if not getattr(self, "_uvm_prefill_p3_seen", False):
+            self._poison_uvm_prefill_p3_decode_remote(
+                "decode arrived before a P3 prefill step"
+            )
+            raise RuntimeError("P3-to-remote decode arrived before prefill")
+        if len(scheduler_output.num_scheduled_tokens) != 1:
+            self._poison_uvm_prefill_p3_decode_remote(
+                "decode cutover requires exactly one request"
+            )
+            raise RuntimeError("P3-to-remote decode cutover requires one request")
+        self._switch_uvm_prefill_p3_to_decode_remote_read()
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3034,6 +3283,10 @@ class GPUModelRunner(
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         enabled_step_phase = self._uvm_enabled_step_phase(scheduler_output)
+        self._maybe_switch_uvm_prefill_p3_to_decode_remote_read(
+            scheduler_output,
+            enabled_step_phase,
+        )
         with (
             uvm_allocation_phase(enabled_step_phase),
             set_forward_context(
@@ -4898,6 +5151,254 @@ class GPUModelRunner(
             self.encoder_cache.clear()
             gc.collect()
 
+    def _write_uvm_init_weight_placement_manifest(
+        self,
+        expert_modules: list[Any],
+    ) -> None:
+        """Persist an auditable post-warmup expert placement snapshot."""
+        output_path = os.environ.get(
+            "VLLM_UVM_INIT_WEIGHT_PLACEMENT_MANIFEST", ""
+        ).strip()
+        if not output_path:
+            return
+
+        snapshots: list[dict[str, Any]] = []
+        for module in expert_modules:
+            snapshot_fn = getattr(
+                module, "get_uvm_init_weight_placement_snapshot", None
+            )
+            if callable(snapshot_fn):
+                value = snapshot_fn()
+                if not isinstance(value, dict):
+                    raise RuntimeError("Expert placement snapshot is not an object")
+                snapshots.append(value)
+
+        plan_files = {
+            str(value.get("plan_file", ""))
+            for value in snapshots
+            if str(value.get("plan_file", ""))
+        }
+        failures: list[str] = []
+        if not snapshots:
+            failures.append("no_expert_snapshots")
+        layer_ids = [value.get("layer_id") for value in snapshots]
+        if len(layer_ids) != len(set(layer_ids)) or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in layer_ids
+        ):
+            failures.append("layer_ids_missing_or_duplicate")
+        if len(plan_files) != 1:
+            failures.append("plan_file_not_unique")
+
+        experts: list[dict[str, Any]] = []
+        owners: list[dict[str, Any]] = []
+        audits: list[dict[str, Any]] = []
+        for snapshot in snapshots:
+            experts.extend(
+                value
+                for value in snapshot.get("experts", [])
+                if isinstance(value, dict)
+            )
+            owners.extend(
+                value
+                for value in snapshot.get("region_owners", [])
+                if isinstance(value, dict)
+            )
+            audits.extend(
+                value
+                for value in snapshot.get("release_audits", [])
+                if isinstance(value, dict)
+            )
+
+        expert_keys = [
+            (int(value["layer_id"]), int(value["expert_id"])) for value in experts
+        ]
+        if len(expert_keys) != len(set(expert_keys)):
+            failures.append("duplicate_expert_coordinates")
+        region_ids = [str(value.get("region_id", "")) for value in owners]
+        if not region_ids or any(not value for value in region_ids):
+            failures.append("region_owners_empty_or_invalid")
+        if len(region_ids) != len(set(region_ids)):
+            failures.append("duplicate_region_ownership")
+
+        registry = snapshot_uvm_region_registry(region_ids)
+        registry_records = registry.get("regions", [])
+        registry_by_id = {
+            str(value["region_id"]): value
+            for value in registry_records
+            if isinstance(value, dict) and value.get("region_id")
+        }
+        if registry.get("ok") is not True or set(registry_by_id) != set(region_ids):
+            failures.append("application_registry_snapshot_incomplete")
+
+        remote_experts = sorted(
+            (int(value["layer_id"]), int(value["expert_id"]))
+            for value in experts
+            if value.get("placement") == "remote"
+        )
+        offloaded_experts = sorted(
+            (int(value["layer_id"]), int(value["expert_id"]))
+            for value in experts
+            if value.get("placement") == "offloaded"
+        )
+        hot_experts = sorted(
+            (int(value["layer_id"]), int(value["expert_id"]))
+            for value in experts
+            if value.get("placement") == "hot"
+        )
+        owner_by_region = {str(value["region_id"]): value for value in owners}
+        remote_region_ids = sorted(
+            region_id
+            for region_id, owner in owner_by_region.items()
+            if owner.get("placement") == "remote"
+        )
+        hot_region_ids = sorted(
+            region_id
+            for region_id, owner in owner_by_region.items()
+            if owner.get("placement") == "hot"
+        )
+        remote_region_bytes = sum(
+            int(registry_by_id[region_id]["length"])
+            for region_id in remote_region_ids
+            if region_id in registry_by_id
+        )
+        hot_region_bytes = sum(
+            int(registry_by_id[region_id]["length"])
+            for region_id in hot_region_ids
+            if region_id in registry_by_id
+        )
+
+        audit_by_region = {
+            str(value.get("region_id", "")): value
+            for value in audits
+            if value.get("region_id")
+        }
+        if set(audit_by_region) != set(remote_region_ids) | {
+            region_id
+            for region_id, owner in owner_by_region.items()
+            if owner.get("placement") == "offloaded"
+        }:
+            failures.append("release_audit_region_set_mismatch")
+        for region_id in remote_region_ids:
+            audit = audit_by_region.get(region_id, {})
+            registered = registry_by_id.get(region_id, {})
+            length = int(registered.get("length", 0))
+            if not (
+                audit.get("ok") is True
+                and audit.get("remote_read") is True
+                and int(audit.get("registered_length", 0)) == length
+                and int(audit.get("length", 0)) == length
+                and int(audit.get("cpu_resident_bytes", 0)) >= length
+                and int(audit.get("remote_mapped_bytes", 0)) >= length
+                and int(audit.get("remote_map_failure_blocks", -1)) == 0
+                and audit.get("app_state_after") == "cpu"
+            ):
+                failures.append(f"remote_release_audit_failed:{region_id}")
+                break
+        if any(
+            registry_by_id.get(region_id, {}).get("state") != "cpu"
+            for region_id in remote_region_ids
+        ):
+            failures.append("remote_registry_state_not_cpu")
+        if any(
+            registry_by_id.get(region_id, {}).get("state") != "gpu"
+            for region_id in hot_region_ids
+        ):
+            failures.append("hot_registry_state_not_gpu")
+
+        torch.cuda.synchronize()
+        physical = query_uvm_regions_physical_residency(
+            remote_region_ids,
+            device=int(torch.cuda.current_device()),
+            wait_for_trackers=False,
+        )
+        if not remote_region_ids:
+            physical_ok = physical.get("ok") is True
+        else:
+            physical_ok = (
+                physical.get("ok") is True
+                and int(physical.get("queried_bytes", -1)) == remote_region_bytes
+                and int(physical.get("cpu_bytes", -1)) == remote_region_bytes
+                and int(physical.get("gpu_bytes", -1)) == 0
+                and int(physical.get("unknown_bytes", -1)) == 0
+            )
+        if not physical_ok:
+            failures.append("remote_physical_residency_query_failed")
+
+        plan_path = next(iter(plan_files), "")
+        plan_sha256: str | None = None
+        expected_cold: list[tuple[int, int]] = []
+        expected_hot: list[tuple[int, int]] = []
+        if plan_path:
+            try:
+                with open(plan_path, "rb") as handle:
+                    plan_bytes = handle.read()
+                plan_sha256 = hashlib.sha256(plan_bytes).hexdigest()
+                plan = json.loads(plan_bytes)
+                expected_cold = sorted(
+                    (int(value["layer_id"]), int(value["expert_id"]))
+                    for value in plan.get("offload_plan", [])
+                )
+                expected_hot = sorted(
+                    (int(value["layer_id"]), int(value["expert_id"]))
+                    for value in plan.get("hot_plan", plan.get("prefetch_plan", []))
+                )
+            except Exception as exc:
+                failures.append(f"plan_read_failed:{type(exc).__name__}")
+        if remote_experts != expected_cold:
+            failures.append("runtime_remote_coordinates_do_not_match_plan")
+        if hot_experts != expected_hot:
+            failures.append("runtime_hot_coordinates_do_not_match_plan")
+        if offloaded_experts:
+            failures.append("unexpected_restore_offloaded_experts")
+
+        manifest = {
+            "schema_version": 1,
+            "status": "ok" if not failures else "error",
+            "complete": not failures,
+            "failures": failures,
+            "created_at_epoch": time.time(),
+            "plan_file": plan_path,
+            "plan_sha256": plan_sha256,
+            "layer_count": len(snapshots),
+            "expert_count": len(experts),
+            "remote_expert_count": len(remote_experts),
+            "hot_expert_count": len(hot_experts),
+            "offloaded_expert_count": len(offloaded_experts),
+            "remote_experts": [list(value) for value in remote_experts],
+            "hot_experts": [list(value) for value in hot_experts],
+            "remote_region_count": len(remote_region_ids),
+            "hot_region_count": len(hot_region_ids),
+            "remote_region_bytes": remote_region_bytes,
+            "hot_region_bytes": hot_region_bytes,
+            "release_time_remote_mapping_verified": not any(
+                value.startswith("remote_release_audit_failed")
+                or value == "release_audit_region_set_mismatch"
+                for value in failures
+            ),
+            "snapshot_time_remote_physical_residency": physical,
+            "snapshot_time_remote_mapping_query_available": False,
+            "registry": registry,
+            "release_audits": audits,
+            "module_snapshots": snapshots,
+        }
+        parent = os.path.dirname(os.path.abspath(output_path))
+        os.makedirs(parent, exist_ok=True)
+        temporary = f"{output_path}.tmp.{os.getpid()}"
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(temporary, output_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        if failures:
+            raise RuntimeError(
+                "UVM placement manifest failed integrity checks: "
+                + ", ".join(failures[:8])
+            )
+
     def run_uvm_init_time_weight_placement(self) -> None:
         """Finalize cold and Hot Expert placement after model warmup."""
         self._run_uvm_matched_cpu_offload_manifest()
@@ -4923,6 +5424,23 @@ class GPUModelRunner(
                         continue
                     init_offload()
                     expert_modules.append(module)
+
+                bank_candidates: list[
+                    tuple[int, list[tuple[int, list[str]]]]
+                ] = []
+                for module in expert_modules:
+                    collect_groups = getattr(
+                        module,
+                        "get_uvm_slot_init_expert_groups",
+                        None,
+                    )
+                    if not callable(collect_groups):
+                        continue
+                    candidate = collect_groups()
+                    if candidate is not None:
+                        bank_candidates.append(candidate)
+                bank_candidates.sort(key=lambda item: item[0])
+                self._uvm_slot_init_bank_candidates = bank_candidates
 
                 for module in expert_modules:
                     region_ids = module.get_uvm_init_hot_expert_region_ids()
@@ -4952,6 +5470,9 @@ class GPUModelRunner(
                     module.set_uvm_init_hot_expert_state("gpu")
 
             self._uvm_init_weight_placement_done = True
+            GPUModelRunner._write_uvm_init_weight_placement_manifest(
+                self, expert_modules
+            )
         except Exception:
             if hot_region_ids:
                 commit_uvm_regions_gpu_placement(
@@ -4961,6 +5482,410 @@ class GPUModelRunner(
             for module in hot_modules:
                 module.set_uvm_init_hot_expert_state("unknown")
             self._uvm_init_weight_placement_done = False
+            raise
+
+    @staticmethod
+    def _validate_uvm_slot_64k_layout(
+        ranges: Sequence[tuple[int, int]],
+        *,
+        layer_id: int,
+    ) -> None:
+        """Validate sparse 64 KiB plan geometry before mode 8 runs.
+
+        Missing portions of a 2 MiB block are legal and remain ordinary hot
+        leaves. The registered plan still explicitly selects the 64 KiB path;
+        this validation never converts sparse geometry to a 4 KiB plan.
+        """
+        page_bytes = 64 * 1024
+        va_block_bytes = 2 * 1024 * 1024
+        max_entry_bytes = 4 * 1024 * 1024
+        uint64_max = (1 << 64) - 1
+        block_slices: dict[int, list[tuple[int, int]]] = {}
+
+        for index, (base, length) in enumerate(ranges):
+            if base <= 0 or length <= 0:
+                raise RuntimeError(
+                    f"Registered UVM slot layer {layer_id} range {index} has "
+                    "a non-positive base or length"
+                )
+            if length > max_entry_bytes:
+                raise RuntimeError(
+                    f"Registered UVM slot layer {layer_id} range {index} "
+                    "exceeds the 4 MiB slot-direct limit"
+                )
+            if base > uint64_max - length:
+                raise RuntimeError(
+                    f"Registered UVM slot layer {layer_id} range {index} "
+                    "virtual-address end overflows uint64"
+                )
+            if base % page_bytes or length % page_bytes:
+                raise RuntimeError(
+                    f"Registered UVM slot layer {layer_id} range {index} is "
+                    "not 64 KiB aligned"
+                )
+
+            cursor = base
+            end = base + length
+            while cursor < end:
+                block_base = cursor - cursor % va_block_bytes
+                slice_end = min(end, block_base + va_block_bytes)
+                block_slices.setdefault(block_base, []).append(
+                    (cursor, slice_end)
+                )
+                cursor = slice_end
+
+        for block_base, slices in block_slices.items():
+            previous_end: int | None = None
+            for start, end in sorted(slices):
+                if previous_end is not None and start < previous_end:
+                    raise RuntimeError(
+                        "Registered UVM slot 64 KiB ranges overlap; "
+                        f"layer {layer_id} block 0x{block_base:x} contains "
+                        "overlapping slices"
+                    )
+                previous_end = end
+
+    @staticmethod
+    def _validate_uvm_slot_init_plan_candidates(
+        candidates: list[tuple[int, list[tuple[int, list[str]]]]],
+        *,
+        registered_plan: bool,
+    ) -> None:
+        """Reject an invalid immutable plan set before the first mode-8 call."""
+        if not candidates:
+            raise RuntimeError("Slot init-bank has no layer candidates")
+
+        layer_ids = [layer_id for layer_id, _groups in candidates]
+        if any(
+            isinstance(layer_id, bool)
+            or not isinstance(layer_id, int)
+            or layer_id < 0
+            or layer_id > (1 << 32) - 1
+            for layer_id in layer_ids
+        ):
+            raise RuntimeError("Slot init-bank layer_id is outside uint32")
+        if len(layer_ids) != len(set(layer_ids)):
+            raise RuntimeError("Slot init-bank layer_id values must be unique")
+
+        if registered_plan:
+            transition_count = len(candidates)
+            total_plan_count = 1 + transition_count
+            if transition_count > 63 or total_plan_count > 64:
+                raise RuntimeError(
+                    "Registered UVM slot plans exceed the kernel limit: "
+                    f"transition={transition_count}, total={total_plan_count}, "
+                    "maximum transition=63, total=64"
+                )
+            initial_plan_id = (min(layer_ids) << 2) | 1
+            plan_ids = [initial_plan_id] + [
+                (layer_id << 2) | 2 for layer_id in layer_ids
+            ]
+            if len(plan_ids) != len(set(plan_ids)):
+                raise RuntimeError("Registered UVM slot plan_id values must be unique")
+
+        reference_expert_shapes: tuple[tuple[int, ...], ...] | None = None
+        reference_lane_lengths: tuple[int, ...] | None = None
+        reference_lane_count: int | None = None
+        for layer_id, groups in candidates:
+            if not groups:
+                raise RuntimeError(f"Slot layer {layer_id} has no expert groups")
+            expert_ids = [expert_id for expert_id, _regions in groups]
+            if any(
+                isinstance(expert_id, bool)
+                or not isinstance(expert_id, int)
+                or expert_id < 0
+                or expert_id > (1 << 32) - 1
+                for expert_id in expert_ids
+            ):
+                raise RuntimeError(f"Slot layer {layer_id} has an invalid expert_id")
+            if len(expert_ids) != len(set(expert_ids)):
+                raise RuntimeError(f"Slot layer {layer_id} repeats an expert_id")
+            if any(not regions for _expert_id, regions in groups):
+                raise RuntimeError(f"Slot layer {layer_id} has an empty expert lane set")
+
+            region_ids = [
+                str(region_id)
+                for _expert_id, regions in groups
+                for region_id in regions
+            ]
+            if not region_ids or any(not value for value in region_ids):
+                raise RuntimeError(f"Slot layer {layer_id} has an empty lane")
+            if len(region_ids) != len(set(region_ids)):
+                raise RuntimeError(f"Slot layer {layer_id} repeats a lane")
+            if registered_plan and len(region_ids) > 1152:
+                raise RuntimeError(
+                    f"Slot layer {layer_id} exceeds the 1152-entry plan ABI"
+                )
+            snapshot = snapshot_uvm_region_registry(region_ids)
+            if snapshot.get("ok") is not True:
+                raise RuntimeError(
+                    f"Slot layer {layer_id} registry geometry is incomplete"
+                )
+            geometry: dict[str, tuple[int, int]] = {}
+            for record in snapshot.get("regions", []):
+                if not isinstance(record, dict):
+                    continue
+                region_id = str(record.get("region_id", ""))
+                base = record.get("base")
+                length = record.get("length")
+                if (
+                    not region_id
+                    or not isinstance(base, int)
+                    or isinstance(base, bool)
+                    or not isinstance(length, int)
+                    or isinstance(length, bool)
+                    or region_id in geometry
+                ):
+                    raise RuntimeError(
+                        f"Slot layer {layer_id} registry geometry is invalid"
+                    )
+                geometry[region_id] = (base, length)
+            if set(geometry) != set(region_ids):
+                raise RuntimeError(
+                    f"Slot layer {layer_id} registry geometry is incomplete"
+                )
+            if registered_plan:
+                GPUModelRunner._validate_uvm_slot_64k_layout(
+                    list(geometry.values()),
+                    layer_id=layer_id,
+                )
+            lengths = {
+                region_id: length
+                for region_id, (_base, length) in geometry.items()
+            }
+            shapes = {
+                int(expert_id): tuple(
+                    sorted(lengths[str(region_id)] for region_id in regions)
+                )
+                for expert_id, regions in groups
+            }
+            expert_shapes = tuple(sorted(shapes.values()))
+            lane_lengths = tuple(sorted(lengths.values()))
+            if reference_expert_shapes is None:
+                reference_expert_shapes = expert_shapes
+                reference_lane_lengths = lane_lengths
+                reference_lane_count = len(region_ids)
+            elif (
+                expert_shapes != reference_expert_shapes
+                or lane_lengths != reference_lane_lengths
+                or len(region_ids) != reference_lane_count
+            ):
+                raise RuntimeError(
+                    "Registered UVM slot layers must have identical lane-size "
+                    f"geometry; mismatch at layer {layer_id}"
+                )
+
+    def finalize_uvm_slot_bank_after_warmup(self) -> None:
+        """Reserve the fixed bank only after all model warmup has finished.
+
+        Weight placement may run at ``pre_kv`` for other policies. Reserving
+        576 MiB there would perturb KV allocation, compilation, autotuning, or
+        CUDA graph capture. GPUWorker calls this finalizer immediately before
+        the compile/warmup RPC returns, which is still before serving starts.
+        """
+        init_bank = self._env_flag_enabled(
+            "VLLM_UVM_SLOT_DIRECT_INIT_BANK", default=False
+        )
+        registered_plan = self._env_flag_enabled(
+            "VLLM_UVM_SLOT_DIRECT_REGISTERED_PLAN", default=False
+        )
+        dual_bank_event = self._env_flag_enabled(
+            "VLLM_UVM_SLOT_DIRECT_DUAL_BANK_EVENT", default=False
+        )
+        cuda_fence = self._env_flag_enabled(
+            "VLLM_UVM_SLOT_DIRECT_CUDA_FENCE", default=False
+        )
+        access_mode = os.environ.get(
+            "VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE", "restore"
+        ).strip().lower()
+        prefill_p3_decode_remote = self._uvm_prefill_p3_decode_remote_enabled()
+        if prefill_p3_decode_remote:
+            missing: list[str] = []
+            if access_mode != "slot_restore":
+                missing.append("VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE=slot_restore")
+            for name, enabled in (
+                ("VLLM_UVM_SLOT_DIRECT_REGISTERED_PLAN", registered_plan),
+                ("VLLM_UVM_SLOT_DIRECT_DUAL_BANK_EVENT", dual_bank_event),
+                ("VLLM_UVM_SLOT_DIRECT_CUDA_FENCE", cuda_fence),
+            ):
+                if not enabled:
+                    missing.append(name)
+            if missing:
+                raise RuntimeError(
+                    "P3-prefill/remote-read-decode requires the complete P3 "
+                    "fence configuration; missing: " + ", ".join(missing)
+                )
+            unsupported: list[str] = []
+            if bool(getattr(self.scheduler_config, "enable_chunked_prefill", False)):
+                unsupported.append("chunked prefill")
+            if int(getattr(self.scheduler_config, "max_num_seqs", 1)) != 1:
+                unsupported.append("max_num_seqs != 1")
+            if bool(getattr(self, "use_async_scheduling", False)):
+                unsupported.append("async scheduling")
+            if self.speculative_config is not None:
+                unsupported.append("speculative decoding")
+            if unsupported:
+                raise RuntimeError(
+                    "P3-prefill/remote-read-decode currently requires one "
+                    "synchronous, unchunked request; unsupported: "
+                    + ", ".join(unsupported)
+                )
+        if init_bank and access_mode != "slot_restore":
+            raise RuntimeError(
+                "UVM slot init-bank requires "
+                "VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE=slot_restore so the "
+                "frozen shutdown contract owns its cleanup"
+            )
+        if registered_plan:
+            required_flags = (
+                "VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE",
+                "VLLM_UVM_SLOT_FORMAL_RESTORE_ALL_COLD",
+                "VLLM_UVM_SLOT_DIRECT_INIT_BANK",
+                "VLLM_UVM_SLOT_DIRECT_REUSE_BANK",
+                "VLLM_UVM_SLOT_DIRECT_PRECOMPUTED_LANES",
+                "VLLM_UVM_SLOT_DIRECT_LAYER_TRANSITION",
+                "VLLM_UVM_SLOT_DIRECT_SHARED_PUSH",
+                "VLLM_UVM_SLOT_DIRECT_64K_PTE",
+            )
+            disabled = [
+                name
+                for name in required_flags
+                if not self._env_flag_enabled(name, default=False)
+            ]
+            if access_mode != "slot_restore":
+                disabled.append(
+                    "VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE=slot_restore"
+                )
+            if disabled:
+                raise RuntimeError(
+                    "Registered UVM slot plans require the complete fixed-bank "
+                    "configuration; missing: " + ", ".join(disabled)
+                )
+        if dual_bank_event and not registered_plan:
+            raise RuntimeError(
+                "UVM slot dual-bank event mode requires registered plans"
+            )
+        if cuda_fence and (not registered_plan or not dual_bank_event):
+            raise RuntimeError(
+                "UVM slot CUDA fence mode requires registered plans and "
+                "dual-bank event mode"
+            )
+
+        bank_candidates = getattr(self, "_uvm_slot_init_bank_candidates", None)
+        if init_bank:
+            if not bank_candidates:
+                raise RuntimeError(
+                    "Slot init-bank was requested but no cold slot layer was "
+                    "registered before warmup completion"
+                )
+            self._validate_uvm_slot_init_plan_candidates(
+                bank_candidates,
+                registered_plan=registered_plan,
+            )
+            if dual_bank_event:
+                layer_ids = [int(layer_id) for layer_id, _groups in bank_candidates]
+                expected = list(
+                    range(min(layer_ids), min(layer_ids) + len(layer_ids))
+                )
+                if len(layer_ids) < 2 or len(layer_ids) % 2 != 0:
+                    raise RuntimeError(
+                        "Dual-bank registered UVM slot plans require a non-empty "
+                        "even number of layers"
+                    )
+                if layer_ids != expected:
+                    raise RuntimeError(
+                        "Dual-bank registered UVM slot layer ids must be contiguous"
+                    )
+
+        device = int(torch.cuda.current_device())
+        contract = freeze_uvm_slot_direct_session_contract(
+            registered_plan=registered_plan,
+            access_mode=access_mode,
+            device=device,
+        )
+        if init_bank and not bool(contract.get("slot_session_enabled")):
+            raise RuntimeError(
+                "Slot init-bank contract does not enable scoped session cleanup"
+            )
+        self._uvm_slot_session_contract = contract
+        if not init_bank:
+            return
+        if getattr(self, "_uvm_slot_init_bank_done", False):
+            return
+        assert bank_candidates is not None
+        bank_layer_id, bank_groups = bank_candidates[0]
+        try:
+            bank_result = preallocate_uvm_expert_groups_to_slots(
+                bank_groups,
+                layer_id=bank_layer_id,
+                device=device,
+            )
+            if not bool(bank_result.get("ok")):
+                raise RuntimeError(
+                    "Slot init-bank preallocation failed: "
+                    f"layer_id={bank_layer_id}, result={bank_result!r}"
+                )
+            bank_results = [bank_result]
+            if dual_bank_event:
+                second_layer_id, second_bank_groups = bank_candidates[1]
+                second_bank_result = preallocate_uvm_registered_plan_second_bank(
+                    second_bank_groups,
+                    layer_id=second_layer_id,
+                    device=device,
+                )
+                if not bool(second_bank_result.get("ok")):
+                    raise RuntimeError(
+                        "Slot second-bank preallocation failed: "
+                        f"layer_id={second_layer_id}, result={second_bank_result!r}"
+                    )
+                bank_results.append(second_bank_result)
+            self._uvm_slot_init_bank_result = (
+                {
+                    "ok": True,
+                    "dual_bank_event": True,
+                    "bank_results": bank_results,
+                }
+                if dual_bank_event
+                else bank_result
+            )
+            if registered_plan:
+                plan_result = register_uvm_slot_direct_layer_plans(
+                    bank_candidates,
+                    device=device,
+                )
+                if not bool(plan_result.get("ok")):
+                    raise RuntimeError(
+                        "Slot layer-plan registration failed: "
+                        f"result={plan_result!r}"
+                    )
+                self._uvm_slot_registered_plan_result = plan_result
+            self._uvm_slot_init_bank_done = True
+        except Exception as exc:
+            cleanup_result: dict[str, Any] | None = None
+            cleanup_exc: Exception | None = None
+            try:
+                cleanup_result = close_uvm_slot_direct_policy_session(
+                    device=device
+                )
+            except Exception as rollback_exc:
+                cleanup_exc = rollback_exc
+            finally:
+                # Runner state must never advertise a usable bank after any
+                # initialization or rollback failure, including an exception
+                # raised directly by the cleanup wrapper.
+                self._uvm_slot_init_bank_done = False
+                self._uvm_slot_init_bank_result = None
+                self._uvm_slot_registered_plan_result = None
+                self._uvm_slot_session_contract = None
+            if cleanup_exc is not None:
+                raise RuntimeError(
+                    f"{exc}; slot init rollback raised: {cleanup_exc!r}"
+                ) from exc
+            assert cleanup_result is not None
+            if not bool(cleanup_result.get("ok")):
+                raise RuntimeError(
+                    f"{exc}; slot init rollback also failed: {cleanup_result!r}"
+                ) from exc
             raise
 
     @staticmethod

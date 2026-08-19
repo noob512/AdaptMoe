@@ -676,6 +676,8 @@ static NV_STATUS service_fault_once(uvm_parent_gpu_t *parent_gpu,
     uvm_gpu_t *gpu;
     uvm_non_replayable_fault_buffer_t *non_replayable_faults = &parent_gpu->fault_buffer.non_replayable;
     uvm_va_block_context_t *va_block_context = non_replayable_faults->block_service_context.block_context;
+    const NvU64 fault_leaf_base = UVM_ALIGN_DOWN(fault_entry->fault_address,
+                                                 UVM_PAGE_SIZE_64K);
 
     status = uvm_parent_gpu_fault_entry_to_va_space(parent_gpu,
                                                     fault_entry,
@@ -731,15 +733,15 @@ static NV_STATUS service_fault_once(uvm_parent_gpu_t *parent_gpu,
 
     if (!fault_entry->is_fatal &&
         uvm_moe_slot_pool_range_has_mappings(va_space,
-                                             UVM_VA_BLOCK_ALIGN_DOWN(fault_entry->fault_address),
-                                             UVM_VA_BLOCK_SIZE)) {
+                                             fault_leaf_base,
+                                             UVM_PAGE_SIZE_64K)) {
         uvm_va_space_up_read(va_space);
         uvm_va_space_mm_release_unlock(va_space, mm);
         mm = NULL;
 
         status = uvm_moe_slot_pool_clear_range_mappings_for_fault(va_space,
-                                                                  UVM_VA_BLOCK_ALIGN_DOWN(fault_entry->fault_address),
-                                                                  UVM_VA_BLOCK_SIZE);
+                                                                  fault_leaf_base,
+                                                                  UVM_PAGE_SIZE_64K);
         if (status == NV_OK)
             status = NV_WARN_MORE_PROCESSING_REQUIRED;
 

@@ -37,13 +37,21 @@
 
 // This weird number comes from UVM_PREVENT_MIGRATION_RANGE_GROUPS_PARAMS. That
 // ioctl is called frequently so we don't want to allocate a copy every time.
-// It's a little over 256 bytes in size.
+// It's a little over 256 bytes in size. Compact control ioctls such as
+// UVM_MOE_SLOT_SESSION_ABORT use the same stack route; BUILD_BUG_ON below
+// keeps future ABI growth from silently overflowing this bound.
 #define UVM_MAX_IOCTL_PARAM_STACK_SIZE 288
 
 #define UVM_ROUTE_ALLOC_PRINT(fmt, ...)                         \
     do {                                                        \
         uvm_phase_f_route_log(fmt, ##__VA_ARGS__);              \
-        UVM_INFO_PRINT(fmt, ##__VA_ARGS__);                     \
+    } while (0)
+
+// Allocation and userspace copy failures are rare and actionable, so keep
+// them on the normal error path even when verbose route tracing is disabled.
+#define UVM_ROUTE_ALLOC_ERROR(fmt, ...)                         \
+    do {                                                        \
+        UVM_ERR_PRINT(fmt, ##__VA_ARGS__);                      \
     } while (0)
 
 // The UVM_ROUTE_CMD_* macros are only intended for use in the ioctl routines
@@ -91,7 +99,7 @@
                               (unsigned)(cmd), sizeof(params_type), (unsigned)(do_init_check));\
         params_type *params = uvm_kvmalloc(sizeof(*params));                            \
         if (!params) {                                                                  \
-            UVM_ROUTE_ALLOC_PRINT("route_alloc alloc_failed cmd=%u size=%zu\n",         \
+            UVM_ROUTE_ALLOC_ERROR("route_alloc alloc_failed cmd=%u size=%zu\n",         \
                                   (unsigned)(cmd), sizeof(params_type));                \
             return -ENOMEM;                                                             \
         }                                                                               \
@@ -99,7 +107,7 @@
                               (unsigned)(cmd), params, sizeof(*params));                \
         BUILD_BUG_ON(sizeof(*params) <= UVM_MAX_IOCTL_PARAM_STACK_SIZE);                \
         if (copy_from_user(params, (void __user*)arg, sizeof(*params))) {               \
-            UVM_ROUTE_ALLOC_PRINT("route_alloc copy_from_user_failed cmd=%u arg=0x%px size=%zu\n",\
+            UVM_ROUTE_ALLOC_ERROR("route_alloc copy_from_user_failed cmd=%u arg=0x%px size=%zu\n",\
                                   (unsigned)(cmd), (void __user*)arg, sizeof(*params)); \
             uvm_kvfree(params);                                                         \
             return -EFAULT;                                                             \
@@ -133,7 +141,7 @@
         UVM_ROUTE_ALLOC_PRINT("route_alloc copy_to_user_begin cmd=%u rmStatus=0x%x\n",  \
                               (unsigned)(cmd), params->rmStatus);                       \
         if (copy_to_user((void __user*)arg, params, sizeof(*params))) {                 \
-            UVM_ROUTE_ALLOC_PRINT("route_alloc copy_to_user_failed cmd=%u arg=0x%px size=%zu\n",\
+            UVM_ROUTE_ALLOC_ERROR("route_alloc copy_to_user_failed cmd=%u arg=0x%px size=%zu\n",\
                                   (unsigned)(cmd), (void __user*)arg, sizeof(*params)); \
             ret = -EFAULT;                                                              \
         }                                                                               \
@@ -337,6 +345,10 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp);
 bool uvm_moe_slot_pool_range_has_mappings(uvm_va_space_t *va_space, NvU64 base, NvU64 bytes);
 NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_fault(uvm_va_space_t *va_space, NvU64 base, NvU64 bytes);
 NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_migrate(uvm_va_space_t *va_space, NvU64 base, NvU64 bytes);
+NV_STATUS uvm_moe_slot_pool_clear_ranges_mappings_for_migrate_locked(uvm_va_space_t *va_space,
+                                                                     struct mm_struct *mm,
+                                                                     const UVM_PHASE_F_RANGE *ranges,
+                                                                     NvU32 count);
 NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_discard(uvm_va_space_t *va_space, NvU64 base, NvU64 bytes);
 NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_unmap_locked(uvm_va_space_t *va_space,
                                                                   struct mm_struct *mm,

@@ -1033,6 +1033,17 @@ typedef enum
     // Region-id executor variant which loops over registered expert regions
     // and invokes the native EXPERT_READ_DUP_FAST range path for each region.
     UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST_NATIVE_REGIONS = 19,
+    // Setup-only diagnostic action. Every complete, aligned 2 MiB block must
+    // already be CPU-sole-resident and remotely mapped READ-only on the GPU.
+    // Existing 2 MiB PTEs are split in place into 32 ordinary 64 KiB PTEs;
+    // blocks already using all-64 KiB PTEs are only validated. This action is
+    // synchronous regardless of the batch async flag.
+    UVM_PHASE_F_ACTION_FORCE_REMOTE_READ_64K = 20,
+    // P3-to-remote cutover action. Install any missing CPU remote READ PTEs,
+    // then synchronously prove every page is CPU-resident, GPU-nonresident,
+    // and GPU READ-mapped. Result byte fields describe the final audited
+    // state, not only PTEs newly installed by this invocation.
+    UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_AUDITED = 21,
 } UVM_PHASE_F_ACTION;
 
 typedef struct
@@ -1054,11 +1065,11 @@ typedef struct
     NvU32     resident_on_count;   // OUT, query only
     NvBool    resident_on_cpu;     // OUT, query only
     NvBool    resident_on_gpu;     // OUT, query only
-    NvU64     queried_bytes        NV_ALIGN_BYTES(8); // OUT, query only
-    NvU64     resident_gpu_bytes   NV_ALIGN_BYTES(8); // OUT, query only
-    NvU64     resident_cpu_bytes   NV_ALIGN_BYTES(8); // OUT, query only
-    NvU64     resident_any_bytes   NV_ALIGN_BYTES(8); // OUT, query only
-    NvU64     resident_unknown_bytes NV_ALIGN_BYTES(8); // OUT, query only
+    NvU64     queried_bytes        NV_ALIGN_BYTES(8); // OUT, query/setup input bytes
+    NvU64     resident_gpu_bytes   NV_ALIGN_BYTES(8); // OUT, query GPU bytes; action 20 split; action 21 remote-map
+    NvU64     resident_cpu_bytes   NV_ALIGN_BYTES(8); // OUT, query CPU bytes; action 20 already-64K; action 21 CPU-resident
+    NvU64     resident_any_bytes   NV_ALIGN_BYTES(8); // OUT, query any bytes; action 20 validated bytes
+    NvU64     resident_unknown_bytes NV_ALIGN_BYTES(8); // OUT, query/setup unvalidated bytes
 } UVM_PHASE_F_RANGE_RESULT;
 
 #define UVM_PHASE_F_BATCH_EXECUTOR                                     UVM_IOCTL_BASE(81)
@@ -1120,7 +1131,10 @@ typedef struct
 // software state. SLOT_VA_BLOCK_REMAP first lets the target managed VA block
 // unmap the GPU range and wait its tracker, then installs the slot-backed PTE.
 //
-#define UVM_MOE_SLOT_REMAP_MAX_ENTRIES                                128
+// A Qwen3 MoE layer contributes 128 experts with 9 independently-backed
+// 512 KiB weight ranges per expert. Keep the complete layer in one
+// experimental request so userspace can amortize ioctl and VA-space setup.
+#define UVM_MOE_SLOT_REMAP_MAX_ENTRIES                                1152
 
 typedef enum
 {
@@ -1143,7 +1157,84 @@ typedef enum
     // driver-owned VIDMEM slot and return without waiting for the copy engine.
     // Completion is finalized when the slot is next reused or released.
     UVM_MOE_SLOT_REMAP_MODE_GPU_COPY_ASYNC_SUBMIT = 9,
+    // Copy directly from managed CPU chunks into an already-preallocated
+    // driver-owned VIDMEM slot, then map the original managed VA read-only to
+    // that slot. One CE push is submitted per VA block. This mode is
+    // synchronous and never allocates or evicts slot backing.
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_PER_BLOCK_PUSH = 10,
+    // Identical source, slot backing, and PTE mapping semantics to mode 10,
+    // but packs physically-contiguous CPU runs from multiple VA blocks into
+    // shared CE pushes. Pushes are flushed dynamically when they approach the
+    // hardware pushbuffer limit. This mode is synchronous and never allocates
+    // or evicts slot backing.
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_SHARED_PUSH = 11,
+    // Per-block slot-direct copy with the same semantics as mode 10, but map
+    // each eligible full VA block with 64 KiB PTEs.
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_64K_PTE = 12,
+    // Per-block slot-direct copy with the same semantics as mode 10, but map
+    // each eligible full VA block with one 2 MiB PTE.
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_2M_PTE = 13,
+    // Preserve an existing read-only CPU mapping until the slot copy has
+    // completed, then overwrite it with an equal-granularity slot PTE and a
+    // SYS-scoped TLB invalidate. This avoids a separate unmap push.
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_OVERWRITE = 14,
+    // Diagnostic 4 KiB path which synchronizes preparation, copy, and map at
+    // their boundaries so copy-complete and map-complete time can be measured
+    // independently. It is intentionally not a throughput pipeline mode.
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_STAGE_SYNC = 15,
+    // Diagnostic equivalent of mode 12 with a synchronization boundary after
+    // prepare, 64 KiB slot copy, and map. This measures completion rather than
+    // only host submission time.
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_64K_STAGE_SYNC = 16,
+    // Like mode 14, but require every existing ordinary remote READ mapping to
+    // be uniformly 64 KiB. Any 2 MiB, 4 KiB, or mixed block is rejected rather
+    // than auto-detected.
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_64K_OVERWRITE = 17,
+    // Stage-synchronized diagnostic form of mode 17.
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_64K_OVERWRITE_STAGE_SYNC = 18,
+    // Release driver-owned backing and any installed slot PTEs for the
+    // submitted logical slots. Release entries identify a slot only with
+    // layer_id, expert_id, and slot_id; all other entry input fields must be 0.
+    UVM_MOE_SLOT_REMAP_MODE_RELEASE = 19,
+    // Restricted fixed-bank layer transition. Every entry must name an
+    // existing NO_EVICT VIDMEM slot and carry REUSE_BACKING_REQUIRED. The old
+    // slot-backed PTEs are removed first, while the old logical owners remain
+    // unchanged. Copy and replacement-PTE preparation may overlap, but the
+    // replacement PTEs, TLB invalidation, and new owners are published only
+    // after all tracked work succeeds. Optional per-entry strategy bits select
+    // shared pushes and/or sliced 64 KiB PTEs, and must be uniform across the
+    // batch. No backing allocation, eviction, or large-PTE fallback is
+    // permitted. 64K eligibility is fully preflighted before old-PTE teardown.
+    // Before entering this ioctl, the caller must ensure that ordinary CUDA
+    // work has stopped accessing every old slot VA. UVM trackers order the
+    // driver's copy/map pushes, but do not track arbitrary CUDA kernels.
+    // Validation/resource rejection before TRANSITIONING touches no PTE and
+    // leaves the active session intact. Once the execution-stage transition
+    // begins, a failure retains the old owners, reports remap_count == 0, and
+    // leaves the affected GPU VAs unmapped; registered-plan execution also keeps
+    // its active generation unchanged and poisons the session.
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_LAYER_TRANSITION = 20,
+    // Ordinary (non-owner-transition) slot-direct path combining the mode-11
+    // shared CE push strategy with the mode-12 sliced 64 KiB PTE strategy.
+    UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_SHARED_PUSH_64K_PTE = 21,
 } UVM_MOE_SLOT_REMAP_MODE;
+
+// Keep this slot under explicit userspace lifetime control. Allocations with
+// this flag fail when the configured budget or physical VIDMEM is exhausted,
+// and the slot cannot be selected as an implicit budget-eviction victim.
+#define UVM_MOE_SLOT_REMAP_FLAG_NO_EVICT                              0x00000001U
+
+// Mode-8 only: the submitted logical slot must already have sufficiently
+// large VIDMEM backing. The old owner/PTE metadata is replaced, but allocating
+// a new uvm_mem_t (or growing the existing one) is forbidden. This makes a
+// fixed physical slot bank rebind auditable and fail-closed.
+#define UVM_MOE_SLOT_REMAP_FLAG_REUSE_BACKING_REQUIRED                0x00000002U
+
+// Mode-20-only request strategy bits. These describe how the transition's
+// copy/map phase is executed; they are never persisted in slot->flags. Every
+// entry in one transition must carry the same strategy bits.
+#define UVM_MOE_SLOT_REMAP_FLAG_LAYER_TRANSITION_SHARED_PUSH          0x00000004U
+#define UVM_MOE_SLOT_REMAP_FLAG_LAYER_TRANSITION_64K_PTE              0x00000008U
 
 typedef enum
 {
@@ -1183,12 +1274,170 @@ typedef struct
     NvU32 conflict_count;                            // OUT
     NvU32 remap_count;                               // OUT
     NvU32 tlb_invalidate_count;                      // OUT
-    NvU32 reserved;                                  // OUT
+    // OUT; for SLOT_DIRECT_* modes, number of CE copy pushes submitted. For
+    // VIDMEM_PREALLOC, number of entries which reused existing VIDMEM backing.
+    NvU32 reserved;
     NvU64 requested_bytes NV_ALIGN_BYTES(8);         // OUT
     NvU64 accepted_bytes NV_ALIGN_BYTES(8);          // OUT
     UVM_MOE_SLOT_REMAP_ENTRY entries[UVM_MOE_SLOT_REMAP_MAX_ENTRIES]; // IN/OUT
     NV_STATUS rmStatus;                              // OUT
 } UVM_MOE_SLOT_REMAP_BATCH_PARAMS;
+
+// Register one immutable layer placement plan. Registration is deliberately
+// separate from execution: the large descriptor array crosses the ioctl
+// boundary once during model initialization, while the serving hot path uses
+// the compact execute request below. A session must register exactly one mode
+// 21 bootstrap descriptor first; every later descriptor must be a mode 20
+// target-layer transition referencing a preallocated fixed physical slot bank.
+// A dual-bank session may alternate between two disjoint banks; entries from
+// the two banks must never share the same physical slot backing.
+#define UVM_MOE_SLOT_PLAN_REGISTER                                    UVM_IOCTL_BASE(92)
+typedef struct
+{
+    NvU64 plan_id NV_ALIGN_BYTES(8);                 // IN, non-zero userspace id
+    // OUT. The active generation is monotonic for the module lifetime and is
+    // never reused when the last plan is destroyed and a new session starts.
+    NvU64 generation NV_ALIGN_BYTES(8);
+    NvU32 layer_id;                                  // IN, logical model layer
+    NvU32 mode;                                      // IN, mode 20 or mode 21
+    NvU32 count;                                     // IN
+    NvU32 reserved;                                  // must be zero
+    NvProcessorUuid gpu_uuid;                        // IN
+    NvU64 requested_bytes NV_ALIGN_BYTES(8);         // OUT
+    UVM_MOE_SLOT_REMAP_ENTRY entries[UVM_MOE_SLOT_REMAP_MAX_ENTRIES]; // IN
+    NV_STATUS rmStatus;                              // OUT
+} UVM_MOE_SLOT_PLAN_REGISTER_PARAMS;
+
+// Execute a previously registered immutable plan. No range descriptors are
+// copied from userspace on this path. generation serializes owner changes and
+// makes stale layer transitions fail before any PTE or slot state is touched.
+// Each successful execution advances the module-lifetime generation only
+// after copy, PTE publication, and TLB invalidation have completed. Identity,
+// device, slot, target, large-leaf, and cleanup-resource preflight completes
+// before TRANSITIONING; rejection there touches no PTE and leaves the active
+// generation/session intact. Once an execution-stage transition fails,
+// owner_cutover and remap_count are zero, new_generation remains equal to the
+// input generation, poisoned is set, and the affected GPU VAs remain unmapped.
+// Such a session is abort-only. The caller must complete all CUDA work using the
+// old slot VAs before execute; the internal tracker covers UVM pushes, not
+// ordinary CUDA kernel lifetime.
+#define UVM_MOE_SLOT_PLAN_EXECUTE                                     UVM_IOCTL_BASE(93)
+typedef struct
+{
+    NvU64 plan_id NV_ALIGN_BYTES(8);                 // IN
+    NvU64 generation NV_ALIGN_BYTES(8);              // IN
+    NvU64 new_generation NV_ALIGN_BYTES(8);          // OUT
+    NvU64 requested_bytes NV_ALIGN_BYTES(8);         // OUT
+    NvU64 accepted_bytes NV_ALIGN_BYTES(8);          // OUT
+    NvU32 layer_id;                                  // IN
+    NvU32 mode;                                      // OUT
+    NvU32 count;                                     // OUT
+    NvU32 success_count;                             // OUT
+    NvU32 failure_count;                             // OUT
+    NvU32 conflict_count;                            // OUT
+    NvU32 remap_count;                               // OUT
+    NvU32 tlb_invalidate_count;                      // OUT
+    NvU32 copy_push_count;                           // OUT
+    NvU32 owner_cutover;                             // OUT, 1 only after successful owner/generation commit
+    NvU32 poisoned;                                  // OUT, failure requires generation-free session abort
+    NV_STATUS rmStatus;                              // OUT
+} UVM_MOE_SLOT_PLAN_EXECUTE_PARAMS;
+
+// Execute a registered plan with a kernel-verified CUDA stream hand-off.
+// Both addresses must name distinct, naturally aligned 32-bit cells in a UVM
+// semaphore-pool VA range owned by this file's VA space. Before entering the
+// transition, the UVM MEMOPS channel waits for compute_payload at
+// compute_semaphore_address. Only after copy, PTE/TLB publication, metadata,
+// owner, and generation commit have all completed does the driver publish
+// completion_payload at completion_semaphore_address. CUDA user space must
+// enqueue the matching stream write before this ioctl and the matching stream
+// wait before submitting kernels which consume the new mapping.
+//
+// This is a separate command instead of extending command 93 so an older
+// userspace structure can never be over-read by a newer experimental driver.
+#define UVM_MOE_SLOT_PLAN_EXECUTE_FENCED                              UVM_IOCTL_BASE(96)
+
+#define UVM_MOE_SLOT_PLAN_FENCE_FLAG_COMPUTE_ACQUIRE                 0x00000001U
+#define UVM_MOE_SLOT_PLAN_FENCE_FLAG_COMPLETION_RELEASE              0x00000002U
+#define UVM_MOE_SLOT_PLAN_FENCE_FLAGS_ALL                            \
+    (UVM_MOE_SLOT_PLAN_FENCE_FLAG_COMPUTE_ACQUIRE |                  \
+     UVM_MOE_SLOT_PLAN_FENCE_FLAG_COMPLETION_RELEASE)
+
+typedef struct
+{
+    // Common execute inputs and outputs. Keep this prefix field-for-field
+    // compatible with command 93 through poisoned; rmStatus is intentionally
+    // last so the two command sizes remain unambiguous.
+    NvU64 plan_id NV_ALIGN_BYTES(8);                 // IN
+    NvU64 generation NV_ALIGN_BYTES(8);              // IN
+    NvU64 new_generation NV_ALIGN_BYTES(8);          // OUT
+    NvU64 requested_bytes NV_ALIGN_BYTES(8);         // OUT
+    NvU64 accepted_bytes NV_ALIGN_BYTES(8);          // OUT
+    NvU32 layer_id;                                  // IN
+    NvU32 mode;                                      // OUT
+    NvU32 count;                                     // OUT
+    NvU32 success_count;                             // OUT
+    NvU32 failure_count;                             // OUT
+    NvU32 conflict_count;                            // OUT
+    NvU32 remap_count;                               // OUT
+    NvU32 tlb_invalidate_count;                      // OUT
+    NvU32 copy_push_count;                           // OUT
+    NvU32 owner_cutover;                             // OUT
+    NvU32 poisoned;                                  // OUT
+
+    NvU32 fence_flags;                               // IN, exactly FLAGS_ALL
+    NvU64 compute_semaphore_address NV_ALIGN_BYTES(8);    // IN
+    NvU64 completion_semaphore_address NV_ALIGN_BYTES(8); // IN
+    NvU32 compute_payload;                           // IN, non-zero timeline value
+    NvU32 completion_payload;                        // IN, equal to compute_payload
+    NvU32 fence_accepted;                            // OUT, kernel validated and waited
+    NvU32 completion_signaled;                       // OUT, success payload published
+    NvU32 reserved;                                  // IN, must be zero
+    NV_STATUS rmStatus;                              // OUT
+} UVM_MOE_SLOT_PLAN_EXECUTE_FENCED_PARAMS;
+
+// Remove one cached descriptor plan. Physical slot backing remains under the
+// existing mode-19/session-close lifetime contract. VA-space teardown also
+// destroys all remaining plans without relying on userspace. Destroying the
+// last plan reports current_generation == 0 to preserve the ABI's inactive-
+// session sentinel, but the internal module-lifetime counter is not reset.
+#define UVM_MOE_SLOT_PLAN_DESTROY                                     UVM_IOCTL_BASE(94)
+typedef struct
+{
+    NvU64 plan_id NV_ALIGN_BYTES(8);                 // IN
+    NvU64 generation NV_ALIGN_BYTES(8);              // IN
+    NvU64 current_generation NV_ALIGN_BYTES(8);      // OUT
+    NvU32 destroyed;                                 // OUT
+    NvU32 reserved;                                  // must be zero
+    NV_STATUS rmStatus;                              // OUT
+} UVM_MOE_SLOT_PLAN_DESTROY_PARAMS;
+
+// Tear down every MoE slot resource owned by the VA space associated with
+// this file. Unlike closing an os.dup() of the UVM fd, this is an explicit,
+// live-session operation. It is intentionally independent of userspace's
+// cached plan ids and slot list so it can recover after a partial register or
+// an ioctl result/contract mismatch.
+//
+// Release is convergent: successfully released slots stay released. If any
+// slot fails, its owner/backing and all registered plans remain available for
+// a retry and the registered session is poisoned. Plans and session metadata
+// are destroyed only after no owned slot remains.
+#define UVM_MOE_SLOT_SESSION_ABORT                                   UVM_IOCTL_BASE(95)
+typedef struct
+{
+    NvU32 flags;                                      // IN, must be zero
+    NvU32 reserved;                                   // IN, must be zero
+    NvU64 generation_before NV_ALIGN_BYTES(8);        // OUT, zero without an owned registered session
+    NvU64 released_bytes NV_ALIGN_BYTES(8);           // OUT, bytes released by this call
+    NvU64 remaining_bytes NV_ALIGN_BYTES(8);          // OUT, backing/mapping bytes requiring retry
+    NvU32 destroyed_plan_count;                       // OUT, plans destroyed by this call
+    NvU32 released_slot_count;                        // OUT, slots released by this call
+    NvU32 remaining_slot_count;                       // OUT, slot records which still require retry
+    NvU32 had_registered_session;                     // OUT, this VA space owned plans/session on entry
+    NvU32 session_cleared;                            // OUT, this VA space now owns no slot or plan
+    NvU32 poisoned;                                   // OUT, retry-only state remains after this call
+    NV_STATUS rmStatus;                               // OUT
+} UVM_MOE_SLOT_SESSION_ABORT_PARAMS;
 
 typedef enum
 {
@@ -1248,6 +1497,32 @@ typedef struct
     NvU32     found_by_va;                  // OUT
     NV_STATUS rmStatus;                     // OUT
 } UVM_QUERY_REGION_BY_VA_PARAMS;
+
+//
+// UvmPhaseFPrefetchGpuBatchV2
+//
+// Synchronous managed-memory GPU prefetch with a single driver batch. This is
+// a versioned ABI so the legacy 64-range Phase F executor remains unchanged.
+// flags is reserved and must be zero.
+//
+#define UVM_PHASE_F_PREFETCH_GPU_BATCH_V2_MAX_RANGES                    128
+#define UVM_PHASE_F_PREFETCH_GPU_BATCH_V2                               UVM_IOCTL_BASE(90)
+typedef struct
+{
+    NvU32                    count;                                      // IN
+    NvU32                    flags;                                      // IN, must be zero
+    NvProcessorUuid          gpu_uuid;                                   // IN
+    NvU32                    success_count;                              // OUT
+    NvU32                    failure_count;                              // OUT
+    NvU32                    core_calls;                                 // OUT, batch-core entries (0 or 1)
+    NvU32                    tracker_waits;                              // OUT, aggregate migration waits (0 or 1)
+    NvU64                    requested_bytes NV_ALIGN_BYTES(8);          // OUT, sum of accepted request lengths
+    NvU64                    completed_bytes NV_ALIGN_BYTES(8);          // OUT, sum of successful request lengths
+    UVM_PHASE_F_RANGE        ranges[UVM_PHASE_F_PREFETCH_GPU_BATCH_V2_MAX_RANGES];  // IN
+    // OUT; status is authoritative. Residency processor-count fields are not queried.
+    UVM_PHASE_F_RANGE_RESULT results[UVM_PHASE_F_PREFETCH_GPU_BATCH_V2_MAX_RANGES];
+    NV_STATUS                rmStatus;                                   // OUT
+} UVM_PHASE_F_PREFETCH_GPU_BATCH_V2_PARAMS;
 
 //
 // UvmExpertOffloadRelease

@@ -21,11 +21,19 @@ from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.device_allocator.uvm import (
     uvm_enabled_allocation_phase,
     uvm_local_memory_pool,
+    uvm_slot_cuda_fence_enabled,
 )
 from vllm.device_allocator.uvm_pool_residency import (
+    commit_uvm_regions_gpu_placement,
+    prepare_uvm_regions_for_gpu_placement,
+    protect_uvm_slot_direct_groups,
     register_uvm_region,
     release_uvm_regions,
+    restore_uvm_expert_groups_to_slots,
+    restore_uvm_registered_layer_plan,
     restore_uvm_regions,
+    restore_uvm_regions_to_slots,
+    validate_uvm_slot_direct_session_contract,
 )
 from vllm.device_allocator.uvm_region import (
     ExpertRecord,
@@ -121,6 +129,12 @@ _UVM_INIT_WEIGHT_DRIVER_RELEASE_MODES = (
 )
 _UVM_EXPERT_512K_ENVELOPE_BYTES = 512 * 1024
 _UVM_EXPERT_2MB_ENVELOPE_BYTES = 2 * 1024 * 1024
+_UVM_INIT_WEIGHT_PLACEMENT_MANIFEST_ENV = (
+    "VLLM_UVM_INIT_WEIGHT_PLACEMENT_MANIFEST"
+)
+_UVM_SLOT_FORMAL_RESTORE_ALL_COLD_ENV = (
+    "VLLM_UVM_SLOT_FORMAL_RESTORE_ALL_COLD"
+)
 
 
 def _env_flag_enabled(env_name: str, default: bool = False) -> bool:
@@ -144,6 +158,39 @@ def _env_int(env_name: str, default: int) -> int:
             default,
         )
         return default
+
+
+def _validate_uvm_slot_restore_execution(vllm_config: VllmConfig) -> None:
+    unsupported: list[str] = []
+    if not vllm_config.model_config.enforce_eager:
+        unsupported.append("CUDA graph execution")
+    if vllm_config.parallel_config.enable_dbo:
+        unsupported.append("dual-batch overlap")
+    if vllm_config.parallel_config.world_size_across_dp != 1:
+        unsupported.append("multi-GPU execution")
+    if unsupported:
+        raise RuntimeError(
+            "UVM slot_restore currently requires single-GPU eager execution "
+            "with DBO disabled; unsupported: " + ", ".join(unsupported)
+        )
+
+
+def _uvm_slot_formal_restore_all_cold_enabled(
+    access_mode: str,
+    vllm_config: VllmConfig,
+) -> bool:
+    enabled = _env_flag_enabled(
+        _UVM_SLOT_FORMAL_RESTORE_ALL_COLD_ENV,
+        default=False,
+    )
+    if enabled and access_mode != "slot_restore":
+        raise RuntimeError(
+            f"{_UVM_SLOT_FORMAL_RESTORE_ALL_COLD_ENV}=1 requires "
+            "VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE=slot_restore"
+        )
+    if access_mode == "slot_restore":
+        _validate_uvm_slot_restore_execution(vllm_config)
+    return enabled
 
 
 def _align_down(value: int, alignment: int) -> int:
@@ -710,12 +757,19 @@ class FusedMoE(CustomOp):
         if self.uvm_expert_offload_access_mode not in (
             "restore",
             "remote_read",
+            "slot_restore",
         ):
             logger.warning(
                 "Unknown VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE=%s; using restore",
                 self.uvm_expert_offload_access_mode,
             )
             self.uvm_expert_offload_access_mode = "restore"
+        self.uvm_slot_formal_restore_all_cold = (
+            _uvm_slot_formal_restore_all_cold_enabled(
+                self.uvm_expert_offload_access_mode,
+                vllm_config,
+            )
+        )
         self.uvm_weight_executor = os.environ.get(
             "VLLM_UVM_WEIGHT_EXECUTOR",
             "cpp_batch",
@@ -1991,6 +2045,15 @@ class FusedMoE(CustomOp):
                 "topk_weight_sum": float(topk_weights.detach().sum().cpu().item()),
                 "enable_eplb": bool(self.enable_eplb),
             }
+            if getattr(self, "uvm_slot_formal_restore_all_cold", False):
+                record.update(
+                    {
+                        "slot_formal_restore_all_cold": True,
+                        "slot_formal_restore_expert_count": len(
+                            self._uvm_offloaded_global_expert_ids
+                        ),
+                    }
+                )
             with open(self.uvm_moe_trace_file, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
         except Exception:
@@ -2508,6 +2571,56 @@ class FusedMoE(CustomOp):
             record.aggregate_state = target
         return len(records)
 
+    def get_uvm_init_weight_placement_snapshot(self) -> dict[str, object]:
+        """Return JSON-ready expert ownership for the optional runtime manifest."""
+        layer_id = self._uvm_layer_id()
+        remote_ids = set(self._uvm_remote_read_global_expert_ids)
+        offloaded_ids = set(self._uvm_offloaded_global_expert_ids)
+        experts: list[dict[str, object]] = []
+        region_owners: list[dict[str, object]] = []
+        for (_, expert_id), record in sorted(self._uvm_expert_records.items()):
+            placement = "hot"
+            if int(expert_id) in remote_ids:
+                placement = "remote"
+            elif int(expert_id) in offloaded_ids:
+                placement = "offloaded"
+            experts.append(
+                {
+                    "layer_id": int(record.layer_id),
+                    "expert_id": int(record.global_expert_id),
+                    "placement": placement,
+                    "app_state": record.aggregate_state.value,
+                    "region_count": len(record.envelope_region_ids),
+                }
+            )
+            region_owners.extend(
+                {
+                    "region_id": region_id,
+                    "layer_id": int(record.layer_id),
+                    "expert_id": int(record.global_expert_id),
+                    "placement": placement,
+                }
+                for region_id in record.envelope_region_ids
+            )
+        release_audits = getattr(
+            self,
+            "_uvm_init_weight_release_audits",
+            {},
+        )
+        return {
+            "layer_name": self.layer_name,
+            "layer_id": layer_id,
+            "access_mode": self.uvm_expert_offload_access_mode,
+            "plan_file": self.uvm_init_weight_offload_plan_file,
+            "plan_policy": self.uvm_init_weight_plan_policy,
+            "experts": experts,
+            "region_owners": region_owners,
+            "release_audits": [
+                dict(release_audits[region_id])
+                for region_id in sorted(release_audits)
+            ],
+        }
+
     def _uvm_record_expert_state(
         self,
         layer_id: int,
@@ -2518,6 +2631,136 @@ class FusedMoE(CustomOp):
         if record is not None:
             record.aggregate_state = state
 
+    def uvm_prefill_oracle_plan_expert_ids(self) -> list[int]:
+        """Return this layer's still-CPU experts selected by the fixed plan."""
+        layer_id = self._uvm_layer_id()
+        if layer_id is None:
+            return []
+        tracked = (
+            self._uvm_remote_read_global_expert_ids
+            if self.uvm_expert_offload_access_mode == "remote_read"
+            else self._uvm_offloaded_global_expert_ids
+        )
+        planned = {
+            int(expert_id)
+            for plan_layer_id, expert_id in self.uvm_init_weight_offload_plan_keys
+            if int(plan_layer_id) == int(layer_id)
+        }
+        return sorted(planned & tracked)
+
+    def prepare_uvm_prefill_oracle_experts(
+        self,
+        expert_ids: Iterable[int],
+        *,
+        device: int,
+    ) -> dict[str, object]:
+        """Submit fixed-plan expert prefetch on the current CUDA stream."""
+        layer_id = self._uvm_layer_id()
+        requested = sorted({int(expert_id) for expert_id in expert_ids})
+        if layer_id is None:
+            return {"ok": False, "reason": "layer_id_unavailable"}
+        if not requested:
+            return {
+                "ok": True,
+                "reason": "no_experts",
+                "layer_id": int(layer_id),
+                "expert_ids": [],
+                "region_ids": [],
+                "requested_bytes": 0,
+            }
+
+        records: list[ExpertRecord] = []
+        missing: list[int] = []
+        tracked = (
+            self._uvm_remote_read_global_expert_ids
+            if self.uvm_expert_offload_access_mode == "remote_read"
+            else self._uvm_offloaded_global_expert_ids
+        )
+        for expert_id in requested:
+            record = self._uvm_expert_records.get((int(layer_id), expert_id))
+            if record is None or expert_id not in tracked:
+                missing.append(expert_id)
+            else:
+                records.append(record)
+        if missing:
+            return {
+                "ok": False,
+                "reason": "expert_not_offloaded_or_unregistered",
+                "layer_id": int(layer_id),
+                "missing_expert_ids": missing,
+            }
+
+        region_ids = list(
+            dict.fromkeys(
+                region_id
+                for record in records
+                for region_id in record.envelope_region_ids
+            )
+        )
+        requested_bytes = 0
+        for region_id in region_ids:
+            try:
+                requested_bytes += int(region_id.rsplit(":", 1)[1], 16)
+            except (IndexError, ValueError):
+                return {
+                    "ok": False,
+                    "reason": "invalid_region_id",
+                    "layer_id": int(layer_id),
+                    "region_id": region_id,
+                }
+
+        result = prepare_uvm_regions_for_gpu_placement(
+            region_ids,
+            device=int(device),
+            executor=self.uvm_weight_executor,
+        )
+        if bool(result.get("ok")):
+            for record in records:
+                record.aggregate_state = RegionState.PREFETCHING_GPU
+        return {
+            **result,
+            "layer_id": int(layer_id),
+            "expert_ids": requested,
+            "region_ids": region_ids,
+            "region_count": len(region_ids),
+            "requested_bytes": int(requested_bytes),
+            "initial_access_mode": self.uvm_expert_offload_access_mode,
+        }
+
+    def commit_uvm_prefill_oracle_experts(
+        self,
+        expert_ids: Iterable[int],
+        region_ids: Iterable[str],
+    ) -> dict[str, object]:
+        """Commit fixed-plan placement after its CUDA ready event completed."""
+        layer_id = self._uvm_layer_id()
+        requested_experts = sorted({int(value) for value in expert_ids})
+        requested_regions = list(dict.fromkeys(str(value) for value in region_ids))
+        if layer_id is None:
+            return {"ok": False, "reason": "layer_id_unavailable"}
+        result = commit_uvm_regions_gpu_placement(
+            requested_regions,
+            synchronized=True,
+        )
+        state = RegionState.GPU if bool(result.get("ok")) else RegionState.UNKNOWN
+        tracked = (
+            self._uvm_remote_read_global_expert_ids
+            if self.uvm_expert_offload_access_mode == "remote_read"
+            else self._uvm_offloaded_global_expert_ids
+        )
+        for expert_id in requested_experts:
+            self._uvm_record_expert_state(layer_id, expert_id, state)
+            if state == RegionState.GPU:
+                tracked.discard(expert_id)
+            else:
+                tracked.add(expert_id)
+        return {
+            **result,
+            "layer_id": int(layer_id),
+            "expert_ids": requested_experts,
+            "region_ids": requested_regions,
+        }
+
     def _uvm_release_expert_record(
         self,
         *,
@@ -2526,11 +2769,49 @@ class FusedMoE(CustomOp):
         device: int,
     ) -> dict[str, object]:
         record = self._uvm_expert_records[(int(layer_id), int(global_expert_id))]
+        audit_enabled = bool(
+            os.environ.get(_UVM_INIT_WEIGHT_PLACEMENT_MANIFEST_ENV, "").strip()
+        )
+        release_kwargs: dict[str, object] = {
+            "device": device,
+            "remote_read": self._uvm_stage_m_uses_remote_read(),
+        }
+        if audit_enabled:
+            release_kwargs["include_audit"] = True
         result = release_uvm_regions(
             record.envelope_region_ids,
-            device=device,
-            remote_read=self._uvm_stage_m_uses_remote_read(),
+            **release_kwargs,
         )
+        if audit_enabled:
+            raw_audits = result.get("audits")
+            expected_regions = set(record.envelope_region_ids)
+            if not isinstance(raw_audits, dict) or set(raw_audits) != expected_regions:
+                raise RuntimeError(
+                    "Release audit is incomplete: "
+                    f"layer_id={layer_id}, expert_id={global_expert_id}"
+                )
+            audit_store = getattr(
+                self,
+                "_uvm_init_weight_release_audits",
+                None,
+            )
+            if not isinstance(audit_store, dict):
+                audit_store = {}
+                self._uvm_init_weight_release_audits = audit_store
+            for region_id in sorted(expected_regions):
+                raw_audit = raw_audits[region_id]
+                if not isinstance(raw_audit, dict) or raw_audit.get("ok") is not True:
+                    raise RuntimeError(
+                        "Release audit did not prove success: "
+                        f"layer_id={layer_id}, expert_id={global_expert_id}, "
+                        f"region_id={region_id!r}"
+                    )
+                audit_store[region_id] = {
+                    **raw_audit,
+                    "region_id": region_id,
+                    "layer_id": int(layer_id),
+                    "expert_id": int(global_expert_id),
+                }
         state = RegionState.CPU if bool(result.get("ok")) else RegionState.UNKNOWN
         self._uvm_record_expert_state(layer_id, global_expert_id, state)
         return result
@@ -2543,46 +2824,175 @@ class FusedMoE(CustomOp):
         device: int,
     ) -> dict[str, object]:
         record = self._uvm_expert_records[(int(layer_id), int(global_expert_id))]
-        result = restore_uvm_regions(
-            record.envelope_region_ids,
-            device=device,
-            executor=self.uvm_weight_executor,
-        )
-        state = RegionState.GPU if bool(result.get("ok")) else RegionState.UNKNOWN
+        if self.uvm_expert_offload_access_mode == "slot_restore":
+            validate_uvm_slot_direct_session_contract(
+                access_mode=self.uvm_expert_offload_access_mode,
+                device=int(device),
+            )
+            result = restore_uvm_regions_to_slots(
+                record.envelope_region_ids,
+                layer_id=layer_id,
+                expert_id=global_expert_id,
+                device=device,
+            )
+        else:
+            result = restore_uvm_regions(
+                record.envelope_region_ids,
+                device=device,
+                executor=self.uvm_weight_executor,
+            )
+        if bool(result.get("ok")):
+            # A slot mapping is logically GPU-accessible, but its ordinary UVM
+            # backing remains CPU-resident. Keep the aggregate state honest so
+            # cache eviction never needs a cross-layer state repair callback.
+            state = (
+                RegionState.CPU
+                if self.uvm_expert_offload_access_mode == "slot_restore"
+                else RegionState.GPU
+            )
+        else:
+            state = RegionState.UNKNOWN
         self._uvm_record_expert_state(layer_id, global_expert_id, state)
         return result
 
+    def _uvm_restore_expert_records_to_slots(
+        self,
+        *,
+        layer_id: int,
+        global_expert_ids: list[int],
+        device: int,
+    ) -> dict[str, object]:
+        """Submit one complete fused-MoE working set as a slot transaction."""
+        contract = validate_uvm_slot_direct_session_contract(
+            access_mode=self.uvm_expert_offload_access_mode,
+            device=int(device),
+        )
+        if bool(contract["registered_plan"]):
+            result = restore_uvm_registered_layer_plan(
+                layer_id=int(layer_id),
+                expert_ids=global_expert_ids,
+                device=int(device),
+            )
+            state = (
+                RegionState.CPU if bool(result.get("ok")) else RegionState.UNKNOWN
+            )
+            for global_expert_id in global_expert_ids:
+                self._uvm_record_expert_state(layer_id, global_expert_id, state)
+            return result
+
+        groups = [
+            (
+                int(global_expert_id),
+                self._uvm_expert_records[
+                    (int(layer_id), int(global_expert_id))
+                ].envelope_region_ids,
+            )
+            for global_expert_id in global_expert_ids
+        ]
+        result = restore_uvm_expert_groups_to_slots(
+            groups,
+            layer_id=int(layer_id),
+            device=int(device),
+        )
+        state = RegionState.CPU if bool(result.get("ok")) else RegionState.UNKNOWN
+        for global_expert_id in global_expert_ids:
+            self._uvm_record_expert_state(layer_id, global_expert_id, state)
+        return result
+
+    def get_uvm_slot_init_expert_groups(
+        self,
+    ) -> tuple[int, list[tuple[int, list[str]]]] | None:
+        """Return the immutable cold-layer geometry for bank initialization."""
+        if self.uvm_expert_offload_access_mode != "slot_restore":
+            return None
+        layer_id = self._uvm_layer_id()
+        if layer_id is None or not self._uvm_offloaded_global_expert_ids:
+            return None
+        groups = [
+            (
+                int(global_expert_id),
+                list(
+                    self._uvm_expert_records[
+                        (int(layer_id), int(global_expert_id))
+                    ].envelope_region_ids
+                ),
+            )
+            for global_expert_id in sorted(
+                self._uvm_offloaded_global_expert_ids
+            )
+        ]
+        return int(layer_id), groups
+
     def _uvm_restore_active_experts(self, topk_ids: torch.Tensor) -> None:
         if (
-            self.uvm_expert_offload_access_mode != "restore"
+            self.uvm_expert_offload_access_mode not in ("restore", "slot_restore")
             or not self._uvm_offloaded_global_expert_ids
         ):
             return
         layer_id = self._uvm_layer_id()
         if layer_id is None:
             return
-        active_ids = {
-            global_expert_id
-            for global_expert_id, _ in self._uvm_active_expert_pairs(topk_ids)
-            if global_expert_id in self._uvm_offloaded_global_expert_ids
-        }
+        if getattr(self, "uvm_slot_formal_restore_all_cold", False):
+            active_ids = set(self._uvm_offloaded_global_expert_ids)
+        else:
+            active_ids = {
+                global_expert_id
+                for global_expert_id, _ in self._uvm_active_expert_pairs(topk_ids)
+                if global_expert_id in self._uvm_offloaded_global_expert_ids
+            }
         if not active_ids:
             return
         device = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
-        for global_expert_id in sorted(active_ids):
-            result = self._uvm_restore_expert_record(
-                layer_id=layer_id,
-                global_expert_id=global_expert_id,
-                device=device,
-            )
-            if not bool(result.get("ok")):
-                raise RuntimeError(
-                    "Failed to restore active expert regions: "
-                    f"layer_id={layer_id}, expert_id={global_expert_id}, "
-                    f"result={result!r}"
+        kernel_stream_fence = (
+            self.uvm_expert_offload_access_mode == "slot_restore"
+            and uvm_slot_cuda_fence_enabled()
+            and _env_flag_enabled("VLLM_UVM_SLOT_DIRECT_REGISTERED_PLAN")
+            and _env_flag_enabled("VLLM_UVM_SLOT_DIRECT_DUAL_BANK_EVENT")
+        )
+        if (
+            self.uvm_expert_offload_access_mode == "slot_restore"
+            and torch.cuda.is_available()
+            and not kernel_stream_fence
+        ):
+            # Neither mode 20 nor registered-plan execution can observe
+            # ordinary CUDA-kernel lifetime. This device boundary applies to
+            # every slot transition (not only an eviction fallback), and proves
+            # that the old layer stopped using the bank before its PTE teardown.
+            torch.cuda.synchronize(device)
+        protected_groups = (
+            [(int(layer_id), expert_id) for expert_id in sorted(active_ids)]
+            if self.uvm_expert_offload_access_mode == "slot_restore"
+            else []
+        )
+        with protect_uvm_slot_direct_groups(protected_groups):
+            sorted_active_ids = sorted(active_ids)
+            if self.uvm_expert_offload_access_mode == "slot_restore":
+                result = self._uvm_restore_expert_records_to_slots(
+                    layer_id=layer_id,
+                    global_expert_ids=sorted_active_ids,
+                    device=device,
                 )
-            self._uvm_offloaded_global_expert_ids.remove(global_expert_id)
-        if torch.cuda.is_available():
+                if not bool(result.get("ok")):
+                    raise RuntimeError(
+                        "Failed to restore active expert regions: "
+                        f"layer_id={layer_id}, expert_ids={sorted_active_ids}, "
+                        f"result={result!r}"
+                    )
+            else:
+                for global_expert_id in sorted_active_ids:
+                    result = self._uvm_restore_expert_record(
+                        layer_id=layer_id,
+                        global_expert_id=global_expert_id,
+                        device=device,
+                    )
+                    if not bool(result.get("ok")):
+                        raise RuntimeError(
+                            "Failed to restore active expert regions: "
+                            f"layer_id={layer_id}, expert_id={global_expert_id}, "
+                            f"result={result!r}"
+                        )
+                    self._uvm_offloaded_global_expert_ids.remove(global_expert_id)
+        if torch.cuda.is_available() and not kernel_stream_fence:
             torch.cuda.synchronize(device)
 
     def run_uvm_init_weight_offload(self) -> None:

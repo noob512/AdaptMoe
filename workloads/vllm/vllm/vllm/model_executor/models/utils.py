@@ -4,6 +4,7 @@
 import itertools
 import json
 import os
+import threading
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -564,6 +565,16 @@ class PPMissingLayer(torch.nn.Identity):
 _CPU_OFFLOAD_BYTES = 0
 _CPU_OFFLOAD_MAX_BYTES = 0
 _CPU_OFFLOAD_ORDER = 0
+_CPU_OFFLOAD_EXACT_NAMES_FILE = ""
+_CPU_OFFLOAD_EXACT_NAMES: frozenset[str] | None = None
+_CPU_OFFLOAD_EXACT_PENDING: set[str] = set()
+_CPU_OFFLOAD_EXACT_SEEN: set[str] = set()
+_CPU_OFFLOAD_STATIC_BANK = False
+_CPU_OFFLOAD_STATIC_BANKS: dict[tuple[Any, ...], torch.Tensor] = {}
+_CPU_OFFLOAD_STATIC_BANK_BYTES = 0
+_CPU_OFFLOAD_OWNER_THREAD_ID: int | None = None
+_CPU_OFFLOAD_OWNER_DEVICE_INDEX: int | None = None
+_CPU_OFFLOAD_OWNER_STREAM_ID: int | None = None
 
 
 def _cpu_offload_manifest_file() -> str:
@@ -586,11 +597,113 @@ def _append_cpu_offload_manifest(record: dict[str, Any]) -> None:
         )
 
 
+def _load_cpu_offload_exact_names(exact_names_file: str) -> frozenset[str]:
+    try:
+        with open(exact_names_file, encoding="utf-8") as handle:
+            contents = handle.read()
+    except OSError as exc:
+        raise ValueError(
+            "Unable to read VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE "
+            f"{exact_names_file!r}: {exc}"
+        ) from exc
+
+    stripped = contents.strip()
+    if not stripped:
+        raise ValueError(
+            "VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE must contain at least one "
+            "full parameter name"
+        )
+
+    if stripped.startswith("["):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE starts with '[' but is "
+                f"not a valid JSON string list: {exc}"
+            ) from exc
+        if not isinstance(parsed, list) or not all(
+            isinstance(name, str) for name in parsed
+        ):
+            raise ValueError(
+                "JSON VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE must be a list of "
+                "strings"
+            )
+        names = parsed
+    else:
+        names = [line.strip() for line in contents.splitlines() if line.strip()]
+
+    if not names or any(not name.strip() for name in names):
+        raise ValueError(
+            "VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE contains an empty parameter name"
+        )
+    if any(name != name.strip() for name in names):
+        raise ValueError(
+            "JSON parameter names in VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE must not "
+            "have leading or trailing whitespace"
+        )
+    if len(names) != len(set(names)):
+        raise ValueError(
+            "VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE contains duplicate parameter "
+            "names"
+        )
+    return frozenset(names)
+
+
+def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
+    global _CPU_OFFLOAD_EXACT_NAMES_FILE
+    global _CPU_OFFLOAD_EXACT_NAMES, _CPU_OFFLOAD_EXACT_PENDING
+    global _CPU_OFFLOAD_EXACT_SEEN, _CPU_OFFLOAD_STATIC_BANK
+    global _CPU_OFFLOAD_STATIC_BANKS, _CPU_OFFLOAD_STATIC_BANK_BYTES
+    global _CPU_OFFLOAD_OWNER_THREAD_ID, _CPU_OFFLOAD_OWNER_DEVICE_INDEX
+    global _CPU_OFFLOAD_OWNER_STREAM_ID
+
+    exact_names_file = os.environ.get(
+        "VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE", ""
+    ).strip()
+    static_bank = _strict_env_flag("VLLM_CPU_OFFLOAD_STATIC_BANK", False)
+
+    _CPU_OFFLOAD_EXACT_NAMES_FILE = ""
+    _CPU_OFFLOAD_EXACT_NAMES = None
+    _CPU_OFFLOAD_EXACT_PENDING = set()
+    _CPU_OFFLOAD_EXACT_SEEN = set()
+    _CPU_OFFLOAD_STATIC_BANK = False
+    _CPU_OFFLOAD_STATIC_BANKS = {}
+    _CPU_OFFLOAD_STATIC_BANK_BYTES = 0
+    _CPU_OFFLOAD_OWNER_THREAD_ID = None
+    _CPU_OFFLOAD_OWNER_DEVICE_INDEX = None
+    _CPU_OFFLOAD_OWNER_STREAM_ID = None
+
+    if static_bank and not exact_names_file:
+        raise ValueError(
+            "VLLM_CPU_OFFLOAD_STATIC_BANK=1 requires "
+            "VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE"
+        )
+    if not exact_names_file:
+        return
+    if _normalized_cpu_offload_backend() != "copy":
+        raise ValueError(
+            "VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE is supported only with "
+            "VLLM_CPU_OFFLOAD_BACKEND=copy"
+        )
+    if max_bytes <= 0:
+        raise ValueError(
+            "Exact-name CPU offload requires a positive cpu_offload_gb budget"
+        )
+
+    exact_names = _load_cpu_offload_exact_names(exact_names_file)
+    _CPU_OFFLOAD_EXACT_NAMES_FILE = exact_names_file
+    _CPU_OFFLOAD_EXACT_NAMES = exact_names
+    _CPU_OFFLOAD_EXACT_PENDING = set(exact_names)
+    _CPU_OFFLOAD_STATIC_BANK = static_bank
+
+
 def set_cpu_offload_max_bytes(max_bytes: int) -> None:
     global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES, _CPU_OFFLOAD_ORDER
     _CPU_OFFLOAD_BYTES = 0
     _CPU_OFFLOAD_MAX_BYTES = max_bytes
     _CPU_OFFLOAD_ORDER = 0
+    _configure_cpu_offload_exact_names(max_bytes)
     manifest_file = _cpu_offload_manifest_file()
     if manifest_file and os.environ.get(
         "VLLM_CPU_OFFLOAD_MANIFEST_RESET", "1"
@@ -605,6 +718,17 @@ def set_cpu_offload_max_bytes(max_bytes: int) -> None:
                             "timestamp": time.time(),
                             "pid": os.getpid(),
                             "max_offload_bytes": int(max_bytes),
+                            "copy_exact_names": bool(
+                                _CPU_OFFLOAD_EXACT_NAMES is not None
+                            ),
+                            "copy_exact_name_count": len(
+                                _CPU_OFFLOAD_EXACT_NAMES or ()
+                            ),
+                            "copy_exact_names_file": (
+                                _CPU_OFFLOAD_EXACT_NAMES_FILE or None
+                            ),
+                            "copy_static_bank": bool(_CPU_OFFLOAD_STATIC_BANK),
+                            "copy_bank_bytes": 0,
                         },
                         sort_keys=True,
                     )
@@ -622,11 +746,106 @@ def _cpu_offload_backend() -> str:
     return os.environ.get("VLLM_CPU_OFFLOAD_BACKEND", "uva").strip().lower()
 
 
+def _normalized_cpu_offload_backend() -> str:
+    backend = _cpu_offload_backend()
+    if backend in ("", "native", "native_uva", "pinned_uva"):
+        return "uva"
+    if backend in ("copy_on_forward", "streaming_copy"):
+        return "copy"
+    return backend
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _strict_env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be 0 or 1, got {raw!r}")
+
+
+def _copy_exact_names_enabled() -> bool:
+    return _CPU_OFFLOAD_EXACT_NAMES is not None
+
+
+def _validate_copy_exact_context(
+    device: torch.device,
+    *,
+    check_stream: bool,
+) -> None:
+    global _CPU_OFFLOAD_OWNER_THREAD_ID, _CPU_OFFLOAD_OWNER_DEVICE_INDEX
+    global _CPU_OFFLOAD_OWNER_STREAM_ID
+
+    if getattr(device, "type", None) != "cuda":
+        raise RuntimeError(
+            "Exact-name CPU offload requires parameters on CUDA device 0"
+        )
+    device_count = int(torch.cuda.device_count())
+    if device_count != 1:
+        raise RuntimeError(
+            "Exact-name CPU offload is fail-closed for a single GPU; "
+            f"torch.cuda.device_count() returned {device_count}"
+        )
+    device_index = getattr(device, "index", None)
+    if device_index is None:
+        device_index = int(torch.cuda.current_device())
+    if int(device_index) != 0 or int(torch.cuda.current_device()) != 0:
+        raise RuntimeError(
+            "Exact-name CPU offload supports only current CUDA device 0"
+        )
+
+    thread_id = threading.get_ident()
+    if _CPU_OFFLOAD_OWNER_THREAD_ID is None:
+        _CPU_OFFLOAD_OWNER_THREAD_ID = thread_id
+        _CPU_OFFLOAD_OWNER_DEVICE_INDEX = int(device_index)
+    elif (
+        thread_id != _CPU_OFFLOAD_OWNER_THREAD_ID
+        or int(device_index) != _CPU_OFFLOAD_OWNER_DEVICE_INDEX
+    ):
+        raise RuntimeError(
+            "Exact-name CPU offload must be constructed and executed on one "
+            "thread and CUDA device"
+        )
+
+    if not check_stream:
+        return
+    stream = torch.cuda.current_stream(device)
+    cuda_stream = getattr(stream, "cuda_stream", None)
+    if cuda_stream is None:
+        raise RuntimeError(
+            "Exact-name CPU offload cannot identify the current CUDA stream"
+        )
+    stream_id = int(cuda_stream)
+    if _CPU_OFFLOAD_OWNER_STREAM_ID is None:
+        _CPU_OFFLOAD_OWNER_STREAM_ID = stream_id
+    elif stream_id != _CPU_OFFLOAD_OWNER_STREAM_ID:
+        raise RuntimeError(
+            "Exact-name CPU offload static-bank/copy execution must remain on "
+            "one CUDA stream"
+        )
+
+
+def _require_all_copy_exact_names_seen() -> None:
+    if not _copy_exact_names_enabled() or not _CPU_OFFLOAD_EXACT_PENDING:
+        return
+    missing = sorted(_CPU_OFFLOAD_EXACT_PENDING)
+    preview = ", ".join(repr(name) for name in missing[:8])
+    if len(missing) > 8:
+        preview += f", ... ({len(missing)} total)"
+    raise RuntimeError(
+        "Exact-name CPU offload did not find every requested parameter: "
+        f"{preview}"
+    )
 
 
 def _is_uvm_cpu_offload_backend(backend: str) -> bool:
@@ -664,24 +883,38 @@ def maybe_offload_to_cpu(
         return module
 
     global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES, _CPU_OFFLOAD_ORDER
-    if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
+    global _CPU_OFFLOAD_EXACT_PENDING, _CPU_OFFLOAD_EXACT_SEEN
+    global _CPU_OFFLOAD_STATIC_BANK_BYTES
+    exact_names_enabled = _copy_exact_names_enabled()
+    if (
+        not exact_names_enabled
+        and _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES
+    ):
         return module
 
     pin_memory = is_pin_memory_available()
     uva_available = is_uva_available()
 
-    assert uva_available, "V1 CPU offloading requires uva (pin memory) support"
-    uva_offloading = True
-    direct_cuda_parameter = True
-    offload_backend = _cpu_offload_backend()
-    if offload_backend in ("", "native", "native_uva", "pinned_uva"):
-        offload_backend = "uva"
-    if offload_backend != "uva" and not _is_uvm_cpu_offload_backend(
-        offload_backend
+    offload_backend = _normalized_cpu_offload_backend()
+    copy_on_forward = offload_backend == "copy"
+    if exact_names_enabled and not copy_on_forward:
+        raise RuntimeError(
+            "Exact-name CPU offload configuration changed after initialization; "
+            "VLLM_CPU_OFFLOAD_BACKEND must remain 'copy'"
+        )
+    uva_offloading = offload_backend == "uva"
+    direct_cuda_parameter = not copy_on_forward
+    if uva_offloading:
+        assert uva_available, "V1 CPU offloading requires uva support"
+    if (
+        offload_backend != "uva"
+        and not copy_on_forward
+        and not _is_uvm_cpu_offload_backend(offload_backend)
     ):
         raise ValueError(
             "Unknown VLLM_CPU_OFFLOAD_BACKEND="
-            f"{offload_backend!r}; use 'uva', 'isolated_uvm_migration', "
+            f"{offload_backend!r}; use 'uva', 'copy', "
+            "'isolated_uvm_migration', "
             "'isolated_uvm_remote', 'isolated_uvm_readmostly_remote', "
             "'isolated_uvm_prepare_remote', "
             "'isolated_uvm_prepare_remote_noreadmostly', "
@@ -694,6 +927,9 @@ def maybe_offload_to_cpu(
     # offload parameters to CPU
     # use pin_memory if possible, which helps cudagraph capture speed
     offloaded_parameters = False
+    exact_local_parameter_names: set[str] = set()
+    static_bank_keys: dict[str, tuple[Any, ...]] = {}
+    static_signature_lanes: dict[tuple[Any, ...], int] = {}
     hybrid_remote_ranges: list[tuple[int, int]] = []
     hybrid_remote_device_index = (
         device.index
@@ -701,7 +937,10 @@ def maybe_offload_to_cpu(
         else torch.cuda.current_device()
     )
     for param_index, (param_name, p) in enumerate(module.named_parameters()):
-        if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
+        if (
+            not exact_names_enabled
+            and _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES
+        ):
             # we use per-parameter offloading
             # one module might have some parameters offloaded and some not
             break
@@ -711,6 +950,28 @@ def maybe_offload_to_cpu(
             if module_prefix and param_name
             else (module_prefix or param_name)
         )
+
+        if exact_names_enabled:
+            assert _CPU_OFFLOAD_EXACT_NAMES is not None
+            if full_parameter_name not in _CPU_OFFLOAD_EXACT_NAMES:
+                continue
+            if full_parameter_name in _CPU_OFFLOAD_EXACT_SEEN:
+                raise RuntimeError(
+                    "Exact-name CPU offload encountered the same full parameter "
+                    f"name more than once: {full_parameter_name!r}"
+                )
+            if not pin_memory:
+                raise RuntimeError(
+                    "Exact-name CPU offload requires pinned host memory, but "
+                    "is_pin_memory_available() returned False"
+                )
+            if _CPU_OFFLOAD_BYTES + bytes_before > _CPU_OFFLOAD_MAX_BYTES:
+                raise RuntimeError(
+                    "Exact-name CPU offload selection exceeds cpu_offload_gb: "
+                    f"adding {full_parameter_name!r} ({bytes_before} bytes) "
+                    f"would exceed {_CPU_OFFLOAD_MAX_BYTES} bytes"
+                )
+            _validate_copy_exact_context(device, check_stream=False)
 
         manifest_extra: dict[str, Any] = {"offload_backend": offload_backend}
 
@@ -894,6 +1155,51 @@ def maybe_offload_to_cpu(
                 pin_memory=pin_memory,
             )
             cpu_data.copy_(p.data)
+            cpu_data_pinned = bool(
+                cpu_data.is_pinned() if hasattr(cpu_data, "is_pinned") else False
+            )
+            if exact_names_enabled and not cpu_data_pinned:
+                raise RuntimeError(
+                    "Exact-name CPU offload allocated pageable memory for "
+                    f"{full_parameter_name!r}; pinned memory is required"
+                )
+
+            bank_key: tuple[Any, ...] | None = None
+            bank_lane: int | None = None
+            bank_tensor_bytes = 0
+            if exact_names_enabled and _CPU_OFFLOAD_STATIC_BANK:
+                size = tuple(int(value) for value in p.data.size())
+                stride = tuple(int(value) for value in p.data.stride())
+                signature = (
+                    size,
+                    stride,
+                    p.data.dtype,
+                    getattr(device, "type", None),
+                    int(_CPU_OFFLOAD_OWNER_DEVICE_INDEX or 0),
+                )
+                bank_lane = static_signature_lanes.get(signature, 0)
+                static_signature_lanes[signature] = bank_lane + 1
+                bank_key = (*signature, bank_lane)
+                bank = _CPU_OFFLOAD_STATIC_BANKS.get(bank_key)
+                if bank is None:
+                    bank = torch.empty_strided(
+                        size=p.data.size(),
+                        stride=p.data.stride(),
+                        dtype=p.data.dtype,
+                        layout=p.data.layout,
+                        device=device,
+                    )
+                    _CPU_OFFLOAD_STATIC_BANKS[bank_key] = bank
+                    bank_tensor_bytes = int(
+                        bank.numel() * bank.element_size()
+                    )
+                    _CPU_OFFLOAD_STATIC_BANK_BYTES += bank_tensor_bytes
+                else:
+                    bank_tensor_bytes = int(
+                        bank.numel() * bank.element_size()
+                    )
+                static_bank_keys[param_name] = bank_key
+
             if not uva_offloading:
                 p.data = cpu_data
                 direct_cuda_parameter = False
@@ -903,13 +1209,38 @@ def maybe_offload_to_cpu(
                 p.data = get_cuda_view_from_cpu_tensor(cpu_data)
             manifest_extra.update(
                 {
-                    "cpu_data_pinned": bool(
-                        cpu_data.is_pinned()
-                        if hasattr(cpu_data, "is_pinned")
-                        else False
-                    )
+                    "cpu_data_pinned": cpu_data_pinned,
+                    "copy_on_forward": bool(copy_on_forward),
                 }
             )
+            if exact_names_enabled:
+                exact_local_parameter_names.add(param_name)
+                manifest_extra.update(
+                    {
+                        "copy_exact_names": True,
+                        "copy_exact_names_file": _CPU_OFFLOAD_EXACT_NAMES_FILE,
+                        "copy_static_bank": bool(_CPU_OFFLOAD_STATIC_BANK),
+                        "copy_bank_bytes": int(_CPU_OFFLOAD_STATIC_BANK_BYTES),
+                        "copy_bank_tensor_bytes": int(bank_tensor_bytes),
+                        "copy_bank_lane": bank_lane,
+                        "copy_bank_key": (
+                            {
+                                "shape": list(bank_key[0]),
+                                "stride": list(bank_key[1]),
+                                "dtype": str(bank_key[2]),
+                                "device_type": bank_key[3],
+                                "device_index": bank_key[4],
+                                "lane": bank_key[5],
+                            }
+                            if bank_key is not None
+                            else None
+                        ),
+                    }
+                )
+
+        if exact_names_enabled:
+            _CPU_OFFLOAD_EXACT_SEEN.add(full_parameter_name)
+            _CPU_OFFLOAD_EXACT_PENDING.remove(full_parameter_name)
 
         _CPU_OFFLOAD_BYTES += bytes_before
         offloaded_parameters = True
@@ -942,18 +1273,149 @@ def maybe_offload_to_cpu(
 
     if offloaded_parameters and not direct_cuda_parameter:
         original_forward = module.forward
+        copy_forward_index = 0
+        copy_trace = _env_flag("VLLM_CPU_OFFLOAD_COPY_TRACE", False)
+        copy_sync = _env_flag("VLLM_CPU_OFFLOAD_COPY_SYNC", False)
+        copy_static_bank = bool(
+            exact_names_enabled and _CPU_OFFLOAD_STATIC_BANK
+        )
 
         def forward(*args, **kwargs):
+            nonlocal copy_forward_index
             module.forward = original_forward
-            device_state = {
-                # here we blindly call `to(device)`
-                # if the parameter is already on the device, it will be a no-op
-                k: v.to(device, non_blocking=True)
-                for k, v in module.state_dict().items()
-            }
-            output = functional_call(module, device_state, args=args, kwargs=kwargs)
-            module.forward = forward
-            return output
+            copy_forward_index += 1
+            copy_bytes = 0
+            copy_tensor_count = 0
+            copy_cuda_ms: float | None = None
+            copy_submit_us: float | None = None
+            copy_ok = False
+            try:
+                if exact_names_enabled:
+                    _require_all_copy_exact_names_seen()
+                    _validate_copy_exact_context(
+                        device, check_stream=copy_static_bank
+                    )
+
+                state_items = list(module.state_dict().items())
+                if exact_names_enabled:
+                    state_keys = {key for key, _ in state_items}
+                    missing_local = exact_local_parameter_names - state_keys
+                    if missing_local:
+                        raise RuntimeError(
+                            "Exact-name CPU offload parameters disappeared from "
+                            f"module.state_dict(): {sorted(missing_local)!r}"
+                        )
+                for key, value in state_items:
+                    if (
+                        exact_names_enabled
+                        and key in exact_local_parameter_names
+                        and value.device.type != "cpu"
+                    ):
+                        raise RuntimeError(
+                            "Exact-name CPU-offload source is no longer "
+                            f"CPU-resident: {key!r} is on {value.device}"
+                        )
+                    if copy_static_bank and key in exact_local_parameter_names:
+                        copy_bytes += value.numel() * value.element_size()
+                        copy_tensor_count += 1
+                    elif copy_static_bank and value.device.type == "cpu":
+                        raise RuntimeError(
+                            "Static-bank forward found an unregistered CPU "
+                            f"state tensor: {key!r}"
+                        )
+                    elif not copy_static_bank and value.device.type == "cpu":
+                        copy_bytes += value.numel() * value.element_size()
+                        copy_tensor_count += 1
+
+                start_event = None
+                end_event = None
+                if copy_sync:
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    start_event.record(torch.cuda.current_stream(device))
+
+                copy_submit_start_ns = time.perf_counter_ns()
+                if copy_static_bank:
+                    device_state = {}
+                    for key, value in state_items:
+                        bank_key = static_bank_keys.get(key)
+                        if bank_key is None:
+                            device_state[key] = value
+                            continue
+                        bank = _CPU_OFFLOAD_STATIC_BANKS.get(bank_key)
+                        if bank is None:
+                            raise RuntimeError(
+                                "Static CPU-offload bank was reset or released "
+                                f"before forward for {key!r}"
+                            )
+                        bank.copy_(value, non_blocking=True)
+                        device_state[key] = bank
+                else:
+                    device_state = {
+                        # GPU values are a no-op. CPU values allocate a
+                        # temporary CUDA tensor and enqueue H2D on the current
+                        # stream. Keep this native path unchanged when no exact
+                        # name file is configured.
+                        key: value.to(device, non_blocking=True)
+                        for key, value in state_items
+                    }
+                copy_submit_us = (
+                    time.perf_counter_ns() - copy_submit_start_ns
+                ) / 1e3
+
+                if copy_sync:
+                    assert start_event is not None and end_event is not None
+                    end_event.record(torch.cuda.current_stream(device))
+                    end_event.synchronize()
+                    copy_cuda_ms = float(start_event.elapsed_time(end_event))
+
+                output = functional_call(
+                    module,
+                    device_state,
+                    args=args,
+                    kwargs=kwargs,
+                )
+                copy_ok = True
+                return output
+            finally:
+                module.forward = forward
+                if copy_trace:
+                    _append_cpu_offload_manifest(
+                        {
+                            "event": "cpu_offload_copy_forward",
+                            "timestamp": time.time(),
+                            "pid": os.getpid(),
+                            "module_prefix": module_prefix,
+                            "module_class": module.__class__.__name__,
+                            "forward_index": copy_forward_index,
+                            "copy_bytes": int(copy_bytes),
+                            "copy_tensor_count": int(copy_tensor_count),
+                            "copy_submit_us": copy_submit_us,
+                            "copy_cuda_ms": copy_cuda_ms,
+                            "copy_sync": bool(copy_sync),
+                            "copy_exact_names": bool(exact_names_enabled),
+                            "copy_exact_name_count": len(
+                                exact_local_parameter_names
+                            ),
+                            "copy_exact_names_file": (
+                                _CPU_OFFLOAD_EXACT_NAMES_FILE
+                                if exact_names_enabled
+                                else None
+                            ),
+                            "copy_static_bank": bool(copy_static_bank),
+                            "copy_bank_bytes": int(
+                                _CPU_OFFLOAD_STATIC_BANK_BYTES
+                                if copy_static_bank
+                                else 0
+                            ),
+                            "copy_bank_tensor_count": int(
+                                len(_CPU_OFFLOAD_STATIC_BANKS)
+                                if copy_static_bank
+                                else 0
+                            ),
+                            "ok": bool(copy_ok),
+                        }
+                    )
 
         module.forward = forward
 
@@ -1084,6 +1546,7 @@ def make_layers(
         ]
         + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
     )
+    _require_all_copy_exact_names_seen()
     return start_layer, end_layer, modules
 
 

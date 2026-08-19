@@ -48,6 +48,15 @@
   static int uvm_enable_debug_procfs = 0;
 #endif
 
+// Route tracing is intentionally opt-in: the slot transition hot path can
+// issue thousands of trace points, and timestamping, formatting, and
+// serializing each one materially distorts its latency. This parameter is
+// writable so a running experiment can bracket only the interval of interest.
+unsigned int uvm_phase_f_route_log_enable = 0;
+module_param(uvm_phase_f_route_log_enable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_phase_f_route_log_enable,
+                 "Enable high-frequency Phase F route debug tracing. Default: 0.");
+
 // Optional debug-only delay after each Phase F route log write. This gives a
 // userspace watcher more time to copy /proc/driver/nvidia-uvm/phase_f_route_log
 // into a real file before a suspected hard crash. Keep this disabled by default:
@@ -61,6 +70,7 @@ static struct proc_dir_entry *uvm_proc_dir;
 static struct proc_dir_entry *uvm_proc_gpus;
 static struct proc_dir_entry *uvm_proc_cpu;
 static struct proc_dir_entry *uvm_proc_phase_f_route_log;
+static struct proc_dir_entry *uvm_proc_phase_f_route_log_stats;
 static struct proc_dir_entry *uvm_proc_latency_stats;
 static struct proc_dir_entry *uvm_proc_latency_stats_reset;
 
@@ -68,29 +78,37 @@ static DEFINE_MUTEX(g_phase_f_route_log_lock);
 static char g_phase_f_route_log[UVM_PHASE_F_ROUTE_LOG_SIZE];
 static size_t g_phase_f_route_log_pos;
 static bool g_phase_f_route_log_wrapped;
+static atomic64_t g_phase_f_route_debug_emit_calls = ATOMIC64_INIT(0);
+static atomic64_t g_phase_f_route_disabled_race_drops = ATOMIC64_INIT(0);
+static atomic64_t g_phase_f_route_always_emit_calls = ATOMIC64_INIT(0);
+static atomic64_t g_phase_f_route_timestamp_calls = ATOMIC64_INIT(0);
+static atomic64_t g_phase_f_route_format_calls = ATOMIC64_INIT(0);
+static atomic64_t g_phase_f_route_mutex_acquires = ATOMIC64_INIT(0);
+static atomic64_t g_phase_f_route_records = ATOMIC64_INIT(0);
+static atomic64_t g_phase_f_route_bytes = ATOMIC64_INIT(0);
 
 bool uvm_procfs_is_debug_enabled(void)
 {
     return uvm_enable_debug_procfs != 0;
 }
 
-void uvm_phase_f_route_log(const char *fmt, ...)
+static void uvm_phase_f_route_vlog(const char *fmt, va_list args)
 {
     char line[512];
-    va_list args;
     size_t len;
     struct timespec64 ts;
 
+    atomic64_inc(&g_phase_f_route_timestamp_calls);
     ktime_get_real_ts64(&ts);
+
+    atomic64_inc(&g_phase_f_route_format_calls);
     len = scnprintf(line,
                     sizeof(line),
                     "[%lld.%09ld] ",
                     (long long)ts.tv_sec,
                     ts.tv_nsec);
 
-    va_start(args, fmt);
     len += vscnprintf(line + len, sizeof(line) - len, fmt, args);
-    va_end(args);
 
     if (len >= sizeof(line))
         len = sizeof(line) - 1;
@@ -102,6 +120,7 @@ void uvm_phase_f_route_log(const char *fmt, ...)
             line[sizeof(line) - 1] = '\n';
     }
 
+    atomic64_inc(&g_phase_f_route_mutex_acquires);
     mutex_lock(&g_phase_f_route_log_lock);
     if (len >= sizeof(g_phase_f_route_log)) {
         memcpy(g_phase_f_route_log, line + len - sizeof(g_phase_f_route_log), sizeof(g_phase_f_route_log));
@@ -119,8 +138,41 @@ void uvm_phase_f_route_log(const char *fmt, ...)
     }
     mutex_unlock(&g_phase_f_route_log_lock);
 
+    atomic64_inc(&g_phase_f_route_records);
+    atomic64_add(len, &g_phase_f_route_bytes);
+
     if (uvm_phase_f_route_log_delay_ms != 0)
         msleep(uvm_phase_f_route_log_delay_ms);
+}
+
+void uvm_phase_f_route_log_emit(const char *fmt, ...)
+{
+    va_list args;
+
+    atomic64_inc(&g_phase_f_route_debug_emit_calls);
+
+    // The header gate normally prevents this call entirely. Repeat it here so
+    // a concurrent sysfs disable cannot reach timestamp/format/mutex work.
+    if (unlikely(!uvm_phase_f_route_log_is_enabled())) {
+        atomic64_inc(&g_phase_f_route_disabled_race_drops);
+        return;
+    }
+
+    va_start(args, fmt);
+    uvm_phase_f_route_vlog(fmt, args);
+    va_end(args);
+}
+
+void uvm_phase_f_route_log_always(const char *fmt, ...)
+{
+    va_list args;
+
+    // Reserved for low-frequency fallback/error records which must remain
+    // visible even while high-frequency debug tracing is disabled.
+    atomic64_inc(&g_phase_f_route_always_emit_calls);
+    va_start(args, fmt);
+    uvm_phase_f_route_vlog(fmt, args);
+    va_end(args);
 }
 
 static int nv_procfs_read_phase_f_route_log(struct seq_file *s, void *v)
@@ -141,6 +193,35 @@ static int nv_procfs_read_phase_f_route_log(struct seq_file *s, void *v)
 }
 
 UVM_DEFINE_SINGLE_PROCFS_FILE(phase_f_route_log);
+
+static int nv_procfs_read_phase_f_route_log_stats(struct seq_file *s, void *v)
+{
+    seq_printf(s, "enabled %u\n", uvm_phase_f_route_log_is_enabled() ? 1 : 0);
+    seq_printf(s,
+               "debug_emit_calls %llu\n",
+               (NvU64)atomic64_read(&g_phase_f_route_debug_emit_calls));
+    seq_printf(s,
+               "disabled_race_drops %llu\n",
+               (NvU64)atomic64_read(&g_phase_f_route_disabled_race_drops));
+    seq_printf(s,
+               "always_emit_calls %llu\n",
+               (NvU64)atomic64_read(&g_phase_f_route_always_emit_calls));
+    seq_printf(s,
+               "timestamp_calls %llu\n",
+               (NvU64)atomic64_read(&g_phase_f_route_timestamp_calls));
+    seq_printf(s,
+               "format_calls %llu\n",
+               (NvU64)atomic64_read(&g_phase_f_route_format_calls));
+    seq_printf(s,
+               "mutex_acquires %llu\n",
+               (NvU64)atomic64_read(&g_phase_f_route_mutex_acquires));
+    seq_printf(s, "records %llu\n", (NvU64)atomic64_read(&g_phase_f_route_records));
+    seq_printf(s, "bytes %llu\n", (NvU64)atomic64_read(&g_phase_f_route_bytes));
+
+    return 0;
+}
+
+UVM_DEFINE_SINGLE_PROCFS_FILE(phase_f_route_log_stats);
 
 static int nv_procfs_read_latency_stats(struct seq_file *s, void *v)
 {
@@ -186,6 +267,13 @@ NV_STATUS uvm_procfs_init(void)
                                                      phase_f_route_log,
                                                      NULL);
     if (uvm_proc_phase_f_route_log == NULL)
+        return NV_ERR_OPERATING_SYSTEM;
+
+    uvm_proc_phase_f_route_log_stats = NV_CREATE_PROC_FILE("phase_f_route_log_stats",
+                                                           uvm_proc_dir,
+                                                           phase_f_route_log_stats,
+                                                           NULL);
+    if (uvm_proc_phase_f_route_log_stats == NULL)
         return NV_ERR_OPERATING_SYSTEM;
 
     uvm_proc_latency_stats = NV_CREATE_PROC_FILE("latency_stats",

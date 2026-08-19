@@ -327,6 +327,12 @@ struct uvm_va_block_struct
     NvU64 start;
     NvU64 end;
 
+    // Incremented whenever CPU chunk topology or a CE-visible sysmem DMA
+    // mapping changes. Registered MoE copy plans cache physical copy
+    // addresses and compare this epoch while holding the block lock before
+    // reusing them. Zero is reserved for an uninitialized/invalid epoch.
+    NvU64 moe_slot_copy_source_epoch;
+
     // Per-processor residency bit vector, used for fast lookup of which
     // processors are active in this block.
     //
@@ -950,6 +956,23 @@ NV_STATUS uvm_va_block_premap_readmostly_remote_read(uvm_va_block_t *va_block,
                                                      bool wait_for_mappings,
                                                      NvU32 *mapped_pages_out);
 
+// Setup-only helper which converts an existing ordinary CPU-backed 2 MiB GPU
+// READ-only PTE into 32 ordinary 64 KiB PTEs without changing residency,
+// permissions, or virtual addresses. An existing uniform 64 KiB hierarchy is
+// accepted idempotently. Partial blocks, 4 KiB/mixed hierarchies, GPU residency,
+// WRITE/ATOMIC mappings, slot-backed PTEs, and non-sole CPU residency are
+// rejected. The helper waits for the block tracker before returning.
+//
+// LOCKING: The caller must hold the va block lock. If va_block_context->mm !=
+//          NULL, va_block_context->mm->mmap_lock must be held in at least read
+//          mode.
+NV_STATUS uvm_va_block_force_cpu_remote_read_64k(uvm_va_block_t *va_block,
+                                                 uvm_va_block_context_t *va_block_context,
+                                                 uvm_gpu_id_t gpu_id,
+                                                 uvm_va_block_region_t region,
+                                                 bool *split_out,
+                                                 bool *already_64k_out);
+
 // Enqueue a background read-dup promotion for ReadMostly managed pages. This is
 // intended to be paired with uvm_va_block_premap_readmostly_remote_read(): the
 // foreground path keeps GPU reads remote, while the worker copies CPU-resident
@@ -1063,6 +1086,387 @@ NV_STATUS uvm_va_block_expert_promote_read_duplicate_batch_single_lock(uvm_va_sp
                                                                        size_t entry_count,
                                                                        uvm_tracker_t *out_tracker,
                                                                        uvm_processor_mask_t *involved_processors);
+
+typedef enum
+{
+    UVM_SLOT_DIRECT_FAILURE_NONE = 0,
+    UVM_SLOT_DIRECT_FAILURE_ELIGIBILITY,
+    UVM_SLOT_DIRECT_FAILURE_PREPARE,
+    UVM_SLOT_DIRECT_FAILURE_COPY,
+    UVM_SLOT_DIRECT_FAILURE_MAP,
+    UVM_SLOT_DIRECT_FAILURE_ROLLBACK,
+} uvm_slot_direct_failure_stage_t;
+
+// GPU PTE granularity used by one slot-direct VA-block slice. Keep 4K as zero
+// so callers which predate this field retain the original behavior when their
+// entry storage is zero-initialized.
+typedef enum
+{
+    UVM_SLOT_DIRECT_PTE_MODE_4K = 0,
+    UVM_SLOT_DIRECT_PTE_MODE_64K,
+    UVM_SLOT_DIRECT_PTE_MODE_2M,
+} uvm_slot_direct_pte_mode_t;
+
+// One block slice of a slot-direct batch. Callers flatten user ranges into
+// unique VA blocks, sort them by increasing VA, and provide one persistent
+// preallocated VIDMEM slot plus one slot-lifetime tracker per slice.
+typedef struct
+{
+    uvm_va_block_t *va_block;
+    uvm_va_block_region_t region;
+    uvm_mem_t *slot_mem;
+    uvm_tracker_t *slot_tracker;
+    NvU64 slot_offset;
+    uvm_slot_direct_pte_mode_t pte_mode;
+
+    // Outputs used by the slot-pool owner for completion and rollback.
+    NvU64 copied_bytes;
+    int cpu_nid;
+    bool mapped;
+    // A complete 64K leaf table has been filled while its parent 2M entry is
+    // still invalid. The table is unreachable by the GPU page walker until a
+    // later publish push activates the parent PDE.
+    bool shadow_prefilled;
+    // Set only after the transition caller has validated the entire 64K batch
+    // under the VA-space and slot-pool locks, before owner cutover.
+    bool preflighted_64k;
+
+    // Private state for the shared-push implementation.
+    bool prepared;
+    // Intrusive touched-entry lists let copy_flush visit only blocks and
+    // slots referenced by the active push. Entries are emitted in sorted VA
+    // order, so each unique block and logical slot is appended once.
+    size_t next_copy_block_entry;
+    size_t next_copy_slot_entry;
+} uvm_va_block_slot_direct_entry_t;
+
+// One immutable CE transfer recorded by a registered MoE plan. The push and
+// its acquire/completion methods remain dynamic; only the stable memcopy
+// payload is cached.
+typedef struct
+{
+    uvm_gpu_address_t src;
+    uvm_gpu_address_t dst;
+    NvU64 bytes;
+    NvU32 entry_index;
+} uvm_va_block_slot_copy_run_t;
+
+// Topology/epoch guard for one flattened VA-block slice. This is deliberately
+// separate from the run array so execute can validate one record per slice
+// instead of walking every CPU page again.
+typedef struct
+{
+    uvm_va_block_t *va_block;
+    uvm_va_block_region_t region;
+    uvm_mem_t *slot_mem;
+    NvU64 slot_offset;
+    NvU64 source_epoch;
+    NvU32 first_run;
+    NvU32 run_count;
+    int cpu_nid;
+} uvm_va_block_slot_copy_entry_t;
+
+typedef struct
+{
+    uvm_va_block_slot_copy_entry_t *entries;
+    uvm_va_block_slot_copy_run_t *runs;
+    size_t entry_count;
+    size_t run_count;
+    NvU64 bytes;
+} uvm_va_block_slot_copy_plan_t;
+
+typedef struct
+{
+    NvU64 block_count;
+    NvU64 prepared_blocks;
+    NvU64 mapped_blocks;
+    NvU64 pte_4k_blocks;
+    NvU64 pte_64k_blocks;
+    NvU64 partial_64k_blocks;
+    NvU64 pte_2m_blocks;
+    NvU64 pte_write_entries;
+    NvU64 skipped_unmap_blocks;
+    NvU64 stage_sync_waits;
+    NvU64 copy_methods;
+    NvU64 copy_pushes;
+    NvU64 copied_bytes;
+    NvU64 mapped_bytes;
+    bool overlap_copy_prepare;
+    bool copy_already_submitted;
+    bool shadow_pte_prefill;
+    NvU64 shadow_pte_prefill_blocks;
+    NvU64 shadow_pte_prefill_ns;
+    NvU64 shadow_pte_publish_ns;
+    NvU64 prepare_ns;
+    NvU64 invalidate_ns;
+    NvU64 pte_prepare_ns;
+    NvU64 unmap_ns;
+    NvU64 copy_ns;
+    NvU64 map_ns;
+    NvU64 prepare_complete_ns;
+    NvU64 copy_complete_ns;
+    NvU64 map_complete_ns;
+    NvU64 helper_context_ns;
+    NvU64 block_lock_acquire_ns;
+    NvU64 locked_revalidate_ns;
+    NvU64 copy_to_map_ns;
+    NvU64 block_unlock_ns;
+    NvU64 helper_context_free_ns;
+    bool copy_run_cache_hit;
+    NvU64 copy_run_cache_runs;
+    NvU64 copy_run_cache_validate_ns;
+    NvU64 copy_method_emit_ns;
+    NvU64 copy_tracker_attach_ns;
+    uvm_slot_direct_failure_stage_t failure_stage;
+} uvm_va_block_slot_direct_result_t;
+
+typedef struct
+{
+    NvU64 block_count;
+    NvU64 allocated_blocks;
+    NvU64 reused_blocks;
+    // Full 2 MiB groups can use shadow leaf prefill. Partial 64K groups in the
+    // same plan use the copy-dependent live-leaf path, so this flag means at
+    // least one group is eligible rather than that the entire plan is full.
+    NvU64 full_block_count;
+    NvU64 partial_block_count;
+    bool shadow_eligible;
+} uvm_va_block_slot_plan_pte_prewarm_result_t;
+
+// Restricted managed-CPU-to-preallocated-slot copy and map path. Both modes
+// use the same prepare, physical source runs, slot backing, and PTE mapping;
+// shared_push only changes CE push aggregation. Every submitted push is added
+// to all involved VA-block trackers, slot trackers, and batch_tracker before
+// any block lock is released.
+//
+// Validate the sliced-64K contract without clearing any PTE or submitting a
+// copy. This is used before an irreversible fixed-bank owner cutover to prove
+// source residency/copyability, sorted non-overlapping 64K-aligned slices, MMU
+// support, and every destination slot's 64K physical compatibility. Partial
+// 2M VA-block coverage is legal, but is not eligible for shadow leaf prefill.
+// LOCKING: va_space->lock and mmap_lock (when mm is non-NULL) must be held.
+NV_STATUS uvm_va_block_slot_direct_preflight_64k_batch(uvm_va_space_t *va_space,
+                                                       struct mm_struct *mm,
+                                                       uvm_gpu_t *gpu,
+                                                       uvm_va_block_slot_direct_entry_t *entries,
+                                                       size_t entry_count);
+
+// Reject a transition target which is already covered by any slot-backed PTE.
+// This keeps fail-closed cleanup from having to split or infer ownership of a
+// pre-existing slot-backed large leaf. Entries must be VA-sorted.
+// LOCKING: va_space->lock must be held.
+NV_STATUS uvm_va_block_slot_direct_preflight_targets_not_slot_mapped(
+    uvm_va_space_t *va_space,
+    uvm_gpu_t *gpu,
+    uvm_va_block_slot_direct_entry_t *entries,
+    size_t entry_count);
+
+// Allocate the complete 64K page-table hierarchy required by an immutable
+// registered plan without writing any valid leaf PTE or changing mapping,
+// residency, slot-owner, or generation state. The execute path deliberately
+// keeps its normal allocation/revalidation call; an intact hierarchy turns
+// that call into an O(1) check, while an invalidated hierarchy is rebuilt.
+//
+// LOCKING: va_space->lock must be held for write and entries must be sorted by
+//          block VA and region start. If mm is non-NULL, its mmap_lock must be
+//          held by the caller.
+NV_STATUS uvm_va_block_slot_plan_pte_prewarm(
+    uvm_va_space_t *va_space,
+    struct mm_struct *mm,
+    uvm_gpu_t *gpu,
+    uvm_va_block_slot_direct_entry_t *entries,
+    size_t entry_count,
+    uvm_va_block_slot_plan_pte_prewarm_result_t *result);
+
+// Build and validate the immutable memcopy portion of a registered plan.
+// Creation scans the CPU backing only at registration. Validation is O(number
+// of flattened slices) and rejects a changed source epoch before transaction
+// state, PTEs, or slot contents are modified.
+//
+// LOCKING: va_space->lock must be held for write. lockdep_nest_lock must be
+//          held by the caller. Entries must be sorted by block and region.
+NV_STATUS uvm_va_block_slot_copy_plan_create(
+    uvm_va_space_t *va_space,
+    struct mm_struct *mm,
+    uvm_gpu_t *gpu,
+    uvm_va_block_slot_direct_entry_t *entries,
+    size_t entry_count,
+    struct mutex *lockdep_nest_lock,
+    uvm_va_block_slot_copy_plan_t **copy_plan_out);
+
+NV_STATUS uvm_va_block_slot_copy_plan_validate(
+    uvm_va_space_t *va_space,
+    struct mm_struct *mm,
+    uvm_gpu_t *gpu,
+    uvm_va_block_slot_direct_entry_t *entries,
+    size_t entry_count,
+    const uvm_va_block_slot_copy_plan_t *copy_plan);
+
+void uvm_va_block_slot_copy_plan_destroy(uvm_va_block_slot_copy_plan_t *copy_plan);
+
+// Submit only the immutable cached CE copy portion of a registered plan. This
+// is used by the dual-bank event path after userspace has completed the main
+// compute-stream event. The destination bank must be inactive: no PTE is
+// cleared or published here. The submitted push is retained by destination
+// slot trackers and batch_tracker. Source VA-block attachment is deliberately
+// deferred: the follow-on map helper first queues target invalidation, then
+// attaches the aggregate tracker before publishing any valid PTE. The
+// VA-space and mmap locks protect source lifetime across that interval.
+//
+// LOCKING: va_space->lock and mmap_lock (when mm is non-NULL) must be held.
+//          lockdep_nest_lock must be held by the caller. Entries must be
+//          sorted by block VA and region start, and slot trackers initialized.
+NV_STATUS uvm_va_block_slot_direct_submit_cached_copy(
+    uvm_va_space_t *va_space,
+    struct mm_struct *mm,
+    uvm_gpu_t *gpu,
+    uvm_va_block_slot_direct_entry_t *entries,
+    size_t entry_count,
+    bool shared_push,
+    const uvm_va_block_slot_copy_plan_t *copy_plan,
+    struct mutex *lockdep_nest_lock,
+    uvm_tracker_t *batch_tracker,
+    uvm_va_block_slot_direct_result_t *result);
+
+// LOCKING: va_space->lock and mmap_lock (when mm is non-NULL) must be held.
+//          lockdep_nest_lock must be held by the caller. Entries must be
+//          sorted by block VA and region start. Disjoint slices may share a
+//          block; the implementation acquires each unique block lock once.
+NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
+                                                   struct mm_struct *mm,
+                                                   uvm_gpu_t *gpu,
+                                                   uvm_va_block_slot_direct_entry_t *entries,
+                                                   size_t entry_count,
+                                                   bool shared_push,
+                                                   bool skip_unmap,
+                                                   bool require_existing_pte_mode,
+                                                   bool stage_sync,
+                                                   bool overlap_copy_prepare,
+                                                   bool copy_already_submitted,
+                                                   bool shadow_pte_prefill,
+                                                   bool fail_closed,
+                                                   const uvm_va_block_slot_copy_plan_t *copy_plan,
+                                                   struct mutex *lockdep_nest_lock,
+                                                   uvm_tracker_t *batch_tracker,
+                                                   uvm_va_block_slot_direct_result_t *result);
+
+// Best-effort failure cleanup for a slot-direct transaction which must never
+// restore a GPU mapping to CPU backing. Every target slice is generically
+// unmapped, including slices which still carry an ordinary CPU-backed GPU PTE,
+// and the function waits for their PTE/TLB pushes before returning. The caller
+// must reserve block_context before starting any fail-closed mutation.
+NV_STATUS uvm_va_block_slot_direct_fail_closed_unmap_batch(
+    uvm_va_space_t *va_space,
+    uvm_va_block_context_t *block_context,
+    uvm_gpu_t *gpu,
+    uvm_va_block_slot_direct_entry_t *entries,
+    size_t entry_count);
+
+typedef struct
+{
+    bool shared_push;
+    bool stage_sync;
+    bool overlap_copy_prepare;
+    bool dual_bank_copy_first;
+    bool shadow_pte_prefill;
+    bool metadata_recipe_cache_enabled;
+    bool target_recipe_cache_hit;
+    bool clear_recipe_cache_hit;
+    bool success;
+    bool fallback;
+    bool transition_fast_index;
+    bool transition_group_clear;
+    bool transition_group_clear_fallback;
+    bool transition_direct_cutover;
+    NvU64 requested_ranges;
+    NvU64 completed_ranges;
+    NvU64 blocks;
+    NvU64 pte_4k_blocks;
+    NvU64 pte_64k_blocks;
+    NvU64 partial_64k_blocks;
+    NvU64 pte_2m_blocks;
+    NvU64 pte_write_entries;
+    NvU64 skipped_unmap_blocks;
+    NvU64 methods;
+    NvU64 pushes;
+    NvU64 requested_bytes;
+    NvU64 completed_bytes;
+    NvU64 pte_map_ranges;
+    NvU64 pte_map_bytes;
+    NvU64 tracker_waits;
+    NvU64 backing_allocations;
+    NvU64 backing_evictions;
+    NvU64 transition_clear_ranges;
+    NvU64 transition_clear_unique_blocks;
+    NvU64 transition_direct_cutover_pages;
+    NvU64 total_ns;
+    NvU64 prepare_ns;
+    NvU64 invalidate_ns;
+    NvU64 pte_prepare_ns;
+    NvU64 unmap_ns;
+    NvU64 copy_ns;
+    NvU64 map_ns;
+    NvU64 wait_ns;
+    NvU64 prepare_complete_ns;
+    NvU64 copy_complete_ns;
+    NvU64 map_complete_ns;
+    NvU64 shadow_pte_prefill_blocks;
+    NvU64 shadow_pte_prefill_ns;
+    NvU64 shadow_pte_publish_ns;
+    NvU64 pre_helper_total_ns;
+    NvU64 helper_total_ns;
+    NvU64 post_helper_total_ns;
+    NvU64 gate_ns;
+    NvU64 state_alloc_ns;
+    NvU64 gpu_retain_ns;
+    NvU64 outer_lock_acquire_ns;
+    NvU64 batch_bookkeeping_ns;
+    NvU64 slot_validate_ns;
+    NvU64 flatten_sort_ns;
+    NvU64 transition_preflight_ns;
+    NvU64 transition_clear_rebind_ns;
+    NvU64 slot_tracker_init_ns;
+    NvU64 helper_context_ns;
+    NvU64 block_lock_acquire_ns;
+    NvU64 locked_revalidate_ns;
+    NvU64 copy_to_map_ns;
+    NvU64 block_unlock_ns;
+    NvU64 helper_context_free_ns;
+    bool copy_run_cache_hit;
+    NvU64 copy_run_cache_runs;
+    NvU64 copy_run_cache_validate_ns;
+    NvU64 copy_method_emit_ns;
+    NvU64 copy_tracker_attach_ns;
+    NvU64 result_check_ns;
+    NvU64 pte_metadata_ns;
+    NvU64 status_resolve_ns;
+    NvU64 slot_state_commit_ns;
+    NvU64 telemetry_cleanup_ns;
+    NvU64 outer_lock_release_ns;
+    NvU64 resource_teardown_ns;
+} uvm_slot_direct_batch_telemetry_t;
+
+void uvm_va_block_note_slot_direct_batch(const uvm_slot_direct_batch_telemetry_t *telemetry);
+void uvm_va_block_note_slot_plan_register(void);
+void uvm_va_block_note_slot_plan_pte_prewarm(
+    NV_STATUS status,
+    NvU64 ranges,
+    NvU64 bytes,
+    NvU64 ns,
+    const uvm_va_block_slot_plan_pte_prewarm_result_t *result);
+void uvm_va_block_note_slot_plan_copy_cache(NV_STATUS status,
+                                             NvU64 ranges,
+                                             NvU64 bytes,
+                                             NvU64 ns,
+                                             NvU64 entries,
+                                             NvU64 runs);
+void uvm_va_block_note_slot_plan_execute(void);
+void uvm_va_block_note_slot_plan_destroy(void);
+void uvm_va_block_note_slot_session_abort(NvBool session_cleared,
+                                          NvU32 released_slots,
+                                          NvU64 released_bytes,
+                                          NvU32 remaining_slots);
+void uvm_va_block_note_slot_legacy_ioctl(NvBool layer_transition);
 
 // Like uvm_va_block_map, except it maps all processors in the input mask. The
 // VA block tracker contains all map operations on return.
@@ -1599,6 +2003,34 @@ NV_STATUS uvm_va_block_unmap_moe_slot(uvm_va_block_t *va_block,
                                       uvm_va_block_region_t region,
                                       const uvm_page_mask_t *page_mask,
                                       uvm_tracker_t *out_tracker);
+
+// Clears a slot-backed GPU mapping without eagerly replacing it with a
+// GPU-visible read-only mapping to the CPU-resident source. CPU residency and
+// the CPU virtual mapping are preserved, so a later GPU access follows the
+// ordinary UVM fault path. This is restricted to fixed-bank owner transitions:
+// general slot release continues to use uvm_va_block_unmap_moe_slot() so old
+// weights remain immediately GPU-readable through sysmem.
+//
+// Locking and complete-leaf requirements are identical to
+// uvm_va_block_unmap_moe_slot().
+NV_STATUS uvm_va_block_unmap_moe_slot_no_cpu_restore(uvm_va_block_t *va_block,
+                                                     uvm_va_block_context_t *block_context,
+                                                     uvm_gpu_t *gpu,
+                                                     uvm_va_block_region_t region,
+                                                     const uvm_page_mask_t *page_mask,
+                                                     uvm_tracker_t *out_tracker);
+
+// Validate, without changing hardware or software mapping state, that every
+// requested page is currently covered by a slot-backed read-only PTE and that
+// the request does not select only part of a 2 MiB or 64 KiB leaf. This is used
+// by the fixed-bank transition path to prove a complete grouped clear before
+// any old mapping is changed.
+//
+// Locking: the va_block lock must be held. The va_space lock must be held.
+NV_STATUS uvm_va_block_validate_moe_slot_unmap(uvm_va_block_t *va_block,
+                                               uvm_gpu_t *gpu,
+                                               uvm_va_block_region_t region,
+                                               const uvm_page_mask_t *page_mask);
 
 // Release any GPU or policy data associated with the given region in response
 // to munmap().
@@ -2479,6 +2911,18 @@ void uvm_va_block_print_latency_stats(struct seq_file *s);
 // Reset global counters for the experimental latency-aware remote-first
 // background promotion path.
 void uvm_va_block_reset_latency_stats(void);
+
+// Add one completed V2 prefetch-batch API attempt to the flat latency_stats
+// counters. fallbacks is explicit so tests can verify that this API never
+// routes through the legacy per-range migration path.
+void uvm_va_block_note_prefetch_gpu_batch_fast(NvU64 core_calls,
+                                               NvU64 requested_ranges,
+                                               NvU64 completed_ranges,
+                                               NvU64 requested_bytes,
+                                               NvU64 completed_bytes,
+                                               NvU64 waits,
+                                               NvU64 fallbacks,
+                                               NvU64 errors);
 
 typedef enum
 {

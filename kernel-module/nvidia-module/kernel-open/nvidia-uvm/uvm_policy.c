@@ -917,6 +917,11 @@ retry_after_slot_clear:
     mm = uvm_va_space_mm_or_current_retain_lock(va_space);
     uvm_va_space_down_read(va_space);
 
+    // Discard changes the data/residency contract cached by immutable slot
+    // plans. The VA lock serializes this epoch bump with plan registration and
+    // with the execution-time locked revalidation.
+    uvm_va_space_moe_slot_plan_invalidate(va_space);
+
     type = uvm_api_range_type_check(va_space, mm, base, length);
     if (type != UVM_API_RANGE_TYPE_MANAGED) {
         // System allocated and HMM memory is validated but we don't do anything with it.

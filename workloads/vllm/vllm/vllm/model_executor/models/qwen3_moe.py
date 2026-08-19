@@ -30,6 +30,8 @@ import time
 import typing
 from collections import Counter
 from collections.abc import Callable, Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
+from functools import partial
 from itertools import islice
 from typing import Any
 
@@ -607,6 +609,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        pre_mlp_callback: Callable[[], None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -621,8 +624,534 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if pre_mlp_callback is not None:
+            pre_mlp_callback()
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+
+
+class _Qwen3MoePrefillOraclePrefetch:
+    """Experimental fixed-plan L+1 prefetch used only by the prefill probe."""
+
+    def __init__(self) -> None:
+        self.mode = os.environ.get(
+            "VLLM_UVM_PREFILL_ORACLE_PREFETCH_MODE", "off"
+        ).strip().lower()
+        if self.mode not in ("off", "sync", "async"):
+            logger.warning(
+                "Unknown VLLM_UVM_PREFILL_ORACLE_PREFETCH_MODE=%s; disabling",
+                self.mode,
+            )
+            self.mode = "off"
+        try:
+            self.min_tokens = max(
+                int(os.environ.get("VLLM_UVM_PREFILL_ORACLE_MIN_TOKENS", "2")),
+                1,
+            )
+        except ValueError:
+            self.min_tokens = 2
+        self.fail_fast = os.environ.get(
+            "VLLM_UVM_PREFILL_ORACLE_FAIL_FAST", "1"
+        ).lower() in ("1", "true", "yes", "on")
+        self.trace_file = os.environ.get(
+            "VLLM_UVM_PREFILL_ORACLE_TRACE_FILE", ""
+        )
+        self.prefetch_stream: torch.cuda.Stream | None = None
+        self.device: int | None = None
+        self.executor: ThreadPoolExecutor | None = None
+        self.modules: dict[int, FusedMoE] = {}
+        self.configured_experts: dict[int, list[int]] = {}
+        self.tickets: dict[int, dict[str, Any]] = {}
+        self.completed_layers: set[int] = set()
+        self.layer_records: list[dict[str, Any]] = []
+        self.active = False
+        self.completed_once = False
+        self.generation = 0
+        self.num_tokens = 0
+        self.started_ns = 0
+
+    def _shutdown_executor(self) -> None:
+        executor, self.executor = self.executor, None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+
+    def _reject(
+        self,
+        message: str,
+        *,
+        cause: BaseException | None = None,
+    ) -> bool:
+        try:
+            self.abort(message)
+        except BaseException as drain_error:
+            raise RuntimeError(
+                f"{message}; failed to drain prefill oracle pipeline"
+            ) from drain_error
+        if self.fail_fast:
+            raise RuntimeError(message) from cause
+        logger.error(message)
+        return False
+
+    @staticmethod
+    def _expert_module(layer: nn.Module) -> FusedMoE | None:
+        mlp = getattr(layer, "mlp", None)
+        experts = getattr(mlp, "experts", None)
+        return experts if isinstance(experts, FusedMoE) else None
+
+    def begin(
+        self,
+        layer_items: list[tuple[int, nn.Module]],
+        *,
+        num_tokens: int,
+    ) -> bool:
+        self.active = False
+        if (
+            self.mode == "off"
+            or self.completed_once
+            or int(num_tokens) < self.min_tokens
+            or not torch.cuda.is_available()
+        ):
+            return False
+
+        self.modules = {}
+        self.configured_experts = {}
+        for layer_id, layer in layer_items:
+            module = self._expert_module(layer)
+            if module is None:
+                continue
+            configured = sorted(
+                int(expert_id)
+                for plan_layer_id, expert_id in module.uvm_init_weight_offload_plan_keys
+                if int(plan_layer_id) == int(layer_id)
+            )
+            if configured:
+                self.modules[int(layer_id)] = module
+                self.configured_experts[int(layer_id)] = configured
+
+        if not self.configured_experts:
+            return self._reject("Prefill oracle plan contains no local experts")
+
+        # Model warmup runs before Stage-M post-warmup offload.  Ignore those
+        # forwards and activate only after every configured layer was released.
+        if not all(
+            bool(getattr(module, "_uvm_init_weight_offload_done", False))
+            for module in self.modules.values()
+        ):
+            return False
+
+        if any(
+            module.uvm_weight_executor != "cpp_batch"
+            for module in self.modules.values()
+        ):
+            return self._reject("Prefill oracle prefetch requires cpp_batch")
+
+        remaining = {
+            layer_id: module.uvm_prefill_oracle_plan_expert_ids()
+            for layer_id, module in self.modules.items()
+        }
+        mismatched = {
+            layer_id: {
+                "configured": self.configured_experts[layer_id],
+                "remaining": remaining[layer_id],
+            }
+            for layer_id in self.modules
+            if remaining[layer_id] != self.configured_experts[layer_id]
+        }
+        if mismatched:
+            return self._reject(
+                f"Prefill oracle plan/offloaded state mismatch: {mismatched!r}"
+            )
+
+        device = int(torch.cuda.current_device())
+        self.device = device
+        if self.prefetch_stream is None:
+            self.prefetch_stream = torch.cuda.Stream(device=device)
+        if self.mode == "async":
+            self.executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="qwen-prefill-oracle",
+            )
+        self.tickets = {}
+        self.completed_layers = set()
+        self.layer_records = []
+        self.generation += 1
+        self.num_tokens = int(num_tokens)
+        self.started_ns = time.perf_counter_ns()
+        self.active = True
+
+        first_layer_id = int(layer_items[0][0])
+        entry_event = torch.cuda.Event(enable_timing=True)
+        entry_event.record(torch.cuda.current_stream(device))
+        submitted = self._submit(
+            target_layer_id=first_layer_id,
+            source_layer_id=None,
+            trigger_event=entry_event,
+            use_worker=False,
+        )
+        if submitted and first_layer_id in self.modules:
+            # The first layer has no preceding MoE compute to overlap.  Make it
+            # an identical, fully synchronous cost in both comparison modes.
+            self._complete_ticket(first_layer_id)
+        return bool(self.active)
+
+    def _run_prepare(self, ticket: dict[str, Any]) -> dict[str, Any]:
+        """Run one prepare operation, optionally on the executor thread."""
+        stream = typing.cast(torch.cuda.Stream, ticket["prefetch_stream"])
+        trigger = typing.cast(torch.cuda.Event, ticket["trigger_event"])
+        prefetch_start = typing.cast(torch.cuda.Event, ticket["prefetch_start"])
+        ready = typing.cast(torch.cuda.Event, ticket["ready"])
+        module = typing.cast(FusedMoE, ticket["module"])
+        expert_ids = typing.cast(list[int], ticket["configured_expert_ids"])
+        device = int(ticket["device"])
+        result: dict[str, object] = {
+            "ok": False,
+            "reason": "submission_not_started",
+        }
+        submission_error: BaseException | None = None
+        ready_error: BaseException | None = None
+        prefetch_start_recorded = False
+        ready_recorded = False
+        worker_start_ns = time.perf_counter_ns()
+
+        try:
+            with torch.cuda.device(device), torch.cuda.stream(stream):
+                try:
+                    stream.wait_event(trigger)
+                    prefetch_start.record(stream)
+                    prefetch_start_recorded = True
+                    result = module.prepare_uvm_prefill_oracle_experts(
+                        expert_ids,
+                        device=device,
+                    )
+                except BaseException as exc:
+                    submission_error = exc
+                    result = {
+                        "ok": False,
+                        "reason": "submission_exception",
+                    }
+                finally:
+                    try:
+                        ready.record(stream)
+                        ready_recorded = True
+                    except BaseException as exc:
+                        ready_error = exc
+        except BaseException as exc:
+            if submission_error is None:
+                submission_error = exc
+
+        # If entering the CUDA context failed before the inner finally, make a
+        # best effort to create a drain point without hiding the first error.
+        if not ready_recorded:
+            try:
+                with torch.cuda.device(device), torch.cuda.stream(stream):
+                    ready.record(stream)
+                    ready_recorded = True
+            except BaseException as exc:
+                if ready_error is None:
+                    ready_error = exc
+
+        return {
+            "result": result,
+            "submission_error": submission_error,
+            "ready_error": ready_error,
+            "prefetch_start_recorded": prefetch_start_recorded,
+            "ready_recorded": ready_recorded,
+            "prepare_host_ms": (time.perf_counter_ns() - worker_start_ns) / 1e6,
+            "worker_thread_id": threading.get_ident(),
+        }
+
+    def _submit(
+        self,
+        *,
+        target_layer_id: int,
+        source_layer_id: int | None,
+        trigger_event: torch.cuda.Event,
+        use_worker: bool,
+    ) -> bool:
+        if not self.active or target_layer_id not in self.modules:
+            return True
+        if (
+            target_layer_id in self.tickets
+            or target_layer_id in self.completed_layers
+        ):
+            return self._reject(
+                f"Duplicate prefill oracle ticket for layer {target_layer_id}"
+            )
+        assert self.prefetch_stream is not None
+        assert self.device is not None
+        module = self.modules[target_layer_id]
+        expert_ids = self.configured_experts[target_layer_id]
+        prefetch_start = torch.cuda.Event(enable_timing=True)
+        ready = torch.cuda.Event(enable_timing=True)
+        ticket: dict[str, Any] = {
+            "target_layer_id": int(target_layer_id),
+            "source_layer_id": source_layer_id,
+            "module": module,
+            "configured_expert_ids": list(expert_ids),
+            "device": int(self.device),
+            "dispatch_kind": "async_worker" if use_worker else "foreground",
+            "trigger_event": trigger_event,
+            "prefetch_stream": self.prefetch_stream,
+            "prefetch_start": prefetch_start,
+            "ready": ready,
+        }
+        self.tickets[target_layer_id] = ticket
+        submit_start_ns = time.perf_counter_ns()
+        if use_worker:
+            assert self.executor is not None
+            try:
+                ticket["future"] = self.executor.submit(
+                    self._run_prepare,
+                    ticket,
+                )
+            except BaseException as exc:
+                self.tickets.pop(target_layer_id, None)
+                return self._reject(
+                    "Failed to dispatch prefill oracle worker: "
+                    f"target_layer={target_layer_id}",
+                    cause=exc,
+                )
+        else:
+            ticket["outcome"] = self._run_prepare(ticket)
+        ticket["loop_submit_us"] = (
+            time.perf_counter_ns() - submit_start_ns
+        ) / 1e3
+        return True
+
+    @staticmethod
+    def _apply_result_to_ticket(
+        ticket: dict[str, Any],
+        result: dict[str, object],
+    ) -> None:
+        ticket["expert_ids"] = list(result.get("expert_ids") or [])
+        ticket["region_ids"] = list(result.get("region_ids") or [])
+        ticket["requested_bytes"] = int(result.get("requested_bytes") or 0)
+        ticket["region_count"] = int(result.get("region_count") or 0)
+        ticket["initial_access_mode"] = result.get("initial_access_mode")
+
+    def _resolve_and_drain_ticket(
+        self,
+        ticket: dict[str, Any],
+    ) -> tuple[dict[str, Any], float, float]:
+        future_wait_start_ns = time.perf_counter_ns()
+        outcome = ticket.get("outcome")
+        if outcome is None:
+            future = typing.cast(Future[dict[str, Any]], ticket["future"])
+            outcome = future.result()
+            ticket["outcome"] = outcome
+        future_wait_ms = (time.perf_counter_ns() - future_wait_start_ns) / 1e6
+
+        ready_wait_start_ns = time.perf_counter_ns()
+        if bool(outcome.get("ready_recorded")):
+            ready = typing.cast(torch.cuda.Event, ticket["ready"])
+            ready.synchronize()
+        else:
+            # No event means no safe fail-open point.  Synchronize the entire
+            # dedicated stream before inspecting or falling back.
+            stream = typing.cast(torch.cuda.Stream, ticket["prefetch_stream"])
+            device = int(ticket["device"])
+            with torch.cuda.device(device):
+                stream.synchronize()
+        ready_wait_ms = (time.perf_counter_ns() - ready_wait_start_ns) / 1e6
+        return typing.cast(dict[str, Any], outcome), future_wait_ms, ready_wait_ms
+
+    def _complete_ticket(self, layer_id: int) -> None:
+        if layer_id in self.completed_layers:
+            return
+        ticket = self.tickets.get(int(layer_id))
+        if ticket is None:
+            self._reject(f"Missing prefill oracle ticket for layer {layer_id}")
+            return
+
+        wait_start_ns = time.perf_counter_ns()
+        try:
+            outcome, future_wait_ms, ready_wait_ms = (
+                self._resolve_and_drain_ticket(ticket)
+            )
+        except BaseException as exc:
+            self._reject(
+                f"Failed to drain prefill oracle ticket for layer {layer_id}",
+                cause=exc,
+            )
+            return
+        exposed_wait_ms = (time.perf_counter_ns() - wait_start_ns) / 1e6
+        result = typing.cast(dict[str, object], outcome["result"])
+        submission_error = typing.cast(
+            BaseException | None,
+            outcome.get("submission_error"),
+        )
+        ready_error = typing.cast(
+            BaseException | None,
+            outcome.get("ready_error"),
+        )
+        if submission_error is not None or ready_error is not None:
+            self._reject(
+                "Prefill oracle worker raised: "
+                f"target_layer={layer_id} result={result!r}",
+                cause=submission_error or ready_error,
+            )
+            return
+        if not bool(result.get("ok")):
+            self._reject(
+                "Failed to submit prefill oracle prefetch: "
+                f"target_layer={layer_id} result={result!r}"
+            )
+            return
+
+        self._apply_result_to_ticket(ticket, result)
+        prefetch_start = typing.cast(torch.cuda.Event, ticket["prefetch_start"])
+        ready = typing.cast(torch.cuda.Event, ticket["ready"])
+        if not bool(outcome.get("prefetch_start_recorded")):
+            self._reject(
+                f"Missing prefetch start event for layer {layer_id}"
+            )
+            return
+        prefetch_ms = float(prefetch_start.elapsed_time(ready))
+        module = typing.cast(FusedMoE, ticket["module"])
+        commit = module.commit_uvm_prefill_oracle_experts(
+            typing.cast(list[int], ticket["expert_ids"]),
+            typing.cast(list[str], ticket["region_ids"]),
+        )
+        if not bool(commit.get("ok")):
+            # commit() already degraded the complete batch to UNKNOWN, so an
+            # abort must not try to commit the same ticket a second time.
+            self.tickets.pop(int(layer_id), None)
+            self._reject(
+                "Failed to commit prefill oracle prefetch: "
+                f"layer={layer_id} result={commit!r}"
+            )
+            return
+        self.completed_layers.add(int(layer_id))
+        self.tickets.pop(int(layer_id), None)
+        self.layer_records.append(
+            {
+                "target_layer_id": int(layer_id),
+                "source_layer_id": ticket["source_layer_id"],
+                "expert_ids": ticket["expert_ids"],
+                "expert_count": len(typing.cast(list[int], ticket["expert_ids"])),
+                "region_count": ticket["region_count"],
+                "requested_bytes": ticket["requested_bytes"],
+                "initial_access_mode": ticket["initial_access_mode"],
+                "dispatch_kind": ticket["dispatch_kind"],
+                "loop_submit_us": ticket["loop_submit_us"],
+                "prepare_host_ms": outcome["prepare_host_ms"],
+                "worker_thread_id": outcome["worker_thread_id"],
+                "future_wait_ms": future_wait_ms,
+                "ready_wait_ms": ready_wait_ms,
+                "prefetch_cuda_ms": prefetch_ms,
+                "exposed_wait_ms": exposed_wait_ms,
+            }
+        )
+
+    def wait_for_layer(self, layer_id: int) -> None:
+        if not self.active or layer_id not in self.modules:
+            return
+        self._complete_ticket(int(layer_id))
+
+    def submit_next_layer(
+        self,
+        *,
+        source_layer_id: int,
+        target_layer_id: int,
+        trigger_event: torch.cuda.Event,
+    ) -> None:
+        if not self.active:
+            return
+        if target_layer_id not in self.modules:
+            return
+        submitted = self._submit(
+            target_layer_id=int(target_layer_id),
+            source_layer_id=int(source_layer_id),
+            trigger_event=trigger_event,
+            use_worker=self.mode == "async",
+        )
+        if submitted and self.mode == "sync":
+            # A true no-overlap control: do not let the target attention hide
+            # any part of migration, even if CUDA submission becomes cheap.
+            self._complete_ticket(int(target_layer_id))
+
+    def abort(self, reason: str = "") -> None:
+        """Drain in-flight work and leave region tracking in a safe state."""
+        self.active = False
+        errors: list[BaseException] = []
+        for layer_id, ticket in list(self.tickets.items()):
+            try:
+                outcome, _, _ = self._resolve_and_drain_ticket(ticket)
+                result = typing.cast(dict[str, object], outcome["result"])
+                if bool(result.get("ok")):
+                    self._apply_result_to_ticket(ticket, result)
+                    module = typing.cast(FusedMoE, ticket["module"])
+                    commit = module.commit_uvm_prefill_oracle_experts(
+                        typing.cast(list[int], ticket["expert_ids"]),
+                        typing.cast(list[str], ticket["region_ids"]),
+                    )
+                    if not bool(commit.get("ok")):
+                        raise RuntimeError(
+                            "abort commit failed: "
+                            f"layer={layer_id} result={commit!r}"
+                        )
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                self.tickets.pop(layer_id, None)
+        self._shutdown_executor()
+        if errors:
+            detail = f" ({reason})" if reason else ""
+            raise RuntimeError(
+                f"Could not safely drain prefill oracle pipeline{detail}"
+            ) from errors[0]
+
+    def finish(self) -> None:
+        if not self.active:
+            return
+        expected_layers = sorted(self.modules)
+        completed_layers = sorted(
+            int(record["target_layer_id"]) for record in self.layer_records
+        )
+        if completed_layers != expected_layers:
+            self._reject(
+                "Incomplete prefill oracle pipeline: "
+                f"expected={expected_layers} completed={completed_layers}"
+            )
+            return
+        record = {
+            "event": "qwen3_moe_prefill_oracle_prefetch",
+            "timestamp": time.time(),
+            "pid": os.getpid(),
+            "generation": self.generation,
+            "mode": self.mode,
+            "num_tokens": self.num_tokens,
+            "layer_count": len(self.layer_records),
+            "expert_count": sum(
+                int(item["expert_count"]) for item in self.layer_records
+            ),
+            "requested_bytes": sum(
+                int(item["requested_bytes"]) for item in self.layer_records
+            ),
+            "prefetch_cuda_sum_ms": sum(
+                float(item["prefetch_cuda_ms"]) for item in self.layer_records
+            ),
+            "exposed_wait_sum_ms": sum(
+                float(item["exposed_wait_ms"]) for item in self.layer_records
+            ),
+            "prepare_host_sum_ms": sum(
+                float(item["prepare_host_ms"]) for item in self.layer_records
+            ),
+            "loop_submit_sum_ms": sum(
+                float(item["loop_submit_us"]) for item in self.layer_records
+            )
+            / 1e3,
+            "host_pipeline_ms": (time.perf_counter_ns() - self.started_ns) / 1e6,
+            "layers": self.layer_records,
+        }
+        if self.trace_file:
+            with _QWEN3_MOE_TRACE_LOCK:
+                os.makedirs(os.path.dirname(self.trace_file) or ".", exist_ok=True)
+                with open(self.trace_file, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
+        self.completed_once = True
+        self.active = False
+        self._shutdown_executor()
 
 
 @support_torch_compile
@@ -654,6 +1183,19 @@ class Qwen3MoeModel(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+        self._uvm_prefill_oracle = _Qwen3MoePrefillOraclePrefetch()
+        if self._uvm_prefill_oracle.mode != "off":
+            if not vllm_config.model_config.enforce_eager:
+                raise RuntimeError("Prefill oracle prefetch requires eager mode")
+            if parallel_config.enable_dbo:
+                raise RuntimeError("Prefill oracle prefetch does not support DBO")
+            if (
+                int(parallel_config.tensor_parallel_size) != 1
+                or parallel_config.enable_expert_parallel
+            ):
+                raise RuntimeError(
+                    "Prefill oracle prefetch currently requires TP=1 and EP disabled"
+                )
         # Track layers for auxiliary hidden state outputs (EAGLE3)
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
@@ -679,17 +1221,68 @@ class Qwen3MoeModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
-        for layer_idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
-            # Collect auxiliary hidden states if specified
-            if layer_idx in self.aux_hidden_state_layers:
-                aux_hidden_state = (
-                    hidden_states + residual if residual is not None else hidden_states
+        layer_items = list(
+            enumerate(
+                islice(self.layers, self.start_layer, self.end_layer),
+                start=self.start_layer,
+            )
+        )
+        oracle_active = self._uvm_prefill_oracle.begin(
+            layer_items,
+            num_tokens=int(hidden_states.shape[0]),
+        )
+        try:
+            for item_index, (layer_idx, layer) in enumerate(layer_items):
+                # Collect auxiliary hidden states if specified
+                if layer_idx in self.aux_hidden_state_layers:
+                    aux_hidden_state = (
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
+                    )
+                    aux_hidden_states.append(aux_hidden_state)
+                source_start_event = None
+                if (
+                    oracle_active
+                    and item_index + 1 < len(layer_items)
+                    and self._uvm_prefill_oracle.mode == "async"
+                ):
+                    source_start_event = torch.cuda.Event(enable_timing=True)
+                    source_start_event.record(torch.cuda.current_stream())
+                pre_mlp_callback = None
+                if oracle_active:
+                    pre_mlp_callback = partial(
+                        self._uvm_prefill_oracle.wait_for_layer,
+                        layer_idx,
+                    )
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    residual,
+                    pre_mlp_callback=pre_mlp_callback,
                 )
-                aux_hidden_states.append(aux_hidden_state)
-            hidden_states, residual = layer(positions, hidden_states, residual)
+                if oracle_active and item_index + 1 < len(layer_items):
+                    if self._uvm_prefill_oracle.mode == "async":
+                        assert source_start_event is not None
+                        trigger_event = source_start_event
+                    else:
+                        trigger_event = torch.cuda.Event(enable_timing=True)
+                        trigger_event.record(torch.cuda.current_stream())
+                    self._uvm_prefill_oracle.submit_next_layer(
+                        source_layer_id=layer_idx,
+                        target_layer_id=layer_items[item_index + 1][0],
+                        trigger_event=trigger_event,
+                    )
+
+            if oracle_active:
+                self._uvm_prefill_oracle.finish()
+        except BaseException:
+            if oracle_active:
+                try:
+                    self._uvm_prefill_oracle.abort("model forward failed")
+                except BaseException:
+                    logger.exception("Failed to abort prefill oracle pipeline")
+            raise
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

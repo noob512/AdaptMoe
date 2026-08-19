@@ -45,6 +45,29 @@ static struct kmem_cache *g_uvm_va_range_channel_cache __read_mostly;
 static struct kmem_cache *g_uvm_va_range_sked_reflected_cache __read_mostly;
 static struct kmem_cache *g_uvm_va_range_semaphore_pool_cache __read_mostly;
 static struct kmem_cache *g_uvm_vma_wrapper_cache __read_mostly;
+static atomic64_t g_uvm_moe_slot_allocation_id = ATOMIC64_INIT(0);
+
+static NvU64 uvm_moe_slot_next_allocation_id(void)
+{
+    NvU64 old_id;
+    NvU64 new_id;
+
+    // Zero is reserved for an uninitialized/dead descriptor. Saturate at the
+    // last non-zero value instead of wrapping and reusing an allocation
+    // identity. New allocations then receive identity 0, which makes compact
+    // plan registration fail closed.
+    do {
+        old_id = (NvU64)atomic64_read(&g_uvm_moe_slot_allocation_id);
+        if (unlikely(old_id == ~0ULL))
+            return 0;
+
+        new_id = old_id + 1;
+    } while ((NvU64)atomic64_cmpxchg(&g_uvm_moe_slot_allocation_id,
+                                     old_id,
+                                     new_id) != old_id);
+
+    return new_id;
+}
 
 NV_STATUS uvm_va_range_init(void)
 {
@@ -194,6 +217,7 @@ static uvm_va_range_managed_t *uvm_va_range_alloc_managed(uvm_va_space_t *va_spa
         return NULL;
 
     uvm_va_range_initialize(&managed_range->va_range, UVM_VA_RANGE_TYPE_MANAGED, va_space, start, end);
+    managed_range->moe_slot_allocation_id = uvm_moe_slot_next_allocation_id();
 
     managed_range->policy = uvm_va_policy_default;
 
@@ -1318,9 +1342,16 @@ NV_STATUS uvm_va_range_split(uvm_va_range_managed_t *existing_managed_range,
     UVM_ASSERT(PAGE_ALIGNED(new_end + 1));
     uvm_assert_rwsem_locked_write(&va_space->lock);
 
+    // Any split after compact-plan registration must make the plan revalidate
+    // under the VA-space write lock before it can touch a slot or a PTE.
+    uvm_va_space_moe_slot_plan_invalidate(va_space);
+
     new = uvm_va_range_alloc_managed(va_space, new_end + 1, existing_managed_range->va_range.node.end);
     if (!new)
         return NV_ERR_NO_MEMORY;
+
+    // A split changes range objects, not the underlying managed allocation.
+    new->moe_slot_allocation_id = existing_managed_range->moe_slot_allocation_id;
 
     // The new managed_range is under the same vma. If this is a uvm_vm_open,
     // the caller takes care of updating existing's vma_wrapper for us.

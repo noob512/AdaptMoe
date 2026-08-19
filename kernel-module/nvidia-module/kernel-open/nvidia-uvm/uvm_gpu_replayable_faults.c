@@ -2454,6 +2454,8 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
         uvm_fault_buffer_entry_t *current_entry = batch_context->ordered_fault_cache[i];
         uvm_fault_utlb_info_t *utlb = &batch_context->utlbs[current_entry->fault_source.utlb_id];
         uvm_gpu_va_space_t *gpu_va_space;
+        const NvU64 fault_leaf_base = UVM_ALIGN_DOWN(current_entry->fault_address,
+                                                     UVM_PAGE_SIZE_64K);
 
         UVM_ASSERT(current_entry->va_space);
 
@@ -2522,8 +2524,8 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
         }
 
         if (uvm_moe_slot_pool_range_has_mappings(va_space,
-                                                 UVM_VA_BLOCK_ALIGN_DOWN(current_entry->fault_address),
-                                                 UVM_VA_BLOCK_SIZE)) {
+                                                 fault_leaf_base,
+                                                 UVM_PAGE_SIZE_64K)) {
             if (prev_gpu_va_space) {
                 status = uvm_ats_invalidate_tlbs(prev_gpu_va_space, ats_invalidate, &batch_context->tracker);
                 if (status != NV_OK)
@@ -2537,8 +2539,8 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
             prev_gpu_va_space = NULL;
 
             status = uvm_moe_slot_pool_clear_range_mappings_for_fault(current_entry->va_space,
-                                                                      UVM_VA_BLOCK_ALIGN_DOWN(current_entry->fault_address),
-                                                                      UVM_VA_BLOCK_SIZE);
+                                                                      fault_leaf_base,
+                                                                      UVM_PAGE_SIZE_64K);
             if (status != NV_OK)
                 goto fail;
 

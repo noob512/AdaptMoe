@@ -15,6 +15,11 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.device_allocator.uvm import uvm_allocation_phase
+from vllm.device_allocator.uvm_pool_residency import (
+    close_uvm_slot_direct_policy_session,
+    get_uvm_slot_direct_session_contract,
+    validate_uvm_slot_direct_session_contract,
+)
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -687,6 +692,7 @@ class Worker(WorkerBase):
                 "VLLM_UVM_CONTROLLED_REMAP_SKIP_POST_INIT_WARMUP=1"
             )
             self._run_uvm_post_warmup_rebalance()
+            self.model_runner.finalize_uvm_slot_bank_after_warmup()
             set_random_seed(self.model_config.seed)
             return
 
@@ -805,6 +811,7 @@ class Worker(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         self._run_uvm_post_warmup_rebalance()
+        self.model_runner.finalize_uvm_slot_bank_after_warmup()
 
         set_random_seed(self.model_config.seed)
 
@@ -1199,11 +1206,86 @@ class Worker(WorkerBase):
         )
 
     def shutdown(self) -> None:
-        if runner := getattr(self, "model_runner", None):
-            runner.ensure_kv_transfer_shutdown()
+        shutdown_errors: list[tuple[str, Exception]] = []
+        contract = get_uvm_slot_direct_session_contract()
+        if contract is not None and bool(contract["slot_session_enabled"]):
+            try:
+                device = int(contract["device"])
+                contract_error: Exception | None = None
+                synchronize_error: Exception | None = None
+                close_error: Exception | None = None
+                try:
+                    validate_uvm_slot_direct_session_contract(
+                        access_mode=str(contract["access_mode"]),
+                        device=device,
+                    )
+                except Exception as exc:
+                    # Environment drift must fail closed, but never skip
+                    # releasing the bank selected by the frozen contract.
+                    contract_error = exc
+                try:
+                    torch.cuda.synchronize(device)
+                except Exception as exc:
+                    # UVM/CE trackers do not observe ordinary CUDA kernels.
+                    # If this wait fails, keep the backing/session alive for
+                    # process/driver teardown instead of risking a use-after-
+                    # free by releasing memory which a kernel may still use.
+                    synchronize_error = exc
+                if synchronize_error is None:
+                    try:
+                        close_result = close_uvm_slot_direct_policy_session(
+                            device=device
+                        )
+                        if not bool(close_result.get("ok")):
+                            close_error = RuntimeError(
+                                "Failed to close bounded UVM slot session: "
+                                f"{close_result!r}"
+                            )
+                    except Exception as exc:
+                        close_error = exc
 
-        if self.profiler is not None:
-            self.profiler.shutdown()
+                if any(
+                    error is not None
+                    for error in (close_error, synchronize_error, contract_error)
+                ):
+                    failures = []
+                    if close_error is not None:
+                        failures.append(f"close failed: {close_error!r}")
+                    if synchronize_error is not None:
+                        failures.append(
+                            f"synchronize failed: {synchronize_error!r}"
+                        )
+                    if contract_error is not None:
+                        failures.append(f"contract drifted: {contract_error!r}")
+                    primary_error = (
+                        close_error or synchronize_error or contract_error
+                    )
+                    assert primary_error is not None
+                    raise RuntimeError(
+                        "UVM slot session shutdown encountered errors: "
+                        + "; ".join(failures)
+                    ) from primary_error
+            except Exception as exc:
+                shutdown_errors.append(("uvm_slot", exc))
+        if runner := getattr(self, "model_runner", None):
+            try:
+                runner.ensure_kv_transfer_shutdown()
+            except Exception as exc:
+                shutdown_errors.append(("kv_transfer", exc))
+
+        if (profiler := getattr(self, "profiler", None)) is not None:
+            try:
+                profiler.shutdown()
+            except Exception as exc:
+                shutdown_errors.append(("profiler", exc))
+
+        if shutdown_errors:
+            details = "; ".join(
+                f"{stage}: {error!r}" for stage, error in shutdown_errors
+            )
+            raise RuntimeError(f"Worker shutdown encountered errors: {details}") from (
+                shutdown_errors[0][1]
+            )
 
 
 def init_worker_distributed_environment(

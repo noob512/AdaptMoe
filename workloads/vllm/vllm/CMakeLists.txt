@@ -238,7 +238,8 @@ endif()
 #
 
 set(VLLM_CUMEM_EXT_SRC
-  "csrc/cumem_allocator.cpp")
+  "csrc/cumem_allocator.cpp"
+  "csrc/static_alias_allocator.cpp")
 
 set_gencode_flags_for_srcs(
   SRCS "${VLLM_CUMEM_EXT_SRC}"

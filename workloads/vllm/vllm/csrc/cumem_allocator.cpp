@@ -4,6 +4,7 @@
 #include <iostream>
 
 #include "cumem_allocator_compat.h"
+#include "static_alias_allocator.h"
 
 #ifndef USE_ROCM
 static const char* PYARGS_PARSE = "KKKK";
@@ -706,6 +707,17 @@ static PyMethodDef module_methods[] = {
      "Create and map memory on the device."},
     {"python_unmap_and_release", (PyCFunction)python_unmap_and_release,
      METH_VARARGS, "Unmap and release memory on the device."},
+    {"static_alias_create", (PyCFunction)python_static_alias_create,
+     METH_VARARGS,
+     "Create one explicit CUDA VMM bank with RW upload and RO aliases."},
+    {"static_alias_info", (PyCFunction)python_static_alias_info, METH_VARARGS,
+     "Return metadata and lifecycle state for a static-alias bank."},
+    {"static_alias_dlpack", (PyCFunction)python_static_alias_dlpack,
+     METH_VARARGS, "Export an upload or consumer view as a DLPack capsule."},
+    {"static_alias_synchronize", (PyCFunction)python_static_alias_synchronize,
+     METH_VARARGS, "Synchronize a static-alias bank before teardown."},
+    {"static_alias_destroy", (PyCFunction)python_static_alias_destroy,
+     METH_VARARGS, "Destroy a synchronized static-alias bank."},
     {NULL, NULL, 0, NULL}  // sentinel
 };
 

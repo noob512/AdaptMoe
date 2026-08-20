@@ -81,8 +81,23 @@ class CudagraphDispatcher:
         # guarantee all keys would be used. For example, if we allow lazy
         # capturing in future PR, some keys may never be triggered.
         if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
+            mixed_capture_sizes = self.compilation_config.cudagraph_capture_sizes
+            if cudagraph_mode == CUDAGraphMode.FULL_SEPARATE:
+                # The dual-topology UVM mode reserves small, uniform-decode
+                # sizes for remote graphs. Do not create colliding non-uniform
+                # keys for those sizes: initialization warmups then run eager,
+                # while real prefill sizes use the alias Graph entries.
+                max_uniform_decode_tokens = (
+                    uniform_decode_query_len
+                    * self.vllm_config.scheduler_config.max_num_seqs
+                )
+                mixed_capture_sizes = [
+                    size
+                    for size in mixed_capture_sizes
+                    if size > max_uniform_decode_tokens
+                ]
             for bs, has_lora in product(
-                self.compilation_config.cudagraph_capture_sizes, lora_cases
+                mixed_capture_sizes, lora_cases
             ):
                 self.add_cudagraph_key(
                     cudagraph_mode.mixed_mode(),

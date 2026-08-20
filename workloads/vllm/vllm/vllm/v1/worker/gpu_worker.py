@@ -693,6 +693,11 @@ class Worker(WorkerBase):
             )
             self._run_uvm_post_warmup_rebalance()
             self.model_runner.finalize_uvm_slot_bank_after_warmup()
+            from vllm.model_executor.models.utils import (
+                activate_cpu_offload_uvm_original_va_prefill_topology,
+            )
+
+            activate_cpu_offload_uvm_original_va_prefill_topology()
             set_random_seed(self.model_config.seed)
             return
 
@@ -812,6 +817,15 @@ class Worker(WorkerBase):
         # the model initialization and profiling.
         self._run_uvm_post_warmup_rebalance()
         self.model_runner.finalize_uvm_slot_bank_after_warmup()
+
+        # Keep the remote-only capture topology active through every init-time
+        # dummy replay. Only now is it safe to install alias banks for serving
+        # prefill; the first real decode will switch back before Graph replay.
+        from vllm.model_executor.models.utils import (
+            activate_cpu_offload_uvm_original_va_prefill_topology,
+        )
+
+        activate_cpu_offload_uvm_original_va_prefill_topology()
 
         set_random_seed(self.model_config.seed)
 
@@ -1207,8 +1221,25 @@ class Worker(WorkerBase):
 
     def shutdown(self) -> None:
         shutdown_errors: list[tuple[str, Exception]] = []
+        if runner := getattr(self, "model_runner", None):
+            static_alias_shutdown = getattr(
+                runner, "shutdown_cpu_offload_graph_static_alias", None
+            )
+            try:
+                if static_alias_shutdown is not None:
+                    static_alias_shutdown()
+            except Exception as exc:
+                # A failed Graph/PTE teardown must keep the backing/session
+                # alive for process teardown; never continue by freeing the
+                # same slot pool through a less-specific cleanup path.
+                shutdown_errors.append(("uvm_static_alias", exc))
+
         contract = get_uvm_slot_direct_session_contract()
-        if contract is not None and bool(contract["slot_session_enabled"]):
+        if (
+            not any(stage == "uvm_static_alias" for stage, _ in shutdown_errors)
+            and contract is not None
+            and bool(contract["slot_session_enabled"])
+        ):
             try:
                 device = int(contract["device"])
                 contract_error: Exception | None = None

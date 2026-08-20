@@ -341,9 +341,16 @@ class GPUModelRunner(
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
 
-        from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
+        from vllm.model_executor.models.utils import (
+            set_cpu_offload_max_bytes,
+            validate_cpu_offload_graph_static_alias_runtime,
+        )
 
         set_cpu_offload_max_bytes(int(self.cache_config.cpu_offload_gb * 1024**3))
+        # Validate before model construction/profile execution. In particular,
+        # the Python H2D hook is intentionally captured by CUDA Graph and must
+        # not first be traced by Dynamo/Inductor.
+        validate_cpu_offload_graph_static_alias_runtime(vllm_config)
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -665,6 +672,10 @@ class GPUModelRunner(
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self._uvm_init_weight_placement_done = False
+        self._uvm_original_va_phase_prefill_seen = False
+        self._uvm_original_va_phase_decode_cutover_done = False
+        self._uvm_original_va_phase_poison_reason: str | None = None
+        self._uvm_original_va_phase_transition_result: dict[str, Any] | None = None
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -2694,12 +2705,17 @@ class GPUModelRunner(
         if scheduler_output.total_num_scheduled_tokens <= 0:
             return "enabled:idle_step"
 
-        token_counts = tuple(scheduler_output.num_scheduled_tokens.values())
-        has_prefill_like_work = bool(scheduler_output.scheduled_new_reqs) or any(
-            count > self.uniform_decode_query_len for count in token_counts
+        new_request_ids = {
+            request.req_id for request in scheduler_output.scheduled_new_reqs
+        }
+        token_counts = scheduler_output.num_scheduled_tokens
+        has_prefill_like_work = bool(new_request_ids) or any(
+            count > self.uniform_decode_query_len for count in token_counts.values()
         )
         has_decode_like_work = any(
-            0 < count <= self.uniform_decode_query_len for count in token_counts
+            req_id not in new_request_ids
+            and 0 < count <= self.uniform_decode_query_len
+            for req_id, count in token_counts.items()
         )
 
         if has_prefill_like_work and has_decode_like_work:
@@ -2947,6 +2963,276 @@ class GPUModelRunner(
             )
             raise RuntimeError("P3-to-remote decode cutover requires one request")
         self._switch_uvm_prefill_p3_to_decode_remote_read()
+
+    def _poison_uvm_original_va_phase(self, reason: str) -> None:
+        from vllm.model_executor.models.utils import (
+            poison_cpu_offload_uvm_original_va_phase,
+        )
+
+        self._uvm_original_va_phase_poison_reason = str(reason)
+        poison_cpu_offload_uvm_original_va_phase(str(reason))
+
+    def _write_uvm_original_va_phase_result(self, result: dict[str, Any]) -> None:
+        result_path = os.environ.get(
+            "VLLM_UVM_ORIGINAL_VA_PHASE_RESULT_FILE", ""
+        ).strip()
+        if not result_path:
+            return
+        absolute = os.path.abspath(result_path)
+        os.makedirs(os.path.dirname(absolute), exist_ok=True)
+        temporary = f"{absolute}.tmp.{os.getpid()}"
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(result, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(temporary, absolute)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _destroy_uvm_original_va_alias_prefill_graphs(self) -> dict[str, Any]:
+        """Reset only non-uniform alias Graphs before cmd99 frees backing."""
+        from vllm.model_executor.models.utils import (
+            certify_cpu_offload_uvm_original_va_alias_graphs_destroyed,
+            get_cpu_offload_graph_static_alias_diagnostics,
+        )
+
+        model = self.model
+        if not isinstance(model, CUDAGraphWrapper):
+            raise RuntimeError(
+                "Selective alias Graph teardown requires a CUDAGraphWrapper"
+            )
+
+        def record(descriptor: BatchDescriptor) -> dict[str, Any]:
+            return {
+                "num_tokens": int(descriptor.num_tokens),
+                "uniform_decode": bool(descriptor.uniform_decode),
+                "has_lora": bool(descriptor.has_lora),
+            }
+
+        entries = model.concrete_cudagraph_entries
+        alias_descriptors = sorted(
+            (
+                descriptor
+                for descriptor, entry in entries.items()
+                if not descriptor.uniform_decode and entry.cudagraph is not None
+            ),
+            key=tuple,
+        )
+        remote_descriptors = sorted(
+            (
+                descriptor
+                for descriptor, entry in entries.items()
+                if descriptor.uniform_decode and entry.cudagraph is not None
+            ),
+            key=tuple,
+        )
+        diagnostics = get_cpu_offload_graph_static_alias_diagnostics()
+        partition = diagnostics.get("dual_graph_partition_certificate")
+        if not isinstance(partition, dict):
+            raise RuntimeError("Dual Graph partition certificate is absent")
+        expected_alias = tuple(tuple(item) for item in partition.get("alias_entries", ()))
+        expected_remote = tuple(
+            tuple(item) for item in partition.get("remote_entries", ())
+        )
+        actual_alias = tuple(
+            sorted(
+                (
+                    descriptor.num_tokens,
+                    descriptor.uniform_decode,
+                    descriptor.has_lora,
+                )
+                for descriptor in alias_descriptors
+            )
+        )
+        actual_remote = tuple(
+            sorted(
+                (
+                    descriptor.num_tokens,
+                    descriptor.uniform_decode,
+                    descriptor.has_lora,
+                )
+                for descriptor in remote_descriptors
+            )
+        )
+        if actual_alias != expected_alias or actual_remote != expected_remote:
+            raise RuntimeError(
+                "Live CUDA Graph entries differ from the dual-topology "
+                "capture certificate"
+            )
+
+        torch.cuda.synchronize(self.device)
+        destroyed_records: list[dict[str, Any]] = []
+        for descriptor in alias_descriptors:
+            entry = entries[descriptor]
+            graph = entry.cudagraph
+            if graph is None:
+                raise RuntimeError("Alias Graph disappeared during teardown")
+            graph.reset()
+            entry.cudagraph = None
+            entry.output = None
+            entry.input_addresses = None
+            destroyed_records.append(record(descriptor))
+            del entries[descriptor]
+        gc.collect()
+        torch.cuda.synchronize(self.device)
+
+        remaining_records = [record(value) for value in remote_descriptors]
+        result = certify_cpu_offload_uvm_original_va_alias_graphs_destroyed(
+            destroyed_alias_entries=destroyed_records,
+            remaining_remote_entries=remaining_records,
+        )
+        result["live_entry_count_after"] = len(entries)
+        return result
+
+    def _maybe_switch_uvm_original_va_prefill_to_decode_remote(
+        self,
+        scheduler_output: "SchedulerOutput",
+        step_phase: str,
+    ) -> None:
+        from vllm.model_executor.models.utils import (
+            cpu_offload_uvm_original_va_phase_mode,
+            get_cpu_offload_graph_static_alias_diagnostics,
+            transition_cpu_offload_uvm_original_va_to_remote,
+        )
+
+        mode = cpu_offload_uvm_original_va_phase_mode()
+        if mode == "off":
+            return
+        if self._uvm_original_va_phase_poison_reason is not None:
+            raise RuntimeError(
+                "Original-VA phase worker is poisoned: "
+                + self._uvm_original_va_phase_poison_reason
+            )
+
+        diagnostics = get_cpu_offload_graph_static_alias_diagnostics()
+        if mode == "remote_only":
+            if not (
+                diagnostics.get("lifecycle_state") == "remote"
+                and diagnostics.get("remote_map_active") is True
+                and int(diagnostics.get("session_id", -1)) == 0
+                and int(diagnostics.get("active_driver_backing_bytes", -1)) == 0
+            ):
+                self._poison_uvm_original_va_phase(
+                    "remote_only serving step observed a non-remote topology"
+                )
+                raise RuntimeError(
+                    "remote_only serving requires audited remote original-VA PTEs"
+                )
+            return
+
+        if mode not in (
+            "prefill_remote_decode",
+            "prefill_graph_remote_decode",
+        ):
+            self._poison_uvm_original_va_phase(f"unknown phase mode {mode!r}")
+            raise RuntimeError(f"Unsupported original-VA phase mode {mode!r}")
+        if step_phase == "enabled:mixed_step":
+            self._poison_uvm_original_va_phase(
+                "mixed prefill/decode batches are unsupported"
+            )
+            raise RuntimeError(
+                "Original-VA alias-prefill/remote-decode requires an unmixed request"
+            )
+        if step_phase == "enabled:prefill_step":
+            if self._uvm_original_va_phase_decode_cutover_done:
+                self._poison_uvm_original_va_phase(
+                    "a prefill step arrived after remote decode cutover"
+                )
+                raise RuntimeError(
+                    "Original-VA prefill arrived after one-way remote cutover"
+                )
+            if not (
+                diagnostics.get("lifecycle_state") == "sealed"
+                and diagnostics.get("sealed") is True
+                and int(diagnostics.get("session_id", 0)) > 0
+                and int(diagnostics.get("active_driver_backing_bytes", 0)) > 0
+            ):
+                self._poison_uvm_original_va_phase(
+                    "prefill step observed a non-sealed alias topology"
+                )
+                raise RuntimeError(
+                    "Original-VA prefill requires sealed static-alias banks"
+                )
+            self._uvm_original_va_phase_prefill_seen = True
+            return
+        if step_phase != "enabled:decode_step":
+            return
+        if self._uvm_original_va_phase_decode_cutover_done:
+            if not (
+                diagnostics.get("lifecycle_state") == "remote"
+                and diagnostics.get("remote_map_active") is True
+                and int(diagnostics.get("session_id", -1)) == 0
+            ):
+                self._poison_uvm_original_va_phase(
+                    "decode topology drifted after remote cutover"
+                )
+                raise RuntimeError("Original-VA remote decode topology drifted")
+            return
+        if not self._uvm_original_va_phase_prefill_seen:
+            self._poison_uvm_original_va_phase(
+                "decode arrived before an alias-prefill step"
+            )
+            raise RuntimeError("Original-VA remote decode arrived before prefill")
+        decode_counts = tuple(scheduler_output.num_scheduled_tokens.values())
+        if not decode_counts or any(
+            count != self.uniform_decode_query_len for count in decode_counts
+        ):
+            self._poison_uvm_original_va_phase(
+                "first decode cutover requires a strict uniform decode step"
+            )
+            raise RuntimeError(
+                "Original-VA remote decode cutover requires strict uniform decode"
+            )
+
+        alias_graph_teardown: dict[str, Any] | None = None
+        if mode == "prefill_graph_remote_decode":
+            try:
+                alias_graph_teardown = (
+                    self._destroy_uvm_original_va_alias_prefill_graphs()
+                )
+            except Exception as exc:
+                self._poison_uvm_original_va_phase(
+                    "selective alias-prefill Graph teardown failed"
+                )
+                raise RuntimeError(
+                    "Failed to retire alias-prefill CUDA Graphs before "
+                    "original-VA remote cutover"
+                ) from exc
+            diagnostics = get_cpu_offload_graph_static_alias_diagnostics()
+
+        preserve_remote_graphs = bool(diagnostics.get("remote_graph_captured"))
+        transition = transition_cpu_offload_uvm_original_va_to_remote(
+            reason="first_decode_cutover",
+            preserve_remote_graphs=preserve_remote_graphs,
+        )
+        after = get_cpu_offload_graph_static_alias_diagnostics()
+        if not (
+            transition.get("ok") is True
+            and after.get("lifecycle_state") == "remote"
+            and after.get("remote_map_active") is True
+            and int(after.get("session_id", -1)) == 0
+            and int(after.get("active_driver_backing_bytes", -1)) == 0
+        ):
+            self._poison_uvm_original_va_phase(
+                "post-cutover remote metadata contract failed"
+            )
+            raise RuntimeError(
+                "Original-VA remote decode cutover metadata contract failed"
+            )
+        result = {
+            "schema": "vllm_uvm_original_va_phase_transition_v1",
+            "ok": True,
+            "phase_mode": mode,
+            "remote_graph_preserved": preserve_remote_graphs,
+            "alias_graph_teardown": alias_graph_teardown,
+            "transition": transition,
+            "diagnostics_after": after,
+        }
+        self._uvm_original_va_phase_transition_result = result
+        self._uvm_original_va_phase_decode_cutover_done = True
+        self._write_uvm_original_va_phase_result(result)
+        logger.info("Original-VA prefill-to-remote decode transition: %s", result)
 
     def _bookkeeping_sync(
         self,
@@ -3257,6 +3543,7 @@ class GPUModelRunner(
                     scheduler_output, num_input_tokens, intermediate_tensors
                 )
 
+            enabled_step_phase = self._uvm_enabled_step_phase(scheduler_output)
             uniform_decode = (
                 max_num_scheduled_tokens == self.uniform_decode_query_len
             ) and (num_scheduled_tokens == num_reqs * max_num_scheduled_tokens)
@@ -3271,6 +3558,20 @@ class GPUModelRunner(
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                 )
             )
+            from vllm.model_executor.models.utils import (
+                cpu_offload_uvm_original_va_phase_mode,
+            )
+
+            original_va_phase_mode = cpu_offload_uvm_original_va_phase_mode()
+            if (
+                original_va_phase_mode != "off"
+                and original_va_phase_mode != "prefill_graph_remote_decode"
+                and enabled_step_phase != "enabled:decode_step"
+            ):
+                # FULL_DECODE_ONLY can classify a one-token new request as a
+                # uniform decode shape. A remote-only Graph must never replay
+                # while alias-prefill PTEs are active, so phase wins over shape.
+                cudagraph_runtime_mode = CUDAGraphMode.NONE
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -3282,11 +3583,30 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        enabled_step_phase = self._uvm_enabled_step_phase(scheduler_output)
+        self._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+            scheduler_output,
+            enabled_step_phase,
+        )
         self._maybe_switch_uvm_prefill_p3_to_decode_remote_read(
             scheduler_output,
             enabled_step_phase,
         )
+        if (
+            original_va_phase_mode != "off"
+            and cudagraph_runtime_mode != CUDAGraphMode.NONE
+        ):
+            from vllm.model_executor.models.utils import (
+                validate_cpu_offload_uvm_original_va_alias_graph_replay,
+                validate_cpu_offload_uvm_original_va_remote_graph_replay,
+            )
+
+            if (
+                original_va_phase_mode == "prefill_graph_remote_decode"
+                and enabled_step_phase == "enabled:prefill_step"
+            ):
+                validate_cpu_offload_uvm_original_va_alias_graph_replay()
+            else:
+                validate_cpu_offload_uvm_original_va_remote_graph_replay()
         with (
             uvm_allocation_phase(enabled_step_phase),
             set_forward_context(
@@ -4341,6 +4661,18 @@ class GPUModelRunner(
 
         self._materialize_fixed_weights_device_direct()
 
+        # The UVM original-VA static-alias backend must freeze the final
+        # checkpoint/post-processing storage before any profile run, compile
+        # wrapper, or CUDA Graph capture can observe the model.  The helper is
+        # a no-op for the default VMM backend and when static aliasing is off.
+        from vllm.model_executor.models.utils import (
+            finalize_cpu_offload_graph_static_alias,
+            initialize_cpu_offload_uvm_original_va_phase_topology,
+        )
+
+        finalize_cpu_offload_graph_static_alias()
+        initialize_cpu_offload_uvm_original_va_phase_topology()
+
         # 处理模型图编译加速
         # 1. 尝试使用原生的 PyTorch 图编译 (torch.compile)
         if (
@@ -4404,6 +4736,20 @@ class GPUModelRunner(
         assert getattr(self, "model", None) is not None, (
             "Cannot reload weights before model is loaded."
         )
+        from vllm.model_executor.models.utils import (
+            get_cpu_offload_graph_static_alias_diagnostics,
+        )
+
+        alias_state = get_cpu_offload_graph_static_alias_diagnostics()
+        if (
+            alias_state.get("backend") == "uvm_original_va"
+            and int(alias_state.get("session_id", 0)) != 0
+        ):
+            raise RuntimeError(
+                "Cannot reload weights while a sealed UVM original-VA "
+                "static-alias session or captured CUDA Graph is live; destroy "
+                "the Graph topology first"
+            )
         model_loader = get_model_loader(self.load_config)
         logger.info("Reloading weights inplace...")
         model_loader.load_weights(self.get_model(), model_config=self.model_config)
@@ -6265,13 +6611,81 @@ class GPUModelRunner(
         )
         return successes
 
+    def shutdown_cpu_offload_graph_static_alias(self) -> dict[str, Any]:
+        """Reset captured Graphs before releasing static-alias backing.
+
+        Neither cmd99 nor CUDA VMM may unmap an alias while a Graph executable
+        still owns its VA. Keep this ordering in the model runner, where the
+        concrete Graph entries are owned, instead of relying on interpreter-
+        finalization order.
+        """
+        from vllm.model_executor.models.utils import (
+            destroy_cpu_offload_graph_static_alias,
+            get_cpu_offload_graph_static_alias_diagnostics,
+        )
+
+        diagnostics = get_cpu_offload_graph_static_alias_diagnostics()
+        if not diagnostics.get("enabled"):
+            return destroy_cpu_offload_graph_static_alias(
+                graphs_destroyed=True,
+                synchronize=False,
+            )
+
+        torch.cuda.synchronize(self.device)
+        destroyed_graph_count = 0
+        model = getattr(self, "model", None)
+        if isinstance(model, CUDAGraphWrapper):
+            entries = model.concrete_cudagraph_entries
+            for entry in tuple(entries.values()):
+                graph = entry.cudagraph
+                if graph is not None:
+                    graph.reset()
+                    destroyed_graph_count += 1
+                    entry.cudagraph = None
+                entry.output = None
+                entry.input_addresses = None
+            entries.clear()
+        gc.collect()
+        torch.cuda.synchronize(self.device)
+
+        result = destroy_cpu_offload_graph_static_alias(
+            graphs_destroyed=True,
+            synchronize=False,
+        )
+        result["destroyed_graph_count"] = destroyed_graph_count
+        if not bool(result.get("ok")):
+            raise RuntimeError(
+                "Failed to tear down static aliases after "
+                f"destroying {destroyed_graph_count} CUDA Graphs: {result!r}"
+            )
+        return result
+
     def capture_model(self) -> int:
+        from vllm.model_executor.models.utils import (
+            activate_cpu_offload_uvm_original_va_prefill_topology,
+            certify_cpu_offload_uvm_original_va_dual_graph_partition,
+            cpu_offload_graph_static_alias_capture_context,
+            cpu_offload_uvm_original_va_phase_mode,
+            prepare_cpu_offload_uvm_original_va_remote_graph_capture,
+            validate_cpu_offload_graph_static_alias_runtime,
+        )
+
+        validate_cpu_offload_graph_static_alias_runtime(self.vllm_config)
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
                 "ensure `cudagraph_mode` was not manually set to `NONE`"
             )
             return 0
+
+        # Phase-switch experiments capture decode kernels only after original
+        # Parameter VAs have audited CPU-backed remote READ PTEs. This keeps
+        # every upload memcpy node out of the reusable decode Graph.
+        prepare_cpu_offload_uvm_original_va_remote_graph_capture()
+        original_va_phase_mode = cpu_offload_uvm_original_va_phase_mode()
+        dual_topology_graphs = (
+            original_va_phase_mode == "prefill_graph_remote_decode"
+        )
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
@@ -6310,24 +6724,40 @@ class GPUModelRunner(
             else:
                 lora_cases = [False]
 
-            if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
-                cudagraph_runtime_mode = cudagraph_mode.mixed_mode()
-                # make sure we capture the largest batch size first
+            def capture_mixed_graphs() -> None:
+                if cudagraph_mode.mixed_mode() == CUDAGraphMode.NONE:
+                    return
+                mixed_batch_sizes = self.cudagraph_batch_sizes
+                if dual_topology_graphs:
+                    mixed_batch_sizes = sorted(
+                        {
+                            descriptor.num_tokens
+                            for descriptor in self.cudagraph_dispatcher.cudagraph_keys[
+                                CUDAGraphMode.FULL
+                            ]
+                            if not descriptor.uniform_decode
+                        }
+                    )
+                    if not mixed_batch_sizes:
+                        raise RuntimeError(
+                            "Dual-topology Graph capture has no dedicated "
+                            "prefill size above the uniform-decode range"
+                        )
                 compilation_cases = list(
-                    product(reversed(self.cudagraph_batch_sizes), lora_cases)
+                    product(reversed(mixed_batch_sizes), lora_cases)
                 )
                 self._capture_cudagraphs(
                     compilation_cases,
-                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    cudagraph_runtime_mode=cudagraph_mode.mixed_mode(),
                     uniform_decode=False,
                 )
 
-            # Capture full cudagraph for uniform decode batches if we
-            # don't already have full mixed prefill-decode cudagraphs.
-            if (
-                cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
-                and cudagraph_mode.separate_routine()
-            ):
+            def capture_uniform_decode_graphs() -> None:
+                if not (
+                    cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+                    and cudagraph_mode.separate_routine()
+                ):
+                    return
                 max_num_tokens = (
                     self.scheduler_config.max_num_seqs * self.uniform_decode_query_len
                 )
@@ -6344,6 +6774,72 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=CUDAGraphMode.FULL,
                     uniform_decode=True,
                 )
+
+            if dual_topology_graphs:
+                if cudagraph_mode != CUDAGraphMode.FULL_SEPARATE:
+                    raise RuntimeError(
+                        "prefill_graph_remote_decode requires "
+                        "CUDAGraphMode.FULL_SEPARATE"
+                    )
+
+                # Remote graphs are captured first while all original
+                # Parameter VAs have audited CPU-backed READ PTEs. Their
+                # BatchDescriptor keys are uniform-decode=True.
+                with cpu_offload_graph_static_alias_capture_context(
+                    expected_topology="remote"
+                ):
+                    capture_uniform_decode_graphs()
+
+                # Restore the same original VAs to sealed dual-bank aliases,
+                # then capture independent non-uniform prefill entries. These
+                # graphs contain the pinned-source -> upload-VA H2D nodes.
+                torch.cuda.synchronize(self.device)
+                activate_cpu_offload_uvm_original_va_prefill_topology()
+                with cpu_offload_graph_static_alias_capture_context(
+                    expected_topology="sealed"
+                ):
+                    capture_mixed_graphs()
+
+                model = self.model
+                if not isinstance(model, CUDAGraphWrapper):
+                    raise RuntimeError(
+                        "Dual-topology capture requires a CUDAGraphWrapper"
+                    )
+
+                def entry_records(uniform_decode: bool) -> list[dict[str, Any]]:
+                    records: list[dict[str, Any]] = []
+                    for descriptor, entry in sorted(
+                        model.concrete_cudagraph_entries.items(),
+                        key=lambda item: tuple(item[0]),
+                    ):
+                        if descriptor.uniform_decode != uniform_decode:
+                            continue
+                        if entry.cudagraph is None:
+                            raise RuntimeError(
+                                "A captured dual-topology Graph entry is empty"
+                            )
+                        records.append(
+                            {
+                                "num_tokens": int(descriptor.num_tokens),
+                                "uniform_decode": bool(
+                                    descriptor.uniform_decode
+                                ),
+                                "has_lora": bool(descriptor.has_lora),
+                            }
+                        )
+                    return records
+
+                certify_cpu_offload_uvm_original_va_dual_graph_partition(
+                    remote_entries=entry_records(True),
+                    alias_entries=entry_records(False),
+                )
+            else:
+                # Legacy paths retain their single capture topology and
+                # ordering byte-for-byte: mixed first, then optional dedicated
+                # uniform decode entries.
+                with cpu_offload_graph_static_alias_capture_context():
+                    capture_mixed_graphs()
+                    capture_uniform_decode_graphs()
 
             torch.cuda.synchronize()
             end_free_gpu_memory = torch.cuda.mem_get_info()[0]

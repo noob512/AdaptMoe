@@ -54,6 +54,12 @@ class CUDAGraphMode(enum.Enum):
     PIECEWISE = 1
     FULL = 2
     FULL_DECODE_ONLY = (FULL, NONE)
+    # Capture distinct FULL graphs for mixed/prefill and uniform-decode
+    # batches.  Unlike FULL, the two routines keep different
+    # BatchDescriptor keys even when their padded token counts are equal.
+    # This is required by the experimental UVM original-VA phase path, whose
+    # prefill and decode graphs are captured against different PTE topologies.
+    FULL_SEPARATE = (FULL, FULL)
     FULL_AND_PIECEWISE = (FULL, PIECEWISE)
 
     def decode_mode(self) -> "CUDAGraphMode":
@@ -398,6 +404,7 @@ class CompilationConfig:
     - PIECEWISE.
     - FULL.
     - FULL_DECODE_ONLY.
+    - FULL_SEPARATE.
     - FULL_AND_PIECEWISE. (v1 default)
 
     PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
@@ -412,6 +419,10 @@ class CompilationConfig:
     Mixed prefill-decode batches are run without cudagraphs. Can be good for
     decode instances in a P/D setup where prefill is not as important so we
     can save some memory.
+
+    FULL_SEPARATE mode: Capture distinct full cudagraphs for mixed/prefill and
+    uniform-decode batches. This experimental mode has the same execution
+    coverage as FULL, but does not let decode fall back to the mixed graph.
 
     FULL_AND_PIECEWISE mode: Capture full cudagraph for decode batches and
     piecewise cudagraph for prefill and mixed prefill-decode batches.

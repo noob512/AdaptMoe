@@ -10,6 +10,7 @@ import pytest
 
 from vllm.device_allocator import uvm as uvm_module
 from vllm.device_allocator import uvm_pool_residency as residency_module
+from vllm.model_executor.models import utils as offload_utils
 from vllm.v1.core.uvm_kv_runtime_policy import UvmKvRuntimePolicy
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
 from vllm.v1.worker import gpu_model_runner as gpu_model_runner_module
@@ -243,6 +244,84 @@ def test_prefill_p3_decode_remote_requires_complete_fence_configuration(
 
     with pytest.raises(RuntimeError, match="complete P3 fence configuration"):
         runner.finalize_uvm_slot_bank_after_warmup()
+
+
+def test_uvm_step_phase_treats_one_token_new_request_as_prefill() -> None:
+    runner = object.__new__(GPUModelRunner)
+    runner.uniform_decode_query_len = 1
+    new_request = SimpleNamespace(req_id="new")
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=1,
+        scheduled_new_reqs=[new_request],
+        num_scheduled_tokens={"new": 1},
+    )
+
+    assert runner._uvm_enabled_step_phase(scheduler_output) == (
+        "enabled:prefill_step"
+    )
+
+
+def test_original_va_alias_prefill_switches_before_first_decode(
+    monkeypatch: Any,
+) -> None:
+    runner = object.__new__(GPUModelRunner)
+    runner._uvm_original_va_phase_prefill_seen = False
+    runner._uvm_original_va_phase_decode_cutover_done = False
+    runner._uvm_original_va_phase_poison_reason = None
+    runner._uvm_original_va_phase_transition_result = None
+    runner.uniform_decode_query_len = 1
+
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS", True)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND",
+        "uvm_original_va",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE",
+        "prefill_remote_decode",
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "sealed")
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID", 7)
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES", 4096
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED", True)
+
+    runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+        SimpleNamespace(num_scheduled_tokens={"request": 8}),
+        "enabled:prefill_step",
+    )
+    assert runner._uvm_original_va_phase_prefill_seen is True
+
+    calls: list[dict[str, Any]] = []
+
+    def transition(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        offload_utils._CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "remote"
+        offload_utils._CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID = 0
+        offload_utils._CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = True
+        return {"ok": True, "pre_state": "sealed", "post_state": "remote"}
+
+    monkeypatch.setattr(
+        offload_utils,
+        "transition_cpu_offload_uvm_original_va_to_remote",
+        transition,
+    )
+    runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+        SimpleNamespace(num_scheduled_tokens={"request": 1}),
+        "enabled:decode_step",
+    )
+
+    assert calls == [
+        {
+            "reason": "first_decode_cutover",
+            "preserve_remote_graphs": True,
+        }
+    ]
+    assert runner._uvm_original_va_phase_decode_cutover_done is True
+    assert runner._uvm_original_va_phase_transition_result is not None
 
 
 def _complete_p3_close_result() -> dict[str, Any]:
@@ -499,17 +578,25 @@ def test_audited_remote_batch_checks_every_range_result(
         "_phase_f_gpu_uuid",
         lambda _device: uvm_module._PhaseFUuid(),
     )
+    monkeypatch.setattr(uvm_module, "_iter_existing_uvm_fd_sources", lambda: [23])
     monkeypatch.setattr(
         uvm_module,
-        "_open_or_adopt_initialized_uvm_fd",
-        lambda **_kwargs: 123,
+        "_initialize_duplicated_uvm_fd",
+        lambda source_fd: 123 if source_fd == 23 else None,
+    )
+    monkeypatch.setattr(
+        uvm_module,
+        "_open_initialized_uvm_fd",
+        lambda: (_ for _ in ()).throw(AssertionError("fallback fd must not open")),
     )
     monkeypatch.setattr(uvm_module.os, "close", lambda _fd: None)
     calls = 0
+    actions: list[int] = []
 
     def ioctl(_fd: int, _request: int, params: Any) -> int:
         nonlocal calls
         calls += 1
+        actions.append(int(params.action))
         params.success_count = params.count
         params.failure_count = 0
         params.rmStatus = 0
@@ -533,7 +620,190 @@ def test_audited_remote_batch_checks_every_range_result(
     assert result["ioctl_calls"] == 2
     assert result["success_count"] == 65
     assert result["remote_mapped_bytes"] == 65 * 0x10000
+    assert result["fd_candidate_attempts"] == 1
+    assert result["fd_candidate_ioctl_calls"] == 2
+    assert result["selected_fd_source"] == 23
+    assert result["selected_fd_kind"] == "existing"
     assert calls == 2
+    assert actions == [
+        uvm_module.UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_AUDITED,
+        uvm_module.UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_AUDITED,
+    ]
+
+
+def test_audited_remote_batch_retries_zero_progress_invalid_device_fd(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(
+        uvm_module,
+        "_phase_f_gpu_uuid",
+        lambda _device: uvm_module._PhaseFUuid(),
+    )
+    monkeypatch.setattr(
+        uvm_module,
+        "_iter_existing_uvm_fd_sources",
+        lambda: [10, 20],
+    )
+    monkeypatch.setattr(
+        uvm_module,
+        "_initialize_duplicated_uvm_fd",
+        lambda source_fd: source_fd + 100,
+    )
+    monkeypatch.setattr(
+        uvm_module,
+        "_open_initialized_uvm_fd",
+        lambda: (_ for _ in ()).throw(AssertionError("fallback fd must not open")),
+    )
+    closed: list[int] = []
+    monkeypatch.setattr(uvm_module.os, "close", lambda fd: closed.append(int(fd)))
+    calls: list[int] = []
+
+    def ioctl(fd: int, request: int, params: Any) -> int:
+        calls.append(fd)
+        assert request == uvm_module._UVM_PHASE_F_BATCH_EXECUTOR_IOCTL
+        if fd == 110:
+            params.success_count = 0
+            params.failure_count = params.count
+            params.rmStatus = uvm_module._NV_ERR_INVALID_DEVICE
+            for index in range(int(params.count)):
+                length = int(params.ranges[index].length)
+                item = params.results[index]
+                item.status = uvm_module._NV_ERR_INVALID_DEVICE
+                item.queried_bytes = length
+                item.resident_unknown_bytes = length
+            return 0
+        assert fd == 120
+        params.success_count = params.count
+        params.failure_count = 0
+        params.rmStatus = 0
+        for index in range(int(params.count)):
+            length = int(params.ranges[index].length)
+            item = params.results[index]
+            item.status = 0
+            item.queried_bytes = length
+            item.resident_cpu_bytes = length
+            item.resident_gpu_bytes = length
+            item.resident_any_bytes = length
+            item.resident_unknown_bytes = 0
+        return 0
+
+    monkeypatch.setattr(uvm_module, "_libc_ioctl", ioctl)
+    result = uvm_module.driver_prepare_ranges_remote_read_audited(
+        [(0x100000, 0x10000)]
+    )
+
+    assert result["ok"] is True
+    assert result["fd_candidate_attempts"] == 2
+    assert result["fd_candidate_ioctl_calls"] == 2
+    assert result["selected_fd_source"] == 20
+    assert result["selected_fd_kind"] == "existing"
+    assert result["made_progress"] is True
+    assert result["fd_mismatch_proven"] is False
+    assert calls == [110, 120]
+    assert closed == [110, 120]
+
+
+def test_audited_remote_batch_partial_progress_never_switches_fd(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(
+        uvm_module,
+        "_phase_f_gpu_uuid",
+        lambda _device: uvm_module._PhaseFUuid(),
+    )
+    monkeypatch.setattr(
+        uvm_module,
+        "_iter_existing_uvm_fd_sources",
+        lambda: [10, 20],
+    )
+    monkeypatch.setattr(
+        uvm_module,
+        "_initialize_duplicated_uvm_fd",
+        lambda source_fd: source_fd + 100,
+    )
+    monkeypatch.setattr(
+        uvm_module,
+        "_open_initialized_uvm_fd",
+        lambda: (_ for _ in ()).throw(AssertionError("fallback fd must not open")),
+    )
+    calls: list[int] = []
+    monkeypatch.setattr(uvm_module.os, "close", lambda _fd: None)
+
+    def ioctl(fd: int, _request: int, params: Any) -> int:
+        calls.append(fd)
+        assert fd == 110
+        params.success_count = 1
+        params.failure_count = params.count - 1
+        params.rmStatus = uvm_module._NV_ERR_INVALID_DEVICE
+        length = int(params.ranges[0].length)
+        item = params.results[0]
+        item.status = 0
+        item.queried_bytes = length
+        item.resident_cpu_bytes = length
+        item.resident_gpu_bytes = length
+        item.resident_any_bytes = length
+        item.resident_unknown_bytes = 0
+        return 0
+
+    monkeypatch.setattr(uvm_module, "_libc_ioctl", ioctl)
+    result = uvm_module.driver_prepare_ranges_remote_read_audited(
+        [(0x100000, 0x10000), (0x110000, 0x10000)]
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "batch_ioctl_failed"
+    assert result["made_progress"] is True
+    assert result["fd_candidate_attempts"] == 1
+    assert result["selected_fd_source"] == 10
+    assert calls == [110]
+
+
+def test_audited_remote_batch_indeterminate_zero_progress_never_switches_fd(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(
+        uvm_module,
+        "_phase_f_gpu_uuid",
+        lambda _device: uvm_module._PhaseFUuid(),
+    )
+    monkeypatch.setattr(
+        uvm_module,
+        "_iter_existing_uvm_fd_sources",
+        lambda: [10, 20],
+    )
+    monkeypatch.setattr(
+        uvm_module,
+        "_initialize_duplicated_uvm_fd",
+        lambda source_fd: source_fd + 100,
+    )
+    monkeypatch.setattr(
+        uvm_module,
+        "_open_initialized_uvm_fd",
+        lambda: (_ for _ in ()).throw(AssertionError("fallback fd must not open")),
+    )
+    calls: list[int] = []
+    monkeypatch.setattr(uvm_module.os, "close", lambda _fd: None)
+
+    def ioctl(fd: int, _request: int, params: Any) -> int:
+        calls.append(fd)
+        assert fd == 110
+        params.success_count = 0
+        params.failure_count = params.count
+        params.rmStatus = uvm_module._NV_ERR_INVALID_DEVICE
+        # A missing per-range preflight signature makes side effects
+        # indeterminate even when all aggregate byte counters are zero.
+        return 0
+
+    monkeypatch.setattr(uvm_module, "_libc_ioctl", ioctl)
+    result = uvm_module.driver_prepare_ranges_remote_read_audited(
+        [(0x100000, 0x10000)]
+    )
+
+    assert result["ok"] is False
+    assert result["made_progress"] is False
+    assert result["fd_mismatch_proven"] is False
+    assert result["fd_candidate_attempts"] == 1
+    assert calls == [110]
 
 
 def _complete_registered_remote_batch(

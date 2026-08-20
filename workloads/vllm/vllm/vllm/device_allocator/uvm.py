@@ -142,6 +142,7 @@ UVM_PHASE_F_ACTION_START_BG_PROMOTION = 8
 UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16
 UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17
 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_AUDITED = 21
+_NV_ERR_INVALID_DEVICE = 0x00000026
 
 UVM_REGION_STATE_UNKNOWN = 0
 UVM_REGION_STATE_COLD = 1
@@ -4971,8 +4972,11 @@ def driver_prepare_ranges_remote_read_audited(
     Unlike :func:`driver_prepare_ranges_remote_read`, this wrapper deliberately
     bypasses the C++ count-only helper so the caller can prove that every input
     page was CPU-resident, covered, and actually mapped.  Up to 64 ranges share
-    one ioctl and one adopted UVM fd is retained for the complete operation.
-    Partial progress is reported as failure; callers must fail closed.
+    one ioctl.  Existing initialized UVM file descriptions are probed until
+    the VA-space which owns the ranges is found.  Only an
+    ``NV_ERR_INVALID_DEVICE`` result with no observable progress may advance
+    to another candidate.  Partial progress is reported as failure and stops
+    candidate probing; callers must fail closed.
     """
     normalized = [
         (int(base), int(length))
@@ -4997,6 +5001,12 @@ def driver_prepare_ranges_remote_read_audited(
         ioctl_ret: int = 0,
         rm_status: int = 0,
         errno_value: int = 0,
+        fd_candidate_attempts: int = 0,
+        fd_candidate_ioctl_calls: int = 0,
+        selected_fd_source: int = -1,
+        selected_fd_kind: str = "",
+        made_progress: bool = False,
+        fd_mismatch_proven: bool = False,
     ) -> dict[str, object]:
         return {
             "ok": bool(ok),
@@ -5014,6 +5024,12 @@ def driver_prepare_ranges_remote_read_audited(
             "ioctl_ret": int(ioctl_ret),
             "rm_status": int(rm_status),
             "errno": int(errno_value),
+            "fd_candidate_attempts": int(fd_candidate_attempts),
+            "fd_candidate_ioctl_calls": int(fd_candidate_ioctl_calls),
+            "selected_fd_source": int(selected_fd_source),
+            "selected_fd_kind": str(selected_fd_kind),
+            "made_progress": bool(made_progress),
+            "fd_mismatch_proven": bool(fd_mismatch_proven),
         }
 
     if not normalized:
@@ -5028,141 +5044,274 @@ def driver_prepare_ranges_remote_read_audited(
             failure_count=requested_count,
         )
 
-    fd = -1
-    success_count = 0
-    failure_count = 0
-    ioctl_calls = 0
-    cpu_resident_bytes = 0
-    remote_mapped_bytes = 0
-    covered_bytes = 0
-    unknown_bytes = 0
-    try:
-        fd = _open_or_adopt_initialized_uvm_fd(prefer_existing=True)
-        for start in range(0, requested_count, _UVM_PHASE_F_MAX_RANGES):
-            chunk = normalized[start : start + _UVM_PHASE_F_MAX_RANGES]
-            params = _PhaseFBatchExecutorParams()
-            params.action = UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ
-            params.count = len(chunk)
-            params.gpu_uuid = gpu_uuid
-            params.async_ = 0
-            for offset, (base, length) in enumerate(chunk):
-                params.ranges[offset].base = base
-                params.ranges[offset].length = length
+    total_ioctl_calls = 0
+    candidate_attempts = 0
 
-            ctypes.set_errno(0)
-            ret = int(_libc_ioctl(fd, _UVM_PHASE_F_BATCH_EXECUTOR_IOCTL, params))
-            ioctl_calls += 1
-            rm_status = int(params.rmStatus)
-            if ret != 0 or rm_status != 0:
-                errno_value = ctypes.get_errno() if ret != 0 else 0
-                failure_count += len(chunk)
-                return result(
-                    ok=False,
-                    reason="batch_ioctl_failed",
-                    success_count=success_count,
-                    failure_count=failure_count,
-                    ioctl_calls=ioctl_calls,
-                    cpu_resident_bytes=cpu_resident_bytes,
-                    remote_mapped_bytes=remote_mapped_bytes,
-                    covered_bytes=covered_bytes,
-                    unknown_bytes=unknown_bytes,
-                    first_failed_index=start,
-                    ioctl_ret=ret,
-                    rm_status=rm_status,
-                    errno_value=errno_value,
+    def run_candidate(
+        fd: int,
+        *,
+        source_fd: int,
+        source_kind: str,
+    ) -> dict[str, object]:
+        nonlocal total_ioctl_calls
+        success_count = 0
+        failure_count = 0
+        cpu_resident_bytes = 0
+        remote_mapped_bytes = 0
+        covered_bytes = 0
+        unknown_bytes = 0
+        made_progress = False
+        fd_mismatch_proven = False
+
+        def candidate_result(**kwargs: object) -> dict[str, object]:
+            return result(
+                fd_candidate_attempts=candidate_attempts,
+                fd_candidate_ioctl_calls=total_ioctl_calls,
+                selected_fd_source=source_fd,
+                selected_fd_kind=source_kind,
+                made_progress=made_progress,
+                fd_mismatch_proven=fd_mismatch_proven,
+                **kwargs,
+            )
+
+        try:
+            for start in range(0, requested_count, _UVM_PHASE_F_MAX_RANGES):
+                chunk = normalized[start : start + _UVM_PHASE_F_MAX_RANGES]
+                params = _PhaseFBatchExecutorParams()
+                # Action 21 audits the final remote mapping state and is
+                # intentionally idempotent.  This matters after cmd99 restores an
+                # already-present CPU-backed READ PTE: action 5 reports only newly
+                # installed pages and would incorrectly return zero mapped bytes.
+                params.action = UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_AUDITED
+                params.count = len(chunk)
+                params.gpu_uuid = gpu_uuid
+                params.async_ = 0
+                for offset, (base, length) in enumerate(chunk):
+                    params.ranges[offset].base = base
+                    params.ranges[offset].length = length
+
+                ctypes.set_errno(0)
+                ret = int(_libc_ioctl(fd, _UVM_PHASE_F_BATCH_EXECUTOR_IOCTL, params))
+                total_ioctl_calls += 1
+                rm_status = int(params.rmStatus)
+                chunk_success = int(params.success_count)
+                chunk_failure = int(params.failure_count)
+                chunk_cpu = sum(
+                    int(params.results[offset].resident_cpu_bytes)
+                    for offset in range(len(chunk))
+                )
+                chunk_mapped = sum(
+                    int(params.results[offset].resident_gpu_bytes)
+                    for offset in range(len(chunk))
+                )
+                chunk_covered = sum(
+                    int(params.results[offset].resident_any_bytes)
+                    for offset in range(len(chunk))
+                )
+                chunk_unknown = sum(
+                    int(params.results[offset].resident_unknown_bytes)
+                    for offset in range(len(chunk))
+                )
+                cpu_resident_bytes += chunk_cpu
+                remote_mapped_bytes += chunk_mapped
+                covered_bytes += chunk_covered
+                unknown_bytes += chunk_unknown
+                made_progress = made_progress or any(
+                    (
+                        chunk_success > 0,
+                        chunk_cpu > 0,
+                        chunk_mapped > 0,
+                        chunk_covered > 0,
+                    )
                 )
 
-            if (
-                int(params.success_count) != len(chunk)
-                or int(params.failure_count) != 0
-            ):
-                failure_count += max(int(params.failure_count), 1)
-                return result(
-                    ok=False,
-                    reason="batch_count_mismatch",
-                    success_count=success_count + int(params.success_count),
-                    failure_count=failure_count,
-                    ioctl_calls=ioctl_calls,
-                    cpu_resident_bytes=cpu_resident_bytes,
-                    remote_mapped_bytes=remote_mapped_bytes,
-                    covered_bytes=covered_bytes,
-                    unknown_bytes=unknown_bytes,
-                    first_failed_index=start + int(params.success_count),
-                    rm_status=rm_status,
-                )
-
-            for offset, (_base, length) in enumerate(chunk):
-                item = params.results[offset]
-                item_cpu = int(item.resident_cpu_bytes)
-                item_mapped = int(item.resident_gpu_bytes)
-                item_covered = int(item.resident_any_bytes)
-                item_unknown = int(item.resident_unknown_bytes)
-                valid = (
-                    int(item.status) == 0
-                    and int(item.queried_bytes) == length
-                    and item_cpu >= length
-                    and item_mapped >= length
-                    and item_covered >= length
-                    and item_unknown == 0
-                )
-                cpu_resident_bytes += item_cpu
-                remote_mapped_bytes += item_mapped
-                covered_bytes += item_covered
-                unknown_bytes += item_unknown
-                if not valid:
-                    failure_count += 1
-                    return result(
+                if ret != 0 or rm_status != 0:
+                    fd_mismatch_proven = (
+                        ret == 0
+                        and rm_status == _NV_ERR_INVALID_DEVICE
+                        and chunk_success == 0
+                        and chunk_failure == len(chunk)
+                        and all(
+                            int(params.results[offset].status)
+                            == _NV_ERR_INVALID_DEVICE
+                            and int(params.results[offset].queried_bytes)
+                            == int(chunk[offset][1])
+                            and int(params.results[offset].resident_cpu_bytes) == 0
+                            and int(params.results[offset].resident_gpu_bytes) == 0
+                            and int(params.results[offset].resident_any_bytes) == 0
+                            and int(params.results[offset].resident_unknown_bytes)
+                            == int(chunk[offset][1])
+                            for offset in range(len(chunk))
+                        )
+                    )
+                    success_count += chunk_success
+                    failure_count += max(
+                        chunk_failure,
+                        len(chunk) - chunk_success,
+                        1,
+                    )
+                    return candidate_result(
                         ok=False,
-                        reason="range_audit_failed",
-                        success_count=success_count + offset,
+                        reason="batch_ioctl_failed",
+                        success_count=success_count,
                         failure_count=failure_count,
-                        ioctl_calls=ioctl_calls,
+                        ioctl_calls=total_ioctl_calls,
                         cpu_resident_bytes=cpu_resident_bytes,
                         remote_mapped_bytes=remote_mapped_bytes,
                         covered_bytes=covered_bytes,
                         unknown_bytes=unknown_bytes,
-                        first_failed_index=start + offset,
-                        rm_status=int(item.status) or rm_status,
+                        first_failed_index=start + min(chunk_success, len(chunk) - 1),
+                        ioctl_ret=ret,
+                        rm_status=rm_status,
+                        errno_value=ctypes.get_errno() if ret != 0 else 0,
                     )
-            success_count += len(chunk)
 
-        complete = (
-            success_count == requested_count
-            and cpu_resident_bytes >= requested_bytes
-            and remote_mapped_bytes >= requested_bytes
-            and covered_bytes >= requested_bytes
-            and unknown_bytes == 0
-        )
-        return result(
-            ok=complete,
-            reason="ok" if complete else "aggregate_audit_failed",
-            success_count=success_count,
-            failure_count=failure_count,
-            ioctl_calls=ioctl_calls,
-            cpu_resident_bytes=cpu_resident_bytes,
-            remote_mapped_bytes=remote_mapped_bytes,
-            covered_bytes=covered_bytes,
-            unknown_bytes=unknown_bytes,
-        )
-    except Exception as exc:
-        logger.debug("Audited remote-read batch failed", exc_info=True)
-        return result(
-            ok=False,
-            reason="batch_exception",
-            success_count=success_count,
-            failure_count=max(failure_count, requested_count - success_count),
-            ioctl_calls=ioctl_calls,
-            cpu_resident_bytes=cpu_resident_bytes,
-            remote_mapped_bytes=remote_mapped_bytes,
-            covered_bytes=covered_bytes,
-            unknown_bytes=unknown_bytes,
-            first_failed_index=success_count,
-            errno_value=getattr(exc, "errno", 0) or 0,
-        )
-    finally:
-        if fd >= 0:
+                if chunk_success != len(chunk) or chunk_failure != 0:
+                    success_count += chunk_success
+                    failure_count += max(
+                        chunk_failure,
+                        len(chunk) - chunk_success,
+                        1,
+                    )
+                    return candidate_result(
+                        ok=False,
+                        reason="batch_count_mismatch",
+                        success_count=success_count,
+                        failure_count=failure_count,
+                        ioctl_calls=total_ioctl_calls,
+                        cpu_resident_bytes=cpu_resident_bytes,
+                        remote_mapped_bytes=remote_mapped_bytes,
+                        covered_bytes=covered_bytes,
+                        unknown_bytes=unknown_bytes,
+                        first_failed_index=start + min(chunk_success, len(chunk) - 1),
+                        rm_status=rm_status,
+                    )
+
+                for offset, (_base, length) in enumerate(chunk):
+                    item = params.results[offset]
+                    item_cpu = int(item.resident_cpu_bytes)
+                    item_mapped = int(item.resident_gpu_bytes)
+                    item_covered = int(item.resident_any_bytes)
+                    item_unknown = int(item.resident_unknown_bytes)
+                    valid = (
+                        int(item.status) == 0
+                        and int(item.queried_bytes) == length
+                        and item_cpu >= length
+                        and item_mapped >= length
+                        and item_covered >= length
+                        and item_unknown == 0
+                    )
+                    if not valid:
+                        success_count += offset
+                        failure_count += 1
+                        return candidate_result(
+                            ok=False,
+                            reason="range_audit_failed",
+                            success_count=success_count,
+                            failure_count=failure_count,
+                            ioctl_calls=total_ioctl_calls,
+                            cpu_resident_bytes=cpu_resident_bytes,
+                            remote_mapped_bytes=remote_mapped_bytes,
+                            covered_bytes=covered_bytes,
+                            unknown_bytes=unknown_bytes,
+                            first_failed_index=start + offset,
+                            rm_status=int(item.status) or rm_status,
+                        )
+                success_count += len(chunk)
+
+            complete = (
+                success_count == requested_count
+                and failure_count == 0
+                and cpu_resident_bytes >= requested_bytes
+                and remote_mapped_bytes >= requested_bytes
+                and covered_bytes >= requested_bytes
+                and unknown_bytes == 0
+            )
+            return candidate_result(
+                ok=complete,
+                reason="ok" if complete else "aggregate_audit_failed",
+                success_count=success_count,
+                failure_count=failure_count,
+                ioctl_calls=total_ioctl_calls,
+                cpu_resident_bytes=cpu_resident_bytes,
+                remote_mapped_bytes=remote_mapped_bytes,
+                covered_bytes=covered_bytes,
+                unknown_bytes=unknown_bytes,
+            )
+        except Exception as exc:
+            logger.debug("Audited remote-read batch failed", exc_info=True)
+            return candidate_result(
+                ok=False,
+                reason="batch_exception",
+                success_count=success_count,
+                failure_count=max(failure_count, requested_count - success_count),
+                ioctl_calls=total_ioctl_calls,
+                cpu_resident_bytes=cpu_resident_bytes,
+                remote_mapped_bytes=remote_mapped_bytes,
+                covered_bytes=covered_bytes,
+                unknown_bytes=unknown_bytes,
+                first_failed_index=success_count,
+                errno_value=getattr(exc, "errno", 0) or 0,
+            )
+
+    last_candidate: dict[str, object] | None = None
+    for source_fd in _iter_existing_uvm_fd_sources():
+        fd = _initialize_duplicated_uvm_fd(source_fd)
+        if fd is None:
+            continue
+        candidate_attempts += 1
+        try:
+            candidate = run_candidate(
+                fd,
+                source_fd=int(source_fd),
+                source_kind="existing",
+            )
+        finally:
             with suppress(OSError):
                 os.close(fd)
+
+        if bool(candidate["ok"]) or bool(candidate["made_progress"]):
+            return candidate
+        if not bool(candidate["fd_mismatch_proven"]):
+            return candidate
+        last_candidate = candidate
+
+    # Preserve the legacy fallback only after every existing file description
+    # was proven unusable without modifying or auditing any target range.
+    try:
+        fd = _open_initialized_uvm_fd()
+    except Exception as exc:
+        logger.debug("Failed to open fallback UVM fd for remote audit", exc_info=True)
+        if last_candidate is not None:
+            return {
+                **last_candidate,
+                "reason": "no_matching_existing_uvm_fd",
+                "fd_candidate_attempts": candidate_attempts,
+                "fd_candidate_ioctl_calls": total_ioctl_calls,
+            }
+        return result(
+            ok=False,
+            reason="no_initializable_uvm_fd",
+            failure_count=requested_count,
+            ioctl_calls=total_ioctl_calls,
+            errno_value=getattr(exc, "errno", 0) or 0,
+            fd_candidate_attempts=candidate_attempts,
+            fd_candidate_ioctl_calls=total_ioctl_calls,
+        )
+
+    candidate_attempts += 1
+    try:
+        fallback = run_candidate(fd, source_fd=-1, source_kind="new")
+    finally:
+        with suppress(OSError):
+            os.close(fd)
+    if (
+        not bool(fallback["ok"])
+        and not bool(fallback["made_progress"])
+        and bool(fallback["fd_mismatch_proven"])
+    ):
+        return {**fallback, "reason": "no_matching_uvm_fd"}
+    return fallback
 
 
 def driver_prepare_regions_remote_read_audited(

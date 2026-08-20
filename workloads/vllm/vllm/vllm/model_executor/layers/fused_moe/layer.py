@@ -892,9 +892,29 @@ class FusedMoE(CustomOp):
         self._uvm_offloaded_global_expert_ids: set[int] = set()
         self._uvm_remote_read_global_expert_ids: set[int] = set()
         self._uvm_init_weight_offload_done = False
-        self.uvm_expert_weights_managed = _env_flag_enabled(
+        managed_expert_weights_requested = _env_flag_enabled(
             "VLLM_UVM_EXPERT_WEIGHTS_MANAGED",
             default=False,
+        )
+        # Imported lazily to avoid a models.utils <-> FusedMoE import cycle.
+        # set_cpu_offload_max_bytes() freezes the exact-name plan before model
+        # construction, so this decision is stable for the layer lifetime.
+        from vllm.model_executor.models.utils import (
+            cpu_offload_uvm_original_va_static_alias_enabled,
+            use_uvm_expert_weight_allocation,
+        )
+
+        self.uvm_expert_weights_managed = use_uvm_expert_weight_allocation(
+            prefix,
+            managed_requested=managed_expert_weights_requested,
+        )
+        # Fail-fast fault mode deliberately cannot populate a fresh managed
+        # allocation on first GPU touch. Selected original-VA parameters are
+        # therefore placed explicitly during initialization; finalize() later
+        # moves them to CPU and installs the sealed static GPU mappings.
+        self.uvm_expert_weights_explicit_prefetch = bool(
+            self.uvm_expert_weights_managed
+            and cpu_offload_uvm_original_va_static_alias_enabled()
         )
         self.quant_config = quant_config
 
@@ -971,6 +991,8 @@ class FusedMoE(CustomOp):
     def uvm_expert_weight_allocation_scope(self):
         if not self.uvm_expert_weights_managed:
             return nullcontext()
+        if self.uvm_expert_weights_explicit_prefetch:
+            return uvm_local_memory_pool(enable_prefetch=True)
         return uvm_local_memory_pool()
 
     # Note: maybe_init_modular_kernel should only be called by

@@ -1439,6 +1439,124 @@ typedef struct
     NV_STATUS rmStatus;                               // OUT
 } UVM_MOE_SLOT_SESSION_ABORT_PARAMS;
 
+// Initialization-time static aliases for CUDA Graph weight streaming. Unlike
+// the dynamic MoE slot transition commands above, these commands never perform
+// a serving-time owner cutover. Userspace builds an immutable set of aliases,
+// seals it before CUDA Graph capture, and destroys it only after every Graph and
+// CUDA kernel which can reference an alias has completed.
+//
+// MAP creates a session when session_id is zero and returns its non-zero id. A
+// later MAP with that id appends aliases to the same unsealed session. Entries
+// with the same backing identity and overlapping backing offsets intentionally
+// alias the same physical bytes. Target VA ranges within a session must not
+// overlap. The VA ranges must belong to the UVM VA space associated with this
+// file. A successful MAP installs every requested alias or none; a failure
+// which reports poisoned leaves the session destroy-only. Before MAP,
+// userspace must synchronize every stream which could access a target VA; UVM
+// trackers cannot observe arbitrary user kernels or an existing Graph replay.
+// All entries in one MAP use the same PTE granularity in ABI v1.
+#define UVM_MOE_STATIC_ALIAS_ABI_VERSION                              1U
+#define UVM_MOE_STATIC_ALIAS_MAX_ENTRIES                              1152U
+
+#define UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW                            0x00000001U
+#define UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_PTE_64K                       0x00000002U
+#define UVM_MOE_STATIC_ALIAS_ENTRY_FLAGS_ALL                          \
+    (UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW |                             \
+     UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_PTE_64K)
+
+typedef enum
+{
+    UVM_MOE_STATIC_ALIAS_ENTRY_OK = 0,
+    UVM_MOE_STATIC_ALIAS_ENTRY_INVALID_ARGUMENT = 1,
+    UVM_MOE_STATIC_ALIAS_ENTRY_INVALID_ADDRESS = 2,
+    UVM_MOE_STATIC_ALIAS_ENTRY_BACKING_NOT_FOUND = 3,
+    UVM_MOE_STATIC_ALIAS_ENTRY_ALIAS_CONFLICT = 4,
+    UVM_MOE_STATIC_ALIAS_ENTRY_MAP_FAILED = 5,
+    UVM_MOE_STATIC_ALIAS_ENTRY_ROLLED_BACK = 6,
+} UVM_MOE_STATIC_ALIAS_ENTRY_STATUS;
+
+typedef struct
+{
+    NvU32 backing_layer_id;                           // IN
+    NvU32 backing_expert_id;                          // IN
+    NvU32 backing_slot_id;                            // IN
+    NvU32 flags;                                      // IN, ENTRY_FLAG_*
+    NvU64 va_base NV_ALIGN_BYTES(8);                  // IN, target alias VA
+    NvU64 bytes NV_ALIGN_BYTES(8);                    // IN
+    NvU64 slot_offset NV_ALIGN_BYTES(8);              // IN, physical backing offset
+    NvU32 status;                                     // OUT, ENTRY_STATUS
+} UVM_MOE_STATIC_ALIAS_ENTRY;
+
+#define UVM_MOE_STATIC_ALIAS_MAP                                      UVM_IOCTL_BASE(97)
+typedef struct
+{
+    NvU32 abi_version;                                // IN, ABI_VERSION
+    NvU32 struct_size;                                // IN, sizeof(params)
+    NvU32 flags;                                      // IN, must be zero in v1
+    NvU32 reserved;                                   // IN, must be zero
+    NvU64 session_id NV_ALIGN_BYTES(8);               // IN/OUT, zero creates
+    NvProcessorUuid gpu_uuid;                         // IN
+    NvU64 requested_bytes NV_ALIGN_BYTES(8);          // OUT, this call
+    NvU64 mapped_bytes NV_ALIGN_BYTES(8);             // OUT, this call
+    NvU64 total_alias_bytes NV_ALIGN_BYTES(8);        // OUT, whole session
+    NvU64 backing_bytes NV_ALIGN_BYTES(8);            // OUT, unique backing
+    NvU32 count;                                      // IN
+    NvU32 success_count;                              // OUT, this call
+    NvU32 failure_count;                              // OUT, this call
+    NvU32 alias_count;                                // OUT, this call
+    NvU32 tlb_invalidate_count;                       // OUT, this call
+    NvU32 poisoned;                                   // OUT, boolean
+    UVM_MOE_STATIC_ALIAS_ENTRY entries[UVM_MOE_STATIC_ALIAS_MAX_ENTRIES]; // IN/OUT
+    NV_STATUS rmStatus;                               // OUT
+} UVM_MOE_STATIC_ALIAS_MAP_PARAMS;
+
+// Freeze an alias session before CUDA Graph capture. The expected fields make
+// a userspace/kernel descriptor mismatch fail before the session is published
+// as immutable. Repeated SEAL is not part of the v1 contract.
+#define UVM_MOE_STATIC_ALIAS_SEAL                                     UVM_IOCTL_BASE(98)
+typedef struct
+{
+    NvU32 abi_version;                                // IN, ABI_VERSION
+    NvU32 struct_size;                                // IN, sizeof(params)
+    NvU32 flags;                                      // IN, must be zero in v1
+    NvU32 reserved;                                   // IN, must be zero
+    NvU64 session_id NV_ALIGN_BYTES(8);               // IN, non-zero
+    NvU64 expected_alias_bytes NV_ALIGN_BYTES(8);     // IN
+    NvU64 alias_bytes NV_ALIGN_BYTES(8);              // OUT
+    NvU64 backing_bytes NV_ALIGN_BYTES(8);            // OUT
+    NvU32 expected_alias_count;                       // IN
+    NvU32 sealed;                                     // OUT, boolean
+    NvU32 alias_count;                                // OUT
+    NvU32 poisoned;                                   // OUT, boolean
+    NV_STATUS rmStatus;                               // OUT
+} UVM_MOE_STATIC_ALIAS_SEAL_PARAMS;
+
+// Remove every mapping owned by one session. RELEASE_BACKING additionally
+// releases the session's physical slot backing. Destruction is convergent:
+// released resources stay released and remaining_* reports what a retry must
+// reclaim. session_cleared is set only when no alias or backing remains.
+#define UVM_MOE_STATIC_ALIAS_DESTROY                                  UVM_IOCTL_BASE(99)
+#define UVM_MOE_STATIC_ALIAS_DESTROY_FLAG_RELEASE_BACKING              0x00000001U
+#define UVM_MOE_STATIC_ALIAS_DESTROY_FLAGS_ALL                         \
+    UVM_MOE_STATIC_ALIAS_DESTROY_FLAG_RELEASE_BACKING
+typedef struct
+{
+    NvU32 abi_version;                                // IN, ABI_VERSION
+    NvU32 struct_size;                                // IN, sizeof(params)
+    NvU32 flags;                                      // IN, DESTROY_FLAG_*
+    NvU32 reserved;                                   // IN, must be zero
+    NvU64 session_id NV_ALIGN_BYTES(8);               // IN, non-zero
+    NvU64 released_alias_bytes NV_ALIGN_BYTES(8);     // OUT, this call
+    NvU64 remaining_alias_bytes NV_ALIGN_BYTES(8);    // OUT
+    NvU64 released_backing_bytes NV_ALIGN_BYTES(8);   // OUT, this call
+    NvU64 remaining_backing_bytes NV_ALIGN_BYTES(8);  // OUT
+    NvU32 released_alias_count;                       // OUT, this call
+    NvU32 remaining_alias_count;                      // OUT
+    NvU32 session_cleared;                            // OUT, boolean
+    NvU32 poisoned;                                   // OUT, boolean
+    NV_STATUS rmStatus;                               // OUT
+} UVM_MOE_STATIC_ALIAS_DESTROY_PARAMS;
+
 typedef enum
 {
     UVM_MOE_SLOT_POOL_STATE_EMPTY = 0,

@@ -343,6 +343,11 @@ NV_STATUS uvm_api_enable_read_duplication(const UVM_ENABLE_READ_DUPLICATION_PARA
 NV_STATUS uvm_api_disable_read_duplication(const UVM_DISABLE_READ_DUPLICATION_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp);
 bool uvm_moe_slot_pool_range_has_mappings(uvm_va_space_t *va_space, NvU64 base, NvU64 bytes);
+// Reject a serving-time residency, mapping, or policy mutation which overlaps
+// an active static alias. The VA-space lock must be held in at least read mode.
+NV_STATUS uvm_moe_static_alias_reject_range_mutation_locked(uvm_va_space_t *va_space,
+                                                             NvU64 base,
+                                                             NvU64 bytes);
 NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_fault(uvm_va_space_t *va_space, NvU64 base, NvU64 bytes);
 NV_STATUS uvm_moe_slot_pool_clear_range_mappings_for_migrate(uvm_va_space_t *va_space, NvU64 base, NvU64 bytes);
 NV_STATUS uvm_moe_slot_pool_clear_ranges_mappings_for_migrate_locked(uvm_va_space_t *va_space,

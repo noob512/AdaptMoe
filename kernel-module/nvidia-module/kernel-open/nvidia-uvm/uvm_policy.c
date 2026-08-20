@@ -314,6 +314,12 @@ NV_STATUS uvm_api_set_preferred_location(const UVM_SET_PREFERRED_LOCATION_PARAMS
         status = NV_ERR_INVALID_ADDRESS;
         goto done;
     }
+    if (type == UVM_API_RANGE_TYPE_MANAGED) {
+        status = uvm_moe_static_alias_reject_range_mutation_locked(
+            va_space, start, length);
+        if (status != NV_OK)
+            goto done;
+    }
 
     // If the CPU is the preferred location, we don't have to find the associated uvm_gpu_t
     if (uvm_uuid_is_cpu(&params->preferredLocation)) {
@@ -410,6 +416,12 @@ NV_STATUS uvm_api_unset_preferred_location(const UVM_UNSET_PREFERRED_LOCATION_PA
     if (type == UVM_API_RANGE_TYPE_INVALID) {
         status = NV_ERR_INVALID_ADDRESS;
         goto done;
+    }
+    if (type == UVM_API_RANGE_TYPE_MANAGED) {
+        status = uvm_moe_static_alias_reject_range_mutation_locked(
+            va_space, params->requestedBase, params->length);
+        if (status != NV_OK)
+            goto done;
     }
 
     if ((type != UVM_API_RANGE_TYPE_MANAGED) && (current->mm != mm)) {
@@ -538,6 +550,12 @@ static NV_STATUS accessed_by_set(uvm_va_space_t *va_space,
     if (type == UVM_API_RANGE_TYPE_INVALID) {
         status = NV_ERR_INVALID_ADDRESS;
         goto done;
+    }
+    if (type == UVM_API_RANGE_TYPE_MANAGED) {
+        status = uvm_moe_static_alias_reject_range_mutation_locked(
+            va_space, base, length);
+        if (status != NV_OK)
+            goto done;
     }
 
     if (uvm_uuid_is_cpu(processor_uuid)) {
@@ -819,6 +837,12 @@ static NV_STATUS read_duplication_set(uvm_va_space_t *va_space, NvU64 base, NvU6
     else if (type == UVM_API_RANGE_TYPE_ATS) {
         status = NV_OK;
         goto done;
+    }
+    if (type == UVM_API_RANGE_TYPE_MANAGED) {
+        status = uvm_moe_static_alias_reject_range_mutation_locked(
+            va_space, base, length);
+        if (status != NV_OK)
+            goto done;
     }
 
     // An integrated GPU has no vidmem to make a duplicate

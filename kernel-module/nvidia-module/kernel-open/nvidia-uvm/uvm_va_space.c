@@ -2631,6 +2631,15 @@ static vm_fault_t uvm_va_space_cpu_fault(uvm_va_space_t *va_space, struct vm_fau
         if (do_sleep)
             uvm_tools_record_throttling_end(va_space, fault_addr, UVM_ID_CPU);
 
+        if (!is_hmm) {
+            status = uvm_moe_static_alias_reject_range_mutation_locked(
+                va_space,
+                UVM_PAGE_ALIGN_DOWN(fault_addr),
+                PAGE_SIZE);
+            if (status != NV_OK)
+                break;
+        }
+
         if (is_hmm) {
             if (va_space->va_space_mm.mm == vma->vm_mm) {
                 // Note that normally we should find a va_block for the faulting

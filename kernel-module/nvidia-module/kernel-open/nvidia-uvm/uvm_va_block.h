@@ -1109,7 +1109,8 @@ typedef enum
 
 // One block slice of a slot-direct batch. Callers flatten user ranges into
 // unique VA blocks, sort them by increasing VA, and provide one persistent
-// preallocated VIDMEM slot plus one slot-lifetime tracker per slice.
+// preallocated VIDMEM slot per slice. Copy/map callers also provide a slot-
+// lifetime tracker; static alias-map callers own that lifetime externally.
 typedef struct
 {
     uvm_va_block_t *va_block;
@@ -1118,6 +1119,10 @@ typedef struct
     uvm_tracker_t *slot_tracker;
     NvU64 slot_offset;
     uvm_slot_direct_pte_mode_t pte_mode;
+    // Slot-backed aliases default to read-only so zero-initialized entries and
+    // every existing slot-direct caller retain their original behavior. A
+    // writable alias receives READ_WRITE PTEs, never atomic permission.
+    bool writable;
 
     // Outputs used by the slot-pool owner for completion and rollback.
     NvU64 copied_bytes;
@@ -1349,6 +1354,53 @@ NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
                                                    struct mutex *lockdep_nest_lock,
                                                    uvm_tracker_t *batch_tracker,
                                                    uvm_va_block_slot_direct_result_t *result);
+
+// Install already-populated slot backing at a set of managed target aliases
+// without submitting a CPU-to-GPU data copy. Each flattened entry selects
+// read-only or read-write (non-atomic) access through entry->writable. Target
+// ordinary GPU PTEs are cleared before the slot leaves are published, and all
+// PTE/TLB work is retained by the VA-block and batch trackers. This path does
+// not read entry->slot_tracker; static backing lifetime is owned by its caller.
+//
+// LOCKING: va_space->lock and mmap_lock (when mm is non-NULL) must be held.
+//          lockdep_nest_lock must be held by the caller. Entries must be
+//          sorted by block VA and region start. Disjoint slices may share a
+//          block; the implementation acquires each unique block lock once.
+NV_STATUS uvm_va_block_slot_alias_map_batch(
+    uvm_va_space_t *va_space,
+    struct mm_struct *mm,
+    uvm_gpu_t *gpu,
+    uvm_va_block_slot_direct_entry_t *entries,
+    size_t entry_count,
+    bool stage_sync,
+    bool fail_closed,
+    struct mutex *lockdep_nest_lock,
+    uvm_tracker_t *batch_tracker,
+    uvm_va_block_slot_direct_result_t *result);
+
+// Revoke existing CPU PTEs for a static-alias target set before publishing
+// slot-backed GPU mappings. CPU residency is preserved. Once the caller has
+// committed static-alias range metadata, any later CPU fault is rejected by
+// the session guard until explicit teardown restores the ordinary mapping.
+//
+// LOCKING: va_space->lock and mmap_lock must be held. Entries must be sorted
+//          by block VA and region start.
+NV_STATUS uvm_va_block_slot_alias_revoke_cpu_mappings_batch(
+    uvm_va_space_t *va_space,
+    struct mm_struct *mm,
+    uvm_va_block_slot_direct_entry_t *entries,
+    size_t entry_count);
+
+// Validate the software-visible mapping and permission state of one sealed
+// static-alias range. This also proves that MAP revoked every CPU PTE in the
+// range, preventing a writable sysmem view from coexisting with slot HBM.
+//
+// LOCKING: va_space->lock must be held.
+NV_STATUS uvm_va_block_validate_slot_alias_range(uvm_va_space_t *va_space,
+                                                  uvm_gpu_t *gpu,
+                                                  NvU64 va_base,
+                                                  NvU64 bytes,
+                                                  bool writable);
 
 // Best-effort failure cleanup for a slot-direct transaction which must never
 // restore a GPU mapping to CPU backing. Every target slice is generically

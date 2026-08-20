@@ -7085,13 +7085,21 @@ static bool block_check_mappings_page(uvm_va_block_t *block,
     block_page_authorized_processors(block, page_index, UVM_PROT_READ_ONLY, read_mappings);
 
     uvm_processor_mask_zero(&moe_slot_mappings);
-    for_each_id_in_mask(id, read_mappings) {
-        if (block_page_is_moe_slot_backed(block, id, page_index)) {
-            UVM_ASSERT(!uvm_processor_mask_test(write_mappings, id));
-            UVM_ASSERT(!uvm_processor_mask_test(atomic_mappings, id));
-            uvm_processor_mask_set(&moe_slot_mappings, id);
-        }
+    for_each_gpu_id(id) {
+        if (!block_page_is_moe_slot_backed(block, id, page_index))
+            continue;
+
+        // Slot-backed mappings have driver-owned physical residency, so they
+        // must not participate in the ordinary residency continuity checks
+        // below. They may be read-only consumers or read-write upload aliases,
+        // but atomic access is never permitted. Checking the slot mask rather
+        // than walking read_mappings also catches stale slot metadata which no
+        // longer has a readable PTE.
+        UVM_ASSERT(uvm_processor_mask_test(read_mappings, id));
+        UVM_ASSERT(!uvm_processor_mask_test(atomic_mappings, id));
+        uvm_processor_mask_set(&moe_slot_mappings, id);
     }
+    uvm_processor_mask_andnot(write_mappings, write_mappings, &moe_slot_mappings);
     uvm_processor_mask_andnot(read_mappings, read_mappings, &moe_slot_mappings);
 
     // Each access bit implies all accesses below it
@@ -7341,7 +7349,7 @@ static bool block_check_mappings_ptes(uvm_va_block_t *block, uvm_va_block_contex
             // Slot PTEs deliberately do not represent ordinary UVM residency.
             // Their physical backing and lifetime are owned by the slot pool,
             // so the resident-processor continuity checks below do not apply.
-            UVM_ASSERT(prot == UVM_PROT_READ_ONLY);
+            UVM_ASSERT(prot == UVM_PROT_READ_ONLY || prot == UVM_PROT_READ_WRITE);
         }
         else if (prot != UVM_PROT_NONE) {
             resident_id = block_gpu_get_processor_to_map(block, block_context, gpu, 0);
@@ -7411,7 +7419,7 @@ static bool block_check_mappings_ptes(uvm_va_block_t *block, uvm_va_block_contex
             }
 
             if (slot_backed_big) {
-                UVM_ASSERT(prot == UVM_PROT_READ_ONLY);
+                UVM_ASSERT(prot == UVM_PROT_READ_ONLY || prot == UVM_PROT_READ_WRITE);
             }
             else if (prot != UVM_PROT_NONE) {
                 resident_id = block_gpu_get_processor_to_map(block, block_context, gpu, big_region.first);
@@ -7696,6 +7704,7 @@ static void block_gpu_pte_write_moe_slot_4k(uvm_va_block_t *block,
                                             const uvm_page_mask_t *write_page_mask,
                                             uvm_mem_t *slot_mem,
                                             NvU64 slot_offset,
+                                            uvm_prot_t new_prot,
                                             uvm_pte_batch_t *pte_batch,
                                             uvm_tlb_batch_t *tlb_batch)
 {
@@ -7711,6 +7720,7 @@ static void block_gpu_pte_write_moe_slot_4k(uvm_va_block_t *block,
 
     UVM_ASSERT(uvm_mem_is_local_vidmem(slot_mem, gpu));
     UVM_ASSERT(IS_ALIGNED(slot_offset, UVM_PAGE_SIZE_4K));
+    UVM_ASSERT(new_prot == UVM_PROT_READ_ONLY || new_prot == UVM_PROT_READ_WRITE);
 
     base_page_index = uvm_va_block_first_page_in_mask(block_region, write_page_mask);
 
@@ -7729,7 +7739,7 @@ static void block_gpu_pte_write_moe_slot_4k(uvm_va_block_t *block,
         for (i = 0; i < ptes_per_page; i++) {
             NvU64 pte_val = tree->hal->make_pte(page_addr.aperture,
                                                 page_addr.address,
-                                                UVM_PROT_READ_ONLY,
+                                                new_prot,
                                                 pte_flags);
             uvm_pte_batch_write_pte(pte_batch, pte_addr, pte_val, pte_size);
             page_addr.address += UVM_PAGE_SIZE_4K;
@@ -7754,6 +7764,7 @@ static void block_gpu_pte_write_moe_slot_big_region(uvm_va_block_t *block,
                                                     uvm_va_block_region_t region,
                                                     uvm_mem_t *slot_mem,
                                                     NvU64 slot_offset,
+                                                    uvm_prot_t new_prot,
                                                     uvm_pte_batch_t *pte_batch,
                                                     uvm_tlb_batch_t *tlb_batch)
 {
@@ -7773,6 +7784,7 @@ static void block_gpu_pte_write_moe_slot_big_region(uvm_va_block_t *block,
     UVM_ASSERT(IS_ALIGNED(slot_offset, UVM_BIG_PAGE_SIZE));
     UVM_ASSERT(uvm_mem_is_local_vidmem(slot_mem, gpu));
     UVM_ASSERT(gpu_state->page_table_range_big.table);
+    UVM_ASSERT(new_prot == UVM_PROT_READ_ONLY || new_prot == UVM_PROT_READ_WRITE);
 
     for (big_page_index = 0; big_page_index < uvm_va_block_num_big_pages(block); ++big_page_index) {
         uvm_va_block_region_t big_region = uvm_va_block_big_page_region(block, big_page_index);
@@ -7796,7 +7808,7 @@ static void block_gpu_pte_write_moe_slot_big_region(uvm_va_block_t *block,
                                                       big_page_index);
         pte_val = tree->hal->make_pte(page_addr.aperture,
                                       page_addr.address,
-                                      UVM_PROT_READ_ONLY,
+                                      new_prot,
                                       pte_flags);
         uvm_pte_batch_write_pte(pte_batch, pte_addr, pte_val, pte_size);
     }
@@ -7814,6 +7826,7 @@ static void block_gpu_pte_write_moe_slot_big(uvm_va_block_t *block,
                                              uvm_gpu_t *gpu,
                                              uvm_mem_t *slot_mem,
                                              NvU64 slot_offset,
+                                             uvm_prot_t new_prot,
                                              uvm_pte_batch_t *pte_batch,
                                              uvm_tlb_batch_t *tlb_batch)
 {
@@ -7822,6 +7835,7 @@ static void block_gpu_pte_write_moe_slot_big(uvm_va_block_t *block,
                                             uvm_va_block_region_from_block(block),
                                             slot_mem,
                                             slot_offset,
+                                            new_prot,
                                             pte_batch,
                                             tlb_batch);
 }
@@ -7830,6 +7844,7 @@ static void block_gpu_pte_write_moe_slot_2m(uvm_va_block_t *block,
                                             uvm_gpu_t *gpu,
                                             uvm_mem_t *slot_mem,
                                             NvU64 slot_offset,
+                                            uvm_prot_t new_prot,
                                             uvm_pte_batch_t *pte_batch,
                                             uvm_tlb_batch_t *tlb_batch)
 {
@@ -7847,6 +7862,7 @@ static void block_gpu_pte_write_moe_slot_2m(uvm_va_block_t *block,
     UVM_ASSERT(gpu_state->pte_is_2m);
     UVM_ASSERT(gpu_state->page_table_range_2m.table);
     UVM_ASSERT(uvm_mem_is_physically_contiguous(slot_mem, slot_offset, UVM_PAGE_SIZE_2M));
+    UVM_ASSERT(new_prot == UVM_PROT_READ_ONLY || new_prot == UVM_PROT_READ_WRITE);
 
     page_addr = uvm_mem_gpu_physical(slot_mem, gpu, slot_offset, UVM_PAGE_SIZE_2M);
     UVM_ASSERT(page_addr.aperture == UVM_APERTURE_VID);
@@ -7855,7 +7871,7 @@ static void block_gpu_pte_write_moe_slot_2m(uvm_va_block_t *block,
     pte_addr = uvm_page_table_range_entry_address(tree, &gpu_state->page_table_range_2m, 0);
     pte_val = tree->hal->make_pte(page_addr.aperture,
                                   page_addr.address,
-                                  UVM_PROT_READ_ONLY,
+                                  new_prot,
                                   UVM_MMU_PTE_FLAGS_CACHED);
     uvm_pte_batch_write_pte(pte_batch, pte_addr, pte_val, pte_size);
 
@@ -10571,16 +10587,17 @@ static NV_STATUS block_alloc_moe_slot_4k_ptes(uvm_va_block_t *va_block,
                                      out_tracker);
 }
 
-static NV_STATUS block_map_moe_slot_readonly(uvm_va_block_t *va_block,
-                                             uvm_va_block_context_t *block_context,
-                                             uvm_gpu_t *gpu,
-                                             uvm_va_block_region_t region,
-                                             const uvm_page_mask_t *page_mask,
-                                             uvm_mem_t *slot_mem,
-                                             NvU64 slot_offset,
-                                             uvm_slot_direct_pte_mode_t pte_mode,
-                                             bool overwrite_existing,
-                                             uvm_tracker_t *out_tracker)
+static NV_STATUS block_map_moe_slot(uvm_va_block_t *va_block,
+                                    uvm_va_block_context_t *block_context,
+                                    uvm_gpu_t *gpu,
+                                    uvm_va_block_region_t region,
+                                    const uvm_page_mask_t *page_mask,
+                                    uvm_mem_t *slot_mem,
+                                    NvU64 slot_offset,
+                                    uvm_slot_direct_pte_mode_t pte_mode,
+                                    bool overwrite_existing,
+                                    bool writable,
+                                    uvm_tracker_t *out_tracker)
 {
     uvm_va_space_t *va_space = uvm_va_block_get_va_space(va_block);
     uvm_va_block_gpu_state_t *gpu_state;
@@ -10591,6 +10608,7 @@ static NV_STATUS block_map_moe_slot_readonly(uvm_va_block_t *va_block,
     uvm_push_t push;
     NV_STATUS status;
     uvm_page_mask_t *pages_to_map = &block_context->mapping.page_mask;
+    uvm_prot_t new_prot = writable ? UVM_PROT_READ_WRITE : UVM_PROT_READ_ONLY;
 
     UVM_ASSERT(!uvm_va_block_is_dead(va_block));
     uvm_assert_mutex_locked(&va_block->lock);
@@ -10685,6 +10703,7 @@ static NV_STATUS block_map_moe_slot_readonly(uvm_va_block_t *va_block,
                                             pages_to_map,
                                             slot_mem,
                                             slot_offset,
+                                            new_prot,
                                             pte_batch,
                                             tlb_batch);
             uvm_pte_batch_end(pte_batch);
@@ -10709,6 +10728,7 @@ static NV_STATUS block_map_moe_slot_readonly(uvm_va_block_t *va_block,
                                                  gpu,
                                                  slot_mem,
                                                  slot_offset,
+                                                 new_prot,
                                                  pte_batch,
                                                  tlb_batch);
                 uvm_pte_batch_end(pte_batch);
@@ -10727,6 +10747,7 @@ static NV_STATUS block_map_moe_slot_readonly(uvm_va_block_t *va_block,
                                              gpu,
                                              slot_mem,
                                              slot_offset,
+                                             new_prot,
                                              pte_batch,
                                              NULL);
             gpu_state->initialized_big = true;
@@ -10762,6 +10783,7 @@ static NV_STATUS block_map_moe_slot_readonly(uvm_va_block_t *va_block,
                                             gpu,
                                             slot_mem,
                                             slot_offset,
+                                            new_prot,
                                             pte_batch,
                                             tlb_batch);
             uvm_pte_batch_end(pte_batch);
@@ -10783,9 +10805,16 @@ static NV_STATUS block_map_moe_slot_readonly(uvm_va_block_t *va_block,
     uvm_page_mask_or(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ],
                      &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ],
                      pages_to_map);
-    uvm_page_mask_andnot(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
+    if (writable) {
+        uvm_page_mask_or(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
                          &gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
                          pages_to_map);
+    }
+    else {
+        uvm_page_mask_andnot(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
+                             &gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
+                             pages_to_map);
+    }
     uvm_page_mask_andnot(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_ATOMIC],
                          &gpu_state->pte_bits[UVM_PTE_BITS_GPU_ATOMIC],
                          pages_to_map);
@@ -10815,16 +10844,17 @@ NV_STATUS uvm_va_block_map_moe_slot_readonly(uvm_va_block_t *va_block,
                                              NvU64 slot_offset,
                                              uvm_tracker_t *out_tracker)
 {
-    return block_map_moe_slot_readonly(va_block,
-                                       block_context,
-                                       gpu,
-                                       region,
-                                       page_mask,
-                                       slot_mem,
-                                       slot_offset,
-                                       UVM_SLOT_DIRECT_PTE_MODE_4K,
-                                       false,
-                                       out_tracker);
+    return block_map_moe_slot(va_block,
+                              block_context,
+                              gpu,
+                              region,
+                              page_mask,
+                              slot_mem,
+                              slot_offset,
+                              UVM_SLOT_DIRECT_PTE_MODE_4K,
+                              false,
+                              false,
+                              out_tracker);
 }
 
 NV_STATUS uvm_va_block_map_moe_user_backing_readonly(uvm_va_block_t *target_va_block,
@@ -11057,27 +11087,34 @@ static NV_STATUS block_unmap_moe_slot_common(uvm_va_block_t *va_block,
     uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
     uvm_page_mask_t *pages_to_unmap = &block_context->mapping.page_mask;
     uvm_page_mask_t *pages_to_restore = &block_context->caller_page_mask;
-    NV_STATUS status;
+    bool had_slot_mapping = false;
+    NV_STATUS status = NV_OK;
     size_t big_page_index;
 
     UVM_ASSERT(!uvm_va_block_is_dead(va_block));
     uvm_assert_mutex_locked(&va_block->lock);
 
-    if (!gpu_state)
-        return NV_OK;
-
-    uvm_page_mask_init_from_region(pages_to_unmap, region, page_mask);
-    if (!uvm_page_mask_and(pages_to_unmap, pages_to_unmap, &gpu_state->moe_slot_pte_bits))
+    // Keep the complete requested range independently of the current slot
+    // mask. A failed MAP can invalidate an ordinary CPU-backed GPU PTE before
+    // publishing the replacement slot bit. DESTROY must restore those pages
+    // too, particularly when automatic UVM migration is disabled.
+    uvm_page_mask_init_from_region(pages_to_restore, region, page_mask);
+    uvm_page_mask_copy(pages_to_unmap, pages_to_restore);
+    had_slot_mapping = gpu_state &&
+                       uvm_page_mask_and(pages_to_unmap,
+                                         pages_to_unmap,
+                                         &gpu_state->moe_slot_pte_bits);
+    if (!had_slot_mapping && !restore_cpu_mapping)
         return NV_OK;
 
     // Never let the generic unmap path retain part of a slot-backed large
     // PTE: the retained portion has no ordinary UVM residency from which that
     // path could reconstruct the physical target. Slot-pool cleanup always
     // passes complete recorded ranges, so a partial request is a caller bug.
-    if (gpu_state->pte_is_2m && !uvm_page_mask_full(pages_to_unmap))
+    if (had_slot_mapping && gpu_state->pte_is_2m && !uvm_page_mask_full(pages_to_unmap))
         return NV_ERR_INVALID_ARGUMENT;
 
-    if (!gpu_state->pte_is_2m) {
+    if (had_slot_mapping && !gpu_state->pte_is_2m) {
         for_each_set_bit(big_page_index,
                          gpu_state->big_ptes,
                          UVM_BIG_PAGES_PER_UVM_VA_BLOCK) {
@@ -11091,13 +11128,20 @@ static NV_STATUS block_unmap_moe_slot_common(uvm_va_block_t *va_block,
         }
     }
 
-    // Keep moe_slot_pte_bits set while the normal unmap path runs. Several VA
-    // block checks and mapping helpers use this mask to distinguish slot-backed
-    // read-only PTEs from ordinary GPU-resident mappings. block_unmap_gpu()
-    // clears the mask atomically with the regular GPU PTE metadata.
-    status = uvm_va_block_unmap(va_block, block_context, gpu->id, region, pages_to_unmap, out_tracker);
-    if (status != NV_OK)
-        return status;
+    if (had_slot_mapping) {
+        // Keep moe_slot_pte_bits set while the normal unmap path runs. Several
+        // VA-block checks and mapping helpers use this mask to distinguish
+        // slot-backed PTEs from ordinary GPU mappings. block_unmap_gpu()
+        // clears the mask atomically with the regular GPU PTE metadata.
+        status = uvm_va_block_unmap(va_block,
+                                    block_context,
+                                    gpu->id,
+                                    region,
+                                    pages_to_unmap,
+                                    out_tracker);
+        if (status != NV_OK)
+            return status;
+    }
 
     if (!restore_cpu_mapping) {
         // A fixed-bank transition keeps the old managed source CPU-resident,
@@ -11120,7 +11164,9 @@ static NV_STATUS block_unmap_moe_slot_common(uvm_va_block_t *va_block,
     // mapping so the old VA remains immediately remotely readable without a
     // fault. Fixed-bank transitions use the no-restore wrapper above instead:
     // their inactive old VA may remain GPU-unmapped and fault normally later.
-    if (uvm_page_mask_and(pages_to_restore, pages_to_unmap, &va_block->cpu.resident)) {
+    if (uvm_page_mask_and(pages_to_restore,
+                          pages_to_restore,
+                          &va_block->cpu.resident)) {
         status = uvm_va_block_map(va_block,
                                   block_context,
                                   gpu->id,
@@ -12468,7 +12514,8 @@ static NV_STATUS block_slot_direct_validate_locked(uvm_va_block_slot_direct_entr
                                                    uvm_gpu_t *gpu,
                                                    bool require_unmapped,
                                                    bool overwrite_existing,
-                                                   bool require_existing_pte_mode)
+                                                   bool require_existing_pte_mode,
+                                                   bool require_slot_tracker)
 {
     uvm_va_block_t *va_block = entry->va_block;
     uvm_va_block_gpu_state_t *gpu_state;
@@ -12480,8 +12527,12 @@ static NV_STATUS block_slot_direct_validate_locked(uvm_va_block_slot_direct_entr
         return NV_WARN_MORE_PROCESSING_REQUIRED;
     }
 
-    if (!entry->slot_mem || !entry->slot_tracker || !uvm_mem_is_local_vidmem(entry->slot_mem, gpu) ||
+    if (!entry->slot_mem || !uvm_mem_is_local_vidmem(entry->slot_mem, gpu) ||
         !IS_ALIGNED(entry->slot_offset, PAGE_SIZE)) {
+        return NV_WARN_MORE_PROCESSING_REQUIRED;
+    }
+
+    if (require_slot_tracker && !entry->slot_tracker) {
         return NV_WARN_MORE_PROCESSING_REQUIRED;
     }
 
@@ -12618,6 +12669,7 @@ static NV_STATUS block_slot_direct_invalidate_locked(uvm_va_block_slot_direct_en
                                                      uvm_gpu_t *gpu,
                                                      bool skip_unmap,
                                                      bool require_existing_pte_mode,
+                                                     bool require_slot_tracker,
                                                      uvm_va_block_slot_direct_result_t *result)
 {
     uvm_page_mask_t *pages = &block_context->caller_page_mask;
@@ -12630,7 +12682,8 @@ static NV_STATUS block_slot_direct_invalidate_locked(uvm_va_block_slot_direct_en
                                                gpu,
                                                false,
                                                skip_unmap,
-                                               require_existing_pte_mode);
+                                               require_existing_pte_mode,
+                                               require_slot_tracker);
     if (status != NV_OK)
         return status;
 
@@ -12688,6 +12741,7 @@ static NV_STATUS block_slot_direct_prepare_locked(uvm_va_block_slot_direct_entry
                                                   uvm_gpu_t *gpu,
                                                   bool skip_unmap,
                                                   bool require_existing_pte_mode,
+                                                  bool require_slot_tracker,
                                                   uvm_va_block_slot_direct_result_t *result)
 {
     NV_STATUS status = block_slot_direct_invalidate_locked(entry,
@@ -12695,6 +12749,7 @@ static NV_STATUS block_slot_direct_prepare_locked(uvm_va_block_slot_direct_entry
                                                             gpu,
                                                             skip_unmap,
                                                             require_existing_pte_mode,
+                                                            require_slot_tracker,
                                                             result);
 
     if (status != NV_OK)
@@ -12827,7 +12882,8 @@ static NV_STATUS block_slot_direct_preflight_64k_group_locked(
                                                    gpu,
                                                    false,
                                                    false,
-                                                   false);
+                                                   false,
+                                                   true);
         if (status != NV_OK)
             return status;
 
@@ -12852,11 +12908,14 @@ static NV_STATUS block_slot_direct_invalidate_64k_group_locked(
     size_t outer,
     uvm_va_block_context_t *block_context,
     uvm_gpu_t *gpu,
+    bool require_slot_tracker,
     uvm_va_block_slot_direct_result_t *result)
 {
     uvm_va_block_t *va_block = entries[first].va_block;
     uvm_va_block_region_t full_region = uvm_va_block_region_from_block(va_block);
-    uvm_page_mask_t *target_pages = &block_context->caller_page_mask;
+    // Keep the group union independent from block_context scratch masks.
+    // Per-entry validation below rewrites caller_page_mask for each slice.
+    uvm_page_mask_t target_pages;
     NV_STATUS status;
     NvU64 unmap_start;
     size_t index;
@@ -12864,7 +12923,7 @@ static NV_STATUS block_slot_direct_invalidate_64k_group_locked(
     status = block_slot_direct_validate_64k_group_layout(entries,
                                                          first,
                                                          outer,
-                                                         target_pages,
+                                                         &target_pages,
                                                          NULL,
                                                          NULL);
     if (status != NV_OK)
@@ -12880,7 +12939,8 @@ static NV_STATUS block_slot_direct_invalidate_64k_group_locked(
                                                    gpu,
                                                    false,
                                                    false,
-                                                   false);
+                                                   false,
+                                                   require_slot_tracker);
         if (status != NV_OK)
             return status;
     }
@@ -12892,7 +12952,7 @@ static NV_STATUS block_slot_direct_invalidate_64k_group_locked(
                                 block_context,
                                 gpu->id,
                                 full_region,
-                                target_pages,
+                                &target_pages,
                                 &va_block->tracker);
     result->unmap_ns += NV_GETTIME() - unmap_start;
     if (status != NV_OK)
@@ -12942,6 +13002,7 @@ static NV_STATUS block_slot_direct_prepare_64k_group_locked(
     size_t outer,
     uvm_va_block_context_t *block_context,
     uvm_gpu_t *gpu,
+    bool require_slot_tracker,
     uvm_va_block_slot_direct_result_t *result)
 {
     NV_STATUS status = block_slot_direct_invalidate_64k_group_locked(entries,
@@ -12949,6 +13010,7 @@ static NV_STATUS block_slot_direct_prepare_64k_group_locked(
                                                                      outer,
                                                                      block_context,
                                                                      gpu,
+                                                                     require_slot_tracker,
                                                                      result);
 
     if (status != NV_OK)
@@ -13356,6 +13418,9 @@ static NV_STATUS block_slot_direct_shadow_prefill_64k_group(
                                                 entries[index].region,
                                                 entries[index].slot_mem,
                                                 entries[index].slot_offset,
+                                                entries[index].writable ?
+                                                    UVM_PROT_READ_WRITE :
+                                                    UVM_PROT_READ_ONLY,
                                                 pte_batch,
                                                 NULL);
     }
@@ -13674,6 +13739,9 @@ static NV_STATUS block_slot_direct_map_64k_group(
                                                     entries[index].region,
                                                     entries[index].slot_mem,
                                                     entries[index].slot_offset,
+                                                    entries[index].writable ?
+                                                        UVM_PROT_READ_WRITE :
+                                                        UVM_PROT_READ_ONLY,
                                                     pte_batch,
                                                     NULL);
         }
@@ -13763,6 +13831,9 @@ static NV_STATUS block_slot_direct_map_64k_group(
                                                     entries[index].region,
                                                     entries[index].slot_mem,
                                                     entries[index].slot_offset,
+                                                    entries[index].writable ?
+                                                        UVM_PROT_READ_WRITE :
+                                                        UVM_PROT_READ_ONLY,
                                                     pte_batch,
                                                     tlb_batch);
         }
@@ -13821,22 +13892,37 @@ static NV_STATUS block_slot_direct_map_64k_group(
         return status;
     }
 
-    uvm_page_mask_copy(pages, &target_pages);
-    uvm_page_mask_or(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ],
-                     &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ],
-                     pages);
-    uvm_page_mask_andnot(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
-                         &gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
+    // Every slice occupies complete, non-overlapping 64K leaves, so one block
+    // may safely contain both read-only consumer aliases and read-write upload
+    // aliases. Record permissions per slice rather than collapsing the group
+    // to the first entry's access mode.
+    for (index = first; index < outer; ++index) {
+        uvm_page_mask_init_from_region(pages, entries[index].region, NULL);
+        uvm_page_mask_or(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ],
+                         &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ],
                          pages);
+        if (entries[index].writable) {
+            uvm_page_mask_or(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
+                             &gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
+                             pages);
+        }
+        else {
+            uvm_page_mask_andnot(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
+                                 &gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE],
+                                 pages);
+        }
+    }
     uvm_page_mask_andnot(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_ATOMIC],
                          &gpu_state->pte_bits[UVM_PTE_BITS_GPU_ATOMIC],
-                         pages);
+                         &target_pages);
     uvm_page_mask_or(&gpu_state->moe_slot_pte_bits,
                      &gpu_state->moe_slot_pte_bits,
-                     pages);
+                     &target_pages);
     uvm_processor_mask_set(&va_block->mapped, gpu->id);
     if (!uvm_va_block_is_hmm(va_block))
-        uvm_page_mask_or(&va_block->maybe_mapped_pages, &va_block->maybe_mapped_pages, pages);
+        uvm_page_mask_or(&va_block->maybe_mapped_pages,
+                         &va_block->maybe_mapped_pages,
+                         &target_pages);
 
     UVM_ASSERT(block_check_mappings(va_block, block_context));
     return NV_OK;
@@ -13854,6 +13940,7 @@ static NV_STATUS block_slot_direct_map_entries(uvm_va_block_slot_direct_entry_t 
                                                uvm_gpu_t *gpu,
                                                bool overwrite_existing,
                                                bool shadow_prefilled,
+                                               bool track_slot_lifetime,
                                                uvm_tracker_t *batch_tracker,
                                                uvm_va_block_slot_direct_result_t *result)
 {
@@ -13894,13 +13981,15 @@ static NV_STATUS block_slot_direct_map_entries(uvm_va_block_slot_direct_entry_t 
                 result->mapped_bytes += uvm_va_block_region_size(group_entry->region);
             }
 
-            for (group_index = entry_index; group_index < group_outer; ++group_index) {
-                uvm_va_block_slot_direct_entry_t *group_entry = &entries[group_index];
+            if (track_slot_lifetime) {
+                for (group_index = entry_index; group_index < group_outer; ++group_index) {
+                    uvm_va_block_slot_direct_entry_t *group_entry = &entries[group_index];
 
-                status = uvm_tracker_add_tracker_safe(group_entry->slot_tracker,
-                                                      &entry->va_block->tracker);
-                if (status != NV_OK)
-                    break;
+                    status = uvm_tracker_add_tracker_safe(group_entry->slot_tracker,
+                                                          &entry->va_block->tracker);
+                    if (status != NV_OK)
+                        break;
+                }
             }
             if (status != NV_OK)
                 break;
@@ -13921,16 +14010,17 @@ static NV_STATUS block_slot_direct_map_entries(uvm_va_block_slot_direct_entry_t 
         }
 
         uvm_page_mask_init_from_region(pages, entry->region, NULL);
-        status = block_map_moe_slot_readonly(entry->va_block,
-                                             block_context,
-                                             gpu,
-                                             entry->region,
-                                             pages,
-                                             entry->slot_mem,
-                                             entry->slot_offset,
-                                             entry->pte_mode,
-                                             overwrite_existing,
-                                             &entry->va_block->tracker);
+        status = block_map_moe_slot(entry->va_block,
+                                    block_context,
+                                    gpu,
+                                    entry->region,
+                                    pages,
+                                    entry->slot_mem,
+                                    entry->slot_offset,
+                                    entry->pte_mode,
+                                    overwrite_existing,
+                                    entry->writable,
+                                    &entry->va_block->tracker);
         if (status != NV_OK)
             break;
 
@@ -13963,9 +14053,12 @@ static NV_STATUS block_slot_direct_map_entries(uvm_va_block_slot_direct_entry_t 
         // Record the lifetime dependency first. Even if duplicating it into
         // the aggregate tracker runs out of memory, slot backing still cannot
         // be reclaimed while the map push is outstanding.
-        status = uvm_tracker_add_tracker_safe(entry->slot_tracker, &entry->va_block->tracker);
-        if (status != NV_OK)
-            break;
+        if (track_slot_lifetime) {
+            status = uvm_tracker_add_tracker_safe(entry->slot_tracker,
+                                                  &entry->va_block->tracker);
+            if (status != NV_OK)
+                break;
+        }
 
         // Add the aggregate dependency after the final slice of this block so
         // the tracker is copied once and already contains every map push for
@@ -13994,6 +14087,7 @@ static NV_STATUS block_slot_direct_rollback_mappings(uvm_va_block_slot_direct_en
                                                      uvm_va_block_context_t *block_context,
                                                      uvm_gpu_t *gpu,
                                                      uvm_tracker_t *batch_tracker,
+                                                     bool track_slot_lifetime,
                                                      bool fail_closed)
 {
     NV_STATUS first_error = NV_OK;
@@ -14037,9 +14131,12 @@ static NV_STATUS block_slot_direct_rollback_mappings(uvm_va_block_slot_direct_en
                 first_error = status;
         }
 
-        status = uvm_tracker_add_tracker_safe(entry->slot_tracker, &entry->va_block->tracker);
-        if (first_error == NV_OK)
-            first_error = status;
+        if (track_slot_lifetime) {
+            status = uvm_tracker_add_tracker_safe(entry->slot_tracker,
+                                                  &entry->va_block->tracker);
+            if (first_error == NV_OK)
+                first_error = status;
+        }
     }
 
     return first_error;
@@ -14232,7 +14329,8 @@ static NV_STATUS block_slot_direct_revalidate_all_locked(
     uvm_va_block_context_t *block_context,
     uvm_gpu_t *gpu,
     bool skip_unmap,
-    bool require_existing_pte_mode)
+    bool require_existing_pte_mode,
+    bool require_slot_tracker)
 {
     size_t entry_index;
 
@@ -14242,7 +14340,8 @@ static NV_STATUS block_slot_direct_revalidate_all_locked(
                                                               gpu,
                                                               !skip_unmap,
                                                               skip_unmap,
-                                                              require_existing_pte_mode);
+                                                              require_existing_pte_mode,
+                                                              require_slot_tracker);
         if (status != NV_OK)
             return status;
     }
@@ -14424,7 +14523,8 @@ NV_STATUS uvm_va_block_slot_copy_plan_create(
                                                    gpu,
                                                    false,
                                                    false,
-                                                   false);
+                                                   false,
+                                                   true);
         if (status == NV_OK) {
             status = block_slot_copy_plan_scan_entry_locked(entry,
                                                              gpu,
@@ -14491,7 +14591,8 @@ NV_STATUS uvm_va_block_slot_copy_plan_create(
                                                    gpu,
                                                    false,
                                                    false,
-                                                   false);
+                                                   false,
+                                                   true);
         if (status == NV_OK &&
             (entry->cpu_nid != cached->cpu_nid ||
              entry->va_block->moe_slot_copy_source_epoch != cached->source_epoch)) {
@@ -14573,7 +14674,8 @@ NV_STATUS uvm_va_block_slot_copy_plan_validate(
                                                    gpu,
                                                    false,
                                                    false,
-                                                   false);
+                                                   false,
+                                                   true);
         if (status == NV_OK &&
             (entry->cpu_nid != cached->cpu_nid ||
              entry->va_block->moe_slot_copy_source_epoch != cached->source_epoch)) {
@@ -14934,7 +15036,8 @@ NV_STATUS uvm_va_block_slot_direct_submit_cached_copy(
                                                      block_context,
                                                      gpu,
                                                      false,
-                                                     false);
+                                                     false,
+                                                     true);
     result->locked_revalidate_ns += NV_GETTIME() - detail_start;
     if (status != NV_OK) {
         result->failure_stage = UVM_SLOT_DIRECT_FAILURE_PREPARE;
@@ -14964,23 +15067,25 @@ done:
     return status;
 }
 
-NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
-                                                   struct mm_struct *mm,
-                                                   uvm_gpu_t *gpu,
-                                                   uvm_va_block_slot_direct_entry_t *entries,
-                                                   size_t entry_count,
-                                                   bool shared_push,
-                                                   bool skip_unmap,
-                                                   bool require_existing_pte_mode,
-                                                   bool stage_sync,
-                                                   bool overlap_copy_prepare,
-                                                   bool copy_already_submitted,
-                                                   bool shadow_pte_prefill,
-                                                   bool fail_closed,
-                                                   const uvm_va_block_slot_copy_plan_t *copy_plan,
-                                                   struct mutex *lockdep_nest_lock,
-                                                   uvm_tracker_t *batch_tracker,
-                                                   uvm_va_block_slot_direct_result_t *result)
+static NV_STATUS block_slot_direct_copy_map_batch_common(
+    uvm_va_space_t *va_space,
+    struct mm_struct *mm,
+    uvm_gpu_t *gpu,
+    uvm_va_block_slot_direct_entry_t *entries,
+    size_t entry_count,
+    bool shared_push,
+    bool skip_unmap,
+    bool require_existing_pte_mode,
+    bool stage_sync,
+    bool overlap_copy_prepare,
+    bool copy_already_submitted,
+    bool shadow_pte_prefill,
+    bool fail_closed,
+    bool map_only,
+    const uvm_va_block_slot_copy_plan_t *copy_plan,
+    struct mutex *lockdep_nest_lock,
+    uvm_tracker_t *batch_tracker,
+    uvm_va_block_slot_direct_result_t *result)
 {
     uvm_va_block_context_t *block_context;
     NV_STATUS status = NV_OK;
@@ -15000,6 +15105,13 @@ NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
     UVM_ASSERT(batch_tracker);
     UVM_ASSERT(result);
     UVM_ASSERT(!require_existing_pte_mode || skip_unmap);
+    UVM_ASSERT(!map_only || (!shared_push &&
+                             !skip_unmap &&
+                             !require_existing_pte_mode &&
+                             !overlap_copy_prepare &&
+                             !copy_already_submitted &&
+                             !shadow_pte_prefill &&
+                             !copy_plan));
 
     // Shadow leaf PTEs are safe only in the registered dual-bank copy-first
     // path. The copy targets a physically disjoint inactive bank. Complete
@@ -15010,7 +15122,7 @@ NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
         return NV_ERR_INVALID_STATE;
     }
 
-    if (!copy_already_submitted)
+    if (map_only || !copy_already_submitted)
         memset(result, 0, sizeof(*result));
     else if (!result->copy_already_submitted || result->copied_bytes == 0)
         return NV_ERR_INVALID_STATE;
@@ -15115,12 +15227,14 @@ NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
                                                                            group_outer,
                                                                            block_context,
                                                                            gpu,
+                                                                           !map_only,
                                                                            result) :
                              block_slot_direct_prepare_64k_group_locked(entries,
                                                                         entry_index,
                                                                         group_outer,
                                                                         block_context,
                                                                         gpu,
+                                                                        !map_only,
                                                                         result);
             }
             else {
@@ -15130,12 +15244,14 @@ NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
                                                                  gpu,
                                                                  skip_unmap,
                                                                  require_existing_pte_mode,
+                                                                 !map_only,
                                                                  result) :
                              block_slot_direct_prepare_locked(&entries[entry_index],
                                                               block_context,
                                                               gpu,
                                                               skip_unmap,
                                                               require_existing_pte_mode,
+                                                              !map_only,
                                                               result);
             }
         } while (status == NV_ERR_MORE_PROCESSING_REQUIRED);
@@ -15192,7 +15308,8 @@ NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
                                                      block_context,
                                                      gpu,
                                                      skip_unmap,
-                                                     require_existing_pte_mode);
+                                                     require_existing_pte_mode,
+                                                     !map_only);
     if (status != NV_OK) {
         result->failure_stage = status == NV_WARN_MORE_PROCESSING_REQUIRED ?
                                     UVM_SLOT_DIRECT_FAILURE_ELIGIBILITY :
@@ -15229,7 +15346,11 @@ NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
 
     stage_start = NV_GETTIME();
     result->locked_revalidate_ns = stage_start - detail_cursor;
-    if (!copy_already_submitted) {
+    if (map_only) {
+        status = NV_OK;
+        detail_now = NV_GETTIME();
+    }
+    else if (!copy_already_submitted) {
         status = block_slot_direct_copy_entries(entries,
                                                 entry_count,
                                                 gpu,
@@ -15246,7 +15367,7 @@ NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
         detail_now = NV_GETTIME();
     }
     copy_submit_end = detail_now;
-    if (status == NV_OK && stage_sync && !overlap_copy_prepare) {
+    if (!map_only && status == NV_OK && stage_sync && !overlap_copy_prepare) {
         status = uvm_tracker_wait(batch_tracker);
         ++result->stage_sync_waits;
         detail_now = NV_GETTIME();
@@ -15314,7 +15435,8 @@ NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
                                                          block_context,
                                                          gpu,
                                                          skip_unmap,
-                                                         require_existing_pte_mode);
+                                                         require_existing_pte_mode,
+                                                         !map_only);
         detail_now = NV_GETTIME();
         result->locked_revalidate_ns += detail_now - detail_cursor;
         if (status != NV_OK) {
@@ -15328,13 +15450,14 @@ NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
 
     detail_cursor = detail_now;
     stage_start = NV_GETTIME();
-    result->copy_to_map_ns = stage_start - copy_submit_end;
+    result->copy_to_map_ns = map_only ? 0 : stage_start - copy_submit_end;
     status = block_slot_direct_map_entries(entries,
                                            entry_count,
                                            block_context,
                                            gpu,
                                            skip_unmap,
                                            shadow_pte_prefill,
+                                           !map_only,
                                            batch_tracker,
                                            result);
     detail_now = NV_GETTIME();
@@ -15355,6 +15478,7 @@ NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
                                                               block_context,
                                                               gpu,
                                                               batch_tracker,
+                                                              !map_only,
                                                               fail_closed);
         if (rollback_status != NV_OK) {
             result->failure_stage = UVM_SLOT_DIRECT_FAILURE_ROLLBACK;
@@ -15383,6 +15507,245 @@ out:
     uvm_va_block_context_free(block_context);
     result->helper_context_free_ns = NV_GETTIME() - detail_cursor;
     return status;
+}
+
+NV_STATUS uvm_va_block_slot_direct_copy_map_batch(uvm_va_space_t *va_space,
+                                                   struct mm_struct *mm,
+                                                   uvm_gpu_t *gpu,
+                                                   uvm_va_block_slot_direct_entry_t *entries,
+                                                   size_t entry_count,
+                                                   bool shared_push,
+                                                   bool skip_unmap,
+                                                   bool require_existing_pte_mode,
+                                                   bool stage_sync,
+                                                   bool overlap_copy_prepare,
+                                                   bool copy_already_submitted,
+                                                   bool shadow_pte_prefill,
+                                                   bool fail_closed,
+                                                   const uvm_va_block_slot_copy_plan_t *copy_plan,
+                                                   struct mutex *lockdep_nest_lock,
+                                                   uvm_tracker_t *batch_tracker,
+                                                   uvm_va_block_slot_direct_result_t *result)
+{
+    return block_slot_direct_copy_map_batch_common(va_space,
+                                                    mm,
+                                                    gpu,
+                                                    entries,
+                                                    entry_count,
+                                                    shared_push,
+                                                    skip_unmap,
+                                                    require_existing_pte_mode,
+                                                    stage_sync,
+                                                    overlap_copy_prepare,
+                                                    copy_already_submitted,
+                                                    shadow_pte_prefill,
+                                                    fail_closed,
+                                                    false,
+                                                    copy_plan,
+                                                    lockdep_nest_lock,
+                                                    batch_tracker,
+                                                    result);
+}
+
+NV_STATUS uvm_va_block_slot_alias_map_batch(
+    uvm_va_space_t *va_space,
+    struct mm_struct *mm,
+    uvm_gpu_t *gpu,
+    uvm_va_block_slot_direct_entry_t *entries,
+    size_t entry_count,
+    bool stage_sync,
+    bool fail_closed,
+    struct mutex *lockdep_nest_lock,
+    uvm_tracker_t *batch_tracker,
+    uvm_va_block_slot_direct_result_t *result)
+{
+    // Static alias backing is populated independently (for example through a
+    // stable writable upload VA). This transaction only invalidates ordinary
+    // target mappings and publishes slot PTEs at the managed consumer VAs.
+    // No copy tracker exists or is required on this path.
+    return block_slot_direct_copy_map_batch_common(va_space,
+                                                    mm,
+                                                    gpu,
+                                                    entries,
+                                                    entry_count,
+                                                    false,
+                                                    false,
+                                                    false,
+                                                    stage_sync,
+                                                    false,
+                                                    false,
+                                                    false,
+                                                    fail_closed,
+                                                    true,
+                                                    NULL,
+                                                    lockdep_nest_lock,
+                                                    batch_tracker,
+                                                    result);
+}
+
+static NV_STATUS block_slot_alias_revoke_cpu_mappings_locked(
+    uvm_va_block_t *va_block,
+    uvm_va_block_context_t *block_context,
+    const uvm_page_mask_t *target_pages)
+{
+    uvm_page_mask_t *pages = &block_context->caller_page_mask;
+    NV_STATUS status;
+
+    uvm_assert_mutex_locked(&va_block->lock);
+    uvm_page_mask_copy(pages, target_pages);
+    status = uvm_va_block_unmap(va_block,
+                                block_context,
+                                UVM_ID_CPU,
+                                uvm_va_block_region_from_block(va_block),
+                                pages,
+                                &va_block->tracker);
+    if (status != NV_OK)
+        return status;
+
+    if (uvm_page_mask_and(&block_context->scratch_page_mask,
+                          pages,
+                          uvm_va_block_map_mask_get(va_block, UVM_ID_CPU))) {
+        return NV_ERR_INVALID_STATE;
+    }
+
+    return NV_OK;
+}
+
+NV_STATUS uvm_va_block_slot_alias_revoke_cpu_mappings_batch(
+    uvm_va_space_t *va_space,
+    struct mm_struct *mm,
+    uvm_va_block_slot_direct_entry_t *entries,
+    size_t entry_count)
+{
+    uvm_va_block_context_t *block_context;
+    uvm_tracker_t revoke_tracker = UVM_TRACKER_INIT();
+    NV_STATUS first_error = NV_OK;
+    NV_STATUS wait_status;
+    size_t entry_index = 0;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+    UVM_ASSERT(mm);
+    UVM_ASSERT(entries || entry_count == 0);
+
+    if (entry_count == 0)
+        return NV_OK;
+
+    block_context = uvm_va_block_context_alloc(mm);
+    if (!block_context)
+        return NV_ERR_NO_MEMORY;
+
+    while (entry_index < entry_count) {
+        uvm_va_block_t *va_block = entries[entry_index].va_block;
+        uvm_page_mask_t pages;
+        uvm_va_block_retry_t block_retry;
+        NV_STATUS status;
+        NV_STATUS tracker_status;
+
+        uvm_page_mask_zero(&pages);
+        do {
+            UVM_ASSERT(entries[entry_index].va_block == va_block);
+            uvm_page_mask_region_fill(&pages, entries[entry_index].region);
+            ++entry_index;
+        } while (entry_index < entry_count &&
+                 entries[entry_index].va_block == va_block);
+
+        status = UVM_VA_BLOCK_LOCK_RETRY(
+            va_block,
+            &block_retry,
+            block_slot_alias_revoke_cpu_mappings_locked(va_block,
+                                                         block_context,
+                                                         &pages));
+        if (first_error == NV_OK)
+            first_error = status;
+
+        uvm_mutex_lock(&va_block->lock);
+        tracker_status = uvm_tracker_add_tracker_safe(&revoke_tracker,
+                                                      &va_block->tracker);
+        uvm_mutex_unlock(&va_block->lock);
+        if (first_error == NV_OK)
+            first_error = tracker_status;
+
+        if (status != NV_OK)
+            break;
+    }
+
+    wait_status = uvm_tracker_wait(&revoke_tracker);
+    if (first_error == NV_OK)
+        first_error = wait_status;
+
+    uvm_tracker_deinit(&revoke_tracker);
+    uvm_va_block_context_free(block_context);
+    return first_error;
+}
+
+NV_STATUS uvm_va_block_validate_slot_alias_range(uvm_va_space_t *va_space,
+                                                  uvm_gpu_t *gpu,
+                                                  NvU64 va_base,
+                                                  NvU64 bytes,
+                                                  bool writable)
+{
+    NvU64 va_end = va_base + bytes;
+    NvU64 cursor = va_base;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+    UVM_ASSERT(gpu);
+
+    if (bytes == 0 || va_end <= va_base)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    while (cursor < va_end) {
+        uvm_va_block_t *va_block;
+        uvm_va_block_gpu_state_t *gpu_state;
+        uvm_va_block_region_t region;
+        uvm_page_mask_t pages;
+        uvm_page_mask_t scratch;
+        NvU64 slice_end;
+        NV_STATUS status;
+
+        status = uvm_va_block_find(va_space, cursor, &va_block);
+        if (status != NV_OK)
+            return status;
+
+        slice_end = min(va_end, va_block->end + 1);
+        if (slice_end <= cursor)
+            return NV_ERR_INVALID_STATE;
+        region = uvm_va_block_region_from_start_size(va_block,
+                                                     cursor,
+                                                     slice_end - cursor);
+        uvm_page_mask_init_from_region(&pages, region, NULL);
+
+        uvm_mutex_lock(&va_block->lock);
+        gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+        if (!gpu_state ||
+            !uvm_page_mask_subset(&pages, &va_block->cpu.resident) ||
+            uvm_page_mask_and(&scratch, &pages, &va_block->discarded_pages) ||
+            uvm_page_mask_and(&scratch,
+                              &pages,
+                              uvm_va_block_map_mask_get(va_block, UVM_ID_CPU)) ||
+            uvm_page_mask_and(&scratch, &pages, &gpu_state->resident) ||
+            !uvm_page_mask_subset(&pages, &gpu_state->moe_slot_pte_bits) ||
+            !uvm_page_mask_subset(&pages,
+                                  &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ]) ||
+            uvm_page_mask_and(&scratch,
+                              &pages,
+                              &gpu_state->pte_bits[UVM_PTE_BITS_GPU_ATOMIC]) ||
+            (writable &&
+             !uvm_page_mask_subset(&pages,
+                                   &gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE])) ||
+            (!writable &&
+             uvm_page_mask_and(&scratch,
+                               &pages,
+                               &gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE]))) {
+            status = NV_ERR_INVALID_STATE;
+        }
+        uvm_mutex_unlock(&va_block->lock);
+        if (status != NV_OK)
+            return status;
+
+        cursor = slice_end;
+    }
+
+    return NV_OK;
 }
 
 static NV_STATUS block_slot_direct_fail_closed_unmap_locked(

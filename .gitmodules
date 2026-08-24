@@ -1,0 +1,6 @@
+[submodule "MoE-Infinity"]
+	path = MoE-Infinity
+	url = https://github.com/noob512/MoE-Infinity.git
+[submodule "KTransformers"]
+	path = KTransformers
+	url = https://github.com/noob512/ktransformers.git

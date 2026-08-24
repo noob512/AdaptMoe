@@ -12,6 +12,8 @@ from vllm.v1.core.kv_cache_utils import (
 class _FakeDynamicPolicy:
     def __init__(self, applied_target: int) -> None:
         self.applied_target = applied_target
+        self.backup_reserve_blocks = 0
+        self.backup_activations: list[int] = []
         self.refresh_reasons: list[str] = []
 
     def dynamic_pool_active(self) -> bool:
@@ -31,6 +33,9 @@ class _FakeDynamicPolicy:
 
     def on_blocks_freed(self, *, blocks: list[Any], reason: str) -> None:
         return
+
+    def on_backup_blocks_activated(self, count: int, *, reason: str) -> None:
+        self.backup_activations.append(count)
 
 
 def _ids(queue: Any) -> list[int]:
@@ -64,6 +69,47 @@ def test_dynamic_pool_partitions_gpu_and_offline_free_queues() -> None:
     pool.free_blocks([block])
     assert _ids(pool.free_block_queue) == list(range(2, 9)) + [1]
     assert _ids(pool.offline_block_queue) == list(range(9, 17))
+
+
+def test_backup_queue_is_used_only_after_ordinary_gpu_queue() -> None:
+    policy = _FakeDynamicPolicy(applied_target=8)
+    policy.backup_reserve_blocks = 2
+    pool = BlockPool(
+        num_gpu_blocks=9,
+        enable_caching=False,
+        hash_block_size=16,
+        uvm_kv_runtime_policy=policy,  # type: ignore[arg-type]
+    )
+
+    assert _ids(pool.free_block_queue) == list(range(1, 7))
+    assert _ids(pool.backup_block_queue) == [7, 8]
+    assert pool.get_num_free_blocks() == 8
+    initial = pool.snapshot_uvm_dynamic_queues()
+    assert initial["invariant_ok"] is True
+    assert initial["accounted_blocks"] == 9
+    assert initial["gpu_free_block_ids"] == list(range(1, 7))
+    assert initial["gpu_backup_block_ids"] == [7, 8]
+    assert initial["cpu_offline_block_ids"] == []
+
+    ordinary = pool.get_new_blocks(6)
+    assert [block.block_id for block in ordinary] == list(range(1, 7))
+    assert policy.backup_activations == []
+
+    reserve = pool.get_new_blocks(1)
+    assert reserve[0].block_id == 7
+    assert policy.backup_activations == [1]
+    under_pressure = pool.snapshot_uvm_dynamic_queues()
+    assert under_pressure["invariant_ok"] is True
+    assert under_pressure["gpu_free_blocks"] == 0
+    assert under_pressure["gpu_backup_block_ids"] == [8]
+    assert under_pressure["active_block_ids"] == list(range(1, 8))
+
+    pool.free_blocks([ordinary[0], reserve[0]])
+    assert pool.backup_block_queue.num_free_blocks == 2
+    assert pool.get_num_free_blocks() == 3
+    refilled = pool.snapshot_uvm_dynamic_queues()
+    assert refilled["invariant_ok"] is True
+    assert refilled["gpu_backup_blocks"] == 2
 
 
 def test_dynamic_pool_grow_promotes_new_gpu_blocks_before_warm_blocks() -> None:

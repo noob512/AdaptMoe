@@ -84,6 +84,31 @@ def register_uvm_kv_cache_physical_ranges(
             _KV_PHYSICAL_RANGE_RECORDS[span.span_id] = span
 
 
+def snapshot_uvm_kv_cache_physical_spans() -> list[dict[str, int | str]]:
+    """Return a stable application-side snapshot of the reserved KV VAs.
+
+    The records describe the maximum managed allocation, not its current
+    physical residency.  Keeping this geometry separate from residency lets
+    qualification code prove that shrink/grow operations changed backing
+    placement while preserving every KV tensor virtual address.
+    """
+    with _KV_PHYSICAL_RANGE_LOCK:
+        spans = sorted(
+            _KV_PHYSICAL_RANGE_RECORDS.values(),
+            key=lambda span: (span.ptr, span.span_id),
+        )
+    return [
+        {
+            "span_id": span.span_id,
+            "ptr": int(span.ptr),
+            "size_bytes": int(span.size_bytes),
+            "page_size": int(span.page_size),
+            "max_block_id": int(span.max_block_id),
+        }
+        for span in spans
+    ]
+
+
 def collect_uvm_kv_cache_physical_ranges_for_blocks(
     block_ids: list[int],
 ) -> list[tuple[int, int]]:
@@ -246,6 +271,18 @@ class UvmKvRuntimePolicy:
         self.dynamic_pool_initial_blocks = _read_int_env(
             "VLLM_UVM_KV_DYNAMIC_POOL_INITIAL_BLOCKS", 0
         )
+        self.backup_reserve_blocks = _read_int_env(
+            "VLLM_UVM_KV_BACKUP_RESERVE_BLOCKS", 0
+        )
+        self.backup_grow_blocks = _read_int_env(
+            "VLLM_UVM_KV_BACKUP_GROW_BLOCKS", 0
+        )
+        self._backup_activated_blocks = 0
+        self._backup_activation_events = 0
+        self._backup_total_activated_blocks = 0
+        self._backup_total_activation_events = 0
+        self._backup_total_consumed_blocks = 0
+        self._backup_total_consumed_events = 0
         self.dynamic_pool_target_blocks = self._clamp_dynamic_pool_target(
             self.dynamic_pool_initial_blocks
             if self.dynamic_pool_initial_blocks > 0
@@ -337,7 +374,51 @@ class UvmKvRuntimePolicy:
             block_pool=block_pool,
             reason="allocatable_free_blocks",
         )
-        return int(getattr(block_pool.free_block_queue, "num_free_blocks", 0))
+        return int(block_pool.get_num_free_blocks())
+
+    def on_backup_blocks_activated(self, count: int, *, reason: str) -> None:
+        """Publish a one-shot pressure signal when the GPU reserve is used."""
+        activated = max(int(count), 0)
+        if activated == 0:
+            return
+        with self._lock:
+            self._backup_activated_blocks += activated
+            self._backup_activation_events += 1
+            self._backup_total_activated_blocks += activated
+            self._backup_total_activation_events += 1
+        logger.info(
+            "UVM KV backup reserve activated: blocks=%d reason=%s",
+            activated,
+            reason,
+        )
+
+    def consume_backup_activation(self) -> dict[str, int]:
+        """Consume pressure accumulated since the previous engine step."""
+        with self._lock:
+            blocks = self._backup_activated_blocks
+            events = self._backup_activation_events
+            self._backup_activated_blocks = 0
+            self._backup_activation_events = 0
+            self._backup_total_consumed_blocks += blocks
+            self._backup_total_consumed_events += events
+        return {"blocks": blocks, "events": events}
+
+    def snapshot_backup_activation(self) -> dict[str, int | str]:
+        """Return pending and cumulative backup pressure without consuming it."""
+        with self._lock:
+            return {
+                "schema": "vllm_uvm_kv_backup_pressure_snapshot_v1",
+                "pending_blocks": int(self._backup_activated_blocks),
+                "pending_events": int(self._backup_activation_events),
+                "total_activated_blocks": int(
+                    self._backup_total_activated_blocks
+                ),
+                "total_activation_events": int(
+                    self._backup_total_activation_events
+                ),
+                "total_consumed_blocks": int(self._backup_total_consumed_blocks),
+                "total_consumed_events": int(self._backup_total_consumed_events),
+            }
 
     def apply_unified_kv_target_blocks(
         self,

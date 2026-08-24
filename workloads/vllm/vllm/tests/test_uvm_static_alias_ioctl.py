@@ -119,6 +119,10 @@ def test_static_alias_ioctl_abi_matches_kernel_header() -> None:
     assert static_alias._UVM_MOE_STATIC_ALIAS_MAP_IOCTL == 97
     assert static_alias._UVM_MOE_STATIC_ALIAS_SEAL_IOCTL == 98
     assert static_alias._UVM_MOE_STATIC_ALIAS_DESTROY_IOCTL == 99
+    assert static_alias._UVM_MOE_STATIC_ALIAS_PARK_IOCTL == 101
+    assert static_alias._UVM_MOE_STATIC_ALIAS_RESUME_IOCTL == 102
+    assert static_alias._UVM_MOE_STATIC_ALIAS_REBIND_IOCTL == 103
+    assert static_alias.UVM_MOE_STATIC_ALIAS_REBIND_FLAG_RESIZE == 8
 
     assert ctypes.sizeof(static_alias._StaticAliasEntry) == 48
     assert static_alias._StaticAliasEntry.va_base.offset == 16
@@ -138,6 +142,233 @@ def test_static_alias_ioctl_abi_matches_kernel_header() -> None:
     assert ctypes.sizeof(static_alias._StaticAliasDestroyParams) == 80
     assert static_alias._StaticAliasDestroyParams.released_alias_count.offset == 56
     assert static_alias._StaticAliasDestroyParams.rmStatus.offset == 72
+
+    assert ctypes.sizeof(static_alias._StaticAliasTransitionParams) == 80
+    assert static_alias._StaticAliasTransitionParams.reserved.offset == 12
+    assert static_alias._StaticAliasTransitionParams.session_id.offset == 16
+    assert (
+        static_alias._StaticAliasTransitionParams.processed_alias_count.offset == 48
+    )
+    assert static_alias._StaticAliasTransitionParams.rmStatus.offset == 76
+
+    assert ctypes.sizeof(static_alias._StaticAliasRebindParams) == 55400
+    assert static_alias._StaticAliasRebindParams.session_id.offset == 16
+    assert static_alias._StaticAliasRebindParams.rebind_id.offset == 24
+    assert static_alias._StaticAliasRebindParams.count.offset == 64
+    assert static_alias._StaticAliasRebindParams.entries.offset == 96
+    assert static_alias._StaticAliasRebindParams.rmStatus.offset == 55392
+
+
+def _parked_rebind_session() -> static_alias._StaticAliasSession:
+    upload = (
+        0,
+        11,
+        7,
+        static_alias.UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW,
+        0x20000000,
+        PAGE_BYTES,
+        0,
+    )
+    consumer = (0, 11, 7, 0, 0x30000000, PAGE_BYTES, 0)
+    return static_alias._StaticAliasSession(
+        fd=110,
+        uuid_bytes=UUID_BYTES,
+        session_id=41,
+        owner_pid=os.getpid(),
+        sealed=True,
+        parked=True,
+        alias_count=2,
+        alias_bytes=2 * PAGE_BYTES,
+        backing_bytes=PAGE_BYTES,
+        target_ranges=[
+            (upload[4], upload[4] + upload[5]),
+            (consumer[4], consumer[4] + consumer[5]),
+        ],
+        backing_identities={(0, 11, 7)},
+        alias_entries=[upload, consumer],
+    )
+
+
+def test_rebind_streams_large_consumer_set_and_updates_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _parked_rebind_session()
+    static_alias._static_alias_sessions[0] = session
+    consumers = [
+        (0, 11, 7, 0, 0x40000000 + index * PAGE_BYTES, PAGE_BYTES, 0)
+        for index in range(1153)
+    ]
+    calls: list[tuple[int, int, int]] = []
+    staged_count = 0
+    staged_bytes = 0
+
+    def ioctl(fd: int, request: int, raw: object) -> int:
+        nonlocal staged_count, staged_bytes
+        assert fd == 110
+        assert request == 103
+        assert isinstance(raw, static_alias._StaticAliasRebindParams)
+        calls.append((int(raw.flags), int(raw.rebind_id), int(raw.count)))
+        if raw.flags & static_alias.UVM_MOE_STATIC_ALIAS_REBIND_FLAG_BEGIN:
+            assert raw.rebind_id == 0
+            raw.rebind_id = 77
+        else:
+            assert raw.rebind_id == 77
+        chunk_bytes = sum(int(raw.entries[index].bytes) for index in range(raw.count))
+        staged_count += int(raw.count)
+        staged_bytes += chunk_bytes
+        raw.accepted_count = raw.count
+        raw.upload_alias_count = 1
+        raw.backing_bytes = PAGE_BYTES
+        for index in range(raw.count):
+            raw.entries[index].status = 0
+        if raw.flags & static_alias.UVM_MOE_STATIC_ALIAS_REBIND_FLAG_COMMIT:
+            assert staged_count == len(consumers)
+            raw.committed = 1
+            raw.rebind_id = 0
+            raw.staged_consumer_alias_count = 0
+            raw.staged_consumer_alias_bytes = 0
+            raw.total_alias_bytes = PAGE_BYTES + staged_bytes
+        else:
+            raw.staged_consumer_alias_count = staged_count
+            raw.staged_consumer_alias_bytes = staged_bytes
+            raw.total_alias_bytes = session.alias_bytes
+        raw.poisoned = 0
+        raw.rmStatus = 0
+        return 0
+
+    monkeypatch.setattr(static_alias, "_libc_ioctl", ioctl)
+    result = static_alias.driver_static_alias_rebind(41, consumers)
+
+    assert result["ok"] is True
+    assert result["batch_count"] == 2
+    assert calls == [
+        (static_alias.UVM_MOE_STATIC_ALIAS_REBIND_FLAG_BEGIN, 0, 1152),
+        (static_alias.UVM_MOE_STATIC_ALIAS_REBIND_FLAG_COMMIT, 77, 1),
+    ]
+    assert session.alias_count == 1154
+    assert session.alias_bytes == 1154 * PAGE_BYTES
+    assert session.alias_entries[0][3] & static_alias.UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW
+    assert session.alias_entries[1:] == consumers
+    assert session.parked is True
+    assert session.poisoned is False
+
+
+def test_rebind_failed_append_aborts_and_preserves_committed_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _parked_rebind_session()
+    static_alias._static_alias_sessions[0] = session
+    original_entries = list(session.alias_entries)
+    consumers = [
+        (0, 11, 7, 0, 0x50000000 + index * PAGE_BYTES, PAGE_BYTES, 0)
+        for index in range(1153)
+    ]
+    calls: list[int] = []
+
+    def ioctl(_fd: int, request: int, raw: object) -> int:
+        assert request == 103
+        assert isinstance(raw, static_alias._StaticAliasRebindParams)
+        calls.append(int(raw.flags))
+        if raw.flags == static_alias.UVM_MOE_STATIC_ALIAS_REBIND_FLAG_ABORT:
+            raw.rebind_id = 0
+            raw.rmStatus = 0
+            return 0
+        if raw.flags & static_alias.UVM_MOE_STATIC_ALIAS_REBIND_FLAG_BEGIN:
+            raw.rebind_id = 91
+            raw.accepted_count = raw.count
+            raw.staged_consumer_alias_count = raw.count
+            raw.staged_consumer_alias_bytes = raw.count * PAGE_BYTES
+            raw.upload_alias_count = 1
+            raw.backing_bytes = PAGE_BYTES
+            for index in range(raw.count):
+                raw.entries[index].status = 0
+            raw.rmStatus = 0
+            return 0
+        raw.rebind_id = 91
+        raw.rmStatus = 5
+        return -1
+
+    monkeypatch.setattr(static_alias, "_libc_ioctl", ioctl)
+    result = static_alias.driver_static_alias_rebind(41, consumers)
+
+    assert result["ok"] is False
+    assert result["reason"] == "rebind_ioctl_failed"
+    assert result["abort_result"]["ok"] is True
+    assert calls[-1] == static_alias.UVM_MOE_STATIC_ALIAS_REBIND_FLAG_ABORT
+    assert session.alias_entries == original_entries
+    assert session.alias_count == 2
+    assert session.alias_bytes == 2 * PAGE_BYTES
+    assert session.poisoned is False
+
+
+def test_resize_rebind_reuses_session_and_updates_backing_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _parked_rebind_session()
+    static_alias._static_alias_sessions[0] = session
+    old_identity = (0, 11, 7)
+    added_identity = (0, 12, 8)
+    static_alias._uvm._uvm_slot_direct_owners[0] = {
+        (old_identity[0], old_identity[2]): old_identity[1],
+        (added_identity[0], added_identity[2]): added_identity[1],
+    }
+    target = [
+        session.alias_entries[0],
+        (
+            *added_identity,
+            static_alias.UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW,
+            0x21000000,
+            PAGE_BYTES,
+            0,
+        ),
+        (0, 11, 7, 0, 0x31000000, PAGE_BYTES, 0),
+        (0, 12, 8, 0, 0x32000000, PAGE_BYTES, 0),
+    ]
+    calls: list[int] = []
+
+    def ioctl(_fd: int, request: int, raw: object) -> int:
+        assert request == 103
+        assert isinstance(raw, static_alias._StaticAliasRebindParams)
+        calls.append(int(raw.flags))
+        assert raw.flags == (
+            static_alias.UVM_MOE_STATIC_ALIAS_REBIND_FLAG_BEGIN
+            | static_alias.UVM_MOE_STATIC_ALIAS_REBIND_FLAG_COMMIT
+            | static_alias.UVM_MOE_STATIC_ALIAS_REBIND_FLAG_RESIZE
+        )
+        assert raw.expected_consumer_alias_count == len(target)
+        assert raw.expected_consumer_alias_bytes == len(target) * PAGE_BYTES
+        raw.accepted_count = raw.count
+        raw.staged_consumer_alias_count = 0
+        raw.staged_consumer_alias_bytes = 0
+        raw.upload_alias_count = 2
+        raw.backing_bytes = 2 * PAGE_BYTES
+        raw.total_alias_bytes = len(target) * PAGE_BYTES
+        raw.committed = 1
+        raw.rebind_id = 0
+        raw.poisoned = 0
+        for index in range(raw.count):
+            raw.entries[index].status = 0
+        raw.rmStatus = 0
+        return 0
+
+    monkeypatch.setattr(static_alias, "_libc_ioctl", ioctl)
+    result = static_alias.driver_static_alias_rebind(
+        41,
+        target,
+        resize=True,
+        expected_backing_bytes=2 * PAGE_BYTES,
+    )
+
+    assert result["ok"] is True
+    assert result["resized"] is True
+    assert result["retained_backing_count"] == 1
+    assert result["added_backing_count"] == 1
+    assert result["removed_backing_count"] == 0
+    assert session.session_id == 41
+    assert session.alias_entries == target
+    assert session.alias_count == 4
+    assert session.backing_bytes == 2 * PAGE_BYTES
+    assert calls == [11]
 
 
 def test_map_create_marshals_entries_and_caches_independent_session(
@@ -187,11 +418,107 @@ def test_map_create_marshals_entries_and_caches_independent_session(
         "session_id": 41,
         "owner_pid": os.getpid(),
         "sealed": False,
+        "parked": False,
         "poisoned": False,
         "alias_count": 2,
         "alias_bytes": 2 * PAGE_BYTES,
         "backing_bytes": PAGE_BYTES,
     }
+
+
+def test_park_resume_preserves_cached_session_and_backing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = static_alias._StaticAliasSession(
+        fd=110,
+        uuid_bytes=UUID_BYTES,
+        session_id=41,
+        owner_pid=os.getpid(),
+        sealed=True,
+        alias_count=2,
+        alias_bytes=2 * PAGE_BYTES,
+        backing_bytes=PAGE_BYTES,
+    )
+    static_alias._static_alias_sessions[0] = session
+    calls: list[int] = []
+
+    def ioctl(_fd: int, request: int, raw: object) -> int:
+        assert isinstance(raw, static_alias._StaticAliasTransitionParams)
+        assert raw.struct_size == 80
+        assert raw.reserved == 0
+        assert raw.session_id == 41
+        calls.append(request)
+        raw.processed_alias_count = 1
+        raw.consumer_alias_count = 1
+        raw.upload_alias_count = 1
+        raw.processed_alias_bytes = PAGE_BYTES
+        raw.consumer_alias_bytes = PAGE_BYTES
+        raw.backing_bytes = PAGE_BYTES
+        raw.tlb_invalidate_count = 1
+        raw.reserved = 1
+        raw.parked = int(request == 101)
+        raw.sealed = 1
+        raw.poisoned = 0
+        raw.rmStatus = 0
+        return 0
+
+    monkeypatch.setattr(static_alias, "_libc_ioctl", ioctl)
+    parked = static_alias.driver_static_alias_park(41)
+    assert parked["ok"] is True
+    assert parked["parked"] is True
+    assert parked["transition_batch_count"] == 1
+    assert parked["batch_count_reported"] is True
+    assert session.parked is True
+    assert session.backing_bytes == PAGE_BYTES
+
+    resumed = static_alias.driver_static_alias_resume(41)
+    assert resumed["ok"] is True
+    assert resumed["parked"] is False
+    assert resumed["transition_batch_count"] == 1
+    assert session.parked is False
+    assert session.backing_bytes == PAGE_BYTES
+    assert calls == [101, 102]
+
+
+def test_transition_rejects_impossible_batch_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = static_alias._StaticAliasSession(
+        fd=110,
+        uuid_bytes=UUID_BYTES,
+        session_id=41,
+        owner_pid=os.getpid(),
+        sealed=True,
+        alias_count=2,
+        alias_bytes=2 * PAGE_BYTES,
+        backing_bytes=PAGE_BYTES,
+    )
+    static_alias._static_alias_sessions[0] = session
+
+    def ioctl(_fd: int, request: int, raw: object) -> int:
+        assert request == 101
+        assert isinstance(raw, static_alias._StaticAliasTransitionParams)
+        raw.processed_alias_count = 1
+        raw.consumer_alias_count = 1
+        raw.upload_alias_count = 1
+        raw.processed_alias_bytes = PAGE_BYTES
+        raw.consumer_alias_bytes = PAGE_BYTES
+        raw.backing_bytes = PAGE_BYTES
+        raw.tlb_invalidate_count = 1
+        raw.reserved = 2
+        raw.parked = 1
+        raw.sealed = 1
+        raw.poisoned = 0
+        raw.rmStatus = 0
+        return 0
+
+    monkeypatch.setattr(static_alias, "_libc_ioctl", ioctl)
+    result = static_alias.driver_static_alias_park(41)
+
+    assert result["ok"] is False
+    assert result["reason"] == "park_contract_mismatch"
+    assert result["batch_count_valid"] is False
+    assert session.poisoned is True
 
 
 def test_map_create_probes_zero_progress_fd_then_keeps_matching_fd(

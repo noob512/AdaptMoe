@@ -21,4 +21,12 @@
 #undef NV_DEVICE_VM_BUILD
 #define NV_PCIE_RESET_FLR_PRESENT
 #undef NV_MODULE_IMPORT_NS_TAKES_CONSTANT
+#define NV_IS_EXPORT_SYMBOL_GPL_refcount_inc 0
+#define NV_IS_EXPORT_SYMBOL_GPL_refcount_dec_and_test 0
+#define NV_DRM_ALPHA_BLENDING_AVAILABLE
+#define NV_IS_EXPORT_SYMBOL_PRESENT_drm_gem_prime_fd_to_handle 1
+#define NV_IS_EXPORT_SYMBOL_PRESENT_drm_gem_prime_handle_to_fd 1
+#define NV_IS_EXPORT_SYMBOL_PRESENT_timer_delete_sync 1
+#define NV_IS_EXPORT_SYMBOL_GPL___vma_start_write 0
+#undef NV_MLNX_IB_PEER_MEM_SYMBOLS_PRESENT
 // Kernel version:             "6.13.12-061312-generic"

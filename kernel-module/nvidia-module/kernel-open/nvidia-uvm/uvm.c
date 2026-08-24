@@ -484,6 +484,9 @@ typedef struct
     NvU64 va_base;
     NvU64 bytes;
     NvU64 slot_offset;
+    NvU32 backing_layer_id;
+    NvU32 backing_expert_id;
+    NvU32 backing_slot_id;
     NvU32 pool_index;
     NvU32 flags;
     NvBool active;
@@ -493,6 +496,7 @@ typedef struct
 {
     NvBool valid;
     NvBool sealed;
+    NvBool parked;
     NvBool poisoned;
     NvU64 session_id;
     uvm_va_space_t *owner_va_space;
@@ -501,6 +505,18 @@ typedef struct
     NvU32 alias_count;
     NvU64 alias_bytes;
     NvU64 backing_bytes;
+    // Candidate read-only consumer records for a multi-ioctl REBIND. They
+    // never participate in fault handling or PTE cleanup until COMMIT swaps
+    // them into aliases while the session remains parked.
+    uvm_moe_static_alias_record_t *rebind_aliases;
+    NvU32 rebind_alias_count;
+    NvU32 rebind_expected_alias_count;
+    NvU64 rebind_alias_bytes;
+    NvU64 rebind_expected_alias_bytes;
+    NvU64 rebind_id;
+    // A RESIZE transaction stages the complete upload + consumer set. The
+    // ordinary form stages consumers only and preserves every upload/backing.
+    NvBool rebind_resize;
 } uvm_moe_static_alias_session_t;
 
 // Static aliases are logically independent of registered cmd96 plans, but
@@ -511,6 +527,7 @@ typedef struct
 static uvm_moe_static_alias_session_t
     g_uvm_moe_static_alias_sessions[UVM_MOE_STATIC_ALIAS_MAX_SESSIONS];
 static NvU64 g_uvm_moe_static_alias_session_counter;
+static NvU64 g_uvm_moe_static_alias_rebind_counter;
 
 static unsigned long long uvm_moe_slot_pool_vidmem_budget_bytes __read_mostly = 512ULL * 1024 * 1024;
 module_param(uvm_moe_slot_pool_vidmem_budget_bytes, ullong, S_IRUGO | S_IWUSR);
@@ -5052,6 +5069,7 @@ static void uvm_moe_static_alias_session_free_locked(uvm_moe_static_alias_sessio
         return;
 
     uvm_kvfree(session->aliases);
+    uvm_kvfree(session->rebind_aliases);
     memset(session, 0, sizeof(*session));
 }
 
@@ -5155,6 +5173,7 @@ static void uvm_moe_slot_pool_reset(void)
         for (i = 0; i < UVM_MOE_STATIC_ALIAS_MAX_SESSIONS; ++i)
             uvm_moe_static_alias_session_free_locked(&g_uvm_moe_static_alias_sessions[i]);
         g_uvm_moe_static_alias_session_counter = 0;
+        g_uvm_moe_static_alias_rebind_counter = 0;
         uvm_moe_slot_plan_clear_session_locked(NV_TRUE);
     }
     mutex_unlock(&g_uvm_moe_slot_plan_lock);
@@ -14209,6 +14228,12 @@ static NV_STATUS uvm_api_moe_static_alias_map(UVM_MOE_STATIC_ALIAS_MAP_PARAMS *p
         new_aliases[old_alias_count + i].va_base = params->entries[i].va_base;
         new_aliases[old_alias_count + i].bytes = params->entries[i].bytes;
         new_aliases[old_alias_count + i].slot_offset = params->entries[i].slot_offset;
+        new_aliases[old_alias_count + i].backing_layer_id =
+            params->entries[i].backing_layer_id;
+        new_aliases[old_alias_count + i].backing_expert_id =
+            params->entries[i].backing_expert_id;
+        new_aliases[old_alias_count + i].backing_slot_id =
+            params->entries[i].backing_slot_id;
         new_aliases[old_alias_count + i].pool_index = pool_index;
         new_aliases[old_alias_count + i].flags = params->entries[i].flags;
         new_aliases[old_alias_count + i].active = NV_TRUE;
@@ -14462,6 +14487,1862 @@ out_plan:
     return status;
 }
 
+static void uvm_moe_static_alias_transition_snapshot(
+    const uvm_moe_static_alias_session_t *session,
+    UVM_MOE_STATIC_ALIAS_TRANSITION_PARAMS *params)
+{
+    NvU32 i;
+
+    params->consumer_alias_bytes = 0;
+    params->backing_bytes = 0;
+    params->consumer_alias_count = 0;
+    params->upload_alias_count = 0;
+    params->parked = 0;
+    params->sealed = 0;
+    params->poisoned = 0;
+
+    if (!session)
+        return;
+
+    for (i = 0; i < session->alias_count; ++i) {
+        const uvm_moe_static_alias_record_t *record = &session->aliases[i];
+
+        if (!record->active)
+            continue;
+        if (record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW) {
+            ++params->upload_alias_count;
+        }
+        else {
+            ++params->consumer_alias_count;
+            params->consumer_alias_bytes += record->bytes;
+        }
+    }
+
+    params->backing_bytes = session->backing_bytes;
+    params->parked = session->parked;
+    params->sealed = session->sealed;
+    params->poisoned = session->poisoned;
+}
+
+static NV_STATUS uvm_moe_static_alias_remove_slot_range_locked(
+    uvm_moe_slot_pool_slot_t *slot,
+    NvU64 va_base,
+    NvU64 bytes)
+{
+    NvU32 index;
+    NvU32 i;
+
+    for (index = 0; index < slot->pte_range_count; ++index) {
+        if (slot->pte_ranges[index].va_base == va_base &&
+            slot->pte_ranges[index].bytes == bytes) {
+            break;
+        }
+    }
+    if (index == slot->pte_range_count)
+        return NV_ERR_OBJECT_NOT_FOUND;
+
+    if (index + 1 < slot->pte_range_count) {
+        memmove(&slot->pte_ranges[index],
+                &slot->pte_ranges[index + 1],
+                (slot->pte_range_count - index - 1) * sizeof(slot->pte_ranges[0]));
+    }
+    --slot->pte_range_count;
+    memset(&slot->pte_ranges[slot->pte_range_count],
+           0,
+           sizeof(slot->pte_ranges[0]));
+
+    slot->pte_va_base = 0;
+    slot->pte_bytes = 0;
+    for (i = 0; i < slot->pte_range_count; ++i) {
+        const uvm_moe_slot_pool_pte_range_t *range = &slot->pte_ranges[i];
+
+        if (slot->pte_bytes == 0 || range->va_base < slot->pte_va_base)
+            slot->pte_va_base = range->va_base;
+        slot->pte_bytes += range->bytes;
+    }
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_moe_static_alias_validate_transition_locked(
+    const uvm_moe_static_alias_session_t *session,
+    uvm_va_space_t *va_space,
+    NvBool expect_parked)
+{
+    NvU32 i;
+
+    for (i = 0; i < session->alias_count; ++i) {
+        const uvm_moe_static_alias_record_t *record = &session->aliases[i];
+        const uvm_moe_slot_pool_slot_t *slot;
+        NvBool mapped;
+
+        if (!record->active || record->pool_index >= UVM_MOE_SLOT_POOL_MAX_SLOTS)
+            return NV_ERR_INVALID_STATE;
+
+        slot = &g_uvm_moe_slot_pool[record->pool_index];
+        if (!slot->valid ||
+            slot->owner_va_space != va_space ||
+            slot->static_alias_session_id != session->session_id ||
+            slot->static_alias_poisoned ||
+            slot->pte_va_space != va_space ||
+            slot->pte_bytes == 0 ||
+            slot->pte_gpu == NULL ||
+            slot->pte_mode != UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP) {
+            return NV_ERR_INVALID_STATE;
+        }
+
+        mapped = uvm_moe_static_alias_slot_has_exact_range(slot,
+                                                            record->va_base,
+                                                            record->bytes);
+        if (record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW) {
+            if (!mapped)
+                return NV_ERR_INVALID_STATE;
+        }
+        else if (mapped == expect_parked) {
+            // Active topology: consumers must be mapped. Parked topology:
+            // consumers must be absent while their immutable records survive.
+            return NV_ERR_INVALID_STATE;
+        }
+    }
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_moe_static_alias_build_park_clear_state_locked(
+    UVM_MOE_SLOT_REMAP_BATCH_PARAMS *legacy,
+    uvm_va_space_t *va_space,
+    uvm_gpu_t *gpu,
+    uvm_moe_slot_direct_batch_state_t *state,
+    uvm_moe_slot_transition_clear_state_t *clear_state)
+{
+    NvU32 i;
+
+    uvm_assert_rwsem_locked_write(&va_space->lock);
+
+    for (i = 0; i < legacy->count; ++i) {
+        const UVM_MOE_SLOT_REMAP_ENTRY *entry = &legacy->entries[i];
+        uvm_moe_slot_pool_slot_t *slot = state->slots[i];
+        NvU64 range_end = entry->va_base + entry->bytes;
+        NvU64 cursor = entry->va_base;
+
+        if (!slot ||
+            slot->pte_range_vec ||
+            slot->pte_gpu != gpu ||
+            slot->pte_va_space != va_space ||
+            slot->pte_mode != UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP ||
+            !slot->pte_va_block_tracked ||
+            entry->bytes == 0 ||
+            range_end <= entry->va_base ||
+            !IS_ALIGNED(entry->va_base, PAGE_SIZE) ||
+            !IS_ALIGNED(entry->bytes, PAGE_SIZE) ||
+            !uvm_moe_static_alias_slot_has_exact_range(slot,
+                                                       entry->va_base,
+                                                       entry->bytes)) {
+            return NV_ERR_INVALID_STATE;
+        }
+
+        while (cursor < range_end) {
+            uvm_moe_slot_transition_clear_slice_t *slice;
+            uvm_va_block_t *va_block = NULL;
+            NvU64 slice_end;
+            NV_STATUS status;
+
+            if (clear_state->slice_count >= UVM_MOE_SLOT_DIRECT_MAX_BLOCKS)
+                return NV_ERR_INSUFFICIENT_RESOURCES;
+
+            // A sealed alias already owns PTEs in an existing managed block.
+            // Never create VA state merely to make PARK eligible.
+            status = uvm_va_block_find(va_space, cursor, &va_block);
+            if (status != NV_OK ||
+                !va_block ||
+                uvm_va_block_is_dead(va_block) ||
+                uvm_va_block_is_hmm(va_block) ||
+                uvm_va_block_get_va_space(va_block) != va_space ||
+                cursor > va_block->end) {
+                return status == NV_OK ? NV_ERR_INVALID_STATE : status;
+            }
+
+            slice_end = min(range_end, va_block->end + 1);
+            if (slice_end <= cursor)
+                return NV_ERR_INVALID_STATE;
+
+            slice = &clear_state->slices[clear_state->slice_count++];
+            slice->va_block = va_block;
+            slice->region =
+                uvm_va_block_region_from_start_end(va_block, cursor, slice_end - 1);
+            slice->slot_index = i;
+            ++clear_state->slot_block_counts[i];
+            cursor = slice_end;
+        }
+
+        ++clear_state->range_count;
+    }
+
+    sort(clear_state->slices,
+         clear_state->slice_count,
+         sizeof(clear_state->slices[0]),
+         uvm_moe_slot_transition_clear_slice_cmp,
+         NULL);
+
+    for (i = 0; i < clear_state->slice_count; ++i) {
+        const uvm_moe_slot_transition_clear_slice_t *slice =
+            &clear_state->slices[i];
+        uvm_moe_slot_transition_clear_group_t *group;
+
+        clear_state->page_count += uvm_va_block_region_num_pages(slice->region);
+        if (i == 0 || clear_state->slices[i - 1].va_block != slice->va_block) {
+            if (clear_state->group_count >= UVM_MOE_SLOT_DIRECT_MAX_BLOCKS)
+                return NV_ERR_INSUFFICIENT_RESOURCES;
+            ++clear_state->unique_block_count;
+            group = &clear_state->groups[clear_state->group_count++];
+            group->va_block = slice->va_block;
+            group->first_slice = i;
+            uvm_page_mask_zero(&group->page_mask);
+        }
+        else {
+            group = &clear_state->groups[clear_state->group_count - 1];
+            if (clear_state->slices[i - 1].region.outer > slice->region.first)
+                return NV_ERR_INVALID_STATE;
+        }
+
+        ++group->slice_count;
+        uvm_page_mask_region_fill(&group->page_mask, slice->region);
+    }
+
+    if (clear_state->range_count != legacy->count ||
+        clear_state->slice_count == 0 ||
+        clear_state->group_count != clear_state->unique_block_count) {
+        return NV_ERR_INVALID_STATE;
+    }
+
+    return NV_OK;
+}
+
+static NV_STATUS uvm_moe_static_alias_park_chunk_locked(
+    uvm_moe_static_alias_session_t *session,
+    uvm_va_space_t *va_space,
+    uvm_gpu_t *gpu,
+    struct mm_struct *mm,
+    NvU32 *record_cursor,
+    UVM_MOE_SLOT_REMAP_BATCH_PARAMS *legacy,
+    uvm_moe_slot_direct_batch_state_t *state,
+    uvm_moe_slot_transition_clear_state_t *clear_state,
+    uvm_va_block_context_t *block_context,
+    UVM_MOE_STATIC_ALIAS_TRANSITION_PARAMS *params,
+    NvBool *mutation_started)
+{
+    uvm_tracker_t clear_tracker = UVM_TRACKER_INIT();
+    NV_STATUS first_error = NV_OK;
+    NV_STATUS wait_status;
+    NvU64 chunk_bytes = 0;
+    NvU32 group_index;
+    NvU32 i;
+
+    memset(legacy, 0, sizeof(*legacy));
+    memset(state, 0, sizeof(*state));
+    memset(clear_state, 0, sizeof(*clear_state));
+    legacy->mode = UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_SHARED_PUSH_64K_PTE;
+    uvm_uuid_copy(&legacy->gpu_uuid, &session->gpu_uuid);
+
+    while (*record_cursor < session->alias_count &&
+           legacy->count < UVM_MOE_STATIC_ALIAS_MAX_ENTRIES) {
+        const uvm_moe_static_alias_record_t *record =
+            &session->aliases[*record_cursor];
+        uvm_moe_slot_pool_slot_t *slot;
+        UVM_MOE_SLOT_REMAP_ENTRY *entry;
+
+        ++*record_cursor;
+        if (record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW)
+            continue;
+        if (!record->active || record->pool_index >= UVM_MOE_SLOT_POOL_MAX_SLOTS)
+            return NV_ERR_INVALID_STATE;
+
+        slot = &g_uvm_moe_slot_pool[record->pool_index];
+        entry = &legacy->entries[legacy->count];
+        entry->layer_id = slot->layer_id;
+        entry->expert_id = slot->owner_expert_id;
+        entry->slot_id = slot->slot_id;
+        entry->role = record->flags;
+        entry->va_base = record->va_base;
+        entry->bytes = record->bytes;
+        entry->slot_offset = record->slot_offset;
+        entry->flags = UVM_MOE_SLOT_REMAP_FLAG_NO_EVICT;
+        entry->status = UVM_MOE_SLOT_REMAP_ENTRY_OK;
+        state->slots[legacy->count] = slot;
+        chunk_bytes += record->bytes;
+        ++legacy->count;
+    }
+
+    if (legacy->count == 0)
+        return NV_OK;
+    legacy->requested_bytes = chunk_bytes;
+
+    first_error = uvm_moe_static_alias_build_park_clear_state_locked(legacy,
+                                                                      va_space,
+                                                                      gpu,
+                                                                      state,
+                                                                      clear_state);
+    if (first_error != NV_OK)
+        goto out;
+
+    first_error = uvm_moe_slot_transition_preflight_group_clear_locked(
+        va_space,
+        gpu,
+        clear_state);
+    if (first_error == NV_WARN_MORE_PROCESSING_REQUIRED) {
+        NvU64 sequential_block_unmaps = 0;
+        NvU64 sequential_tracker_waits = 0;
+
+        // Some sparse expert layouts share a VA block with ordinary UVM
+        // mappings whose current PTE shape cannot be proven safe by the
+        // grouped transaction.  The grouped preflight has not mutated any
+        // PTEs, so fall back to the long-standing range-at-a-time uninstaller.
+        // It performs its own VA-block locking, tracker wait, CPU-remote map,
+        // and TLB synchronization for each complete recorded consumer range.
+        // Keep the upload ranges and backing alive exactly as PARK requires.
+        *mutation_started = NV_TRUE;
+        for (i = 0; i < legacy->count; ++i) {
+            UVM_MOE_SLOT_REMAP_ENTRY *entry = &legacy->entries[i];
+            uvm_moe_slot_pool_slot_t *slot = state->slots[i];
+            NvU64 range_block_unmaps = 0;
+            NvU64 range_tracker_waits = 0;
+
+            first_error = uvm_moe_slot_pool_uninstall_va_block_slot_mapping(
+                va_space,
+                gpu,
+                mm,
+                entry->va_base,
+                entry->bytes,
+                &range_block_unmaps,
+                &range_tracker_waits);
+            if (first_error != NV_OK)
+                goto out;
+
+            first_error = uvm_moe_static_alias_remove_slot_range_locked(
+                slot,
+                entry->va_base,
+                entry->bytes);
+            if (first_error != NV_OK)
+                goto out;
+
+            slot->pte_block_unmap_count += range_block_unmaps;
+            slot->pte_block_tracker_wait_count += range_tracker_waits;
+            ++slot->pte_clear_count;
+            sequential_block_unmaps += range_block_unmaps;
+            sequential_tracker_waits += range_tracker_waits;
+            ++params->processed_alias_count;
+            params->processed_alias_bytes += entry->bytes;
+        }
+
+        params->tlb_invalidate_count = (NvU32)min_t(
+            NvU64,
+            (NvU64)params->tlb_invalidate_count + sequential_block_unmaps,
+            (NvU64)NV_U32_MAX);
+        ++params->reserved;
+        g_uvm_moe_slot_pool_pte_clear_count += legacy->count;
+        g_uvm_moe_slot_pool_pte_block_unmap_count += sequential_block_unmaps;
+        g_uvm_moe_slot_pool_pte_block_tracker_wait_count +=
+            sequential_tracker_waits;
+
+        uvm_phase_f_route_log("moe_static_alias_park_sequential_fallback session=%llu batch=%u ranges=%u bytes=%llu block_unmaps=%llu tracker_waits=%llu\n",
+                              session->session_id,
+                              params->reserved,
+                              legacy->count,
+                              chunk_bytes,
+                              sequential_block_unmaps,
+                              sequential_tracker_waits);
+        first_error = NV_OK;
+        goto out;
+    }
+    if (first_error != NV_OK)
+        goto out;
+
+    // All allocation, range, overlap, and large-PTE checks completed without
+    // mutation. Every group below performs slot->CPU-remote replacement and
+    // contributes its block tracker to one completion boundary for the chunk.
+    *mutation_started = NV_TRUE;
+    for (group_index = 0; group_index < clear_state->group_count; ++group_index) {
+        const uvm_moe_slot_transition_clear_group_t *group =
+            &clear_state->groups[group_index];
+        uvm_va_block_t *va_block = group->va_block;
+        uvm_va_block_retry_t block_retry;
+        NV_STATUS status;
+        NV_STATUS tracker_status;
+
+        status = UVM_VA_BLOCK_LOCK_RETRY(
+            va_block,
+            &block_retry,
+            uvm_va_block_unmap_moe_slot(
+                va_block,
+                block_context,
+                gpu,
+                uvm_va_block_region_from_block(va_block),
+                &group->page_mask,
+                &va_block->tracker));
+
+        // Snapshot even on failure: unmap or remote-map work may already have
+        // been submitted before the helper returned an error.
+        uvm_mutex_lock(&va_block->lock);
+        tracker_status =
+            uvm_tracker_add_tracker_safe(&clear_tracker, &va_block->tracker);
+        uvm_mutex_unlock(&va_block->lock);
+        if (status != NV_OK && first_error == NV_OK)
+            first_error = status;
+        if (tracker_status != NV_OK && first_error == NV_OK)
+            first_error = tracker_status;
+        if (first_error != NV_OK)
+            break;
+    }
+
+    wait_status = uvm_tracker_wait(&clear_tracker);
+    if (first_error == NV_OK)
+        first_error = wait_status;
+    if (first_error != NV_OK)
+        goto out;
+
+    // Commit only consumer metadata after every PTE/TLB operation completed.
+    // RW upload mappings and the slot/session/backing lifetime remain intact.
+    for (i = 0; i < legacy->count; ++i) {
+        UVM_MOE_SLOT_REMAP_ENTRY *entry = &legacy->entries[i];
+        uvm_moe_slot_pool_slot_t *slot = state->slots[i];
+
+        first_error = uvm_moe_static_alias_remove_slot_range_locked(slot,
+                                                                     entry->va_base,
+                                                                     entry->bytes);
+        if (first_error != NV_OK)
+            goto out;
+    }
+
+    for (i = 0; i < legacy->count; ++i) {
+        uvm_moe_slot_pool_slot_t *slot = state->slots[i];
+        NvBool first_slot_in_chunk = NV_TRUE;
+        NvU32 j;
+
+        slot->pte_block_unmap_count += clear_state->slot_block_counts[i];
+        ++slot->pte_clear_count;
+        for (j = 0; j < i; ++j) {
+            if (state->slots[j] == slot) {
+                first_slot_in_chunk = NV_FALSE;
+                break;
+            }
+        }
+        if (first_slot_in_chunk && clear_state->slot_block_counts[i] != 0)
+            ++slot->pte_block_tracker_wait_count;
+    }
+
+    params->processed_alias_count += legacy->count;
+    params->processed_alias_bytes += chunk_bytes;
+    params->tlb_invalidate_count = (NvU32)min_t(
+        NvU64,
+        (NvU64)params->tlb_invalidate_count + clear_state->unique_block_count,
+        (NvU64)NV_U32_MAX);
+    ++params->reserved;
+    g_uvm_moe_slot_pool_pte_clear_count += legacy->count;
+    g_uvm_moe_slot_pool_pte_block_unmap_count +=
+        clear_state->unique_block_count;
+    if (clear_state->unique_block_count != 0)
+        ++g_uvm_moe_slot_pool_pte_block_tracker_wait_count;
+
+    uvm_phase_f_route_log("moe_static_alias_park_batch session=%llu batch=%u ranges=%u bytes=%llu slices=%u unique_blocks=%u\n",
+                          session->session_id,
+                          params->reserved,
+                          legacy->count,
+                          chunk_bytes,
+                          clear_state->slice_count,
+                          clear_state->unique_block_count);
+
+out:
+    uvm_tracker_deinit(&clear_tracker);
+    return first_error;
+}
+
+static NV_STATUS uvm_api_moe_static_alias_park(
+    UVM_MOE_STATIC_ALIAS_TRANSITION_PARAMS *params,
+    struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_moe_static_alias_session_t *session;
+    UVM_MOE_SLOT_REMAP_BATCH_PARAMS *legacy = NULL;
+    uvm_moe_slot_direct_batch_state_t *state = NULL;
+    uvm_moe_slot_transition_clear_state_t *clear_state = NULL;
+    uvm_va_block_context_t *block_context = NULL;
+    NvBool *pool_has_upload = NULL;
+    uvm_gpu_t *gpu = NULL;
+    struct mm_struct *mm = NULL;
+    NV_STATUS status = NV_OK;
+    NvU32 record_cursor = 0;
+    NvBool mutation_started = NV_FALSE;
+    NvU32 i;
+
+    BUILD_BUG_ON(sizeof(*params) != 80);
+
+    params->processed_alias_bytes = 0;
+    params->processed_alias_count = 0;
+    params->tlb_invalidate_count = 0;
+    uvm_moe_static_alias_transition_snapshot(NULL, params);
+
+    if (params->abi_version != UVM_MOE_STATIC_ALIAS_ABI_VERSION ||
+        params->struct_size != sizeof(*params) ||
+        params->flags != 0 ||
+        params->reserved != 0 ||
+        params->session_id == 0) {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    params->reserved = 0;
+
+    mutex_lock(&g_uvm_moe_slot_plan_lock);
+    session = uvm_moe_static_alias_find_locked(va_space, params->session_id);
+    if (!session) {
+        status = NV_ERR_OBJECT_NOT_FOUND;
+        goto out_plan;
+    }
+    uvm_moe_static_alias_transition_snapshot(session, params);
+    if (!session->sealed || session->parked || session->poisoned ||
+        params->consumer_alias_count == 0 || params->upload_alias_count == 0) {
+        status = session->poisoned ? NV_ERR_INVALID_STATE : NV_ERR_IN_USE;
+        goto out_plan;
+    }
+
+    legacy = uvm_kvmalloc_zero(sizeof(*legacy));
+    state = uvm_kvmalloc_zero(sizeof(*state));
+    clear_state = uvm_kvmalloc_zero(sizeof(*clear_state));
+    pool_has_upload = uvm_kvmalloc_zero(
+        UVM_MOE_SLOT_POOL_MAX_SLOTS * sizeof(*pool_has_upload));
+    if (!legacy || !state || !clear_state || !pool_has_upload) {
+        status = NV_ERR_NO_MEMORY;
+        goto out_plan;
+    }
+
+    // PARK must leave at least one writable upload alias for every backing
+    // slot which loses consumer mappings. Build the ownership certificate in
+    // one linear pass instead of adding an O(alias_count^2) transition check.
+    for (i = 0; i < session->alias_count; ++i) {
+        const uvm_moe_static_alias_record_t *record = &session->aliases[i];
+
+        if (!record->active || record->pool_index >= UVM_MOE_SLOT_POOL_MAX_SLOTS) {
+            status = NV_ERR_INVALID_STATE;
+            goto out_plan;
+        }
+        if (record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW)
+            pool_has_upload[record->pool_index] = NV_TRUE;
+    }
+    for (i = 0; i < session->alias_count; ++i) {
+        const uvm_moe_static_alias_record_t *record = &session->aliases[i];
+
+        if (!(record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW) &&
+            !pool_has_upload[record->pool_index]) {
+            status = NV_ERR_INVALID_STATE;
+            goto out_plan;
+        }
+    }
+
+    gpu = uvm_va_space_retain_gpu_by_uuid(va_space, &session->gpu_uuid);
+    if (!gpu) {
+        status = NV_ERR_INVALID_DEVICE;
+        goto out_plan;
+    }
+
+    mm = uvm_va_space_mm_or_current_retain_lock(va_space);
+    block_context = uvm_va_block_context_alloc(mm);
+    if (!block_context) {
+        status = NV_ERR_NO_MEMORY;
+        goto out_mm;
+    }
+    uvm_va_space_down_write(va_space);
+    mutex_lock(&g_uvm_moe_slot_pool_lock);
+
+    status = uvm_moe_static_alias_validate_transition_locked(session,
+                                                             va_space,
+                                                             NV_FALSE);
+    if (status != NV_OK)
+        goto out_pool;
+
+    while (status == NV_OK && record_cursor < session->alias_count) {
+        status = uvm_moe_static_alias_park_chunk_locked(session,
+                                                        va_space,
+                                                        gpu,
+                                                        mm,
+                                                        &record_cursor,
+                                                        legacy,
+                                                        state,
+                                                        clear_state,
+                                                        block_context,
+                                                        params,
+                                                        &mutation_started);
+    }
+
+    if (status == NV_OK &&
+        params->processed_alias_count == params->consumer_alias_count &&
+        params->processed_alias_bytes == params->consumer_alias_bytes) {
+        session->parked = NV_TRUE;
+    }
+    else {
+        if (status == NV_OK)
+            status = NV_ERR_INVALID_STATE;
+        session->parked = NV_FALSE;
+        if (mutation_started || params->processed_alias_count != 0) {
+            session->poisoned = NV_TRUE;
+            for (i = 0; i < UVM_MOE_SLOT_POOL_MAX_SLOTS; ++i) {
+                if (g_uvm_moe_slot_pool[i].static_alias_session_id ==
+                    session->session_id) {
+                    g_uvm_moe_slot_pool[i].static_alias_poisoned = NV_TRUE;
+                }
+            }
+        }
+    }
+
+out_pool:
+    uvm_moe_static_alias_transition_snapshot(session, params);
+    mutex_unlock(&g_uvm_moe_slot_pool_lock);
+    uvm_va_space_up_write(va_space);
+    uvm_va_block_context_free(block_context);
+    block_context = NULL;
+
+out_mm:
+    uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+
+out_plan:
+    if (gpu)
+        uvm_gpu_release(gpu);
+    mutex_unlock(&g_uvm_moe_slot_plan_lock);
+    uvm_va_block_context_free(block_context);
+    uvm_kvfree(pool_has_upload);
+    uvm_kvfree(clear_state);
+    uvm_kvfree(state);
+    uvm_kvfree(legacy);
+    return status;
+}
+
+#define UVM_MOE_STATIC_ALIAS_MAX_REBIND_CONSUMERS 65536U
+
+static void uvm_moe_static_alias_rebind_reset_locked(
+    uvm_moe_static_alias_session_t *session)
+{
+    UVM_ASSERT(mutex_is_locked(&g_uvm_moe_slot_plan_lock));
+
+    if (!session)
+        return;
+
+    uvm_kvfree(session->rebind_aliases);
+    session->rebind_aliases = NULL;
+    session->rebind_alias_count = 0;
+    session->rebind_expected_alias_count = 0;
+    session->rebind_alias_bytes = 0;
+    session->rebind_expected_alias_bytes = 0;
+    session->rebind_id = 0;
+    session->rebind_resize = NV_FALSE;
+}
+
+static NvU32 uvm_moe_static_alias_upload_count(
+    const uvm_moe_static_alias_session_t *session,
+    NvU64 *upload_bytes_out)
+{
+    NvU64 upload_bytes = 0;
+    NvU32 upload_count = 0;
+    NvU32 i;
+
+    for (i = 0; session && i < session->alias_count; ++i) {
+        const uvm_moe_static_alias_record_t *record = &session->aliases[i];
+
+        if (!record->active ||
+            !(record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW)) {
+            continue;
+        }
+        ++upload_count;
+        upload_bytes += record->bytes;
+    }
+
+    if (upload_bytes_out)
+        *upload_bytes_out = upload_bytes;
+    return upload_count;
+}
+
+static bool uvm_moe_static_alias_has_matching_upload(
+    const uvm_moe_static_alias_session_t *session,
+    NvU32 pool_index,
+    const UVM_MOE_STATIC_ALIAS_ENTRY *entry)
+{
+    NvU32 i;
+
+    for (i = 0; i < session->alias_count; ++i) {
+        const uvm_moe_static_alias_record_t *record = &session->aliases[i];
+
+        if (!record->active || record->pool_index != pool_index ||
+            !(record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW)) {
+            continue;
+        }
+        if (record->bytes == entry->bytes &&
+            record->slot_offset == entry->slot_offset &&
+            ((record->flags ^ entry->flags) &
+             UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_PTE_64K) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static int uvm_moe_static_alias_record_va_cmp(const void *a, const void *b)
+{
+    const uvm_moe_static_alias_record_t *left = a;
+    const uvm_moe_static_alias_record_t *right = b;
+
+    if (left->va_base < right->va_base)
+        return -1;
+    if (left->va_base > right->va_base)
+        return 1;
+    if (left->bytes < right->bytes)
+        return -1;
+    if (left->bytes > right->bytes)
+        return 1;
+    return 0;
+}
+
+static void uvm_moe_static_alias_rebind_fail_entries(
+    UVM_MOE_STATIC_ALIAS_REBIND_PARAMS *params,
+    NvU32 status)
+{
+    NvU32 i;
+
+    params->accepted_count = 0;
+    for (i = 0; i < params->count; ++i) {
+        if (params->entries[i].status == UVM_MOE_STATIC_ALIAS_ENTRY_OK)
+            params->entries[i].status = status;
+    }
+}
+
+static NvBool uvm_moe_static_alias_resize_has_old_upload(
+    const uvm_moe_static_alias_session_t *session,
+    const uvm_moe_static_alias_record_t *candidate)
+{
+    NvU32 i;
+
+    for (i = 0; i < session->alias_count; ++i) {
+        const uvm_moe_static_alias_record_t *record = &session->aliases[i];
+
+        if (!record->active ||
+            !(record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW) ||
+            record->pool_index != candidate->pool_index) {
+            continue;
+        }
+        if (record->va_base == candidate->va_base &&
+            record->bytes == candidate->bytes &&
+            record->slot_offset == candidate->slot_offset &&
+            ((record->flags ^ candidate->flags) &
+             UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_PTE_64K) == 0) {
+            return NV_TRUE;
+        }
+    }
+
+    return NV_FALSE;
+}
+
+/*
+ * Commit a complete parked topology while retaining every common pool slot.
+ * Newly requested pool slots must already have mode-8 VIDMEM backing; this
+ * transaction adopts them into the static session and maps only their upload
+ * aliases. Consumer aliases remain ordinary CPU-remote mappings until RESUME.
+ * Slots absent from the candidate are released only after all additions have
+ * been installed successfully.
+ */
+static NV_STATUS uvm_moe_static_alias_resize_commit_locked(
+    uvm_moe_static_alias_session_t *session,
+    uvm_va_space_t *va_space,
+    uvm_gpu_t *gpu,
+    struct mm_struct *mm,
+    UVM_MOE_SLOT_REMAP_BATCH_PARAMS *legacy,
+    uvm_moe_slot_direct_batch_state_t *state,
+    UVM_MOE_STATIC_ALIAS_REBIND_PARAMS *params,
+    NvBool *mutation_started)
+{
+    NvBool *old_pool = NULL;
+    NvBool *target_pool = NULL;
+    NvBool *target_has_upload = NULL;
+    NvU32 *target_range_count = NULL;
+    NvU32 *target_upload_index = NULL;
+    uvm_moe_static_alias_record_t *old_aliases = NULL;
+    uvm_tracker_t batch_tracker = UVM_TRACKER_INIT();
+    uvm_va_block_slot_direct_result_t map_result = {0};
+    NV_STATUS status = NV_OK;
+    NV_STATUS tracker_status = NV_OK;
+    NvU64 target_backing_bytes = 0;
+    NvU64 added_backing_bytes = 0;
+    NvU64 removed_backing_bytes = 0;
+    NvU32 target_upload_count = 0;
+    NvU32 added_upload_count = 0;
+    NvU32 removed_pool_count = 0;
+    NvU32 i;
+    NvBool tracker_initialized = NV_FALSE;
+
+    UVM_ASSERT(mutex_is_locked(&g_uvm_moe_slot_plan_lock));
+    UVM_ASSERT(mutex_is_locked(&g_uvm_moe_slot_pool_lock));
+    uvm_assert_rwsem_locked_write(&va_space->lock);
+
+    old_pool = uvm_kvmalloc_zero(
+        UVM_MOE_SLOT_POOL_MAX_SLOTS * sizeof(*old_pool));
+    target_pool = uvm_kvmalloc_zero(
+        UVM_MOE_SLOT_POOL_MAX_SLOTS * sizeof(*target_pool));
+    target_has_upload = uvm_kvmalloc_zero(
+        UVM_MOE_SLOT_POOL_MAX_SLOTS * sizeof(*target_has_upload));
+    target_range_count = uvm_kvmalloc_zero(
+        UVM_MOE_SLOT_POOL_MAX_SLOTS * sizeof(*target_range_count));
+    target_upload_index = uvm_kvmalloc_zero(
+        UVM_MOE_SLOT_POOL_MAX_SLOTS * sizeof(*target_upload_index));
+    if (!old_pool || !target_pool || !target_has_upload ||
+        !target_range_count || !target_upload_index) {
+        status = NV_ERR_NO_MEMORY;
+        goto out;
+    }
+    for (i = 0; i < UVM_MOE_SLOT_POOL_MAX_SLOTS; ++i)
+        target_upload_index[i] = NV_U32_MAX;
+
+    for (i = 0; i < session->alias_count; ++i) {
+        const uvm_moe_static_alias_record_t *record = &session->aliases[i];
+
+        if (!record->active || record->pool_index >= UVM_MOE_SLOT_POOL_MAX_SLOTS) {
+            status = NV_ERR_INVALID_STATE;
+            goto out;
+        }
+        old_pool[record->pool_index] = NV_TRUE;
+    }
+
+    for (i = 0; i < session->rebind_alias_count; ++i) {
+        const uvm_moe_static_alias_record_t *record = &session->rebind_aliases[i];
+        uvm_moe_slot_pool_slot_t *slot;
+        NvU32 pool_index = record->pool_index;
+
+        if (!record->active || pool_index >= UVM_MOE_SLOT_POOL_MAX_SLOTS) {
+            status = NV_ERR_INVALID_STATE;
+            goto out;
+        }
+        slot = &g_uvm_moe_slot_pool[pool_index];
+        if (!slot->valid ||
+            slot->owner_va_space != va_space ||
+            slot->layer_id != record->backing_layer_id ||
+            slot->owner_expert_id != record->backing_expert_id ||
+            slot->slot_id != record->backing_slot_id ||
+            !uvm_moe_slot_pool_slot_has_vidmem_backing(slot, gpu) ||
+            !(slot->flags & UVM_MOE_SLOT_REMAP_FLAG_NO_EVICT) ||
+            slot->async_copy_pending || slot->async_copy_staging ||
+            slot->static_alias_poisoned ||
+            record->slot_offset + record->bytes > slot->slot_bytes) {
+            status = NV_ERR_INVALID_STATE;
+            goto out;
+        }
+        if (old_pool[pool_index]) {
+            if (slot->static_alias_session_id != session->session_id ||
+                !slot->static_alias_sealed ||
+                slot->pte_va_space != va_space || slot->pte_gpu != gpu ||
+                slot->pte_mode != UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_REMAP) {
+                status = NV_ERR_INVALID_STATE;
+                goto out;
+            }
+        }
+        else if (slot->static_alias_session_id != 0 ||
+                 !uvm_moe_slot_direct_pte_metadata_empty(slot) ||
+                 slot->state != UVM_MOE_SLOT_POOL_STATE_READY) {
+            status = NV_ERR_IN_USE;
+            goto out;
+        }
+
+        target_pool[pool_index] = NV_TRUE;
+        if (++target_range_count[pool_index] >
+            UVM_MOE_SLOT_POOL_MAX_PTE_RANGES_PER_SLOT) {
+            status = NV_ERR_INSUFFICIENT_RESOURCES;
+            goto out;
+        }
+        if (record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW) {
+            if (target_has_upload[pool_index]) {
+                status = NV_ERR_INVALID_ARGUMENT;
+                goto out;
+            }
+            target_has_upload[pool_index] = NV_TRUE;
+            target_upload_index[pool_index] = i;
+            ++target_upload_count;
+            target_backing_bytes += slot->slot_bytes;
+            if (old_pool[pool_index]) {
+                if (!uvm_moe_static_alias_resize_has_old_upload(session, record)) {
+                    status = NV_ERR_INVALID_ARGUMENT;
+                    goto out;
+                }
+            }
+            else {
+                ++added_upload_count;
+                added_backing_bytes += slot->slot_bytes;
+            }
+        }
+    }
+
+    if (target_upload_count == 0 ||
+        added_upload_count > UVM_MOE_STATIC_ALIAS_MAX_ENTRIES) {
+        status = target_upload_count == 0 ?
+            NV_ERR_INVALID_ARGUMENT : NV_ERR_INSUFFICIENT_RESOURCES;
+        goto out;
+    }
+    for (i = 0; i < UVM_MOE_SLOT_POOL_MAX_SLOTS; ++i) {
+        if (target_pool[i] && !target_has_upload[i]) {
+            status = NV_ERR_INVALID_ARGUMENT;
+            goto out;
+        }
+    }
+    for (i = 0; i < session->rebind_alias_count; ++i) {
+        const uvm_moe_static_alias_record_t *record = &session->rebind_aliases[i];
+        const uvm_moe_static_alias_record_t *upload;
+
+        if (record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW)
+            continue;
+        upload = &session->rebind_aliases[
+            target_upload_index[record->pool_index]];
+        if (upload->bytes != record->bytes ||
+            upload->slot_offset != record->slot_offset ||
+            ((upload->flags ^ record->flags) &
+             UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_PTE_64K) != 0) {
+            status = NV_ERR_INVALID_ARGUMENT;
+            goto out;
+        }
+    }
+
+    memset(legacy, 0, sizeof(*legacy));
+    memset(state, 0, sizeof(*state));
+    legacy->mode = UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_SHARED_PUSH_64K_PTE;
+    uvm_uuid_copy(&legacy->gpu_uuid, &session->gpu_uuid);
+    for (i = 0; i < session->rebind_alias_count; ++i) {
+        const uvm_moe_static_alias_record_t *record = &session->rebind_aliases[i];
+        UVM_MOE_SLOT_REMAP_ENTRY *entry;
+
+        if (!(record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW) ||
+            old_pool[record->pool_index]) {
+            continue;
+        }
+        entry = &legacy->entries[legacy->count];
+        entry->layer_id = record->backing_layer_id;
+        entry->expert_id = record->backing_expert_id;
+        entry->slot_id = record->backing_slot_id;
+        entry->role = record->flags;
+        entry->va_base = record->va_base;
+        entry->bytes = record->bytes;
+        entry->slot_offset = record->slot_offset;
+        entry->flags = UVM_MOE_SLOT_REMAP_FLAG_NO_EVICT;
+        entry->status = UVM_MOE_SLOT_REMAP_ENTRY_OK;
+        state->slots[legacy->count] =
+            &g_uvm_moe_slot_pool[record->pool_index];
+        legacy->requested_bytes += record->bytes;
+        ++legacy->count;
+    }
+
+    if (legacy->count != added_upload_count) {
+        status = NV_ERR_INVALID_STATE;
+        goto out;
+    }
+    if (legacy->count != 0) {
+        status = uvm_moe_slot_direct_flatten_blocks_locked(legacy,
+                                                            va_space,
+                                                            state,
+                                                            NV_TRUE);
+        if (status != NV_OK)
+            goto out;
+        for (i = 0; i < state->block_count; ++i) {
+            NvU32 entry_index = state->block_entry_indices[i];
+            NvU32 flags = legacy->entries[entry_index].role;
+
+            state->blocks[i].pte_mode =
+                (flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_PTE_64K) ?
+                    UVM_SLOT_DIRECT_PTE_MODE_64K : UVM_SLOT_DIRECT_PTE_MODE_4K;
+            state->blocks[i].writable = true;
+            state->blocks[i].slot_tracker = NULL;
+        }
+        status = uvm_va_block_slot_direct_preflight_targets_not_slot_mapped(
+            va_space, gpu, state->blocks, state->block_count);
+        if (status != NV_OK)
+            goto out;
+        status = uvm_moe_slot_direct_record_all_pte_metadata_locked(legacy,
+                                                                    va_space,
+                                                                    gpu,
+                                                                    state);
+        if (status != NV_OK)
+            goto out;
+
+        /* Publish ownership before revoking CPU mappings: the fault guard must
+         * see every range as soon as the first PTE can change. */
+        for (i = 0; i < legacy->count; ++i) {
+            state->slots[i]->static_alias_session_id = session->session_id;
+            state->slots[i]->static_alias_sealed = NV_TRUE;
+            state->slots[i]->static_alias_poisoned = NV_FALSE;
+        }
+        *mutation_started = NV_TRUE;
+        status = uvm_va_block_slot_alias_revoke_cpu_mappings_batch(
+            va_space, mm, state->blocks, state->block_count);
+        if (status != NV_OK)
+            goto poison;
+
+        uvm_tracker_init(&batch_tracker);
+        tracker_initialized = NV_TRUE;
+        status = uvm_va_block_slot_alias_map_batch(
+            va_space,
+            mm,
+            gpu,
+            state->blocks,
+            state->block_count,
+            true,
+            true,
+            &g_uvm_moe_slot_pool_lock,
+            &batch_tracker,
+            &map_result);
+        for (i = 0; i < state->block_count; ++i) {
+            uvm_va_block_t *block = state->blocks[i].va_block;
+            NV_STATUS add_status;
+
+            if (i > 0 && state->blocks[i - 1].va_block == block)
+                continue;
+            uvm_mutex_lock(&block->lock);
+            add_status =
+                uvm_tracker_add_tracker_safe(&batch_tracker, &block->tracker);
+            uvm_mutex_unlock(&block->lock);
+            if (tracker_status == NV_OK)
+                tracker_status = add_status;
+        }
+        {
+            NV_STATUS wait_status = uvm_tracker_wait(&batch_tracker);
+
+            if (tracker_status == NV_OK)
+                tracker_status = wait_status;
+        }
+        if (status == NV_OK && tracker_status != NV_OK)
+            status = tracker_status;
+        if (status != NV_OK)
+            goto poison;
+    }
+
+    /* Additions are now durable. Release only slots absent from the target;
+     * common backing and its writable upload PTE never move. */
+    for (i = 0; i < UVM_MOE_SLOT_POOL_MAX_SLOTS; ++i) {
+        uvm_moe_slot_pool_slot_t *slot;
+        NvU32 record_index;
+
+        if (!old_pool[i] || target_pool[i])
+            continue;
+        slot = &g_uvm_moe_slot_pool[i];
+        if (slot->static_alias_session_id != session->session_id) {
+            status = NV_ERR_INVALID_STATE;
+            goto poison;
+        }
+        *mutation_started = NV_TRUE;
+        removed_backing_bytes += slot->slot_bytes;
+        status = uvm_moe_slot_pool_release_backing_locked(slot, va_space, mm);
+        if (status != NV_OK)
+            goto poison;
+        for (record_index = 0; record_index < session->alias_count;
+             ++record_index) {
+            if (session->aliases[record_index].active &&
+                session->aliases[record_index].pool_index == i) {
+                session->aliases[record_index].active = NV_FALSE;
+            }
+        }
+        memset(slot, 0, sizeof(*slot));
+        ++removed_pool_count;
+    }
+
+    old_aliases = session->aliases;
+    session->aliases = session->rebind_aliases;
+    session->alias_count = session->rebind_alias_count;
+    session->alias_bytes = session->rebind_alias_bytes;
+    session->backing_bytes = target_backing_bytes;
+    session->rebind_aliases = NULL;
+    session->rebind_alias_count = 0;
+    session->rebind_alias_bytes = 0;
+    for (i = 0; i < UVM_MOE_SLOT_POOL_MAX_SLOTS; ++i) {
+        uvm_moe_slot_pool_slot_t *slot;
+
+        if (!target_pool[i])
+            continue;
+        slot = &g_uvm_moe_slot_pool[i];
+        slot->static_alias_session_id = session->session_id;
+        slot->static_alias_sealed = NV_TRUE;
+        slot->static_alias_poisoned = NV_FALSE;
+    }
+    status = uvm_moe_static_alias_validate_transition_locked(session,
+                                                             va_space,
+                                                             NV_TRUE);
+    if (status != NV_OK)
+        goto poison;
+    uvm_kvfree(old_aliases);
+    old_aliases = NULL;
+    params->backing_bytes = session->backing_bytes;
+    params->total_alias_bytes = session->alias_bytes;
+    params->upload_alias_count = target_upload_count;
+    params->committed = 1;
+    uvm_phase_f_route_log(
+        "moe_static_alias_resize session=%llu retained_backing=%llu added_backing=%llu removed_backing=%llu added_uploads=%u removed_pools=%u target_aliases=%u\n",
+        session->session_id,
+        session->backing_bytes - added_backing_bytes,
+        added_backing_bytes,
+        removed_backing_bytes,
+        added_upload_count,
+        removed_pool_count,
+        session->alias_count);
+    goto out;
+
+poison:
+    session->poisoned = NV_TRUE;
+    params->poisoned = 1;
+    for (i = 0; i < UVM_MOE_SLOT_POOL_MAX_SLOTS; ++i) {
+        if (g_uvm_moe_slot_pool[i].static_alias_session_id ==
+            session->session_id) {
+            g_uvm_moe_slot_pool[i].static_alias_poisoned = NV_TRUE;
+        }
+    }
+
+out:
+    if (tracker_initialized)
+        uvm_tracker_deinit(&batch_tracker);
+    uvm_kvfree(old_aliases);
+    uvm_kvfree(target_upload_index);
+    uvm_kvfree(target_range_count);
+    uvm_kvfree(target_has_upload);
+    uvm_kvfree(target_pool);
+    uvm_kvfree(old_pool);
+    return status;
+}
+
+static NV_STATUS uvm_api_moe_static_alias_rebind(
+    UVM_MOE_STATIC_ALIAS_REBIND_PARAMS *params,
+    struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_moe_static_alias_session_t *session = NULL;
+    UVM_MOE_SLOT_REMAP_BATCH_PARAMS *legacy = NULL;
+    uvm_moe_slot_direct_batch_state_t *state = NULL;
+    uvm_moe_static_alias_record_t *replacement_aliases = NULL;
+    NvU32 *pending_per_pool = NULL;
+    uvm_gpu_t *gpu = NULL;
+    struct mm_struct *mm = NULL;
+    NV_STATUS status = NV_OK;
+    NvU64 call_bytes = 0;
+    NvU64 upload_bytes = 0;
+    NvU32 upload_count = 0;
+    NvU32 i;
+    bool plan_locked = false;
+    bool mm_locked = false;
+    bool va_locked = false;
+    bool pool_locked = false;
+    bool transaction_started = false;
+    bool resize_requested = false;
+    NvBool resize_mutation_started = NV_FALSE;
+
+    BUILD_BUG_ON(sizeof(*params) != 55400);
+    BUILD_BUG_ON(offsetof(UVM_MOE_STATIC_ALIAS_REBIND_PARAMS, entries) != 96);
+    BUILD_BUG_ON(offsetof(UVM_MOE_STATIC_ALIAS_REBIND_PARAMS, rmStatus) != 55392);
+
+    params->accepted_count = 0;
+    params->staged_consumer_alias_bytes = 0;
+    params->backing_bytes = 0;
+    params->total_alias_bytes = 0;
+    params->staged_consumer_alias_count = 0;
+    params->upload_alias_count = 0;
+    params->committed = 0;
+    params->poisoned = 0;
+
+    if (params->abi_version != UVM_MOE_STATIC_ALIAS_ABI_VERSION ||
+        params->struct_size != sizeof(*params) ||
+        (params->flags & ~UVM_MOE_STATIC_ALIAS_REBIND_FLAGS_ALL) ||
+        params->reserved != 0 || params->reserved2 != 0 ||
+        params->session_id == 0) {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    resize_requested =
+        (params->flags & UVM_MOE_STATIC_ALIAS_REBIND_FLAG_RESIZE) != 0;
+    if (params->flags & UVM_MOE_STATIC_ALIAS_REBIND_FLAG_ABORT) {
+        if (params->flags != UVM_MOE_STATIC_ALIAS_REBIND_FLAG_ABORT ||
+            params->count != 0 || params->rebind_id == 0) {
+            return NV_ERR_INVALID_ARGUMENT;
+        }
+    }
+    else if (params->count == 0 ||
+             params->count > UVM_MOE_STATIC_ALIAS_MAX_ENTRIES ||
+             params->expected_consumer_alias_count == 0 ||
+             params->expected_consumer_alias_count >
+                 UVM_MOE_STATIC_ALIAS_MAX_REBIND_CONSUMERS ||
+             params->expected_consumer_alias_bytes == 0 ||
+             ((params->flags & UVM_MOE_STATIC_ALIAS_REBIND_FLAG_BEGIN) != 0) !=
+                 (params->rebind_id == 0)) {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    for (i = 0; i < params->count; ++i) {
+        UVM_MOE_STATIC_ALIAS_ENTRY *entry = &params->entries[i];
+        NvU32 j;
+
+        entry->status = UVM_MOE_STATIC_ALIAS_ENTRY_OK;
+        if (uvm_moe_static_alias_range_invalid(entry) ||
+            (!resize_requested &&
+             (entry->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW)) ||
+            call_bytes + entry->bytes < call_bytes) {
+            entry->status = UVM_MOE_STATIC_ALIAS_ENTRY_INVALID_ARGUMENT;
+            status = NV_ERR_INVALID_ARGUMENT;
+            continue;
+        }
+        call_bytes += entry->bytes;
+        for (j = 0; j < i; ++j) {
+            const UVM_MOE_STATIC_ALIAS_ENTRY *previous = &params->entries[j];
+
+            if (previous->status != UVM_MOE_STATIC_ALIAS_ENTRY_OK)
+                continue;
+            if (uvm_moe_static_alias_ranges_overlap(entry->va_base,
+                                                     entry->bytes,
+                                                     previous->va_base,
+                                                     previous->bytes)) {
+                entry->status = UVM_MOE_STATIC_ALIAS_ENTRY_ALIAS_CONFLICT;
+                status = NV_ERR_INVALID_ARGUMENT;
+                break;
+            }
+        }
+    }
+    if (status != NV_OK) {
+        uvm_moe_static_alias_rebind_fail_entries(
+            params, UVM_MOE_STATIC_ALIAS_ENTRY_ROLLED_BACK);
+        return status;
+    }
+
+    if (!(params->flags & UVM_MOE_STATIC_ALIAS_REBIND_FLAG_ABORT)) {
+        legacy = uvm_kvmalloc_zero(sizeof(*legacy));
+        state = uvm_kvmalloc_zero(sizeof(*state));
+        pending_per_pool = uvm_kvmalloc_zero(
+            UVM_MOE_SLOT_POOL_MAX_SLOTS * sizeof(*pending_per_pool));
+        if (!legacy || !state || !pending_per_pool) {
+            status = NV_ERR_NO_MEMORY;
+            goto out;
+        }
+    }
+
+    mutex_lock(&g_uvm_moe_slot_plan_lock);
+    plan_locked = true;
+    session = uvm_moe_static_alias_find_locked(va_space, params->session_id);
+    if (!session) {
+        status = NV_ERR_OBJECT_NOT_FOUND;
+        goto out;
+    }
+    upload_count = uvm_moe_static_alias_upload_count(session, &upload_bytes);
+    params->upload_alias_count = upload_count;
+    params->backing_bytes = session->backing_bytes;
+    params->total_alias_bytes = session->alias_bytes;
+    params->poisoned = session->poisoned;
+
+    if (!session->sealed || !session->parked || session->poisoned ||
+        upload_count == 0) {
+        status = session->poisoned ? NV_ERR_INVALID_STATE : NV_ERR_IN_USE;
+        goto out;
+    }
+
+    if (params->flags & UVM_MOE_STATIC_ALIAS_REBIND_FLAG_ABORT) {
+        if (session->rebind_id != params->rebind_id) {
+            status = NV_ERR_OBJECT_NOT_FOUND;
+            goto out;
+        }
+        uvm_moe_static_alias_rebind_reset_locked(session);
+        params->rebind_id = 0;
+        goto out;
+    }
+
+    if (params->flags & UVM_MOE_STATIC_ALIAS_REBIND_FLAG_BEGIN) {
+        if (session->rebind_id != 0 || session->rebind_aliases != NULL) {
+            status = NV_ERR_IN_USE;
+            goto out;
+        }
+        session->rebind_aliases = uvm_kvmalloc_zero(
+            (size_t)params->expected_consumer_alias_count *
+            sizeof(*session->rebind_aliases));
+        if (!session->rebind_aliases) {
+            status = NV_ERR_NO_MEMORY;
+            goto out;
+        }
+        ++g_uvm_moe_static_alias_rebind_counter;
+        if (g_uvm_moe_static_alias_rebind_counter == 0)
+            ++g_uvm_moe_static_alias_rebind_counter;
+        session->rebind_id = g_uvm_moe_static_alias_rebind_counter;
+        session->rebind_expected_alias_count =
+            params->expected_consumer_alias_count;
+        session->rebind_expected_alias_bytes =
+            params->expected_consumer_alias_bytes;
+        session->rebind_resize = resize_requested ? NV_TRUE : NV_FALSE;
+        params->rebind_id = session->rebind_id;
+        transaction_started = true;
+    }
+    else if (session->rebind_id == 0 ||
+             session->rebind_id != params->rebind_id ||
+             session->rebind_expected_alias_count !=
+                 params->expected_consumer_alias_count ||
+             session->rebind_expected_alias_bytes !=
+                 params->expected_consumer_alias_bytes ||
+             session->rebind_resize !=
+                 (resize_requested ? NV_TRUE : NV_FALSE)) {
+        status = NV_ERR_INVALID_STATE;
+        goto out;
+    }
+
+    if (session->rebind_alias_count > session->rebind_expected_alias_count ||
+        params->count > session->rebind_expected_alias_count -
+                            session->rebind_alias_count ||
+        session->rebind_alias_bytes > session->rebind_expected_alias_bytes ||
+        call_bytes > session->rebind_expected_alias_bytes -
+                         session->rebind_alias_bytes) {
+        status = NV_ERR_OUT_OF_RANGE;
+        goto abort_transaction;
+    }
+
+    legacy->count = params->count;
+    legacy->mode = UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_SHARED_PUSH_64K_PTE;
+    uvm_uuid_copy(&legacy->gpu_uuid, &session->gpu_uuid);
+    gpu = uvm_va_space_retain_gpu_by_uuid(va_space, &session->gpu_uuid);
+    if (!gpu) {
+        status = NV_ERR_INVALID_DEVICE;
+        goto abort_transaction;
+    }
+    mm = uvm_va_space_mm_or_current_retain_lock(va_space);
+    mm_locked = true;
+    uvm_va_space_down_write(va_space);
+    va_locked = true;
+    mutex_lock(&g_uvm_moe_slot_pool_lock);
+    pool_locked = true;
+
+    status = uvm_moe_static_alias_validate_transition_locked(session,
+                                                             va_space,
+                                                             NV_TRUE);
+    if (status != NV_OK)
+        goto abort_transaction;
+
+    for (i = 0; i < params->count; ++i) {
+        UVM_MOE_STATIC_ALIAS_ENTRY *entry = &params->entries[i];
+        UVM_MOE_SLOT_REMAP_ENTRY *legacy_entry = &legacy->entries[i];
+        uvm_moe_slot_pool_slot_t *slot;
+        NvU32 pool_index;
+        NvU32 j;
+
+        slot = uvm_moe_slot_pool_find_locked(va_space,
+                                             entry->backing_layer_id,
+                                             entry->backing_slot_id);
+        if (!slot || slot->owner_expert_id != entry->backing_expert_id) {
+            entry->status = UVM_MOE_STATIC_ALIAS_ENTRY_BACKING_NOT_FOUND;
+            status = NV_ERR_OBJECT_NOT_FOUND;
+            break;
+        }
+        pool_index = (NvU32)(slot - g_uvm_moe_slot_pool);
+        if (!uvm_moe_slot_pool_slot_has_vidmem_backing(slot, gpu) ||
+            slot->owner_va_space != va_space ||
+            slot->static_alias_poisoned ||
+            slot->async_copy_pending || slot->async_copy_staging ||
+            entry->slot_offset + entry->bytes > slot->slot_bytes ||
+            (!resize_requested &&
+             (slot->static_alias_session_id != session->session_id ||
+              !slot->static_alias_sealed ||
+              !uvm_moe_static_alias_has_matching_upload(session,
+                                                        pool_index,
+                                                        entry))) ||
+            (resize_requested &&
+             slot->static_alias_session_id != 0 &&
+             slot->static_alias_session_id != session->session_id)) {
+            entry->status = UVM_MOE_STATIC_ALIAS_ENTRY_ALIAS_CONFLICT;
+            status = NV_ERR_INVALID_STATE;
+            break;
+        }
+
+        for (j = 0; j < session->rebind_alias_count; ++j) {
+            const uvm_moe_static_alias_record_t *pending =
+                &session->rebind_aliases[j];
+
+            if (uvm_moe_static_alias_ranges_overlap(entry->va_base,
+                                                     entry->bytes,
+                                                     pending->va_base,
+                                                     pending->bytes)) {
+                entry->status = UVM_MOE_STATIC_ALIAS_ENTRY_ALIAS_CONFLICT;
+                status = NV_ERR_INVALID_ARGUMENT;
+                break;
+            }
+        }
+        if (status != NV_OK)
+            break;
+        for (j = 0; !resize_requested && j < session->alias_count; ++j) {
+            const uvm_moe_static_alias_record_t *active = &session->aliases[j];
+
+            if (!active->active ||
+                !(active->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW)) {
+                continue;
+            }
+            if (uvm_moe_static_alias_ranges_overlap(entry->va_base,
+                                                     entry->bytes,
+                                                     active->va_base,
+                                                     active->bytes)) {
+                entry->status = UVM_MOE_STATIC_ALIAS_ENTRY_ALIAS_CONFLICT;
+                status = NV_ERR_INVALID_ARGUMENT;
+                break;
+            }
+        }
+        if (status != NV_OK)
+            break;
+
+        if (!resize_requested) {
+            legacy_entry->layer_id = entry->backing_layer_id;
+            legacy_entry->expert_id = entry->backing_expert_id;
+            legacy_entry->slot_id = entry->backing_slot_id;
+            legacy_entry->role = entry->flags;
+            legacy_entry->va_base = entry->va_base;
+            legacy_entry->bytes = entry->bytes;
+            legacy_entry->slot_offset = entry->slot_offset;
+            legacy_entry->flags = UVM_MOE_SLOT_REMAP_FLAG_NO_EVICT;
+            legacy_entry->status = UVM_MOE_SLOT_REMAP_ENTRY_OK;
+        }
+        state->slots[i] = slot;
+    }
+    if (status != NV_OK)
+        goto abort_transaction;
+
+    if (!resize_requested) {
+        status = uvm_moe_slot_direct_flatten_blocks_locked(legacy,
+                                                            va_space,
+                                                            state,
+                                                            NV_TRUE);
+        if (status != NV_OK)
+            goto abort_transaction;
+        for (i = 0; i < state->block_count; ++i) {
+            NvU32 entry_index = state->block_entry_indices[i];
+
+            state->blocks[i].pte_mode =
+                (params->entries[entry_index].flags &
+                 UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_PTE_64K) ?
+                    UVM_SLOT_DIRECT_PTE_MODE_64K : UVM_SLOT_DIRECT_PTE_MODE_4K;
+            state->blocks[i].writable = false;
+            state->blocks[i].slot_tracker = NULL;
+        }
+        status = uvm_va_block_slot_direct_preflight_targets_not_slot_mapped(
+            va_space, gpu, state->blocks, state->block_count);
+        if (status != NV_OK)
+            goto abort_transaction;
+    }
+
+    for (i = 0; i < params->count; ++i) {
+        const UVM_MOE_STATIC_ALIAS_ENTRY *entry = &params->entries[i];
+        uvm_moe_static_alias_record_t *pending =
+            &session->rebind_aliases[session->rebind_alias_count + i];
+
+        pending->va_base = entry->va_base;
+        pending->bytes = entry->bytes;
+        pending->slot_offset = entry->slot_offset;
+        pending->backing_layer_id = entry->backing_layer_id;
+        pending->backing_expert_id = entry->backing_expert_id;
+        pending->backing_slot_id = entry->backing_slot_id;
+        pending->pool_index =
+            (NvU32)(state->slots[i] - g_uvm_moe_slot_pool);
+        pending->flags = entry->flags;
+        pending->active = NV_TRUE;
+    }
+    session->rebind_alias_count += params->count;
+    session->rebind_alias_bytes += call_bytes;
+    params->accepted_count = params->count;
+
+    if (params->flags & UVM_MOE_STATIC_ALIAS_REBIND_FLAG_COMMIT) {
+        uvm_moe_static_alias_record_t *old_aliases;
+        NvU32 old_alias_count;
+        NvU64 old_alias_bytes;
+        NvU32 replacement_index = 0;
+
+        if (session->rebind_alias_count !=
+                session->rebind_expected_alias_count ||
+            session->rebind_alias_bytes !=
+                session->rebind_expected_alias_bytes) {
+            status = NV_ERR_INVALID_ARGUMENT;
+            goto abort_transaction;
+        }
+
+        sort(session->rebind_aliases,
+             session->rebind_alias_count,
+             sizeof(session->rebind_aliases[0]),
+             uvm_moe_static_alias_record_va_cmp,
+             NULL);
+        for (i = 1; i < session->rebind_alias_count; ++i) {
+            const uvm_moe_static_alias_record_t *previous =
+                &session->rebind_aliases[i - 1];
+            const uvm_moe_static_alias_record_t *candidate =
+                &session->rebind_aliases[i];
+
+            if (uvm_moe_static_alias_ranges_overlap(previous->va_base,
+                                                     previous->bytes,
+                                                     candidate->va_base,
+                                                     candidate->bytes)) {
+                status = NV_ERR_INVALID_ARGUMENT;
+                goto abort_transaction;
+            }
+        }
+        if (resize_requested) {
+            status = uvm_moe_static_alias_resize_commit_locked(
+                session,
+                va_space,
+                gpu,
+                mm,
+                legacy,
+                state,
+                params,
+                &resize_mutation_started);
+            if (status != NV_OK)
+                goto abort_transaction;
+            uvm_moe_static_alias_rebind_reset_locked(session);
+            params->rebind_id = 0;
+            goto out;
+        }
+        for (i = 0; i < session->rebind_alias_count; ++i) {
+            NvU32 pool_index = session->rebind_aliases[i].pool_index;
+            uvm_moe_slot_pool_slot_t *slot;
+
+            if (pool_index >= UVM_MOE_SLOT_POOL_MAX_SLOTS) {
+                status = NV_ERR_INVALID_STATE;
+                goto abort_transaction;
+            }
+            slot = &g_uvm_moe_slot_pool[pool_index];
+            ++pending_per_pool[pool_index];
+            if (slot->pte_range_count + pending_per_pool[pool_index] >
+                UVM_MOE_SLOT_POOL_MAX_PTE_RANGES_PER_SLOT) {
+                status = NV_ERR_INSUFFICIENT_RESOURCES;
+                goto abort_transaction;
+            }
+        }
+
+        replacement_aliases = uvm_kvmalloc_zero(
+            (size_t)(upload_count + session->rebind_alias_count) *
+            sizeof(*replacement_aliases));
+        if (!replacement_aliases) {
+            status = NV_ERR_NO_MEMORY;
+            goto abort_transaction;
+        }
+        for (i = 0; i < session->alias_count; ++i) {
+            const uvm_moe_static_alias_record_t *record = &session->aliases[i];
+
+            if (record->active &&
+                (record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW)) {
+                replacement_aliases[replacement_index++] = *record;
+            }
+        }
+        if (replacement_index != upload_count) {
+            status = NV_ERR_INVALID_STATE;
+            goto abort_transaction;
+        }
+        memcpy(&replacement_aliases[replacement_index],
+               session->rebind_aliases,
+               (size_t)session->rebind_alias_count *
+                   sizeof(*replacement_aliases));
+
+        old_aliases = session->aliases;
+        old_alias_count = session->alias_count;
+        old_alias_bytes = session->alias_bytes;
+        session->aliases = replacement_aliases;
+        session->alias_count = upload_count + session->rebind_alias_count;
+        session->alias_bytes = upload_bytes + session->rebind_alias_bytes;
+        status = uvm_moe_static_alias_validate_transition_locked(session,
+                                                                 va_space,
+                                                                 NV_TRUE);
+        if (status != NV_OK) {
+            session->aliases = old_aliases;
+            session->alias_count = old_alias_count;
+            session->alias_bytes = old_alias_bytes;
+            goto abort_transaction;
+        }
+        replacement_aliases = NULL;
+        uvm_kvfree(old_aliases);
+        params->total_alias_bytes = session->alias_bytes;
+        params->committed = 1;
+        uvm_moe_static_alias_rebind_reset_locked(session);
+        params->rebind_id = 0;
+    }
+
+    goto out;
+
+abort_transaction:
+    if (session && session->rebind_id != 0) {
+        uvm_moe_static_alias_rebind_reset_locked(session);
+        params->rebind_id = 0;
+    }
+
+out:
+    if (session) {
+        params->staged_consumer_alias_bytes = session->rebind_alias_bytes;
+        params->staged_consumer_alias_count = session->rebind_alias_count;
+        params->backing_bytes = session->backing_bytes;
+        params->total_alias_bytes = session->alias_bytes;
+        params->poisoned = session->poisoned;
+    }
+    if (status != NV_OK) {
+        uvm_moe_static_alias_rebind_fail_entries(
+            params, UVM_MOE_STATIC_ALIAS_ENTRY_ROLLED_BACK);
+        if (transaction_started)
+            params->rebind_id = 0;
+    }
+    if (pool_locked)
+        mutex_unlock(&g_uvm_moe_slot_pool_lock);
+    if (va_locked)
+        uvm_va_space_up_write(va_space);
+    if (mm_locked)
+        uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+    if (gpu)
+        uvm_gpu_release(gpu);
+    if (plan_locked)
+        mutex_unlock(&g_uvm_moe_slot_plan_lock);
+    uvm_kvfree(pending_per_pool);
+    uvm_kvfree(replacement_aliases);
+    uvm_kvfree(state);
+    uvm_kvfree(legacy);
+    return status;
+}
+
+static NV_STATUS uvm_moe_static_alias_resume_chunk_locked(
+    uvm_moe_static_alias_session_t *session,
+    uvm_va_space_t *va_space,
+    uvm_gpu_t *gpu,
+    struct mm_struct *mm,
+    NvU32 *record_cursor,
+    UVM_MOE_SLOT_REMAP_BATCH_PARAMS *legacy,
+    uvm_moe_slot_direct_batch_state_t *state,
+    UVM_MOE_STATIC_ALIAS_TRANSITION_PARAMS *params)
+{
+    uvm_tracker_t batch_tracker = UVM_TRACKER_INIT();
+    uvm_va_block_slot_direct_result_t map_result = {0};
+    NV_STATUS status = NV_OK;
+    NV_STATUS tracker_status = NV_OK;
+    NvU64 chunk_bytes = 0;
+    NvU32 i;
+    NvBool tracker_initialized = NV_FALSE;
+
+    memset(legacy, 0, sizeof(*legacy));
+    memset(state, 0, sizeof(*state));
+    legacy->mode = UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_SHARED_PUSH_64K_PTE;
+    uvm_uuid_copy(&legacy->gpu_uuid, &session->gpu_uuid);
+
+    while (*record_cursor < session->alias_count &&
+           legacy->count < UVM_MOE_STATIC_ALIAS_MAX_ENTRIES) {
+        const uvm_moe_static_alias_record_t *record =
+            &session->aliases[*record_cursor];
+        uvm_moe_slot_pool_slot_t *slot;
+        UVM_MOE_SLOT_REMAP_ENTRY *entry;
+
+        ++*record_cursor;
+        if (record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW)
+            continue;
+
+        slot = &g_uvm_moe_slot_pool[record->pool_index];
+        entry = &legacy->entries[legacy->count];
+        entry->layer_id = slot->layer_id;
+        entry->expert_id = slot->owner_expert_id;
+        entry->slot_id = slot->slot_id;
+        // role is otherwise diagnostic-only in this control path. Retain the
+        // static-alias PTE-mode bits here so flattened block entries can be
+        // configured without an O(session-size) record lookup per block.
+        entry->role = record->flags;
+        entry->va_base = record->va_base;
+        entry->bytes = record->bytes;
+        entry->slot_offset = record->slot_offset;
+        entry->flags = UVM_MOE_SLOT_REMAP_FLAG_NO_EVICT;
+        entry->status = UVM_MOE_SLOT_REMAP_ENTRY_OK;
+        state->slots[legacy->count] = slot;
+        chunk_bytes += record->bytes;
+        ++legacy->count;
+    }
+
+    if (legacy->count == 0)
+        return NV_OK;
+
+    status = uvm_moe_slot_direct_flatten_blocks_locked(legacy,
+                                                        va_space,
+                                                        state,
+                                                        NV_TRUE);
+    if (status != NV_OK)
+        goto out;
+
+    for (i = 0; i < state->block_count; ++i) {
+        NvU32 entry_index = state->block_entry_indices[i];
+        NvU32 flags = legacy->entries[entry_index].role;
+
+        state->blocks[i].pte_mode =
+            (flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_PTE_64K) ?
+                UVM_SLOT_DIRECT_PTE_MODE_64K : UVM_SLOT_DIRECT_PTE_MODE_4K;
+        state->blocks[i].writable = false;
+        state->blocks[i].slot_tracker = NULL;
+    }
+
+    status = uvm_va_block_slot_direct_preflight_targets_not_slot_mapped(
+        va_space,
+        gpu,
+        state->blocks,
+        state->block_count);
+    if (status != NV_OK)
+        goto out;
+
+    status = uvm_moe_slot_direct_record_all_pte_metadata_locked(legacy,
+                                                                va_space,
+                                                                gpu,
+                                                                state);
+    if (status != NV_OK)
+        goto out;
+
+    status = uvm_va_block_slot_alias_revoke_cpu_mappings_batch(va_space,
+                                                               mm,
+                                                               state->blocks,
+                                                               state->block_count);
+    if (status != NV_OK)
+        goto out;
+
+    uvm_tracker_init(&batch_tracker);
+    tracker_initialized = NV_TRUE;
+    status = uvm_va_block_slot_alias_map_batch(va_space,
+                                               mm,
+                                               gpu,
+                                               state->blocks,
+                                               state->block_count,
+                                               true,
+                                               true,
+                                               &g_uvm_moe_slot_pool_lock,
+                                               &batch_tracker,
+                                               &map_result);
+    for (i = 0; i < state->block_count; ++i) {
+        uvm_va_block_t *block = state->blocks[i].va_block;
+        NV_STATUS add_status;
+
+        if (i > 0 && state->blocks[i - 1].va_block == block)
+            continue;
+        uvm_mutex_lock(&block->lock);
+        add_status = uvm_tracker_add_tracker_safe(&batch_tracker, &block->tracker);
+        uvm_mutex_unlock(&block->lock);
+        if (tracker_status == NV_OK)
+            tracker_status = add_status;
+    }
+    {
+        NV_STATUS wait_status = uvm_tracker_wait(&batch_tracker);
+
+        if (tracker_status == NV_OK)
+            tracker_status = wait_status;
+    }
+    if (status == NV_OK && tracker_status != NV_OK)
+        status = tracker_status;
+    if (status == NV_OK) {
+        params->processed_alias_count += legacy->count;
+        params->processed_alias_bytes += chunk_bytes;
+        params->tlb_invalidate_count = (NvU32)min_t(
+            NvU64,
+            (NvU64)params->tlb_invalidate_count + map_result.mapped_blocks,
+            (NvU64)NV_U32_MAX);
+        ++params->reserved;
+    }
+
+out:
+    if (tracker_initialized)
+        uvm_tracker_deinit(&batch_tracker);
+    return status;
+}
+
+static NV_STATUS uvm_api_moe_static_alias_resume(
+    UVM_MOE_STATIC_ALIAS_TRANSITION_PARAMS *params,
+    struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_moe_static_alias_session_t *session;
+    UVM_MOE_SLOT_REMAP_BATCH_PARAMS *legacy = NULL;
+    uvm_moe_slot_direct_batch_state_t *state = NULL;
+    uvm_gpu_t *gpu = NULL;
+    struct mm_struct *mm = NULL;
+    NV_STATUS status = NV_OK;
+    NvU32 record_cursor = 0;
+    NvU32 i;
+
+    BUILD_BUG_ON(sizeof(*params) != 80);
+
+    params->processed_alias_bytes = 0;
+    params->processed_alias_count = 0;
+    params->tlb_invalidate_count = 0;
+    uvm_moe_static_alias_transition_snapshot(NULL, params);
+
+    if (params->abi_version != UVM_MOE_STATIC_ALIAS_ABI_VERSION ||
+        params->struct_size != sizeof(*params) ||
+        params->flags != 0 ||
+        params->reserved != 0 ||
+        params->session_id == 0) {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    params->reserved = 0;
+
+    legacy = uvm_kvmalloc_zero(sizeof(*legacy));
+    state = uvm_kvmalloc_zero(sizeof(*state));
+    if (!legacy || !state) {
+        status = NV_ERR_NO_MEMORY;
+        goto out_alloc;
+    }
+
+    mutex_lock(&g_uvm_moe_slot_plan_lock);
+    session = uvm_moe_static_alias_find_locked(va_space, params->session_id);
+    if (!session) {
+        status = NV_ERR_OBJECT_NOT_FOUND;
+        goto out_plan;
+    }
+    uvm_moe_static_alias_transition_snapshot(session, params);
+    if (!session->sealed || !session->parked || session->poisoned ||
+        session->rebind_id != 0 || session->rebind_aliases != NULL ||
+        params->consumer_alias_count == 0 || params->upload_alias_count == 0) {
+        status = session->poisoned ? NV_ERR_INVALID_STATE : NV_ERR_IN_USE;
+        goto out_plan;
+    }
+
+    gpu = uvm_va_space_retain_gpu_by_uuid(va_space, &session->gpu_uuid);
+    if (!gpu) {
+        status = NV_ERR_INVALID_DEVICE;
+        goto out_plan;
+    }
+    mm = uvm_va_space_mm_or_current_retain_lock(va_space);
+    uvm_va_space_down_write(va_space);
+    mutex_lock(&g_uvm_moe_slot_pool_lock);
+
+    status = uvm_moe_static_alias_validate_transition_locked(session,
+                                                             va_space,
+                                                             NV_TRUE);
+    while (status == NV_OK && record_cursor < session->alias_count) {
+        status = uvm_moe_static_alias_resume_chunk_locked(session,
+                                                          va_space,
+                                                          gpu,
+                                                          mm,
+                                                          &record_cursor,
+                                                          legacy,
+                                                          state,
+                                                          params);
+    }
+
+    if (status == NV_OK &&
+        params->processed_alias_count == params->consumer_alias_count &&
+        params->processed_alias_bytes == params->consumer_alias_bytes) {
+        session->parked = NV_FALSE;
+        status = uvm_moe_static_alias_validate_transition_locked(session,
+                                                                 va_space,
+                                                                 NV_FALSE);
+    }
+    if (status != NV_OK) {
+        session->parked = NV_FALSE;
+        session->poisoned = NV_TRUE;
+        for (i = 0; i < UVM_MOE_SLOT_POOL_MAX_SLOTS; ++i) {
+            if (g_uvm_moe_slot_pool[i].static_alias_session_id == session->session_id)
+                g_uvm_moe_slot_pool[i].static_alias_poisoned = NV_TRUE;
+        }
+    }
+
+    uvm_moe_static_alias_transition_snapshot(session, params);
+    mutex_unlock(&g_uvm_moe_slot_pool_lock);
+    uvm_va_space_up_write(va_space);
+    uvm_va_space_mm_or_current_release_unlock(va_space, mm);
+    mm = NULL;
+
+out_plan:
+    if (gpu)
+        uvm_gpu_release(gpu);
+    mutex_unlock(&g_uvm_moe_slot_plan_lock);
+
+out_alloc:
+    uvm_kvfree(state);
+    uvm_kvfree(legacy);
+    return status;
+}
+
 static void uvm_moe_static_alias_deactivate_pool_records(
     uvm_moe_static_alias_session_t *session,
     NvU32 pool_index,
@@ -14529,6 +16410,9 @@ static NV_STATUS uvm_api_moe_static_alias_destroy(UVM_MOE_STATIC_ALIAS_DESTROY_P
     // unpoisoned, destroy-only backing handle so a later RELEASE_BACKING call
     // can reclaim HBM without rebuilding alias metadata.
     session->sealed = NV_TRUE;
+    // DESTROY is authoritative teardown. A candidate REBIND set has never
+    // owned PTEs, so discard it before walking committed slot metadata.
+    uvm_moe_static_alias_rebind_reset_locked(session);
     mm = uvm_va_space_mm_or_current_retain_lock(va_space);
     uvm_va_space_down_write(va_space);
     mutex_lock(&g_uvm_moe_slot_pool_lock);
@@ -14624,9 +16508,62 @@ out_plan:
     return first_error;
 }
 
+/*
+ * A resizing REBIND adopts backing prepared by mode 8 and, on a failed
+ * preparation, userspace releases that uncommitted backing with mode 19.
+ * Those operations are safe alongside a static-alias session only while all
+ * consumers are parked and only for logical slots outside the committed
+ * session. Keep every other legacy slot operation excluded exactly as before.
+ *
+ * The caller holds the plan lock, so the committed alias set is immutable
+ * until the legacy operation finishes. The slot-pool path subsequently
+ * validates the concrete owner and backing while holding the pool lock.
+ */
+static NvBool uvm_moe_static_alias_parked_backing_op_allowed_locked(
+    const uvm_moe_static_alias_session_t *session,
+    const UVM_MOE_SLOT_REMAP_BATCH_PARAMS *params)
+{
+    NvU32 entry_index;
+
+    UVM_ASSERT(mutex_is_locked(&g_uvm_moe_slot_plan_lock));
+
+    if (!session || !session->sealed || !session->parked ||
+        session->poisoned || session->rebind_id != 0 ||
+        session->rebind_aliases != NULL ||
+        (params->mode != UVM_MOE_SLOT_REMAP_MODE_VIDMEM_PREALLOC &&
+         params->mode != UVM_MOE_SLOT_REMAP_MODE_RELEASE)) {
+        return NV_FALSE;
+    }
+
+    if (params->mode == UVM_MOE_SLOT_REMAP_MODE_VIDMEM_PREALLOC &&
+        !uvm_uuid_eq(&session->gpu_uuid, &params->gpu_uuid)) {
+        return NV_FALSE;
+    }
+
+    for (entry_index = 0; entry_index < params->count; ++entry_index) {
+        const UVM_MOE_SLOT_REMAP_ENTRY *entry = &params->entries[entry_index];
+        NvU32 alias_index;
+
+        for (alias_index = 0; alias_index < session->alias_count;
+             ++alias_index) {
+            const uvm_moe_static_alias_record_t *record =
+                &session->aliases[alias_index];
+
+            if (record->active &&
+                record->backing_layer_id == entry->layer_id &&
+                record->backing_slot_id == entry->slot_id) {
+                return NV_FALSE;
+            }
+        }
+    }
+
+    return NV_TRUE;
+}
+
 static NV_STATUS uvm_api_moe_slot_remap_batch(UVM_MOE_SLOT_REMAP_BATCH_PARAMS *params, struct file *filp)
 {
     uvm_va_space_t *va_space = uvm_va_space_get(filp);
+    uvm_moe_static_alias_session_t *static_alias_session;
     uvm_gpu_t *gpu = NULL;
     NV_STATUS first_error = NV_OK;
     NvU32 i;
@@ -14655,8 +16592,11 @@ static NV_STATUS uvm_api_moe_slot_remap_batch(UVM_MOE_SLOT_REMAP_BATCH_PARAMS *p
     // concurrent register could publish a plan after the check while this
     // ioctl later changes the same slot owners without advancing generation.
     mutex_lock(&g_uvm_moe_slot_plan_lock);
+    static_alias_session = uvm_moe_static_alias_find_va_space_locked(va_space);
     if (g_uvm_moe_slot_plan_owner_va_space == va_space ||
-        uvm_moe_static_alias_active_for_va_space_locked(va_space)) {
+        (static_alias_session &&
+         !uvm_moe_static_alias_parked_backing_op_allowed_locked(
+             static_alias_session, params))) {
         mutex_unlock(&g_uvm_moe_slot_plan_lock);
         return NV_ERR_IN_USE;
     }
@@ -15071,6 +17011,9 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         UVM_ROUTE_CMD_ALLOC_INIT_CHECK(UVM_MOE_STATIC_ALIAS_MAP,             uvm_api_moe_static_alias_map);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_MOE_STATIC_ALIAS_SEAL,            uvm_api_moe_static_alias_seal);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_MOE_STATIC_ALIAS_DESTROY,         uvm_api_moe_static_alias_destroy);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_MOE_STATIC_ALIAS_PARK,            uvm_api_moe_static_alias_park);
+        UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_MOE_STATIC_ALIAS_RESUME,          uvm_api_moe_static_alias_resume);
+        UVM_ROUTE_CMD_ALLOC_INIT_CHECK(UVM_MOE_STATIC_ALIAS_REBIND,           uvm_api_moe_static_alias_rebind);
     }
 
     // Try the test ioctls if none of the above matched

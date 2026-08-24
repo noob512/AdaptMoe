@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+import hashlib
 import itertools
 import json
 import os
@@ -578,6 +579,16 @@ _CPU_OFFLOAD_GRAPH_STATIC_ALIAS = False
 _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN: dict[str, "_GraphStaticAliasNamePlan"] = {}
 _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE = ""
 _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER: dict[int, tuple[int, ...]] = {}
+_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASSES_FILE = ""
+_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASS_FILES: dict[str, str] = {}
+_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS: dict[
+    str, dict[int, tuple[int, ...]]
+] = {}
+_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASS_CAPACITY_GIB: dict[str, float] = {}
+_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ACTIVE_PLAN_CLASS: str | None = None
+_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_INITIAL_PLAN_CLASS: str | None = None
+_CPU_OFFLOAD_UVM_STATIC_ALIAS_ENVELOPE_BYTES = 0
+_CPU_OFFLOAD_UVM_PLAN_CLASS_SWITCH_HISTORY: list[dict[str, Any]] = []
 _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ARENAS: dict[
     tuple[str, str, int], "_GraphStaticAliasArena"
 ] = {}
@@ -595,12 +606,16 @@ _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "disabled"
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_PREALLOCATE_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_MAP_RESULTS: list[dict[str, Any]] = []
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_SEAL_RESULT: dict[str, Any] | None = None
+_CPU_OFFLOAD_UVM_STATIC_ALIAS_ORIGINAL_RELEASE_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_COLD_RESIDENCY_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_RESIDENCY_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_DESTROY_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_SLOT_CLOSE_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED = False
 _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE = "off"
+_CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED = False
+_CPU_OFFLOAD_UVM_STATIC_ALIAS_PARK_RESULT: dict[str, Any] | None = None
+_CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_CAPTURE_TOPOLOGY: str | None = None
 _CPU_OFFLOAD_UVM_CAPTURE_SUCCESS_COUNT = 0
 _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED = False
@@ -613,11 +628,14 @@ _CPU_OFFLOAD_UVM_CAPTURE_VA_SNAPSHOT: tuple[int, ...] = ()
 _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CERTIFICATE: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CERTIFICATE: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE: dict[str, Any] | None = None
+_CPU_OFFLOAD_UVM_GRAPH_CERTIFICATES_BY_CLASS: dict[str, dict[str, Any]] = {}
 _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
 _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY: list[dict[str, Any]] = []
 _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY: list[dict[str, Any]] = []
 _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT: tuple[int, ...] = ()
+_CPU_OFFLOAD_UVM_PLAN_GENERATION = 0
+_CPU_OFFLOAD_UVM_PLAN_REBUILD_HISTORY: list[dict[str, Any]] = []
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_LOCK = threading.RLock()
 _CPU_OFFLOAD_OWNER_THREAD_ID: int | None = None
 _CPU_OFFLOAD_OWNER_DEVICE_INDEX: int | None = None
@@ -664,6 +682,7 @@ class _UvmOriginalAliasArena:
     pte_flags: int
     region_bytes: int
     packed_slice_bytes: int = 0
+    envelope_expert_count: int = 0
     consumers: dict[int, "_UvmOriginalAliasBinding"] = field(default_factory=dict)
 
 
@@ -919,6 +938,121 @@ def _load_graph_static_alias_expert_plan(
     return normalized
 
 
+def _normalize_uvm_plan_class_name(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if not normalized or any(
+        character not in "abcdefghijklmnopqrstuvwxyz0123456789_-"
+        for character in normalized
+    ):
+        raise ValueError(f"Invalid UVM expert plan class name: {value!r}")
+    return normalized
+
+
+def _load_graph_static_alias_plan_classes(
+    path: str,
+    name_plan: Mapping[str, _GraphStaticAliasNamePlan],
+) -> tuple[
+    dict[str, str],
+    dict[str, dict[int, tuple[int, ...]]],
+    dict[str, float],
+    str,
+]:
+    """Load fixed plan classes whose maximum width defines one stable VA envelope."""
+    manifest_path = os.path.realpath(str(path).strip())
+    try:
+        with open(manifest_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Unable to load static-alias plan-class manifest {path!r}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("classes"), dict):
+        raise ValueError("Static-alias plan-class manifest requires a classes object")
+    raw_classes = payload["classes"]
+    if len(raw_classes) < 2:
+        raise ValueError("Stable plan classes require at least two capacity classes")
+
+    base_dir = os.path.dirname(manifest_path)
+    class_files: dict[str, str] = {}
+    plans: dict[str, dict[int, tuple[int, ...]]] = {}
+    capacities: dict[str, float] = {}
+    for raw_name, raw_record in raw_classes.items():
+        class_name = _normalize_uvm_plan_class_name(str(raw_name))
+        if class_name in class_files:
+            raise ValueError(f"Duplicate normalized plan class {class_name!r}")
+        if isinstance(raw_record, str):
+            raw_file = raw_record
+            capacity_gib = None
+        elif isinstance(raw_record, dict):
+            raw_file = raw_record.get("plan_file")
+            capacity_gib = raw_record.get("capacity_gib")
+        else:
+            raise ValueError(f"Plan class {raw_name!r} must be a path or object")
+        if not isinstance(raw_file, str) or not raw_file.strip():
+            raise ValueError(f"Plan class {raw_name!r} has no plan_file")
+        class_path = raw_file.strip()
+        if not os.path.isabs(class_path):
+            class_path = os.path.join(base_dir, class_path)
+        class_path = os.path.realpath(class_path)
+        class_files[class_name] = class_path
+        plans[class_name] = _load_graph_static_alias_expert_plan(
+            class_path, name_plan
+        )
+        if capacity_gib is not None:
+            if (
+                not isinstance(capacity_gib, (int, float))
+                or isinstance(capacity_gib, bool)
+                or float(capacity_gib) <= 0
+            ):
+                raise ValueError(
+                    f"Plan class {raw_name!r} capacity_gib must be positive"
+                )
+            capacities[class_name] = float(capacity_gib)
+
+    widths = {
+        class_name: len(next(iter(plan.values())))
+        for class_name, plan in plans.items()
+    }
+    if len(set(widths.values())) != len(widths):
+        raise ValueError(
+            "Fixed plan classes must have distinct expert widths: "
+            f"{widths!r}"
+        )
+    initial = _normalize_uvm_plan_class_name(
+        str(payload.get("initial_class") or max(widths, key=widths.get))
+    )
+    if initial not in plans:
+        raise ValueError(f"initial_class {initial!r} is not registered")
+    return class_files, plans, capacities, initial
+
+
+def cpu_offload_uvm_plan_class_registry() -> dict[str, Any]:
+    """Return immutable fixed-class metadata used by worker startup/control."""
+    return {
+        "enabled": bool(_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS),
+        "manifest_file": _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASSES_FILE or None,
+        "initial_class": _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_INITIAL_PLAN_CLASS,
+        "active_class": _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ACTIVE_PLAN_CLASS,
+        "classes": {
+            class_name: {
+                "plan_file": _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASS_FILES[
+                    class_name
+                ],
+                "capacity_gib": (
+                    _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASS_CAPACITY_GIB.get(
+                        class_name
+                    )
+                ),
+                "experts_per_layer": len(next(iter(plan.values()))),
+                "selected_expert_count": sum(len(values) for values in plan.values()),
+            }
+            for class_name, plan in sorted(
+                _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS.items()
+            )
+        },
+    }
+
+
 def _configured_graph_static_alias_backend() -> str:
     raw = (
         os.environ.get("VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND", "vmm")
@@ -984,6 +1118,14 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN
     global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE
     global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASSES_FILE
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASS_FILES
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASS_CAPACITY_GIB
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ACTIVE_PLAN_CLASS
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_INITIAL_PLAN_CLASS
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_ENVELOPE_BYTES
+    global _CPU_OFFLOAD_UVM_PLAN_CLASS_SWITCH_HISTORY
     global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ARENAS
     global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES
     global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_FORWARD_CALLS
@@ -996,12 +1138,16 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_PREALLOCATE_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_MAP_RESULTS
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_SEAL_RESULT
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_ORIGINAL_RELEASE_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_COLD_RESIDENCY_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_RESIDENCY_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_DESTROY_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_SLOT_CLOSE_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED
     global _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE
+    global _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_PARK_RESULT
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT
     global _CPU_OFFLOAD_UVM_CAPTURE_TOPOLOGY
     global _CPU_OFFLOAD_UVM_CAPTURE_SUCCESS_COUNT
     global _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED
@@ -1014,11 +1160,14 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     global _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CERTIFICATE
     global _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CERTIFICATE
     global _CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE
+    global _CPU_OFFLOAD_UVM_GRAPH_CERTIFICATES_BY_CLASS
     global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
     global _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT
     global _CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY
     global _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY
     global _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT
+    global _CPU_OFFLOAD_UVM_PLAN_GENERATION
+    global _CPU_OFFLOAD_UVM_PLAN_REBUILD_HISTORY
     global _CPU_OFFLOAD_OWNER_THREAD_ID, _CPU_OFFLOAD_OWNER_DEVICE_INDEX
     global _CPU_OFFLOAD_OWNER_STREAM_ID
 
@@ -1027,7 +1176,13 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
         or _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED
         or (
             _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
-            in ("finalizing", "sealed", "poisoned", "cleanup_pending")
+            in (
+                "finalizing",
+                "sealed",
+                "remote_parked",
+                "poisoned",
+                "cleanup_pending",
+            )
         )
     ):
         raise RuntimeError(
@@ -1044,8 +1199,14 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     )
     graph_static_alias_backend = _configured_graph_static_alias_backend()
     original_va_phase_mode = _configured_uvm_original_va_phase_mode()
+    park_resume_enabled = _strict_env_flag(
+        "VLLM_CPU_OFFLOAD_UVM_ORIGINAL_VA_PARK_RESUME", False
+    )
     graph_static_alias_expert_plan_file = os.environ.get(
         "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE", ""
+    ).strip()
+    graph_static_alias_plan_classes_file = os.environ.get(
+        "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASSES_FILE", ""
     ).strip()
 
     _CPU_OFFLOAD_EXACT_NAMES_FILE = ""
@@ -1059,6 +1220,14 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN = {}
     _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE = ""
     _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER = {}
+    _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASSES_FILE = ""
+    _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASS_FILES = {}
+    _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS = {}
+    _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASS_CAPACITY_GIB = {}
+    _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ACTIVE_PLAN_CLASS = None
+    _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_INITIAL_PLAN_CLASS = None
+    _CPU_OFFLOAD_UVM_STATIC_ALIAS_ENVELOPE_BYTES = 0
+    _CPU_OFFLOAD_UVM_PLAN_CLASS_SWITCH_HISTORY = []
     _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ARENAS = {}
     _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES = 0
     _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_FORWARD_CALLS = 0
@@ -1071,12 +1240,16 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_PREALLOCATE_RESULT = None
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_MAP_RESULTS = []
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_SEAL_RESULT = None
+    _CPU_OFFLOAD_UVM_STATIC_ALIAS_ORIGINAL_RELEASE_RESULT = None
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_COLD_RESIDENCY_RESULT = None
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_RESIDENCY_RESULT = None
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_DESTROY_RESULT = None
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_SLOT_CLOSE_RESULT = None
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED = False
     _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE = "off"
+    _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED = False
+    _CPU_OFFLOAD_UVM_STATIC_ALIAS_PARK_RESULT = None
+    _CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT = None
     _CPU_OFFLOAD_UVM_CAPTURE_TOPOLOGY = None
     _CPU_OFFLOAD_UVM_CAPTURE_SUCCESS_COUNT = 0
     _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED = False
@@ -1089,11 +1262,14 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CERTIFICATE = None
     _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CERTIFICATE = None
     _CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE = None
+    _CPU_OFFLOAD_UVM_GRAPH_CERTIFICATES_BY_CLASS = {}
     _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
     _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT = None
     _CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY = []
     _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY = []
     _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT = ()
+    _CPU_OFFLOAD_UVM_PLAN_GENERATION = 0
+    _CPU_OFFLOAD_UVM_PLAN_REBUILD_HISTORY = []
     _CPU_OFFLOAD_OWNER_THREAD_ID = None
     _CPU_OFFLOAD_OWNER_DEVICE_INDEX = None
     _CPU_OFFLOAD_OWNER_STREAM_ID = None
@@ -1121,6 +1297,16 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
             "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE requires "
             "the uvm_original_va graph static-alias backend"
         )
+    if graph_static_alias_plan_classes_file and not (
+        graph_static_alias
+        and graph_static_alias_backend == "uvm_original_va"
+        and original_va_phase_mode == "prefill_graph_remote_decode"
+        and park_resume_enabled
+    ):
+        raise ValueError(
+            "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASSES_FILE requires "
+            "uvm_original_va, prefill_graph_remote_decode, and PARK/RESUME"
+        )
     if graph_static_alias_eager and original_va_phase_mode != "off":
         raise ValueError(
             "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EAGER=1 is only valid with "
@@ -1145,6 +1331,14 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
             "VLLM_UVM_ORIGINAL_VA_PHASE_MODE and the legacy "
             "VLLM_UVM_PREFILL_P3_DECODE_REMOTE_READ path are mutually exclusive"
         )
+    if park_resume_enabled and original_va_phase_mode not in (
+        "prefill_remote_decode",
+        "prefill_graph_remote_decode",
+    ):
+        raise ValueError(
+            "VLLM_CPU_OFFLOAD_UVM_ORIGINAL_VA_PARK_RESUME=1 requires an "
+            "alias-prefill/remote-decode phase mode"
+        )
     if not exact_names_file:
         return
     if _normalized_cpu_offload_backend() != "copy":
@@ -1165,6 +1359,7 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     _CPU_OFFLOAD_GRAPH_STATIC_ALIAS = graph_static_alias
     _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND = graph_static_alias_backend
     _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE = original_va_phase_mode
+    _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED = park_resume_enabled
     if graph_static_alias:
         if _strict_env_flag("VLLM_CPU_OFFLOAD_COPY_SYNC", False):
             raise ValueError(
@@ -1184,7 +1379,48 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
         )
         if graph_static_alias_backend == "uvm_original_va":
             _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "collecting"
-            if graph_static_alias_expert_plan_file:
+            if graph_static_alias_plan_classes_file:
+                (
+                    class_files,
+                    class_plans,
+                    class_capacities,
+                    initial_class,
+                ) = _load_graph_static_alias_plan_classes(
+                    graph_static_alias_plan_classes_file,
+                    _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN,
+                )
+                if graph_static_alias_expert_plan_file:
+                    requested_initial_path = os.path.realpath(
+                        graph_static_alias_expert_plan_file
+                    )
+                    matching_classes = [
+                        class_name
+                        for class_name, class_path in class_files.items()
+                        if class_path == requested_initial_path
+                    ]
+                    if len(matching_classes) != 1:
+                        raise ValueError(
+                            "The configured expert plan must identify exactly "
+                            "one registered plan class"
+                        )
+                    initial_class = matching_classes[0]
+                _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASSES_FILE = (
+                    os.path.realpath(graph_static_alias_plan_classes_file)
+                )
+                _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASS_FILES = class_files
+                _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS = class_plans
+                _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASS_CAPACITY_GIB = (
+                    class_capacities
+                )
+                _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_INITIAL_PLAN_CLASS = initial_class
+                _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ACTIVE_PLAN_CLASS = initial_class
+                _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE = class_files[
+                    initial_class
+                ]
+                _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER = dict(
+                    class_plans[initial_class]
+                )
+            elif graph_static_alias_expert_plan_file:
                 _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE = (
                     graph_static_alias_expert_plan_file
                 )
@@ -1315,6 +1551,36 @@ def cpu_offload_uvm_original_va_phase_mode() -> str:
     if not cpu_offload_uvm_original_va_static_alias_enabled():
         return "off"
     return _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE
+
+
+def cpu_offload_uvm_original_va_park_resume_enabled() -> bool:
+    """Return whether sealed aliases are parked instead of destroyed."""
+    return bool(
+        cpu_offload_uvm_original_va_static_alias_enabled()
+        and _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED
+    )
+
+
+def cpu_offload_uvm_original_va_static_alias_experts_for_layer(
+    layer_id: int,
+) -> frozenset[int]:
+    """Return experts whose original VA is owned by the active alias plan.
+
+    Runtime expert-residency records share the same managed Parameter
+    allocations.  The driver forbids registering a second region that
+    overlaps an already registered static-alias release range, so callers use
+    this immutable ownership view to leave those experts under the alias
+    session's registry instead of constructing duplicate envelope regions.
+    """
+    if not cpu_offload_uvm_original_va_static_alias_enabled():
+        return frozenset()
+    return frozenset(
+        int(expert_id)
+        for expert_id in _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER.get(
+            int(layer_id),
+            (),
+        )
+    )
 
 
 def use_uvm_expert_weight_allocation(
@@ -1452,6 +1718,9 @@ def get_cpu_offload_graph_static_alias_diagnostics() -> dict[str, Any]:
                 "pte_alignment": int(arena.pte_alignment),
                 "pte_mode": "64K" if arena.pte_flags else "4K",
                 "region_bytes": int(arena.region_bytes),
+                "envelope_expert_count": int(arena.envelope_expert_count),
+                "envelope_bytes": int(arena.aligned_bytes),
+                "active_backing_bytes": int(arena.requested_bytes),
             }
         )
     return {
@@ -1463,12 +1732,18 @@ def get_cpu_offload_graph_static_alias_diagnostics() -> dict[str, Any]:
         ),
         "lifecycle_state": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE,
         "sealed": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE == "sealed",
+        "park_resume_enabled": bool(_CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED),
+        "parked": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE == "remote_parked",
         "session_id": int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
         "original_vas": original_vas,
         "source_vas": source_vas,
         "expert_plan_file": (
             _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE or None
         ),
+        "plan_class_registry": cpu_offload_uvm_plan_class_registry(),
+        "active_plan_class": _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ACTIVE_PLAN_CLASS,
+        "initial_plan_class": _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_INITIAL_PLAN_CLASS,
+        "stable_envelope_bytes": int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_ENVELOPE_BYTES),
         "expert_plan": tuple(
             (int(layer_id), tuple(expert_ids))
             for layer_id, expert_ids in sorted(
@@ -1505,6 +1780,9 @@ def get_cpu_offload_graph_static_alias_diagnostics() -> dict[str, Any]:
         "preallocate_result": _CPU_OFFLOAD_UVM_STATIC_ALIAS_PREALLOCATE_RESULT,
         "map_results": tuple(_CPU_OFFLOAD_UVM_STATIC_ALIAS_MAP_RESULTS),
         "seal_result": _CPU_OFFLOAD_UVM_STATIC_ALIAS_SEAL_RESULT,
+        "original_release_result": (
+            _CPU_OFFLOAD_UVM_STATIC_ALIAS_ORIGINAL_RELEASE_RESULT
+        ),
         "cold_residency_result": (
             _CPU_OFFLOAD_UVM_STATIC_ALIAS_COLD_RESIDENCY_RESULT
         ),
@@ -1512,6 +1790,8 @@ def get_cpu_offload_graph_static_alias_diagnostics() -> dict[str, Any]:
             _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_RESIDENCY_RESULT
         ),
         "destroy_result": _CPU_OFFLOAD_UVM_STATIC_ALIAS_DESTROY_RESULT,
+        "park_result": _CPU_OFFLOAD_UVM_STATIC_ALIAS_PARK_RESULT,
+        "resume_result": _CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT,
         "slot_close_result": (_CPU_OFFLOAD_UVM_STATIC_ALIAS_SLOT_CLOSE_RESULT),
         "cleanup_pending": (_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE == "cleanup_pending"),
         "cleanup_unresolved": bool(_CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED),
@@ -1545,9 +1825,18 @@ def get_cpu_offload_graph_static_alias_diagnostics() -> dict[str, Any]:
             _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY
         ),
         "original_va_snapshot": _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT,
+        "plan_generation": int(_CPU_OFFLOAD_UVM_PLAN_GENERATION),
+        "plan_rebuild_history": tuple(_CPU_OFFLOAD_UVM_PLAN_REBUILD_HISTORY),
+        "plan_class_switch_history": tuple(
+            _CPU_OFFLOAD_UVM_PLAN_CLASS_SWITCH_HISTORY
+        ),
+        "graph_certificate_classes": tuple(
+            sorted(_CPU_OFFLOAD_UVM_GRAPH_CERTIFICATES_BY_CLASS)
+        ),
         "active_driver_backing_bytes": int(
             _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES
-            if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE == "sealed"
+            if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+            in ("sealed", "remote_parked")
             else 0
         ),
     }
@@ -1625,13 +1914,18 @@ def set_cpu_offload_graph_static_alias_capture_phase(
     if not _CPU_OFFLOAD_GRAPH_STATIC_ALIAS:
         return
     if active and cpu_offload_uvm_original_va_static_alias_enabled():
+        actual_topology = (
+            "remote"
+            if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE == "remote_parked"
+            else _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+        )
         if expected_topology is not None:
             required_state = expected_topology
         elif (
             _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE
             == "prefill_graph_remote_decode"
         ):
-            required_state = _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+            required_state = actual_topology
             if required_state not in ("remote", "sealed"):
                 raise RuntimeError(
                     "Dual-topology CUDA Graph capture requires either an "
@@ -1645,7 +1939,7 @@ def set_cpu_offload_graph_static_alias_capture_phase(
                 in ("prefill_remote_decode", "remote_only")
                 else "sealed"
             )
-        if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE != required_state:
+        if actual_topology != required_state:
             required_description = (
                 "completely mapped and sealed"
                 if required_state == "sealed"
@@ -1704,7 +1998,11 @@ def cpu_offload_graph_static_alias_capture_context(
         yield
         return
     topology = (
-        _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+        (
+            "remote"
+            if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE == "remote_parked"
+            else _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+        )
         if cpu_offload_uvm_original_va_static_alias_enabled()
         else "static_alias"
     )
@@ -2105,6 +2403,7 @@ def _uvm_original_alias_parameter_geometry(
     full_parameter_name: str,
     tensor: torch.Tensor,
     parameter_bytes: int,
+    experts_by_layer: Mapping[int, tuple[int, ...]] | None = None,
 ) -> tuple[
     tuple[int, ...] | None,
     int,
@@ -2128,9 +2427,12 @@ def _uvm_original_alias_parameter_geometry(
     shape = tuple(int(value) for value in tensor.size())
     strides = tuple(int(value) for value in tensor.stride())
     consumer_va = int(tensor.data_ptr())
-    expert_ids = _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER.get(
-        plan.layer_index
+    selected_experts = (
+        _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER
+        if experts_by_layer is None
+        else experts_by_layer
     )
+    expert_ids = selected_experts.get(plan.layer_index)
     if expert_ids is None:
         return (
             None,
@@ -2192,6 +2494,64 @@ def _uvm_original_alias_parameter_geometry(
     )
 
 
+def _uvm_original_alias_envelope_expert_count(
+    full_parameter_name: str,
+    active_expert_ids: tuple[int, ...] | None,
+) -> int:
+    if not _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS:
+        return len(active_expert_ids) if active_expert_ids is not None else 0
+    plan = _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN[full_parameter_name]
+    counts = [
+        len(experts_by_layer[plan.layer_index])
+        for experts_by_layer in (
+            _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS.values()
+        )
+    ]
+    envelope_count = max(counts)
+    if active_expert_ids is None or len(active_expert_ids) > envelope_count:
+        raise RuntimeError(
+            f"Invalid stable envelope for {full_parameter_name!r}: "
+            f"active={active_expert_ids!r}, envelope_count={envelope_count}"
+        )
+    return envelope_count
+
+
+def _uvm_original_alias_binding_upload_view(
+    binding: _UvmOriginalAliasBinding,
+) -> torch.Tensor:
+    if binding.expert_ids is None:
+        return binding.arena.upload
+    return binding.arena.upload.narrow(0, 0, len(binding.expert_ids))
+
+
+def _uvm_original_alias_binding_source_view(
+    binding: _UvmOriginalAliasBinding,
+) -> torch.Tensor:
+    if binding.source is None:
+        raise RuntimeError(
+            f"Pinned source is absent for {binding.full_parameter_name!r}"
+        )
+    if binding.expert_ids is None:
+        return binding.source
+    return binding.source.narrow(0, 0, len(binding.expert_ids))
+
+
+def _refill_uvm_original_alias_binding_source(
+    binding: _UvmOriginalAliasBinding,
+) -> None:
+    source = binding.source
+    if source is None:
+        raise RuntimeError(
+            f"Pinned source is absent for {binding.full_parameter_name!r}"
+        )
+    current = binding.parameter.data
+    if binding.expert_ids is None:
+        source.copy_(current, non_blocking=True)
+        return
+    for packed_index, expert_id in enumerate(binding.expert_ids):
+        source[packed_index].copy_(current[expert_id], non_blocking=True)
+
+
 def _uvm_original_alias_binding_consumer_ranges(
     binding: _UvmOriginalAliasBinding,
 ) -> tuple[tuple[int, int], ...]:
@@ -2204,6 +2564,141 @@ def _uvm_original_alias_binding_consumer_ranges(
             int(binding.requested_bytes),
         ),
     )
+
+
+def _release_uvm_original_alias_consumer_gpu_chunks(
+    *,
+    device: int,
+) -> dict[str, Any]:
+    """Release the original GPU chunks before alias MAP takes ownership.
+
+    Moving managed pages to CPU is not sufficient here: UVM may retain the
+    empty GPU chunks and continue charging their allocation commitment.  The
+    explicit release ioctl splits those chunks at 64 KiB granularity and
+    returns them to the GPU allocator while the original VA and CPU copy stay
+    valid.  Pinned sources must already be complete before this helper runs.
+    """
+    bindings = [
+        binding
+        for _, binding in sorted(_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items())
+    ]
+    sliced = [binding for binding in bindings if binding.expert_ids is not None]
+    if not sliced:
+        return {
+            "ok": True,
+            "required": False,
+            "reason": "whole_parameter_topology",
+            "region_count": 0,
+            "requested_bytes": 0,
+            "released_bytes": 0,
+        }
+    if len(sliced) != len(bindings):
+        raise RuntimeError(
+            "UVM original-VA topology mixes whole parameters and expert slices"
+        )
+
+    specs: list[tuple[str, int, int]] = []
+    seen_ranges: set[tuple[int, int]] = set()
+    for binding in sliced:
+        expert_ids = tuple(int(value) for value in binding.expert_ids or ())
+        ranges = _uvm_original_alias_binding_consumer_ranges(binding)
+        if len(expert_ids) != len(ranges):
+            raise RuntimeError(
+                "UVM original-VA expert/range cardinality changed before release: "
+                f"{binding.full_parameter_name!r}"
+            )
+        for expert_id, (base, length) in zip(expert_ids, ranges):
+            base = int(base)
+            length = int(length)
+            if (
+                base <= 0
+                or length <= 0
+                or base % (64 * 1024)
+                or length % (64 * 1024)
+            ):
+                raise RuntimeError(
+                    "UVM original-VA cold release range is not 64 KiB aligned: "
+                    f"{binding.full_parameter_name!r}, expert={expert_id}, "
+                    f"range=0x{base:x}+{length}"
+                )
+            geometry = (base, length)
+            if geometry in seen_ranges:
+                raise RuntimeError(
+                    "UVM original-VA cold release range has multiple owners: "
+                    f"range=0x{base:x}+{length}"
+                )
+            seen_ranges.add(geometry)
+            region_id = (
+                "static_alias_release:"
+                f"{binding.full_parameter_name}:{binding.plan.layer_index}:"
+                f"{expert_id}:{base:x}:{length:x}"
+            )
+            specs.append((region_id, base, length))
+
+    from vllm.device_allocator.uvm_pool_residency import (
+        register_uvm_region,
+        release_uvm_regions,
+    )
+
+    for region_id, base, length in specs:
+        register_uvm_region(region_id, base, length, state="unknown")
+
+    region_ids = [region_id for region_id, _, _ in specs]
+    release = release_uvm_regions(
+        region_ids,
+        device=int(device),
+        remote_read=False,
+        include_audit=True,
+    )
+    statuses = release.get("statuses")
+    audits = release.get("audits")
+    if not isinstance(statuses, dict) or not isinstance(audits, dict):
+        raise RuntimeError(
+            "UVM original-VA cold release returned incomplete audit tables"
+        )
+
+    released_bytes = 0
+    attempted_bytes = 0
+    made_progress_count = 0
+    for region_id, base, length in specs:
+        audit = audits.get(region_id)
+        valid = (
+            release.get("ok") is True
+            and statuses.get(region_id) is True
+            and isinstance(audit, dict)
+            and audit.get("ok") is True
+            and audit.get("remote_read") is False
+            and int(audit.get("registered_base", -1)) == base
+            and int(audit.get("registered_length", -1)) == length
+            and int(audit.get("base", -1)) == base
+            and int(audit.get("length", -1)) == length
+            and audit.get("app_state_after") == "cpu"
+        )
+        if not valid:
+            raise RuntimeError(
+                "UVM original-VA cold release did not prove completion: "
+                f"region_id={region_id!r}, audit={audit!r}"
+            )
+        released_bytes += int(audit.get("released_bytes", 0))
+        attempted_bytes += int(audit.get("attempted_bytes", 0))
+        made_progress_count += int(bool(audit.get("made_progress")))
+
+    geometry_hash = hashlib.sha256()
+    for region_id, base, length in specs:
+        geometry_hash.update(
+            f"{region_id}\t{base:x}\t{length:x}\n".encode("ascii")
+        )
+    return {
+        "ok": True,
+        "required": True,
+        "reason": "released",
+        "region_count": len(specs),
+        "requested_bytes": sum(length for _, _, length in specs),
+        "attempted_bytes": int(attempted_bytes),
+        "released_bytes": int(released_bytes),
+        "made_progress_count": int(made_progress_count),
+        "geometry_sha256": geometry_hash.hexdigest(),
+    }
 
 
 def _uvm_original_alias_binding_hot_ranges(
@@ -2241,8 +2736,8 @@ def _uvm_original_alias_arena_regions(
     """Yield (region_id, packed_offset, bytes), never crossing an expert."""
     offset = 0
     region_id = 0
-    while offset < arena.aligned_bytes:
-        length = min(arena.region_bytes, arena.aligned_bytes - offset)
+    while offset < arena.requested_bytes:
+        length = min(arena.region_bytes, arena.requested_bytes - offset)
         if arena.packed_slice_bytes:
             slice_remaining = arena.packed_slice_bytes - (
                 offset % arena.packed_slice_bytes
@@ -2262,6 +2757,7 @@ def _create_uvm_original_alias_binding(
     requested_bytes: int,
 ) -> _UvmOriginalAliasBinding:
     global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_ENVELOPE_BYTES
 
     plan = _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN.get(full_parameter_name)
     if plan is None:
@@ -2309,13 +2805,22 @@ def _create_uvm_original_alias_binding(
         tensor=tensor,
         parameter_bytes=int(requested_bytes),
     )
+    envelope_expert_count = _uvm_original_alias_envelope_expert_count(
+        full_parameter_name,
+        expert_ids,
+    )
+    envelope_bytes = int(selected_bytes)
+    envelope_shape = upload_shape
+    if expert_ids is not None:
+        envelope_bytes = envelope_expert_count * int(expert_stride_bytes)
+        envelope_shape = (envelope_expert_count, *shape[1:])
     signature = (
         shape,
         strides,
         tensor.dtype,
         int(device_index),
-        int(selected_bytes),
-        upload_shape,
+        int(envelope_bytes),
+        envelope_shape,
         int(plan.consumer_count),
     )
     arena_key = (plan.layer_container, plan.local_name, plan.bank_id)
@@ -2324,8 +2829,8 @@ def _create_uvm_original_alias_binding(
         upload_storage, upload = _allocate_uvm_original_alias_upload(
             tensor=tensor,
             device=device,
-            requested_bytes=int(selected_bytes),
-            upload_size=upload_shape,
+            requested_bytes=int(envelope_bytes),
+            upload_size=envelope_shape,
             upload_stride=upload_strides,
         )
         arena = _UvmOriginalAliasArena(
@@ -2333,7 +2838,7 @@ def _create_uvm_original_alias_binding(
             upload=upload,
             signature=signature,
             requested_bytes=int(selected_bytes),
-            aligned_bytes=int(selected_bytes),
+            aligned_bytes=int(envelope_bytes),
             backing_layer_id=_uvm_original_alias_backing_layer_id(
                 len(_CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS)
             ),
@@ -2341,14 +2846,22 @@ def _create_uvm_original_alias_binding(
             pte_flags=0,
             region_bytes=_uvm_original_alias_region_bytes(),
             packed_slice_bytes=int(expert_stride_bytes),
+            envelope_expert_count=int(envelope_expert_count),
         )
         _CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS[arena_key] = arena
         _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES += int(selected_bytes)
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_ENVELOPE_BYTES += int(envelope_bytes)
     elif arena.signature != signature:
         raise RuntimeError(
             "UVM original-VA layers sharing a bank/local key have different "
             f"tensor signatures for {full_parameter_name!r}: expected "
             f"{arena.signature!r}, got {signature!r}"
+        )
+    elif arena.requested_bytes != int(selected_bytes):
+        raise RuntimeError(
+            "Layers sharing one stable upload arena selected different active "
+            f"widths for {full_parameter_name!r}: arena={arena.requested_bytes}, "
+            f"binding={selected_bytes}"
         )
     if plan.consumer_index in arena.consumers:
         raise RuntimeError(
@@ -2378,7 +2891,7 @@ def _uvm_original_alias_select_pte_mode() -> tuple[int, int, str]:
     )
 
     target_ranges = [
-        (int(arena.upload.data_ptr()), int(arena.aligned_bytes))
+        (int(arena.upload.data_ptr()), int(arena.requested_bytes))
         for arena in _CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS.values()
     ]
     target_ranges.extend(
@@ -2590,6 +3103,7 @@ def finalize_cpu_offload_graph_static_alias() -> dict[str, Any]:
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_PREALLOCATE_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_MAP_RESULTS
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_SEAL_RESULT
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_ORIGINAL_RELEASE_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_COLD_RESIDENCY_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_RESIDENCY_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_DESTROY_RESULT
@@ -2649,6 +3163,7 @@ def finalize_cpu_offload_graph_static_alias() -> dict[str, Any]:
         _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
         _CPU_OFFLOAD_UVM_STATIC_ALIAS_DESTROY_RESULT = None
         _CPU_OFFLOAD_UVM_STATIC_ALIAS_SLOT_CLOSE_RESULT = None
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_ORIGINAL_RELEASE_RESULT = None
         _CPU_OFFLOAD_UVM_STATIC_ALIAS_COLD_RESIDENCY_RESULT = None
         _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_RESIDENCY_RESULT = None
         _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED = False
@@ -2715,15 +3230,6 @@ def finalize_cpu_offload_graph_static_alias() -> dict[str, Any]:
                             "UVM original-VA source allocation is not pinned for "
                             f"{binding.full_parameter_name!r}"
                         )
-                    if binding.expert_ids is None:
-                        source.copy_(current, non_blocking=True)
-                    else:
-                        for packed_index, expert_id in enumerate(
-                            binding.expert_ids
-                        ):
-                            source[packed_index].copy_(
-                                current[expert_id], non_blocking=True
-                            )
                     binding.source = source
                     source_created_count += 1
                 else:
@@ -2740,7 +3246,15 @@ def finalize_cpu_offload_graph_static_alias() -> dict[str, Any]:
                             f"geometry for {binding.full_parameter_name!r}"
                         )
                     source_reused_count += 1
+                _refill_uvm_original_alias_binding_source(binding)
             torch.cuda.synchronize(device)
+
+            original_release = (
+                _release_uvm_original_alias_consumer_gpu_chunks(device=device)
+            )
+            _CPU_OFFLOAD_UVM_STATIC_ALIAS_ORIGINAL_RELEASE_RESULT = (
+                original_release
+            )
 
             current_original_vas = tuple(
                 int(binding.consumer.data_ptr())
@@ -2953,6 +3467,7 @@ def finalize_cpu_offload_graph_static_alias() -> dict[str, Any]:
                 "map_batch_count": len(map_results),
                 "source_created_count": int(source_created_count),
                 "source_reused_count": int(source_reused_count),
+                "original_release": original_release,
                 "cold_residency": cold_residency,
                 "hot_residency": hot_residency,
                 "cold_residency_range_count": len(cold_residency_ranges),
@@ -3115,6 +3630,124 @@ def certify_cpu_offload_uvm_original_va_dual_graph_partition(
         }
     )
     return dict(certificate)
+
+
+def begin_cpu_offload_uvm_plan_class_graph_capture(class_name: str) -> None:
+    """Open an independent certificate epoch while older GraphExecs stay live."""
+    global _CPU_OFFLOAD_UVM_CAPTURE_TOPOLOGY
+    global _CPU_OFFLOAD_UVM_CAPTURE_SUCCESS_COUNT
+    global _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED
+    global _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CAPTURED
+    global _CPU_OFFLOAD_UVM_ALIAS_GRAPHS_DESTROYED
+    global _CPU_OFFLOAD_UVM_REMOTE_GRAPH_REMAINING_COUNT
+    global _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CERTIFICATE
+    global _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CERTIFICATE
+    global _CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE
+
+    normalized = _normalize_uvm_plan_class_name(class_name)
+    if normalized not in _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS:
+        raise RuntimeError(f"Plan class {normalized!r} is not registered")
+    if _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_CAPTURE_PHASE:
+        raise RuntimeError("Cannot begin a plan-class capture during CUDA capture")
+    _CPU_OFFLOAD_UVM_CAPTURE_TOPOLOGY = None
+    _CPU_OFFLOAD_UVM_CAPTURE_SUCCESS_COUNT = 0
+    _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED = False
+    _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CAPTURED = False
+    _CPU_OFFLOAD_UVM_ALIAS_GRAPHS_DESTROYED = False
+    _CPU_OFFLOAD_UVM_REMOTE_GRAPH_REMAINING_COUNT = 0
+    _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CERTIFICATE = None
+    _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CERTIFICATE = None
+    _CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE = None
+
+
+def register_cpu_offload_uvm_plan_class_graph_certificates(
+    class_name: str,
+) -> dict[str, Any]:
+    normalized = _normalize_uvm_plan_class_name(class_name)
+    if not (
+        _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED
+        and _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CAPTURED
+        and isinstance(_CPU_OFFLOAD_UVM_REMOTE_GRAPH_CERTIFICATE, dict)
+        and isinstance(_CPU_OFFLOAD_UVM_ALIAS_GRAPH_CERTIFICATE, dict)
+        and isinstance(_CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE, dict)
+    ):
+        raise RuntimeError(
+            f"Plan class {normalized!r} has no complete dual-Graph certificate"
+        )
+    bundle = {
+        "capture_topology": _CPU_OFFLOAD_UVM_CAPTURE_TOPOLOGY,
+        "capture_success_count": int(_CPU_OFFLOAD_UVM_CAPTURE_SUCCESS_COUNT),
+        "remote_graph_captured": True,
+        "alias_graph_captured": True,
+        "alias_graphs_destroyed": False,
+        "remote_graph_remaining_count": int(
+            _CPU_OFFLOAD_UVM_REMOTE_GRAPH_REMAINING_COUNT
+        ),
+        "remote": dict(_CPU_OFFLOAD_UVM_REMOTE_GRAPH_CERTIFICATE),
+        "alias": dict(_CPU_OFFLOAD_UVM_ALIAS_GRAPH_CERTIFICATE),
+        "partition": dict(_CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE),
+        "parameter_vas": _uvm_original_parameter_va_snapshot(),
+        "upload_vas": tuple(
+            int(arena.upload.data_ptr())
+            for _, arena in sorted(_CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS.items())
+        ),
+        "source_vas": tuple(
+            int(binding.source.data_ptr())
+            for _, binding in sorted(
+                _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+            )
+            if binding.source is not None
+        ),
+    }
+    _CPU_OFFLOAD_UVM_GRAPH_CERTIFICATES_BY_CLASS[normalized] = bundle
+    return dict(bundle)
+
+
+def activate_cpu_offload_uvm_plan_class_graph_certificates(
+    class_name: str,
+) -> dict[str, Any]:
+    global _CPU_OFFLOAD_UVM_CAPTURE_TOPOLOGY
+    global _CPU_OFFLOAD_UVM_CAPTURE_SUCCESS_COUNT
+    global _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED
+    global _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CAPTURED
+    global _CPU_OFFLOAD_UVM_ALIAS_GRAPHS_DESTROYED
+    global _CPU_OFFLOAD_UVM_REMOTE_GRAPH_REMAINING_COUNT
+    global _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CERTIFICATE
+    global _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CERTIFICATE
+    global _CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE
+
+    normalized = _normalize_uvm_plan_class_name(class_name)
+    bundle = _CPU_OFFLOAD_UVM_GRAPH_CERTIFICATES_BY_CLASS.get(normalized)
+    if bundle is None:
+        return {"ok": False, "reason": "class_certificate_not_registered"}
+    current_parameter_vas = _uvm_original_parameter_va_snapshot()
+    current_upload_vas = tuple(
+        int(arena.upload.data_ptr())
+        for _, arena in sorted(_CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS.items())
+    )
+    current_source_vas = tuple(
+        int(binding.source.data_ptr())
+        for _, binding in sorted(_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items())
+        if binding.source is not None
+    )
+    if (
+        tuple(bundle["parameter_vas"]) != current_parameter_vas
+        or tuple(bundle["upload_vas"]) != current_upload_vas
+        or tuple(bundle["source_vas"]) != current_source_vas
+    ):
+        return {"ok": False, "reason": "class_certificate_va_mismatch"}
+    _CPU_OFFLOAD_UVM_CAPTURE_TOPOLOGY = bundle["capture_topology"]
+    _CPU_OFFLOAD_UVM_CAPTURE_SUCCESS_COUNT = int(bundle["capture_success_count"])
+    _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED = True
+    _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CAPTURED = True
+    _CPU_OFFLOAD_UVM_ALIAS_GRAPHS_DESTROYED = False
+    _CPU_OFFLOAD_UVM_REMOTE_GRAPH_REMAINING_COUNT = int(
+        bundle["remote_graph_remaining_count"]
+    )
+    _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CERTIFICATE = dict(bundle["remote"])
+    _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CERTIFICATE = dict(bundle["alias"])
+    _CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE = dict(bundle["partition"])
+    return {"ok": True, "reason": "class_certificate_activated"}
 
 
 def certify_cpu_offload_uvm_original_va_alias_graphs_destroyed(
@@ -3629,6 +4262,1664 @@ def _uvm_original_parameter_va_snapshot() -> tuple[int, ...]:
     return tuple(vas)
 
 
+def release_cpu_offload_uvm_original_va_shutdown_references() -> dict[str, Any]:
+    """Release process-global tensor references after audited shutdown.
+
+    ``destroy_cpu_offload_graph_static_alias`` tears down driver mappings and
+    backing, but serving keeps binding objects alive because module forward
+    closures may still need them.  At final process shutdown those globals
+    must be released while CUDA and UVM are still initialized; otherwise
+    managed Parameters, upload arenas, and pinned sources are left to the
+    interpreter's unspecified module-destruction order.
+    """
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ARENAS
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_ENVELOPE_BYTES
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+    global _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT
+    global _CPU_OFFLOAD_OWNER_THREAD_ID
+    global _CPU_OFFLOAD_OWNER_DEVICE_INDEX
+    global _CPU_OFFLOAD_OWNER_STREAM_ID
+
+    with _CPU_OFFLOAD_UVM_STATIC_ALIAS_LOCK:
+        if _CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID != 0:
+            raise RuntimeError(
+                "Cannot release original-VA references while a driver "
+                "session is active"
+            )
+        if _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED:
+            raise RuntimeError(
+                "Cannot release original-VA references while driver cleanup "
+                "is unresolved"
+            )
+        if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE not in (
+            "disabled",
+            "remote",
+            "shutdown",
+        ):
+            raise RuntimeError(
+                "Cannot release original-VA references from lifecycle state "
+                f"{_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE!r}"
+            )
+
+        binding_count = len(_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS)
+        arena_count = len(_CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS)
+        source_count = 0
+        for binding in _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.values():
+            if binding.source is not None:
+                source_count += 1
+                binding.source = None
+
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS = {}
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS = {}
+        _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ARENAS = {}
+        _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES = 0
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_ENVELOPE_BYTES = 0
+        _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT = ()
+        _CPU_OFFLOAD_OWNER_THREAD_ID = None
+        _CPU_OFFLOAD_OWNER_DEVICE_INDEX = None
+        _CPU_OFFLOAD_OWNER_STREAM_ID = None
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "shutdown"
+        return {
+            "ok": True,
+            "operation": "release_shutdown_references",
+            "binding_count": binding_count,
+            "arena_count": arena_count,
+            "source_count": source_count,
+            "state": "shutdown",
+        }
+
+
+def _reset_uvm_original_va_graph_certificates_for_plan_rebuild() -> None:
+    """Forget certificates only after their concrete Graphs were reset."""
+    global _CPU_OFFLOAD_UVM_CAPTURE_TOPOLOGY
+    global _CPU_OFFLOAD_UVM_CAPTURE_SUCCESS_COUNT
+    global _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED
+    global _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CAPTURED
+    global _CPU_OFFLOAD_UVM_ALIAS_GRAPHS_DESTROYED
+    global _CPU_OFFLOAD_UVM_REMOTE_GRAPH_REMAINING_COUNT
+    global _CPU_OFFLOAD_UVM_CAPTURE_FORWARD_COUNT
+    global _CPU_OFFLOAD_UVM_CAPTURE_ACTUAL_H2D_BYTES
+    global _CPU_OFFLOAD_UVM_CAPTURE_VA_SNAPSHOT
+    global _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CERTIFICATE
+    global _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CERTIFICATE
+    global _CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE
+
+    if _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_CAPTURE_PHASE:
+        raise RuntimeError("Cannot reset CUDA Graph certificates during capture")
+    _CPU_OFFLOAD_UVM_CAPTURE_TOPOLOGY = None
+    _CPU_OFFLOAD_UVM_CAPTURE_SUCCESS_COUNT = 0
+    _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED = False
+    _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CAPTURED = False
+    _CPU_OFFLOAD_UVM_ALIAS_GRAPHS_DESTROYED = True
+    _CPU_OFFLOAD_UVM_REMOTE_GRAPH_REMAINING_COUNT = 0
+    _CPU_OFFLOAD_UVM_CAPTURE_FORWARD_COUNT = 0
+    _CPU_OFFLOAD_UVM_CAPTURE_ACTUAL_H2D_BYTES = 0
+    _CPU_OFFLOAD_UVM_CAPTURE_VA_SNAPSHOT = ()
+    _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CERTIFICATE = None
+    _CPU_OFFLOAD_UVM_ALIAS_GRAPH_CERTIFICATE = None
+    _CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE = None
+
+
+def _uvm_original_alias_plan_geometry(
+    experts_by_layer: Mapping[int, tuple[int, ...]],
+) -> dict[
+    str,
+    tuple[
+        tuple[int, ...] | None,
+        int,
+        int,
+        tuple[int, ...],
+        tuple[int, ...],
+        tuple[tuple[int, int], ...],
+    ],
+]:
+    result = {}
+    for full_name, binding in sorted(
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+    ):
+        result[full_name] = _uvm_original_alias_parameter_geometry(
+            full_parameter_name=full_name,
+            tensor=binding.consumer,
+            parameter_bytes=int(binding.parameter_bytes),
+            experts_by_layer=experts_by_layer,
+        )
+    return result
+
+
+def _uvm_original_alias_stabilize_plan_slots(
+    old_geometry: Mapping[str, tuple[Any, ...]],
+    target_geometry: Mapping[str, tuple[Any, ...]],
+) -> tuple[dict[str, tuple[Any, ...]], dict[str, Any]]:
+    """Keep retained experts in the same packed slot whenever possible.
+
+    Plan files describe expert sets, not a semantically significant packed
+    order.  Preserving the old slot index avoids refilling immutable expert
+    data and lets the backing-resize transaction retain the prefix slots shared
+    by two capacity classes.
+    """
+    stabilized: dict[str, tuple[Any, ...]] = {}
+    retained_slot_count = 0
+    relocated_slot_count = 0
+    changed_slot_count = 0
+    for full_name, raw_target in sorted(target_geometry.items()):
+        try:
+            raw_old = old_geometry[full_name]
+            binding = _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS[full_name]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Stable slot geometry is missing {full_name!r}"
+            ) from exc
+        old_ids = raw_old[0]
+        target_ids = raw_target[0]
+        if old_ids is None or target_ids is None:
+            if old_ids != target_ids or raw_old[2] != raw_target[2]:
+                raise RuntimeError(
+                    f"Non-expert alias geometry changed for {full_name!r}"
+                )
+            stabilized[full_name] = tuple(raw_target)
+            continue
+
+        target_set = set(target_ids)
+        assigned: list[int | None] = [None] * len(target_ids)
+        used: set[int] = set()
+        for slot_index in range(min(len(old_ids), len(target_ids))):
+            expert_id = int(old_ids[slot_index])
+            if expert_id in target_set and expert_id not in used:
+                assigned[slot_index] = expert_id
+                used.add(expert_id)
+                retained_slot_count += 1
+        remaining = [int(value) for value in target_ids if int(value) not in used]
+        remaining_iter = iter(remaining)
+        for slot_index, expert_id in enumerate(assigned):
+            if expert_id is None:
+                assigned[slot_index] = next(remaining_iter)
+        stable_ids = tuple(int(value) for value in assigned)
+        if set(stable_ids) != target_set or len(stable_ids) != len(target_ids):
+            raise RuntimeError(
+                f"Stable slot assignment changed the target set for {full_name!r}"
+            )
+        for slot_index, expert_id in enumerate(stable_ids):
+            old_expert = old_ids[slot_index] if slot_index < len(old_ids) else None
+            if old_expert != expert_id:
+                changed_slot_count += 1
+                if expert_id in set(old_ids):
+                    relocated_slot_count += 1
+        stride = int(raw_target[1])
+        consumer_base = int(binding.consumer.data_ptr())
+        consumer_ranges = tuple(
+            (consumer_base + expert_id * stride, stride)
+            for expert_id in stable_ids
+        )
+        stabilized[full_name] = (
+            stable_ids,
+            stride,
+            int(raw_target[2]),
+            raw_target[3],
+            raw_target[4],
+            consumer_ranges,
+        )
+    return stabilized, {
+        "retained_slot_count": int(retained_slot_count),
+        "relocated_slot_count": int(relocated_slot_count),
+        "changed_slot_count": int(changed_slot_count),
+    }
+
+
+def _refill_uvm_original_alias_plan_delta(
+    old_geometry: Mapping[str, tuple[Any, ...]],
+    target_geometry: Mapping[str, tuple[Any, ...]],
+) -> dict[str, Any]:
+    """Refresh only packed source slots whose logical expert changed."""
+    changed_slot_count = 0
+    changed_bytes = 0
+    changed_bindings: list[str] = []
+    for full_name, binding in sorted(
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+    ):
+        old_ids = old_geometry[full_name][0]
+        target_ids = target_geometry[full_name][0]
+        if old_ids is None or target_ids is None:
+            continue
+        if binding.source is None:
+            raise RuntimeError(
+                f"Pinned source is absent for {binding.full_parameter_name!r}"
+            )
+        binding_changed = False
+        current = binding.parameter.data
+        stride = int(target_geometry[full_name][1])
+        for slot_index, expert_id in enumerate(target_ids):
+            old_expert = old_ids[slot_index] if slot_index < len(old_ids) else None
+            if old_expert == expert_id:
+                continue
+            binding.source[slot_index].copy_(
+                current[int(expert_id)], non_blocking=True
+            )
+            changed_slot_count += 1
+            changed_bytes += stride
+            binding_changed = True
+        if binding_changed:
+            changed_bindings.append(full_name)
+    return {
+        "mode": "delta",
+        "changed_binding_count": len(changed_bindings),
+        "changed_slot_count": int(changed_slot_count),
+        "changed_bytes": int(changed_bytes),
+        "changed_bindings": tuple(changed_bindings),
+    }
+
+
+def _uvm_original_alias_geometry_expert_ranges(
+    geometry: Mapping[str, tuple[Any, ...]],
+) -> dict[str, dict[int, tuple[int, int]]]:
+    result: dict[str, dict[int, tuple[int, int]]] = {}
+    for full_name, values in geometry.items():
+        expert_ids = values[0]
+        if expert_ids is None:
+            continue
+        binding = _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS[full_name]
+        stride = int(values[1])
+        base = int(binding.consumer.data_ptr())
+        result[full_name] = {
+            int(expert_id): (base + int(expert_id) * stride, stride)
+            for expert_id in expert_ids
+        }
+    return result
+
+
+def _prepare_uvm_original_alias_plan_residency_delta(
+    old_geometry: Mapping[str, tuple[Any, ...]],
+    target_geometry: Mapping[str, tuple[Any, ...]],
+    *,
+    device: int,
+) -> dict[str, Any]:
+    """Move only newly cold experts to CPU and newly hot experts to GPU."""
+    from vllm.device_allocator import uvm
+
+    old_ranges = _uvm_original_alias_geometry_expert_ranges(old_geometry)
+    target_ranges = _uvm_original_alias_geometry_expert_ranges(target_geometry)
+    added_cold: list[tuple[int, int]] = []
+    removed_cold: list[tuple[int, int]] = []
+    for full_name in sorted(set(old_ranges) | set(target_ranges)):
+        old = old_ranges.get(full_name, {})
+        target = target_ranges.get(full_name, {})
+        added_cold.extend(target[expert] for expert in sorted(set(target) - set(old)))
+        removed_cold.extend(old[expert] for expert in sorted(set(old) - set(target)))
+
+    added_bytes = sum(length for _, length in added_cold)
+    removed_bytes = sum(length for _, length in removed_cold)
+    if added_cold:
+        prepared = uvm.batch_prepare_ranges_for_native_remote_access_with_executor(
+            added_cold,
+            sync=True,
+            device=device,
+        )
+        if int(prepared[0]) != len(added_cold):
+            raise RuntimeError(
+                f"Failed to move every added cold expert to CPU: {prepared!r}"
+            )
+    else:
+        prepared = (0, "none", 0)
+
+    if removed_cold:
+        advised = int(
+            uvm.batch_advise_ranges_preferred_location(removed_cold, device)
+        )
+        prefetched, executor, driver_result = (
+            uvm.batch_prefetch_ranges_to_device_with_executor(
+                removed_cold,
+                device,
+                executor="cpp_batch",
+            )
+        )
+        if advised != len(removed_cold) or int(prefetched) != len(removed_cold):
+            raise RuntimeError(
+                "Failed to restore every removed cold expert to GPU: "
+                f"advised={advised}, prefetched={prefetched}, "
+                f"expected={len(removed_cold)}, executor={executor!r}, "
+                f"driver_result={driver_result}"
+            )
+    else:
+        advised = 0
+        prefetched = 0
+        executor = "none"
+        driver_result = 0
+
+    if added_cold or removed_cold:
+        torch.cuda.synchronize(device)
+    added_residency: dict[str, Any] | None = None
+    removed_residency: dict[str, Any] | None = None
+    if added_cold:
+        added_residency = dict(
+            uvm.driver_batch_query_ranges_residency_bytes(
+                added_cold, device=device, wait_for_trackers=False
+            )
+        )
+        if not (
+            added_residency.get("ok") is True
+            and int(added_residency.get("queried_bytes", -1)) == added_bytes
+            and int(added_residency.get("cpu_bytes", -1)) == added_bytes
+            and int(added_residency.get("gpu_bytes", -1)) == 0
+            and int(added_residency.get("unknown_bytes", -1)) == 0
+        ):
+            raise RuntimeError(
+                f"Added cold expert residency is not CPU-only: {added_residency!r}"
+            )
+    if removed_cold:
+        removed_residency = dict(
+            uvm.driver_batch_query_ranges_residency_bytes(
+                removed_cold, device=device, wait_for_trackers=False
+            )
+        )
+        if not (
+            removed_residency.get("ok") is True
+            and int(removed_residency.get("queried_bytes", -1)) == removed_bytes
+            and int(removed_residency.get("gpu_bytes", -1)) == removed_bytes
+            and int(removed_residency.get("cpu_bytes", -1)) == 0
+            and int(removed_residency.get("unknown_bytes", -1)) == 0
+        ):
+            raise RuntimeError(
+                "Removed cold expert residency is not GPU-only: "
+                f"{removed_residency!r}"
+            )
+    return {
+        "mode": "delta",
+        "added_cold_range_count": len(added_cold),
+        "added_cold_bytes": int(added_bytes),
+        "removed_cold_range_count": len(removed_cold),
+        "removed_cold_bytes": int(removed_bytes),
+        "prepare": prepared,
+        "advised_count": advised,
+        "prefetched_count": int(prefetched),
+        "prefetch_executor": str(executor),
+        "prefetch_driver_result": int(driver_result),
+        "added_cold_residency": added_residency,
+        "removed_cold_residency": removed_residency,
+    }
+
+
+def _apply_uvm_original_alias_plan_geometry(
+    geometry: Mapping[
+        str,
+        tuple[
+            tuple[int, ...] | None,
+            int,
+            int,
+            tuple[int, ...],
+            tuple[int, ...],
+            tuple[tuple[int, int], ...],
+        ],
+    ],
+    *,
+    refill_sources: bool,
+) -> int:
+    global _CPU_OFFLOAD_BYTES
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES
+
+    arena_active_bytes: dict[int, int] = {}
+    selected_parameter_bytes = 0
+    for full_name, binding in sorted(
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+    ):
+        try:
+            (
+                expert_ids,
+                expert_stride_bytes,
+                selected_bytes,
+                _upload_shape,
+                _upload_strides,
+                consumer_ranges,
+            ) = geometry[full_name]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Plan geometry is missing {full_name!r}"
+            ) from exc
+        if selected_bytes <= 0 or selected_bytes > binding.arena.aligned_bytes:
+            raise RuntimeError(
+                f"Plan geometry escapes stable envelope for {full_name!r}: "
+                f"selected={selected_bytes}, envelope={binding.arena.aligned_bytes}"
+            )
+        if expert_ids is not None and len(expert_ids) > int(
+            binding.arena.envelope_expert_count
+        ):
+            raise RuntimeError(
+                f"Plan expert count escapes stable envelope for {full_name!r}"
+            )
+        arena_key = id(binding.arena)
+        previous_bytes = arena_active_bytes.setdefault(
+            arena_key, int(selected_bytes)
+        )
+        if previous_bytes != int(selected_bytes):
+            raise RuntimeError(
+                "Consumers sharing one upload arena require one active width"
+            )
+        binding.requested_bytes = int(selected_bytes)
+        binding.expert_ids = expert_ids
+        binding.expert_stride_bytes = int(expert_stride_bytes)
+        binding.consumer_ranges = tuple(consumer_ranges)
+        selected_parameter_bytes += int(selected_bytes)
+
+    for arena in _CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS.values():
+        try:
+            arena.requested_bytes = arena_active_bytes[id(arena)]
+        except KeyError as exc:
+            raise RuntimeError("Stable envelope arena has no active consumer") from exc
+    _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES = sum(
+        int(arena.requested_bytes)
+        for arena in _CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS.values()
+    )
+    _CPU_OFFLOAD_BYTES = int(selected_parameter_bytes)
+    if refill_sources:
+        for binding in _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.values():
+            _refill_uvm_original_alias_binding_source(binding)
+    return int(selected_parameter_bytes)
+
+
+def _prepare_uvm_original_alias_plan_residency(*, device: int) -> dict[str, Any]:
+    from vllm.device_allocator import uvm
+
+    cold_ranges = [
+        consumer_range
+        for binding in _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.values()
+        for consumer_range in _uvm_original_alias_binding_consumer_ranges(binding)
+    ]
+    hot_ranges = [
+        hot_range
+        for binding in _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.values()
+        for hot_range in _uvm_original_alias_binding_hot_ranges(binding)
+    ]
+    cold_bytes = sum(length for _, length in cold_ranges)
+    hot_bytes = sum(length for _, length in hot_ranges)
+    prepared = uvm.batch_prepare_ranges_for_native_remote_access_with_executor(
+        cold_ranges,
+        sync=True,
+        device=device,
+    )
+    if int(prepared[0]) != len(cold_ranges):
+        raise RuntimeError(
+            f"Failed to make new cold experts CPU resident: {prepared!r}"
+        )
+    advised = int(uvm.batch_advise_ranges_preferred_location(hot_ranges, device))
+    prefetched, executor, driver_result = (
+        uvm.batch_prefetch_ranges_to_device_with_executor(
+            hot_ranges,
+            device,
+            executor="cpp_batch",
+        )
+    )
+    if advised != len(hot_ranges) or int(prefetched) != len(hot_ranges):
+        raise RuntimeError(
+            "Failed to restore every hot expert while changing plan class: "
+            f"advised={advised}, prefetched={prefetched}, "
+            f"expected={len(hot_ranges)}, executor={executor!r}, "
+            f"driver_result={driver_result}"
+        )
+    torch.cuda.synchronize(device)
+    cold_residency = dict(
+        uvm.driver_batch_query_ranges_residency_bytes(
+            cold_ranges, device=device, wait_for_trackers=False
+        )
+    )
+    hot_residency = dict(
+        uvm.driver_batch_query_ranges_residency_bytes(
+            hot_ranges, device=device, wait_for_trackers=False
+        )
+    )
+    if cold_ranges and not (
+        cold_residency.get("ok") is True
+        and int(cold_residency.get("queried_bytes", -1)) == cold_bytes
+        and int(cold_residency.get("cpu_bytes", -1)) == cold_bytes
+        and int(cold_residency.get("gpu_bytes", -1)) == 0
+        and int(cold_residency.get("unknown_bytes", -1)) == 0
+    ):
+        raise RuntimeError(
+            f"New cold expert residency is not CPU-only: {cold_residency!r}"
+        )
+    if hot_ranges and not (
+        hot_residency.get("ok") is True
+        and int(hot_residency.get("queried_bytes", -1)) == hot_bytes
+        and int(hot_residency.get("gpu_bytes", -1)) == hot_bytes
+        and int(hot_residency.get("cpu_bytes", -1)) == 0
+        and int(hot_residency.get("unknown_bytes", -1)) == 0
+    ):
+        raise RuntimeError(
+            f"New hot expert residency is not GPU-only: {hot_residency!r}"
+        )
+    return {
+        "cold_range_count": len(cold_ranges),
+        "cold_bytes": int(cold_bytes),
+        "hot_range_count": len(hot_ranges),
+        "hot_bytes": int(hot_bytes),
+        "prepare": prepared,
+        "advised_count": advised,
+        "prefetched_count": int(prefetched),
+        "prefetch_executor": str(executor),
+        "prefetch_driver_result": int(driver_result),
+        "cold_residency": cold_residency,
+        "hot_residency": hot_residency,
+    }
+
+
+def _set_uvm_original_alias_parked_state(result: Mapping[str, Any]) -> None:
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_PARK_RESULT
+
+    _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "remote_parked"
+    _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = True
+    _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT = dict(result)
+    _CPU_OFFLOAD_UVM_STATIC_ALIAS_PARK_RESULT = dict(result)
+
+
+def _set_uvm_original_alias_sealed_state(result: Mapping[str, Any]) -> None:
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT
+
+    _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "sealed"
+    _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
+    _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT = None
+    _CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT = dict(result)
+
+
+def _rollback_uvm_original_alias_plan_class_switch(
+    *,
+    old_geometry: Mapping[str, tuple[Any, ...]],
+    target_geometry: Mapping[str, tuple[Any, ...]],
+    old_consumer_entries: tuple[tuple[int, int, int, int, int, int, int], ...],
+    pre_state: str,
+    same_capacity: bool,
+    rebind_committed: bool,
+    fast_rollback_safe: bool,
+    old_session_destroyed: bool,
+    old_backing_bytes: int,
+    parameter_vas: tuple[int, ...],
+    upload_vas: tuple[int, ...],
+    source_vas: tuple[int, ...],
+    old_remote_map_active: bool,
+    old_remote_map_result: Mapping[str, Any] | None,
+    device: int,
+    old_map_entries: tuple[
+        tuple[int, int, int, int, int, int, int], ...
+    ] = (),
+    rollback_preallocate_entries: tuple[
+        tuple[int, int, int, int, int, int, int], ...
+    ] = (),
+    orphan_preallocate_entries: tuple[
+        tuple[int, int, int, int, int, int, int], ...
+    ] = (),
+) -> dict[str, Any]:
+    """Restore the complete pre-switch topology or raise and poison upstream.
+
+    A retained-backing rollback is preferred because it only needs another
+    parked REBIND.  If that path is unavailable or any transition poisons the
+    session, destroy the current session and materialize the old class again.
+    The stable upload/source/Parameter allocations remain alive in both cases.
+    """
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT
+
+    from vllm.device_allocator import uvm, uvm_static_alias
+
+    started_ns = time.perf_counter_ns()
+    _apply_uvm_original_alias_plan_geometry(old_geometry, refill_sources=True)
+    torch.cuda.synchronize(device)
+
+    retained_error: str | None = None
+    rollback_park: dict[str, Any] | None = None
+    rollback_rebind: dict[str, Any] | None = None
+    rollback_resume: dict[str, Any] | None = None
+    rollback_residency: dict[str, Any] | None = None
+    rollback_destroy: dict[str, Any] | None = None
+    rollback_close: dict[str, Any] | None = None
+    rollback_finalize: dict[str, Any] | None = None
+    rollback_preallocate: dict[str, Any] | None = None
+    orphan_release: dict[str, Any] | None = None
+
+    if not old_session_destroyed and fast_rollback_safe:
+        try:
+            session_id = int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID)
+            if session_id <= 0:
+                raise RuntimeError("Retained rollback lost its alias session")
+            if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE == "sealed":
+                rollback_park = dict(
+                    uvm_static_alias.driver_static_alias_park(
+                        session_id,
+                        device=device,
+                        synchronize=False,
+                    )
+                )
+                if rollback_park.get("ok") is not True:
+                    raise RuntimeError(
+                        f"Rollback PARK failed: {rollback_park!r}"
+                    )
+                _set_uvm_original_alias_parked_state(rollback_park)
+            elif _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE != "remote_parked":
+                raise RuntimeError(
+                    "Retained rollback requires a sealed or parked session, "
+                    f"got {_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE!r}"
+                )
+
+            if rebind_committed:
+                if old_map_entries:
+                    if rollback_preallocate_entries:
+                        rollback_preallocate = dict(
+                            uvm.driver_slot_preallocate_ranges(
+                                rollback_preallocate_entries,
+                                device=device,
+                            )
+                        )
+                        if rollback_preallocate.get("ok") is not True:
+                            raise RuntimeError(
+                                "Rollback could not preallocate removed old "
+                                f"backing: {rollback_preallocate!r}"
+                            )
+                    rollback_rebind = dict(
+                        uvm_static_alias.driver_static_alias_rebind(
+                            session_id,
+                            old_map_entries,
+                            device=device,
+                            synchronize=False,
+                            resize=True,
+                            expected_backing_bytes=old_backing_bytes,
+                        )
+                    )
+                elif same_capacity:
+                    rollback_rebind = dict(
+                        uvm_static_alias.driver_static_alias_rebind(
+                            session_id,
+                            old_consumer_entries,
+                            device=device,
+                            synchronize=False,
+                        )
+                    )
+                else:
+                    raise RuntimeError(
+                        "Rollback lacks the complete old topology for resize"
+                    )
+                if rollback_rebind.get("ok") is not True:
+                    raise RuntimeError(
+                        f"Rollback REBIND failed: {rollback_rebind!r}"
+                    )
+            elif orphan_preallocate_entries:
+                orphan_release = dict(
+                    uvm.driver_slot_release_ranges(
+                        tuple(
+                            (entry[2], entry[3], entry[4])
+                            for entry in orphan_preallocate_entries
+                        ),
+                        device=device,
+                    )
+                )
+                if orphan_release.get("ok") is not True:
+                    raise RuntimeError(
+                        "Rollback could not release uncommitted added backing: "
+                        f"{orphan_release!r}"
+                    )
+
+            # Reverse exactly the residency difference applied by the forward
+            # switch. A full-plan pass both touches retained experts and, on
+            # an early preallocation failure, can leave the newly cold pages
+            # in the target state.
+            rollback_residency = _prepare_uvm_original_alias_plan_residency_delta(
+                target_geometry,
+                old_geometry,
+                device=device,
+            )
+            if pre_state == "sealed":
+                rollback_resume = dict(
+                    uvm_static_alias.driver_static_alias_resume(
+                        session_id,
+                        device=device,
+                        synchronize=False,
+                    )
+                )
+                if rollback_resume.get("ok") is not True:
+                    raise RuntimeError(
+                        f"Rollback RESUME failed: {rollback_resume!r}"
+                    )
+                _set_uvm_original_alias_sealed_state(rollback_resume)
+            else:
+                _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "remote_parked"
+                _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = old_remote_map_active
+                _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT = (
+                    dict(old_remote_map_result)
+                    if old_remote_map_result is not None
+                    else None
+                )
+        except Exception as exc:
+            retained_error = repr(exc)
+        else:
+            mode = "retained_backing_rebind"
+            result = {
+                "ok": True,
+                "mode": mode,
+                "park": rollback_park,
+                "rebind": rollback_rebind,
+                "preallocate": rollback_preallocate,
+                "orphan_release": orphan_release,
+                "resume": rollback_resume,
+                "residency": rollback_residency,
+                "wall_ns": time.perf_counter_ns() - started_ns,
+            }
+            if int(_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES) != int(
+                old_backing_bytes
+            ):
+                raise RuntimeError(
+                    "Retained rollback restored an unexpected backing size"
+                )
+            if pre_state != _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE:
+                raise RuntimeError(
+                    "Retained rollback did not restore the lifecycle state"
+                )
+            if _uvm_original_parameter_va_snapshot() != parameter_vas:
+                raise RuntimeError("Rollback changed Parameter VAs")
+            if tuple(
+                int(arena.upload.data_ptr())
+                for _, arena in sorted(
+                    _CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS.items()
+                )
+            ) != upload_vas:
+                raise RuntimeError("Rollback changed upload VAs")
+            if tuple(
+                int(binding.source.data_ptr())
+                for _, binding in sorted(
+                    _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+                )
+                if binding.source is not None
+            ) != source_vas:
+                raise RuntimeError("Rollback changed pinned source VAs")
+            return result
+
+    # Either the old backing was already released or the in-place recovery
+    # could not be trusted.  A full alias/backing rebuild is still safe because
+    # Graph-visible allocations are the stable envelope, not driver backing.
+    if _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED:
+        raise RuntimeError(
+            "Cannot rebuild the old class while alias cleanup is unresolved"
+        )
+    active_session_id = int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID)
+    if active_session_id > 0:
+        rollback_destroy = dict(
+            uvm_static_alias.driver_static_alias_destroy(
+                active_session_id,
+                device=device,
+                release_backing=True,
+                synchronize=False,
+            )
+        )
+        if not _uvm_original_alias_destroy_cleared(rollback_destroy):
+            raise RuntimeError(
+                "Rollback could not authoritatively destroy the current alias "
+                f"session: {rollback_destroy!r}"
+            )
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID = 0
+
+    closed, raw_close = _uvm_original_alias_close_slot_session(
+        uvm, device=device
+    )
+    rollback_close = dict(raw_close or {"ok": closed})
+    if not closed:
+        raise RuntimeError(
+            f"Rollback could not close the current backing: {rollback_close!r}"
+        )
+
+    _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "remote"
+    _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
+    _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT = None
+    rollback_finalize = finalize_cpu_offload_graph_static_alias()
+    if rollback_finalize.get("ok") is not True:
+        raise RuntimeError(
+            f"Rollback could not materialize the old class: {rollback_finalize!r}"
+        )
+    if pre_state == "remote_parked":
+        rollback_park = dict(
+            uvm_static_alias.driver_static_alias_park(
+                int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
+                device=device,
+                synchronize=False,
+            )
+        )
+        if rollback_park.get("ok") is not True:
+            raise RuntimeError(
+                f"Rollback PARK after rematerialization failed: {rollback_park!r}"
+            )
+        _set_uvm_original_alias_parked_state(rollback_park)
+
+    if int(_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES) != int(
+        old_backing_bytes
+    ):
+        raise RuntimeError("Rollback rebuilt an unexpected backing size")
+    if pre_state != _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE:
+        raise RuntimeError("Rollback rebuild did not restore the lifecycle state")
+    if _uvm_original_parameter_va_snapshot() != parameter_vas:
+        raise RuntimeError("Rollback rebuild changed Parameter VAs")
+    if tuple(
+        int(arena.upload.data_ptr())
+        for _, arena in sorted(_CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS.items())
+    ) != upload_vas:
+        raise RuntimeError("Rollback rebuild changed upload VAs")
+    if tuple(
+        int(binding.source.data_ptr())
+        for _, binding in sorted(_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items())
+        if binding.source is not None
+    ) != source_vas:
+        raise RuntimeError("Rollback rebuild changed pinned source VAs")
+    return {
+        "ok": True,
+        "mode": "backing_rematerialized",
+        "retained_error": retained_error,
+        "destroy": rollback_destroy,
+        "slot_close": rollback_close,
+        "finalize": rollback_finalize,
+        "park": rollback_park,
+        "wall_ns": time.perf_counter_ns() - started_ns,
+    }
+
+
+def switch_cpu_offload_uvm_original_va_plan_class(
+    class_name: str,
+    *,
+    reason: str,
+    graphs_retained: bool,
+    expected_selected_bytes: int | None = None,
+    pressure: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Switch one fixed class while keeping all Graph-visible VAs alive."""
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ACTIVE_PLAN_CLASS
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+    global _CPU_OFFLOAD_UVM_PLAN_GENERATION
+
+    target_class = _normalize_uvm_plan_class_name(class_name)
+    if target_class not in _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS:
+        return {
+            "ok": False,
+            "reason": "plan_class_not_registered",
+            "class_name": target_class,
+        }
+    if graphs_retained is not True:
+        raise RuntimeError(
+            "Stable class switching requires an explicit retained-Graph contract"
+        )
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("Plan-class switching requires a non-empty reason")
+    pressure_record = dict(pressure or {})
+    json.dumps(pressure_record, sort_keys=True)
+
+    with _CPU_OFFLOAD_UVM_STATIC_ALIAS_LOCK:
+        old_class = _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ACTIVE_PLAN_CLASS
+        if old_class == target_class:
+            return {
+                "ok": True,
+                "reason": "plan_class_already_active",
+                "old_class": old_class,
+                "new_class": target_class,
+                "generation": int(_CPU_OFFLOAD_UVM_PLAN_GENERATION),
+            }
+        if old_class not in _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS:
+            raise RuntimeError("The active stable plan class is not registered")
+        pre_state = _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+        if pre_state not in ("sealed", "remote_parked"):
+            raise RuntimeError(
+                "Stable class switching requires sealed/parked state, got "
+                f"{pre_state!r}"
+            )
+        if pre_state == "remote_parked" and not (
+            _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+        ):
+            raise RuntimeError(
+                "A parked plan class requires an active remote-read topology"
+            )
+        if not _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS:
+            raise RuntimeError("Stable class switching found no bindings")
+
+        target_plan = _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS[target_class]
+        old_plan = dict(_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER)
+        old_plan_file = _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE
+        old_geometry = _uvm_original_alias_plan_geometry(old_plan)
+        raw_target_geometry = _uvm_original_alias_plan_geometry(target_plan)
+        target_geometry, slot_assignment = (
+            _uvm_original_alias_stabilize_plan_slots(
+                old_geometry,
+                raw_target_geometry,
+            )
+        )
+        active_target_plan: dict[int, tuple[int, ...]] = {}
+        for full_name, values in target_geometry.items():
+            expert_ids = values[0]
+            if expert_ids is None:
+                continue
+            layer_index = _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN[
+                full_name
+            ].layer_index
+            previous = active_target_plan.setdefault(
+                layer_index, tuple(int(value) for value in expert_ids)
+            )
+            if previous != tuple(expert_ids):
+                raise RuntimeError(
+                    "Stable slot assignment differs within one expert layer"
+                )
+        old_selected_bytes = sum(value[2] for value in old_geometry.values())
+        new_selected_bytes = sum(value[2] for value in target_geometry.values())
+        if (
+            expected_selected_bytes is not None
+            and new_selected_bytes != int(expected_selected_bytes)
+        ):
+            raise RuntimeError(
+                "Plan class selected an unexpected byte count: "
+                f"actual={new_selected_bytes}, expected={expected_selected_bytes}"
+            )
+        if new_selected_bytes > _CPU_OFFLOAD_MAX_BYTES:
+            raise RuntimeError(
+                "Plan class exceeds configured CPU-offload budget: "
+                f"selected={new_selected_bytes}, budget={_CPU_OFFLOAD_MAX_BYTES}"
+            )
+
+        device = int(_CPU_OFFLOAD_OWNER_DEVICE_INDEX or 0)
+        parameter_vas = _uvm_original_parameter_va_snapshot()
+        upload_vas = tuple(
+            int(arena.upload.data_ptr())
+            for _, arena in sorted(_CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS.items())
+        )
+        source_vas = tuple(
+            int(binding.source.data_ptr())
+            for _, binding in sorted(
+                _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+            )
+            if binding.source is not None
+        )
+        if len(source_vas) != len(_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS):
+            raise RuntimeError("Stable class switching requires every pinned source")
+        old_remote_map_active = bool(_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE)
+        old_remote_map_result = (
+            dict(_CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT)
+            if _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT is not None
+            else None
+        )
+        old_backing_bytes = int(_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES)
+        target_backing_bytes = 0
+        for arena in _CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS.values():
+            arena_widths = {
+                int(target_geometry[binding.full_parameter_name][2])
+                for binding in _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.values()
+                if binding.arena is arena
+            }
+            if len(arena_widths) != 1:
+                raise RuntimeError(
+                    "Target class has inconsistent widths in one stable arena"
+                )
+            target_backing_bytes += arena_widths.pop()
+        same_capacity = target_backing_bytes == old_backing_bytes
+        started_ns = time.perf_counter_ns()
+        park_result: dict[str, Any] | None = None
+        rebind_result: dict[str, Any] | None = None
+        destroy_result: dict[str, Any] | None = None
+        close_result: dict[str, Any] | None = None
+        finalize_result: dict[str, Any] | None = None
+        residency_result: dict[str, Any] | None = None
+        source_refill_result: dict[str, Any] | None = None
+        preallocate_result: dict[str, Any] | None = None
+        resume_result: dict[str, Any] | None = None
+        rollback_result: dict[str, Any] | None = None
+        old_map_entries: tuple[
+            tuple[int, int, int, int, int, int, int], ...
+        ] = ()
+        target_map_entries: tuple[
+            tuple[int, int, int, int, int, int, int], ...
+        ] = ()
+        added_preallocate_entries: tuple[
+            tuple[int, int, int, int, int, int, int], ...
+        ] = ()
+        rollback_preallocate_entries: tuple[
+            tuple[int, int, int, int, int, int, int], ...
+        ] = ()
+        old_consumer_entries: tuple[
+            tuple[int, int, int, int, int, int, int], ...
+        ] = ()
+        rebind_committed = False
+        old_session_destroyed = False
+        fast_rollback_safe = True
+        try:
+            from vllm.device_allocator import uvm, uvm_static_alias
+
+            pte_flags = next(
+                iter(_CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS.values())
+            ).pte_flags
+            old_map_entries = tuple(
+                _uvm_original_alias_map_entries(pte_flags)
+            )
+            old_consumer_entries = tuple(
+                entry
+                for entry in old_map_entries
+                if not (
+                    entry[3]
+                    & uvm_static_alias.UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW
+                )
+            )
+            torch.cuda.synchronize(device)
+            if pre_state == "sealed":
+                park_result = dict(
+                    uvm_static_alias.driver_static_alias_park(
+                        int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
+                        device=device,
+                        synchronize=False,
+                    )
+                )
+                if park_result.get("side_effect_indeterminate") or (
+                    park_result.get("poisoned")
+                    and park_result.get("ok") is not True
+                ):
+                    fast_rollback_safe = False
+                if park_result.get("ok") is not True:
+                    raise RuntimeError(
+                        f"PARK before class switch failed: {park_result!r}"
+                    )
+                _set_uvm_original_alias_parked_state(park_result)
+
+            _apply_uvm_original_alias_plan_geometry(
+                target_geometry, refill_sources=False
+            )
+            source_refill_result = _refill_uvm_original_alias_plan_delta(
+                old_geometry,
+                target_geometry,
+            )
+            if int(source_refill_result["changed_slot_count"]) > 0:
+                torch.cuda.synchronize(device)
+            residency_result = (
+                _prepare_uvm_original_alias_plan_residency_delta(
+                    old_geometry,
+                    target_geometry,
+                    device=device,
+                )
+            )
+            target_map_entries = tuple(
+                _uvm_original_alias_map_entries(pte_flags)
+            )
+            old_preallocate_entries = tuple(
+                (
+                    entry[4],
+                    entry[5],
+                    entry[0],
+                    entry[1],
+                    entry[2],
+                    entry[6],
+                    uvm.UVM_MOE_SLOT_REMAP_FLAG_NO_EVICT,
+                )
+                for entry in old_map_entries
+                if entry[3]
+                & uvm_static_alias.UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW
+            )
+            target_preallocate_entries = tuple(
+                _uvm_original_alias_preallocate_entries()
+            )
+            old_backing_keys = {
+                (entry[2], entry[3], entry[4])
+                for entry in old_preallocate_entries
+            }
+            target_backing_keys = {
+                (entry[2], entry[3], entry[4])
+                for entry in target_preallocate_entries
+            }
+            added_preallocate_entries = tuple(
+                entry
+                for entry in target_preallocate_entries
+                if (entry[2], entry[3], entry[4]) not in old_backing_keys
+            )
+            rollback_preallocate_entries = tuple(
+                entry
+                for entry in old_preallocate_entries
+                if (entry[2], entry[3], entry[4]) not in target_backing_keys
+            )
+            if added_preallocate_entries:
+                preallocate_result = dict(
+                    uvm.driver_slot_preallocate_ranges(
+                        added_preallocate_entries,
+                        device=device,
+                    )
+                )
+                if preallocate_result.get("ok") is not True:
+                    raise RuntimeError(
+                        "Failed to preallocate added class backing: "
+                        f"{preallocate_result!r}"
+                    )
+            else:
+                preallocate_result = {
+                    "ok": True,
+                    "reason": "no_added_backing",
+                    "requested_count": 0,
+                    "requested_bytes": 0,
+                }
+            rebind_result = dict(
+                uvm_static_alias.driver_static_alias_rebind(
+                    int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
+                    target_map_entries,
+                    device=device,
+                    synchronize=False,
+                    resize=True,
+                    expected_backing_bytes=target_backing_bytes,
+                )
+            )
+            if rebind_result.get("side_effect_indeterminate") or (
+                rebind_result.get("poisoned")
+                and rebind_result.get("ok") is not True
+            ):
+                fast_rollback_safe = False
+            if rebind_result.get("ok") is not True:
+                raise RuntimeError(
+                    f"Static-alias resizing REBIND failed: {rebind_result!r}"
+                )
+            rebind_committed = True
+            if pre_state == "sealed":
+                resume_result = dict(
+                    uvm_static_alias.driver_static_alias_resume(
+                        int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
+                        device=device,
+                        synchronize=False,
+                    )
+                )
+                if resume_result.get("side_effect_indeterminate") or (
+                    resume_result.get("poisoned")
+                    and resume_result.get("ok") is not True
+                ):
+                    fast_rollback_safe = False
+                if resume_result.get("ok") is not True:
+                    raise RuntimeError(
+                        f"RESUME after resizing REBIND failed: {resume_result!r}"
+                    )
+                _set_uvm_original_alias_sealed_state(resume_result)
+
+            if _uvm_original_parameter_va_snapshot() != parameter_vas:
+                raise RuntimeError("Parameter VAs changed during stable class switch")
+            if tuple(
+                int(arena.upload.data_ptr())
+                for _, arena in sorted(_CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS.items())
+            ) != upload_vas:
+                raise RuntimeError("Upload VAs changed during stable class switch")
+            if tuple(
+                int(binding.source.data_ptr())
+                for _, binding in sorted(
+                    _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+                )
+                if binding.source is not None
+            ) != source_vas:
+                raise RuntimeError("Pinned source VAs changed during class switch")
+            if int(_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES) != int(
+                target_backing_bytes
+            ):
+                raise RuntimeError(
+                    "Plan-class switch materialized an unexpected backing size"
+                )
+            if pre_state != _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE:
+                raise RuntimeError(
+                    "Plan-class switch changed the serving lifecycle state"
+                )
+
+            _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER = dict(
+                active_target_plan
+            )
+            _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE = (
+                _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASS_FILES[target_class]
+            )
+            _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ACTIVE_PLAN_CLASS = target_class
+            _CPU_OFFLOAD_UVM_PLAN_GENERATION += 1
+            result = {
+                "schema": "vllm_uvm_incremental_plan_class_switch_v2",
+                "ok": True,
+                "reason": reason,
+                "old_class": old_class,
+                "new_class": target_class,
+                "generation": int(_CPU_OFFLOAD_UVM_PLAN_GENERATION),
+                "pre_state": pre_state,
+                "post_state": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE,
+                "same_capacity_rebind": bool(same_capacity),
+                "incremental_topology": True,
+                "session_reused": True,
+                "graphs_retained": True,
+                "old_selected_bytes": int(old_selected_bytes),
+                "new_selected_bytes": int(new_selected_bytes),
+                "old_backing_bytes": old_backing_bytes,
+                "new_backing_bytes": int(
+                    _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES
+                ),
+                "stable_envelope_bytes": int(
+                    _CPU_OFFLOAD_UVM_STATIC_ALIAS_ENVELOPE_BYTES
+                ),
+                "parameter_vas": parameter_vas,
+                "upload_vas": upload_vas,
+                "source_vas": source_vas,
+                "pressure": pressure_record,
+                "slot_assignment": slot_assignment,
+                "park": park_result,
+                "source_refill": source_refill_result,
+                "source_refill_saved_bytes": max(
+                    0,
+                    int(new_selected_bytes)
+                    - int((source_refill_result or {}).get("changed_bytes", 0)),
+                ),
+                "preallocate": preallocate_result,
+                "rebind": rebind_result,
+                "resume": resume_result,
+                "retained_backing_count": int(
+                    (rebind_result or {}).get("retained_backing_count", 0)
+                ),
+                "added_backing_count": int(
+                    (rebind_result or {}).get("added_backing_count", 0)
+                ),
+                "removed_backing_count": int(
+                    (rebind_result or {}).get("removed_backing_count", 0)
+                ),
+                "destroy": destroy_result,
+                "slot_close": close_result,
+                "finalize": finalize_result,
+                "residency": residency_result,
+                "wall_ns": time.perf_counter_ns() - started_ns,
+            }
+            _CPU_OFFLOAD_UVM_PLAN_CLASS_SWITCH_HISTORY.append(result)
+            _append_cpu_offload_manifest(
+                {
+                    "event": "cpu_offload_uvm_stable_plan_class_switched",
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    **result,
+                }
+            )
+            return result
+        except Exception as exc:
+            rollback_error: Exception | None = None
+            _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER = old_plan
+            _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE = old_plan_file
+            _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ACTIVE_PLAN_CLASS = old_class
+            try:
+                rollback_result = (
+                    _rollback_uvm_original_alias_plan_class_switch(
+                        old_geometry=old_geometry,
+                        target_geometry=target_geometry,
+                        old_consumer_entries=old_consumer_entries,
+                        pre_state=pre_state,
+                        same_capacity=same_capacity,
+                        rebind_committed=rebind_committed,
+                        fast_rollback_safe=fast_rollback_safe,
+                        old_session_destroyed=old_session_destroyed,
+                        old_backing_bytes=old_backing_bytes,
+                        parameter_vas=parameter_vas,
+                        upload_vas=upload_vas,
+                        source_vas=source_vas,
+                        old_remote_map_active=old_remote_map_active,
+                        old_remote_map_result=old_remote_map_result,
+                        device=device,
+                        old_map_entries=old_map_entries,
+                        rollback_preallocate_entries=(
+                            rollback_preallocate_entries
+                        ),
+                        orphan_preallocate_entries=added_preallocate_entries,
+                    )
+                )
+            except Exception as rollback_exc:
+                rollback_error = rollback_exc
+                _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "poisoned"
+                _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
+                rollback_result = {
+                    "ok": False,
+                    "reason": "driver_topology_rollback_failed",
+                    "error": repr(rollback_exc),
+                }
+            failed = {
+                "schema": "vllm_uvm_incremental_plan_class_switch_v2",
+                "ok": False,
+                "reason": reason,
+                "old_class": old_class,
+                "new_class": target_class,
+                "pre_state": pre_state,
+                "post_state": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE,
+                "same_capacity_rebind": bool(same_capacity),
+                "incremental_topology": True,
+                "graphs_retained": True,
+                "pressure": pressure_record,
+                "slot_assignment": slot_assignment,
+                "park": park_result,
+                "source_refill": source_refill_result,
+                "preallocate": preallocate_result,
+                "rebind": rebind_result,
+                "resume": resume_result,
+                "destroy": destroy_result,
+                "slot_close": close_result,
+                "finalize": finalize_result,
+                "residency": residency_result,
+                "rollback": rollback_result,
+                "error": repr(exc),
+                "wall_ns": time.perf_counter_ns() - started_ns,
+            }
+            _CPU_OFFLOAD_UVM_PLAN_CLASS_SWITCH_HISTORY.append(failed)
+            _append_cpu_offload_manifest(
+                {
+                    "event": "cpu_offload_uvm_stable_plan_class_switch_failed",
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    **failed,
+                }
+            )
+            if rollback_error is not None:
+                raise RuntimeError(
+                    "Stable plan-class switch and driver topology rollback "
+                    "both failed; the process is poisoned"
+                ) from rollback_error
+            return failed
+
+
+def rebuild_cpu_offload_uvm_original_va_expert_plan(
+    expert_plan_file: str,
+    *,
+    reason: str,
+    graphs_destroyed: bool,
+    expected_selected_bytes: int | None = None,
+    pressure: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Rebuild one original-VA expert plan at an idle request boundary.
+
+    The complete expert Parameters stay in their original managed allocations.
+    Long-lived module-forward closures retain their binding objects; this
+    function replaces the arena/source/range fields of those objects in place.
+    Consequently Parameter objects and VAs do not change, while both the
+    prefill upload plan and decode remote-read ranges can change.
+
+    Concrete CUDA Graphs must be reset by their model-runner owner first.  The
+    caller must recapture them after this function returns a sealed topology.
+    """
+    global _CPU_OFFLOAD_BYTES
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS
+    global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT
+    global _CPU_OFFLOAD_UVM_PLAN_GENERATION
+
+    if not cpu_offload_uvm_original_va_static_alias_enabled():
+        raise RuntimeError("Dynamic expert-plan rebuild requires original-VA aliases")
+    if _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE != "prefill_graph_remote_decode":
+        raise RuntimeError(
+            "Dynamic expert-plan rebuild currently requires "
+            "prefill_graph_remote_decode"
+        )
+    if graphs_destroyed is not True:
+        raise RuntimeError(
+            "Dynamic expert-plan rebuild requires every concrete CUDA Graph "
+            "to be reset first"
+        )
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("Dynamic expert-plan rebuild requires a non-empty reason")
+    plan_path = os.path.realpath(str(expert_plan_file).strip())
+    if not plan_path or not os.path.isfile(plan_path):
+        raise ValueError(f"Dynamic expert plan is absent: {expert_plan_file!r}")
+    if expected_selected_bytes is not None and expected_selected_bytes <= 0:
+        raise ValueError("expected_selected_bytes must be positive when provided")
+    pressure_record = dict(pressure or {})
+    try:
+        json.dumps(pressure_record, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pressure metadata must be JSON serializable") from exc
+
+    with _CPU_OFFLOAD_UVM_STATIC_ALIAS_LOCK:
+        pre_state = _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+        if pre_state not in ("sealed", "remote", "remote_parked"):
+            raise RuntimeError(
+                "Dynamic expert-plan rebuild requires a stable serving "
+                f"topology, got {pre_state!r}"
+            )
+        if not _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS:
+            raise RuntimeError("Dynamic expert-plan rebuild found no bindings")
+
+        new_experts = _load_graph_static_alias_expert_plan(
+            plan_path,
+            _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN,
+        )
+        old_experts = dict(_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER)
+        old_plan_path = _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE
+        old_bindings = dict(_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS)
+        old_arenas = dict(_CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS)
+        parameter_vas_before = _uvm_original_parameter_va_snapshot()
+        if (
+            _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT
+            and parameter_vas_before != _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT
+        ):
+            raise RuntimeError("Parameter VAs changed before dynamic plan rebuild")
+
+        started_ns = time.perf_counter_ns()
+        synchronized_ns = started_ns
+        destroyed_ns = started_ns
+        bindings_rebuilt_ns = started_ns
+        hot_restored_ns = started_ns
+        destroy_result: dict[str, Any] | None = None
+        hot_restore: dict[str, Any] | None = None
+        finalize_result: dict[str, Any] | None = None
+        attempted_generation = _CPU_OFFLOAD_UVM_PLAN_GENERATION + 1
+        try:
+            device = int(_CPU_OFFLOAD_OWNER_DEVICE_INDEX or 0)
+            torch.cuda.synchronize(device)
+            synchronized_ns = time.perf_counter_ns()
+
+            destroy_result = destroy_cpu_offload_graph_static_alias(
+                graphs_destroyed=True,
+                synchronize=False,
+            )
+            if destroy_result.get("ok") is not True:
+                raise RuntimeError(
+                    "Failed to release the previous alias session before "
+                    f"dynamic rebuild: {destroy_result!r}"
+                )
+            destroyed_ns = time.perf_counter_ns()
+            _reset_uvm_original_va_graph_certificates_for_plan_rebuild()
+
+            _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE = plan_path
+            _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER = new_experts
+            _CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS = {}
+            _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS = {}
+            _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES = 0
+            _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "collecting"
+            _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
+            _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT = None
+
+            for full_name, retained in sorted(old_bindings.items()):
+                current = retained.parameter.data
+                if int(current.data_ptr()) != int(retained.consumer.data_ptr()):
+                    raise RuntimeError(
+                        "A Parameter changed VA while rebuilding its expert plan: "
+                        f"{full_name!r}"
+                    )
+                replacement = _create_uvm_original_alias_binding(
+                    full_parameter_name=full_name,
+                    parameter=retained.parameter,
+                    tensor=retained.consumer,
+                    device=current.device,
+                    requested_bytes=int(retained.parameter_bytes),
+                )
+                retained.arena = replacement.arena
+                retained.consumer = replacement.consumer
+                retained.plan = replacement.plan
+                retained.requested_bytes = replacement.requested_bytes
+                retained.parameter_bytes = replacement.parameter_bytes
+                retained.expert_ids = replacement.expert_ids
+                retained.expert_stride_bytes = replacement.expert_stride_bytes
+                retained.consumer_ranges = replacement.consumer_ranges
+                retained.source = None
+                replacement.arena.consumers[replacement.plan.consumer_index] = (
+                    retained
+                )
+                retained.parameter._vllm_uvm_original_alias_binding = retained
+
+            _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS = old_bindings
+            selected_bytes = sum(
+                int(binding.requested_bytes) for binding in old_bindings.values()
+            )
+            if (
+                expected_selected_bytes is not None
+                and selected_bytes != int(expected_selected_bytes)
+            ):
+                raise RuntimeError(
+                    "Dynamic expert plan selected an unexpected byte count: "
+                    f"actual={selected_bytes}, expected={expected_selected_bytes}"
+                )
+            if selected_bytes > _CPU_OFFLOAD_MAX_BYTES:
+                raise RuntimeError(
+                    "Dynamic expert plan exceeds the configured offload budget: "
+                    f"selected={selected_bytes}, budget={_CPU_OFFLOAD_MAX_BYTES}"
+                )
+            _CPU_OFFLOAD_BYTES = selected_bytes
+            bindings_rebuilt_ns = time.perf_counter_ns()
+
+            # Experts removed from the cold set may still carry the previous
+            # request's CPU remote mapping.  Restore the complete complement to
+            # GPU before finalize audits the new hot/cold partition.
+            from vllm.device_allocator import uvm
+
+            hot_ranges = [
+                hot_range
+                for _, binding in sorted(old_bindings.items())
+                for hot_range in _uvm_original_alias_binding_hot_ranges(binding)
+            ]
+            hot_bytes = sum(length for _, length in hot_ranges)
+            torch.cuda.empty_cache()
+            advised = int(
+                uvm.batch_advise_ranges_preferred_location(hot_ranges, device)
+            )
+            prefetched, executor, driver_result = (
+                uvm.batch_prefetch_ranges_to_device_with_executor(
+                    hot_ranges,
+                    device,
+                    executor="cpp_batch",
+                )
+            )
+            if advised != len(hot_ranges) or int(prefetched) != len(hot_ranges):
+                raise RuntimeError(
+                    "Failed to restore every new hot expert range before "
+                    "dynamic finalize: "
+                    f"advised={advised}, prefetched={prefetched}, "
+                    f"expected={len(hot_ranges)}, executor={executor!r}, "
+                    f"driver_result={driver_result}"
+                )
+            torch.cuda.synchronize(device)
+            hot_residency = dict(
+                uvm.driver_batch_query_ranges_residency_bytes(
+                    hot_ranges,
+                    device=device,
+                    wait_for_trackers=False,
+                )
+            )
+            if hot_ranges and not (
+                hot_residency.get("ok") is True
+                and int(hot_residency.get("queried_bytes", -1)) == hot_bytes
+                and int(hot_residency.get("gpu_bytes", -1)) == hot_bytes
+                and int(hot_residency.get("cpu_bytes", -1)) == 0
+                and int(hot_residency.get("unknown_bytes", -1)) == 0
+            ):
+                raise RuntimeError(
+                    "New hot expert residency is incomplete before dynamic "
+                    f"finalize: {hot_residency!r}"
+                )
+            hot_restore = {
+                "range_count": len(hot_ranges),
+                "bytes": int(hot_bytes),
+                "advised_count": advised,
+                "prefetched_count": int(prefetched),
+                "executor": str(executor),
+                "driver_result": int(driver_result),
+                "residency": hot_residency,
+            }
+            hot_restored_ns = time.perf_counter_ns()
+
+            finalize_result = finalize_cpu_offload_graph_static_alias()
+            if finalize_result.get("ok") is not True:
+                raise RuntimeError(
+                    f"Dynamic expert-plan finalize failed: {finalize_result!r}"
+                )
+            parameter_vas_after = _uvm_original_parameter_va_snapshot()
+            if parameter_vas_after != parameter_vas_before:
+                raise RuntimeError("Parameter VAs changed during dynamic plan rebuild")
+            _CPU_OFFLOAD_UVM_PLAN_GENERATION = attempted_generation
+            finished_ns = time.perf_counter_ns()
+            with open(plan_path, "rb") as plan_handle:
+                plan_sha256 = hashlib.sha256(plan_handle.read()).hexdigest()
+            result = {
+                "event": "cpu_offload_uvm_original_va_plan_rebuilt",
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "ok": True,
+                "reason": reason,
+                "generation": attempted_generation,
+                "pre_state": pre_state,
+                "post_state": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE,
+                "old_plan_file": old_plan_path or None,
+                "new_plan_file": plan_path,
+                "new_plan_sha256": plan_sha256,
+                "old_selected_expert_count": sum(
+                    len(values) for values in old_experts.values()
+                ),
+                "new_selected_expert_count": sum(
+                    len(values) for values in new_experts.values()
+                ),
+                "selected_bytes": int(selected_bytes),
+                "backing_bytes": int(
+                    _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES
+                ),
+                "parameter_vas_before": parameter_vas_before,
+                "parameter_vas_after": parameter_vas_after,
+                "pressure": pressure_record,
+                "sync_ns": synchronized_ns - started_ns,
+                "alias_destroy_ns": destroyed_ns - synchronized_ns,
+                "binding_rebuild_ns": bindings_rebuilt_ns - destroyed_ns,
+                "hot_restore_ns": hot_restored_ns - bindings_rebuilt_ns,
+                "finalize_ns": finished_ns - hot_restored_ns,
+                "wall_ns": finished_ns - started_ns,
+                "destroy": destroy_result,
+                "hot_restore": hot_restore,
+                "finalize": finalize_result,
+            }
+            _CPU_OFFLOAD_UVM_PLAN_REBUILD_HISTORY.append(result)
+            _append_cpu_offload_manifest(result)
+            old_arenas.clear()
+            gc.collect()
+            return result
+        except Exception as exc:
+            _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "poisoned"
+            _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
+            failed = {
+                "event": "cpu_offload_uvm_original_va_plan_rebuilt",
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "ok": False,
+                "reason": reason,
+                "generation": attempted_generation,
+                "pre_state": pre_state,
+                "post_state": "poisoned",
+                "old_plan_file": old_plan_path or None,
+                "new_plan_file": plan_path,
+                "pressure": pressure_record,
+                "wall_ns": time.perf_counter_ns() - started_ns,
+                "destroy": destroy_result,
+                "hot_restore": hot_restore,
+                "finalize": finalize_result,
+                "error": repr(exc),
+            }
+            _CPU_OFFLOAD_UVM_PLAN_REBUILD_HISTORY.append(failed)
+            _append_cpu_offload_manifest(failed)
+            raise RuntimeError(
+                "Dynamic original-VA expert-plan rebuild failed; the process "
+                "is poisoned and must be torn down"
+            ) from exc
+
+
 def poison_cpu_offload_uvm_original_va_phase(reason: str) -> None:
     """Prevent any later selected-expert forward after a phase violation."""
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
@@ -3654,12 +5945,14 @@ def transition_cpu_offload_uvm_original_va_to_remote(
     *,
     reason: str,
     preserve_remote_graphs: bool,
+    runtime_remote_ranges: Iterable[tuple[int, int]] = (),
 ) -> dict[str, Any]:
     """Replace sealed alias PTEs with audited CPU-backed remote READ PTEs."""
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
     global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
     global _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT
     global _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_PARK_RESULT
 
     if not cpu_offload_uvm_original_va_static_alias_enabled():
         return {
@@ -3678,9 +5971,59 @@ def transition_cpu_offload_uvm_original_va_to_remote(
     if not isinstance(preserve_remote_graphs, bool):
         raise TypeError("preserve_remote_graphs must be bool")
 
+    normalized_runtime_remote_ranges: list[tuple[int, int]] = []
+    for raw_base, raw_length in runtime_remote_ranges:
+        base = int(raw_base)
+        length = int(raw_length)
+        if base <= 0 or length <= 0:
+            raise ValueError(
+                "Runtime remote expert ranges require positive base and length"
+            )
+        end = base + length
+        if end <= base:
+            raise ValueError("Runtime remote expert range overflowed")
+        normalized_runtime_remote_ranges.append((base, length))
+    normalized_runtime_remote_ranges.sort()
+    merged_runtime_remote_ranges: list[tuple[int, int]] = []
+    for base, length in normalized_runtime_remote_ranges:
+        end = base + length
+        if not merged_runtime_remote_ranges:
+            merged_runtime_remote_ranges.append((base, length))
+            continue
+        previous_base, previous_length = merged_runtime_remote_ranges[-1]
+        previous_end = previous_base + previous_length
+        if base > previous_end:
+            merged_runtime_remote_ranges.append((base, length))
+            continue
+        merged_runtime_remote_ranges[-1] = (
+            previous_base,
+            max(previous_end, end) - previous_base,
+        )
+
+    def runtime_remote_overlap_bytes(
+        ranges: Iterable[tuple[int, int]],
+    ) -> int:
+        overlap_bytes = 0
+        for raw_base, raw_length in ranges:
+            base = int(raw_base)
+            end = base + int(raw_length)
+            for remote_base, remote_length in merged_runtime_remote_ranges:
+                remote_end = remote_base + remote_length
+                if remote_end <= base:
+                    continue
+                if remote_base >= end:
+                    break
+                overlap_bytes += max(
+                    0,
+                    min(end, remote_end) - max(base, remote_base),
+                )
+        return overlap_bytes
+
     with _CPU_OFFLOAD_UVM_STATIC_ALIAS_LOCK:
         pre_state = _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
-        if pre_state == "remote" and _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE:
+        if pre_state in ("remote", "remote_parked") and (
+            _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+        ):
             return {
                 "ok": True,
                 "reason": "already_remote",
@@ -3688,7 +6031,7 @@ def transition_cpu_offload_uvm_original_va_to_remote(
                 "post_state": pre_state,
                 "remote_map": _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT,
             }
-        if pre_state not in ("sealed", "remote"):
+        if pre_state not in ("sealed", "remote", "remote_parked"):
             raise RuntimeError(
                 "Cannot establish original-VA remote topology from state "
                 f"{pre_state!r}"
@@ -3703,6 +6046,7 @@ def transition_cpu_offload_uvm_original_va_to_remote(
             raise RuntimeError("Original Parameter VAs changed before remote cutover")
         _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT = parameter_vas_before
         destroy_result: dict[str, Any] | None = None
+        park_result: dict[str, Any] | None = None
         remote_map: dict[str, Any] | None = None
         physical: dict[str, Any] | None = None
         synchronized_ns = started_ns
@@ -3713,16 +6057,33 @@ def transition_cpu_offload_uvm_original_va_to_remote(
             torch.cuda.synchronize(device)
             synchronized_ns = time.perf_counter_ns()
             if pre_state == "sealed":
-                destroy_result = destroy_cpu_offload_graph_static_alias(
-                    graphs_destroyed=not preserve_remote_graphs,
-                    synchronize=True,
-                    remote_graphs_preserved=preserve_remote_graphs,
-                )
-                if not bool(destroy_result.get("ok")):
-                    raise RuntimeError(
-                        "Failed to detach original-VA aliases before remote map: "
-                        f"{destroy_result!r}"
+                if _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED:
+                    from vllm.device_allocator import uvm_static_alias
+
+                    park_result = dict(
+                        uvm_static_alias.driver_static_alias_park(
+                            int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
+                            device=device,
+                            synchronize=False,
+                        )
                     )
+                    _CPU_OFFLOAD_UVM_STATIC_ALIAS_PARK_RESULT = park_result
+                    if not bool(park_result.get("ok")):
+                        raise RuntimeError(
+                            "Failed to park original-VA consumer aliases before "
+                            f"remote map: {park_result!r}"
+                        )
+                else:
+                    destroy_result = destroy_cpu_offload_graph_static_alias(
+                        graphs_destroyed=not preserve_remote_graphs,
+                        synchronize=True,
+                        remote_graphs_preserved=preserve_remote_graphs,
+                    )
+                    if not bool(destroy_result.get("ok")):
+                        raise RuntimeError(
+                            "Failed to detach original-VA aliases before remote map: "
+                            f"{destroy_result!r}"
+                        )
             destroyed_ns = time.perf_counter_ns()
 
             _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "remote_mapping"
@@ -3795,6 +6156,10 @@ def transition_cpu_offload_uvm_original_va_to_remote(
                 for hot_range in _uvm_original_alias_binding_hot_ranges(binding)
             ]
             hot_requested_bytes = sum(length for _, length in hot_ranges)
+            hot_runtime_remote_bytes = runtime_remote_overlap_bytes(hot_ranges)
+            hot_expected_gpu_bytes = (
+                hot_requested_bytes - hot_runtime_remote_bytes
+            )
             hot_physical = dict(
                 uvm.driver_batch_query_ranges_residency_bytes(
                     hot_ranges,
@@ -3807,8 +6172,9 @@ def transition_cpu_offload_uvm_original_va_to_remote(
                 and int(hot_physical.get("queried_bytes", -1))
                 == hot_requested_bytes
                 and int(hot_physical.get("gpu_bytes", -1))
-                == hot_requested_bytes
-                and int(hot_physical.get("cpu_bytes", -1)) == 0
+                == hot_expected_gpu_bytes
+                and int(hot_physical.get("cpu_bytes", -1))
+                == hot_runtime_remote_bytes
                 and int(hot_physical.get("any_bytes", -1))
                 == hot_requested_bytes
                 and int(hot_physical.get("unknown_bytes", -1)) == 0
@@ -3820,12 +6186,19 @@ def transition_cpu_offload_uvm_original_va_to_remote(
 
             parameter_vas_after = _uvm_original_parameter_va_snapshot()
             if parameter_vas_after != parameter_vas_before:
-                raise RuntimeError("Original Parameter VAs changed during remote cutover")
+                raise RuntimeError(
+                    "Original Parameter VAs changed during remote cutover"
+                )
             finished_ns = time.perf_counter_ns()
             _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT = remote_map
             _CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY.append(dict(remote_map))
             _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = True
-            _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "remote"
+            post_state = (
+                "remote_parked"
+                if _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED
+                else "remote"
+            )
+            _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = post_state
             result = {
                 "event": "cpu_offload_uvm_original_va_remote_transition",
                 "timestamp": time.time(),
@@ -3833,9 +6206,13 @@ def transition_cpu_offload_uvm_original_va_to_remote(
                 "ok": True,
                 "reason": reason,
                 "pre_state": pre_state,
-                "post_state": "remote",
+                "post_state": post_state,
                 "sync_ns": synchronized_ns - started_ns,
                 "destroy_ns": destroyed_ns - synchronized_ns,
+                "alias_detach_ns": destroyed_ns - synchronized_ns,
+                "alias_detach_operation": (
+                    "park" if park_result is not None else "destroy"
+                ),
                 "remote_map_ns": mapped_ns - destroyed_ns,
                 "physical_audit_ns": finished_ns - mapped_ns,
                 "wall_ns": finished_ns - started_ns,
@@ -3843,12 +6220,21 @@ def transition_cpu_offload_uvm_original_va_to_remote(
                 "parameter_vas_after": parameter_vas_after,
                 "preserve_remote_graphs": bool(preserve_remote_graphs),
                 "destroy": destroy_result,
+                "park": park_result,
                 "remote_map": remote_map,
                 "physical_residency": physical,
                 "hot_physical_residency": hot_physical,
                 "remote_range_count": len(ranges),
                 "hot_range_count": len(hot_ranges),
                 "hot_requested_bytes": int(hot_requested_bytes),
+                "runtime_remote_range_count": len(
+                    merged_runtime_remote_ranges
+                ),
+                "runtime_remote_bytes": sum(
+                    length for _, length in merged_runtime_remote_ranges
+                ),
+                "hot_runtime_remote_bytes": int(hot_runtime_remote_bytes),
+                "hot_expected_gpu_bytes": int(hot_expected_gpu_bytes),
             }
             _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY.append(result)
             _append_cpu_offload_manifest(result)
@@ -3874,12 +6260,17 @@ def transition_cpu_offload_uvm_original_va_to_remote(
                 "post_state": "poisoned",
                 "sync_ns": synchronized_ns - started_ns,
                 "destroy_ns": destroyed_ns - synchronized_ns,
+                "alias_detach_ns": destroyed_ns - synchronized_ns,
+                "alias_detach_operation": (
+                    "park" if park_result is not None else "destroy"
+                ),
                 "remote_map_ns": mapped_ns - destroyed_ns,
                 "wall_ns": finished_ns - started_ns,
                 "parameter_vas_before": parameter_vas_before,
                 "parameter_vas_after": failed_parameter_vas_after,
                 "preserve_remote_graphs": bool(preserve_remote_graphs),
                 "destroy": destroy_result,
+                "park": park_result,
                 "remote_map": remote_map,
                 "physical_residency": physical,
             }
@@ -3902,6 +6293,280 @@ def initialize_cpu_offload_uvm_original_va_phase_topology() -> dict[str, Any]:
     )
 
 
+def reconcile_cpu_offload_uvm_original_va_remote_graph_residency() -> dict[str, Any]:
+    """Repair and audit expert residency immediately before Graph capture.
+
+    ``remote_only`` establishes its PTE topology directly after model load.
+    Memory profiling and KV-cache allocation happen later and may evict an
+    otherwise-hot managed expert.  A CUDA Graph cannot service that first
+    access as a normal UVM fault, so re-establish the complete cold/hot
+    placement after those allocations and fail before capture unless it is
+    exact and leaves a configured amount of free device memory.
+    """
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+
+    if not cpu_offload_uvm_original_va_static_alias_enabled():
+        return {"ok": True, "reason": "disabled"}
+
+    raw_min_free = os.environ.get(
+        "VLLM_UVM_ORIGINAL_VA_GRAPH_MIN_FREE_BYTES",
+        str(256 * 1024 * 1024),
+    ).strip()
+    try:
+        min_free_bytes = int(raw_min_free)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_UVM_ORIGINAL_VA_GRAPH_MIN_FREE_BYTES must be an integer"
+        ) from exc
+    if min_free_bytes < 0:
+        raise ValueError(
+            "VLLM_UVM_ORIGINAL_VA_GRAPH_MIN_FREE_BYTES must be non-negative"
+        )
+
+    with _CPU_OFFLOAD_UVM_STATIC_ALIAS_LOCK:
+        pre_state = _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+        if pre_state not in ("remote", "remote_parked") or not (
+            _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+        ):
+            raise RuntimeError(
+                "Graph residency reconciliation requires an audited active "
+                f"remote topology; state={pre_state!r}, "
+                f"remote_map_active={_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE!r}"
+            )
+
+        started_ns = time.perf_counter_ns()
+        parameter_vas_before = _uvm_original_parameter_va_snapshot()
+        remote_map: dict[str, Any] | None = None
+        cold_physical: dict[str, Any] | None = None
+        hot_physical: dict[str, Any] | None = None
+        hot_advise_count = 0
+        hot_prefetch_count = 0
+        hot_prefetch_executor = "none"
+        hot_prefetch_driver_result = 0
+        cold_range_count = 0
+        hot_range_count = 0
+        cold_bytes = 0
+        hot_bytes = 0
+        free_bytes = -1
+        total_bytes = -1
+        try:
+            from vllm.device_allocator import uvm
+
+            device = int(_CPU_OFFLOAD_OWNER_DEVICE_INDEX or 0)
+            torch.cuda.synchronize(device)
+            # Profile/autotune tensors can remain in PyTorch's cache even
+            # after their Python owners are gone.  Return those blocks before
+            # asking UVM to restore every hot expert.
+            torch.cuda.empty_cache()
+
+            cold_ranges = [
+                consumer_range
+                for _, binding in sorted(
+                    _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+                )
+                for consumer_range in (
+                    _uvm_original_alias_binding_consumer_ranges(binding)
+                )
+            ]
+            hot_ranges = [
+                hot_range
+                for _, binding in sorted(
+                    _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+                )
+                for hot_range in _uvm_original_alias_binding_hot_ranges(binding)
+            ]
+            cold_range_count = len(cold_ranges)
+            hot_range_count = len(hot_ranges)
+            cold_bytes = sum(length for _, length in cold_ranges)
+            hot_bytes = sum(length for _, length in hot_ranges)
+
+            # Reinstall the audited CPU remote-read mapping.  This is
+            # deliberately repeated after KV allocation so the capture gate
+            # proves the current topology rather than trusting model-load
+            # metadata.
+            remote_map = dict(
+                uvm.driver_prepare_ranges_remote_read_audited(
+                    cold_ranges,
+                    device=device,
+                )
+            )
+            remote_contract_ok = (
+                remote_map.get("ok") is True
+                and int(remote_map.get("requested_count", -1))
+                == len(cold_ranges)
+                and int(remote_map.get("success_count", -1))
+                == len(cold_ranges)
+                and int(remote_map.get("failure_count", -1)) == 0
+                and int(remote_map.get("requested_bytes", -1)) == cold_bytes
+                and int(remote_map.get("cpu_resident_bytes", -1)) >= cold_bytes
+                and int(remote_map.get("remote_mapped_bytes", -1)) >= cold_bytes
+                and int(remote_map.get("covered_bytes", -1)) >= cold_bytes
+                and int(remote_map.get("unknown_bytes", -1)) == 0
+            )
+            if not remote_contract_ok:
+                raise RuntimeError(
+                    "Cold expert remote-read reconciliation was incomplete: "
+                    f"{remote_map!r}"
+                )
+
+            if hot_ranges:
+                hot_advise_count = int(
+                    uvm.batch_advise_ranges_preferred_location(
+                        hot_ranges,
+                        device,
+                    )
+                )
+                if hot_advise_count != len(hot_ranges):
+                    raise RuntimeError(
+                        "Failed to set GPU preferred location for every hot "
+                        "expert range: "
+                        f"advised={hot_advise_count}, expected={len(hot_ranges)}"
+                    )
+                (
+                    hot_prefetch_count,
+                    hot_prefetch_executor,
+                    hot_prefetch_driver_result,
+                ) = uvm.batch_prefetch_ranges_to_device_with_executor(
+                    hot_ranges,
+                    device,
+                    executor="cpp_batch",
+                )
+                if int(hot_prefetch_count) != len(hot_ranges):
+                    raise RuntimeError(
+                        "Failed to restore every hot expert range to GPU: "
+                        f"prefetched={hot_prefetch_count}, "
+                        f"expected={len(hot_ranges)}, "
+                        f"executor={hot_prefetch_executor!r}, "
+                        f"driver_result={hot_prefetch_driver_result}"
+                    )
+
+            torch.cuda.synchronize(device)
+            cold_physical = dict(
+                uvm.driver_batch_query_ranges_residency_bytes(
+                    cold_ranges,
+                    device=device,
+                    wait_for_trackers=False,
+                )
+            )
+            if not (
+                cold_physical.get("ok") is True
+                and int(cold_physical.get("queried_bytes", -1)) == cold_bytes
+                and int(cold_physical.get("cpu_bytes", -1)) == cold_bytes
+                and int(cold_physical.get("gpu_bytes", -1)) == 0
+                and int(cold_physical.get("any_bytes", -1)) == cold_bytes
+                and int(cold_physical.get("unknown_bytes", -1)) == 0
+            ):
+                raise RuntimeError(
+                    "Cold experts lost exclusive CPU residency at the Graph "
+                    f"capture gate: {cold_physical!r}"
+                )
+
+            hot_physical = dict(
+                uvm.driver_batch_query_ranges_residency_bytes(
+                    hot_ranges,
+                    device=device,
+                    wait_for_trackers=False,
+                )
+            )
+            if hot_ranges and not (
+                hot_physical.get("ok") is True
+                and int(hot_physical.get("queried_bytes", -1)) == hot_bytes
+                and int(hot_physical.get("gpu_bytes", -1)) == hot_bytes
+                and int(hot_physical.get("cpu_bytes", -1)) == 0
+                and int(hot_physical.get("any_bytes", -1)) == hot_bytes
+                and int(hot_physical.get("unknown_bytes", -1)) == 0
+            ):
+                raise RuntimeError(
+                    "Hot experts were not exclusively GPU resident at the "
+                    f"Graph capture gate: {hot_physical!r}"
+                )
+
+            free_bytes, total_bytes = (
+                int(value) for value in torch.cuda.mem_get_info(device)
+            )
+            if free_bytes < min_free_bytes:
+                raise RuntimeError(
+                    "Insufficient GPU headroom after expert residency "
+                    "reconciliation: "
+                    f"free_bytes={free_bytes}, required_bytes={min_free_bytes}"
+                )
+
+            parameter_vas_after = _uvm_original_parameter_va_snapshot()
+            if parameter_vas_after != parameter_vas_before:
+                raise RuntimeError(
+                    "Original Parameter VAs changed during Graph residency "
+                    "reconciliation"
+                )
+
+            _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT = remote_map
+            _CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY.append(dict(remote_map))
+            finished_ns = time.perf_counter_ns()
+            result = {
+                "event": "cpu_offload_uvm_original_va_graph_residency_reconciled",
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "ok": True,
+                "pre_state": pre_state,
+                "post_state": pre_state,
+                "wall_ns": finished_ns - started_ns,
+                "parameter_vas_before": parameter_vas_before,
+                "parameter_vas_after": parameter_vas_after,
+                "cold_range_count": len(cold_ranges),
+                "cold_bytes": int(cold_bytes),
+                "hot_range_count": len(hot_ranges),
+                "hot_bytes": int(hot_bytes),
+                "hot_advise_count": int(hot_advise_count),
+                "hot_prefetch_count": int(hot_prefetch_count),
+                "hot_prefetch_executor": hot_prefetch_executor,
+                "hot_prefetch_driver_result": int(hot_prefetch_driver_result),
+                "remote_map": remote_map,
+                "cold_physical_residency": cold_physical,
+                "hot_physical_residency": hot_physical,
+                "free_bytes": int(free_bytes),
+                "total_bytes": int(total_bytes),
+                "minimum_free_bytes": int(min_free_bytes),
+            }
+            _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY.append(result)
+            _append_cpu_offload_manifest(result)
+            return result
+        except Exception as exc:
+            _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
+            _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "poisoned"
+            failed = {
+                "event": "cpu_offload_uvm_original_va_graph_residency_reconciled",
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "ok": False,
+                "error": repr(exc),
+                "pre_state": pre_state,
+                "post_state": "poisoned",
+                "wall_ns": time.perf_counter_ns() - started_ns,
+                "parameter_vas_before": parameter_vas_before,
+                "remote_map": remote_map,
+                "cold_physical_residency": cold_physical,
+                "hot_physical_residency": hot_physical,
+                "cold_range_count": int(cold_range_count),
+                "cold_bytes": int(cold_bytes),
+                "hot_range_count": int(hot_range_count),
+                "hot_bytes": int(hot_bytes),
+                "hot_advise_count": int(hot_advise_count),
+                "hot_prefetch_count": int(hot_prefetch_count),
+                "hot_prefetch_executor": hot_prefetch_executor,
+                "hot_prefetch_driver_result": int(hot_prefetch_driver_result),
+                "free_bytes": int(free_bytes),
+                "total_bytes": int(total_bytes),
+                "minimum_free_bytes": int(min_free_bytes),
+            }
+            _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY.append(failed)
+            _append_cpu_offload_manifest(failed)
+            raise RuntimeError(
+                "Original-VA Graph residency reconciliation failed; the "
+                "process is poisoned and must be torn down"
+            ) from exc
+
+
 def prepare_cpu_offload_uvm_original_va_remote_graph_capture() -> dict[str, Any]:
     """Establish the no-H2D remote topology immediately before capture."""
     mode = cpu_offload_uvm_original_va_phase_mode()
@@ -3912,14 +6577,25 @@ def prepare_cpu_offload_uvm_original_va_remote_graph_capture() -> dict[str, Any]
             "A certified original-VA remote Graph already exists; recapture and "
             "lazy capture are unsupported for the phase-switch experiment"
         )
-    return transition_cpu_offload_uvm_original_va_to_remote(
+    transition = transition_cpu_offload_uvm_original_va_to_remote(
         reason="remote_graph_capture_prepare",
         preserve_remote_graphs=False,
     )
+    reconciliation = (
+        reconcile_cpu_offload_uvm_original_va_remote_graph_residency()
+    )
+    return {
+        **transition,
+        "graph_residency_reconciliation": reconciliation,
+    }
 
 
 def activate_cpu_offload_uvm_original_va_prefill_topology() -> dict[str, Any]:
     """Restore sealed alias banks after all initialization Graph replays end."""
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+
     mode = cpu_offload_uvm_original_va_phase_mode()
     if mode not in (
         "prefill_remote_decode",
@@ -3929,14 +6605,42 @@ def activate_cpu_offload_uvm_original_va_prefill_topology() -> dict[str, Any]:
     state = _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
     if state == "sealed":
         return {"ok": True, "reason": "already_sealed", "state": state}
-    if state != "remote" or not _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE:
+    expected_remote_state = (
+        "remote_parked" if _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED else "remote"
+    )
+    if state != expected_remote_state or not _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE:
         raise RuntimeError(
             "Cannot activate alias-prefill topology from lifecycle state "
             f"{state!r}"
         )
     started_ns = time.perf_counter_ns()
     before = _uvm_original_parameter_va_snapshot()
-    finalized = finalize_cpu_offload_graph_static_alias()
+    finalized: dict[str, Any] | None = None
+    resumed: dict[str, Any] | None = None
+    if _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED:
+        from vllm.device_allocator import uvm_static_alias
+
+        device = int(_CPU_OFFLOAD_OWNER_DEVICE_INDEX or 0)
+        torch.cuda.synchronize(device)
+        resumed = dict(
+            uvm_static_alias.driver_static_alias_resume(
+                int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
+                device=device,
+                synchronize=False,
+            )
+        )
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT = resumed
+        if not bool(resumed.get("ok")):
+            poison_cpu_offload_uvm_original_va_phase(
+                f"static-alias resume failed: {resumed!r}"
+            )
+            raise RuntimeError(
+                "Failed to resume original-VA aliases after remote decode"
+            )
+        _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "sealed"
+    else:
+        finalized = finalize_cpu_offload_graph_static_alias()
     after = _uvm_original_parameter_va_snapshot()
     if before != after:
         poison_cpu_offload_uvm_original_va_phase(
@@ -3947,7 +6651,9 @@ def activate_cpu_offload_uvm_original_va_prefill_topology() -> dict[str, Any]:
         "event": "cpu_offload_uvm_original_va_alias_prefill_activated",
         "timestamp": time.time(),
         "pid": os.getpid(),
-        "ok": bool(finalized.get("ok")),
+        "ok": bool(
+            (resumed or finalized or {"ok": False}).get("ok")
+        ),
         "reason": "remote_capture_complete",
         "pre_state": state,
         "post_state": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE,
@@ -3955,6 +6661,7 @@ def activate_cpu_offload_uvm_original_va_prefill_topology() -> dict[str, Any]:
         "parameter_vas_before": before,
         "parameter_vas_after": after,
         "finalize": finalized,
+        "resume": resumed,
     }
     _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY.append(result)
     _append_cpu_offload_manifest(result)
@@ -3969,9 +6676,15 @@ def validate_cpu_offload_uvm_original_va_remote_graph_replay() -> None:
     certificate = _CPU_OFFLOAD_UVM_REMOTE_GRAPH_CERTIFICATE
     remote_map = _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT
     failures: list[str] = []
-    if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE != "remote":
+    expected_state = (
+        "remote_parked" if _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED else "remote"
+    )
+    if expected_state != _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE:
         failures.append(f"state={_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE}")
-    if _CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID != 0:
+    if _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED:
+        if _CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID <= 0:
+            failures.append("parked_alias_session_missing")
+    elif _CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID != 0:
         failures.append(f"session={_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID}")
     if not _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE:
         failures.append("remote_map_inactive")
@@ -3993,9 +6706,20 @@ def validate_cpu_offload_uvm_original_va_remote_graph_replay() -> None:
             _CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE, dict
         ):
             failures.append("dual_graph_partition_certificate_missing")
-        if not _CPU_OFFLOAD_UVM_ALIAS_GRAPHS_DESTROYED:
+        if _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED:
+            if _CPU_OFFLOAD_UVM_ALIAS_GRAPHS_DESTROYED:
+                failures.append("retained_alias_prefill_graphs_destroyed")
+            partition = _CPU_OFFLOAD_UVM_DUAL_GRAPH_PARTITION_CERTIFICATE
+            if not isinstance(partition, dict) or int(
+                partition.get("remote_entry_count", 0)
+            ) <= 0:
+                failures.append("retained_remote_decode_graph_missing")
+        elif not _CPU_OFFLOAD_UVM_ALIAS_GRAPHS_DESTROYED:
             failures.append("alias_prefill_graphs_still_live")
-        if _CPU_OFFLOAD_UVM_REMOTE_GRAPH_REMAINING_COUNT <= 0:
+        if (
+            not _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED
+            and _CPU_OFFLOAD_UVM_REMOTE_GRAPH_REMAINING_COUNT <= 0
+        ):
             failures.append("remote_decode_graph_not_preserved")
     if not isinstance(remote_map, dict) or remote_map.get("ok") is not True:
         failures.append("remote_map_audit_missing")
@@ -4252,7 +6976,11 @@ def maybe_offload_to_cpu(
                         binding.arena.aligned_bytes
                     ),
                     "graph_static_alias_backing_bytes": int(
-                        binding.arena.aligned_bytes
+                        getattr(
+                            binding.arena,
+                            "requested_bytes",
+                            binding.requested_bytes,
+                        )
                     ),
                     "graph_static_alias_granularity": None,
                     "graph_static_alias_upload_access": "read_write",
@@ -4358,12 +7086,8 @@ def maybe_offload_to_cpu(
                     ranges, int(device_index)
                 )
             remote_read_bg_result = (0, 0, 0, 0)
-            if offload_backend == "isolated_uvm_prepare_remote":
-                remote_read_bg_result = driver_prepare_ranges_remote_read(
-                    phase_f_ranges,
-                    device=int(device_index),
-                )
-            elif offload_backend in (
+            if offload_backend in (
+                "isolated_uvm_prepare_remote",
                 "isolated_uvm_prepare_remote_noreadmostly",
                 "isolated_uvm_prepare_remote_noreadmostly_noaccessedby",
             ):
@@ -4654,6 +7378,52 @@ def maybe_offload_to_cpu(
             graph_static_alias
             and _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND == "uvm_original_va"
         )
+        uvm_original_bindings: tuple[_UvmOriginalAliasBinding, ...] = ()
+        if uvm_original_graph_alias:
+            state_items = list(module.state_dict().items())
+            state_keys = {key for key, _ in state_items}
+            missing_local = exact_local_parameter_names - state_keys
+            if missing_local:
+                raise RuntimeError(
+                    "Exact-name original-VA parameters disappeared from "
+                    f"module.state_dict(): {sorted(missing_local)!r}"
+                )
+            if set(graph_static_alias_bindings) != exact_local_parameter_names:
+                raise RuntimeError(
+                    "UVM original-VA cached bindings do not cover the selected "
+                    "module parameters"
+                )
+            for key, value in state_items:
+                binding = graph_static_alias_bindings.get(key)
+                if binding is None:
+                    if value.device.type == "cpu":
+                        raise RuntimeError(
+                            "Original-VA fast forward found an unregistered CPU "
+                            f"state tensor: {key!r}"
+                        )
+                    continue
+                if not isinstance(binding, _UvmOriginalAliasBinding):
+                    raise RuntimeError(
+                        "Original-VA fast forward received a non-UVM binding for "
+                        f"{key!r}"
+                    )
+                if value.device.type != "cuda" or int(value.data_ptr()) != int(
+                    binding.consumer.data_ptr()
+                ):
+                    raise RuntimeError(
+                        "Original-VA selected parameter changed device or VA "
+                        f"during initialization: {key!r}"
+                    )
+            uvm_original_bindings = tuple(
+                binding
+                for _, binding in sorted(graph_static_alias_bindings.items())
+                if isinstance(binding, _UvmOriginalAliasBinding)
+            )
+            if len(uvm_original_bindings) != len(exact_local_parameter_names):
+                raise RuntimeError(
+                    "Original-VA fast forward could not freeze every selected "
+                    "module binding"
+                )
 
         def forward(*args, **kwargs):
             global _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_FORWARD_CALLS
@@ -4693,51 +7463,91 @@ def maybe_offload_to_cpu(
                     )
                     stream_id = int(torch.cuda.current_stream(device).cuda_stream)
 
-                state_items = list(module.state_dict().items())
-                if exact_names_enabled:
-                    state_keys = {key for key, _ in state_items}
-                    missing_local = exact_local_parameter_names - state_keys
-                    if missing_local:
-                        raise RuntimeError(
-                            "Exact-name CPU offload parameters disappeared from "
-                            f"module.state_dict(): {sorted(missing_local)!r}"
-                        )
-                for key, value in state_items:
-                    if (
-                        exact_names_enabled
-                        and key in exact_local_parameter_names
-                        and (
-                            value.device.type
-                            != ("cuda" if uvm_original_graph_alias else "cpu")
-                        )
+                if uvm_original_graph_alias:
+                    lifecycle_state = _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+                    if lifecycle_state == "sealed":
+                        if _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE:
+                            raise RuntimeError(
+                                "UVM original-VA sealed prefill retained an active "
+                                "remote map"
+                            )
+                    elif lifecycle_state not in ("remote", "remote_parked") or not (
+                        _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
                     ):
                         raise RuntimeError(
-                            "Exact-name static-alias parameter is on the wrong "
-                            f"device: {key!r} is on {value.device}"
+                            "UVM original-VA direct forward requires a sealed "
+                            "prefill topology or an audited active remote-decode "
+                            f"topology; current state is {lifecycle_state!r}, "
+                            "remote_map_active="
+                            f"{_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE!r}"
                         )
-                    if (
-                        copy_static_bank or graph_static_alias
-                    ) and key in exact_local_parameter_names:
-                        binding = graph_static_alias_bindings.get(key)
-                        if isinstance(binding, _UvmOriginalAliasBinding):
-                            copy_bytes += int(binding.requested_bytes)
-                        else:
+
+                    # Validate every cached binding before submitting any copy so
+                    # a stale Parameter cannot leave a partially updated bank.
+                    for binding in uvm_original_bindings:
+                        current = binding.parameter.data
+                        if current.device.type != "cuda" or int(
+                            current.data_ptr()
+                        ) != int(binding.consumer.data_ptr()):
+                            raise RuntimeError(
+                                "UVM original-VA selected Parameter changed "
+                                "device or VA after initialization: "
+                                f"{binding.full_parameter_name!r}"
+                            )
+                        if lifecycle_state == "sealed" and binding.source is None:
+                            raise RuntimeError(
+                                "UVM original-VA alias was sealed without a "
+                                "pinned host source for "
+                                f"{binding.full_parameter_name!r}"
+                            )
+                    # A request-boundary plan rebuild mutates these long-lived
+                    # binding objects in place.  Do not freeze the selected
+                    # byte count in the module closure created at model load.
+                    copy_bytes = sum(
+                        int(binding.requested_bytes)
+                        for binding in uvm_original_bindings
+                    )
+                    copy_tensor_count = len(uvm_original_bindings)
+                else:
+                    state_items = list(module.state_dict().items())
+                    if exact_names_enabled:
+                        state_keys = {key for key, _ in state_items}
+                        missing_local = exact_local_parameter_names - state_keys
+                        if missing_local:
+                            raise RuntimeError(
+                                "Exact-name CPU offload parameters disappeared "
+                                "from module.state_dict(): "
+                                f"{sorted(missing_local)!r}"
+                            )
+                    for key, value in state_items:
+                        if (
+                            exact_names_enabled
+                            and key in exact_local_parameter_names
+                            and value.device.type != "cpu"
+                        ):
+                            raise RuntimeError(
+                                "Exact-name static-alias parameter is on the "
+                                f"wrong device: {key!r} is on {value.device}"
+                            )
+                        if (
+                            copy_static_bank or graph_static_alias
+                        ) and key in exact_local_parameter_names:
                             copy_bytes += value.numel() * value.element_size()
-                        copy_tensor_count += 1
-                    elif (
-                        copy_static_bank or graph_static_alias
-                    ) and value.device.type == "cpu":
-                        raise RuntimeError(
-                            "Static bank/alias forward found an unregistered CPU "
-                            f"state tensor: {key!r}"
-                        )
-                    elif (
-                        not copy_static_bank
-                        and not graph_static_alias
-                        and value.device.type == "cpu"
-                    ):
-                        copy_bytes += value.numel() * value.element_size()
-                        copy_tensor_count += 1
+                            copy_tensor_count += 1
+                        elif (
+                            copy_static_bank or graph_static_alias
+                        ) and value.device.type == "cpu":
+                            raise RuntimeError(
+                                "Static bank/alias forward found an unregistered "
+                                f"CPU state tensor: {key!r}"
+                            )
+                        elif (
+                            not copy_static_bank
+                            and not graph_static_alias
+                            and value.device.type == "cpu"
+                        ):
+                            copy_bytes += value.numel() * value.element_size()
+                            copy_tensor_count += 1
 
                 start_event = None
                 end_event = None
@@ -4747,55 +7557,31 @@ def maybe_offload_to_cpu(
                     start_event.record(torch.cuda.current_stream(device))
 
                 copy_submit_start_ns = time.perf_counter_ns()
-                if graph_static_alias:
+                if uvm_original_graph_alias:
+                    if lifecycle_state == "sealed":
+                        for binding in uvm_original_bindings:
+                            assert binding.source is not None
+                            _uvm_original_alias_binding_upload_view(binding).copy_(
+                                _uvm_original_alias_binding_source_view(binding),
+                                non_blocking=True,
+                            )
+                            graph_static_alias_actual_h2d_bytes += int(
+                                binding.requested_bytes
+                            )
+                            graph_static_alias_actual_h2d_tensor_count += 1
+                elif graph_static_alias:
                     device_state = {}
                     for key, value in state_items:
                         binding = graph_static_alias_bindings.get(key)
                         if binding is None:
                             device_state[key] = value
                             continue
-                        if isinstance(binding, _UvmOriginalAliasBinding):
-                            if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE == "sealed":
-                                if binding.source is None:
-                                    raise RuntimeError(
-                                        "UVM original-VA alias was sealed "
-                                        "without a pinned host source for "
-                                        f"{binding.full_parameter_name!r}"
-                                    )
-                                binding.arena.upload.copy_(
-                                    binding.source, non_blocking=True
-                                )
-                                graph_static_alias_actual_h2d_bytes += int(
-                                    binding.requested_bytes
-                                )
-                                graph_static_alias_actual_h2d_tensor_count += 1
-                            elif (
-                                _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE != "remote"
-                                or not _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
-                            ):
-                                raise RuntimeError(
-                                    "UVM original-VA forward requires a sealed "
-                                    "prefill topology or an audited active "
-                                    "remote-decode topology; current state is "
-                                    f"{_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE!r}, "
-                                    "remote_map_active="
-                                    f"{_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE!r}"
-                                )
-                            if int(value.data_ptr()) != int(
-                                binding.consumer.data_ptr()
-                            ):
-                                raise RuntimeError(
-                                    "UVM original-VA state_dict changed a "
-                                    "selected parameter VA"
-                                )
-                            device_state[key] = binding.consumer
-                        else:
-                            binding.arena.upload.copy_(value, non_blocking=True)
-                            graph_static_alias_actual_h2d_bytes += int(
-                                value.numel() * value.element_size()
-                            )
-                            graph_static_alias_actual_h2d_tensor_count += 1
-                            device_state[key] = binding.consumer
+                        binding.arena.upload.copy_(value, non_blocking=True)
+                        graph_static_alias_actual_h2d_bytes += int(
+                            value.numel() * value.element_size()
+                        )
+                        graph_static_alias_actual_h2d_tensor_count += 1
+                        device_state[key] = binding.consumer
                 elif copy_static_bank:
                     device_state = {}
                     for key, value in state_items:
@@ -4828,12 +7614,20 @@ def maybe_offload_to_cpu(
                     end_event.synchronize()
                     copy_cuda_ms = float(start_event.elapsed_time(end_event))
 
-                output = functional_call(
-                    module,
-                    device_state,
-                    args=args,
-                    kwargs=kwargs,
-                )
+                if uvm_original_graph_alias:
+                    output = original_forward(*args, **kwargs)
+                else:
+                    output = functional_call(
+                        module,
+                        device_state,
+                        args=args,
+                        kwargs=kwargs,
+                        # Some architectures expose the same Parameter under
+                        # multiple state-dict names (for example DeepSeek-V2 MLA).
+                        # device_state already preserves each alias explicitly;
+                        # asking functional_call to re-tie them rejects the map.
+                        tie_weights=False,
+                    )
                 copy_ok = True
                 return output
             finally:
@@ -4874,6 +7668,9 @@ def maybe_offload_to_cpu(
                                 _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND
                                 if graph_static_alias
                                 else None
+                            ),
+                            "uvm_original_va_direct_forward": bool(
+                                uvm_original_graph_alias
                             ),
                             "graph_static_alias_lifecycle_state": (
                                 _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE

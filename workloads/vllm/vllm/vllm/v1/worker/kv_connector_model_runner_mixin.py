@@ -5,6 +5,7 @@ Define KV connector functionality mixin for model runners.
 """
 
 import copy
+import os
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import (
@@ -288,9 +289,47 @@ class KVConnectorModelRunnerMixin:
         logger.info("Allocating a cross layer KV cache of shape %s", kv_cache_shape)
 
         # allocate one contiguous buffer for all layers
-        cross_layers_kv_cache_raw = torch.zeros(
-            total_size, dtype=torch.int8, device=device
-        )
+        lazy_reserve = os.environ.get(
+            "VLLM_UVM_KV_CACHE_LAZY_RESERVE",
+            "0",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if lazy_reserve:
+            cross_layers_kv_cache_raw = torch.empty(
+                total_size, dtype=torch.int8, device=device
+            )
+            # This layout is selected specifically because one block across
+            # all layers is contiguous.  Touch only the null block and leave
+            # the remaining maximum reservation physically lazy.
+            null_block_bytes = min(total_size, page_size * num_layers)
+            from vllm.device_allocator.uvm import (
+                batch_advise_ranges_preferred_location,
+                batch_prefetch_ranges_to_device,
+            )
+
+            null_range = [
+                (int(cross_layers_kv_cache_raw.data_ptr()), null_block_bytes)
+            ]
+            device_index = int(torch.cuda.current_device())
+            advised = batch_advise_ranges_preferred_location(
+                null_range,
+                device_index,
+            )
+            prefetched = batch_prefetch_ranges_to_device(
+                null_range,
+                device_index,
+            )
+            if int(advised) != 1 or int(prefetched) != 1:
+                raise RuntimeError(
+                    "Failed to materialize cross-layer lazy KV null block: "
+                    f"advised={advised} prefetched={prefetched}"
+                )
+            torch.cuda.synchronize(device_index)
+            cross_layers_kv_cache_raw[:null_block_bytes].zero_()
+            torch.cuda.synchronize(device_index)
+        else:
+            cross_layers_kv_cache_raw = torch.zeros(
+                total_size, dtype=torch.int8, device=device
+            )
         cross_layers_kv_cache = (
             cross_layers_kv_cache_raw.view(kv_cache_spec.dtype).view(kv_cache_shape)
         )

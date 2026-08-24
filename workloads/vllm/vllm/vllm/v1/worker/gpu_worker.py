@@ -187,7 +187,11 @@ class Worker(WorkerBase):
 
         from vllm.device_allocator.uvm import uvm_local_memory_pool
 
-        return uvm_local_memory_pool(enable_prefetch=True)
+        lazy_reserve = os.environ.get(
+            "VLLM_UVM_KV_CACHE_LAZY_RESERVE",
+            "0",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        return uvm_local_memory_pool(enable_prefetch=not lazy_reserve)
 
     def _kv_cache_uvm_allocations_enabled(self) -> bool:
         return (
@@ -460,6 +464,17 @@ class Worker(WorkerBase):
             selected_experts_by_layer,
         )
 
+    def get_uvm_incremental_expert_restore_candidates(self) -> dict[str, Any]:
+        return self.model_runner.get_uvm_incremental_expert_restore_candidates()
+
+    def run_uvm_incremental_expert_restore(
+        self,
+        selected_experts_by_layer: dict[str, int],
+    ) -> dict[str, Any]:
+        return self.model_runner.run_uvm_incremental_expert_restore(
+            selected_experts_by_layer
+        )
+
     def get_uvm_dynamic_expert_heat(
         self,
         reset: bool = False,
@@ -471,6 +486,26 @@ class Worker(WorkerBase):
         swaps_by_layer: dict[str, list[dict[str, object]]],
     ) -> dict[str, Any]:
         return self.model_runner.run_uvm_dynamic_expert_swaps(swaps_by_layer)
+
+    def capture_uvm_expert_graph_class(
+        self,
+        class_name: str,
+        scheduler_idle: bool,
+    ) -> dict[str, Any]:
+        return self.model_runner.capture_uvm_expert_graph_class_at_idle_boundary(
+            class_name,
+            scheduler_idle=scheduler_idle,
+        )
+
+    def activate_uvm_expert_graph_class(
+        self,
+        class_name: str,
+        scheduler_idle: bool,
+    ) -> dict[str, Any]:
+        return self.model_runner.activate_uvm_expert_graph_class_at_idle_boundary(
+            class_name,
+            scheduler_idle=scheduler_idle,
+        )
 
     def get_cuda_memory_info(self) -> dict[str, int]:
         torch.cuda.synchronize()
@@ -674,6 +709,63 @@ class Worker(WorkerBase):
 
         self._uvm_post_warmup_rebalance_done = True
 
+    def _reconverge_uvm_kv_cache_for_serving(self) -> None:
+        """Reapply the requested KV residency after serving topology setup.
+
+        Expert residency repair and original-VA alias activation happen after
+        the ordinary post-warmup KV rebalance.  Those operations can evict KV
+        pages under tight memory pressure, so make the configured physical KV
+        target the final initialization-time placement operation.
+        """
+        target_blocks = self._uvm_post_warmup_kv_target_blocks()
+        if target_blocks is None:
+            return
+        managed_kv = self._kv_cache_uvm_allocations_enabled() or self._uvm_env_flag(
+            "VLLM_USE_UVM", default=False
+        )
+        if not managed_kv:
+            return
+
+        result = self.model_runner.rebalance_uvm_kv_cache_after_warmup(target_blocks)
+        if not bool(result.get("offload_complete")) and self._uvm_env_flag(
+            "VLLM_UVM_POST_WARMUP_REBALANCE_FAIL_FAST",
+            default=True,
+        ):
+            raise RuntimeError(
+                "serving-time KV physical reconvergence failed: "
+                f"result={result!r}"
+            )
+        logger.info(
+            "Reconverged UVM KV cache for serving target_blocks=%d result=%s",
+            target_blocks,
+            result,
+        )
+
+    def _reconcile_uvm_original_va_remote_before_warmup(self) -> None:
+        """Repair remote-only expert placement after KV allocation.
+
+        Kernel/compile warmup executes real MoE kernels before
+        ``GPUModelRunner.capture_model``.  Therefore the capture-time gate is
+        too late when KV allocation has already evicted a hot managed expert.
+        Reconcile once here, before any such warmup, and again immediately
+        before capture.
+        """
+        from vllm.model_executor.models.utils import (
+            cpu_offload_uvm_original_va_phase_mode,
+            reconcile_cpu_offload_uvm_original_va_remote_graph_residency,
+        )
+
+        if cpu_offload_uvm_original_va_phase_mode() != "remote_only":
+            return
+        result = reconcile_cpu_offload_uvm_original_va_remote_graph_residency()
+        logger.info(
+            "Reconciled original-VA remote expert placement before warmup: "
+            "cold_bytes=%d hot_bytes=%d free_bytes=%d",
+            int(result.get("cold_bytes", 0)),
+            int(result.get("hot_bytes", 0)),
+            int(result.get("free_bytes", -1)),
+        )
+
     def compile_or_warm_up_model(self) -> None:
         driver_mode = os.environ.get(
             "VLLM_UVM_COLD_SLOT_POOL_DRIVER_MODE",
@@ -686,6 +778,10 @@ class Worker(WorkerBase):
                 "0",
             ).strip().lower() in ("1", "true", "yes", "on")
         )
+        # KV cache is already allocated when this method is entered.  Repair
+        # expert residency before the first compile/kernel warmup can touch a
+        # hot expert through a stale non-remote PTE.
+        self._reconcile_uvm_original_va_remote_before_warmup()
         if skip_uvm_controlled_warmup:
             logger.warning(
                 "Skipping post-init compile/kernel/sampler warmup for "
@@ -698,6 +794,7 @@ class Worker(WorkerBase):
             )
 
             activate_cpu_offload_uvm_original_va_prefill_topology()
+            self._reconverge_uvm_kv_cache_for_serving()
             set_random_seed(self.model_config.seed)
             return
 
@@ -730,6 +827,21 @@ class Worker(WorkerBase):
         if not self.model_config.enforce_eager:
             with uvm_allocation_phase("capture_model"):
                 cuda_graph_memory_bytes = self.model_runner.capture_model()
+            with uvm_allocation_phase("capture_uvm_plan_classes"):
+                class_capture = (
+                    self.model_runner.
+                    capture_configured_uvm_expert_graph_classes_at_idle_boundary(
+                        scheduler_idle=True
+                    )
+                )
+            if class_capture.get("ok") is not True:
+                raise RuntimeError(
+                    "Failed to capture configured UVM expert Graph classes: "
+                    f"{class_capture!r}"
+                )
+            cuda_graph_memory_bytes += int(
+                class_capture.get("graph_memory_bytes", 0)
+            )
 
         if self.cache_config.kv_cache_memory_bytes is None and hasattr(
             self, "peak_activation_memory"
@@ -826,6 +938,7 @@ class Worker(WorkerBase):
         )
 
         activate_cpu_offload_uvm_original_va_prefill_topology()
+        self._reconverge_uvm_kv_cache_for_serving()
 
         set_random_seed(self.model_config.seed)
 

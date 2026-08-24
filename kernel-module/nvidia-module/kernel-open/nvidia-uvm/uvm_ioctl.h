@@ -1151,7 +1151,9 @@ typedef enum
     // copy_done_event. No slot copy is performed by this mode.
     UVM_MOE_SLOT_REMAP_MODE_SLOT_VA_BLOCK_USER_BACKING_REMAP = 7,
     // Preallocate driver-owned VIDMEM slot backing for the submitted logical
-    // slots. This does not copy data and does not install PTEs.
+    // slots. This does not copy data and does not install PTEs. While a
+    // static-alias session exists this is accepted only for new, uncommitted
+    // slots in a healthy parked session, for a later resizing REBIND.
     UVM_MOE_SLOT_REMAP_MODE_VIDMEM_PREALLOC = 8,
     // Submit a CPU-to-GPU copy into an existing or newly allocated
     // driver-owned VIDMEM slot and return without waiting for the copy engine.
@@ -1195,6 +1197,8 @@ typedef enum
     // Release driver-owned backing and any installed slot PTEs for the
     // submitted logical slots. Release entries identify a slot only with
     // layer_id, expert_id, and slot_id; all other entry input fields must be 0.
+    // A healthy parked static-alias session may use this only to roll back
+    // uncommitted slots outside its committed topology.
     UVM_MOE_SLOT_REMAP_MODE_RELEASE = 19,
     // Restricted fixed-bank layer transition. Every entry must name an
     // existing NO_EVICT VIDMEM slot and carry REUSE_BACKING_REQUIRED. The old
@@ -1556,6 +1560,83 @@ typedef struct
     NvU32 poisoned;                                   // OUT, boolean
     NV_STATUS rmStatus;                               // OUT
 } UVM_MOE_STATIC_ALIAS_DESTROY_PARAMS;
+
+// Reversible serving-time topology switch for a sealed static-alias session.
+// PARK atomically replaces read-only consumer aliases with ordinary CPU
+// remote-read PTEs in grouped VA-block batches. Writable upload aliases,
+// physical backing, the session descriptor, and all alias records remain
+// live. RESUME replaces those ordinary UVM PTEs with the original read-only
+// slot aliases. Both operations require a userspace GPU/scheduler barrier;
+// the kernel cannot observe arbitrary CUDA Graph replays.
+//
+// Command numbers 101 and 102 are used because command 100 is already the
+// expert offload/release ABI below.
+#define UVM_MOE_STATIC_ALIAS_PARK                                     UVM_IOCTL_BASE(101)
+#define UVM_MOE_STATIC_ALIAS_RESUME                                   UVM_IOCTL_BASE(102)
+typedef struct
+{
+    NvU32 abi_version;                                // IN, ABI_VERSION
+    NvU32 struct_size;                                // IN, sizeof(params)
+    NvU32 flags;                                      // IN, must be zero in v1
+    NvU32 reserved;                                   // IN zero; OUT completed grouped batches
+    NvU64 session_id NV_ALIGN_BYTES(8);               // IN, sealed non-zero session
+    NvU64 processed_alias_bytes NV_ALIGN_BYTES(8);    // OUT, consumer bytes changed
+    NvU64 consumer_alias_bytes NV_ALIGN_BYTES(8);     // OUT, complete consumer set
+    NvU64 backing_bytes NV_ALIGN_BYTES(8);            // OUT, retained physical backing
+    NvU32 processed_alias_count;                      // OUT, consumers changed this call
+    NvU32 consumer_alias_count;                       // OUT, complete consumer set
+    NvU32 upload_alias_count;                         // OUT, retained writable aliases
+    NvU32 tlb_invalidate_count;                       // OUT, affected VA-block groups/slices
+    NvU32 parked;                                     // OUT, consumer aliases absent
+    NvU32 sealed;                                     // OUT, session remains sealed
+    NvU32 poisoned;                                   // OUT, destroy-only after failure
+    NV_STATUS rmStatus;                               // OUT
+} UVM_MOE_STATIC_ALIAS_TRANSITION_PARAMS;
+typedef UVM_MOE_STATIC_ALIAS_TRANSITION_PARAMS UVM_MOE_STATIC_ALIAS_PARK_PARAMS;
+typedef UVM_MOE_STATIC_ALIAS_TRANSITION_PARAMS UVM_MOE_STATIC_ALIAS_RESUME_PARAMS;
+
+// Replace aliases in a parked session. The default form replaces only the
+// read-only consumer set without changing writable upload aliases or physical
+// backing. RESIZE submits the complete upload + consumer set: backing shared
+// with the old set is retained, preallocated additions are adopted, and
+// removed backing is released at COMMIT. Large model topologies are submitted
+// as a BEGIN/append/COMMIT transaction. No consumer GPU PTE is installed by
+// REBIND; a later RESUME publishes the new consumer aliases. Failed or aborted
+// transactions before a mutating RESIZE commit leave the old set intact.
+#define UVM_MOE_STATIC_ALIAS_REBIND                                   UVM_IOCTL_BASE(103)
+#define UVM_MOE_STATIC_ALIAS_REBIND_FLAG_BEGIN                        0x00000001U
+#define UVM_MOE_STATIC_ALIAS_REBIND_FLAG_COMMIT                       0x00000002U
+#define UVM_MOE_STATIC_ALIAS_REBIND_FLAG_ABORT                        0x00000004U
+#define UVM_MOE_STATIC_ALIAS_REBIND_FLAG_RESIZE                       0x00000008U
+#define UVM_MOE_STATIC_ALIAS_REBIND_FLAGS_ALL                         \
+    (UVM_MOE_STATIC_ALIAS_REBIND_FLAG_BEGIN |                         \
+     UVM_MOE_STATIC_ALIAS_REBIND_FLAG_COMMIT |                        \
+     UVM_MOE_STATIC_ALIAS_REBIND_FLAG_ABORT |                         \
+     UVM_MOE_STATIC_ALIAS_REBIND_FLAG_RESIZE)
+
+typedef struct
+{
+    NvU32 abi_version;                                // IN, ABI_VERSION
+    NvU32 struct_size;                                // IN, sizeof(params)
+    NvU32 flags;                                      // IN, REBIND_FLAG_*
+    NvU32 reserved;                                   // IN, must be zero in v1
+    NvU64 session_id NV_ALIGN_BYTES(8);               // IN, sealed parked session
+    NvU64 rebind_id NV_ALIGN_BYTES(8);                // IN/OUT, zero on BEGIN
+    NvU64 expected_consumer_alias_bytes NV_ALIGN_BYTES(8); // IN, complete txn/set
+    NvU64 staged_consumer_alias_bytes NV_ALIGN_BYTES(8);   // OUT, staged txn/set
+    NvU64 backing_bytes NV_ALIGN_BYTES(8);            // OUT, changed only by RESIZE
+    NvU64 total_alias_bytes NV_ALIGN_BYTES(8);        // OUT, committed session
+    NvU32 count;                                      // IN, entries in this call
+    NvU32 accepted_count;                             // OUT, staged this call
+    NvU32 expected_consumer_alias_count;              // IN, complete txn/set
+    NvU32 staged_consumer_alias_count;                // OUT
+    NvU32 upload_alias_count;                         // OUT, changed only by RESIZE
+    NvU32 committed;                                  // OUT, boolean
+    NvU32 poisoned;                                   // OUT, session state
+    NvU32 reserved2;                                  // IN, must be zero in v1
+    UVM_MOE_STATIC_ALIAS_ENTRY entries[UVM_MOE_STATIC_ALIAS_MAX_ENTRIES]; // IN/OUT
+    NV_STATUS rmStatus;                               // OUT
+} UVM_MOE_STATIC_ALIAS_REBIND_PARAMS;
 
 typedef enum
 {

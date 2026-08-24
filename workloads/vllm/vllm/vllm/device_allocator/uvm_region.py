@@ -86,7 +86,10 @@ class PhysicalKVSpan:
 
     def ranges_for_blocks(self, block_ids: Iterable[int]) -> list[tuple[int, int]]:
         ids = sorted({int(block_id) for block_id in block_ids})
-        ids = [block_id for block_id in ids if 0 < block_id <= self.max_block_id]
+        # Block 0 is the permanently reserved null block. Runtime pool resizing
+        # never requests it, but initialization-time convergence must be able
+        # to rematerialize it after memory pressure evicts its physical page.
+        ids = [block_id for block_id in ids if 0 <= block_id <= self.max_block_id]
         if not ids:
             return []
         ranges: list[tuple[int, int]] = []

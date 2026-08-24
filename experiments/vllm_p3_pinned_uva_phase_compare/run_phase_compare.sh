@@ -14,7 +14,7 @@ STATS_PATH="${STATS_PATH:-/proc/driver/nvidia-uvm/latency_stats}"
 PARAM_ROOT="${PARAM_ROOT:-/sys/module/nvidia_uvm/parameters}"
 
 DEFAULT_MODEL="${REPO_ROOT}/../.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B-FP8/snapshots/d206ba732169f29bb77fbf80fc2c4b81d4d30782"
-DEFAULT_FIXTURE="${REPO_ROOT}/experiments/broad_offload_compare/artifacts/common_fixtures_20260813/evaluation_fixture_token_ids.json"
+DEFAULT_FIXTURE="${REPO_ROOT}/experiments/eurosys_moe_offload_evaluation/inputs/legacy_pilot/qwen3_30b_a3b_fp8/fixtures/evaluation_fixture_token_ids.json"
 
 LAYER_BYTES=603979776
 TOTAL_BYTES=2415919104

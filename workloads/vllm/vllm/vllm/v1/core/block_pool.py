@@ -163,6 +163,10 @@ class BlockPool:
         # list of free blocks (including eviction candidates when caching is
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # GPU-resident burst reserve. Blocks in this queue consume HBM but are
+        # kept out of the ordinary free queue until allocation pressure needs
+        # them. The runtime policy controls its target size.
+        self.backup_block_queue = FreeKVCacheBlockQueue([])
         self.offline_block_queue = FreeKVCacheBlockQueue([])
 
         # Cache for block lookup
@@ -182,6 +186,27 @@ class BlockPool:
         self.uvm_kv_runtime_policy = uvm_kv_runtime_policy
         if self.uvm_kv_runtime_policy is not None:
             self.uvm_kv_runtime_policy.register_stage_l5_kv_blocks(self)
+            self._refill_uvm_backup_queue()
+
+    def _uvm_backup_target_blocks(self) -> int:
+        policy = self.uvm_kv_runtime_policy
+        if policy is None or not policy.dynamic_pool_active():
+            return 0
+        return max(int(getattr(policy, "backup_reserve_blocks", 0)), 0)
+
+    def _refill_uvm_backup_queue(self) -> int:
+        """Move ordinary GPU-free blocks into the logical burst reserve."""
+        wanted = self._uvm_backup_target_blocks()
+        missing = max(wanted - self.backup_block_queue.num_free_blocks, 0)
+        count = min(missing, self.free_block_queue.num_free_blocks)
+        if count == 0:
+            return 0
+        blocks = self.free_block_queue.get_all_free_blocks()[-count:]
+        for block in blocks:
+            self.free_block_queue.remove(block)
+            block.free_queue_kind = "backup"
+        self.backup_block_queue.append_n(blocks)
+        return count
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -333,9 +358,23 @@ class BlockPool:
         )
         ret: list[KVCacheBlock] | None = None
         if dynamic_pool_active:
-            ret = self.free_block_queue.popleft_n(num_blocks)
+            ordinary = min(num_blocks, self.free_block_queue.num_free_blocks)
+            ret = self.free_block_queue.popleft_n(ordinary)
             for block in ret:
                 block.free_queue_kind = None
+            backup_count = num_blocks - ordinary
+            if backup_count:
+                backup = self.backup_block_queue.popleft_n(backup_count)
+                for block in backup:
+                    block.free_queue_kind = None
+                ret.extend(backup)
+                notify = getattr(
+                    self.uvm_kv_runtime_policy,
+                    "on_backup_blocks_activated",
+                    None,
+                )
+                if notify is not None:
+                    notify(backup_count, reason="get_new_blocks")
         elif self.uvm_kv_runtime_policy is not None:
             ret = self.uvm_kv_runtime_policy.select_free_blocks_for_allocation(
                 block_pool=self,
@@ -492,6 +531,7 @@ class BlockPool:
                 gpu_blocks.append(block)
         self.free_block_queue.append_n(gpu_blocks)
         self.offline_block_queue.append_n(offline_blocks)
+        self._refill_uvm_backup_queue()
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -504,6 +544,7 @@ class BlockPool:
         """
         num_used_blocks = self.num_gpu_blocks - (
             self.free_block_queue.num_free_blocks
+            + self.backup_block_queue.num_free_blocks
             + self.offline_block_queue.num_free_blocks
         )
         if num_used_blocks != 1:  # The null block is always marked as used
@@ -542,11 +583,16 @@ class BlockPool:
                 self,
                 "block_pool_free_count",
             )
-        return self.free_block_queue.num_free_blocks
+        return (
+            self.free_block_queue.num_free_blocks
+            + self.backup_block_queue.num_free_blocks
+        )
 
     def _remove_from_current_free_queue(self, block: KVCacheBlock) -> None:
         if block.free_queue_kind == "gpu":
             self.free_block_queue.remove(block)
+        elif block.free_queue_kind == "backup":
+            self.backup_block_queue.remove(block)
         elif block.free_queue_kind == "offline":
             self.offline_block_queue.remove(block)
         else:
@@ -576,8 +622,8 @@ class BlockPool:
                 if block.ref_cnt != 0:
                     deferred_active += 1
                     continue
-                if block.free_queue_kind == "gpu":
-                    self.free_block_queue.remove(block)
+                if block.free_queue_kind in ("gpu", "backup"):
+                    self._remove_from_current_free_queue(block)
                     block.free_queue_kind = "offline"
                     self.offline_block_queue.append(block)
                     moved_offline += 1
@@ -596,12 +642,116 @@ class BlockPool:
             # Newly GPU-resident blocks are fresh allocation candidates.
             self.free_block_queue.prepend_n(promoted)
 
+        self._refill_uvm_backup_queue()
+
         return {
             "moved_gpu": moved_gpu,
             "moved_offline": moved_offline,
             "deferred_active": deferred_active,
             "gpu_free_blocks": self.free_block_queue.num_free_blocks,
+            "backup_free_blocks": self.backup_block_queue.num_free_blocks,
             "offline_free_blocks": self.offline_block_queue.num_free_blocks,
+        }
+
+    def snapshot_uvm_dynamic_queues(self) -> dict[str, Any]:
+        """Return a fail-closed audit snapshot of the three KV queues.
+
+        The scheduler owns BlockPool mutation, so callers must take this
+        snapshot at a scheduler boundary.  The method deliberately reports
+        both counts and block ids: an E2E qualification must prove queue
+        disjointness and whole-pool conservation, not merely plausible totals.
+        """
+        gpu_ids = [
+            int(block.block_id)
+            for block in self.free_block_queue.get_all_free_blocks()
+        ]
+        backup_ids = [
+            int(block.block_id)
+            for block in self.backup_block_queue.get_all_free_blocks()
+        ]
+        offline_ids = [
+            int(block.block_id)
+            for block in self.offline_block_queue.get_all_free_blocks()
+        ]
+        active_ids = [
+            int(block.block_id)
+            for block in self.blocks
+            if not block.is_null and int(block.ref_cnt) > 0
+        ]
+        null_ids = [int(block.block_id) for block in self.blocks if block.is_null]
+        unqueued_free_ids = [
+            int(block.block_id)
+            for block in self.blocks
+            if (
+                not block.is_null
+                and int(block.ref_cnt) == 0
+                and block.free_queue_kind is None
+            )
+        ]
+
+        partitions = {
+            "gpu_free": gpu_ids,
+            "gpu_backup": backup_ids,
+            "cpu_offline": offline_ids,
+            "active": active_ids,
+            "null": null_ids,
+        }
+        flattened = [
+            block_id for block_ids in partitions.values() for block_id in block_ids
+        ]
+        unique_ids = set(flattened)
+        membership_matches = all(
+            all(
+                self.blocks[block_id].free_queue_kind == queue_kind
+                for block_id in block_ids
+            )
+            for queue_kind, block_ids in (
+                ("gpu", gpu_ids),
+                ("backup", backup_ids),
+                ("offline", offline_ids),
+            )
+        )
+        applied_target = (
+            int(
+                getattr(
+                    self.uvm_kv_runtime_policy,
+                    "_dynamic_pool_applied_target_blocks",
+                    self.num_gpu_blocks - 1,
+                )
+            )
+            if self.uvm_kv_runtime_policy is not None
+            else self.num_gpu_blocks - 1
+        )
+        all_ids = set(range(self.num_gpu_blocks))
+        duplicate_memberships = len(flattened) - len(unique_ids)
+        invariant_ok = (
+            duplicate_memberships == 0
+            and unique_ids == all_ids
+            and not unqueued_free_ids
+            and membership_matches
+            and len(null_ids) == 1
+        )
+        return {
+            "schema": "vllm_uvm_kv_three_queue_snapshot_v1",
+            "total_blocks_including_null": int(self.num_gpu_blocks),
+            "total_allocatable_blocks": int(self.num_gpu_blocks - 1),
+            "applied_target_blocks": applied_target,
+            "backup_target_blocks": self._uvm_backup_target_blocks(),
+            "gpu_free_blocks": len(gpu_ids),
+            "gpu_backup_blocks": len(backup_ids),
+            "cpu_offline_blocks": len(offline_ids),
+            "active_blocks": len(active_ids),
+            "null_blocks": len(null_ids),
+            "accounted_blocks": len(flattened),
+            "duplicate_memberships": duplicate_memberships,
+            "membership_matches_queue_kind": membership_matches,
+            "unqueued_free_block_ids": unqueued_free_ids,
+            "invariant_ok": invariant_ok,
+            "gpu_free_block_ids": gpu_ids,
+            "gpu_backup_block_ids": backup_ids,
+            "cpu_offline_block_ids": offline_ids,
+            "active_block_ids": active_ids,
+            "null_block_ids": null_ids,
         }
 
     def get_usage(self) -> float:

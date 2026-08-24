@@ -887,10 +887,17 @@ class FusedMoE(CustomOp):
             default=False,
         )
         self._uvm_dynamic_expert_heat_counts: torch.Tensor | None = None
+        self._uvm_dynamic_expert_heat_buffers: list[torch.Tensor] = []
+        self._uvm_dynamic_expert_heat_active_index = 0
+        self._uvm_dynamic_expert_heat_epoch = 0
         self._uvm_incremental_offload_in_progress = False
         self._uvm_incremental_selected_global_expert_id: int | None = None
         self._uvm_offloaded_global_expert_ids: set[int] = set()
         self._uvm_remote_read_global_expert_ids: set[int] = set()
+        # Tracks only experts released by runtime KV-pressure waves. Initial
+        # static-plan experts are deliberately excluded so KV shrink can undo
+        # exactly one balanced wave without changing the frozen base plan.
+        self._uvm_incremental_offloaded_global_expert_ids: set[int] = set()
         self._uvm_init_weight_offload_done = False
         managed_expert_weights_requested = _env_flag_enabled(
             "VLLM_UVM_EXPERT_WEIGHTS_MANAGED",
@@ -2098,10 +2105,17 @@ class FusedMoE(CustomOp):
                 self._uvm_dynamic_expert_heat_counts is None
                 or self._uvm_dynamic_expert_heat_counts.device != counts.device
             ):
-                self._uvm_dynamic_expert_heat_counts = torch.zeros(
-                    int(self.global_num_experts),
-                    dtype=torch.int64,
-                    device=counts.device,
+                self._uvm_dynamic_expert_heat_buffers = [
+                    torch.zeros(
+                        int(self.global_num_experts),
+                        dtype=torch.int64,
+                        device=counts.device,
+                    )
+                    for _ in range(2)
+                ]
+                self._uvm_dynamic_expert_heat_active_index = 0
+                self._uvm_dynamic_expert_heat_counts = (
+                    self._uvm_dynamic_expert_heat_buffers[0]
                 )
             self._uvm_dynamic_expert_heat_counts.add_(counts)
         except Exception:
@@ -2120,6 +2134,18 @@ class FusedMoE(CustomOp):
             # The counter is created during model inference and is therefore an
             # inference tensor. Maintenance RPCs run outside that context.
             with torch.inference_mode():
+                if reset and len(self._uvm_dynamic_expert_heat_buffers) == 2:
+                    completed_index = self._uvm_dynamic_expert_heat_active_index
+                    self._uvm_dynamic_expert_heat_active_index = 1 - completed_index
+                    self._uvm_dynamic_expert_heat_counts = (
+                        self._uvm_dynamic_expert_heat_buffers[
+                            self._uvm_dynamic_expert_heat_active_index
+                        ]
+                    )
+                    counts_tensor = self._uvm_dynamic_expert_heat_buffers[
+                        completed_index
+                    ]
+                    self._uvm_dynamic_expert_heat_epoch += 1
                 counts = [int(value) for value in counts_tensor.detach().cpu().tolist()]
                 if reset:
                     counts_tensor.zero_()
@@ -2131,7 +2157,16 @@ class FusedMoE(CustomOp):
             "local_num_experts": int(self.local_num_experts),
             "expert_token_counts": counts,
             "remote_experts": sorted(self._uvm_remote_read_global_expert_ids),
+            "incremental_offloaded_experts": sorted(
+                getattr(
+                    self,
+                    "_uvm_incremental_offloaded_global_expert_ids",
+                    set(),
+                )
+            ),
             "reset": bool(reset),
+            "heat_epoch": int(self._uvm_dynamic_expert_heat_epoch),
+            "double_buffered": len(self._uvm_dynamic_expert_heat_buffers) == 2,
         }
 
     def _uvm_layer_id(self) -> int | None:
@@ -2215,16 +2250,38 @@ class FusedMoE(CustomOp):
             return "cold"
         return "warm"
 
+    @staticmethod
+    def _uvm_static_alias_owned_experts(layer_id: int) -> set[int]:
+        from vllm.model_executor.models.utils import (
+            cpu_offload_uvm_original_va_static_alias_experts_for_layer,
+        )
+
+        return set(
+            cpu_offload_uvm_original_va_static_alias_experts_for_layer(
+                int(layer_id)
+            )
+        )
+
     def _uvm_stage_m_offload_expert_pairs(
         self,
         layer_id: int,
         all_local_pairs: list[tuple[int, int]],
     ) -> list[tuple[int, int]]:
-        if not self.uvm_init_weight_offload_enable:
+        # Runtime KV-pressure waves are deliberately independent from the
+        # initialization-time Stage-M pass.  In particular, an original-VA
+        # static-alias plan may have already released its frozen base experts
+        # during finalize(), while later explicit waves still need the plan
+        # classification helpers below.  Do not require callers to enable the
+        # post-warmup Stage-M pass merely to enumerate runtime candidates.
+        if not (
+            self.uvm_init_weight_offload_enable
+            or self.uvm_incremental_expert_offload_enable
+        ):
             return []
 
         cold_pairs: list[tuple[int, int]] = []
         warm_pairs: list[tuple[int, int]] = []
+        static_alias_owned = self._uvm_static_alias_owned_experts(layer_id)
         layer_warm_plan_ids = {
             expert_id
             for plan_layer_id, expert_id in self.uvm_init_weight_warm_plan_keys
@@ -2234,6 +2291,7 @@ class FusedMoE(CustomOp):
             if global_expert_id in (
                 self._uvm_offloaded_global_expert_ids
                 | getattr(self, "_uvm_remote_read_global_expert_ids", set())
+                | static_alias_owned
             ):
                 continue
             expert_class = self._uvm_init_weight_expert_class(
@@ -2307,6 +2365,19 @@ class FusedMoE(CustomOp):
                 "reason": "no_candidates",
                 "released_experts": [],
             }
+        layer_id = self._uvm_layer_id()
+        if (
+            layer_id is not None
+            and int(selected_global_expert_id)
+            in self._uvm_static_alias_owned_experts(layer_id)
+        ):
+            return {
+                "ok": False,
+                "reason": "expert_owned_by_static_alias_plan",
+                "layer_id": int(layer_id),
+                "selected_global_expert_id": int(selected_global_expert_id),
+                "released_experts": [],
+            }
         before = set(tracked_experts)
         self._uvm_incremental_offload_in_progress = True
         self._uvm_incremental_selected_global_expert_id = int(selected_global_expert_id)
@@ -2317,6 +2388,15 @@ class FusedMoE(CustomOp):
             self._uvm_incremental_offload_in_progress = False
             self._uvm_incremental_selected_global_expert_id = None
         released = sorted(set(tracked_experts) - before)
+        incremental = getattr(
+            self,
+            "_uvm_incremental_offloaded_global_expert_ids",
+            None,
+        )
+        if not isinstance(incremental, set):
+            incremental = set()
+            self._uvm_incremental_offloaded_global_expert_ids = incremental
+        incremental.update(int(expert_id) for expert_id in released)
         return {
             "ok": True,
             "reason": "released" if released else "no_capacity_or_candidates",
@@ -2326,6 +2406,118 @@ class FusedMoE(CustomOp):
             "allow_warm": bool(allow_warm),
             "selected_global_expert_id": selected_global_expert_id,
             "access_mode": "remote_read" if remote_read else "restore",
+        }
+
+    def uvm_next_incremental_restore_expert(self) -> int | None:
+        """Choose the hottest expert released by a prior KV-pressure wave."""
+        incremental = set(
+            getattr(
+                self,
+                "_uvm_incremental_offloaded_global_expert_ids",
+                set(),
+            )
+        )
+        tracked = (
+            self._uvm_remote_read_global_expert_ids
+            if self._uvm_stage_m_uses_remote_read()
+            else self._uvm_offloaded_global_expert_ids
+        )
+        candidates = sorted(incremental & set(tracked))
+        if not candidates:
+            return None
+        counts_tensor = getattr(self, "_uvm_dynamic_expert_heat_counts", None)
+        if counts_tensor is None:
+            # Deterministic LIFO-like restoration without requiring heat
+            # collection. Heat-enabled deployments take the branch below.
+            return int(candidates[-1])
+        try:
+            counts = counts_tensor.detach()
+            return int(
+                max(
+                    candidates,
+                    key=lambda expert_id: (
+                        int(counts[int(expert_id)].item()),
+                        -int(expert_id),
+                    ),
+                )
+            )
+        except Exception:
+            logger.debug(
+                "Failed to rank incremental expert restoration by heat",
+                exc_info=True,
+            )
+            return int(candidates[-1])
+
+    def run_uvm_incremental_weight_restore(
+        self,
+        *,
+        selected_global_expert_id: int,
+    ) -> dict[str, object]:
+        """Undo one runtime offload while preserving the static cold plan."""
+        expert_id = int(selected_global_expert_id)
+        incremental = getattr(
+            self,
+            "_uvm_incremental_offloaded_global_expert_ids",
+            None,
+        )
+        tracked = (
+            self._uvm_remote_read_global_expert_ids
+            if self._uvm_stage_m_uses_remote_read()
+            else self._uvm_offloaded_global_expert_ids
+        )
+        if not isinstance(incremental, set) or expert_id not in incremental:
+            return {
+                "ok": False,
+                "reason": "expert_not_incrementally_offloaded",
+                "selected_global_expert_id": expert_id,
+                # Rollback calls name the complete intended wave. A layer
+                # whose release never committed is already in the desired
+                # local state and can be treated as an idempotent success by
+                # the worker-level transaction.
+                "already_local": expert_id not in tracked,
+            }
+        layer_id = self._uvm_layer_id()
+        if layer_id is None:
+            return {
+                "ok": False,
+                "reason": "layer_id_unavailable",
+                "selected_global_expert_id": expert_id,
+            }
+        if expert_id not in tracked:
+            return {
+                "ok": False,
+                "reason": "incremental_expert_tracking_mismatch",
+                "selected_global_expert_id": expert_id,
+            }
+        if (int(layer_id), expert_id) not in self._uvm_expert_records:
+            return {
+                "ok": False,
+                "reason": "expert_record_missing",
+                "selected_global_expert_id": expert_id,
+            }
+        device = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
+        result = self._uvm_restore_expert_record(
+            layer_id=int(layer_id),
+            global_expert_id=expert_id,
+            device=device,
+        )
+        if not bool(result.get("ok")):
+            return {
+                "ok": False,
+                "reason": "expert_restore_failed",
+                "selected_global_expert_id": expert_id,
+                "restore_result": result,
+            }
+        tracked.remove(expert_id)
+        incremental.remove(expert_id)
+        return {
+            "ok": True,
+            "reason": "restored",
+            "layer_id": int(layer_id),
+            "restored_experts": [expert_id],
+            "restored_count": 1,
+            "selected_global_expert_id": expert_id,
+            "restore_result": result,
         }
 
     def run_uvm_dynamic_remote_read_swaps(
@@ -2432,6 +2624,17 @@ class FusedMoE(CustomOp):
                 }
 
             self._uvm_remote_read_global_expert_ids.remove(promote_expert)
+            incremental = getattr(
+                self,
+                "_uvm_incremental_offloaded_global_expert_ids",
+                None,
+            )
+            if isinstance(incremental, set) and promote_expert in incremental:
+                # The heat swap changes the identity occupying one runtime
+                # KV-pressure offload slot. Transfer ownership so a later KV
+                # shrink still restores exactly one expert for this layer.
+                incremental.remove(promote_expert)
+                incremental.add(demote_expert)
             results.append({**pair_result, "ok": True})
 
         return {
@@ -2508,6 +2711,8 @@ class FusedMoE(CustomOp):
         records: dict[tuple[int, int], ExpertRecord] = {}
         envelope_owners: dict[str, tuple[int, int]] = {}
         geometry_by_region: dict[str, tuple[int, int]] = {}
+        static_alias_owned = self._uvm_static_alias_owned_experts(layer_id)
+        self._uvm_static_alias_owned_global_expert_ids = set(static_alias_owned)
         for global_expert_id, local_expert_id in self._uvm_all_local_expert_pairs():
             slices = self._uvm_expert_weight_slices(local_expert_id)
             compile_slices: list[tuple[int, int]] = []
@@ -2533,12 +2738,19 @@ class FusedMoE(CustomOp):
                 envelope_bytes=block_bytes,
                 existing_owners=envelope_owners,
             )
-            for region_id in record.envelope_region_ids:
-                _, base_text, length_text = region_id.rsplit(":", 2)
-                geometry_by_region[region_id] = (
-                    int(base_text, 16),
-                    int(length_text, 16),
-                )
+            # Static-alias finalize registered whole expert slices before the
+            # runtime controller was initialized.  Their envelope geometry
+            # overlaps those live driver regions, so retain logical records
+            # for inventory purposes but leave physical region ownership with
+            # the alias session.  Explicit runtime waves are fail-closed above
+            # if they ever try to select one of these frozen base experts.
+            if int(global_expert_id) not in static_alias_owned:
+                for region_id in record.envelope_region_ids:
+                    _, base_text, length_text = region_id.rsplit(":", 2)
+                    geometry_by_region[region_id] = (
+                        int(base_text, 16),
+                        int(length_text, 16),
+                    )
             # Registration records geometry, not physical residency.  Final
             # post-warmup placement is the first operation allowed to commit
             # survivor experts to GPU.
@@ -2598,6 +2810,13 @@ class FusedMoE(CustomOp):
         layer_id = self._uvm_layer_id()
         remote_ids = set(self._uvm_remote_read_global_expert_ids)
         offloaded_ids = set(self._uvm_offloaded_global_expert_ids)
+        incremental_ids = set(
+            getattr(
+                self,
+                "_uvm_incremental_offloaded_global_expert_ids",
+                set(),
+            )
+        )
         experts: list[dict[str, object]] = []
         region_owners: list[dict[str, object]] = []
         for (_, expert_id), record in sorted(self._uvm_expert_records.items()):
@@ -2611,6 +2830,9 @@ class FusedMoE(CustomOp):
                     "layer_id": int(record.layer_id),
                     "expert_id": int(record.global_expert_id),
                     "placement": placement,
+                    "incremental_runtime_offload": bool(
+                        int(expert_id) in incremental_ids
+                    ),
                     "app_state": record.aggregate_state.value,
                     "region_count": len(record.envelope_region_ids),
                 }
@@ -2635,6 +2857,7 @@ class FusedMoE(CustomOp):
             "access_mode": self.uvm_expert_offload_access_mode,
             "plan_file": self.uvm_init_weight_offload_plan_file,
             "plan_policy": self.uvm_init_weight_plan_policy,
+            "incremental_offloaded_experts": sorted(incremental_ids),
             "experts": experts,
             "region_owners": region_owners,
             "release_audits": [
@@ -3019,9 +3242,19 @@ class FusedMoE(CustomOp):
 
     def run_uvm_init_weight_offload(self) -> None:
         """Register all local experts, then offload the caller-selected set."""
-        if not self.uvm_init_weight_offload_enable:
+        incremental_transaction = bool(
+            self.uvm_incremental_expert_offload_enable
+            and self._uvm_incremental_offload_in_progress
+            and self._uvm_incremental_selected_global_expert_id is not None
+        )
+        # INIT_WEIGHT_OFFLOAD_ENABLE owns only the one-shot Stage-M placement.
+        # An explicit runtime wave has its own enable flag and transaction
+        # marker, so it can safely operate after static-alias finalize without
+        # re-running the frozen base plan.  A normal warmup/finalize call with
+        # INIT_WEIGHT_OFFLOAD_ENABLE=0 remains a strict no-op.
+        if not self.uvm_init_weight_offload_enable and not incremental_transaction:
             return
-        if self.uvm_init_weight_offload_enable and not getattr(
+        if not getattr(
             self,
             "uvm_expert_envelope_enable",
             False,

@@ -1,0 +1,59 @@
+{
+  "logical_count_shape": [
+    1,
+    27,
+    64
+  ],
+  "schema": "deepseek_v2_lite_kt_frequency_placements_v1",
+  "selection": "exact complement of frozen per-layer cold expert plan",
+  "tiers": {
+    "2g": {
+      "cold_experts_per_layer": 5,
+      "frequency_path": "/home/ubuntu/nvidia-uvm-gpu/experiments/eurosys_moe_offload_evaluation/inputs/generated/eurosys-pa-v1-20260823/deepseek_v2_lite_bf16/calibration_assets_attempt3/kt_placements/kt_frequency_2g.pt",
+      "frequency_sha256": "d8cb2020299363328131630334a5d065fd1316852519db2f9607bcc0a8652bf6",
+      "gpu_experts_per_layer": 59,
+      "mask_uint8_sha256": "22a8c1ea4e5304eb556aad4921abc108ab04ff6550d7fac0c04c8734ad25721d",
+      "selected_main_bytes": 2249195520,
+      "source_plan": "/home/ubuntu/nvidia-uvm-gpu/experiments/eurosys_moe_offload_evaluation/inputs/generated/eurosys-pa-v1-20260823/deepseek_v2_lite_bf16/calibration_assets_attempt3/plans/cold_plan_2g.json",
+      "source_plan_sha256": "e36731108eb5e8c7ed514158a9db4a72687d4cb8d3bf0ca5d59105c858ddc604",
+      "total_cpu_experts": 130,
+      "total_gpu_experts": 1534
+    },
+    "4g": {
+      "cold_experts_per_layer": 10,
+      "frequency_path": "/home/ubuntu/nvidia-uvm-gpu/experiments/eurosys_moe_offload_evaluation/inputs/generated/eurosys-pa-v1-20260823/deepseek_v2_lite_bf16/calibration_assets_attempt3/kt_placements/kt_frequency_4g.pt",
+      "frequency_sha256": "777973db8ebd5e527243acacc7142f391ed75283af41a09b8c4218dc092538b7",
+      "gpu_experts_per_layer": 54,
+      "mask_uint8_sha256": "647e8b28c31acef34dc9f42c82c8e751dce2e933e573dc4e2a22e5851a630b10",
+      "selected_main_bytes": 4498391040,
+      "source_plan": "/home/ubuntu/nvidia-uvm-gpu/experiments/eurosys_moe_offload_evaluation/inputs/generated/eurosys-pa-v1-20260823/deepseek_v2_lite_bf16/calibration_assets_attempt3/plans/cold_plan_4g.json",
+      "source_plan_sha256": "335ba082ce81937180f409389fc9db52f8e33a67987ca764804988c7d66126be",
+      "total_cpu_experts": 260,
+      "total_gpu_experts": 1404
+    },
+    "6g": {
+      "cold_experts_per_layer": 14,
+      "frequency_path": "/home/ubuntu/nvidia-uvm-gpu/experiments/eurosys_moe_offload_evaluation/inputs/generated/eurosys-pa-v1-20260823/deepseek_v2_lite_bf16/calibration_assets_attempt3/kt_placements/kt_frequency_6g.pt",
+      "frequency_sha256": "50c66f86576c7e2a93029e1c25df532c756ce6681aa3c2f025d3e817323d7c97",
+      "gpu_experts_per_layer": 50,
+      "mask_uint8_sha256": "e0774d17698c9c3c8370a1b4884ff80b70606b86c854ad8ccf31f1d479c509aa",
+      "selected_main_bytes": 6297747456,
+      "source_plan": "/home/ubuntu/nvidia-uvm-gpu/experiments/eurosys_moe_offload_evaluation/inputs/generated/eurosys-pa-v1-20260823/deepseek_v2_lite_bf16/calibration_assets_attempt3/plans/cold_plan_6g.json",
+      "source_plan_sha256": "8c41f8b7c7dbd1fa586b1d557ce8efa65958af7af2498b993e7057a7930e7f3f",
+      "total_cpu_experts": 364,
+      "total_gpu_experts": 1300
+    },
+    "8g": {
+      "cold_experts_per_layer": 19,
+      "frequency_path": "/home/ubuntu/nvidia-uvm-gpu/experiments/eurosys_moe_offload_evaluation/inputs/generated/eurosys-pa-v1-20260823/deepseek_v2_lite_bf16/calibration_assets_attempt3/kt_placements/kt_frequency_8g.pt",
+      "frequency_sha256": "15c5dafbfe74c0f76bc2478bdcac0c907c287d0010fa71bbee03f86637f543ff",
+      "gpu_experts_per_layer": 45,
+      "mask_uint8_sha256": "4fab86c8775b073930c6a9c51bfd068d9c3d9b71b0f910dc33dd2b88c9fe8415",
+      "selected_main_bytes": 8546942976,
+      "source_plan": "/home/ubuntu/nvidia-uvm-gpu/experiments/eurosys_moe_offload_evaluation/inputs/generated/eurosys-pa-v1-20260823/deepseek_v2_lite_bf16/calibration_assets_attempt3/plans/cold_plan_8g.json",
+      "source_plan_sha256": "e1400c84b775208bf71ff8dbb3a8f059648e9ad05b7e2f2c00141af3d3664954",
+      "total_cpu_experts": 494,
+      "total_gpu_experts": 1170
+    }
+  }
+}

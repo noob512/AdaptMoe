@@ -4,9 +4,9 @@ This experiment compares the current synchronous P3 path with vLLM pinned
 copy-on-forward and the project's custom managed-UVA remote-read path.  It
 measures prefill and decode as separate, scheduler-validated engine steps.
 
-For the complete build, safety, module-cycle, measurement, verification, and
-recovery procedure, see
-[`REPRODUCE_20260819.md`](REPRODUCE_20260819.md).
+The historical reproduction report was superseded on 2026-08-23. Use this
+implementation entry point together with
+[`../../docs/eurosys_moe_offload_evaluation_plan.md`](../../docs/eurosys_moe_offload_evaluation_plan.md).
 
 ## Equal weight contract
 

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "stage": "trace_coverage_verification",
+  "returncode": 1,
+  "created_at": "2026-08-23T06:53:53Z",
+  "reason": "0.5 GiB KV caused scheduler preemption/recompute; decode token count reached 3462",
+  "gpu_rerun": false,
+  "preserved_plan_manifest": "/home/ubuntu/nvidia-uvm-gpu/experiments/eurosys_moe_offload_evaluation/inputs/generated/eurosys-pa-v1-20260823/deepseek_v2_lite_bf16/calibration_assets_attempt2/plans/manifest.json"
+}

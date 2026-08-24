@@ -1,0 +1,1 @@
+/home/ubuntu/nvidia-uvm-gpu/experiments/eurosys_moe_offload_evaluation/inputs/generated/eurosys-pa-v1-20260823/deepseek_v2_lite_bf16/calibration_assets_attempt2/kt_placements/kt_frequency_manifest.json

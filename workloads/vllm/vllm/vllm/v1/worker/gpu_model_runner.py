@@ -40,11 +40,13 @@ from vllm.config import (
 )
 from vllm.device_allocator.uvm import (
     batch_advise_ranges_cpu_with_executor,
+    batch_advise_ranges_preferred_location,
     batch_offload_ranges_to_cpu_with_executor,
     batch_prefetch_ranges_to_device,
     batch_prefetch_ranges_to_device_with_executor,
     batch_prepare_ranges_for_native_remote_access_with_executor,
     batch_prepare_ranges_for_remote_read_with_executor,
+    driver_batch_query_ranges_residency_bytes,
     probe_driver_capable_range,
     uvm_allocation_phase,
     uvm_enabled_allocation_phase,
@@ -223,6 +225,30 @@ def _uvm_kv_tail_range_for_allocation(
     tail_ptr = int(ptr) + first_cpu_block * int(page_size)
     tail_bytes = (max_block_id - first_cpu_block + 1) * int(page_size)
     return tail_ptr, tail_bytes, first_cpu_block, max_block_id
+
+
+def _uvm_kv_ranges_have_exclusive_residency(
+    ranges: Sequence[tuple[int, int]],
+    residency: dict[str, int | bool],
+    *,
+    location: str,
+) -> bool:
+    """Return whether every byte is resident exclusively at one location."""
+    if not ranges:
+        return True
+    expected_bytes = sum(int(size) for _, size in ranges)
+    if expected_bytes <= 0 or location not in ("cpu", "gpu"):
+        return False
+    local_key = f"{location}_bytes"
+    remote_key = "gpu_bytes" if location == "cpu" else "cpu_bytes"
+    return (
+        residency.get("ok") is True
+        and int(residency.get("queried_bytes", -1)) == expected_bytes
+        and int(residency.get("any_bytes", -1)) == expected_bytes
+        and int(residency.get(local_key, -1)) == expected_bytes
+        and int(residency.get(remote_key, -1)) == 0
+        and int(residency.get("unknown_bytes", -1)) == 0
+    )
 
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
@@ -3085,18 +3111,69 @@ class GPUModelRunner(
         result["live_entry_count_after"] = len(entries)
         return result
 
+    def _collect_uvm_runtime_remote_expert_ranges(
+        self,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return live incremental remote-expert ranges outside the alias plan."""
+        if not self._env_flag_enabled(
+            "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE",
+            default=False,
+        ):
+            return ()
+
+        ranges: set[tuple[int, int]] = set()
+        for module in self.get_model().modules():
+            snapshot_fn = getattr(
+                module,
+                "get_uvm_init_weight_placement_snapshot",
+                None,
+            )
+            if not callable(snapshot_fn):
+                continue
+            snapshot = snapshot_fn()
+            owners = (
+                snapshot.get("region_owners")
+                if isinstance(snapshot, dict)
+                else None
+            )
+            if not isinstance(owners, list):
+                continue
+            for owner in owners:
+                if not isinstance(owner, dict) or owner.get("placement") != "remote":
+                    continue
+                region_id = owner.get("region_id")
+                if not isinstance(region_id, str):
+                    raise RuntimeError("Remote expert region has no stable identity")
+                try:
+                    _prefix, base_text, length_text = region_id.rsplit(":", 2)
+                    base = int(base_text, 16)
+                    length = int(length_text, 16)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"Malformed remote expert region identity: {region_id!r}"
+                    ) from exc
+                if base <= 0 or length <= 0:
+                    raise RuntimeError(
+                        f"Invalid remote expert region geometry: {region_id!r}"
+                    )
+                ranges.add((base, length))
+        return tuple(sorted(ranges))
+
     def _maybe_switch_uvm_original_va_prefill_to_decode_remote(
         self,
         scheduler_output: "SchedulerOutput",
         step_phase: str,
     ) -> None:
         from vllm.model_executor.models.utils import (
+            activate_cpu_offload_uvm_original_va_prefill_topology,
+            cpu_offload_uvm_original_va_park_resume_enabled,
             cpu_offload_uvm_original_va_phase_mode,
             get_cpu_offload_graph_static_alias_diagnostics,
             transition_cpu_offload_uvm_original_va_to_remote,
         )
 
         mode = cpu_offload_uvm_original_va_phase_mode()
+        park_resume = cpu_offload_uvm_original_va_park_resume_enabled()
         if mode == "off":
             return
         if self._uvm_original_va_phase_poison_reason is not None:
@@ -3136,12 +3213,23 @@ class GPUModelRunner(
             )
         if step_phase == "enabled:prefill_step":
             if self._uvm_original_va_phase_decode_cutover_done:
-                self._poison_uvm_original_va_phase(
-                    "a prefill step arrived after remote decode cutover"
-                )
-                raise RuntimeError(
-                    "Original-VA prefill arrived after one-way remote cutover"
-                )
+                if not park_resume:
+                    self._poison_uvm_original_va_phase(
+                        "a prefill step arrived after remote decode cutover"
+                    )
+                    raise RuntimeError(
+                        "Original-VA prefill arrived after one-way remote cutover"
+                    )
+                resumed = activate_cpu_offload_uvm_original_va_prefill_topology()
+                if resumed.get("ok") is not True:
+                    self._poison_uvm_original_va_phase(
+                        "parked aliases failed to resume for a new prefill"
+                    )
+                    raise RuntimeError(
+                        "Original-VA parked aliases failed to resume"
+                    )
+                self._uvm_original_va_phase_decode_cutover_done = False
+                diagnostics = get_cpu_offload_graph_static_alias_diagnostics()
             if not (
                 diagnostics.get("lifecycle_state") == "sealed"
                 and diagnostics.get("sealed") is True
@@ -3159,10 +3247,15 @@ class GPUModelRunner(
         if step_phase != "enabled:decode_step":
             return
         if self._uvm_original_va_phase_decode_cutover_done:
+            expected_remote_state = "remote_parked" if park_resume else "remote"
             if not (
-                diagnostics.get("lifecycle_state") == "remote"
+                diagnostics.get("lifecycle_state") == expected_remote_state
                 and diagnostics.get("remote_map_active") is True
-                and int(diagnostics.get("session_id", -1)) == 0
+                and (
+                    int(diagnostics.get("session_id", 0)) > 0
+                    if park_resume
+                    else int(diagnostics.get("session_id", -1)) == 0
+                )
             ):
                 self._poison_uvm_original_va_phase(
                     "decode topology drifted after remote cutover"
@@ -3186,7 +3279,7 @@ class GPUModelRunner(
             )
 
         alias_graph_teardown: dict[str, Any] | None = None
-        if mode == "prefill_graph_remote_decode":
+        if mode == "prefill_graph_remote_decode" and not park_resume:
             try:
                 alias_graph_teardown = (
                     self._destroy_uvm_original_va_alias_prefill_graphs()
@@ -3202,17 +3295,32 @@ class GPUModelRunner(
             diagnostics = get_cpu_offload_graph_static_alias_diagnostics()
 
         preserve_remote_graphs = bool(diagnostics.get("remote_graph_captured"))
+        transition_kwargs: dict[str, Any] = {
+            "reason": "first_decode_cutover",
+            "preserve_remote_graphs": preserve_remote_graphs,
+        }
+        runtime_remote_ranges = self._collect_uvm_runtime_remote_expert_ranges()
+        if runtime_remote_ranges:
+            transition_kwargs["runtime_remote_ranges"] = runtime_remote_ranges
         transition = transition_cpu_offload_uvm_original_va_to_remote(
-            reason="first_decode_cutover",
-            preserve_remote_graphs=preserve_remote_graphs,
+            **transition_kwargs,
         )
         after = get_cpu_offload_graph_static_alias_diagnostics()
+        expected_remote_state = "remote_parked" if park_resume else "remote"
         if not (
             transition.get("ok") is True
-            and after.get("lifecycle_state") == "remote"
+            and after.get("lifecycle_state") == expected_remote_state
             and after.get("remote_map_active") is True
-            and int(after.get("session_id", -1)) == 0
-            and int(after.get("active_driver_backing_bytes", -1)) == 0
+            and (
+                int(after.get("session_id", 0)) > 0
+                if park_resume
+                else int(after.get("session_id", -1)) == 0
+            )
+            and (
+                int(after.get("active_driver_backing_bytes", 0)) > 0
+                if park_resume
+                else int(after.get("active_driver_backing_bytes", -1)) == 0
+            )
         ):
             self._poison_uvm_original_va_phase(
                 "post-cutover remote metadata contract failed"
@@ -3224,6 +3332,7 @@ class GPUModelRunner(
             "schema": "vllm_uvm_original_va_phase_transition_v1",
             "ok": True,
             "phase_mode": mode,
+            "park_resume": park_resume,
             "remote_graph_preserved": preserve_remote_graphs,
             "alias_graph_teardown": alias_graph_teardown,
             "transition": transition,
@@ -3565,12 +3674,16 @@ class GPUModelRunner(
             original_va_phase_mode = cpu_offload_uvm_original_va_phase_mode()
             if (
                 original_va_phase_mode != "off"
-                and original_va_phase_mode != "prefill_graph_remote_decode"
+                and original_va_phase_mode
+                not in ("prefill_graph_remote_decode", "remote_only")
                 and enabled_step_phase != "enabled:decode_step"
             ):
                 # FULL_DECODE_ONLY can classify a one-token new request as a
-                # uniform decode shape. A remote-only Graph must never replay
-                # while alias-prefill PTEs are active, so phase wins over shape.
+                # uniform decode shape. A remote Graph must never replay while
+                # alias-prefill PTEs are active, so phase wins over shape. In
+                # remote_only mode the audited remote topology is immutable for
+                # the whole serving lifetime, therefore Prefill FULL replay is
+                # safe and is validated again immediately before model forward.
                 cudagraph_runtime_mode = CUDAGraphMode.NONE
 
         # Set cudagraph mode to none if calc_kv_scales is true.
@@ -4368,7 +4481,13 @@ class GPUModelRunner(
         self,
         target_blocks: int,
     ) -> dict[str, Any]:
-        """Move KV tails past the scheduler target without freeing their tensors."""
+        """Converge fixed-VA KV pages to the requested initial residency.
+
+        The default path preserves the historical tail-only rebalance.  Lazy
+        reserve additionally prefetches the active prefix because the maximum
+        KV allocation was created with ``torch.empty`` and no allocator-level
+        prefetch; in that mode reserving a tensor does not imply GPU residency.
+        """
         ranges, collection = self._collect_uvm_post_warmup_kv_tail_ranges(target_blocks)
         record: dict[str, Any] = {
             "ok": bool(collection.get("ok")),
@@ -4378,10 +4497,6 @@ class GPUModelRunner(
         }
         if not collection.get("ok"):
             return record
-        if not ranges:
-            record["offload_complete"] = True
-            return record
-
         executor = (
             os.environ.get(
                 "VLLM_UVM_POST_WARMUP_KV_OFFLOAD_EXECUTOR",
@@ -4398,14 +4513,177 @@ class GPUModelRunner(
             )
             executor = "auto"
 
-        successes, _, _, _ = (
-            batch_offload_ranges_to_cpu_with_executor(
-                ranges,
-                sync=True,
-                executor=executor,
+        lazy_reserve = os.environ.get(
+            "VLLM_UVM_KV_CACHE_LAZY_RESERVE",
+            "0",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        complete = True
+        made_progress = False
+        device = int(torch.cuda.current_device()) if lazy_reserve else 0
+        head_ranges: list[tuple[int, int]] = []
+
+        cpu_materialization_ranges = ranges
+        if lazy_reserve:
+            # ``torch.empty`` reserves the maximum VA without committing every
+            # page.  A direct high target therefore cannot assume that a GPU
+            # prefetch alone creates backing for the untouched pages.  First
+            # materialize the complete fixed-VA pool on CPU, then migrate the
+            # requested active prefix to GPU.  Dynamic low->high already takes
+            # this path implicitly because the low tail is CPU resident.
+            kv_cache_config = getattr(self, "kv_cache_config", None)
+            total_blocks = (
+                max(int(kv_cache_config.num_blocks) - 1, 0)
+                if kv_cache_config is not None
+                else 0
             )
-        )
-        record["offload_complete"] = successes == len(ranges)
+            cpu_materialization_ranges = (
+                collect_uvm_kv_cache_physical_ranges_for_blocks(
+                    list(range(0, total_blocks + 1))
+                )
+            )
+            if total_blocks > 0 and not cpu_materialization_ranges:
+                complete = False
+
+        if complete and cpu_materialization_ranges:
+            successes, _, _, _ = (
+                batch_offload_ranges_to_cpu_with_executor(
+                    cpu_materialization_ranges,
+                    sync=True,
+                    executor=executor,
+                )
+            )
+            complete = int(successes) == len(cpu_materialization_ranges)
+            made_progress = True
+
+        if complete and lazy_reserve:
+            clamped_target = int(record["target_blocks"])
+            head_ranges = collect_uvm_kv_cache_physical_ranges_for_blocks(
+                list(range(0, clamped_target + 1))
+            )
+            if clamped_target > 0 and not head_ranges:
+                complete = False
+            elif head_ranges:
+                advised = batch_advise_ranges_preferred_location(
+                    head_ranges,
+                    device,
+                )
+                if int(advised) != len(head_ranges):
+                    complete = False
+                else:
+                    successes, _, _ = (
+                        batch_prefetch_ranges_to_device_with_executor(
+                            head_ranges,
+                            device,
+                            executor=executor,
+                        )
+                    )
+                    complete = int(successes) == len(head_ranges)
+                made_progress = True
+
+        if lazy_reserve and made_progress:
+            try:
+                torch.cuda.synchronize(device)
+            except Exception:
+                complete = False
+
+        if complete:
+            head_complete = True
+            if lazy_reserve and head_ranges:
+                head_residency = driver_batch_query_ranges_residency_bytes(
+                    head_ranges,
+                    device=device,
+                    wait_for_trackers=False,
+                )
+                head_complete = _uvm_kv_ranges_have_exclusive_residency(
+                    head_ranges,
+                    head_residency,
+                    location="gpu",
+                )
+
+            tail_complete = True
+            if ranges:
+                tail_residency = driver_batch_query_ranges_residency_bytes(
+                    ranges,
+                    device=device,
+                    wait_for_trackers=False,
+                )
+                tail_complete = _uvm_kv_ranges_have_exclusive_residency(
+                    ranges,
+                    tail_residency,
+                    location="cpu",
+                )
+
+            complete = head_complete and tail_complete
+            if not complete:
+                retry_accepted = True
+                if not tail_complete and ranges:
+                    successes, _, _, _ = (
+                        batch_offload_ranges_to_cpu_with_executor(
+                            ranges,
+                            sync=True,
+                            executor=executor,
+                        )
+                    )
+                    retry_accepted = int(successes) == len(ranges)
+
+                if not head_complete and lazy_reserve and head_ranges:
+                    advised = batch_advise_ranges_preferred_location(
+                        head_ranges,
+                        device,
+                    )
+                    successes, _, _ = (
+                        batch_prefetch_ranges_to_device_with_executor(
+                            head_ranges,
+                            device,
+                            executor=executor,
+                        )
+                    )
+                    retry_accepted = (
+                        retry_accepted
+                        and int(advised) == len(head_ranges)
+                        and int(successes) == len(head_ranges)
+                    )
+
+                if retry_accepted and lazy_reserve and not head_complete:
+                    try:
+                        torch.cuda.synchronize(device)
+                    except Exception:
+                        retry_accepted = False
+
+                if retry_accepted:
+                    if lazy_reserve and head_ranges:
+                        head_residency = (
+                            driver_batch_query_ranges_residency_bytes(
+                                head_ranges,
+                                device=device,
+                                wait_for_trackers=False,
+                            )
+                        )
+                        head_complete = (
+                            _uvm_kv_ranges_have_exclusive_residency(
+                                head_ranges,
+                                head_residency,
+                                location="gpu",
+                            )
+                        )
+                    if ranges:
+                        tail_residency = (
+                            driver_batch_query_ranges_residency_bytes(
+                                ranges,
+                                device=device,
+                                wait_for_trackers=False,
+                            )
+                        )
+                        tail_complete = (
+                            _uvm_kv_ranges_have_exclusive_residency(
+                                ranges,
+                                tail_residency,
+                                location="cpu",
+                            )
+                        )
+                    complete = head_complete and tail_complete
+
+        record["offload_complete"] = complete
         return record
 
     def resize_uvm_kv_cache_target(
@@ -4467,6 +4745,13 @@ class GPUModelRunner(
             try:
                 made_progress = True
                 if direction == "grow":
+                    advised = batch_advise_ranges_preferred_location(
+                        ranges,
+                        device,
+                    )
+                    if int(advised) != len(ranges):
+                        complete = False
+                        break
                     successes, _, _ = (
                         batch_prefetch_ranges_to_device_with_executor(
                             ranges,
@@ -4483,7 +4768,19 @@ class GPUModelRunner(
                         )
                     )
                 complete = int(successes) == len(ranges)
+                if not complete:
+                    logger.warning(
+                        "Incomplete physical KV %s: successes=%d ranges=%d",
+                        direction,
+                        int(successes),
+                        len(ranges),
+                    )
             except Exception:
+                logger.exception(
+                    "Physical KV %s failed for %d ranges",
+                    direction,
+                    len(ranges),
+                )
                 complete = False
             if not complete:
                 break
@@ -4492,6 +4789,7 @@ class GPUModelRunner(
             try:
                 torch.cuda.synchronize(device)
             except Exception:
+                logger.exception("Physical KV resize synchronization failed")
                 complete = False
         return {"ok": complete, "made_progress": made_progress}
 
@@ -6247,11 +6545,18 @@ class GPUModelRunner(
         self,
         expert_class: str,
     ) -> dict[str, Any]:
-        """Return one local candidate for each MoE layer."""
+        """Return one local candidate for every MoE layer, or no wave.
+
+        A KV resize must never reclaim experts from only the layers that
+        happen to have a candidate.  If one layer is exhausted, discard the
+        whole class-specific wave so the caller can try another class (or
+        leave the HBM as safety headroom).
+        """
         normalized_class = str(expert_class).strip().lower()
         if normalized_class not in ("cold", "warm"):
             return {"ok": False, "candidates": {}}
         candidates: dict[str, int] = {}
+        eligible_layers: set[str] = set()
         for module in self.get_model().modules():
             next_candidate = getattr(
                 module,
@@ -6260,11 +6565,19 @@ class GPUModelRunner(
             )
             if not callable(next_candidate):
                 continue
+            layer_key = self._uvm_incremental_expert_layer_key(module)
+            if layer_key in eligible_layers:
+                return {"ok": False, "candidates": {}}
+            eligible_layers.add(layer_key)
             global_expert_id = next_candidate(normalized_class)
             if global_expert_id is None:
                 continue
-            layer_key = self._uvm_incremental_expert_layer_key(module)
             candidates[layer_key] = int(global_expert_id)
+        if candidates and set(candidates) != eligible_layers:
+            # Partial waves violate the equal-per-layer residency invariant.
+            # Returning no candidates lets EngineCore try the all-layer warm
+            # class, while still preventing any mutation in this class.
+            candidates = {}
         return {"ok": True, "candidates": candidates}
 
     def run_uvm_incremental_expert_offload(
@@ -6286,6 +6599,21 @@ class GPUModelRunner(
                 getattr(module, "run_uvm_incremental_weight_offload", None)
             )
         ]
+        module_layers = {
+            self._uvm_incremental_expert_layer_key(module) for module in modules
+        }
+        if len(module_layers) != len(modules):
+            return {"ok": False, "reason": "duplicate_expert_layer_key"}
+        if (
+            selected_experts_by_layer is not None
+            and set(selected_experts_by_layer) != module_layers
+        ):
+            return {
+                "ok": False,
+                "reason": "unbalanced_expert_layer_selection",
+                "selected_layer_count": len(selected_experts_by_layer),
+                "expected_layer_count": len(module_layers),
+            }
         has_cold = any(
             bool(module.has_remaining_uvm_incremental_experts("cold"))
             for module in modules
@@ -6295,6 +6623,7 @@ class GPUModelRunner(
         )
         released_all = True
         visited_layers: set[str] = set()
+        release_results: list[dict[str, Any]] = []
         with uvm_enabled_allocation_phase("enabled:incremental_weight_offload"):
             for module in modules:
                 selected_global_expert_id: int | None = None
@@ -6308,6 +6637,14 @@ class GPUModelRunner(
                 result = module.run_uvm_incremental_weight_offload(
                     allow_warm=effective_allow_warm,
                     selected_global_expert_id=selected_global_expert_id,
+                )
+                layer_key = self._uvm_incremental_expert_layer_key(module)
+                release_results.append(
+                    {
+                        "layer_key": layer_key,
+                        "selected_global_expert_id": selected_global_expert_id,
+                        **dict(result),
+                    }
                 )
                 released = {
                     int(expert_id)
@@ -6323,7 +6660,205 @@ class GPUModelRunner(
             released_all = released_all and visited_layers == set(
                 selected_experts_by_layer
             )
-        return {"ok": released_all}
+        return {
+            "ok": released_all,
+            "allow_warm": effective_allow_warm,
+            "selected_layer_count": (
+                len(selected_experts_by_layer)
+                if selected_experts_by_layer is not None
+                else len(release_results)
+            ),
+            "visited_layer_count": len(visited_layers),
+            "released_expert_count": sum(
+                int(
+                    result.get("released_count")
+                    or len(result.get("released_experts") or [])
+                )
+                for result in release_results
+            ),
+            "results": release_results,
+        }
+
+    def get_uvm_incremental_expert_restore_candidates(self) -> dict[str, Any]:
+        """Return one autoscale-offloaded expert per layer, or no wave."""
+        candidates: dict[str, int] = {}
+        eligible_layers: set[str] = set()
+        for module in self.get_model().modules():
+            next_candidate = getattr(
+                module,
+                "uvm_next_incremental_restore_expert",
+                None,
+            )
+            if not callable(next_candidate):
+                continue
+            layer_key = self._uvm_incremental_expert_layer_key(module)
+            if layer_key in eligible_layers:
+                return {"ok": False, "candidates": {}}
+            eligible_layers.add(layer_key)
+            global_expert_id = next_candidate()
+            if global_expert_id is None:
+                continue
+            candidates[layer_key] = int(global_expert_id)
+        if candidates and set(candidates) != eligible_layers:
+            # A partial restore would make per-layer expert capacity diverge.
+            # Treat it as inconsistent state and keep the pending retry set.
+            return {"ok": False, "candidates": {}}
+        return {"ok": True, "candidates": candidates}
+
+    def run_uvm_incremental_expert_restore(
+        self,
+        selected_experts_by_layer: dict[str, int],
+    ) -> dict[str, Any]:
+        """Restore exactly the selected balanced runtime-offload wave."""
+        selected = {
+            str(layer_key): int(expert_id)
+            for layer_key, expert_id in selected_experts_by_layer.items()
+        }
+        modules = [
+            module
+            for module in self.get_model().modules()
+            if callable(
+                getattr(module, "run_uvm_incremental_weight_restore", None)
+            )
+        ]
+        module_layers = {
+            self._uvm_incremental_expert_layer_key(module) for module in modules
+        }
+        if len(module_layers) != len(modules):
+            return {"ok": False, "reason": "duplicate_expert_layer_key"}
+        if set(selected) != module_layers:
+            return {
+                "ok": False,
+                "reason": "unbalanced_expert_layer_selection",
+                "selected_layer_count": len(selected),
+                "expected_layer_count": len(module_layers),
+            }
+        visited_layers: set[str] = set()
+        restore_results: list[dict[str, Any]] = []
+        restored_modules: dict[str, tuple[Any, int]] = {}
+        rollback_results: list[dict[str, Any]] = []
+        restored_all = True
+        with uvm_enabled_allocation_phase("enabled:incremental_weight_restore"):
+            for module in modules:
+                restore = getattr(
+                    module,
+                    "run_uvm_incremental_weight_restore",
+                    None,
+                )
+                if not callable(restore):
+                    continue
+                layer_key = self._uvm_incremental_expert_layer_key(module)
+                selected_expert = selected.get(layer_key)
+                if selected_expert is None:
+                    continue
+                visited_layers.add(layer_key)
+                try:
+                    result = restore(
+                        selected_global_expert_id=int(selected_expert),
+                    )
+                except Exception as exc:
+                    result = {
+                        "ok": False,
+                        "reason": "expert_restore_raised",
+                        "error": repr(exc),
+                        "restored_experts": [],
+                    }
+                restore_results.append(
+                    {
+                        "layer_key": layer_key,
+                        "selected_global_expert_id": int(selected_expert),
+                        **dict(result),
+                    }
+                )
+                restored = {
+                    int(expert_id)
+                    for expert_id in result.get("restored_experts", [])
+                }
+                if int(selected_expert) in restored:
+                    restored_modules[layer_key] = (
+                        module,
+                        int(selected_expert),
+                    )
+                satisfied = (
+                    bool(result.get("ok"))
+                    and int(selected_expert) in restored
+                ) or bool(result.get("already_local"))
+                restored_all = (
+                    restored_all
+                    and satisfied
+                )
+            restored_all = restored_all and visited_layers == set(selected)
+            rollback_ok = True
+            if not restored_all:
+                # Restoration happens after KV shrink and is allowed to fail,
+                # but a partial success must not leave different expert counts
+                # across layers. Re-offload every expert that was restored in
+                # this attempt so a later maintenance round can retry the same
+                # balanced wave.
+                for layer_key, (module, expert_id) in restored_modules.items():
+                    release = getattr(
+                        module,
+                        "run_uvm_incremental_weight_offload",
+                        None,
+                    )
+                    if not callable(release):
+                        rollback = {
+                            "ok": False,
+                            "reason": "expert_restore_rollback_unavailable",
+                            "released_experts": [],
+                        }
+                    else:
+                        try:
+                            rollback = release(
+                                allow_warm=True,
+                                selected_global_expert_id=expert_id,
+                            )
+                        except Exception as exc:
+                            rollback = {
+                                "ok": False,
+                                "reason": "expert_restore_rollback_raised",
+                                "error": repr(exc),
+                                "released_experts": [],
+                            }
+                    released = {
+                        int(value)
+                        for value in rollback.get("released_experts", [])
+                    }
+                    item_ok = bool(rollback.get("ok")) and expert_id in released
+                    rollback_ok = rollback_ok and item_ok
+                    rollback_results.append(
+                        {
+                            "layer_key": layer_key,
+                            "selected_global_expert_id": expert_id,
+                            **dict(rollback),
+                            "ok": item_ok,
+                        }
+                    )
+        response = {
+            "ok": restored_all,
+            "reason": "restored" if restored_all else "restore_incomplete",
+            "selected_layer_count": len(selected),
+            "visited_layer_count": len(visited_layers),
+            "restored_expert_count": sum(
+                int(
+                    result.get("restored_count")
+                    or len(result.get("restored_experts") or [])
+                )
+                for result in restore_results
+            ),
+            "results": restore_results,
+        }
+        if not restored_all:
+            response.update(
+                {
+                    "rollback_ok": rollback_ok,
+                    "rollback_results": rollback_results,
+                    "net_restored_expert_count": (
+                        0 if rollback_ok else len(restored_modules)
+                    ),
+                }
+            )
+        return response
 
     def get_uvm_dynamic_expert_heat(
         self,
@@ -6635,16 +7170,19 @@ class GPUModelRunner(
         destroyed_graph_count = 0
         model = getattr(self, "model", None)
         if isinstance(model, CUDAGraphWrapper):
-            entries = model.concrete_cudagraph_entries
-            for entry in tuple(entries.values()):
-                graph = entry.cudagraph
-                if graph is not None:
-                    graph.reset()
-                    destroyed_graph_count += 1
+            reset_all = getattr(model, "reset_all_cudagraph_classes", None)
+            if reset_all is not None:
+                destroyed_graph_count = int(reset_all())
+            else:
+                entries = model.concrete_cudagraph_entries
+                for entry in tuple(entries.values()):
+                    if entry.cudagraph is not None:
+                        entry.cudagraph.reset()
+                        destroyed_graph_count += 1
                     entry.cudagraph = None
-                entry.output = None
-                entry.input_addresses = None
-            entries.clear()
+                    entry.output = None
+                    entry.input_addresses = None
+                entries.clear()
         gc.collect()
         torch.cuda.synchronize(self.device)
 
@@ -6659,6 +7197,473 @@ class GPUModelRunner(
                 f"destroying {destroyed_graph_count} CUDA Graphs: {result!r}"
             )
         return result
+
+    def rebuild_cpu_offload_uvm_expert_plan_at_idle_boundary(
+        self,
+        expert_plan_file: str,
+        *,
+        reason: str,
+        scheduler_idle: bool,
+        expected_selected_bytes: int | None = None,
+        pressure: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Rebuild upload/remote plans between two completed requests.
+
+        The scheduler owns the idle proof; this method owns concrete CUDA
+        Graph teardown and recapture.  Keeping those responsibilities explicit
+        prevents a plan change from racing an active request or leaving a
+        Graph executable bound to an old upload arena.
+        """
+        from vllm.model_executor.models.utils import (
+            get_cpu_offload_graph_static_alias_diagnostics,
+            rebuild_cpu_offload_uvm_original_va_expert_plan,
+        )
+
+        if scheduler_idle is not True:
+            raise RuntimeError(
+                "Dynamic expert-plan rebuild requires an audited idle "
+                "scheduler boundary"
+            )
+        model = getattr(self, "model", None)
+        if not isinstance(model, CUDAGraphWrapper):
+            raise RuntimeError(
+                "Dynamic expert-plan rebuild requires a CUDAGraphWrapper"
+            )
+
+        started_ns = time.perf_counter_ns()
+        torch.cuda.synchronize(self.device)
+        graph_reset_started_ns = time.perf_counter_ns()
+        entries = model.concrete_cudagraph_entries
+        destroyed_graph_count = 0
+        destroyed_descriptors: list[dict[str, Any]] = []
+        for descriptor, entry in tuple(entries.items()):
+            graph = entry.cudagraph
+            if graph is not None:
+                graph.reset()
+                destroyed_graph_count += 1
+            destroyed_descriptors.append(
+                {
+                    "num_tokens": int(descriptor.num_tokens),
+                    "uniform_decode": bool(descriptor.uniform_decode),
+                    "has_lora": bool(descriptor.has_lora),
+                }
+            )
+            entry.cudagraph = None
+            entry.output = None
+            entry.input_addresses = None
+        entries.clear()
+        gc.collect()
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+
+        # torch.cuda.CUDAGraph.reset() drops the last live user of the shared
+        # graph pool. Reusing that now-retired pool id for another capture can
+        # trip CUDACachingAllocator's ``use_count > 0`` invariant. A dynamic
+        # plan also owns different upload arenas, so start its captures in a
+        # fresh pool after every old graph and output reference is gone.
+        model.graph_pool = torch.cuda.graph_pool_handle()
+        graphs_destroyed_ns = time.perf_counter_ns()
+        if destroyed_graph_count <= 0:
+            raise RuntimeError(
+                "Dynamic expert-plan rebuild found no captured CUDA Graphs"
+            )
+
+        rebuild = rebuild_cpu_offload_uvm_original_va_expert_plan(
+            expert_plan_file,
+            reason=reason,
+            graphs_destroyed=True,
+            expected_selected_bytes=expected_selected_bytes,
+            pressure=pressure,
+        )
+        plan_rebuilt_ns = time.perf_counter_ns()
+        graph_memory_bytes = self.capture_model()
+        graphs_captured_ns = time.perf_counter_ns()
+
+        diagnostics = get_cpu_offload_graph_static_alias_diagnostics()
+        if not (
+            diagnostics.get("lifecycle_state") == "sealed"
+            and diagnostics.get("remote_graph_captured") is True
+            and diagnostics.get("alias_graph_captured") is True
+            and isinstance(
+                diagnostics.get("dual_graph_partition_certificate"), dict
+            )
+            and int(diagnostics.get("plan_generation", -1))
+            == int(rebuild.get("generation", -2))
+        ):
+            raise RuntimeError(
+                "Dynamic expert-plan recapture did not restore the certified "
+                f"dual topology: {diagnostics!r}"
+            )
+        self._uvm_original_va_phase_decode_cutover_done = False
+        self._uvm_original_va_phase_prefill_seen = False
+        result = {
+            "schema": "vllm_uvm_request_boundary_plan_rebuild_v1",
+            "ok": True,
+            "reason": reason,
+            "scheduler_idle": True,
+            "pressure": dict(pressure or {}),
+            "destroyed_graph_count": destroyed_graph_count,
+            "destroyed_graph_descriptors": destroyed_descriptors,
+            "graph_pool_renewed": True,
+            "graph_memory_bytes": int(graph_memory_bytes),
+            "graph_reset_ns": graphs_destroyed_ns - graph_reset_started_ns,
+            "plan_rebuild_ns": plan_rebuilt_ns - graphs_destroyed_ns,
+            "graph_capture_ns": graphs_captured_ns - plan_rebuilt_ns,
+            "wall_ns": graphs_captured_ns - started_ns,
+            "rebuild": rebuild,
+            "diagnostics_after": diagnostics,
+        }
+        logger.info(
+            "Rebuilt UVM expert plan generation=%d selected_bytes=%d "
+            "graphs=%d wall_ms=%.3f",
+            int(rebuild.get("generation", -1)),
+            int(rebuild.get("selected_bytes", 0)),
+            destroyed_graph_count,
+            float(result["wall_ns"]) / 1e6,
+        )
+        return result
+
+    def capture_uvm_expert_graph_class_at_idle_boundary(
+        self,
+        class_name: str,
+        *,
+        scheduler_idle: bool,
+    ) -> dict[str, Any]:
+        """Capture one additional class while retaining existing GraphExecs."""
+        if scheduler_idle is not True:
+            return {"ok": False, "reason": "scheduler_not_idle"}
+        model = getattr(self, "model", None)
+        if not isinstance(model, CUDAGraphWrapper):
+            return {"ok": False, "reason": "cudagraph_wrapper_unavailable"}
+        from vllm.model_executor.models.utils import (
+            begin_cpu_offload_uvm_plan_class_graph_capture,
+            cpu_offload_uvm_plan_class_registry,
+            register_cpu_offload_uvm_plan_class_graph_certificates,
+            switch_cpu_offload_uvm_original_va_plan_class,
+        )
+
+        torch.cuda.synchronize(self.device)
+        before = model.cudagraph_class_diagnostics()
+        normalized = model._normalize_cudagraph_class(class_name)
+        existing = before["classes"].get(normalized)
+        if existing and bool(existing.get("fully_captured")):
+            return {
+                "ok": True,
+                "reason": "class_already_captured",
+                "class_name": normalized,
+                "graph_memory_bytes": 0,
+                "capture_ns": 0,
+                "before": before,
+                "after": before,
+            }
+
+        registry = cpu_offload_uvm_plan_class_registry()
+        plan_switch = None
+        if bool(registry.get("enabled")):
+            if normalized not in registry["classes"]:
+                return {"ok": False, "reason": "plan_class_not_registered"}
+            if registry.get("active_class") != normalized:
+                plan_switch = switch_cpu_offload_uvm_original_va_plan_class(
+                    normalized,
+                    reason="graph_class_capture",
+                    graphs_retained=True,
+                )
+                if plan_switch.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "reason": "plan_class_switch_failed",
+                        "plan_switch": plan_switch,
+                    }
+
+        # The normal startup capture initially lives under "default". Adopt
+        # it as the configured initial class without duplicating GraphExecs.
+        active_class = before.get("active_class")
+        active_state = before["classes"].get(active_class, {})
+        if (
+            bool(registry.get("enabled"))
+            and registry.get("active_class") == normalized
+            and bool(active_state.get("fully_captured"))
+            and normalized not in before["classes"]
+        ):
+            adopted = model.register_active_cudagraph_class(normalized)
+            if adopted.get("ok") is not True:
+                return {
+                    **adopted,
+                    "class_name": normalized,
+                    "graph_memory_bytes": 0,
+                    "capture_ns": 0,
+                    "certificate": None,
+                    "plan_switch": plan_switch,
+                    "before": before,
+                    "after": model.cudagraph_class_diagnostics(),
+                }
+            certificate = (
+                register_cpu_offload_uvm_plan_class_graph_certificates(
+                    normalized
+                )
+            )
+            after = model.cudagraph_class_diagnostics()
+            return {
+                **adopted,
+                "class_name": normalized,
+                "graph_memory_bytes": 0,
+                "capture_ns": 0,
+                "certificate": certificate,
+                "plan_switch": plan_switch,
+                "before": before,
+                "after": after,
+            }
+
+        model.begin_cudagraph_class_capture(normalized)
+        if bool(registry.get("enabled")):
+            begin_cpu_offload_uvm_plan_class_graph_capture(normalized)
+        started_ns = time.perf_counter_ns()
+        graph_memory_bytes = self.capture_model()
+        torch.cuda.synchronize(self.device)
+        elapsed_ns = time.perf_counter_ns() - started_ns
+        after = model.cudagraph_class_diagnostics()
+        class_state = after["classes"].get(normalized, {})
+        ok = bool(class_state.get("fully_captured"))
+        certificate = None
+        if ok and bool(registry.get("enabled")):
+            certificate = register_cpu_offload_uvm_plan_class_graph_certificates(
+                normalized
+            )
+        return {
+            "ok": ok,
+            "reason": "class_captured" if ok else "class_capture_incomplete",
+            "class_name": normalized,
+            "graph_memory_bytes": int(graph_memory_bytes),
+            "capture_ns": elapsed_ns,
+            "certificate": certificate,
+            "plan_switch": plan_switch,
+            "before": before,
+            "after": after,
+        }
+
+    def activate_uvm_expert_graph_class_at_idle_boundary(
+        self,
+        class_name: str,
+        *,
+        scheduler_idle: bool,
+    ) -> dict[str, Any]:
+        """Switch GraphExec tables without destroying or recapturing graphs."""
+        if scheduler_idle is not True:
+            return {"ok": False, "reason": "scheduler_not_idle"}
+        model = getattr(self, "model", None)
+        if not isinstance(model, CUDAGraphWrapper):
+            return {"ok": False, "reason": "cudagraph_wrapper_unavailable"}
+        from vllm.model_executor.models.utils import (
+            activate_cpu_offload_uvm_plan_class_graph_certificates,
+            cpu_offload_uvm_plan_class_registry,
+            switch_cpu_offload_uvm_original_va_plan_class,
+        )
+
+        torch.cuda.synchronize(self.device)
+        started_ns = time.perf_counter_ns()
+        normalized = model._normalize_cudagraph_class(class_name)
+        before = model.cudagraph_class_diagnostics()
+        class_state = before["classes"].get(normalized)
+        if not class_state or not bool(class_state.get("fully_captured")):
+            return {
+                "ok": False,
+                "reason": "class_not_fully_captured",
+                "class_name": normalized,
+                "diagnostics": before,
+            }
+        registry = cpu_offload_uvm_plan_class_registry()
+        plan_switch = None
+        registry_enabled = bool(registry.get("enabled"))
+        previous_class = str(registry.get("active_class"))
+        previous_graph_class = str(before.get("active_class"))
+        if registry_enabled and previous_graph_class != previous_class:
+            return {
+                "ok": False,
+                "reason": "active_graph_plan_class_mismatch",
+                "class_name": normalized,
+                "active_graph_class": previous_graph_class,
+                "active_plan_class": previous_class,
+                "diagnostics": before,
+            }
+        if registry_enabled and previous_class != normalized:
+            plan_switch = switch_cpu_offload_uvm_original_va_plan_class(
+                normalized,
+                reason="graph_class_activation",
+                graphs_retained=True,
+            )
+            if plan_switch.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "reason": "plan_class_switch_failed",
+                    "class_name": normalized,
+                    "plan_switch": plan_switch,
+                    "diagnostics": model.cudagraph_class_diagnostics(),
+                }
+        certificate = None
+        if registry_enabled:
+            certificate = activate_cpu_offload_uvm_plan_class_graph_certificates(
+                normalized
+            )
+            if certificate.get("ok") is not True:
+                rollback_plan = None
+                rollback_certificate = None
+                if previous_class != normalized:
+                    rollback_plan = (
+                        switch_cpu_offload_uvm_original_va_plan_class(
+                            previous_class,
+                            reason="certificate_activation_rollback",
+                            graphs_retained=True,
+                        )
+                    )
+                    if rollback_plan.get("ok") is True:
+                        rollback_certificate = (
+                            activate_cpu_offload_uvm_plan_class_graph_certificates(
+                                previous_class
+                            )
+                        )
+                    if not (
+                        rollback_plan.get("ok") is True
+                        and rollback_certificate is not None
+                        and rollback_certificate.get("ok") is True
+                    ):
+                        raise RuntimeError(
+                            "Plan class certificate activation failed and the "
+                            "previous class could not be restored: "
+                            f"plan={rollback_plan!r}, "
+                            f"certificate={rollback_certificate!r}"
+                        )
+                return {
+                    "ok": False,
+                    "reason": "class_certificate_activation_failed",
+                    "class_name": normalized,
+                    "plan_switch": plan_switch,
+                    "certificate": certificate,
+                    "rollback_plan": rollback_plan,
+                    "rollback_certificate": rollback_certificate,
+                    "diagnostics": model.cudagraph_class_diagnostics(),
+                }
+        result = model.activate_cudagraph_class(normalized)
+        if result.get("ok") is not True and registry_enabled:
+            rollback_plan = None
+            rollback_certificate = None
+            if previous_class != normalized:
+                rollback_plan = switch_cpu_offload_uvm_original_va_plan_class(
+                    previous_class,
+                    reason="graph_table_activation_rollback",
+                    graphs_retained=True,
+                )
+                if rollback_plan.get("ok") is True:
+                    rollback_certificate = (
+                        activate_cpu_offload_uvm_plan_class_graph_certificates(
+                            previous_class
+                        )
+                    )
+                if not (
+                    rollback_plan.get("ok") is True
+                    and rollback_certificate is not None
+                    and rollback_certificate.get("ok") is True
+                ):
+                    raise RuntimeError(
+                        "CUDA Graph class activation failed and the previous "
+                        "plan class could not be restored: "
+                        f"plan={rollback_plan!r}, "
+                        f"certificate={rollback_certificate!r}"
+                    )
+            return {
+                **result,
+                "plan_switch": plan_switch,
+                "certificate": certificate,
+                "rollback_plan": rollback_plan,
+                "rollback_certificate": rollback_certificate,
+                "switch_ns": time.perf_counter_ns() - started_ns,
+                "diagnostics": model.cudagraph_class_diagnostics(),
+            }
+        torch.cuda.synchronize(self.device)
+        return {
+            **result,
+            "plan_switch": plan_switch,
+            "certificate": certificate,
+            "switch_ns": time.perf_counter_ns() - started_ns,
+            "diagnostics": model.cudagraph_class_diagnostics(),
+        }
+
+    def capture_configured_uvm_expert_graph_classes_at_idle_boundary(
+        self,
+        *,
+        scheduler_idle: bool,
+    ) -> dict[str, Any]:
+        """Capture every configured fixed class once, then restore the initial class."""
+        if scheduler_idle is not True:
+            return {"ok": False, "reason": "scheduler_not_idle"}
+        from vllm.model_executor.models.utils import (
+            cpu_offload_uvm_plan_class_registry,
+        )
+
+        registry = cpu_offload_uvm_plan_class_registry()
+        if not bool(registry.get("enabled")):
+            return {
+                "ok": True,
+                "reason": "plan_class_registry_disabled",
+                "graph_memory_bytes": 0,
+                "class_results": [],
+            }
+        class_records = registry["classes"]
+        ordered_classes = sorted(
+            class_records,
+            key=lambda name: (
+                class_records[name].get("experts_per_layer", 0),
+                name,
+            ),
+        )
+        active = str(registry["active_class"])
+        class_results: list[dict[str, Any]] = []
+        # Adopt the initial startup capture before selecting empty tables for
+        # the other classes.
+        class_results.append(
+            self.capture_uvm_expert_graph_class_at_idle_boundary(
+                active, scheduler_idle=True
+            )
+        )
+        if class_results[-1].get("ok") is not True:
+            return {
+                "ok": False,
+                "reason": "initial_class_registration_failed",
+                "class_results": class_results,
+            }
+        for class_name in ordered_classes:
+            if class_name == active:
+                continue
+            result = self.capture_uvm_expert_graph_class_at_idle_boundary(
+                class_name, scheduler_idle=True
+            )
+            class_results.append(result)
+            if result.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "reason": "class_capture_failed",
+                    "failed_class": class_name,
+                    "class_results": class_results,
+                }
+        initial = str(registry["initial_class"])
+        restore = self.activate_uvm_expert_graph_class_at_idle_boundary(
+            initial, scheduler_idle=True
+        )
+        graph_memory_bytes = sum(
+            int(result.get("graph_memory_bytes", 0)) for result in class_results
+        )
+        return {
+            "ok": restore.get("ok") is True,
+            "reason": (
+                "all_classes_captured"
+                if restore.get("ok") is True
+                else "initial_class_restore_failed"
+            ),
+            "initial_class": initial,
+            "class_results": class_results,
+            "restore": restore,
+            "graph_memory_bytes": graph_memory_bytes,
+            "diagnostics": self.model.cudagraph_class_diagnostics(),
+        }
 
     def capture_model(self) -> int:
         from vllm.model_executor.models.utils import (
@@ -7338,12 +8343,63 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        lazy_reserve = os.environ.get(
+            "VLLM_UVM_KV_CACHE_LAZY_RESERVE",
+            "0",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        page_size_by_layer: dict[str, int] = {}
+        if lazy_reserve:
+            for group in kv_cache_config.kv_cache_groups:
+                page_size = int(group.kv_cache_spec.page_size_bytes)
+                for layer_name in group.layer_names:
+                    page_size_by_layer[layer_name] = page_size
+
+        lazy_null_blocks: list[tuple[torch.Tensor, int]] = []
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            tensor = torch.zeros(
-                kv_cache_tensor.size, dtype=torch.int8, device=self.device
-            )
+            if lazy_reserve:
+                tensor = torch.empty(
+                    kv_cache_tensor.size, dtype=torch.int8, device=self.device
+                )
+                null_block_bytes = max(
+                    (
+                        page_size_by_layer.get(layer_name, 0)
+                        for layer_name in kv_cache_tensor.shared_by
+                    ),
+                    default=0,
+                )
+                if null_block_bytes <= 0:
+                    raise RuntimeError(
+                        "Cannot lazily reserve KV cache without a valid null "
+                        f"block size for {kv_cache_tensor.shared_by!r}"
+                    )
+                lazy_null_blocks.append(
+                    (tensor, min(int(tensor.numel()), null_block_bytes))
+                )
+            else:
+                tensor = torch.zeros(
+                    kv_cache_tensor.size, dtype=torch.int8, device=self.device
+                )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
+
+        if lazy_null_blocks:
+            device = int(torch.cuda.current_device())
+            ranges = [
+                (int(tensor.data_ptr()), int(null_block_bytes))
+                for tensor, null_block_bytes in lazy_null_blocks
+            ]
+            advised = batch_advise_ranges_preferred_location(ranges, device)
+            prefetched = batch_prefetch_ranges_to_device(ranges, device)
+            if int(advised) != len(ranges) or int(prefetched) != len(ranges):
+                raise RuntimeError(
+                    "Failed to materialize lazy KV null blocks before first "
+                    f"GPU write: advised={advised}/{len(ranges)} "
+                    f"prefetched={prefetched}/{len(ranges)}"
+                )
+            torch.cuda.synchronize(device)
+            for tensor, null_block_bytes in lazy_null_blocks:
+                tensor[:null_block_bytes].zero_()
+            torch.cuda.synchronize(device)
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:

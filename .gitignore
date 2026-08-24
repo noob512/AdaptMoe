@@ -77,6 +77,15 @@ workloads/vllm/results/uvm_kv_bench_single_process.log
 # UVM experiment outputs
 /results/
 
+# Local third-party checkout used only for calibration/comparison
+/KTransformers/
+
+# Per-run experiment captures can contain model paths, hardware metadata, and
+# hundreds of megabytes of logs. Keep source, frozen plans, and written
+# reports in git, but never the generated run directories.
+**/artifacts/
+/experiments/uvm_static_alias_original_va/result*.json
+
 # Generated benchmark/result artifacts
 /log/
 **/result/

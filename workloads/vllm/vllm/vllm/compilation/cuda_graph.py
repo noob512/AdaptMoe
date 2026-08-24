@@ -94,6 +94,133 @@ class CUDAGraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # cudagraphs for.
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = {}
+        self._cudagraph_class_entries: dict[
+            str, dict[BatchDescriptor, CUDAGraphEntry]
+        ] = {"default": self.concrete_cudagraph_entries}
+        self._active_cudagraph_class = "default"
+
+    @staticmethod
+    def _normalize_cudagraph_class(class_name: str) -> str:
+        normalized = str(class_name).strip().lower()
+        if not normalized or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789_-"
+            for character in normalized
+        ):
+            raise ValueError(f"Invalid CUDA Graph class name: {class_name!r}")
+        return normalized
+
+    def begin_cudagraph_class_capture(
+        self,
+        class_name: str,
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Select an empty per-class cache for subsequent lazy captures."""
+        normalized = self._normalize_cudagraph_class(class_name)
+        existing = self._cudagraph_class_entries.get(normalized)
+        if existing and not replace:
+            raise RuntimeError(
+                f"CUDA Graph class {normalized!r} is already populated"
+            )
+        if existing and replace:
+            for entry in existing.values():
+                if entry.cudagraph is not None:
+                    entry.cudagraph.reset()
+        entries: dict[BatchDescriptor, CUDAGraphEntry] = {}
+        self._cudagraph_class_entries[normalized] = entries
+        self.concrete_cudagraph_entries = entries
+        self._active_cudagraph_class = normalized
+
+    def register_active_cudagraph_class(self, class_name: str) -> dict[str, Any]:
+        """Name the already-captured active table without copying GraphExecs."""
+        normalized = self._normalize_cudagraph_class(class_name)
+        entries = self.concrete_cudagraph_entries
+        if not entries or any(entry.cudagraph is None for entry in entries.values()):
+            return {"ok": False, "reason": "active_class_not_fully_captured"}
+        existing = self._cudagraph_class_entries.get(normalized)
+        if existing is not None and existing is not entries:
+            return {"ok": False, "reason": "class_already_registered"}
+        old_class = self._active_cudagraph_class
+        self._cudagraph_class_entries[normalized] = entries
+        if old_class != normalized and (
+            self._cudagraph_class_entries.get(old_class) is entries
+        ):
+            self._cudagraph_class_entries.pop(old_class, None)
+        self._active_cudagraph_class = normalized
+        return {
+            "ok": True,
+            "reason": "active_class_registered",
+            "old_class": old_class,
+            "new_class": normalized,
+            "entry_count": len(entries),
+        }
+
+    def reset_all_cudagraph_classes(self) -> int:
+        """Reset every retained GraphExec exactly once during final teardown."""
+        reset_count = 0
+        seen_entries: set[int] = set()
+        for entries in tuple(self._cudagraph_class_entries.values()):
+            if id(entries) in seen_entries:
+                continue
+            seen_entries.add(id(entries))
+            for entry in tuple(entries.values()):
+                if entry.cudagraph is not None:
+                    entry.cudagraph.reset()
+                    reset_count += 1
+                entry.cudagraph = None
+                entry.output = None
+                entry.input_addresses = None
+            entries.clear()
+        self._cudagraph_class_entries = {"default": {}}
+        self.concrete_cudagraph_entries = self._cudagraph_class_entries["default"]
+        self._active_cudagraph_class = "default"
+        return reset_count
+
+    def activate_cudagraph_class(self, class_name: str) -> dict[str, Any]:
+        """Atomically select an already captured class without recapture."""
+        normalized = self._normalize_cudagraph_class(class_name)
+        entries = self._cudagraph_class_entries.get(normalized)
+        if entries is None:
+            return {"ok": False, "reason": "class_not_registered"}
+        uncaptured = [
+            descriptor
+            for descriptor, entry in entries.items()
+            if entry.cudagraph is None
+        ]
+        if not entries or uncaptured:
+            return {
+                "ok": False,
+                "reason": "class_not_fully_captured",
+                "entry_count": len(entries),
+                "uncaptured_count": len(uncaptured),
+            }
+        old_class = self._active_cudagraph_class
+        self.concrete_cudagraph_entries = entries
+        self._active_cudagraph_class = normalized
+        return {
+            "ok": True,
+            "reason": "class_activated",
+            "old_class": old_class,
+            "new_class": normalized,
+            "entry_count": len(entries),
+        }
+
+    def cudagraph_class_diagnostics(self) -> dict[str, Any]:
+        classes: dict[str, Any] = {}
+        for class_name, entries in sorted(self._cudagraph_class_entries.items()):
+            captured = sum(
+                entry.cudagraph is not None for entry in entries.values()
+            )
+            classes[class_name] = {
+                "entry_count": len(entries),
+                "captured_count": captured,
+                "fully_captured": bool(entries) and captured == len(entries),
+            }
+        return {
+            "active_class": self._active_cudagraph_class,
+            "class_count": len(classes),
+            "classes": classes,
+        }
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.

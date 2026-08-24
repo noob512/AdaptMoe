@@ -3,13 +3,15 @@
 import json
 from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 import pytest
+import torch
 
 from vllm.device_allocator import uvm as uvm_module
 from vllm.device_allocator import uvm_pool_residency as residency_module
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.models import utils as offload_utils
 from vllm.v1.core.uvm_kv_runtime_policy import UvmKvRuntimePolicy
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
@@ -63,6 +65,22 @@ def _enable_registered_slot_plan(monkeypatch: Any) -> None:
     monkeypatch.setenv("VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE", "slot_restore")
 
 
+def _exclusive_residency_result(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    location: str,
+) -> dict[str, int | bool]:
+    expected_bytes = sum(size for _, size in ranges)
+    return {
+        "ok": True,
+        "status": len(ranges),
+        "queried_bytes": expected_bytes,
+        "gpu_bytes": expected_bytes if location == "gpu" else 0,
+        "cpu_bytes": expected_bytes if location == "cpu" else 0,
+        "any_bytes": expected_bytes,
+        "unknown_bytes": 0,
+    }
+
+
 def test_uvm_kv_tail_range_respects_block_boundaries() -> None:
     page_size = 4096
     ptr = 0x100000
@@ -108,6 +126,13 @@ def test_post_warmup_kv_rebalance_returns_control_fields_only(
             {"diagnostic": "unused"},
         ),
     )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "driver_batch_query_ranges_residency_bytes",
+        lambda ranges, *, device, wait_for_trackers: _exclusive_residency_result(
+            ranges, "cpu"
+        ),
+    )
 
     result = runner.rebalance_uvm_kv_cache_after_warmup(4)
 
@@ -117,6 +142,224 @@ def test_post_warmup_kv_rebalance_returns_control_fields_only(
         "target_blocks": 4,
         "offload_complete": True,
     }
+
+
+def test_lazy_kv_reserve_touches_only_null_block(monkeypatch: Any) -> None:
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.runner_only_attn_layers = set()
+    config = SimpleNamespace(
+        kv_cache_tensors=[SimpleNamespace(size=64, shared_by=["layer.0"])],
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=["layer.0"],
+                kv_cache_spec=SimpleNamespace(page_size_bytes=16),
+            )
+        ],
+    )
+    real_empty = torch.empty
+
+    def filled_empty(size: int, *, dtype: torch.dtype, device: torch.device):
+        return real_empty(size, dtype=dtype, device=device).fill_(7)
+
+    monkeypatch.setenv("VLLM_UVM_KV_CACHE_LAZY_RESERVE", "1")
+    monkeypatch.setattr(gpu_model_runner_module.torch, "empty", filled_empty)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_advise_ranges_preferred_location",
+        lambda ranges, _device: len(ranges),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_prefetch_ranges_to_device",
+        lambda ranges, _device: len(ranges),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda,
+        "current_device",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda,
+        "synchronize",
+        lambda _device: None,
+    )
+
+    tensors = runner._allocate_kv_cache_tensors(config)
+
+    tensor = tensors["layer.0"]
+    assert torch.count_nonzero(tensor[:16]).item() == 0
+    assert torch.all(tensor[16:] == 7)
+
+
+def test_lazy_post_warmup_kv_rebalance_converges_head_and_tail(
+    monkeypatch: Any,
+) -> None:
+    runner = object.__new__(GPUModelRunner)
+    runner.kv_cache_config = SimpleNamespace(num_blocks=11)
+    runner._collect_uvm_post_warmup_kv_tail_ranges = (  # type: ignore[method-assign]
+        lambda _target: (
+            [(0x200000, 0x6000)],
+            {"ok": True, "reason": "ranges_collected", "target_blocks": 4},
+        )
+    )
+    events: list[tuple[str, object]] = []
+    monkeypatch.setenv("VLLM_UVM_KV_CACHE_LAZY_RESERVE", "1")
+    monkeypatch.setenv("VLLM_UVM_POST_WARMUP_KV_OFFLOAD_EXECUTOR", "driver_batch")
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "collect_uvm_kv_cache_physical_ranges_for_blocks",
+        lambda block_ids: events.append(("collect", tuple(block_ids)))
+        or [(0x100000, 0x4000)],
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_offload_ranges_to_cpu_with_executor",
+        lambda ranges, *, sync, executor: events.append(
+            ("offload", (tuple(ranges), sync, executor))
+        )
+        or (len(ranges), executor, 0, 0),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_advise_ranges_preferred_location",
+        lambda ranges, device: events.append(("advise", (tuple(ranges), device)))
+        or len(ranges),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_prefetch_ranges_to_device_with_executor",
+        lambda ranges, device, *, executor: events.append(
+            ("prefetch", (tuple(ranges), device, executor))
+        )
+        or (len(ranges), executor, 0),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda,
+        "current_device",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda,
+        "synchronize",
+        lambda device: events.append(("sync", device)),
+    )
+
+    def query_residency(
+        ranges: list[tuple[int, int]],
+        *,
+        device: int,
+        wait_for_trackers: bool,
+    ) -> dict[str, int | bool]:
+        range_tuple = tuple(ranges)
+        events.append(("query", (range_tuple, device, wait_for_trackers)))
+        location = "gpu" if range_tuple == ((0x100000, 0x4000),) else "cpu"
+        return _exclusive_residency_result(ranges, location)
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "driver_batch_query_ranges_residency_bytes",
+        query_residency,
+    )
+
+    result = runner.rebalance_uvm_kv_cache_after_warmup(4)
+
+    assert result["offload_complete"] is True
+    assert events == [
+        ("collect", tuple(range(0, 11))),
+        ("offload", (((0x100000, 0x4000),), True, "driver_batch")),
+        ("collect", (0, 1, 2, 3, 4)),
+        ("advise", (((0x100000, 0x4000),), 0)),
+        ("prefetch", (((0x100000, 0x4000),), 0, "driver_batch")),
+        ("sync", 0),
+        ("query", (((0x100000, 0x4000),), 0, False)),
+        ("query", (((0x200000, 0x6000),), 0, False)),
+    ]
+
+
+def test_lazy_post_warmup_kv_rebalance_rejects_partial_head_after_retry(
+    monkeypatch: Any,
+) -> None:
+    runner = object.__new__(GPUModelRunner)
+    runner.kv_cache_config = SimpleNamespace(num_blocks=11)
+    tail_ranges = [(0x105000, 0x6000)]
+    head_ranges = [(0x100000, 0x5000)]
+    all_ranges = [(0x100000, 0xB000)]
+    runner._collect_uvm_post_warmup_kv_tail_ranges = (  # type: ignore[method-assign]
+        lambda _target: (
+            tail_ranges,
+            {"ok": True, "reason": "ranges_collected", "target_blocks": 4},
+        )
+    )
+    events: list[str] = []
+    monkeypatch.setenv("VLLM_UVM_KV_CACHE_LAZY_RESERVE", "1")
+    monkeypatch.setenv("VLLM_UVM_POST_WARMUP_KV_OFFLOAD_EXECUTOR", "driver_batch")
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "collect_uvm_kv_cache_physical_ranges_for_blocks",
+        lambda block_ids: all_ranges if len(block_ids) == 11 else head_ranges,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_offload_ranges_to_cpu_with_executor",
+        lambda ranges, *, sync, executor: events.append("offload")
+        or (len(ranges), executor, 0, 0),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_advise_ranges_preferred_location",
+        lambda ranges, device: events.append("advise") or len(ranges),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_prefetch_ranges_to_device_with_executor",
+        lambda ranges, device, *, executor: events.append("prefetch")
+        or (len(ranges), executor, 0),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda,
+        "current_device",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda,
+        "synchronize",
+        lambda device: events.append("sync"),
+    )
+
+    def query_residency(
+        ranges: list[tuple[int, int]],
+        *,
+        device: int,
+        wait_for_trackers: bool,
+    ) -> dict[str, int | bool]:
+        if ranges == tail_ranges:
+            return _exclusive_residency_result(ranges, "cpu")
+        expected_bytes = sum(size for _, size in ranges)
+        cpu_bytes = 0x2000
+        return {
+            "ok": True,
+            "status": len(ranges),
+            "queried_bytes": expected_bytes,
+            "gpu_bytes": expected_bytes - cpu_bytes,
+            "cpu_bytes": cpu_bytes,
+            "any_bytes": expected_bytes,
+            "unknown_bytes": 0,
+        }
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "driver_batch_query_ranges_residency_bytes",
+        query_residency,
+    )
+
+    result = runner.rebalance_uvm_kv_cache_after_warmup(4)
+
+    assert result["offload_complete"] is False
+    assert events.count("offload") == 1
+    assert events.count("advise") == 2
+    assert events.count("prefetch") == 2
+    assert events.count("sync") == 2
 
 
 def test_pre_kv_stage_orders_expert_placement_before_kv(
@@ -185,6 +428,48 @@ def test_post_warmup_rebalance_orders_kv_before_experts(
 
     worker._run_uvm_post_warmup_rebalance()
     assert events == ["kv:4", "experts"]
+
+
+def test_serving_kv_resize_reconvergence_reapplies_target(
+    monkeypatch: Any,
+) -> None:
+    calls: list[int] = []
+
+    class FakeModelRunner:
+        def rebalance_uvm_kv_cache_after_warmup(
+            self,
+            target_blocks: int,
+        ) -> dict[str, Any]:
+            calls.append(target_blocks)
+            return {"offload_complete": True}
+
+    monkeypatch.setenv("VLLM_UVM_KV_POST_WARMUP_TARGET_BLOCKS", "1023")
+    worker = object.__new__(Worker)
+    worker.model_runner = FakeModelRunner()
+    worker._kv_cache_uvm_allocations_enabled = lambda: True
+
+    worker._reconverge_uvm_kv_cache_for_serving()
+    worker._reconverge_uvm_kv_cache_for_serving()
+
+    assert calls == [1023, 1023]
+
+
+def test_serving_kv_resize_reconvergence_fails_closed(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("VLLM_UVM_KV_POST_WARMUP_TARGET_BLOCKS", "1023")
+    monkeypatch.setenv("VLLM_UVM_POST_WARMUP_REBALANCE_FAIL_FAST", "1")
+    worker = object.__new__(Worker)
+    worker.model_runner = SimpleNamespace(
+        rebalance_uvm_kv_cache_after_warmup=lambda _target: {
+            "offload_complete": False,
+            "reason": "incomplete",
+        }
+    )
+    worker._kv_cache_uvm_allocations_enabled = lambda: True
+
+    with pytest.raises(RuntimeError, match="physical reconvergence failed"):
+        worker._reconverge_uvm_kv_cache_for_serving()
 
 
 def test_post_warmup_target_automatically_enables_dynamic_pool(
@@ -322,6 +607,127 @@ def test_original_va_alias_prefill_switches_before_first_decode(
     ]
     assert runner._uvm_original_va_phase_decode_cutover_done is True
     assert runner._uvm_original_va_phase_transition_result is not None
+
+
+def test_original_va_collects_incremental_remote_expert_ranges(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE", "1")
+    module = SimpleNamespace(
+        get_uvm_init_weight_placement_snapshot=lambda: {
+            "region_owners": [
+                {
+                    "region_id": "weights:0:4:envelope:400000:80000",
+                    "placement": "remote",
+                },
+                {
+                    "region_id": "weights:0:5:envelope:480000:80000",
+                    "placement": "hot",
+                },
+                {
+                    "region_id": "weights:0:4:envelope:400000:80000",
+                    "placement": "remote",
+                },
+            ]
+        }
+    )
+    runner = object.__new__(GPUModelRunner)
+    runner.get_model = lambda: SimpleNamespace(  # type: ignore[method-assign]
+        modules=lambda: iter([module])
+    )
+
+    assert runner._collect_uvm_runtime_remote_expert_ranges() == (
+        (0x400000, 0x80000),
+    )
+
+
+def _make_original_va_phase_runner_for_boundary_tests() -> Any:
+    runner = object.__new__(GPUModelRunner)
+    runner._uvm_original_va_phase_prefill_seen = False
+    runner._uvm_original_va_phase_decode_cutover_done = False
+    runner._uvm_original_va_phase_poison_reason = None
+    runner._uvm_original_va_phase_transition_result = None
+    runner.uniform_decode_query_len = 1
+    return runner
+
+
+def _enable_original_va_hybrid_boundary_state(monkeypatch: Any) -> None:
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS", True)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND",
+        "uvm_original_va",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE",
+        "prefill_remote_decode",
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "sealed")
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID", 7)
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES", 4096
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED", False)
+
+
+def test_original_va_hybrid_rejects_mixed_prefill_decode_batch(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_original_va_phase_runner_for_boundary_tests()
+    _enable_original_va_hybrid_boundary_state(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="requires an unmixed request"):
+        runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+            SimpleNamespace(num_scheduled_tokens={"request": 2}),
+            "enabled:mixed_step",
+        )
+
+    assert runner._uvm_original_va_phase_poison_reason == (
+        "mixed prefill/decode batches are unsupported"
+    )
+
+
+def test_original_va_hybrid_rejects_prefill_after_remote_cutover(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_original_va_phase_runner_for_boundary_tests()
+    _enable_original_va_hybrid_boundary_state(monkeypatch)
+
+    runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+        SimpleNamespace(num_scheduled_tokens={"request": 8}),
+        "enabled:prefill_step",
+    )
+
+    def transition(**_kwargs: Any) -> dict[str, Any]:
+        monkeypatch.setattr(
+            offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "remote"
+        )
+        monkeypatch.setattr(
+            offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID", 0
+        )
+        monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE", True)
+        return {"ok": True, "pre_state": "sealed", "post_state": "remote"}
+
+    monkeypatch.setattr(
+        offload_utils,
+        "transition_cpu_offload_uvm_original_va_to_remote",
+        transition,
+    )
+    runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+        SimpleNamespace(num_scheduled_tokens={"request": 1}),
+        "enabled:decode_step",
+    )
+
+    with pytest.raises(RuntimeError, match="one-way remote cutover"):
+        runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+            SimpleNamespace(num_scheduled_tokens={"request": 8}),
+            "enabled:prefill_step",
+        )
+
+    assert runner._uvm_original_va_phase_poison_reason == (
+        "a prefill step arrived after remote decode cutover"
+    )
 
 
 def _complete_p3_close_result() -> dict[str, Any]:
@@ -1621,6 +2027,53 @@ def test_post_warmup_remote_read_runs_explicit_expert_placement(
     assert events == ["experts"]
 
 
+def test_remote_only_reconciles_after_kv_before_warmup(monkeypatch: Any) -> None:
+    from vllm.model_executor.models import utils as offload_utils
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_phase_mode",
+        lambda: "remote_only",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "reconcile_cpu_offload_uvm_original_va_remote_graph_residency",
+        lambda: events.append("reconcile")
+        or {
+            "ok": True,
+            "cold_bytes": 6,
+            "hot_bytes": 22,
+            "free_bytes": 512,
+        },
+    )
+
+    worker = object.__new__(Worker)
+    worker._reconcile_uvm_original_va_remote_before_warmup()
+
+    assert events == ["reconcile"]
+
+
+def test_non_remote_only_skips_pre_warmup_reconciliation(
+    monkeypatch: Any,
+) -> None:
+    from vllm.model_executor.models import utils as offload_utils
+
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_phase_mode",
+        lambda: "prefill_graph_remote_decode",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "reconcile_cpu_offload_uvm_original_va_remote_graph_residency",
+        _unexpected_call,
+    )
+
+    worker = object.__new__(Worker)
+    worker._reconcile_uvm_original_va_remote_before_warmup()
+
+
 class _FakeExpertModule:
     uvm_weight_executor = "cpp_batch"
 
@@ -2107,6 +2560,20 @@ def test_incremental_expert_worker_protocol_is_minimal(
                 "released_experts": [selected_global_expert_id],
             }
 
+        @staticmethod
+        def uvm_next_incremental_restore_expert() -> int:
+            return 6
+
+        @staticmethod
+        def run_uvm_incremental_weight_restore(
+            *, selected_global_expert_id: int
+        ) -> dict[str, object]:
+            return {
+                "ok": True,
+                "restored_experts": [selected_global_expert_id],
+                "restored_count": 1,
+            }
+
     module = ExpertModule()
     runner = object.__new__(GPUModelRunner)
     runner.get_model = lambda: SimpleNamespace(modules=lambda: [module])  # type: ignore[method-assign]
@@ -2125,7 +2592,346 @@ def test_incremental_expert_worker_protocol_is_minimal(
         runner,
         False,
         {"layer.7": 6},
-    ) == {"ok": True}
+    ) == {
+        "ok": True,
+        "allow_warm": False,
+        "selected_layer_count": 1,
+        "visited_layer_count": 1,
+        "released_expert_count": 1,
+        "results": [
+            {
+                "layer_key": "layer.7",
+                "selected_global_expert_id": 6,
+                "ok": True,
+                "released_experts": [6],
+            }
+        ],
+    }
+    assert GPUModelRunner.get_uvm_incremental_expert_restore_candidates(
+        runner
+    ) == {"ok": True, "candidates": {"layer.7": 6}}
+    assert GPUModelRunner.run_uvm_incremental_expert_restore(
+        runner,
+        {"layer.7": 6},
+    ) == {
+        "ok": True,
+        "reason": "restored",
+        "selected_layer_count": 1,
+        "visited_layer_count": 1,
+        "restored_expert_count": 1,
+        "results": [
+            {
+                "layer_key": "layer.7",
+                "selected_global_expert_id": 6,
+                "ok": True,
+                "restored_experts": [6],
+                "restored_count": 1,
+            }
+        ],
+    }
+
+
+def test_explicit_incremental_wave_does_not_enable_init_stage_m() -> None:
+    released: list[tuple[int, int]] = []
+    layer = SimpleNamespace(
+        uvm_init_weight_offload_enable=False,
+        uvm_init_weight_offload_mode="driver_release_cpu",
+        uvm_incremental_expert_offload_enable=True,
+        uvm_expert_envelope_enable=True,
+        _uvm_incremental_offload_in_progress=False,
+        _uvm_incremental_selected_global_expert_id=None,
+        _uvm_init_weight_offload_done=False,
+        _uvm_expert_records={(3, 7): object()},
+        _uvm_offloaded_global_expert_ids=set(),
+        _uvm_remote_read_global_expert_ids=set(),
+        _uvm_incremental_offloaded_global_expert_ids=set(),
+    )
+    layer._uvm_layer_id = lambda: 3
+    layer._uvm_static_alias_owned_experts = lambda _layer_id: set()
+    layer._uvm_all_local_expert_pairs = lambda: [(7, 0)]
+    layer._refresh_uvm_init_weight_plan = lambda: None
+    layer._uvm_compile_expert_records = lambda _layer_id: (_ for _ in ()).throw(
+        AssertionError("precompiled expert records must be reused")
+    )
+    layer._uvm_stage_m_uses_remote_read = lambda: True
+    layer._uvm_release_expert_record = lambda **kwargs: (
+        released.append((int(kwargs["layer_id"]), int(kwargs["global_expert_id"])))
+        or {"ok": True}
+    )
+    layer.run_uvm_init_weight_offload = MethodType(
+        FusedMoE.run_uvm_init_weight_offload,
+        layer,
+    )
+
+    # Merely enabling runtime waves must not turn the ordinary warmup Stage-M
+    # invocation back on after static-alias finalize released the base plan.
+    FusedMoE.run_uvm_init_weight_offload(layer)
+    assert released == []
+
+    result = FusedMoE.run_uvm_incremental_weight_offload(
+        layer,
+        allow_warm=False,
+        selected_global_expert_id=7,
+    )
+
+    assert result["ok"] is True
+    assert result["released_experts"] == [7]
+    assert released == [(3, 7)]
+    assert layer._uvm_remote_read_global_expert_ids == {7}
+    assert layer._uvm_incremental_offloaded_global_expert_ids == {7}
+
+
+def test_runtime_expert_registry_skips_static_alias_owned_ranges(
+    monkeypatch: Any,
+) -> None:
+    registrations: list[tuple[str, int, int]] = []
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.layer.register_uvm_region",
+        lambda region_id, base, length, **_kwargs: registrations.append(
+            (str(region_id), int(base), int(length))
+        ),
+    )
+    layer = SimpleNamespace(
+        uvm_expert_envelope_bytes=0x80000,
+        _uvm_static_alias_owned_experts=lambda _layer_id: {1},
+        _uvm_all_local_expert_pairs=lambda: [(0, 0), (1, 1)],
+        _uvm_expert_weight_slices=lambda local_id: [
+            (
+                0x100000 + int(local_id) * 0x80000,
+                0x80000,
+                (0x100000, 0x200000),
+            )
+        ],
+    )
+
+    FusedMoE._uvm_compile_expert_records(layer, 3)
+
+    assert set(layer._uvm_expert_records) == {(3, 0), (3, 1)}
+    assert layer._uvm_static_alias_owned_global_expert_ids == {1}
+    assert registrations == [
+        ("weights:3:0:envelope:100000:80000", 0x100000, 0x80000)
+    ]
+
+
+def test_incremental_wave_rejects_static_alias_owned_expert() -> None:
+    layer = SimpleNamespace(
+        uvm_incremental_expert_offload_enable=True,
+        _uvm_remote_read_global_expert_ids=set(),
+        _uvm_offloaded_global_expert_ids=set(),
+        _uvm_stage_m_uses_remote_read=lambda: True,
+        _uvm_layer_id=lambda: 3,
+        _uvm_static_alias_owned_experts=lambda _layer_id: {7},
+    )
+
+    result = FusedMoE.run_uvm_incremental_weight_offload(
+        layer,
+        allow_warm=False,
+        selected_global_expert_id=7,
+    )
+
+    assert result == {
+        "ok": False,
+        "reason": "expert_owned_by_static_alias_plan",
+        "layer_id": 3,
+        "selected_global_expert_id": 7,
+        "released_experts": [],
+    }
+
+
+def test_incremental_expert_wave_rejects_partial_layer_sets() -> None:
+    class ExpertModule:
+        def __init__(self, layer: int, candidate: int | None) -> None:
+            self.layer_name = f"layer.{layer}"
+            self._candidate = candidate
+
+        def uvm_next_incremental_expert(self, _expert_class: str) -> int | None:
+            return self._candidate
+
+        def uvm_next_incremental_restore_expert(self) -> int | None:
+            return self._candidate
+
+        @staticmethod
+        def run_uvm_incremental_weight_offload(**_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("an unbalanced wave must not execute")
+
+        @staticmethod
+        def run_uvm_incremental_weight_restore(**_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("an unbalanced wave must not execute")
+
+        @staticmethod
+        def has_remaining_uvm_incremental_experts(_expert_class: str) -> bool:
+            return False
+
+    modules = [ExpertModule(0, 4), ExpertModule(1, None)]
+    runner = object.__new__(GPUModelRunner)
+    runner.get_model = lambda: SimpleNamespace(  # type: ignore[method-assign]
+        modules=lambda: modules
+    )
+    runner._env_flag_enabled = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: True
+    )
+
+    assert GPUModelRunner.get_uvm_incremental_expert_offload_candidates(
+        runner,
+        "cold",
+    ) == {"ok": True, "candidates": {}}
+    assert GPUModelRunner.get_uvm_incremental_expert_restore_candidates(
+        runner
+    ) == {"ok": False, "candidates": {}}
+
+    offload = GPUModelRunner.run_uvm_incremental_expert_offload(
+        runner,
+        False,
+        {"layer.0": 4},
+    )
+    assert offload["ok"] is False
+    assert offload["reason"] == "unbalanced_expert_layer_selection"
+
+    restore = GPUModelRunner.run_uvm_incremental_expert_restore(
+        runner,
+        {"layer.0": 4},
+    )
+    assert restore["ok"] is False
+    assert restore["reason"] == "unbalanced_expert_layer_selection"
+
+
+def test_incremental_restore_rolls_back_partial_layer_success(
+    monkeypatch: Any,
+) -> None:
+    events: list[str] = []
+
+    class ExpertModule:
+        def __init__(self, layer: int, restore_ok: bool) -> None:
+            self.layer_name = f"layer.{layer}"
+            self._restore_ok = restore_ok
+
+        def run_uvm_incremental_weight_restore(
+            self,
+            *,
+            selected_global_expert_id: int,
+        ) -> dict[str, Any]:
+            events.append(f"restore:{self.layer_name}")
+            return {
+                "ok": self._restore_ok,
+                "restored_experts": (
+                    [selected_global_expert_id] if self._restore_ok else []
+                ),
+            }
+
+        def run_uvm_incremental_weight_offload(
+            self,
+            *,
+            allow_warm: bool,
+            selected_global_expert_id: int,
+        ) -> dict[str, Any]:
+            assert allow_warm is True
+            events.append(f"rollback:{self.layer_name}")
+            return {
+                "ok": True,
+                "released_experts": [selected_global_expert_id],
+            }
+
+    modules = [ExpertModule(0, True), ExpertModule(1, False)]
+    runner = object.__new__(GPUModelRunner)
+    runner.get_model = lambda: SimpleNamespace(  # type: ignore[method-assign]
+        modules=lambda: modules
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "uvm_enabled_allocation_phase",
+        lambda _reason: nullcontext(),
+    )
+
+    result = GPUModelRunner.run_uvm_incremental_expert_restore(
+        runner,
+        {"layer.0": 4, "layer.1": 7},
+    )
+
+    assert result["ok"] is False
+    assert result["rollback_ok"] is True
+    assert result["net_restored_expert_count"] == 0
+    assert events == ["restore:layer.0", "restore:layer.1", "rollback:layer.0"]
+
+
+def test_incremental_restore_accepts_idempotently_local_rollback_layer(
+    monkeypatch: Any,
+) -> None:
+    class ExpertModule:
+        def __init__(self, layer: int, already_local: bool) -> None:
+            self.layer_name = f"layer.{layer}"
+            self._already_local = already_local
+
+        def run_uvm_incremental_weight_restore(
+            self,
+            *,
+            selected_global_expert_id: int,
+        ) -> dict[str, Any]:
+            if self._already_local:
+                return {
+                    "ok": False,
+                    "reason": "expert_not_incrementally_offloaded",
+                    "already_local": True,
+                    "restored_experts": [],
+                }
+            return {
+                "ok": True,
+                "restored_experts": [selected_global_expert_id],
+            }
+
+        @staticmethod
+        def run_uvm_incremental_weight_offload(**_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("a satisfied rollback must not be reversed")
+
+    modules = [ExpertModule(0, False), ExpertModule(1, True)]
+    runner = object.__new__(GPUModelRunner)
+    runner.get_model = lambda: SimpleNamespace(  # type: ignore[method-assign]
+        modules=lambda: modules
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "uvm_enabled_allocation_phase",
+        lambda _reason: nullcontext(),
+    )
+
+    result = GPUModelRunner.run_uvm_incremental_expert_restore(
+        runner,
+        {"layer.0": 4, "layer.1": 7},
+    )
+
+    assert result["ok"] is True
+    assert result["reason"] == "restored"
+    assert "rollback_results" not in result
+
+
+def test_incremental_restore_only_undoes_runtime_wave_and_prefers_heat() -> None:
+    layer = SimpleNamespace(
+        _uvm_incremental_offloaded_global_expert_ids={2, 5},
+        _uvm_remote_read_global_expert_ids={1, 2, 5},
+        _uvm_offloaded_global_expert_ids=set(),
+        _uvm_dynamic_expert_heat_counts=torch.tensor([0, 0, 7, 0, 0, 19]),
+        _uvm_expert_records={(7, 1): object(), (7, 2): object(), (7, 5): object()},
+    )
+    layer._uvm_stage_m_uses_remote_read = lambda: True
+    layer._uvm_layer_id = lambda: 7
+    layer._uvm_restore_expert_record = lambda **_kwargs: {"ok": True}
+
+    assert FusedMoE.uvm_next_incremental_restore_expert(layer) == 5
+    result = FusedMoE.run_uvm_incremental_weight_restore(
+        layer,
+        selected_global_expert_id=5,
+    )
+
+    assert result["ok"] is True
+    assert result["restored_experts"] == [5]
+    assert layer._uvm_incremental_offloaded_global_expert_ids == {2}
+    assert layer._uvm_remote_read_global_expert_ids == {1, 2}
+
+    already_local = FusedMoE.run_uvm_incremental_weight_restore(
+        layer,
+        selected_global_expert_id=7,
+    )
+    assert already_local["ok"] is False
+    assert already_local["already_local"] is True
 
 
 def _make_worker_resize_runner() -> GPUModelRunner:
@@ -2164,6 +2970,13 @@ def test_worker_exact_kv_resize_runs_shrink_before_grow(
         events.append(("prefetch", len(ranges)))
         return len(ranges), "test", 0
 
+    def advise(
+        ranges: list[tuple[int, int]],
+        _device: int,
+    ) -> int:
+        events.append(("advise_gpu", len(ranges)))
+        return len(ranges)
+
     monkeypatch.setattr(
         gpu_model_runner_module,
         "collect_uvm_kv_cache_physical_ranges_for_blocks",
@@ -2178,6 +2991,11 @@ def test_worker_exact_kv_resize_runs_shrink_before_grow(
         gpu_model_runner_module,
         "batch_prefetch_ranges_to_device_with_executor",
         prefetch,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_advise_ranges_preferred_location",
+        advise,
     )
     monkeypatch.setattr(
         gpu_model_runner_module.torch.cuda,
@@ -2206,6 +3024,7 @@ def test_worker_exact_kv_resize_runs_shrink_before_grow(
         ("collect", (6,)),
         ("offload", 1),
         ("collect", (4, 5)),
+        ("advise_gpu", 2),
         ("prefetch", 2),
         ("sync", 0),
     ]
@@ -2232,6 +3051,11 @@ def test_worker_partial_kv_resize_only_reports_complete_direction(
         gpu_model_runner_module,
         "batch_prefetch_ranges_to_device_with_executor",
         lambda *_args, **_kwargs: (1, "test", 0),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_advise_ranges_preferred_location",
+        lambda ranges, _device: len(ranges),
     )
     monkeypatch.setattr(
         gpu_model_runner_module.torch.cuda,
@@ -2276,6 +3100,11 @@ def test_worker_kv_resize_sync_failure_never_reports_completion(
         lambda ranges, *_args, **_kwargs: (len(ranges), "test", 0),
     )
     monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_advise_ranges_preferred_location",
+        lambda ranges, _device: len(ranges),
+    )
+    monkeypatch.setattr(
         gpu_model_runner_module.torch.cuda,
         "is_available",
         lambda: True,
@@ -2302,3 +3131,44 @@ def test_worker_kv_resize_sync_failure_never_reports_completion(
     )
 
     assert result == {"ok": False, "made_progress": True}
+
+
+def test_worker_kv_grow_requires_complete_gpu_preferred_advice(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_worker_resize_runner()
+    prefetched = False
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "collect_uvm_kv_cache_physical_ranges_for_blocks",
+        lambda block_ids: [
+            (0x100000 + block_id * 0x1000, 0x1000)
+            for block_id in block_ids
+        ],
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_advise_ranges_preferred_location",
+        lambda _ranges, _device: 0,
+    )
+
+    def unexpected_prefetch(*_args: object, **_kwargs: object):
+        nonlocal prefetched
+        prefetched = True
+        return 0, "test", 0
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_prefetch_ranges_to_device_with_executor",
+        unexpected_prefetch,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda,
+        "current_device",
+        lambda: 0,
+    )
+
+    result = runner.resize_uvm_kv_cache_target(3, 5, [])
+
+    assert result == {"ok": False, "made_progress": True}
+    assert prefetched is False

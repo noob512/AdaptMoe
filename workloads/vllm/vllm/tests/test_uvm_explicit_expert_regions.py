@@ -561,6 +561,7 @@ def test_dynamic_swap_uses_explicit_expert_records(
         _uvm_stage_m_uses_remote_read=lambda: True,
         _uvm_layer_id=lambda: 7,
         _uvm_remote_read_global_expert_ids={3},
+        _uvm_incremental_offloaded_global_expert_ids={3},
         _uvm_expert_records=records,
         _uvm_release_expert_record=release,
         _uvm_restore_expert_record=restore,
@@ -575,6 +576,7 @@ def test_dynamic_swap_uses_explicit_expert_records(
     assert result["ok"] is True
     assert calls == [("release", 4), ("restore", 3)]
     assert layer._uvm_remote_read_global_expert_ids == {4}
+    assert layer._uvm_incremental_offloaded_global_expert_ids == {4}
     assert records[(7, 3)].aggregate_state == RegionState.GPU
     assert records[(7, 4)].aggregate_state == RegionState.CPU
 

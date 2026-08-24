@@ -12,6 +12,69 @@ from vllm.v1.core.uvm_kv_runtime_policy import UvmKvRuntimePolicy
 pytestmark = pytest.mark.cpu_test
 
 
+def test_physical_span_snapshot_preserves_reserved_va_geometry() -> None:
+    policy_module.register_uvm_kv_cache_physical_ranges(
+        [
+            {
+                "span_id": "layer.1",
+                "ptr": 0x400000,
+                "size_bytes": 0x20000,
+                "page_size": 0x1000,
+                "max_block_id": 15,
+            },
+            {
+                "span_id": "layer.0",
+                "ptr": 0x200000,
+                "size_bytes": 0x20000,
+                "page_size": 0x1000,
+                "max_block_id": 15,
+            },
+        ],
+        clear_existing=True,
+    )
+
+    assert policy_module.snapshot_uvm_kv_cache_physical_spans() == [
+        {
+            "span_id": "layer.0",
+            "ptr": 0x200000,
+            "size_bytes": 0x20000,
+            "page_size": 0x1000,
+            "max_block_id": 15,
+        },
+        {
+            "span_id": "layer.1",
+            "ptr": 0x400000,
+            "size_bytes": 0x20000,
+            "page_size": 0x1000,
+            "max_block_id": 15,
+        },
+    ]
+    policy_module.register_uvm_kv_cache_physical_ranges([], clear_existing=True)
+
+
+def test_physical_span_collection_can_rematerialize_null_block() -> None:
+    policy_module.register_uvm_kv_cache_physical_ranges(
+        [
+            {
+                "span_id": "layer.0",
+                "ptr": 0x200000,
+                "size_bytes": 0x20000,
+                "page_size": 0x1000,
+                "max_block_id": 15,
+            }
+        ],
+        clear_existing=True,
+    )
+    try:
+        assert policy_module.collect_uvm_kv_cache_physical_ranges_for_blocks(
+            [0, 1, 2]
+        ) == [(0x200000, 0x3000)]
+    finally:
+        policy_module.register_uvm_kv_cache_physical_ranges(
+            [], clear_existing=True
+        )
+
+
 def _make_policy(
     *,
     applied_target: int,

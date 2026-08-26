@@ -8,7 +8,7 @@ import json
 import os
 import time
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from functools import reduce
@@ -203,6 +203,43 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 logger = init_logger(__name__)
+
+
+def _build_pure_prefill_dummy_shape(
+    *,
+    num_tokens: int,
+    num_reqs: int,
+    max_model_len: int,
+) -> tuple[list[int], int]:
+    """Build a valid zero-context Prefill shape for a dummy model run.
+
+    ``_dummy_run`` historically uses the total batch token count as every
+    request's sequence length. That is useful for some memory-profile runs,
+    but it is not a valid representation of a multi-request pure Prefill and
+    can exceed the per-request block-table capacity. Reserve warmup callers
+    use this helper to describe the actual balanced request lengths instead.
+    """
+    if num_tokens <= 0:
+        raise ValueError(f"num_tokens must be positive, got {num_tokens}")
+    if num_reqs <= 0:
+        raise ValueError(f"num_reqs must be positive, got {num_reqs}")
+    if max_model_len <= 0:
+        raise ValueError(
+            f"max_model_len must be positive, got {max_model_len}"
+        )
+
+    effective_num_reqs = min(int(num_tokens), int(num_reqs))
+    min_tokens_per_req, remainder = divmod(num_tokens, effective_num_reqs)
+    request_lengths = [min_tokens_per_req] * effective_num_reqs
+    request_lengths[-1] += remainder
+    max_query_len = max(request_lengths)
+    if max_query_len > max_model_len:
+        raise ValueError(
+            "Pure-Prefill dummy shape exceeds max_model_len: "
+            f"tokens={num_tokens} requests={effective_num_reqs} "
+            f"max_query_len={max_query_len} max_model_len={max_model_len}"
+        )
+    return request_lengths, max_query_len
 
 
 def _uvm_kv_tail_range_for_allocation(
@@ -3343,6 +3380,42 @@ class GPUModelRunner(
         self._write_uvm_original_va_phase_result(result)
         logger.info("Original-VA prefill-to-remote decode transition: %s", result)
 
+    def _validate_uvm_original_va_graph_replay_for_step(
+        self,
+        *,
+        original_va_phase_mode: str,
+        enabled_step_phase: str,
+        cudagraph_runtime_mode: CUDAGraphMode,
+    ) -> None:
+        """Validate the live PTE topology against the selected Graph class."""
+        if original_va_phase_mode == "off":
+            return
+        if (
+            original_va_phase_mode == "prefill_graph_remote_decode"
+            and enabled_step_phase
+            in ("enabled:prefill_step", "enabled:decode_step")
+            and cudagraph_runtime_mode == CUDAGraphMode.NONE
+        ):
+            raise RuntimeError(
+                "FULL_SEPARATE phase serving cannot fall back to eager execution: "
+                f"step_phase={enabled_step_phase}"
+            )
+        if cudagraph_runtime_mode == CUDAGraphMode.NONE:
+            return
+
+        from vllm.model_executor.models.utils import (
+            validate_cpu_offload_uvm_original_va_alias_graph_replay,
+            validate_cpu_offload_uvm_original_va_remote_graph_replay,
+        )
+
+        if (
+            original_va_phase_mode == "prefill_graph_remote_decode"
+            and enabled_step_phase == "enabled:prefill_step"
+        ):
+            validate_cpu_offload_uvm_original_va_alias_graph_replay()
+        else:
+            validate_cpu_offload_uvm_original_va_remote_graph_replay()
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3704,22 +3777,11 @@ class GPUModelRunner(
             scheduler_output,
             enabled_step_phase,
         )
-        if (
-            original_va_phase_mode != "off"
-            and cudagraph_runtime_mode != CUDAGraphMode.NONE
-        ):
-            from vllm.model_executor.models.utils import (
-                validate_cpu_offload_uvm_original_va_alias_graph_replay,
-                validate_cpu_offload_uvm_original_va_remote_graph_replay,
-            )
-
-            if (
-                original_va_phase_mode == "prefill_graph_remote_decode"
-                and enabled_step_phase == "enabled:prefill_step"
-            ):
-                validate_cpu_offload_uvm_original_va_alias_graph_replay()
-            else:
-                validate_cpu_offload_uvm_original_va_remote_graph_replay()
+        self._validate_uvm_original_va_graph_replay_for_step(
+            original_va_phase_mode=original_va_phase_mode,
+            enabled_step_phase=enabled_step_phase,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+        )
         with (
             uvm_allocation_phase(enabled_step_phase),
             set_forward_context(
@@ -5265,6 +5327,7 @@ class GPUModelRunner(
         remove_lora: bool = True,
         activate_lora: bool = False,
         is_graph_capturing: bool = False,
+        pure_prefill_num_reqs: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5288,6 +5351,10 @@ class GPUModelRunner(
                 (1 token) and prefill (multiple tokens) requests.
             remove_lora: If False, dummy LoRAs are not destroyed after the run
             activate_lora: If False, dummy_run is performed without LoRAs.
+            pure_prefill_num_reqs: If set, construct a balanced, zero-context
+                Prefill batch with at most this many requests. Unlike the
+                legacy profiling shape, sequence lengths equal the scheduled
+                query lengths and must fit ``max_model_len``.
         """
         assert (
             cudagraph_runtime_mode is None
@@ -5314,7 +5381,24 @@ class GPUModelRunner(
         # has num_tokens in total.
         assert num_tokens <= self.scheduler_config.max_num_batched_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if create_mixed_batch:
+        if pure_prefill_num_reqs is not None:
+            if uniform_decode or create_mixed_batch:
+                raise ValueError(
+                    "pure_prefill_num_reqs cannot be combined with "
+                    "uniform_decode or create_mixed_batch"
+                )
+            requested_num_reqs = min(
+                int(pure_prefill_num_reqs), int(max_num_reqs)
+            )
+            num_scheduled_tokens_list, max_query_len = (
+                _build_pure_prefill_dummy_shape(
+                    num_tokens=num_tokens,
+                    num_reqs=requested_num_reqs,
+                    max_model_len=self.max_model_len,
+                )
+            )
+            num_reqs = len(num_scheduled_tokens_list)
+        elif create_mixed_batch:
             assert not uniform_decode
             # Create mixed batch:
             # first half decode tokens, second half one prefill
@@ -5398,6 +5482,8 @@ class GPUModelRunner(
                 # shorter sequence lengths to run faster.
                 # TODO(luka) better system for describing dummy batches
                 seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]
+            elif pure_prefill_num_reqs is not None:
+                seq_lens = num_scheduled_tokens_list
             else:
                 seq_lens = max_query_len  # type: ignore[assignment]
             self.seq_lens.np[:num_reqs] = seq_lens
@@ -6100,7 +6186,9 @@ class GPUModelRunner(
                     executor=hot_modules[0].uvm_weight_executor,
                 )
                 if not result["ok"]:
-                    raise RuntimeError("Hot Expert prefetch failed")
+                    raise RuntimeError(
+                        f"Hot Expert prefetch failed: result={result!r}"
+                    )
 
                 torch.cuda.synchronize(device)
                 result = commit_uvm_regions_gpu_placement(
@@ -7665,13 +7753,19 @@ class GPUModelRunner(
             "diagnostics": self.model.cudagraph_class_diagnostics(),
         }
 
-    def capture_model(self) -> int:
+    def capture_model(
+        self,
+        before_pure_prefill_capture: Callable[[], None] | None = None,
+    ) -> int:
         from vllm.model_executor.models.utils import (
             activate_cpu_offload_uvm_original_va_prefill_topology,
             certify_cpu_offload_uvm_original_va_dual_graph_partition,
             cpu_offload_graph_static_alias_capture_context,
             cpu_offload_uvm_original_va_phase_mode,
+            prepare_cpu_offload_uvm_original_va_profile_topology,
             prepare_cpu_offload_uvm_original_va_remote_graph_capture,
+            reconcile_cpu_offload_uvm_original_va_remote_graph_residency,
+            reconcile_cpu_offload_uvm_original_va_sealed_hot_residency,
             validate_cpu_offload_graph_static_alias_runtime,
         )
 
@@ -7683,14 +7777,33 @@ class GPUModelRunner(
             )
             return 0
 
-        # Phase-switch experiments capture decode kernels only after original
-        # Parameter VAs have audited CPU-backed remote READ PTEs. This keeps
-        # every upload memcpy node out of the reusable decode Graph.
-        prepare_cpu_offload_uvm_original_va_remote_graph_capture()
         original_va_phase_mode = cpu_offload_uvm_original_va_phase_mode()
         dual_topology_graphs = (
             original_va_phase_mode == "prefill_graph_remote_decode"
         )
+        capture_prefill_before_hot_restore = (
+            dual_topology_graphs
+            and os.environ.get(
+                "VLLM_UVM_PREFILL_GRAPH_CAPTURE_BEFORE_HOT_RESTORE", "0"
+            ).strip()
+            == "1"
+        )
+
+        # The ordinary path repairs hot placement before Graph capture.  The
+        # opt-in large-Prefill path instead keeps every expert on its audited
+        # remote READ mapping until the final Prefill Graph (and therefore its
+        # private allocator pool) is permanently live.  Only then are hot
+        # pages restored into the remaining HBM.
+        if capture_prefill_before_hot_restore:
+            prepare_cpu_offload_uvm_original_va_profile_topology(
+                transition_reason="prefill_graph_capture_all_remote",
+                preserve_remote_graphs=False,
+            )
+        else:
+            # Phase-switch experiments capture decode kernels only after
+            # original Parameter VAs have audited CPU-backed remote READ PTEs.
+            # This keeps every upload memcpy node out of the Decode Graph.
+            prepare_cpu_offload_uvm_original_va_remote_graph_capture()
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
@@ -7757,6 +7870,34 @@ class GPUModelRunner(
                     uniform_decode=False,
                 )
 
+            def capture_pure_prefill_graphs() -> None:
+                """Capture sealed-topology Graphs with only Prefill requests."""
+                if cudagraph_mode.mixed_mode() == CUDAGraphMode.NONE:
+                    return
+                prefill_batch_sizes = sorted(
+                    {
+                        descriptor.num_tokens
+                        for descriptor in self.cudagraph_dispatcher.cudagraph_keys[
+                            CUDAGraphMode.FULL
+                        ]
+                        if not descriptor.uniform_decode
+                    }
+                )
+                if not prefill_batch_sizes:
+                    raise RuntimeError(
+                        "Dual-topology Graph capture has no dedicated pure-Prefill "
+                        "size above the uniform-decode range"
+                    )
+                compilation_cases = list(
+                    product(reversed(prefill_batch_sizes), lora_cases)
+                )
+                self._capture_cudagraphs(
+                    compilation_cases,
+                    cudagraph_runtime_mode=cudagraph_mode.mixed_mode(),
+                    uniform_decode=False,
+                    pure_prefill_num_reqs=self.scheduler_config.max_num_seqs,
+                )
+
             def capture_uniform_decode_graphs() -> None:
                 if not (
                     cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
@@ -7795,15 +7936,188 @@ class GPUModelRunner(
                 ):
                     capture_uniform_decode_graphs()
 
-                # Restore the same original VAs to sealed dual-bank aliases,
-                # then capture independent non-uniform prefill entries. These
-                # graphs contain the pinned-source -> upload-VA H2D nodes.
-                torch.cuda.synchronize(self.device)
-                activate_cpu_offload_uvm_original_va_prefill_topology()
-                with cpu_offload_graph_static_alias_capture_context(
-                    expected_topology="sealed"
-                ):
-                    capture_mixed_graphs()
+                preseed_prefill_pool = (
+                    os.environ.get(
+                        "VLLM_UVM_PREFILL_GRAPH_POOL_PRESEED", "0"
+                    ).strip()
+                    == "1"
+                )
+                if capture_prefill_before_hot_restore and preseed_prefill_pool:
+                    raise RuntimeError(
+                        "Capture-before-hot-restore and disposable Prefill "
+                        "pool preseed are mutually exclusive"
+                    )
+                if capture_prefill_before_hot_restore:
+                    if before_pure_prefill_capture is not None:
+                        torch.cuda.synchronize(self.device)
+                        before_pure_prefill_capture()
+
+                    # RESUME only the frozen cold alias banks.  Hot ranges
+                    # intentionally remain on their audited CPU remote READ
+                    # mappings while the *final*, retained Prefill Graph is
+                    # captured.  Ending the profile flag enables the normal
+                    # per-layer H2D copy path, so this is not an allocator-only
+                    # or bypass graph.
+                    torch.cuda.synchronize(self.device)
+                    activate_cpu_offload_uvm_original_va_prefill_topology(
+                        finish_all_remote_profile=True
+                    )
+                    with cpu_offload_graph_static_alias_capture_context(
+                        expected_topology="sealed"
+                    ):
+                        capture_pure_prefill_graphs()
+
+                    # The final GraphExecs now permanently own the exact
+                    # allocator pool needed by serving.  Restore hot experts
+                    # only into HBM left after those non-evictable allocations
+                    # are established; never empty the allocator cache here.
+                    torch.cuda.synchronize(self.device)
+                    reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
+                        preserve_allocator_cache=True
+                    )
+                if preseed_prefill_pool:
+                    if before_pure_prefill_capture is not None:
+                        # Release a diagnostic sentinel before pool seeding,
+                        # while every hot expert is still remote.  The pool,
+                        # not the sentinel extent, owns the resulting native
+                        # reserve from this point onward.
+                        torch.cuda.synchronize(self.device)
+                        before_pure_prefill_capture()
+
+                    model = self.model
+                    if not isinstance(model, CUDAGraphWrapper):
+                        raise RuntimeError(
+                            "Prefill Graph pool preseed requires a "
+                            "CUDAGraphWrapper"
+                        )
+                    prefill_sizes = sorted(
+                        {
+                            descriptor.num_tokens
+                            for descriptor in self.cudagraph_dispatcher.cudagraph_keys[
+                                CUDAGraphMode.FULL
+                            ]
+                            if not descriptor.uniform_decode
+                        }
+                    )
+                    if not prefill_sizes:
+                        raise RuntimeError(
+                            "Prefill Graph pool preseed found no pure-Prefill shape"
+                        )
+                    seed_tokens = max(prefill_sizes)
+                    seed_class = "prefill_pool_seed"
+                    model.begin_cudagraph_class_capture(seed_class, replace=True)
+                    reserved_before_seed = int(
+                        torch.cuda.memory_reserved(self.device)
+                    )
+                    free_before_seed = int(
+                        torch.cuda.mem_get_info(self.device)[0]
+                    )
+                    bypass_name = (
+                        "VLLM_UVM_PREFILL_ALLOCATOR_REUSE_DIAGNOSTIC_"
+                        "BYPASS_MOE_KERNEL"
+                    )
+                    bypass_tokens_name = (
+                        "VLLM_UVM_PREFILL_ALLOCATOR_REUSE_DIAGNOSTIC_TOKENS"
+                    )
+                    previous_bypass = os.environ.get(bypass_name)
+                    previous_bypass_tokens = os.environ.get(bypass_tokens_name)
+                    try:
+                        os.environ[bypass_name] = "1"
+                        os.environ[bypass_tokens_name] = str(seed_tokens)
+                        with cpu_offload_graph_static_alias_capture_context(
+                            expected_topology="remote"
+                        ):
+                            self._capture_cudagraphs(
+                                [
+                                    (seed_tokens, activate_lora)
+                                    for activate_lora in lora_cases
+                                ],
+                                cudagraph_runtime_mode=cudagraph_mode.mixed_mode(),
+                                uniform_decode=False,
+                                pure_prefill_num_reqs=(
+                                    self.scheduler_config.max_num_seqs
+                                ),
+                            )
+                    finally:
+                        if previous_bypass is None:
+                            os.environ.pop(bypass_name, None)
+                        else:
+                            os.environ[bypass_name] = previous_bypass
+                        if previous_bypass_tokens is None:
+                            os.environ.pop(bypass_tokens_name, None)
+                        else:
+                            os.environ[bypass_tokens_name] = previous_bypass_tokens
+
+                    torch.cuda.synchronize(self.device)
+                    reserved_after_seed = int(
+                        torch.cuda.memory_reserved(self.device)
+                    )
+                    free_after_seed = int(torch.cuda.mem_get_info(self.device)[0])
+                    discard = model.discard_cudagraph_class(
+                        seed_class,
+                        activate_class="default",
+                    )
+                    if discard.get("ok") is not True:
+                        raise RuntimeError(
+                            f"Failed to discard Prefill pool seed Graph: {discard!r}"
+                        )
+                    gc.collect()
+                    torch.cuda.synchronize(self.device)
+                    reserved_after_discard = int(
+                        torch.cuda.memory_reserved(self.device)
+                    )
+                    free_after_discard = int(
+                        torch.cuda.mem_get_info(self.device)[0]
+                    )
+                    from vllm.model_executor.models.utils import (
+                        _append_uvm_original_alias_lifecycle,
+                    )
+
+                    _append_uvm_original_alias_lifecycle(
+                        "cpu_offload_uvm_prefill_graph_pool_preseeded",
+                        {
+                            "operation": "prefill_graph_pool_preseed",
+                            "ok": True,
+                            "seed_tokens": int(seed_tokens),
+                            "seed_num_requests": int(
+                                self.scheduler_config.max_num_seqs
+                            ),
+                            "reserved_before_seed": reserved_before_seed,
+                            "reserved_after_seed": reserved_after_seed,
+                            "reserved_delta": (
+                                reserved_after_seed - reserved_before_seed
+                            ),
+                            "reserved_after_discard": reserved_after_discard,
+                            "free_before_seed": free_before_seed,
+                            "free_after_seed": free_after_seed,
+                            "free_after_discard": free_after_discard,
+                            "discard": discard,
+                        },
+                    )
+
+                if not capture_prefill_before_hot_restore:
+                    # Decode Graph capture owns persistent/native allocations.
+                    # Repair any hot placement it disturbed while the remote
+                    # topology is active, retaining allocator cache.
+                    torch.cuda.synchronize(self.device)
+                    reconcile_cpu_offload_uvm_original_va_remote_graph_residency(
+                        preserve_allocator_cache=True
+                    )
+
+                    # Restore the same original VAs to sealed dual-bank
+                    # aliases, then capture independent Prefill entries.
+                    torch.cuda.synchronize(self.device)
+                    activate_cpu_offload_uvm_original_va_prefill_topology()
+                    if (
+                        before_pure_prefill_capture is not None
+                        and not preseed_prefill_pool
+                    ):
+                        torch.cuda.synchronize(self.device)
+                        before_pure_prefill_capture()
+                    with cpu_offload_graph_static_alias_capture_context(
+                        expected_topology="sealed"
+                    ):
+                        capture_pure_prefill_graphs()
 
                 model = self.model
                 if not isinstance(model, CUDAGraphWrapper):
@@ -7873,11 +8187,38 @@ class GPUModelRunner(
         compilation_cases: list[tuple[int, bool]],
         cudagraph_runtime_mode: CUDAGraphMode,
         uniform_decode: bool,
+        pure_prefill_num_reqs: int | None = None,
     ):
         assert (
             cudagraph_runtime_mode != CUDAGraphMode.NONE
             and cudagraph_runtime_mode.valid_runtime_modes()
         ), f"Invalid cudagraph runtime mode: {cudagraph_runtime_mode}"
+
+        if pure_prefill_num_reqs is not None and uniform_decode:
+            raise ValueError(
+                "pure_prefill_num_reqs cannot be used for uniform Decode Graphs"
+            )
+
+        allocator_reuse_diagnostic = (
+            os.environ.get(
+                "VLLM_UVM_PREFILL_ALLOCATOR_REUSE_DIAGNOSTIC", "0"
+            ).strip()
+            == "1"
+        )
+        diagnostic_tokens = int(
+            os.environ.get(
+                "VLLM_UVM_PREFILL_ALLOCATOR_REUSE_DIAGNOSTIC_TOKENS", "16384"
+            )
+        )
+        diagnostic_repeats = int(
+            os.environ.get(
+                "VLLM_UVM_PREFILL_ALLOCATOR_REUSE_DIAGNOSTIC_REPEATS", "2"
+            )
+        )
+        if allocator_reuse_diagnostic and diagnostic_repeats < 2:
+            raise ValueError(
+                "Prefill allocator reuse diagnostic requires at least two repeats"
+            )
 
         # Only rank 0 should print progress bar during capture
         if is_global_first_rank():
@@ -7885,7 +8226,15 @@ class GPUModelRunner(
                 compilation_cases,
                 disable=not self.load_config.use_tqdm_on_load,
                 desc="Capturing CUDA graphs ({}, {})".format(
-                    "decode" if uniform_decode else "mixed prefill-decode",
+                    (
+                        "decode"
+                        if uniform_decode
+                        else (
+                            "pure prefill"
+                            if pure_prefill_num_reqs is not None
+                            else "mixed prefill-decode"
+                        )
+                    ),
                     cudagraph_runtime_mode.name,
                 ),
             )
@@ -7907,6 +8256,177 @@ class GPUModelRunner(
                 )
             )
 
+            if (
+                allocator_reuse_diagnostic
+                and pure_prefill_num_reqs is not None
+                and num_tokens == diagnostic_tokens
+            ):
+                from vllm.model_executor.models.utils import (
+                    _append_uvm_original_alias_lifecycle,
+                )
+
+                device = int(self.device.index or 0)
+                torch.cuda.synchronize(self.device)
+                torch.cuda.memory._record_memory_history(
+                    enabled="all",
+                    context="alloc",
+                    stacks="python",
+                    max_entries=200000,
+                    device=device,
+                    clear_history=True,
+                )
+
+                def allocator_state() -> tuple[dict[str, int], dict[str, Any]]:
+                    torch.cuda.synchronize(self.device)
+                    free_bytes, total_bytes = (
+                        int(value)
+                        for value in torch.cuda.mem_get_info(self.device)
+                    )
+                    stats = torch.cuda.memory_stats(device)
+                    state = {
+                        "free_bytes": free_bytes,
+                        "total_bytes": total_bytes,
+                        "allocated_bytes": int(
+                            torch.cuda.memory_allocated(device)
+                        ),
+                        "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+                        "active_bytes": int(
+                            stats.get("active_bytes.all.current", 0)
+                        ),
+                        "inactive_split_bytes": int(
+                            stats.get("inactive_split_bytes.all.current", 0)
+                        ),
+                        "segment_count": int(stats.get("segment.all.current", 0)),
+                        "allocation_count": int(
+                            stats.get("allocation.all.current", 0)
+                        ),
+                    }
+                    return state, torch.cuda.memory._snapshot(device)
+
+                before, snapshot = allocator_state()
+                device_traces = snapshot.get("device_traces", [])
+                trace_count = (
+                    len(device_traces[device])
+                    if device < len(device_traces)
+                    else 0
+                )
+                repeat_records: list[dict[str, Any]] = []
+                diagnostic_started_ns = time.perf_counter_ns()
+                try:
+                    for repeat_index in range(diagnostic_repeats):
+                        run_started_ns = time.perf_counter_ns()
+                        with uvm_allocation_phase(
+                            "prefill_allocator_reuse_diagnostic:"
+                            f"tokens={num_tokens}:repeat={repeat_index + 1}"
+                        ):
+                            outputs = self._dummy_run(
+                                num_tokens,
+                                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                                force_attention=True,
+                                uniform_decode=False,
+                                allow_microbatching=False,
+                                skip_eplb=True,
+                                remove_lora=False,
+                                activate_lora=activate_lora,
+                                pure_prefill_num_reqs=pure_prefill_num_reqs,
+                            )
+                        torch.cuda.synchronize(self.device)
+                        del outputs
+                        gc.collect()
+                        torch.cuda.synchronize(self.device)
+
+                        after, snapshot = allocator_state()
+                        device_traces = snapshot.get("device_traces", [])
+                        trace_entries = (
+                            device_traces[device]
+                            if device < len(device_traces)
+                            else []
+                        )
+                        if trace_count > len(trace_entries):
+                            trace_count = 0
+                        new_entries = trace_entries[trace_count:]
+                        segment_allocs = [
+                            {
+                                "address": int(entry.get("addr", 0)),
+                                "bytes": int(entry.get("size", 0)),
+                                "stream": int(entry.get("stream", 0)),
+                            }
+                            for entry in new_entries
+                            if entry.get("action") == "segment_alloc"
+                        ]
+                        record = {
+                            "repeat": repeat_index + 1,
+                            "wall_ns": time.perf_counter_ns() - run_started_ns,
+                            "before": before,
+                            "after": after,
+                            "delta": {
+                                key: int(after[key]) - int(before[key])
+                                for key in before
+                                if key != "total_bytes"
+                            },
+                            "segment_alloc_event_count": len(segment_allocs),
+                            "segment_alloc_event_bytes": sum(
+                                int(event["bytes"]) for event in segment_allocs
+                            ),
+                            "segment_alloc_events": segment_allocs,
+                        }
+                        repeat_records.append(record)
+                        _append_uvm_original_alias_lifecycle(
+                            "cpu_offload_uvm_prefill_allocator_reuse_diagnostic_repeat",
+                            {
+                                "operation": "prefill_allocator_reuse_diagnostic",
+                                "num_tokens": int(num_tokens),
+                                "num_requests": int(pure_prefill_num_reqs),
+                                **record,
+                            },
+                        )
+                        before = after
+                        trace_count = len(trace_entries)
+                except Exception as exc:
+                    _append_uvm_original_alias_lifecycle(
+                        "cpu_offload_uvm_prefill_allocator_reuse_diagnostic",
+                        {
+                            "operation": "prefill_allocator_reuse_diagnostic",
+                            "ok": False,
+                            "num_tokens": int(num_tokens),
+                            "num_requests": int(pure_prefill_num_reqs),
+                            "repeat_records": repeat_records,
+                            "error": repr(exc),
+                            "wall_ns": time.perf_counter_ns()
+                            - diagnostic_started_ns,
+                        },
+                    )
+                    raise
+
+                first_segment_bytes = int(
+                    repeat_records[0]["segment_alloc_event_bytes"]
+                )
+                later_segment_bytes = sum(
+                    int(record["segment_alloc_event_bytes"])
+                    for record in repeat_records[1:]
+                )
+                _append_uvm_original_alias_lifecycle(
+                    "cpu_offload_uvm_prefill_allocator_reuse_diagnostic",
+                    {
+                        "operation": "prefill_allocator_reuse_diagnostic",
+                        "ok": True,
+                        "num_tokens": int(num_tokens),
+                        "num_requests": int(pure_prefill_num_reqs),
+                        "repeat_records": repeat_records,
+                        "first_segment_alloc_bytes": first_segment_bytes,
+                        "later_segment_alloc_bytes": later_segment_bytes,
+                        "reuse_proved": bool(
+                            first_segment_bytes > 0 and later_segment_bytes == 0
+                        ),
+                        "wall_ns": time.perf_counter_ns()
+                        - diagnostic_started_ns,
+                    },
+                )
+                raise RuntimeError(
+                    "Prefill allocator reuse diagnostic completed; stopping "
+                    "before hot-expert restoration and formal Graph capture"
+                )
+
             for _ in range(self.compilation_config.cudagraph_num_of_warmups):
                 # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
                 # But be careful, warm up with `NONE`is orthogonal to
@@ -7924,6 +8444,7 @@ class GPUModelRunner(
                         skip_eplb=True,
                         remove_lora=False,
                         activate_lora=activate_lora,
+                        pure_prefill_num_reqs=pure_prefill_num_reqs,
                     )
             with uvm_allocation_phase("enabled:dummy_run"):
                 self._dummy_run(
@@ -7935,6 +8456,7 @@ class GPUModelRunner(
                     remove_lora=False,
                     activate_lora=activate_lora,
                     is_graph_capturing=True,
+                    pure_prefill_num_reqs=pure_prefill_num_reqs,
                 )
         self.maybe_remove_all_loras(self.lora_config)
 

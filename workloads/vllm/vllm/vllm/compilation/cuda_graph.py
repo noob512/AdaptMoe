@@ -205,6 +205,56 @@ class CUDAGraphWrapper:
             "entry_count": len(entries),
         }
 
+    def discard_cudagraph_class(
+        self,
+        class_name: str,
+        *,
+        activate_class: str = "default",
+    ) -> dict[str, Any]:
+        """Destroy one temporary Graph class while retaining its shared pool.
+
+        CUDA Graphs captured by this wrapper all use ``self.graph_pool``.  A
+        startup pool-seeding graph can therefore be reset after its blocks
+        have established the pool layout; another graph captured into the
+        same live pool can reuse those blocks.  At least one other class must
+        remain live so callers cannot accidentally retire the shared pool.
+        """
+        normalized = self._normalize_cudagraph_class(class_name)
+        target = self._normalize_cudagraph_class(activate_class)
+        if normalized == target:
+            return {"ok": False, "reason": "discard_target_is_activate_target"}
+        entries = self._cudagraph_class_entries.get(normalized)
+        target_entries = self._cudagraph_class_entries.get(target)
+        if entries is None:
+            return {"ok": False, "reason": "class_not_registered"}
+        if not target_entries or any(
+            entry.cudagraph is None for entry in target_entries.values()
+        ):
+            return {"ok": False, "reason": "activate_target_not_fully_captured"}
+
+        reset_count = 0
+        for entry in tuple(entries.values()):
+            if entry.cudagraph is not None:
+                entry.cudagraph.reset()
+                reset_count += 1
+            entry.cudagraph = None
+            entry.output = None
+            entry.input_addresses = None
+        entries.clear()
+        self._cudagraph_class_entries.pop(normalized, None)
+        self.concrete_cudagraph_entries = target_entries
+        old_class = self._active_cudagraph_class
+        self._active_cudagraph_class = target
+        return {
+            "ok": True,
+            "reason": "class_discarded_pool_retained",
+            "discarded_class": normalized,
+            "old_class": old_class,
+            "active_class": target,
+            "reset_count": reset_count,
+            "active_entry_count": len(target_entries),
+        }
+
     def cudagraph_class_diagnostics(self) -> dict[str, Any]:
         classes: dict[str, Any] = {}
         for class_name, entries in sorted(self._cudagraph_class_entries.items()):

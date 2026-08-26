@@ -4,6 +4,7 @@
 
 import gc
 import os
+import time
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
@@ -13,7 +14,7 @@ import torch.distributed
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.device_allocator.uvm import uvm_allocation_phase
 from vllm.device_allocator.uvm_pool_residency import (
     close_uvm_slot_direct_policy_session,
@@ -83,6 +84,9 @@ class Worker(WorkerBase):
                 distributed_init_method=distributed_init_method,
                 is_driver_worker=is_driver_worker,
             )
+            self._uvm_pre_kv_native_hole_sentinel: (
+                tuple[Any, Any, int] | None
+            ) = None
 
             # 2. 处理 Hugging Face 模型的自定义代码 (trust_remote_code)
             if self.model_config.trust_remote_code:
@@ -350,7 +354,26 @@ class Worker(WorkerBase):
         GiB = lambda b: b / GiB_bytes
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
-            # max_num_batched_tokens
+            # max_num_batched_tokens. Under the original-VA expert backend,
+            # the profile activation/workspace can otherwise evict a hot
+            # managed expert and make its first fail-fast access fatal. When
+            # explicitly requested, profile with every expert on audited CPU
+            # remote mappings; the post-KV pre-warmup reconciliation restores
+            # the frozen cold-remote/hot-GPU serving placement.
+            from vllm.model_executor.models.utils import (
+                prepare_cpu_offload_uvm_original_va_profile_topology,
+            )
+
+            profile_topology = (
+                prepare_cpu_offload_uvm_original_va_profile_topology()
+            )
+            if profile_topology.get("reason") == "prepared":
+                logger.info(
+                    "Prepared all-remote original-VA startup profile "
+                    "topology: hot_bytes=%d hot_ranges=%d",
+                    int(profile_topology.get("hot_bytes", 0)),
+                    int(profile_topology.get("hot_range_count", 0)),
+                )
             self.model_runner.profile_run()
 
             msg = (
@@ -552,6 +575,19 @@ class Worker(WorkerBase):
         # 如果不提前初始化连接器，这些复杂的内部共享层可能会破坏连接器对连续内存或特定结构的假设。
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
+        if getattr(self, "_uvm_pre_kv_native_hole_sentinel", None) is None:
+            self._uvm_pre_kv_native_hole_sentinel = (
+                self._allocate_uvm_native_hole_sentinel(
+                    bytes_env=(
+                        "VLLM_UVM_PRE_KV_NATIVE_HOLE_SENTINEL_BYTES"
+                    ),
+                    empty_cache_env=(
+                        "VLLM_UVM_PRE_KV_NATIVE_HOLE_SENTINEL_EMPTY_CACHE"
+                    ),
+                    stage="before_kv_initialization",
+                )
+            )
+
         stage_m_stage = (
             os.environ.get(
                 "VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE",
@@ -578,12 +614,28 @@ class Worker(WorkerBase):
             # 使用上下文管理器接管内存分配。
             # 在这个 `with` 块内部，vLLM 分配的 KV Cache 张量会被打上 "kv_cache" 的标签，
             # 并被路由到专门支持解绑/休眠的 CuMem 内存池中。
-            with allocator.use_memory_pool(tag="kv_cache"):
-                self.model_runner.initialize_kv_cache(kv_cache_config)
+            try:
+                with allocator.use_memory_pool(tag="kv_cache"):
+                    self.model_runner.initialize_kv_cache(kv_cache_config)
+            except BaseException:
+                self._release_uvm_native_hole_sentinel(
+                    self._uvm_pre_kv_native_hole_sentinel,
+                    stage="kv_initialization_failure_cleanup",
+                )
+                self._uvm_pre_kv_native_hole_sentinel = None
+                raise
         else:
             # 如果没有启用休眠模式，则走常规的 PyTorch 默认内存分配路径分配 KV Cache。
-            with self._maybe_get_kv_cache_uvm_memory_pool_context():
-                self.model_runner.initialize_kv_cache(kv_cache_config)
+            try:
+                with self._maybe_get_kv_cache_uvm_memory_pool_context():
+                    self.model_runner.initialize_kv_cache(kv_cache_config)
+            except BaseException:
+                self._release_uvm_native_hole_sentinel(
+                    self._uvm_pre_kv_native_hole_sentinel,
+                    stage="kv_initialization_failure_cleanup",
+                )
+                self._uvm_pre_kv_native_hole_sentinel = None
+                raise
 
         # Stage M init-time placement must run on the UVM fast path too.
         # determine_available_memory() skips profile_run() when UVM is enabled.
@@ -709,6 +761,86 @@ class Worker(WorkerBase):
 
         self._uvm_post_warmup_rebalance_done = True
 
+    def _wait_for_uvm_fault_mode_before_post_warmup_rebalance(self) -> None:
+        """Synchronize an experiment-controlled UVM fault-mode cutover.
+
+        The worker never writes the privileged module parameter itself.  Once
+        every startup CUDA operation has completed it atomically publishes a
+        marker, then waits for an external controller to change and verify the
+        requested mode.  With no target configured this is a strict no-op.
+        """
+        raw_target = os.environ.get(
+            "VLLM_UVM_PRE_REBALANCE_MANUAL_MIGRATION_FAULT_MODE", ""
+        ).strip()
+        if not raw_target:
+            return
+        try:
+            target = int(raw_target)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_UVM_PRE_REBALANCE_MANUAL_MIGRATION_FAULT_MODE must "
+                f"be an integer, got {raw_target!r}"
+            ) from exc
+        if target not in (0, 1, 2):
+            raise ValueError(
+                "Pre-rebalance manual migration fault mode must be 0, 1, or 2"
+            )
+
+        parameter_path = os.environ.get(
+            "VLLM_UVM_MANUAL_MIGRATION_FAULT_MODE_PATH",
+            "/sys/module/nvidia_uvm/parameters/uvm_manual_migration_fault_mode",
+        ).strip()
+        marker_path = os.environ.get(
+            "VLLM_UVM_PRE_REBALANCE_FAULT_MODE_MARKER", ""
+        ).strip()
+        if not marker_path:
+            raise RuntimeError(
+                "A pre-rebalance fault-mode target requires a marker path"
+            )
+        raw_timeout = os.environ.get(
+            "VLLM_UVM_PRE_REBALANCE_FAULT_MODE_TIMEOUT_SEC", "30"
+        ).strip()
+        try:
+            timeout_seconds = float(raw_timeout)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_UVM_PRE_REBALANCE_FAULT_MODE_TIMEOUT_SEC must be numeric"
+            ) from exc
+        if timeout_seconds <= 0:
+            raise ValueError("Pre-rebalance fault-mode timeout must be positive")
+
+        torch.cuda.synchronize(self.device)
+        with open(parameter_path, encoding="utf-8") as handle:
+            mode_before = int(handle.read().strip())
+        temporary_path = f"{marker_path}.{os.getpid()}.tmp"
+        os.makedirs(os.path.dirname(marker_path) or ".", exist_ok=True)
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                f"pid={os.getpid()} mode_before={mode_before} "
+                f"target_mode={target}\n"
+            )
+        os.replace(temporary_path, marker_path)
+
+        deadline = time.monotonic() + timeout_seconds
+        observed = mode_before
+        while time.monotonic() < deadline:
+            with open(parameter_path, encoding="utf-8") as handle:
+                observed = int(handle.read().strip())
+            if observed == target:
+                logger.info(
+                    "Observed synchronized UVM fault-mode cutover before "
+                    "post-warmup rebalance: before=%d after=%d marker=%s",
+                    mode_before,
+                    observed,
+                    marker_path,
+                )
+                return
+            time.sleep(0.01)
+        raise RuntimeError(
+            "Timed out waiting for pre-rebalance UVM fault-mode cutover: "
+            f"before={mode_before}, target={target}, observed={observed}"
+        )
+
     def _reconverge_uvm_kv_cache_for_serving(self) -> None:
         """Reapply the requested KV residency after serving topology setup.
 
@@ -742,28 +874,352 @@ class Worker(WorkerBase):
         )
 
     def _reconcile_uvm_original_va_remote_before_warmup(self) -> None:
-        """Repair remote-only expert placement after KV allocation.
+        """Restore serving expert placement after KV allocation.
 
         Kernel/compile warmup executes real MoE kernels before
         ``GPUModelRunner.capture_model``.  Therefore the capture-time gate is
         too late when KV allocation has already evicted a hot managed expert.
-        Reconcile once here, before any such warmup, and again immediately
-        before capture.
+        Reconcile remote-only processes unconditionally. For dual-topology
+        Graph startup, keep the temporary all-remote placement through kernel
+        warmup: restoring the hot set before warmup leaves too little headroom
+        and lets warmup evict a hot page again. The capture gate empties the
+        warmup cache, restores hot experts, and audits the exact placement.
         """
         from vllm.model_executor.models.utils import (
             cpu_offload_uvm_original_va_phase_mode,
+            cpu_offload_uvm_original_va_profile_all_remote_active,
             reconcile_cpu_offload_uvm_original_va_remote_graph_residency,
+            reconcile_cpu_offload_uvm_original_va_sealed_hot_residency,
         )
 
-        if cpu_offload_uvm_original_va_phase_mode() != "remote_only":
+        phase_mode = cpu_offload_uvm_original_va_phase_mode()
+        profile_all_remote = (
+            cpu_offload_uvm_original_va_profile_all_remote_active()
+        )
+        if (
+            phase_mode == "prefill_graph_remote_decode"
+            and profile_all_remote
+        ):
+            logger.info(
+                "Keeping original-VA experts all-remote through kernel "
+                "warmup; hot-GPU restoration is deferred to the Graph "
+                "capture residency gate"
+            )
+            return
+        if (
+            phase_mode == "off"
+            and not profile_all_remote
+            and self._uvm_env_flag(
+                "VLLM_UVM_POST_KV_HOT_RECONCILE",
+                default=False,
+            )
+        ):
+            result = (
+                reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
+                    preserve_allocator_cache=True,
+                )
+            )
+            logger.info(
+                "Reconciled sealed original-VA hot experts after KV "
+                "allocation: hot_bytes=%d hot_cpu_before=%d "
+                "hot_gpu_after=%d free_before=%d free_after=%d "
+                "allocator_reserved=%d",
+                int(result.get("hot_bytes", 0)),
+                int(
+                    (result.get("hot_physical_residency_before") or {}).get(
+                        "cpu_bytes", -1
+                    )
+                ),
+                int(
+                    (result.get("hot_physical_residency_after") or {}).get(
+                        "gpu_bytes", -1
+                    )
+                ),
+                int(result.get("free_bytes_before", -1)),
+                int(result.get("free_bytes_after", -1)),
+                int(result.get("allocator_reserved_after", -1)),
+            )
+            return
+        if phase_mode != "remote_only" and not profile_all_remote:
             return
         result = reconcile_cpu_offload_uvm_original_va_remote_graph_residency()
         logger.info(
-            "Reconciled original-VA remote expert placement before warmup: "
-            "cold_bytes=%d hot_bytes=%d free_bytes=%d",
+            "Reconciled original-VA expert placement before warmup: "
+            "phase_mode=%s profile_all_remote=%s cold_bytes=%d "
+            "hot_bytes=%d free_bytes=%d",
+            phase_mode,
+            profile_all_remote,
             int(result.get("cold_bytes", 0)),
             int(result.get("hot_bytes", 0)),
             int(result.get("free_bytes", -1)),
+        )
+
+    def _prepare_uvm_original_va_post_capture_warmup(self) -> None:
+        """Run the final model/sampler warmup with every expert remote.
+
+        vLLM deliberately performs one real model forward after CUDA Graph
+        capture to initialize sampler buffers.  At tight E2 HBM tiers that
+        forward can evict an otherwise-hot managed page after the dual Graph
+        pools have become live.  Park the alias topology and temporarily map
+        the hot complement remote while preserving both certified Graph sets.
+        """
+        from vllm.model_executor.models.utils import (
+            cpu_offload_uvm_original_va_phase_mode,
+            prepare_cpu_offload_uvm_original_va_profile_topology,
+        )
+
+        if (
+            cpu_offload_uvm_original_va_phase_mode()
+            != "prefill_graph_remote_decode"
+        ):
+            return
+        result = prepare_cpu_offload_uvm_original_va_profile_topology(
+            transition_reason="post_capture_sampler_all_remote",
+            preserve_remote_graphs=True,
+        )
+        if result.get("reason") == "prepared":
+            logger.info(
+                "Prepared all-remote post-capture sampler topology while "
+                "preserving Graphs: hot_bytes=%d hot_ranges=%d",
+                int(result.get("hot_bytes", 0)),
+                int(result.get("hot_range_count", 0)),
+            )
+
+    def _restore_uvm_original_va_after_post_capture_warmup(self) -> None:
+        """Restore and audit hot-GPU/cold-remote before alias resume."""
+        from vllm.model_executor.models.utils import (
+            cpu_offload_uvm_original_va_phase_mode,
+            cpu_offload_uvm_original_va_profile_all_remote_active,
+            reconcile_cpu_offload_uvm_original_va_remote_graph_residency,
+        )
+
+        if (
+            cpu_offload_uvm_original_va_phase_mode()
+            != "prefill_graph_remote_decode"
+            or not cpu_offload_uvm_original_va_profile_all_remote_active()
+        ):
+            return
+        result = reconcile_cpu_offload_uvm_original_va_remote_graph_residency(
+            preserve_allocator_cache=True
+        )
+        logger.info(
+            "Restored original-VA serving residency after sampler warmup: "
+            "cold_bytes=%d hot_bytes=%d free_bytes=%d "
+            "allocator_reserved_before=%d allocator_reserved_after=%d",
+            int(result.get("cold_bytes", 0)),
+            int(result.get("hot_bytes", 0)),
+            int(result.get("free_bytes", -1)),
+            int(result.get("allocator_reserved_before", -1)),
+            int(result.get("allocator_reserved_after", -1)),
+        )
+
+    def _warm_up_uvm_prefill_allocator_reserve(self) -> None:
+        """Populate the native allocator cache before restoring hot experts.
+
+        A large first Prefill can otherwise grow PyTorch's native CUDA segment
+        reserve after the managed hot set has been restored. Under tight HBM,
+        PMA satisfies that cudaMalloc by evicting hot managed pages; fail-fast
+        mode then correctly rejects the next expert read. Run an eager dummy
+        Prefill while every expert is still remote and retain only its inactive
+        allocator segments. No expert page is migrated by this helper.
+        """
+        raw_tokens = os.environ.get(
+            "VLLM_UVM_PREFILL_ALLOCATOR_RESERVE_WARMUP_TOKENS", "0"
+        ).strip()
+        try:
+            num_tokens = int(raw_tokens or "0")
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_UVM_PREFILL_ALLOCATOR_RESERVE_WARMUP_TOKENS must be an "
+                f"integer, got {raw_tokens!r}"
+            ) from exc
+        if num_tokens <= 0:
+            return
+        if num_tokens > self.scheduler_config.max_num_batched_tokens:
+            raise ValueError(
+                "Prefill allocator reserve warmup exceeds "
+                f"max_num_batched_tokens: {num_tokens} > "
+                f"{self.scheduler_config.max_num_batched_tokens}"
+            )
+
+        from vllm.model_executor.models.utils import (
+            cpu_offload_uvm_original_va_phase_mode,
+            cpu_offload_uvm_original_va_profile_all_remote_active,
+        )
+
+        if (
+            cpu_offload_uvm_original_va_phase_mode()
+            != "prefill_graph_remote_decode"
+            or not cpu_offload_uvm_original_va_profile_all_remote_active()
+        ):
+            raise RuntimeError(
+                "Prefill allocator reserve warmup requires the audited "
+                "all-remote post-capture topology"
+            )
+
+        torch.cuda.synchronize(self.device)
+        before_free, total_bytes = (
+            int(value) for value in torch.cuda.mem_get_info(self.device)
+        )
+        before_reserved = int(torch.cuda.memory_reserved(self.device))
+        before_allocated = int(torch.cuda.memory_allocated(self.device))
+        warmup_num_reqs = min(
+            int(num_tokens), int(self.scheduler_config.max_num_seqs)
+        )
+        max_query_tokens = (
+            num_tokens + warmup_num_reqs - 1
+        ) // warmup_num_reqs
+        if max_query_tokens > self.model_runner.max_model_len:
+            raise ValueError(
+                "Prefill allocator reserve warmup cannot form a valid "
+                "multi-request batch: "
+                f"tokens={num_tokens} requests={warmup_num_reqs} "
+                f"max_query_tokens={max_query_tokens} "
+                f"max_model_len={self.model_runner.max_model_len}"
+            )
+        with uvm_allocation_phase(
+            "prefill_allocator_reserve_warmup:"
+            f"tokens={num_tokens}:requests={warmup_num_reqs}"
+        ):
+            hidden_states, last_hidden_states = self.model_runner._dummy_run(
+                num_tokens=num_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                force_attention=True,
+                allow_microbatching=False,
+                skip_eplb=True,
+                remove_lora=False,
+                pure_prefill_num_reqs=warmup_num_reqs,
+            )
+        torch.cuda.synchronize(self.device)
+        del hidden_states, last_hidden_states
+        gc.collect()
+        torch.cuda.synchronize(self.device)
+        after_free = int(torch.cuda.mem_get_info(self.device)[0])
+        after_reserved = int(torch.cuda.memory_reserved(self.device))
+        after_allocated = int(torch.cuda.memory_allocated(self.device))
+        logger.info(
+            "Retained native Prefill allocator reserve while all experts were "
+            "remote: tokens=%d requests=%d max_query_tokens=%d "
+            "reserved_before=%d reserved_after=%d "
+            "reserved_delta=%d allocated_before=%d allocated_after=%d "
+            "free_before=%d free_after=%d total=%d",
+            num_tokens,
+            warmup_num_reqs,
+            max_query_tokens,
+            before_reserved,
+            after_reserved,
+            after_reserved - before_reserved,
+            before_allocated,
+            after_allocated,
+            before_free,
+            after_free,
+            total_bytes,
+        )
+
+    def _allocate_uvm_native_hole_sentinel(
+        self,
+        *,
+        bytes_env: str = "VLLM_UVM_NATIVE_HOLE_SENTINEL_BYTES",
+        empty_cache_env: str = "VLLM_UVM_NATIVE_HOLE_SENTINEL_EMPTY_CACHE",
+        stage: str = "before_serving",
+    ) -> tuple[Any, Any, int] | None:
+        """Hold a touched native allocation while serving residency settles.
+
+        This is a diagnostic-only physical-hole experiment.  Unlike the
+        Prefill allocator reserve above, the allocation is deliberately made
+        outside PyTorch's caching allocator and is returned to the CUDA driver
+        immediately before serving.  Hot managed pages are restored while the
+        sentinel is still live, so they cannot occupy its physical extent.
+        """
+        raw_bytes = os.environ.get(bytes_env, "0").strip()
+        try:
+            sentinel_bytes = int(raw_bytes or "0")
+        except ValueError as exc:
+            raise ValueError(
+                f"{bytes_env} must be an integer, got {raw_bytes!r}"
+            ) from exc
+        if sentinel_bytes <= 0:
+            return None
+
+        empty_cache = os.environ.get(empty_cache_env, "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        torch.cuda.synchronize(self.device)
+        reserved_before = int(torch.cuda.memory_reserved(self.device))
+        if empty_cache:
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(self.device)
+        reserved_after_empty_cache = int(
+            torch.cuda.memory_reserved(self.device)
+        )
+        free_before, total_bytes = (
+            int(value) for value in torch.cuda.mem_get_info(self.device)
+        )
+
+        from vllm.distributed.device_communicators.cuda_wrapper import (
+            CudaRTLibrary,
+        )
+
+        cudart = CudaRTLibrary()
+        cudart.cudaSetDevice(int(self.device.index or 0))
+        pointer = cudart.cudaMalloc(sentinel_bytes)
+        try:
+            # Touch every page so the experiment proves physical commitment,
+            # rather than only successful virtual-address reservation.
+            cudart.cudaMemset(pointer, 0xA5, sentinel_bytes)
+            cudart.cudaDeviceSynchronize()
+        except BaseException:
+            cudart.cudaFree(pointer)
+            raise
+        free_after = int(torch.cuda.mem_get_info(self.device)[0])
+        logger.info(
+            "Allocated native UVM hole sentinel: stage=%s bytes=%d pointer=%#x "
+            "empty_cache=%s reserved_before=%d "
+            "reserved_after_empty_cache=%d free_before=%d free_after=%d "
+            "free_delta=%d total=%d",
+            stage,
+            sentinel_bytes,
+            int(pointer.value or 0),
+            empty_cache,
+            reserved_before,
+            reserved_after_empty_cache,
+            free_before,
+            free_after,
+            free_before - free_after,
+            total_bytes,
+        )
+        return cudart, pointer, sentinel_bytes
+
+    def _release_uvm_native_hole_sentinel(
+        self,
+        sentinel: tuple[Any, Any, int] | None,
+        *,
+        stage: str = "before_serving",
+    ) -> None:
+        if sentinel is None:
+            return
+        cudart, pointer, sentinel_bytes = sentinel
+        torch.cuda.synchronize(self.device)
+        free_before, total_bytes = (
+            int(value) for value in torch.cuda.mem_get_info(self.device)
+        )
+        cudart.cudaFree(pointer)
+        cudart.cudaDeviceSynchronize()
+        free_after = int(torch.cuda.mem_get_info(self.device)[0])
+        logger.info(
+            "Released native UVM hole sentinel: stage=%s bytes=%d "
+            "pointer=%#x free_before=%d free_after=%d free_delta=%d total=%d",
+            stage,
+            sentinel_bytes,
+            int(pointer.value or 0),
+            free_before,
+            free_after,
+            free_after - free_before,
+            total_bytes,
         )
 
     def compile_or_warm_up_model(self) -> None:
@@ -820,13 +1276,59 @@ class Worker(WorkerBase):
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
+        # This opt-in gate is deliberately placed after physical KV creation
+        # and immediately before the first post-KV model forward.  It
+        # distinguishes hot managed pages displaced by KV/native allocation
+        # from a fault caused later inside kernel warmup.  The helper is a
+        # no-op unless VLLM_CPU_OFFLOAD_UVM_HOT_CUDA_READ_GATE is enabled.
+        from vllm.model_executor.models.utils import (
+            _uvm_original_alias_hot_cuda_read_gate,
+        )
+
+        _uvm_original_alias_hot_cuda_read_gate(
+            stage="runtime_post_kv_before_kernel_warmup",
+            device=int(self.device.index or 0),
+        )
         with uvm_allocation_phase("kernel_warmup"):
             kernel_warmup(self)
 
         cuda_graph_memory_bytes = 0
+        capture_sentinel = getattr(
+            self, "_uvm_pre_kv_native_hole_sentinel", None
+        )
+        self._uvm_pre_kv_native_hole_sentinel = None
         if not self.model_config.enforce_eager:
-            with uvm_allocation_phase("capture_model"):
-                cuda_graph_memory_bytes = self.model_runner.capture_model()
+            if capture_sentinel is None:
+                capture_sentinel = self._allocate_uvm_native_hole_sentinel(
+                    bytes_env="VLLM_UVM_CAPTURE_NATIVE_HOLE_SENTINEL_BYTES",
+                    empty_cache_env=(
+                        "VLLM_UVM_CAPTURE_NATIVE_HOLE_SENTINEL_EMPTY_CACHE"
+                    ),
+                    stage="before_graph_capture",
+                )
+
+            def release_capture_sentinel(stage: str) -> None:
+                nonlocal capture_sentinel
+                self._release_uvm_native_hole_sentinel(
+                    capture_sentinel,
+                    stage=stage,
+                )
+                capture_sentinel = None
+
+            try:
+                with uvm_allocation_phase("capture_model"):
+                    if capture_sentinel is None:
+                        cuda_graph_memory_bytes = self.model_runner.capture_model()
+                    else:
+                        cuda_graph_memory_bytes = self.model_runner.capture_model(
+                            before_pure_prefill_capture=(
+                                lambda: release_capture_sentinel(
+                                    "before_pure_prefill_capture"
+                                )
+                            )
+                        )
+            finally:
+                release_capture_sentinel("capture_failure_cleanup")
             with uvm_allocation_phase("capture_uvm_plan_classes"):
                 class_capture = (
                     self.model_runner.
@@ -842,6 +1344,16 @@ class Worker(WorkerBase):
             cuda_graph_memory_bytes += int(
                 class_capture.get("graph_memory_bytes", 0)
             )
+        elif capture_sentinel is not None:
+            self._release_uvm_native_hole_sentinel(
+                capture_sentinel,
+                stage="eager_mode_cleanup",
+            )
+
+        # capture_model leaves the alias-prefill topology active.  Keep every
+        # expert remotely readable through the remaining real model warmup;
+        # restore the serving placement only after all init-time forwards.
+        self._prepare_uvm_original_va_post_capture_warmup()
 
         if self.cache_config.kv_cache_memory_bytes is None and hasattr(
             self, "peak_activation_memory"
@@ -925,20 +1437,32 @@ class Worker(WorkerBase):
                         hidden_states=last_hidden_states
                     )
 
+        # Populate the native cache after every startup forward and before hot
+        # managed pages are restored. There is deliberately no empty_cache()
+        # after this point.
+        self._warm_up_uvm_prefill_allocator_reserve()
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
+        self._wait_for_uvm_fault_mode_before_post_warmup_rebalance()
         self._run_uvm_post_warmup_rebalance()
         self.model_runner.finalize_uvm_slot_bank_after_warmup()
+        native_hole_sentinel = self._allocate_uvm_native_hole_sentinel()
+        try:
+            self._restore_uvm_original_va_after_post_capture_warmup()
 
-        # Keep the remote-only capture topology active through every init-time
-        # dummy replay. Only now is it safe to install alias banks for serving
-        # prefill; the first real decode will switch back before Graph replay.
-        from vllm.model_executor.models.utils import (
-            activate_cpu_offload_uvm_original_va_prefill_topology,
-        )
+            # Keep the remote-only capture topology active through every
+            # init-time dummy replay. Only now is it safe to install alias
+            # banks for serving prefill; the first real decode will switch
+            # back before Graph replay.
+            from vllm.model_executor.models.utils import (
+                activate_cpu_offload_uvm_original_va_prefill_topology,
+            )
 
-        activate_cpu_offload_uvm_original_va_prefill_topology()
-        self._reconverge_uvm_kv_cache_for_serving()
+            activate_cpu_offload_uvm_original_va_prefill_topology()
+            self._reconverge_uvm_kv_cache_for_serving()
+        finally:
+            self._release_uvm_native_hole_sentinel(native_hole_sentinel)
 
         set_random_seed(self.model_config.seed)
 

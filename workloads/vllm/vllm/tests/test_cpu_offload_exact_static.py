@@ -2559,6 +2559,167 @@ def test_uvm_original_transition_to_remote_audits_metadata(
     ]
 
 
+def test_uvm_original_profile_all_remote_then_restores_hot_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.device_allocator import uvm
+
+    pointer = _FakeTensor(shape=(2, 1), pointer=0x400000)
+    binding = SimpleNamespace(
+        full_parameter_name="model.layers.0.weight",
+        parameter=SimpleNamespace(data=pointer),
+        consumer=pointer,
+        requested_bytes=4096,
+        parameter_bytes=8192,
+        expert_ids=(1,),
+        consumer_ranges=((0x401000, 4096),),
+    )
+    monkeypatch.setenv("VLLM_UVM_PROFILE_ALL_EXPERTS_REMOTE", "1")
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS", True)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND",
+        "uvm_original_va",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE",
+        "prefill_graph_remote_decode",
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "sealed")
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE", False)
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE", False
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS",
+        {binding.full_parameter_name: binding},
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT", (0x400000,)
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY", [])
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY", []
+    )
+    monkeypatch.setattr(offload_utils.torch.cuda, "synchronize", lambda device=0: None)
+    empty_cache_calls: list[str] = []
+    monkeypatch.setattr(
+        offload_utils.torch.cuda,
+        "empty_cache",
+        lambda: empty_cache_calls.append("empty_cache"),
+    )
+    monkeypatch.setattr(
+        offload_utils.torch.cuda,
+        "memory_reserved",
+        lambda device=0: 1234,
+    )
+    monkeypatch.setattr(
+        offload_utils.torch.cuda,
+        "mem_get_info",
+        lambda device=0: (512 * 1024 * 1024, 32 * 1024 * 1024 * 1024),
+    )
+
+    def destroy(**_kwargs):
+        offload_utils._CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID = 0
+        offload_utils._CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "remote"
+        return {"ok": True, "state": "remote", "session_id": 0}
+
+    monkeypatch.setattr(
+        offload_utils, "destroy_cpu_offload_graph_static_alias", destroy
+    )
+    remote_calls: list[tuple[tuple[int, int], ...]] = []
+
+    def prepare_cpu(ranges, **_kwargs):
+        normalized = tuple(ranges)
+        assert normalized == ((0x400000, 4096),)
+        return len(normalized), "cpp_batch_native_cuda", len(normalized), len(
+            normalized
+        ), len(normalized)
+
+    def prepare_remote(ranges, **_kwargs):
+        normalized = tuple(ranges)
+        remote_calls.append(normalized)
+        total = sum(length for _, length in normalized)
+        return {
+            "ok": True,
+            "requested_count": len(normalized),
+            "success_count": len(normalized),
+            "failure_count": 0,
+            "requested_bytes": total,
+            "cpu_resident_bytes": total,
+            "remote_mapped_bytes": total,
+            "covered_bytes": total,
+            "unknown_bytes": 0,
+        }
+
+    hot_on_gpu = False
+
+    def advise_hot(ranges, _device):
+        return len(tuple(ranges))
+
+    def prefetch_hot(ranges, _device, *, executor):
+        nonlocal hot_on_gpu
+        normalized = tuple(ranges)
+        hot_on_gpu = True
+        return len(normalized), executor, 0
+
+    def query(ranges, **_kwargs):
+        normalized = tuple(ranges)
+        total = sum(length for _, length in normalized)
+        is_hot = normalized == ((0x400000, 4096),)
+        gpu_bytes = total if is_hot and hot_on_gpu else 0
+        return {
+            "ok": True,
+            "queried_bytes": total,
+            "cpu_bytes": total - gpu_bytes,
+            "gpu_bytes": gpu_bytes,
+            "any_bytes": total,
+            "unknown_bytes": 0,
+        }
+
+    monkeypatch.setattr(
+        uvm,
+        "batch_prepare_ranges_for_native_remote_access_with_executor",
+        prepare_cpu,
+    )
+    monkeypatch.setattr(
+        uvm, "driver_prepare_ranges_remote_read_audited", prepare_remote
+    )
+    monkeypatch.setattr(
+        uvm, "batch_advise_ranges_preferred_location", advise_hot
+    )
+    monkeypatch.setattr(
+        uvm, "batch_prefetch_ranges_to_device_with_executor", prefetch_hot
+    )
+    monkeypatch.setattr(uvm, "driver_batch_query_ranges_residency_bytes", query)
+
+    prepared = offload_utils.prepare_cpu_offload_uvm_original_va_profile_topology()
+    assert prepared["ok"] is True
+    assert prepared["reason"] == "prepared"
+    assert prepared["hot_bytes"] == 4096
+    assert offload_utils.cpu_offload_uvm_original_va_profile_all_remote_active()
+    assert remote_calls == [((0x400000, 4096),), ((0x401000, 4096),)]
+    empty_cache_calls.clear()
+
+    restored = (
+        offload_utils.reconcile_cpu_offload_uvm_original_va_remote_graph_residency(
+            preserve_allocator_cache=True
+        )
+    )
+    assert restored["ok"] is True
+    assert restored["allocator_cache_preserved"] is True
+    assert restored["allocator_reserved_before"] == 1234
+    assert restored["allocator_reserved_after_cleanup"] == 1234
+    assert restored["allocator_reserved_after"] == 1234
+    assert empty_cache_calls == []
+    assert restored["profile_all_remote_before"] is True
+    assert restored["profile_all_remote_after"] is False
+    assert restored["hot_physical_residency"]["gpu_bytes"] == 4096
+    assert not offload_utils.cpu_offload_uvm_original_va_profile_all_remote_active()
+
+
 def test_uvm_original_graph_capture_repairs_hot_residency_and_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ):

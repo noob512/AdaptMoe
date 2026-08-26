@@ -67,6 +67,79 @@ _MOE_REMOTE_REUSE_TRACE_TARGET_ASSIGNMENTS = int(
     os.environ.get("VLLM_MOE_REMOTE_REUSE_TRACE_TARGET_ASSIGNMENTS", "0")
 )
 _MOE_REMOTE_REUSE_TRACE_RECORDS: list[dict[str, Any]] = []
+_MOE_POST_WORKSPACE_UVM_AUDIT_ENABLED = os.environ.get(
+    "VLLM_UVM_FUSED_MOE_POST_WORKSPACE_RESIDENCY_AUDIT", ""
+).strip().lower() in ("1", "true", "yes", "on")
+_MOE_POST_WORKSPACE_UVM_AUDIT_MIN_TOKENS = int(
+    os.environ.get("VLLM_UVM_FUSED_MOE_POST_WORKSPACE_AUDIT_MIN_TOKENS", "1")
+)
+_MOE_POST_WORKSPACE_UVM_AUDIT_DONE = False
+
+
+def _maybe_trace_uvm_prefill_memory(
+    *,
+    stage: str,
+    num_tokens: int,
+    tensors: dict[str, torch.Tensor],
+) -> None:
+    if (
+        not _MOE_POST_WORKSPACE_UVM_AUDIT_ENABLED
+        or _MOE_POST_WORKSPACE_UVM_AUDIT_DONE
+        or num_tokens < _MOE_POST_WORKSPACE_UVM_AUDIT_MIN_TOKENS
+    ):
+        return
+    from vllm.model_executor.models.utils import (
+        trace_cpu_offload_uvm_original_va_prefill_memory,
+    )
+
+    trace_cpu_offload_uvm_original_va_prefill_memory(
+        stage=f"fused_moe:{stage}",
+        num_tokens=num_tokens,
+        tensors=tensors,
+    )
+
+
+def _maybe_audit_uvm_hot_residency_after_workspace_alloc(
+    *,
+    num_tokens: int,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    cache13: torch.Tensor,
+    intermediate_cache2: torch.Tensor,
+    out_hidden_states: torch.Tensor,
+) -> None:
+    """Run the opt-in physical-residency diagnostic exactly once."""
+    global _MOE_POST_WORKSPACE_UVM_AUDIT_DONE
+
+    if (
+        not _MOE_POST_WORKSPACE_UVM_AUDIT_ENABLED
+        or _MOE_POST_WORKSPACE_UVM_AUDIT_DONE
+        or num_tokens < _MOE_POST_WORKSPACE_UVM_AUDIT_MIN_TOKENS
+    ):
+        return
+    from vllm.model_executor.models.utils import (
+        audit_cpu_offload_uvm_original_va_post_workspace_residency,
+    )
+
+    result = audit_cpu_offload_uvm_original_va_post_workspace_residency(
+        num_tokens=num_tokens,
+        weight_tensors={"w1": w1, "w2": w2},
+        workspace_tensors={
+            "cache13": cache13,
+            "intermediate_cache2": intermediate_cache2,
+            "out_hidden_states": out_hidden_states,
+        },
+    )
+    if result.get("performed") is True:
+        _MOE_POST_WORKSPACE_UVM_AUDIT_DONE = True
+        logger.warning(
+            "Post-workspace hot residency audit: hot_gpu_only=%s, "
+            "current_hot_gpu_only=%s, hot_residency=%s, memory=%s",
+            result.get("hot_gpu_only"),
+            result.get("current_hot_gpu_only"),
+            result.get("hot_physical_residency"),
+            result.get("memory"),
+        )
 
 
 def _trace_percentile(values: list[int], q: float) -> float:
@@ -2008,6 +2081,18 @@ def fused_experts_impl(
 
     config = get_config_func(M)
 
+    _maybe_trace_uvm_prefill_memory(
+        stage="entry",
+        num_tokens=num_tokens,
+        tensors={
+            "hidden_states": hidden_states,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "w1": w1,
+            "w2": w2,
+        },
+    )
+
     # We can reuse the memory between these because by the time we need
     # cache3, we're done with cache1
     cache13 = torch.empty(
@@ -2015,12 +2100,26 @@ def fused_experts_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
+    _maybe_trace_uvm_prefill_memory(
+        stage="after_cache13",
+        num_tokens=num_tokens,
+        tensors={"hidden_states": hidden_states, "cache13": cache13},
+    )
     intermediate_cache1 = cache13[: M * top_k_num * N].view(M, top_k_num, N)
     intermediate_cache3 = cache13[: M * top_k_num * K].view(M, top_k_num, K)
 
     # This needs separate memory since it's used concurrently with cache1
     intermediate_cache2 = torch.empty(
         (M * top_k_num, N // 2), device=hidden_states.device, dtype=hidden_states.dtype
+    )
+    _maybe_trace_uvm_prefill_memory(
+        stage="after_intermediate_cache2",
+        num_tokens=num_tokens,
+        tensors={
+            "hidden_states": hidden_states,
+            "cache13": cache13,
+            "intermediate_cache2": intermediate_cache2,
+        },
     )
 
     if hidden_states.dtype == torch.bfloat16:
@@ -2036,6 +2135,16 @@ def fused_experts_impl(
         out_hidden_states = hidden_states
     else:
         out_hidden_states = torch.empty_like(hidden_states)
+    _maybe_trace_uvm_prefill_memory(
+        stage="after_out_hidden_states",
+        num_tokens=num_tokens,
+        tensors={
+            "hidden_states": hidden_states,
+            "cache13": cache13,
+            "intermediate_cache2": intermediate_cache2,
+            "out_hidden_states": out_hidden_states,
+        },
+    )
 
     if ocp_mx_scheme is not None:
         # TODO: On platforms for which `current_platform.supports_mx()` is True
@@ -2108,6 +2217,52 @@ def fused_experts_impl(
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             curr_topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
         )
+
+        _maybe_trace_uvm_prefill_memory(
+            stage="after_align_block_size",
+            num_tokens=num_tokens,
+            tensors={
+                "hidden_states": hidden_states,
+                "cache13": cache13,
+                "intermediate_cache2": intermediate_cache2,
+                "out_hidden_states": out_hidden_states,
+                "sorted_token_ids": sorted_token_ids,
+                "expert_ids": expert_ids,
+                "num_tokens_post_padded": num_tokens_post_padded,
+            },
+        )
+
+        _maybe_audit_uvm_hot_residency_after_workspace_alloc(
+            num_tokens=num_tokens,
+            w1=w1,
+            w2=w2,
+            cache13=cache13,
+            intermediate_cache2=intermediate_cache2,
+            out_hidden_states=out_hidden_states,
+        )
+
+        # Allocator-only diagnostic: preserve the real Attention, dense MLP,
+        # routing and fused-MoE workspace allocation lifetime, but do not
+        # dereference expert weights.  This isolates native segment growth and
+        # caching from original-VA/alias PTE readability.  It is deliberately
+        # restricted to the explicitly requested large Prefill shape and must
+        # never be enabled for serving or correctness measurements.
+        if (
+            os.environ.get(
+                "VLLM_UVM_PREFILL_ALLOCATOR_REUSE_DIAGNOSTIC_BYPASS_MOE_KERNEL",
+                "0",
+            ).strip()
+            == "1"
+            and num_tokens
+            >= int(
+                os.environ.get(
+                    "VLLM_UVM_PREFILL_ALLOCATOR_REUSE_DIAGNOSTIC_TOKENS",
+                    "16384",
+                )
+            )
+        ):
+            out_hidden_states.zero_()
+            return out_hidden_states
 
         invoke_fused_moe_kernel(
             qcurr_hidden_states,

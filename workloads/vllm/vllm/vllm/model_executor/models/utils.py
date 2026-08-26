@@ -609,6 +609,9 @@ _CPU_OFFLOAD_UVM_STATIC_ALIAS_SEAL_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_ORIGINAL_RELEASE_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_COLD_RESIDENCY_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_RESIDENCY_RESULT: dict[str, Any] | None = None
+_CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_CUDA_READ_BASELINE: dict[
+    int, tuple[str, dict[str, tuple[int, int]]]
+] = {}
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_DESTROY_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_SLOT_CLOSE_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED = False
@@ -632,10 +635,12 @@ _CPU_OFFLOAD_UVM_GRAPH_CERTIFICATES_BY_CLASS: dict[str, dict[str, Any]] = {}
 _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
 _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY: list[dict[str, Any]] = []
+_CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE = False
 _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY: list[dict[str, Any]] = []
 _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT: tuple[int, ...] = ()
 _CPU_OFFLOAD_UVM_PLAN_GENERATION = 0
 _CPU_OFFLOAD_UVM_PLAN_REBUILD_HISTORY: list[dict[str, Any]] = []
+_CPU_OFFLOAD_UVM_PREFILL_LAYER_TRACE_STATE: dict[int, dict[str, Any]] = {}
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_LOCK = threading.RLock()
 _CPU_OFFLOAD_OWNER_THREAD_ID: int | None = None
 _CPU_OFFLOAD_OWNER_DEVICE_INDEX: int | None = None
@@ -1141,6 +1146,7 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_ORIGINAL_RELEASE_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_COLD_RESIDENCY_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_RESIDENCY_RESULT
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_CUDA_READ_BASELINE
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_DESTROY_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_SLOT_CLOSE_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED
@@ -1164,6 +1170,7 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
     global _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT
     global _CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY
+    global _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE
     global _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY
     global _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT
     global _CPU_OFFLOAD_UVM_PLAN_GENERATION
@@ -1243,6 +1250,7 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_ORIGINAL_RELEASE_RESULT = None
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_COLD_RESIDENCY_RESULT = None
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_RESIDENCY_RESULT = None
+    _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_CUDA_READ_BASELINE = {}
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_DESTROY_RESULT = None
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_SLOT_CLOSE_RESULT = None
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED = False
@@ -1266,6 +1274,7 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
     _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT = None
     _CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY = []
+    _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE = False
     _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY = []
     _CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT = ()
     _CPU_OFFLOAD_UVM_PLAN_GENERATION = 0
@@ -1553,6 +1562,14 @@ def cpu_offload_uvm_original_va_phase_mode() -> str:
     return _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE
 
 
+def cpu_offload_uvm_original_va_profile_all_remote_active() -> bool:
+    """Return whether startup profiling temporarily uses all-remote experts."""
+    return bool(
+        cpu_offload_uvm_original_va_static_alias_enabled()
+        and _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE
+    )
+
+
 def cpu_offload_uvm_original_va_park_resume_enabled() -> bool:
     """Return whether sealed aliases are parked instead of destroyed."""
     return bool(
@@ -1818,6 +1835,9 @@ def get_cpu_offload_graph_static_alias_diagnostics() -> dict[str, Any]:
         "remote_map_active": bool(_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE),
         "remote_map_result": _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT,
         "remote_map_history": tuple(_CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY),
+        "profile_all_remote_active": bool(
+            _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE
+        ),
         "phase_transition_history": tuple(
             _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY
         ),
@@ -2730,6 +2750,993 @@ def _uvm_original_alias_binding_hot_ranges(
     return tuple(result)
 
 
+def audit_cpu_offload_uvm_original_va_post_workspace_residency(
+    *,
+    num_tokens: int,
+    weight_tensors: Mapping[str, torch.Tensor],
+    workspace_tensors: Mapping[str, torch.Tensor],
+) -> dict[str, Any]:
+    """Query hot physical residency immediately before a fused-MoE launch.
+
+    This is an opt-in diagnostic for distinguishing managed-page eviction
+    from a GPU page-table/channel visibility failure.  Unlike the CUDA-read
+    gate, the driver residency query never dereferences an expert VA and
+    therefore cannot fault a CPU-resident hot page back into GPU memory.
+    """
+    if not cpu_offload_uvm_original_va_static_alias_enabled():
+        return {"performed": False, "reason": "disabled"}
+    if _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE:
+        return {"performed": False, "reason": "profile_all_remote"}
+    if (
+        _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_CAPTURE_PHASE
+        and not _strict_env_flag(
+            "VLLM_UVM_FUSED_MOE_POST_WORKSPACE_AUDIT_CAPTURE_WARMUP", False
+        )
+    ):
+        return {"performed": False, "reason": "capture_phase"}
+    if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE != "sealed":
+        return {
+            "performed": False,
+            "reason": "topology_not_sealed",
+            "state": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE,
+        }
+    if torch.cuda.is_current_stream_capturing():
+        return {"performed": False, "reason": "stream_capturing"}
+    if not weight_tensors:
+        raise ValueError("Post-workspace residency audit requires weight tensors")
+
+    first_weight = next(iter(weight_tensors.values()))
+    if not first_weight.is_cuda:
+        raise ValueError("Post-workspace residency audit requires CUDA weights")
+    device = int(
+        first_weight.device.index
+        if first_weight.device.index is not None
+        else (_CPU_OFFLOAD_OWNER_DEVICE_INDEX or 0)
+    )
+    if any(
+        not tensor.is_cuda or int(tensor.device.index or 0) != device
+        for tensor in (*weight_tensors.values(), *workspace_tensors.values())
+    ):
+        raise ValueError(
+            "Post-workspace residency audit tensors must share one CUDA device"
+        )
+
+    def tensor_record(tensor: torch.Tensor) -> dict[str, Any]:
+        return {
+            "data_ptr": int(tensor.data_ptr()),
+            "bytes": int(tensor.numel() * tensor.element_size()),
+            "storage_bytes": int(tensor.untyped_storage().nbytes()),
+            "shape": tuple(int(value) for value in tensor.shape),
+            "dtype": str(tensor.dtype),
+        }
+
+    binding_records: list[dict[str, Any]] = []
+    matched_binding_names: set[str] = set()
+    for tensor_name, tensor in weight_tensors.items():
+        tensor_base = int(tensor.data_ptr())
+        tensor_bytes = int(tensor.numel() * tensor.element_size())
+        tensor_end = tensor_base + tensor_bytes
+        matches: list[dict[str, Any]] = []
+        for binding_name, binding in sorted(
+            _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+        ):
+            parameter_base = int(binding.consumer.data_ptr())
+            parameter_bytes = int(binding.parameter_bytes)
+            parameter_end = parameter_base + parameter_bytes
+            if parameter_base <= tensor_base and tensor_end <= parameter_end:
+                matched_binding_names.add(binding_name)
+                matches.append(
+                    {
+                        "full_parameter_name": binding_name,
+                        "parameter_base": parameter_base,
+                        "parameter_bytes": parameter_bytes,
+                        "tensor_offset_bytes": tensor_base - parameter_base,
+                        "expert_stride_bytes": int(binding.expert_stride_bytes),
+                        "cold_expert_ids": tuple(binding.expert_ids or ()),
+                    }
+                )
+        binding_records.append(
+            {
+                "tensor_name": str(tensor_name),
+                **tensor_record(tensor),
+                "binding_matches": matches,
+            }
+        )
+
+    hot_ranges = [
+        hot_range
+        for _, binding in sorted(_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items())
+        for hot_range in _uvm_original_alias_binding_hot_ranges(binding)
+    ]
+    current_hot_ranges = [
+        hot_range
+        for binding_name, binding in sorted(
+            _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+        )
+        if binding_name in matched_binding_names
+        for hot_range in _uvm_original_alias_binding_hot_ranges(binding)
+    ]
+    hot_bytes = sum(int(length) for _, length in hot_ranges)
+    current_hot_bytes = sum(int(length) for _, length in current_hot_ranges)
+    workspace_records = {
+        str(name): tensor_record(tensor)
+        for name, tensor in workspace_tensors.items()
+    }
+    workspace_bytes = sum(
+        int(tensor.numel() * tensor.element_size())
+        for tensor in workspace_tensors.values()
+    )
+
+    started_ns = time.perf_counter_ns()
+    begin = {
+        "operation": "post_workspace_hot_residency_audit",
+        "audit_status": "begin",
+        "performed": True,
+        "num_tokens": int(num_tokens),
+        "device": device,
+        "hot_range_count": len(hot_ranges),
+        "hot_bytes": int(hot_bytes),
+        "current_hot_range_count": len(current_hot_ranges),
+        "current_hot_bytes": int(current_hot_bytes),
+        "workspace_bytes": int(workspace_bytes),
+        "workspaces": workspace_records,
+        "weights": binding_records,
+    }
+    _append_uvm_original_alias_lifecycle(
+        "cpu_offload_uvm_post_workspace_residency_audit_begin", begin
+    )
+
+    try:
+        from vllm.device_allocator import uvm
+
+        torch.cuda.synchronize(device)
+        free_bytes, total_bytes = (
+            int(value) for value in torch.cuda.mem_get_info(device)
+        )
+        hot_physical = dict(
+            uvm.driver_batch_query_ranges_residency_bytes(
+                hot_ranges,
+                device=device,
+                wait_for_trackers=False,
+            )
+        )
+        current_hot_physical = dict(
+            uvm.driver_batch_query_ranges_residency_bytes(
+                current_hot_ranges,
+                device=device,
+                wait_for_trackers=False,
+            )
+        )
+        hot_cuda_read_gate: dict[str, Any] | None = None
+        cold_cuda_read_gate: dict[str, Any] | None = None
+        if _strict_env_flag(
+            "VLLM_UVM_FUSED_MOE_PRE_KERNEL_ALIAS_READ_GATE", False
+        ):
+            hot_cuda_read_gate = _uvm_original_alias_hot_cuda_read_gate(
+                stage="runtime_post_workspace_pre_kernel",
+                device=device,
+            )
+            cold_cuda_read_gate = (
+                _uvm_original_alias_current_cold_cuda_read_gate(
+                    stage="runtime_post_workspace_pre_kernel",
+                    device=device,
+                    binding_names=tuple(sorted(matched_binding_names)),
+                )
+            )
+        memory = {
+            "free_bytes": free_bytes,
+            "total_bytes": total_bytes,
+            "allocated_bytes": int(torch.cuda.memory_allocated(device)),
+            "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+            "max_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+            "max_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+        }
+        hot_gpu_only = bool(
+            hot_physical.get("ok") is True
+            and int(hot_physical.get("queried_bytes", -1)) == hot_bytes
+            and int(hot_physical.get("gpu_bytes", -1)) == hot_bytes
+            and int(hot_physical.get("cpu_bytes", -1)) == 0
+            and int(hot_physical.get("unknown_bytes", -1)) == 0
+        )
+        current_hot_gpu_only = bool(
+            current_hot_physical.get("ok") is True
+            and int(current_hot_physical.get("queried_bytes", -1))
+            == current_hot_bytes
+            and int(current_hot_physical.get("gpu_bytes", -1))
+            == current_hot_bytes
+            and int(current_hot_physical.get("cpu_bytes", -1)) == 0
+            and int(current_hot_physical.get("unknown_bytes", -1)) == 0
+        )
+        result = {
+            **begin,
+            "audit_status": "ok",
+            "ok": True,
+            "wall_ns": time.perf_counter_ns() - started_ns,
+            "memory": memory,
+            "hot_physical_residency": hot_physical,
+            "current_hot_physical_residency": current_hot_physical,
+            "hot_gpu_only": hot_gpu_only,
+            "current_hot_gpu_only": current_hot_gpu_only,
+            "hot_cuda_read_gate": hot_cuda_read_gate,
+            "cold_cuda_read_gate": cold_cuda_read_gate,
+        }
+    except Exception as exc:
+        result = {
+            **begin,
+            "audit_status": "error",
+            "ok": False,
+            "wall_ns": time.perf_counter_ns() - started_ns,
+            "error": repr(exc),
+        }
+    _append_uvm_original_alias_lifecycle(
+        "cpu_offload_uvm_post_workspace_residency_audit", result
+    )
+    return result
+
+
+def trace_cpu_offload_uvm_original_va_prefill_memory(
+    *,
+    stage: str,
+    num_tokens: int,
+    tensors: Mapping[str, torch.Tensor],
+) -> dict[str, Any]:
+    """Record an allocation/residency boundary without touching expert VAs.
+
+    This diagnostic complements the post-workspace audit.  It is deliberately
+    callable before the first MoE workspace exists so a large-Prefill run can
+    distinguish attention allocations, caching-allocator segment growth, and
+    the individual fused-MoE scratch allocations.  Residency is queried from
+    driver masks; no hot page is dereferenced or migrated by this helper.
+    """
+    if not cpu_offload_uvm_original_va_static_alias_enabled():
+        return {"performed": False, "reason": "disabled"}
+    if _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE:
+        return {"performed": False, "reason": "profile_all_remote"}
+    if _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_CAPTURE_PHASE:
+        return {"performed": False, "reason": "capture_phase"}
+    if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE != "sealed":
+        return {
+            "performed": False,
+            "reason": "topology_not_sealed",
+            "state": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE,
+        }
+    if torch.cuda.is_current_stream_capturing():
+        return {"performed": False, "reason": "stream_capturing"}
+
+    cuda_tensors = {
+        str(name): tensor
+        for name, tensor in tensors.items()
+        if isinstance(tensor, torch.Tensor) and tensor.is_cuda
+    }
+    if not cuda_tensors:
+        return {"performed": False, "reason": "no_cuda_tensors"}
+    first_tensor = next(iter(cuda_tensors.values()))
+    device = int(first_tensor.device.index or 0)
+    if any(int(tensor.device.index or 0) != device for tensor in cuda_tensors.values()):
+        raise ValueError("Prefill memory trace tensors must share one CUDA device")
+
+    from vllm.device_allocator import uvm
+
+    def tensor_record(tensor: torch.Tensor) -> dict[str, Any]:
+        ptr = int(tensor.data_ptr())
+        logical_bytes = int(tensor.numel() * tensor.element_size())
+        storage_bytes = int(tensor.untyped_storage().nbytes())
+        managed, managed_reason, managed_code = uvm.probe_driver_capable_range(
+            ptr, max(logical_bytes, 1)
+        )
+        return {
+            "data_ptr": ptr,
+            "bytes": logical_bytes,
+            "storage_bytes": storage_bytes,
+            "shape": tuple(int(value) for value in tensor.shape),
+            "dtype": str(tensor.dtype),
+            "managed": bool(managed),
+            "pointer_reason": str(managed_reason),
+            "pointer_code": int(managed_code),
+        }
+
+    tensor_records = {
+        name: tensor_record(tensor) for name, tensor in cuda_tensors.items()
+    }
+    hot_ranges = [
+        hot_range
+        for _, binding in sorted(_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items())
+        for hot_range in _uvm_original_alias_binding_hot_ranges(binding)
+    ]
+    hot_bytes = sum(int(length) for _, length in hot_ranges)
+    started_ns = time.perf_counter_ns()
+    begin = {
+        "operation": "prefill_memory_trace",
+        "trace_status": "begin",
+        "performed": True,
+        "trace_stage": str(stage),
+        "num_tokens": int(num_tokens),
+        "device": device,
+        "hot_range_count": len(hot_ranges),
+        "hot_bytes": int(hot_bytes),
+        "tensors": tensor_records,
+    }
+    _append_uvm_original_alias_lifecycle(
+        "cpu_offload_uvm_prefill_memory_trace_begin", begin
+    )
+
+    try:
+        torch.cuda.synchronize(device)
+        free_bytes, total_bytes = (
+            int(value) for value in torch.cuda.mem_get_info(device)
+        )
+        hot_physical = dict(
+            uvm.driver_batch_query_ranges_residency_bytes(
+                hot_ranges,
+                device=device,
+                wait_for_trackers=False,
+            )
+        )
+        stats = torch.cuda.memory_stats(device)
+        snapshot = torch.cuda.memory_snapshot()
+        raw_segments = [
+            segment
+            for segment in snapshot
+            if int(segment.get("device", device)) == device
+        ]
+        segments = [
+            {
+                "address": int(segment.get("address", 0)),
+                "total_size": int(segment.get("total_size", 0)),
+                "allocated_size": int(segment.get("allocated_size", 0)),
+                "active_size": int(segment.get("active_size", 0)),
+                "requested_size": int(segment.get("requested_size", 0)),
+                "segment_type": str(segment.get("segment_type", "unknown")),
+                "stream": int(segment.get("stream", 0)),
+            }
+            for segment in raw_segments
+        ]
+        segments.sort(key=lambda value: (value["address"], value["total_size"]))
+        for tensor in tensor_records.values():
+            ptr = int(tensor["data_ptr"])
+            owner = next(
+                (
+                    segment
+                    for segment in segments
+                    if int(segment["address"])
+                    <= ptr
+                    < int(segment["address"]) + int(segment["total_size"])
+                ),
+                None,
+            )
+            tensor["allocator_segment"] = owner
+
+        memory = {
+            "free_bytes": free_bytes,
+            "total_bytes": total_bytes,
+            "allocated_bytes": int(torch.cuda.memory_allocated(device)),
+            "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+            "max_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+            "max_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+            "active_bytes": int(stats.get("active_bytes.all.current", 0)),
+            "requested_bytes": int(stats.get("requested_bytes.all.current", 0)),
+            "inactive_split_bytes": int(
+                stats.get("inactive_split_bytes.all.current", 0)
+            ),
+            "segment_bytes": int(stats.get("reserved_bytes.all.current", 0)),
+            "segment_count": int(stats.get("segment.all.current", 0)),
+            "allocation_count": int(stats.get("allocation.all.current", 0)),
+            "active_count": int(stats.get("active.all.current", 0)),
+            "num_alloc_retries": int(stats.get("num_alloc_retries", 0)),
+            "num_ooms": int(stats.get("num_ooms", 0)),
+        }
+        result = {
+            **begin,
+            "trace_status": "ok",
+            "ok": True,
+            "wall_ns": time.perf_counter_ns() - started_ns,
+            "memory": memory,
+            "hot_physical_residency": hot_physical,
+            "allocator_segments": segments,
+        }
+    except Exception as exc:
+        result = {
+            **begin,
+            "trace_status": "error",
+            "ok": False,
+            "wall_ns": time.perf_counter_ns() - started_ns,
+            "error": repr(exc),
+        }
+    _append_uvm_original_alias_lifecycle(
+        "cpu_offload_uvm_prefill_memory_trace", result
+    )
+    return result
+
+
+def trace_cpu_offload_uvm_original_va_prefill_layer_boundary(
+    *,
+    stage: str,
+    num_tokens: int,
+    tensors: Mapping[str, torch.Tensor],
+) -> dict[str, Any]:
+    """Trace allocator segment growth at a cheap per-layer boundary.
+
+    The full Prefill memory trace above intentionally records every allocator
+    segment and every hot range.  Repeating that payload at every decoder
+    layer makes the diagnostic itself too invasive.  This companion trace
+    records allocator history once, emits only newly created native CUDA
+    segments (including their allocation stacks), and queries hot residency
+    only when the allocator reserve or segment set changes.
+    """
+    if not _strict_env_flag("VLLM_UVM_PREFILL_LAYER_MEMORY_TRACE", False):
+        return {"performed": False, "reason": "disabled"}
+    if not cpu_offload_uvm_original_va_static_alias_enabled():
+        return {"performed": False, "reason": "offload_disabled"}
+    if _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE:
+        return {"performed": False, "reason": "profile_all_remote"}
+    if _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_CAPTURE_PHASE:
+        return {"performed": False, "reason": "capture_phase"}
+    if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE != "sealed":
+        return {
+            "performed": False,
+            "reason": "topology_not_sealed",
+            "state": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE,
+        }
+    if torch.cuda.is_current_stream_capturing():
+        return {"performed": False, "reason": "stream_capturing"}
+
+    cuda_tensors = [
+        tensor
+        for tensor in tensors.values()
+        if isinstance(tensor, torch.Tensor) and tensor.is_cuda
+    ]
+    if not cuda_tensors:
+        return {"performed": False, "reason": "no_cuda_tensors"}
+    device = int(cuda_tensors[0].device.index or 0)
+    if any(int(tensor.device.index or 0) != device for tensor in cuda_tensors):
+        raise ValueError("Prefill layer trace tensors must share one CUDA device")
+
+    state = _CPU_OFFLOAD_UVM_PREFILL_LAYER_TRACE_STATE.setdefault(device, {})
+    started_ns = time.perf_counter_ns()
+    try:
+        if not state.get("history_enabled", False):
+            max_entries = int(
+                os.environ.get(
+                    "VLLM_UVM_PREFILL_ALLOCATOR_HISTORY_MAX_ENTRIES", "100000"
+                )
+            )
+            torch.cuda.memory._record_memory_history(
+                enabled="all",
+                context="alloc",
+                stacks="python",
+                max_entries=max_entries,
+                device=device,
+                clear_history=True,
+            )
+            state["history_enabled"] = True
+            state["history_max_entries"] = max_entries
+
+        torch.cuda.synchronize(device)
+        free_bytes, total_bytes = (
+            int(value) for value in torch.cuda.mem_get_info(device)
+        )
+        stats = torch.cuda.memory_stats(device)
+        snapshot = torch.cuda.memory._snapshot(device)
+        raw_segments = [
+            segment
+            for segment in snapshot.get("segments", [])
+            if int(segment.get("device", device)) == device
+        ]
+        current_addresses = {
+            int(segment.get("address", 0)) for segment in raw_segments
+        }
+        previous_addresses = set(state.get("segment_addresses", ()))
+        new_addresses = current_addresses - previous_addresses
+
+        device_traces = snapshot.get("device_traces", [])
+        trace_entries = (
+            device_traces[device] if device < len(device_traces) else []
+        )
+        previous_trace_count = int(state.get("trace_count", 0))
+        if previous_trace_count > len(trace_entries):
+            previous_trace_count = 0
+        new_trace_entries = trace_entries[previous_trace_count:]
+
+        def compact_frames(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
+            frames = list(entry.get("frames", []))
+            # PyTorch orders allocator frames from the allocation site out to
+            # the process entry point. Keep the operator-side context while
+            # bounding manifest size.
+            return [
+                {
+                    "filename": str(frame.get("filename", "")),
+                    "line": int(frame.get("line", 0)),
+                    "name": str(frame.get("name", "")),
+                }
+                for frame in frames[:32]
+            ]
+
+        segment_alloc_events = [
+            {
+                "action": "segment_alloc",
+                "address": int(entry.get("addr", 0)),
+                "bytes": int(entry.get("size", 0)),
+                "stream": int(entry.get("stream", 0)),
+                "frames": compact_frames(entry),
+            }
+            for entry in new_trace_entries
+            if entry.get("action") == "segment_alloc"
+        ]
+        new_segments = []
+        for segment in raw_segments:
+            address = int(segment.get("address", 0))
+            if address not in new_addresses:
+                continue
+            blocks = list(segment.get("blocks", []))
+            new_segments.append(
+                {
+                    "address": address,
+                    "total_size": int(segment.get("total_size", 0)),
+                    "allocated_size": int(segment.get("allocated_size", 0)),
+                    "active_size": int(segment.get("active_size", 0)),
+                    "segment_type": str(segment.get("segment_type", "unknown")),
+                    "stream": int(segment.get("stream", 0)),
+                    "blocks": [
+                        {
+                            "address": int(block.get("address", 0)),
+                            "size": int(block.get("size", 0)),
+                            "requested_size": int(block.get("requested_size", 0)),
+                            "state": str(block.get("state", "unknown")),
+                            "frames": compact_frames(block),
+                        }
+                        for block in blocks
+                    ],
+                }
+            )
+        new_segments.sort(key=lambda value: value["address"])
+
+        memory = {
+            "free_bytes": free_bytes,
+            "total_bytes": total_bytes,
+            "allocated_bytes": int(torch.cuda.memory_allocated(device)),
+            "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+            "active_bytes": int(stats.get("active_bytes.all.current", 0)),
+            "inactive_split_bytes": int(
+                stats.get("inactive_split_bytes.all.current", 0)
+            ),
+            "segment_count": int(stats.get("segment.all.current", 0)),
+            "allocation_count": int(stats.get("allocation.all.current", 0)),
+        }
+        previous_memory = dict(state.get("memory", {}))
+        delta = {
+            key: int(value) - int(previous_memory.get(key, value))
+            for key, value in memory.items()
+            if key != "total_bytes"
+        }
+        allocator_changed = bool(
+            not previous_memory
+            or new_addresses
+            or delta.get("reserved_bytes", 0)
+            or delta.get("segment_count", 0)
+        )
+
+        hot_physical: dict[str, Any] | None = None
+        if allocator_changed:
+            from vllm.device_allocator import uvm
+
+            hot_ranges = [
+                hot_range
+                for _, binding in sorted(
+                    _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+                )
+                for hot_range in _uvm_original_alias_binding_hot_ranges(binding)
+            ]
+            hot_physical = dict(
+                uvm.driver_batch_query_ranges_residency_bytes(
+                    hot_ranges,
+                    device=device,
+                    wait_for_trackers=False,
+                )
+            )
+
+        result = {
+            "operation": "prefill_layer_memory_trace",
+            "performed": True,
+            "ok": True,
+            "trace_stage": str(stage),
+            "num_tokens": int(num_tokens),
+            "device": device,
+            "wall_ns": time.perf_counter_ns() - started_ns,
+            "memory": memory,
+            "delta": delta,
+            "new_segments": new_segments,
+            "segment_alloc_events": segment_alloc_events,
+            "history_entry_count": len(trace_entries),
+            "hot_physical_residency": hot_physical,
+        }
+        state["memory"] = memory
+        state["segment_addresses"] = tuple(sorted(current_addresses))
+        state["trace_count"] = len(trace_entries)
+    except Exception as exc:
+        result = {
+            "operation": "prefill_layer_memory_trace",
+            "performed": True,
+            "ok": False,
+            "trace_stage": str(stage),
+            "num_tokens": int(num_tokens),
+            "device": device,
+            "wall_ns": time.perf_counter_ns() - started_ns,
+            "error": repr(exc),
+        }
+    _append_uvm_original_alias_lifecycle(
+        "cpu_offload_uvm_prefill_layer_memory_trace", result
+    )
+    return result
+
+
+def _uvm_original_alias_hot_cuda_read_gate(
+    *,
+    stage: str,
+    device: int,
+) -> dict[str, Any] | None:
+    """Prove that sampled hot VA pages are GPU-readable and unchanged.
+
+    Residency queries only inspect physical ownership bits. They cannot catch
+    a missing GPU PDE after selected cold subchunks are released or replaced by
+    static aliases. This diagnostic/startup gate issues real CUDA reads from
+    one byte in every hot intersection of the configured VA granularity. The
+    first invocation at each granularity records an immutable byte checksum
+    per Parameter; later stages at that granularity must reproduce it exactly.
+
+    A begin record is flushed before the CUDA work, so a fatal mapping error
+    still identifies the first failing transition in the manifest.
+    """
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_CUDA_READ_BASELINE
+
+    if not _strict_env_flag(
+        "VLLM_CPU_OFFLOAD_UVM_HOT_CUDA_READ_GATE", False
+    ):
+        return None
+
+    default_block_bytes = 2 * 1024 * 1024
+    granularity_env = "VLLM_CPU_OFFLOAD_UVM_HOT_CUDA_READ_GATE_GRANULARITY_BYTES"
+    if str(stage).startswith("runtime_"):
+        granularity_env = (
+            "VLLM_CPU_OFFLOAD_UVM_HOT_CUDA_READ_GATE_RUNTIME_GRANULARITY_BYTES"
+        )
+    raw_block_bytes = os.environ.get(
+        granularity_env,
+        os.environ.get(
+            "VLLM_CPU_OFFLOAD_UVM_HOT_CUDA_READ_GATE_GRANULARITY_BYTES",
+            str(default_block_bytes),
+        ),
+    )
+    try:
+        block_bytes = int(raw_block_bytes)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{granularity_env} must be an integer, got {raw_block_bytes!r}"
+        ) from exc
+    if block_bytes < 4096 or block_bytes % 4096:
+        raise RuntimeError(
+            f"{granularity_env} must be a positive 4 KiB multiple, "
+            f"got {block_bytes}"
+        )
+    sample_bias_bytes = 4 * 1024
+    binding_specs: list[tuple[str, torch.Tensor, tuple[int, ...]]] = []
+    hot_residency_ranges: list[tuple[int, int]] = []
+    total_hot_bytes = 0
+    total_samples = 0
+    for name, binding in sorted(
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+    ):
+        parameter = binding.consumer
+        if not parameter.is_cuda or not parameter.is_contiguous():
+            raise RuntimeError(
+                "Hot CUDA-read gate requires contiguous CUDA Parameters: "
+                f"{name!r}"
+            )
+        parameter_base = int(parameter.data_ptr())
+        parameter_bytes = int(binding.parameter_bytes)
+        indices: list[int] = []
+        for hot_base, hot_bytes in _uvm_original_alias_binding_hot_ranges(
+            binding
+        ):
+            hot_base = int(hot_base)
+            hot_bytes = int(hot_bytes)
+            hot_end = hot_base + hot_bytes
+            if (
+                hot_bytes <= 0
+                or hot_base < parameter_base
+                or hot_end > parameter_base + parameter_bytes
+            ):
+                raise RuntimeError(
+                    f"Invalid hot CUDA-read range for {name!r}: "
+                    f"0x{hot_base:x}+{hot_bytes}"
+                )
+            total_hot_bytes += hot_bytes
+            hot_residency_ranges.append((hot_base, hot_bytes))
+            block_base = hot_base - (hot_base % block_bytes)
+            while block_base < hot_end:
+                intersection_start = max(hot_base, block_base)
+                intersection_end = min(hot_end, block_base + block_bytes)
+                sample_address = min(
+                    intersection_start + sample_bias_bytes,
+                    intersection_end - 1,
+                )
+                indices.append(sample_address - parameter_base)
+                block_base += block_bytes
+        if indices:
+            unique_indices = tuple(sorted(set(indices)))
+            binding_specs.append((name, parameter, unique_indices))
+            total_samples += len(unique_indices)
+
+    hot_physical_residency: dict[str, Any] | None = None
+    if str(stage).startswith("runtime_") and hot_residency_ranges:
+        from vllm.device_allocator import uvm
+
+        hot_physical_residency = dict(
+            uvm.driver_batch_query_ranges_residency_bytes(
+                hot_residency_ranges,
+                device=device,
+                wait_for_trackers=False,
+            )
+        )
+
+    begin = {
+        "operation": "hot_cuda_read_gate",
+        "gate_stage": str(stage),
+        "gate_status": "begin",
+        "parameter_count": len(binding_specs),
+        "sample_count": total_samples,
+        "hot_bytes": total_hot_bytes,
+        "sample_granularity_bytes": block_bytes,
+        "sample_bias_bytes": sample_bias_bytes,
+        "hot_physical_residency": hot_physical_residency,
+    }
+    _append_uvm_original_alias_lifecycle(
+        "cpu_offload_uvm_hot_cuda_read_gate_begin", begin
+    )
+
+    observed: dict[str, tuple[int, int]] = {}
+    with torch.cuda.device(device):
+        for name, parameter, indices in binding_specs:
+            byte_view = parameter.view(torch.uint8).reshape(-1)
+            index = torch.tensor(
+                indices,
+                dtype=torch.int64,
+                device=parameter.device,
+            )
+            sampled = torch.index_select(byte_view, 0, index)
+            checksum = int(sampled.to(torch.int64).sum().item())
+            observed[name] = (len(indices), checksum)
+        torch.cuda.synchronize(device)
+
+    baseline = _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_CUDA_READ_BASELINE.get(
+        block_bytes
+    )
+    if baseline is None:
+        baseline_stage = str(stage)
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_CUDA_READ_BASELINE[block_bytes] = (
+            baseline_stage,
+            dict(observed),
+        )
+    else:
+        baseline_stage, baseline_observed = baseline
+        if observed != baseline_observed:
+            changed = sorted(
+                name
+                for name in set(observed)
+                | set(baseline_observed)
+                if observed.get(name) != baseline_observed.get(name)
+            )
+            raise RuntimeError(
+                "Hot CUDA-read gate detected changed expert bytes after "
+                f"{stage}: {changed[:8]!r}"
+            )
+
+    checksum_sum = sum(value[1] for value in observed.values())
+    result = {
+        **begin,
+        "gate_status": "ok",
+        "baseline_stage": baseline_stage,
+        "checksum_sum": int(checksum_sum),
+    }
+    _append_uvm_original_alias_lifecycle(
+        "cpu_offload_uvm_hot_cuda_read_gate_ok", result
+    )
+    return result
+
+
+def _uvm_original_alias_current_cold_cuda_read_gate(
+    *,
+    stage: str,
+    device: int,
+    binding_names: tuple[str, ...],
+) -> dict[str, Any] | None:
+    """Validate sampled cold consumer aliases against their pinned sources.
+
+    This diagnostic runs only before a real CUDA stream capture. The module
+    wrapper has already enqueued each pinned-source to upload-VA copy on the
+    current stream, so synchronizing and reading the consumer Parameter VA
+    proves both the copy and the sealed alias mapping used by the next MoE
+    kernel. A begin record is flushed first so an invalid alias remains
+    attributable even if the CUDA context is poisoned by the read.
+    """
+    if not _strict_env_flag(
+        "VLLM_UVM_FUSED_MOE_PRE_KERNEL_ALIAS_READ_GATE", False
+    ):
+        return None
+    if _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE != "sealed":
+        raise RuntimeError(
+            "Cold CUDA-read gate requires a sealed alias topology, got "
+            f"{_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE!r}"
+        )
+    raw_block_bytes = os.environ.get(
+        "VLLM_UVM_FUSED_MOE_PRE_KERNEL_COLD_GATE_GRANULARITY_BYTES",
+        str(512 * 1024),
+    )
+    try:
+        block_bytes = int(raw_block_bytes)
+    except ValueError as exc:
+        raise RuntimeError(
+            "VLLM_UVM_FUSED_MOE_PRE_KERNEL_COLD_GATE_GRANULARITY_BYTES "
+            f"must be an integer, got {raw_block_bytes!r}"
+        ) from exc
+    if block_bytes < 4096 or block_bytes % 4096:
+        raise RuntimeError(
+            "Cold CUDA-read gate granularity must be a positive 4 KiB "
+            f"multiple, got {block_bytes}"
+        )
+
+    sample_bias_bytes = 4 * 1024
+    binding_specs: list[
+        tuple[str, torch.Tensor, torch.Tensor, tuple[int, ...], tuple[int, ...]]
+    ] = []
+    residency_ranges: list[tuple[int, int]] = []
+    total_cold_bytes = 0
+    total_samples = 0
+    for name in binding_names:
+        binding = _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.get(name)
+        if binding is None:
+            raise RuntimeError(f"Cold CUDA-read gate lost binding {name!r}")
+        expert_ids = tuple(int(value) for value in (binding.expert_ids or ()))
+        source = binding.source
+        if not expert_ids or source is None:
+            continue
+        parameter = binding.consumer
+        if not parameter.is_cuda or not parameter.is_contiguous():
+            raise RuntimeError(
+                "Cold CUDA-read gate requires a contiguous CUDA Parameter: "
+                f"{name!r}"
+            )
+        if source.device.type != "cpu" or not source.is_contiguous():
+            raise RuntimeError(
+                "Cold CUDA-read gate requires a contiguous CPU source: "
+                f"{name!r}"
+            )
+        parameter_base = int(parameter.data_ptr())
+        parameter_bytes = int(binding.parameter_bytes)
+        source_bytes = int(source.numel() * source.element_size())
+        expert_stride = int(binding.expert_stride_bytes)
+        consumer_ranges = _uvm_original_alias_binding_consumer_ranges(binding)
+        if len(consumer_ranges) != len(expert_ids):
+            raise RuntimeError(
+                "Cold CUDA-read gate found expert/range cardinality drift for "
+                f"{name!r}"
+            )
+
+        consumer_indices: list[int] = []
+        source_indices: list[int] = []
+        for packed_index, (consumer_base, length) in enumerate(consumer_ranges):
+            consumer_base = int(consumer_base)
+            length = int(length)
+            if length != expert_stride:
+                raise RuntimeError(
+                    "Cold CUDA-read gate found an unexpected expert stride for "
+                    f"{name!r}: {length} != {expert_stride}"
+                )
+            residency_ranges.append((consumer_base, length))
+            total_cold_bytes += length
+            offset = 0
+            while offset < length:
+                intersection_end = min(length, offset + block_bytes)
+                sample_offset = min(
+                    offset + sample_bias_bytes,
+                    intersection_end - 1,
+                )
+                consumer_index = consumer_base - parameter_base + sample_offset
+                source_index = packed_index * expert_stride + sample_offset
+                if not 0 <= consumer_index < parameter_bytes:
+                    raise RuntimeError(
+                        f"Cold consumer sample escapes {name!r}: {consumer_index}"
+                    )
+                if not 0 <= source_index < source_bytes:
+                    raise RuntimeError(
+                        f"Cold source sample escapes {name!r}: {source_index}"
+                    )
+                consumer_indices.append(consumer_index)
+                source_indices.append(source_index)
+                offset += block_bytes
+        binding_specs.append(
+            (
+                name,
+                parameter,
+                source,
+                tuple(consumer_indices),
+                tuple(source_indices),
+            )
+        )
+        total_samples += len(consumer_indices)
+
+    cold_physical_residency: dict[str, Any] | None = None
+    if residency_ranges:
+        try:
+            from vllm.device_allocator import uvm
+
+            cold_physical_residency = dict(
+                uvm.driver_batch_query_ranges_residency_bytes(
+                    residency_ranges,
+                    device=device,
+                    wait_for_trackers=False,
+                )
+            )
+        except Exception as exc:
+            cold_physical_residency = {
+                "ok": False,
+                "error": repr(exc),
+            }
+
+    begin = {
+        "operation": "current_cold_cuda_read_gate",
+        "gate_stage": str(stage),
+        "gate_status": "begin",
+        "binding_count": len(binding_specs),
+        "binding_names": tuple(name for name, *_ in binding_specs),
+        "sample_count": int(total_samples),
+        "cold_bytes": int(total_cold_bytes),
+        "sample_granularity_bytes": int(block_bytes),
+        "sample_bias_bytes": int(sample_bias_bytes),
+        "cold_physical_residency": cold_physical_residency,
+    }
+    _append_uvm_original_alias_lifecycle(
+        "cpu_offload_uvm_current_cold_cuda_read_gate_begin", begin
+    )
+
+    observed: dict[str, tuple[int, int]] = {}
+    changed: list[str] = []
+    with torch.cuda.device(device):
+        torch.cuda.current_stream(device).synchronize()
+        for name, parameter, source, consumer_indices, source_indices in binding_specs:
+            parameter_bytes_view = parameter.view(torch.uint8).reshape(-1)
+            source_bytes_view = source.view(torch.uint8).reshape(-1)
+            gpu_index = torch.tensor(
+                consumer_indices,
+                dtype=torch.int64,
+                device=parameter.device,
+            )
+            cpu_index = torch.tensor(source_indices, dtype=torch.int64)
+            actual = torch.index_select(parameter_bytes_view, 0, gpu_index).cpu()
+            expected = torch.index_select(source_bytes_view, 0, cpu_index)
+            if not torch.equal(actual, expected):
+                changed.append(name)
+            observed[name] = (
+                len(consumer_indices),
+                int(actual.to(torch.int64).sum().item()),
+            )
+        torch.cuda.synchronize(device)
+    if changed:
+        raise RuntimeError(
+            "Cold CUDA-read gate detected bytes differing from pinned sources: "
+            f"{changed!r}"
+        )
+
+    result = {
+        **begin,
+        "gate_status": "ok",
+        "checksum_sum": int(sum(value[1] for value in observed.values())),
+    }
+    _append_uvm_original_alias_lifecycle(
+        "cpu_offload_uvm_current_cold_cuda_read_gate_ok", result
+    )
+    return result
+
+
 def _uvm_original_alias_arena_regions(
     arena: _UvmOriginalAliasArena,
 ) -> Iterable[tuple[int, int, int]]:
@@ -3249,11 +4256,20 @@ def finalize_cpu_offload_graph_static_alias() -> dict[str, Any]:
                 _refill_uvm_original_alias_binding_source(binding)
             torch.cuda.synchronize(device)
 
+            _uvm_original_alias_hot_cuda_read_gate(
+                stage="before_original_release",
+                device=device,
+            )
+
             original_release = (
                 _release_uvm_original_alias_consumer_gpu_chunks(device=device)
             )
             _CPU_OFFLOAD_UVM_STATIC_ALIAS_ORIGINAL_RELEASE_RESULT = (
                 original_release
+            )
+            _uvm_original_alias_hot_cuda_read_gate(
+                stage="after_original_release",
+                device=device,
             )
 
             current_original_vas = tuple(
@@ -3294,6 +4310,10 @@ def finalize_cpu_offload_graph_static_alias() -> dict[str, Any]:
                     "Failed to make every original/upload managed range CPU "
                     f"resident before MAP: result={prepared!r}"
                 )
+            _uvm_original_alias_hot_cuda_read_gate(
+                stage="after_native_remote_prepare",
+                device=device,
+            )
 
             cold_residency_bytes = sum(
                 length for _, length in cold_residency_ranges
@@ -3372,6 +4392,10 @@ def finalize_cpu_offload_graph_static_alias() -> dict[str, Any]:
                 raise RuntimeError(
                     f"UVM original-VA backing preallocation failed: {preallocate!r}"
                 )
+            _uvm_original_alias_hot_cuda_read_gate(
+                stage="after_slot_preallocate",
+                device=device,
+            )
 
             map_entries = _uvm_original_alias_map_entries(pte_flags)
             maximum = uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAX_ENTRIES
@@ -3432,6 +4456,10 @@ def finalize_cpu_offload_graph_static_alias() -> dict[str, Any]:
                     ) from exc
                 session_id = next_session_id
                 _CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID = session_id
+                _uvm_original_alias_hot_cuda_read_gate(
+                    stage=f"after_map_batch_{len(map_results)}",
+                    device=device,
+                )
             _CPU_OFFLOAD_UVM_STATIC_ALIAS_MAP_RESULTS = map_results
 
             expected_alias_count = len(map_entries)
@@ -3446,6 +4474,10 @@ def finalize_cpu_offload_graph_static_alias() -> dict[str, Any]:
             if not bool(seal.get("ok")):
                 raise RuntimeError(f"UVM original-VA SEAL failed: {seal!r}")
             _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "sealed"
+            _uvm_original_alias_hot_cuda_read_gate(
+                stage="after_seal",
+                device=device,
+            )
             result = {
                 "ok": True,
                 "operation": "finalize",
@@ -6060,6 +7092,10 @@ def transition_cpu_offload_uvm_original_va_to_remote(
                 if _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED:
                     from vllm.device_allocator import uvm_static_alias
 
+                    _uvm_original_alias_hot_cuda_read_gate(
+                        stage="runtime_remote_before_park",
+                        device=device,
+                    )
                     park_result = dict(
                         uvm_static_alias.driver_static_alias_park(
                             int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
@@ -6073,6 +7109,10 @@ def transition_cpu_offload_uvm_original_va_to_remote(
                             "Failed to park original-VA consumer aliases before "
                             f"remote map: {park_result!r}"
                         )
+                    _uvm_original_alias_hot_cuda_read_gate(
+                        stage="runtime_remote_after_park",
+                        device=device,
+                    )
                 else:
                     destroy_result = destroy_cpu_offload_graph_static_alias(
                         graphs_destroyed=not preserve_remote_graphs,
@@ -6125,6 +7165,10 @@ def transition_cpu_offload_uvm_original_va_to_remote(
                     "Audited original-VA remote READ mapping was incomplete: "
                     f"{remote_map!r}"
                 )
+            _uvm_original_alias_hot_cuda_read_gate(
+                stage="runtime_remote_after_remote_map",
+                device=device,
+            )
 
             torch.cuda.synchronize(device)
             physical = dict(
@@ -6293,7 +7337,474 @@ def initialize_cpu_offload_uvm_original_va_phase_topology() -> dict[str, Any]:
     )
 
 
-def reconcile_cpu_offload_uvm_original_va_remote_graph_residency() -> dict[str, Any]:
+def prepare_cpu_offload_uvm_original_va_profile_topology(
+    *,
+    transition_reason: str = "startup_profile_all_remote",
+    preserve_remote_graphs: bool = False,
+) -> dict[str, Any]:
+    """Temporarily make every expert CPU-remote for startup profiling.
+
+    The explicit-KV vLLM path still executes a maximum-token profile forward
+    before allocating the KV cache.  Its native activation/workspace
+    allocations can evict an otherwise-hot managed expert.  With the custom
+    driver's fail-fast migration mode, the following MoE read is then rejected
+    instead of silently migrating the page.
+
+    When explicitly enabled, install audited CPU-backed READ mappings for the
+    hot complement as well as the frozen cold set.  The ordinary post-KV
+    residency reconciliation restores hot experts to the GPU before serving
+    warmup or Graph capture.  Parameter VAs never change.
+    """
+    global _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+
+    if not isinstance(transition_reason, str) or not transition_reason.strip():
+        raise ValueError("All-remote topology transition requires a reason")
+    if not isinstance(preserve_remote_graphs, bool):
+        raise TypeError("preserve_remote_graphs must be bool")
+    if not cpu_offload_uvm_original_va_static_alias_enabled():
+        return {"ok": True, "reason": "disabled"}
+    if not _strict_env_flag(
+        "VLLM_UVM_PROFILE_ALL_EXPERTS_REMOTE", False
+    ):
+        return {"ok": True, "reason": "not_requested"}
+    mode = cpu_offload_uvm_original_va_phase_mode()
+    if mode == "off":
+        return {"ok": True, "reason": "phase_mode_off"}
+    if _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE:
+        return {
+            "ok": True,
+            "reason": "already_active",
+            "state": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE,
+        }
+
+    started_ns = time.perf_counter_ns()
+    pre_state = _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+    parameter_vas_before = _uvm_original_parameter_va_snapshot()
+    hot_prepare: tuple[Any, ...] | None = None
+    hot_remote_map: dict[str, Any] | None = None
+    hot_physical: dict[str, Any] | None = None
+    transition: dict[str, Any] | None = None
+    hot_range_count = 0
+    hot_bytes = 0
+    try:
+        if pre_state not in ("sealed", "remote", "remote_parked"):
+            raise RuntimeError(
+                "All-remote profile topology requires a sealed or remote "
+                f"original-VA state, got {pre_state!r}"
+            )
+
+        from vllm.device_allocator import uvm
+
+        device = int(_CPU_OFFLOAD_OWNER_DEVICE_INDEX or 0)
+        hot_ranges = [
+            hot_range
+            for _, binding in sorted(
+                _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+            )
+            for hot_range in _uvm_original_alias_binding_hot_ranges(binding)
+        ]
+        hot_range_count = len(hot_ranges)
+        hot_bytes = sum(length for _, length in hot_ranges)
+        if not hot_ranges:
+            return {"ok": True, "reason": "no_hot_ranges"}
+
+        # The audited driver primitive verifies and installs remote READ PTEs;
+        # it intentionally does not migrate GPU-resident pages to CPU. Move
+        # the hot complement first using native UVM APIs, then require the
+        # driver audit to prove complete CPU residency and GPU READ coverage.
+        hot_prepare = tuple(
+            uvm.batch_prepare_ranges_for_native_remote_access_with_executor(
+                hot_ranges,
+                sync=True,
+                device=device,
+            )
+        )
+        if not hot_prepare or int(hot_prepare[0]) != len(hot_ranges):
+            raise RuntimeError(
+                "Failed to place every hot expert range on CPU for startup "
+                f"profiling: result={hot_prepare!r}, "
+                f"expected={len(hot_ranges)}"
+            )
+
+        torch.cuda.synchronize(device)
+        hot_remote_map = dict(
+            uvm.driver_prepare_ranges_remote_read_audited(
+                hot_ranges,
+                device=device,
+            )
+        )
+        hot_remote_contract_ok = (
+            hot_remote_map.get("ok") is True
+            and int(hot_remote_map.get("requested_count", -1))
+            == len(hot_ranges)
+            and int(hot_remote_map.get("success_count", -1))
+            == len(hot_ranges)
+            and int(hot_remote_map.get("failure_count", -1)) == 0
+            and int(hot_remote_map.get("requested_bytes", -1)) == hot_bytes
+            and int(hot_remote_map.get("cpu_resident_bytes", -1))
+            >= hot_bytes
+            and int(hot_remote_map.get("remote_mapped_bytes", -1))
+            >= hot_bytes
+            and int(hot_remote_map.get("covered_bytes", -1)) >= hot_bytes
+            and int(hot_remote_map.get("unknown_bytes", -1)) == 0
+        )
+        if not hot_remote_contract_ok:
+            raise RuntimeError(
+                "Hot expert all-remote profile mapping was incomplete: "
+                f"{hot_remote_map!r}"
+            )
+
+        # A sealed alias owns the frozen cold ranges.  Detach or park those
+        # aliases only after the hot complement has a complete remote map, and
+        # tell the transition audit that those hot bytes are intentionally CPU
+        # resident for this temporary profile topology.
+        if pre_state == "sealed":
+            transition = transition_cpu_offload_uvm_original_va_to_remote(
+                reason=transition_reason,
+                preserve_remote_graphs=preserve_remote_graphs,
+                runtime_remote_ranges=hot_ranges,
+            )
+            if transition.get("ok") is not True:
+                raise RuntimeError(
+                    "Failed to establish cold remote topology for startup "
+                    f"profiling: {transition!r}"
+                )
+        elif not _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE:
+            raise RuntimeError(
+                "All-remote profile topology found an unaudited remote state"
+            )
+
+        torch.cuda.synchronize(device)
+        hot_physical = dict(
+            uvm.driver_batch_query_ranges_residency_bytes(
+                hot_ranges,
+                device=device,
+                wait_for_trackers=False,
+            )
+        )
+        if not (
+            hot_physical.get("ok") is True
+            and int(hot_physical.get("queried_bytes", -1)) == hot_bytes
+            and int(hot_physical.get("cpu_bytes", -1)) == hot_bytes
+            and int(hot_physical.get("gpu_bytes", -1)) == 0
+            and int(hot_physical.get("any_bytes", -1)) == hot_bytes
+            and int(hot_physical.get("unknown_bytes", -1)) == 0
+        ):
+            raise RuntimeError(
+                "Hot experts were not exclusively CPU resident in the "
+                f"all-remote profile topology: {hot_physical!r}"
+            )
+
+        parameter_vas_after = _uvm_original_parameter_va_snapshot()
+        if parameter_vas_after != parameter_vas_before:
+            raise RuntimeError(
+                "Original Parameter VAs changed while preparing startup "
+                "all-remote profiling"
+            )
+        _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE = True
+        result = {
+            "event": "cpu_offload_uvm_original_va_profile_all_remote_prepared",
+            "timestamp": time.time(),
+            "pid": os.getpid(),
+            "ok": True,
+            "reason": "prepared",
+            "transition_reason": transition_reason,
+            "preserve_remote_graphs": preserve_remote_graphs,
+            "pre_state": pre_state,
+            "post_state": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE,
+            "wall_ns": time.perf_counter_ns() - started_ns,
+            "parameter_vas_before": parameter_vas_before,
+            "parameter_vas_after": parameter_vas_after,
+            "hot_range_count": len(hot_ranges),
+            "hot_bytes": int(hot_bytes),
+            "hot_prepare": hot_prepare,
+            "hot_remote_map": hot_remote_map,
+            "hot_physical_residency": hot_physical,
+            "cold_transition": transition,
+        }
+        _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY.append(result)
+        _append_cpu_offload_manifest(result)
+        return result
+    except Exception as exc:
+        _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE = False
+        _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "poisoned"
+        failed = {
+            "event": "cpu_offload_uvm_original_va_profile_all_remote_prepared",
+            "timestamp": time.time(),
+            "pid": os.getpid(),
+            "ok": False,
+            "reason": "failed",
+            "transition_reason": transition_reason,
+            "preserve_remote_graphs": preserve_remote_graphs,
+            "error": repr(exc),
+            "pre_state": pre_state,
+            "post_state": "poisoned",
+            "wall_ns": time.perf_counter_ns() - started_ns,
+            "parameter_vas_before": parameter_vas_before,
+            "hot_range_count": int(hot_range_count),
+            "hot_bytes": int(hot_bytes),
+            "hot_prepare": hot_prepare,
+            "hot_remote_map": hot_remote_map,
+            "hot_physical_residency": hot_physical,
+            "cold_transition": transition,
+        }
+        _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY.append(failed)
+        _append_cpu_offload_manifest(failed)
+        raise RuntimeError(
+            "Original-VA all-remote startup profile preparation failed; the "
+            "process is poisoned and must be torn down"
+        ) from exc
+
+
+def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
+    *,
+    preserve_allocator_cache: bool = True,
+) -> dict[str, Any]:
+    """Restore the hot complement after KV allocation in sealed-alias mode.
+
+    A fixed alias/copy phase keeps the cold expert aliases sealed rather than
+    transitioning them to the audited remote topology used by Graph Decode.
+    Consequently the remote-graph reconciliation below is not applicable,
+    even though a later KV/native allocation can still evict managed hot
+    pages.  This helper repairs only the disjoint hot ranges, leaves every
+    cold alias/PTE untouched, preserves intentional allocator reserve by
+    default, and fails before warmup unless residency and free headroom are
+    exact.
+    """
+    global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+    global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+
+    if not cpu_offload_uvm_original_va_static_alias_enabled():
+        return {"ok": True, "reason": "disabled"}
+
+    raw_min_free = os.environ.get(
+        "VLLM_UVM_ORIGINAL_VA_GRAPH_MIN_FREE_BYTES",
+        str(256 * 1024 * 1024),
+    ).strip()
+    try:
+        min_free_bytes = int(raw_min_free)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_UVM_ORIGINAL_VA_GRAPH_MIN_FREE_BYTES must be an integer"
+        ) from exc
+    if min_free_bytes < 0:
+        raise ValueError(
+            "VLLM_UVM_ORIGINAL_VA_GRAPH_MIN_FREE_BYTES must be non-negative"
+        )
+
+    with _CPU_OFFLOAD_UVM_STATIC_ALIAS_LOCK:
+        pre_state = _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+        if pre_state != "sealed" or _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE:
+            raise RuntimeError(
+                "Sealed hot-residency reconciliation requires the active "
+                f"alias topology; state={pre_state!r}, "
+                f"remote_map_active={_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE!r}"
+            )
+
+        started_ns = time.perf_counter_ns()
+        parameter_vas_before = _uvm_original_parameter_va_snapshot()
+        hot_physical_before: dict[str, Any] | None = None
+        hot_physical_after: dict[str, Any] | None = None
+        hot_advise_count = 0
+        hot_prefetch_count = 0
+        hot_prefetch_executor = "none"
+        hot_prefetch_driver_result = 0
+        hot_range_count = 0
+        hot_bytes = 0
+        free_before = -1
+        free_after = -1
+        total_bytes = -1
+        allocator_reserved_before = -1
+        allocator_reserved_after = -1
+        try:
+            from vllm.device_allocator import uvm
+
+            device = int(_CPU_OFFLOAD_OWNER_DEVICE_INDEX or 0)
+            torch.cuda.synchronize(device)
+            free_before, total_bytes = (
+                int(value) for value in torch.cuda.mem_get_info(device)
+            )
+            allocator_reserved_before = int(torch.cuda.memory_reserved(device))
+            if not preserve_allocator_cache:
+                torch.cuda.empty_cache()
+
+            hot_ranges = [
+                hot_range
+                for _, binding in sorted(
+                    _CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS.items()
+                )
+                for hot_range in _uvm_original_alias_binding_hot_ranges(binding)
+            ]
+            hot_range_count = len(hot_ranges)
+            hot_bytes = sum(length for _, length in hot_ranges)
+            hot_physical_before = dict(
+                uvm.driver_batch_query_ranges_residency_bytes(
+                    hot_ranges,
+                    device=device,
+                    wait_for_trackers=False,
+                )
+            )
+
+            if hot_ranges:
+                hot_advise_count = int(
+                    uvm.batch_advise_ranges_preferred_location(
+                        hot_ranges,
+                        device,
+                    )
+                )
+                if hot_advise_count != len(hot_ranges):
+                    raise RuntimeError(
+                        "Failed to set GPU preferred location for every sealed "
+                        "hot expert range: "
+                        f"advised={hot_advise_count}, expected={len(hot_ranges)}"
+                    )
+                (
+                    hot_prefetch_count,
+                    hot_prefetch_executor,
+                    hot_prefetch_driver_result,
+                ) = uvm.batch_prefetch_ranges_to_device_with_executor(
+                    hot_ranges,
+                    device,
+                    executor="cpp_batch",
+                )
+                if int(hot_prefetch_count) != len(hot_ranges):
+                    raise RuntimeError(
+                        "Failed to restore every sealed hot expert range to "
+                        "GPU: "
+                        f"prefetched={hot_prefetch_count}, "
+                        f"expected={len(hot_ranges)}, "
+                        f"executor={hot_prefetch_executor!r}, "
+                        f"driver_result={hot_prefetch_driver_result}"
+                    )
+
+            torch.cuda.synchronize(device)
+            hot_physical_after = dict(
+                uvm.driver_batch_query_ranges_residency_bytes(
+                    hot_ranges,
+                    device=device,
+                    wait_for_trackers=False,
+                )
+            )
+            if hot_ranges and not (
+                hot_physical_after.get("ok") is True
+                and int(hot_physical_after.get("queried_bytes", -1)) == hot_bytes
+                and int(hot_physical_after.get("gpu_bytes", -1)) == hot_bytes
+                and int(hot_physical_after.get("cpu_bytes", -1)) == 0
+                and int(hot_physical_after.get("any_bytes", -1)) == hot_bytes
+                and int(hot_physical_after.get("unknown_bytes", -1)) == 0
+            ):
+                raise RuntimeError(
+                    "Hot experts were not exclusively GPU resident after "
+                    f"sealed reconciliation: {hot_physical_after!r}"
+                )
+
+            free_after = int(torch.cuda.mem_get_info(device)[0])
+            allocator_reserved_after = int(torch.cuda.memory_reserved(device))
+            if (
+                preserve_allocator_cache
+                and allocator_reserved_after < allocator_reserved_before
+            ):
+                raise RuntimeError(
+                    "Allocator reserve shrank during sealed hot-expert "
+                    "reconciliation: "
+                    f"before={allocator_reserved_before}, "
+                    f"after={allocator_reserved_after}"
+                )
+            if free_after < min_free_bytes:
+                raise RuntimeError(
+                    "Insufficient GPU headroom after sealed hot-expert "
+                    "reconciliation: "
+                    f"free_bytes={free_after}, required_bytes={min_free_bytes}"
+                )
+
+            parameter_vas_after = _uvm_original_parameter_va_snapshot()
+            if parameter_vas_after != parameter_vas_before:
+                raise RuntimeError(
+                    "Original Parameter VAs changed during sealed hot-expert "
+                    "reconciliation"
+                )
+
+            result = {
+                "event": (
+                    "cpu_offload_uvm_original_va_sealed_hot_residency_reconciled"
+                ),
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "ok": True,
+                "pre_state": pre_state,
+                "post_state": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE,
+                "wall_ns": time.perf_counter_ns() - started_ns,
+                "parameter_vas_before": parameter_vas_before,
+                "parameter_vas_after": parameter_vas_after,
+                "hot_range_count": int(hot_range_count),
+                "hot_bytes": int(hot_bytes),
+                "hot_advise_count": int(hot_advise_count),
+                "hot_prefetch_count": int(hot_prefetch_count),
+                "hot_prefetch_executor": str(hot_prefetch_executor),
+                "hot_prefetch_driver_result": int(
+                    hot_prefetch_driver_result
+                ),
+                "hot_physical_residency_before": hot_physical_before,
+                "hot_physical_residency_after": hot_physical_after,
+                "free_bytes_before": int(free_before),
+                "free_bytes_after": int(free_after),
+                "total_bytes": int(total_bytes),
+                "minimum_free_bytes": int(min_free_bytes),
+                "allocator_cache_preserved": bool(preserve_allocator_cache),
+                "allocator_reserved_before": int(allocator_reserved_before),
+                "allocator_reserved_after": int(allocator_reserved_after),
+            }
+            _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY.append(result)
+            _append_cpu_offload_manifest(result)
+            return result
+        except Exception as exc:
+            _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
+            _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "poisoned"
+            failed = {
+                "event": (
+                    "cpu_offload_uvm_original_va_sealed_hot_residency_reconciled"
+                ),
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "ok": False,
+                "error": repr(exc),
+                "pre_state": pre_state,
+                "post_state": "poisoned",
+                "wall_ns": time.perf_counter_ns() - started_ns,
+                "parameter_vas_before": parameter_vas_before,
+                "hot_range_count": int(hot_range_count),
+                "hot_bytes": int(hot_bytes),
+                "hot_advise_count": int(hot_advise_count),
+                "hot_prefetch_count": int(hot_prefetch_count),
+                "hot_prefetch_executor": str(hot_prefetch_executor),
+                "hot_prefetch_driver_result": int(
+                    hot_prefetch_driver_result
+                ),
+                "hot_physical_residency_before": hot_physical_before,
+                "hot_physical_residency_after": hot_physical_after,
+                "free_bytes_before": int(free_before),
+                "free_bytes_after": int(free_after),
+                "total_bytes": int(total_bytes),
+                "minimum_free_bytes": int(min_free_bytes),
+                "allocator_cache_preserved": bool(preserve_allocator_cache),
+                "allocator_reserved_before": int(allocator_reserved_before),
+                "allocator_reserved_after": int(allocator_reserved_after),
+            }
+            _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY.append(failed)
+            _append_cpu_offload_manifest(failed)
+            raise RuntimeError(
+                "Original-VA sealed hot-expert reconciliation failed; the "
+                "process is poisoned and must be torn down"
+            ) from exc
+
+
+def reconcile_cpu_offload_uvm_original_va_remote_graph_residency(
+    *,
+    preserve_allocator_cache: bool = False,
+) -> dict[str, Any]:
     """Repair and audit expert residency immediately before Graph capture.
 
     ``remote_only`` establishes its PTE topology directly after model load.
@@ -6302,10 +7813,17 @@ def reconcile_cpu_offload_uvm_original_va_remote_graph_residency() -> dict[str, 
     access as a normal UVM fault, so re-establish the complete cold/hot
     placement after those allocations and fail before capture unless it is
     exact and leaves a configured amount of free device memory.
+
+    ``preserve_allocator_cache`` is used only after the explicit all-remote
+    Prefill reserve warmup.  In that path the inactive native CUDA segments are
+    intentional serving capacity: releasing them before hot-expert restoration
+    lets hot managed pages occupy the same physical ranges, so the first real
+    Prefill has to evict those pages to recreate its native segments.
     """
     global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
     global _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
+    global _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE
 
     if not cpu_offload_uvm_original_va_static_alias_enabled():
         return {"ok": True, "reason": "disabled"}
@@ -6337,6 +7855,9 @@ def reconcile_cpu_offload_uvm_original_va_remote_graph_residency() -> dict[str, 
             )
 
         started_ns = time.perf_counter_ns()
+        profile_all_remote_before = bool(
+            _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE
+        )
         parameter_vas_before = _uvm_original_parameter_va_snapshot()
         remote_map: dict[str, Any] | None = None
         cold_physical: dict[str, Any] | None = None
@@ -6351,15 +7872,24 @@ def reconcile_cpu_offload_uvm_original_va_remote_graph_residency() -> dict[str, 
         hot_bytes = 0
         free_bytes = -1
         total_bytes = -1
+        allocator_reserved_before = -1
+        allocator_reserved_after_cleanup = -1
+        allocator_reserved_after = -1
         try:
             from vllm.device_allocator import uvm
 
             device = int(_CPU_OFFLOAD_OWNER_DEVICE_INDEX or 0)
             torch.cuda.synchronize(device)
-            # Profile/autotune tensors can remain in PyTorch's cache even
-            # after their Python owners are gone.  Return those blocks before
-            # asking UVM to restore every hot expert.
-            torch.cuda.empty_cache()
+            allocator_reserved_before = int(torch.cuda.memory_reserved(device))
+            if not preserve_allocator_cache:
+                # Profile/autotune tensors can remain in PyTorch's cache even
+                # after their Python owners are gone. Return those blocks
+                # before asking UVM to restore every hot expert. The final
+                # post-reserve reconciliation deliberately skips this call.
+                torch.cuda.empty_cache()
+            allocator_reserved_after_cleanup = int(
+                torch.cuda.memory_reserved(device)
+            )
 
             cold_ranges = [
                 consumer_range
@@ -6486,6 +8016,17 @@ def reconcile_cpu_offload_uvm_original_va_remote_graph_residency() -> dict[str, 
             free_bytes, total_bytes = (
                 int(value) for value in torch.cuda.mem_get_info(device)
             )
+            allocator_reserved_after = int(torch.cuda.memory_reserved(device))
+            if (
+                preserve_allocator_cache
+                and allocator_reserved_after < allocator_reserved_before
+            ):
+                raise RuntimeError(
+                    "Prefill allocator reserve shrank during hot-expert "
+                    "restoration: "
+                    f"before={allocator_reserved_before}, "
+                    f"after={allocator_reserved_after}"
+                )
             if free_bytes < min_free_bytes:
                 raise RuntimeError(
                     "Insufficient GPU headroom after expert residency "
@@ -6502,6 +8043,7 @@ def reconcile_cpu_offload_uvm_original_va_remote_graph_residency() -> dict[str, 
 
             _CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT = remote_map
             _CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY.append(dict(remote_map))
+            _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE = False
             finished_ns = time.perf_counter_ns()
             result = {
                 "event": "cpu_offload_uvm_original_va_graph_residency_reconciled",
@@ -6527,6 +8069,14 @@ def reconcile_cpu_offload_uvm_original_va_remote_graph_residency() -> dict[str, 
                 "free_bytes": int(free_bytes),
                 "total_bytes": int(total_bytes),
                 "minimum_free_bytes": int(min_free_bytes),
+                "allocator_cache_preserved": bool(preserve_allocator_cache),
+                "allocator_reserved_before": int(allocator_reserved_before),
+                "allocator_reserved_after_cleanup": int(
+                    allocator_reserved_after_cleanup
+                ),
+                "allocator_reserved_after": int(allocator_reserved_after),
+                "profile_all_remote_before": profile_all_remote_before,
+                "profile_all_remote_after": False,
             }
             _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY.append(result)
             _append_cpu_offload_manifest(result)
@@ -6558,6 +8108,16 @@ def reconcile_cpu_offload_uvm_original_va_remote_graph_residency() -> dict[str, 
                 "free_bytes": int(free_bytes),
                 "total_bytes": int(total_bytes),
                 "minimum_free_bytes": int(min_free_bytes),
+                "allocator_cache_preserved": bool(preserve_allocator_cache),
+                "allocator_reserved_before": int(allocator_reserved_before),
+                "allocator_reserved_after_cleanup": int(
+                    allocator_reserved_after_cleanup
+                ),
+                "allocator_reserved_after": int(allocator_reserved_after),
+                "profile_all_remote_before": profile_all_remote_before,
+                "profile_all_remote_after": bool(
+                    _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE
+                ),
             }
             _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY.append(failed)
             _append_cpu_offload_manifest(failed)
@@ -6590,9 +8150,20 @@ def prepare_cpu_offload_uvm_original_va_remote_graph_capture() -> dict[str, Any]
     }
 
 
-def activate_cpu_offload_uvm_original_va_prefill_topology() -> dict[str, Any]:
-    """Restore sealed alias banks after all initialization Graph replays end."""
+def activate_cpu_offload_uvm_original_va_prefill_topology(
+    *,
+    finish_all_remote_profile: bool = False,
+) -> dict[str, Any]:
+    """Restore sealed alias banks after all initialization Graph replays end.
+
+    ``finish_all_remote_profile`` is used by the capture-before-hot-restore
+    startup path.  It ends the temporary profile bypass after RESUME so the
+    real Prefill H2D nodes are recorded, while deliberately leaving the hot
+    complement on its audited CPU remote-read mappings until the final Graph
+    and all of its allocator segments are live.
+    """
     global _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE
+    global _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE
 
@@ -6622,6 +8193,10 @@ def activate_cpu_offload_uvm_original_va_prefill_topology() -> dict[str, Any]:
 
         device = int(_CPU_OFFLOAD_OWNER_DEVICE_INDEX or 0)
         torch.cuda.synchronize(device)
+        _uvm_original_alias_hot_cuda_read_gate(
+            stage="runtime_prefill_before_resume",
+            device=device,
+        )
         resumed = dict(
             uvm_static_alias.driver_static_alias_resume(
                 int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
@@ -6637,6 +8212,10 @@ def activate_cpu_offload_uvm_original_va_prefill_topology() -> dict[str, Any]:
             raise RuntimeError(
                 "Failed to resume original-VA aliases after remote decode"
             )
+        _uvm_original_alias_hot_cuda_read_gate(
+            stage="runtime_prefill_after_resume",
+            device=device,
+        )
         _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
         _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "sealed"
     else:
@@ -6647,6 +8226,14 @@ def activate_cpu_offload_uvm_original_va_prefill_topology() -> dict[str, Any]:
             "Parameter VA changed while restoring alias-prefill topology"
         )
         raise RuntimeError("Original Parameter VA changed while restoring aliases")
+    profile_all_remote_before = bool(_CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE)
+    if finish_all_remote_profile:
+        if not profile_all_remote_before:
+            raise RuntimeError(
+                "Prefill capture requested an all-remote profile handoff, but "
+                "the all-remote profile topology is not active"
+            )
+        _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE = False
     result = {
         "event": "cpu_offload_uvm_original_va_alias_prefill_activated",
         "timestamp": time.time(),
@@ -6662,6 +8249,11 @@ def activate_cpu_offload_uvm_original_va_prefill_topology() -> dict[str, Any]:
         "parameter_vas_after": after,
         "finalize": finalized,
         "resume": resumed,
+        "finish_all_remote_profile": bool(finish_all_remote_profile),
+        "profile_all_remote_before": profile_all_remote_before,
+        "profile_all_remote_after": bool(
+            _CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE
+        ),
     }
     _CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY.append(result)
     _append_cpu_offload_manifest(result)

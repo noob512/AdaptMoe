@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 import json
 from contextlib import nullcontext
 from pathlib import Path
@@ -19,6 +20,7 @@ from vllm.v1.worker import gpu_model_runner as gpu_model_runner_module
 from vllm.v1.worker import gpu_worker as gpu_worker_module
 from vllm.v1.worker.gpu_model_runner import (
     GPUModelRunner,
+    _build_pure_prefill_dummy_shape,
     _uvm_kv_tail_range_for_allocation,
 )
 from vllm.v1.worker.gpu_worker import Worker
@@ -103,6 +105,109 @@ def test_uvm_kv_tail_range_respects_block_boundaries() -> None:
         )
         is None
     )
+
+
+def test_pure_prefill_dummy_shape_uses_actual_request_lengths() -> None:
+    request_lengths, max_query_len = _build_pure_prefill_dummy_shape(
+        num_tokens=16384,
+        num_reqs=16,
+        max_model_len=8320,
+    )
+
+    assert request_lengths == [1024] * 16
+    assert sum(request_lengths) == 16384
+    assert max_query_len == 1024
+
+
+def test_pure_prefill_dummy_shape_rejects_oversized_request() -> None:
+    with pytest.raises(ValueError, match="exceeds max_model_len"):
+        _build_pure_prefill_dummy_shape(
+            num_tokens=16384,
+            num_reqs=1,
+            max_model_len=8320,
+        )
+
+
+def test_dual_graph_capture_repairs_hot_residency_before_prefill_topology() -> None:
+    source = inspect.getsource(GPUModelRunner.capture_model)
+    ordinary_path = source.index("if not capture_prefill_before_hot_restore:")
+    repair_call = "reconcile_cpu_offload_uvm_original_va_remote_graph_residency("
+    activate_call = "activate_cpu_offload_uvm_original_va_prefill_topology()"
+
+    assert source.count(repair_call) == 1
+    assert source.index(repair_call, ordinary_path) < source.index(
+        activate_call, ordinary_path
+    )
+
+
+def test_capture_before_hot_restore_keeps_final_prefill_graph_pool() -> None:
+    source = inspect.getsource(GPUModelRunner.capture_model)
+    handoff = source.index("finish_all_remote_profile=True")
+    capture = source.index("capture_pure_prefill_graphs()", handoff)
+    restore = source.index(
+        "reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(", capture
+    )
+
+    assert handoff < capture < restore
+    assert "preserve_allocator_cache=True" in source[restore : restore + 200]
+
+
+def test_prefill_reserve_warmup_requests_valid_pure_prefill_shape(
+    monkeypatch: Any,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class FakeModelRunner:
+        max_model_len = 8320
+
+        def _dummy_run(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+            calls.append(kwargs)
+            return torch.empty(0), torch.empty(0)
+
+    monkeypatch.setenv(
+        "VLLM_UVM_PREFILL_ALLOCATOR_RESERVE_WARMUP_TOKENS", "16384"
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_phase_mode",
+        lambda: "prefill_graph_remote_decode",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_profile_all_remote_active",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "uvm_allocation_phase",
+        lambda _phase: nullcontext(),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (4096, 8192))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _device: 1024)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _device: 512)
+
+    worker = object.__new__(Worker)
+    worker.device = torch.device("cpu")
+    worker.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=16384,
+        max_num_seqs=16,
+    )
+    worker.model_runner = FakeModelRunner()
+
+    worker._warm_up_uvm_prefill_allocator_reserve()
+
+    assert calls == [
+        {
+            "num_tokens": 16384,
+            "cudagraph_runtime_mode": gpu_worker_module.CUDAGraphMode.NONE,
+            "force_attention": True,
+            "allow_microbatching": False,
+            "skip_eplb": True,
+            "remove_lora": False,
+            "pure_prefill_num_reqs": 16,
+        }
+    ]
 
 
 def test_post_warmup_kv_rebalance_returns_control_fields_only(
@@ -686,6 +791,157 @@ def test_original_va_hybrid_rejects_mixed_prefill_decode_batch(
     assert runner._uvm_original_va_phase_poison_reason == (
         "mixed prefill/decode batches are unsupported"
     )
+
+
+def _enable_original_va_graph_park_resume_state(
+    monkeypatch: Any, *, lifecycle_state: str
+) -> None:
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS", True)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND",
+        "uvm_original_va",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE",
+        "prefill_graph_remote_decode",
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED", True)
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", lifecycle_state
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID", 7)
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES", 4096
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE",
+        lifecycle_state == "remote_parked",
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED", True)
+
+
+def test_original_va_graph_park_resume_rejects_mixed_batch(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_original_va_phase_runner_for_boundary_tests()
+    _enable_original_va_graph_park_resume_state(
+        monkeypatch, lifecycle_state="sealed"
+    )
+
+    with pytest.raises(RuntimeError, match="requires an unmixed request"):
+        runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+            SimpleNamespace(num_scheduled_tokens={"decode": 1, "prefill": 8}),
+            "enabled:mixed_step",
+        )
+
+    assert runner._uvm_original_va_phase_prefill_seen is False
+    assert runner._uvm_original_va_phase_decode_cutover_done is False
+    assert runner._uvm_original_va_phase_poison_reason == (
+        "mixed prefill/decode batches are unsupported"
+    )
+
+
+def test_original_va_graph_without_park_resume_rejects_mixed_batch(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_original_va_phase_runner_for_boundary_tests()
+    _enable_original_va_graph_park_resume_state(
+        monkeypatch, lifecycle_state="sealed"
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED", False)
+
+    with pytest.raises(RuntimeError, match="requires an unmixed request"):
+        runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+            SimpleNamespace(num_scheduled_tokens={"decode": 1, "prefill": 8}),
+            "enabled:mixed_step",
+        )
+
+    assert runner._uvm_original_va_phase_poison_reason == (
+        "mixed prefill/decode batches are unsupported"
+    )
+
+
+def test_original_va_graph_mixed_batch_never_resumes_parked_aliases(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_original_va_phase_runner_for_boundary_tests()
+    runner._uvm_original_va_phase_prefill_seen = True
+    runner._uvm_original_va_phase_decode_cutover_done = True
+    _enable_original_va_graph_park_resume_state(
+        monkeypatch, lifecycle_state="remote_parked"
+    )
+    calls: list[str] = []
+
+    def resume() -> dict[str, Any]:
+        calls.append("resume")
+        monkeypatch.setattr(
+            offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "sealed"
+        )
+        monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE", False)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        offload_utils,
+        "activate_cpu_offload_uvm_original_va_prefill_topology",
+        resume,
+    )
+
+    with pytest.raises(RuntimeError, match="requires an unmixed request"):
+        runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+            SimpleNamespace(num_scheduled_tokens={"decode": 1, "prefill": 8}),
+            "enabled:mixed_step",
+        )
+
+    assert calls == []
+    assert runner._uvm_original_va_phase_prefill_seen is True
+    assert runner._uvm_original_va_phase_decode_cutover_done is True
+    assert runner._uvm_original_va_phase_poison_reason == (
+        "mixed prefill/decode batches are unsupported"
+    )
+
+
+def test_original_va_graph_phase_uses_separate_replay_certificates(
+    monkeypatch: Any,
+) -> None:
+    runner = object.__new__(GPUModelRunner)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        offload_utils,
+        "validate_cpu_offload_uvm_original_va_alias_graph_replay",
+        lambda: calls.append("alias"),
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "validate_cpu_offload_uvm_original_va_remote_graph_replay",
+        lambda: calls.append("remote"),
+    )
+
+    runner._validate_uvm_original_va_graph_replay_for_step(
+        original_va_phase_mode="prefill_graph_remote_decode",
+        enabled_step_phase="enabled:prefill_step",
+        cudagraph_runtime_mode=gpu_model_runner_module.CUDAGraphMode.FULL,
+    )
+    runner._validate_uvm_original_va_graph_replay_for_step(
+        original_va_phase_mode="prefill_graph_remote_decode",
+        enabled_step_phase="enabled:decode_step",
+        cudagraph_runtime_mode=gpu_model_runner_module.CUDAGraphMode.FULL,
+    )
+
+    assert calls == ["alias", "remote"]
+
+
+def test_original_va_graph_phase_rejects_eager_fallback() -> None:
+    runner = object.__new__(GPUModelRunner)
+
+    with pytest.raises(RuntimeError, match="cannot fall back to eager"):
+        runner._validate_uvm_original_va_graph_replay_for_step(
+            original_va_phase_mode="prefill_graph_remote_decode",
+            enabled_step_phase="enabled:prefill_step",
+            cudagraph_runtime_mode=gpu_model_runner_module.CUDAGraphMode.NONE,
+        )
 
 
 def test_original_va_hybrid_rejects_prefill_after_remote_cutover(
@@ -2038,6 +2294,11 @@ def test_remote_only_reconciles_after_kv_before_warmup(monkeypatch: Any) -> None
     )
     monkeypatch.setattr(
         offload_utils,
+        "cpu_offload_uvm_original_va_profile_all_remote_active",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        offload_utils,
         "reconcile_cpu_offload_uvm_original_va_remote_graph_residency",
         lambda: events.append("reconcile")
         or {
@@ -2066,12 +2327,190 @@ def test_non_remote_only_skips_pre_warmup_reconciliation(
     )
     monkeypatch.setattr(
         offload_utils,
+        "cpu_offload_uvm_original_va_profile_all_remote_active",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        offload_utils,
         "reconcile_cpu_offload_uvm_original_va_remote_graph_residency",
         _unexpected_call,
     )
 
     worker = object.__new__(Worker)
     worker._reconcile_uvm_original_va_remote_before_warmup()
+
+
+def test_phase_off_opt_in_reconciles_sealed_hot_experts_after_kv(
+    monkeypatch: Any,
+) -> None:
+    from vllm.model_executor.models import utils as offload_utils
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setenv("VLLM_UVM_POST_KV_HOT_RECONCILE", "1")
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_phase_mode",
+        lambda: "off",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_profile_all_remote_active",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "reconcile_cpu_offload_uvm_original_va_sealed_hot_residency",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "ok": True,
+            "hot_bytes": 22,
+            "hot_physical_residency_before": {"cpu_bytes": 6},
+            "hot_physical_residency_after": {"gpu_bytes": 22},
+            "free_bytes_before": 512,
+            "free_bytes_after": 384,
+            "allocator_reserved_after": 128,
+        },
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "reconcile_cpu_offload_uvm_original_va_remote_graph_residency",
+        _unexpected_call,
+    )
+
+    worker = object.__new__(Worker)
+    worker._reconcile_uvm_original_va_remote_before_warmup()
+
+    assert calls == [{"preserve_allocator_cache": True}]
+
+
+def test_profile_all_remote_defers_phase_mode_reconciliation_until_capture(
+    monkeypatch: Any,
+) -> None:
+    from vllm.model_executor.models import utils as offload_utils
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_phase_mode",
+        lambda: "prefill_graph_remote_decode",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_profile_all_remote_active",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "reconcile_cpu_offload_uvm_original_va_remote_graph_residency",
+        lambda: events.append("reconcile")
+        or {
+            "ok": True,
+            "cold_bytes": 6,
+            "hot_bytes": 22,
+            "free_bytes": 512,
+        },
+    )
+
+    worker = object.__new__(Worker)
+    worker._reconcile_uvm_original_va_remote_before_warmup()
+
+    assert events == []
+
+
+def test_explicit_kv_profiles_with_all_remote_topology_first(
+    monkeypatch: Any,
+) -> None:
+    from vllm.model_executor.models import utils as offload_utils
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        offload_utils,
+        "prepare_cpu_offload_uvm_original_va_profile_topology",
+        lambda: events.append("prepare")
+        or {
+            "ok": True,
+            "reason": "prepared",
+            "hot_bytes": 22,
+            "hot_range_count": 3,
+        },
+    )
+    worker = object.__new__(Worker)
+    worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=4096)
+    worker.init_snapshot = SimpleNamespace(free_memory=8192)
+    worker.model_runner = SimpleNamespace(
+        profile_run=lambda: events.append("profile")
+    )
+
+    assert worker.determine_available_memory() == 4096
+    assert events == ["prepare", "profile"]
+
+
+def test_post_capture_sampler_warmup_preserves_dual_graphs(
+    monkeypatch: Any,
+) -> None:
+    from vllm.model_executor.models import utils as offload_utils
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_phase_mode",
+        lambda: "prefill_graph_remote_decode",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "prepare_cpu_offload_uvm_original_va_profile_topology",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "ok": True,
+            "reason": "prepared",
+            "hot_bytes": 22,
+            "hot_range_count": 3,
+        },
+    )
+
+    worker = object.__new__(Worker)
+    worker._prepare_uvm_original_va_post_capture_warmup()
+
+    assert calls == [
+        {
+            "transition_reason": "post_capture_sampler_all_remote",
+            "preserve_remote_graphs": True,
+        }
+    ]
+
+
+def test_post_capture_sampler_warmup_restores_serving_residency(
+    monkeypatch: Any,
+) -> None:
+    from vllm.model_executor.models import utils as offload_utils
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_phase_mode",
+        lambda: "prefill_graph_remote_decode",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_profile_all_remote_active",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "reconcile_cpu_offload_uvm_original_va_remote_graph_residency",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "ok": True,
+            "cold_bytes": 6,
+            "hot_bytes": 22,
+            "free_bytes": 512,
+        },
+    )
+
+    worker = object.__new__(Worker)
+    worker._restore_uvm_original_va_after_post_capture_warmup()
+
+    assert calls == [{"preserve_allocator_cache": True}]
 
 
 class _FakeExpertModule:

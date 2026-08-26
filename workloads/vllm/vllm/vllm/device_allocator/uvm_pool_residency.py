@@ -4361,8 +4361,10 @@ def prepare_uvm_regions_for_gpu_placement(
         ):
             return {"ok": False, "reason": "driver_state_update_failed"}
 
+    executor_used = "not_submitted"
+    driver_result = 0
     try:
-        successes, _, _ = (
+        successes, executor_used, driver_result = (
             batch_prefetch_ranges_to_device_with_executor(
                 ranges,
                 device,
@@ -4375,6 +4377,17 @@ def prepare_uvm_regions_for_gpu_placement(
 
     complete = int(successes) == len(ranges)
     if not complete:
+        logger.error(
+            "Explicit Hot Expert prefetch incomplete: requested_regions=%d "
+            "ranges=%d successes=%d executor_requested=%s "
+            "executor_used=%s driver_result=%d",
+            len(requested),
+            len(ranges),
+            int(successes),
+            executor,
+            executor_used,
+            int(driver_result),
+        )
         with _EXPLICIT_REGION_LOCK:
             current = [
                 region

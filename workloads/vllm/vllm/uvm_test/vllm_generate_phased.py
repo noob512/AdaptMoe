@@ -58,11 +58,25 @@ def load_requests(path: Path) -> list[dict[str, Any]]:
         raise ValueError(f"fixture has no requests: {path}")
     normalized = []
     for index, item in enumerate(requests):
-        if not isinstance(item, dict) or not isinstance(item.get("prompt"), str):
+        if not isinstance(item, dict):
             raise ValueError(f"invalid request {index} in {path}")
+        prompt = item.get("prompt")
+        prompt_token_ids = item.get("prompt_token_ids")
+        if not isinstance(prompt, str) and not (
+            isinstance(prompt_token_ids, list)
+            and prompt_token_ids
+            and all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in prompt_token_ids
+            )
+        ):
+            raise ValueError(f"request {index} has neither text nor token IDs")
         normalized.append({
             "request": int(item.get("request", index)),
-            "prompt": item["prompt"],
+            "prompt": prompt,
+            "prompt_token_ids": (
+                list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None
+            ),
         })
     return normalized
 
@@ -191,7 +205,7 @@ def main() -> int:
         with args.progress.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
 
-    from vllm import LLM, SamplingParams
+    from vllm import LLM, SamplingParams, TokensPrompt
 
     load_started = time.perf_counter()
     llm = LLM(
@@ -273,7 +287,12 @@ def main() -> int:
         for phase_index, (name, count, output_tokens) in enumerate(
             zip(phase_names, phase_counts, phase_outputs)
         ):
-            prompts = [item["prompt"] for item in requests[:count]]
+            prompts = [
+                TokensPrompt(prompt_token_ids=item["prompt_token_ids"])
+                if item["prompt_token_ids"] is not None
+                else item["prompt"]
+                for item in requests[:count]
+            ]
             sampling = SamplingParams(
                 max_tokens=output_tokens,
                 temperature=0.0,
@@ -291,9 +310,11 @@ def main() -> int:
                 f"output_tokens={output_tokens}",
                 flush=True,
             )
+            started_epoch = time.time()
             started = time.perf_counter()
             outputs = llm.generate(prompts, sampling, use_tqdm=False)
             elapsed = time.perf_counter() - started
+            finished_epoch = time.time()
             records = [request_metrics(output) for output in outputs]
             output_count = sum(int(record["output_tokens"]) for record in records)
             ttfts = [float(record["ttft_ms"]) for record in records if record["ttft_ms"] is not None]
@@ -304,12 +325,16 @@ def main() -> int:
                 "request_offset": 0,
                 "output_tokens_per_request": output_tokens,
                 "elapsed_seconds": elapsed,
+                "started_epoch_seconds": started_epoch,
+                "finished_epoch_seconds": finished_epoch,
                 "prompt_tokens": sum(int(record["prompt_tokens"]) for record in records),
                 "output_tokens": output_count,
                 "output_tokens_per_second": output_count / elapsed if elapsed else None,
                 "mean_ttft_ms": sum(ttfts) / len(ttfts) if ttfts else None,
                 "p99_ttft_ms": percentile(ttfts, 99.0),
                 "mean_tpot_ms": sum(tpots) / len(tpots) if tpots else None,
+                "p50_tpot_ms": percentile(tpots, 50.0),
+                "p95_tpot_ms": percentile(tpots, 95.0),
                 "p99_tpot_ms": percentile(tpots, 99.0),
                 "completed_requests": len(records),
                 "requests": records,

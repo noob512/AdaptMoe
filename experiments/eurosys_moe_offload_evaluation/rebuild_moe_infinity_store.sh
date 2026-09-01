@@ -10,6 +10,7 @@ VENV_BIN="$(dirname "${PYTHON}")"
 CUDA_HOME="/usr/local/cuda-12.8"
 NVTX_INCLUDE_DIR="/usr/local/cuda-12.8/nsight-systems-2024.6.2/target-linux-x64/nvtx/include"
 OUTPUT_DIR="${1:-}"
+EXPECTED_MOEI_COMMIT="${EXPECTED_MOEI_COMMIT:-92c2bc9266e33bbed22405356ca7ca7e71ae8974}"
 
 [[ -n "${OUTPUT_DIR}" ]] || {
   echo "usage: $0 OUTPUT_DIR" >&2
@@ -19,8 +20,8 @@ OUTPUT_DIR="${1:-}"
   echo "refusing to overwrite ${OUTPUT_DIR}" >&2
   exit 1
 }
-[[ "$(git -C "${MOEI_ROOT}" rev-parse HEAD)" == \
-  ba5651897a80d9c9b7a1500cef2c68adaa63db0f ]] || {
+ACTUAL_MOEI_COMMIT="$(git -C "${MOEI_ROOT}" rev-parse HEAD)"
+[[ "${ACTUAL_MOEI_COMMIT}" == "${EXPECTED_MOEI_COMMIT}" ]] || {
   echo "MoE-Infinity commit drift" >&2
   exit 1
 }
@@ -94,14 +95,14 @@ BUILD_LOG_SHA256="$(sha256sum "${BUILD_LOG}" | awk '{print $1}')"
 FINISHED_AT="$(date --iso-8601=seconds)"
 
 "${PYTHON}" - "${OUTPUT_DIR}/store_build_receipt.json" \
-  "${RC}" "${STARTED_AT}" "${FINISHED_AT}" "${PATCH_SHA256}" \
+  "${RC}" "${STARTED_AT}" "${FINISHED_AT}" "${ACTUAL_MOEI_COMMIT}" "${PATCH_SHA256}" \
   "${EXTENSION}" "${EXTENSION_SHA256}" "${RUNTIME_ELF_SHA256}" \
   "${RUNTIME_FINGERPRINT_JSON_SHA256}" "${BUILD_LOG_SHA256}" <<'PY'
 import json
 import os
 import sys
 
-(path, returncode, started, finished, patch_sha, extension,
+(path, returncode, started, finished, moe_commit, patch_sha, extension,
  extension_sha, runtime_elf_sha, runtime_manifest_sha, log_sha) = sys.argv[1:]
 payload = {
     "schema_version": 1,
@@ -109,7 +110,7 @@ payload = {
     "returncode": int(returncode),
     "started_at": started,
     "finished_at": finished,
-    "moe_infinity_commit": "ba5651897a80d9c9b7a1500cef2c68adaa63db0f",
+    "moe_infinity_commit": moe_commit,
     "moe_infinity_patch_sha256": patch_sha,
     "extension": os.path.realpath(extension),
     "extension_sha256": extension_sha,

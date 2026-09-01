@@ -166,6 +166,27 @@ typedef struct
     // which case we need to initialize the entire big range.
     bool initialized_big;
 
+    // Static-alias dual-view optimization. A full 2 MiB VA block may set ready
+    // even when only some of its pages are static aliases. dual_pages records
+    // exactly those 4K CPU-resident expert pages. Both children contain a
+    // complete mapping for the block: ordinary/hot pages are identical, while
+    // dual_pages select CPU memory in the CPU child and slot memory in the GPU
+    // child. cpu_active identifies the child currently published by the PDE.
+    bool moe_slot_dual_view_ready;
+    bool moe_slot_dual_view_cpu_active;
+    // Preparation does not modify the currently active mixed UVM hierarchy.
+    // This bit remains set until the first parent switch publishes one of the
+    // two detached, complete 4K children.
+    bool moe_slot_dual_view_original_active;
+    // Retained for fail-closed lifecycle checks while 64K slot mappings
+    // continue to use the legacy transition path.
+    bool moe_slot_dual_view_gpu_uses_big;
+    uvm_page_mask_t moe_slot_dual_pages;
+    DECLARE_BITMAP(moe_slot_dual_original_big_ptes,
+                   UVM_BIG_PAGES_PER_UVM_VA_BLOCK);
+    uvm_page_table_range_t moe_slot_dual_gpu_4k_range;
+    uvm_page_table_range_t moe_slot_dual_cpu_4k_range;
+
     // This table shows the HW PTE states given all permutations of pte_is_2m,
     // big_ptes, and pte_bits. Note that the first row assumes that the 4k page
     // tables have been allocated (if not, then no PDEs are allocated either).
@@ -945,6 +966,9 @@ NV_STATUS uvm_va_block_map(uvm_va_block_t *va_block,
 // managed pages. This is an experimental latency path: it does not migrate or
 // copy data, and it only maps pages which are CPU-resident, not discarded, not
 // already GPU-resident, and not already mapped with GPU READ permissions.
+// If forbid_2m_merge is true, the caller certifies that this is a partial
+// immutable-shadow cutover whose lower-level PTE hierarchy was prepared before
+// GPU backing was released. The helper preserves and verifies that hierarchy.
 //
 // LOCKING: The caller must hold the va block lock. If va_block_context->mm !=
 //          NULL, va_block_context->mm->mmap_lock must be held in at least read
@@ -954,6 +978,7 @@ NV_STATUS uvm_va_block_premap_readmostly_remote_read(uvm_va_block_t *va_block,
                                                      uvm_gpu_id_t gpu_id,
                                                      uvm_va_block_region_t region,
                                                      bool wait_for_mappings,
+                                                     bool forbid_2m_merge,
                                                      NvU32 *mapped_pages_out);
 
 // Setup-only helper which converts an existing ordinary CPU-backed 2 MiB GPU
@@ -2072,6 +2097,55 @@ NV_STATUS uvm_va_block_unmap_moe_slot_no_cpu_restore(uvm_va_block_t *va_block,
                                                      const uvm_page_mask_t *page_mask,
                                                      uvm_tracker_t *out_tracker);
 
+typedef struct
+{
+    NvU64 prepared_blocks;
+    NvU64 reused_blocks;
+    NvU64 skipped_blocks;
+    NvU64 switched_blocks;
+    NvU64 pde_writes;
+    NvU64 tlb_batches;
+    NvU64 elapsed_ns;
+} uvm_va_block_slot_alias_dual_result_t;
+
+// Prebuild a complete CPU 4K child for each full 2 MiB VA block touched by
+// static aliases. Ordinary pages are copied unchanged from the complete GPU
+// 4K child; only the pages in moe_slot_dual_pages differ. block_starts must be
+// sorted and unique. The VA-space write lock must be held.
+NV_STATUS uvm_va_block_slot_alias_dual_prepare_batch(
+    uvm_va_space_t *va_space,
+    struct mm_struct *mm,
+    uvm_gpu_t *gpu,
+    NvU64 *block_starts,
+    NvU32 *block_count,
+    bool nested_refresh,
+    uvm_va_block_slot_alias_dual_result_t *result);
+
+// At a quiesced scheduler boundary, publish the prebuilt CPU or GPU 4K child
+// for every full block. PDE writes are grouped and followed by one TLB
+// invalidate per bounded push rather than one operation per expert leaf. The
+// VA-space write lock must be held.
+NV_STATUS uvm_va_block_slot_alias_dual_switch_batch(
+    uvm_va_space_t *va_space,
+    uvm_gpu_t *gpu,
+    const NvU64 *block_starts,
+    NvU32 block_count,
+    bool to_cpu,
+    uvm_va_block_slot_alias_dual_result_t *result);
+
+// Stop treating the prebuilt views as an immutable pair before topology
+// removal or teardown. If the CPU view is active, the expert pages in the
+// hidden ordinary child are changed to their CPU mapping before that child is
+// republished and slot backing may be released.
+// The VA-space write lock must be held.
+NV_STATUS uvm_va_block_slot_alias_dual_discard_batch(
+    uvm_va_space_t *va_space,
+    struct mm_struct *mm,
+    uvm_gpu_t *gpu,
+    const NvU64 *block_starts,
+    NvU32 block_count,
+    uvm_va_block_slot_alias_dual_result_t *result);
+
 // Validate, without changing hardware or software mapping state, that every
 // requested page is currently covered by a slot-backed read-only PTE and that
 // the request does not select only part of a 2 MiB or 64 KiB leaf. This is used
@@ -2297,8 +2371,22 @@ NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
                                                     uvm_gpu_t *gpu,
                                                     uvm_va_block_region_t region,
                                                     uvm_chunk_size_t release_chunk_size,
+                                                    bool require_immutable_cpu_shadow,
                                                     uvm_tracker_t *tracker,
                                                     NvU64 *released_bytes_out);
+
+// Unconditionally republish the active top-level entry for this VA block and
+// invalidate its complete 2 MiB address range. Unlike normal map/unmap paths,
+// this does not trust activated_big/activated_4k: it is a repair primitive for
+// a hardware parent entry which became stale while software PTE metadata and
+// physical residency remained valid.
+//
+// LOCKING: The caller must hold the VA block lock and VA-space lock.
+NV_STATUS uvm_va_block_force_gpu_parent_mapping_rewrite(
+    uvm_va_block_t *va_block,
+    uvm_va_block_context_t *block_context,
+    uvm_gpu_t *gpu,
+    uvm_tracker_t *out_tracker);
 
 NV_STATUS uvm_test_va_block_inject_error(UVM_TEST_VA_BLOCK_INJECT_ERROR_PARAMS *params, struct file *filp);
 NV_STATUS uvm_test_change_pte_mapping(UVM_TEST_CHANGE_PTE_MAPPING_PARAMS *params, struct file *filp);
@@ -3018,7 +3106,31 @@ typedef enum
     UVM_MIGRATE_PROFILE_COUNT
 } uvm_migrate_profile_stage_t;
 
-void uvm_migrate_profile_add(uvm_migrate_profile_stage_t stage, NvU64 ns, NvU64 pages, NvU64 bytes);
+extern unsigned uvm_migrate_profile_enable;
+
+void uvm_migrate_profile_add_enabled(uvm_migrate_profile_stage_t stage,
+                                     NvU64 ns,
+                                     NvU64 pages,
+                                     NvU64 bytes);
+
+// Keep disabled migration instrumentation off the hot path. In particular,
+// NV_GETTIME() is not a free operation when it is repeated for every VA block
+// and every mapping/copy stage of a large cudaMemPrefetchAsync request.
+static inline NvU64 uvm_migrate_profile_now(void)
+{
+    return READ_ONCE(uvm_migrate_profile_enable) ? NV_GETTIME() : 0;
+}
+
+static inline void uvm_migrate_profile_add(uvm_migrate_profile_stage_t stage,
+                                           NvU64 ns,
+                                           NvU64 pages,
+                                           NvU64 bytes)
+{
+    if (!READ_ONCE(uvm_migrate_profile_enable))
+        return;
+
+    uvm_migrate_profile_add_enabled(stage, ns, pages, bytes);
+}
 
 // Pause or resume deferred read-only background promotion for the block. This
 // is an experimental runtime gate used by Phase F to keep background promotion

@@ -10,6 +10,10 @@ export VLLM_PHASE_SWITCH_SOURCE_ONLY=1
 source "${BASE_HARNESS}"
 unset VLLM_PHASE_SWITCH_SOURCE_ONLY
 export VLLM_PARK_RESUME_EXPERIMENT=1
+TRANSITION_MODE="${TRANSITION_MODE:-grouped}"
+[[ "${TRANSITION_MODE}" == grouped || "${TRANSITION_MODE}" == sequential ]] \
+  || die "TRANSITION_MODE must be grouped or sequential"
+export VLLM_CPU_OFFLOAD_UVM_ORIGINAL_VA_TRANSITION_MODE="${TRANSITION_MODE}"
 
 SCRIPT_DIR="${DUAL_SCRIPT_DIR}"
 REPO_ROOT="${DUAL_REPO_ROOT}"
@@ -53,10 +57,11 @@ write_run_config() {
     "${KV_CACHE_BYTES}" "${SLOT_BUDGET_BYTES}" "${STOCK_UVM}" \
     "${STOCK_SRCVERSION}" "${STOCK_SHA256}" "${CUSTOM_UVM}" \
     "${CUSTOM_SRCVERSION}" "${CUSTOM_SHA256}" "${WARMUP_DECODE_STEPS}" \
-    "${MEASURED_DECODE_STEPS}" <<'PY'
+    "${MEASURED_DECODE_STEPS}" "${TRANSITION_MODE}" <<'PY'
 import json, os, sys
 (path, mode, repeats, model, fixture, kv, budget, stock_path, stock_src,
- stock_sha, custom_path, custom_src, custom_sha, warmup, measured) = sys.argv[1:]
+ stock_sha, custom_path, custom_src, custom_sha, warmup, measured,
+ transition_mode) = sys.argv[1:]
 payload = {
     "schema": "vllm_uvm_dual_topology_graph_park_resume_run_v3",
     "mode": mode,
@@ -68,6 +73,7 @@ payload = {
     "phase_mode": "prefill_graph_remote_decode",
     "park_resume": True,
     "park_batch_required": True,
+    "transition_mode": transition_mode,
     "roundtrip_cycles": 2,
     "attention_backend": "TRITON_ATTN",
     "cudagraph_mode": "FULL_SEPARATE",
@@ -109,6 +115,10 @@ dual_static_preflight() {
   rg -q 'driver_static_alias_resume' \
     "${VLLM_ROOT}/vllm/device_allocator/uvm_static_alias.py" \
     || die "static-alias RESUME userspace ABI is absent"
+  rg -q 'TRANSITION_FLAG_FORCE_SEQUENTIAL' \
+    "${VLLM_ROOT}/vllm/device_allocator/uvm_static_alias.py" \
+    "${REPO_ROOT}/kernel-module/nvidia-module/kernel-open/nvidia-uvm/uvm_ioctl.h" \
+    || die "controlled sequential transition ABI is absent"
   rg -q 'VLLM_ATTENTION_BACKEND=TRITON_ATTN' "${BASE_HARNESS}" \
     || die "D arm does not pin the TRITON_ATTN backend"
   bash -n "${BASH_SOURCE[0]}"

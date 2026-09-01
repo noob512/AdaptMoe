@@ -115,6 +115,7 @@ def main() -> int:
     parser.add_argument("--device-memory-ratio", type=float, default=0.75)
     parser.add_argument("--kv-cache-ratio", type=float, default=0.01)
     parser.add_argument("--max-batch-size", type=int, default=1)
+    parser.add_argument("--max-tokens-per-step", type=int, default=2048)
     parser.add_argument("--num-threads", type=int, default=1)
     parser.add_argument("--reference-fixture", type=Path)
     parser.add_argument("--reference-output", type=Path)
@@ -126,8 +127,12 @@ def main() -> int:
         parser.error("--device-memory-ratio must be in (0, 1)")
     if not 0.0 <= args.kv_cache_ratio < 1.0:
         parser.error("--kv-cache-ratio must be in [0, 1)")
-    if args.max_batch_size <= 0 or args.num_threads <= 0:
-        parser.error("batch size and thread count must be positive")
+    if (
+        args.max_batch_size <= 0
+        or args.max_tokens_per_step <= 0
+        or args.num_threads <= 0
+    ):
+        parser.error("batch size, tokens per step, and thread count must be positive")
     if (args.reference_fixture is None) != (args.reference_output is None):
         parser.error("reference fixture and output must be provided together")
     if args.reference_fixture is not None and not args.reference_fixture.is_file():
@@ -164,6 +169,7 @@ def main() -> int:
         device_memory_ratio=args.device_memory_ratio,
         kv_cache_ratio=args.kv_cache_ratio,
         max_batch_size=args.max_batch_size,
+        max_tokens_per_step=args.max_tokens_per_step,
         enable_prefix_caching=False,
         offload_dir=str(args.offload_path.resolve()),
     )

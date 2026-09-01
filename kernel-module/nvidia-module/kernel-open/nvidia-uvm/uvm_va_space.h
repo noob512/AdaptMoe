@@ -237,6 +237,14 @@ struct uvm_va_space_struct
     // with one comparison.
     atomic64_t moe_slot_copy_source_epoch;
 
+    // Conservative bounds of every MoE slot PTE range installed in this VA
+    // space. The bounds only expand during the VA-space lifetime. That makes
+    // them safe after a slot is removed while allowing unrelated managed
+    // migrations (notably the separately allocated KV pool) to skip the
+    // 8,192-slot overlap scan in constant time.
+    NvU64 moe_slot_pte_seen_min;
+    NvU64 moe_slot_pte_seen_max;
+
     // Range groups
     struct radix_tree_root range_groups;
     uvm_range_tree_t range_group_ranges;

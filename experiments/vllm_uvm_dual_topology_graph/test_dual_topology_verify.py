@@ -67,6 +67,25 @@ def test_batched_transition_certificate_rejects_missing_batches():
         verify.validate_batched_transition(transition, "case", required=True)
 
 
+def test_sequential_transition_certificate():
+    transition = {
+        "processed_alias_count": 4_608,
+        "transition_batch_count": 4_608,
+        "transition_mode": "sequential",
+        "sequential_requested": True,
+        "batch_count_reported": True,
+        "batch_count_valid": True,
+        "ioctl_calls": 1,
+        "tlb_invalidate_count": 4_608,
+    }
+    verify.validate_batched_transition(
+        transition,
+        "case",
+        required=True,
+        transition_mode="sequential",
+    )
+
+
 def test_aggregate_uses_trace_free_samples_and_stable_hash():
     values = [
         sample(1, 99.0, audit=True),
@@ -79,6 +98,9 @@ def test_aggregate_uses_trace_free_samples_and_stable_hash():
     result = verify.aggregate(values)
     assert result["1"]["sample_count"] == 2
     assert result["1"]["prefill_step_ms"]["median"] == 11.0
+    assert result["1"]["prefill_step_ms"]["p95"] == pytest.approx(11.9)
+    assert result["1"]["prefill_step_ms"]["p99"] == pytest.approx(11.98)
+    assert len(result["1"]["prefill_step_ms"]["median_bootstrap_95_ci"]) == 2
     assert result["4"]["steady_decode_step_ms"]["median"] == 23.0
 
 

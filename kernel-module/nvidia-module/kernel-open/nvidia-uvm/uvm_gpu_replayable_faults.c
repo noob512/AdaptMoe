@@ -134,12 +134,17 @@ static unsigned uvm_manual_migration_fault_mode = UVM_MANUAL_MIGRATION_FAULT_MOD
 module_param(uvm_manual_migration_fault_mode, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_manual_migration_fault_mode,
                  "Manual migration fault mode for managed GPU replayable faults: "
-                 "0=normal UVM service, 1=observe/log and continue, 2=log and cancel instead of migrating. Default: 0.");
+                 "0=normal UVM service, 1=observe/log and continue, "
+                 "2=allow mapping-only service for pages already resident on the faulting GPU, "
+                 "otherwise log and cancel instead of migrating. Default: 0.");
 
-static unsigned uvm_manual_migration_fault_log_enable = 1;
+// Per-page fault logging can produce hundreds of thousands of kernel records
+// during an observe-mode diagnostic. Keep the state-machine protection active
+// by default, but require an explicit opt-in for verbose fault attribution.
+static unsigned uvm_manual_migration_fault_log_enable;
 module_param(uvm_manual_migration_fault_log_enable, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_manual_migration_fault_log_enable,
-                 "Log manual migration GPU fault observations to phase_f_route_log. Default: 1.");
+                 "Log manual migration GPU fault observations to phase_f_route_log and the kernel log. Default: 0.");
 
 static bool manual_migration_fault_mode_enabled(void)
 {
@@ -147,28 +152,49 @@ static bool manual_migration_fault_mode_enabled(void)
            uvm_manual_migration_fault_mode == UVM_MANUAL_MIGRATION_FAULT_MODE_FAIL_FAST;
 }
 
-static bool manual_migration_fault_should_block(void)
-{
-    return uvm_manual_migration_fault_mode == UVM_MANUAL_MIGRATION_FAULT_MODE_FAIL_FAST;
-}
-
 static void manual_migration_fault_log(uvm_gpu_t *gpu,
                                        uvm_va_range_managed_t *managed_range,
                                        uvm_fault_buffer_entry_t *fault_entry,
-                                       bool block_fault)
+                                       uvm_page_index_t page_index,
+                                       bool gpu_resident,
+                                       bool cpu_resident,
+                                       bool gpu_read_mapped,
+                                       uvm_processor_id_t selected_residency,
+                                       const char *action)
 {
     if (!uvm_manual_migration_fault_log_enable)
         return;
 
-    uvm_phase_f_route_log("manual_migration_fault mode=%u action=%s fault_addr=0x%llx access=%s gpu_id=%u pid=%d range_base=0x%llx range_len=%llu\n",
+    uvm_phase_f_route_log("manual_migration_fault mode=%u action=%s fault_addr=0x%llx access=%s "
+                          "gpu_id=%u pid=%d range_base=0x%llx range_len=%llu page_index=%u "
+                          "gpu_resident=%u cpu_resident=%u gpu_read_mapped=%u selected_residency=%u\n",
                           uvm_manual_migration_fault_mode,
-                          block_fault ? "block" : "observe",
+                          action,
                           fault_entry->fault_address,
                           uvm_fault_access_type_string(fault_entry->fault_access_type),
                           uvm_id_value(gpu->id),
                           task_tgid_nr(current),
                           managed_range ? managed_range->va_range.node.start : 0,
-                          managed_range ? uvm_va_range_size(&managed_range->va_range) : 0);
+                          managed_range ? uvm_va_range_size(&managed_range->va_range) : 0,
+                          page_index,
+                          gpu_resident,
+                          cpu_resident,
+                          gpu_read_mapped,
+                          uvm_id_value(selected_residency));
+    UVM_INFO_PRINT("manual_migration_fault mode=%u action=%s fault_addr=0x%llx access=%s gpu_id=%u pid=%d range_base=0x%llx range_len=%llu page_index=%u gpu_resident=%u cpu_resident=%u gpu_read_mapped=%u selected_residency=%u\n",
+                   uvm_manual_migration_fault_mode,
+                   action,
+                   fault_entry->fault_address,
+                   uvm_fault_access_type_string(fault_entry->fault_access_type),
+                   uvm_id_value(gpu->id),
+                   task_tgid_nr(current),
+                   managed_range ? managed_range->va_range.node.start : 0,
+                   managed_range ? uvm_va_range_size(&managed_range->va_range) : 0,
+                   page_index,
+                   gpu_resident,
+                   cpu_resident,
+                   gpu_read_mapped,
+                   uvm_id_value(selected_residency));
 }
 
 static unsigned uvm_perf_fault_log_addresses;
@@ -1736,6 +1762,47 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_t *gpu,
                                                       hmm_migratable,
                                                       &read_duplicate);
 
+        // manual_migration_fault_mode=2 is intended to prohibit implicit data
+        // movement, not ordinary page-table repair. A replayable fault can be
+        // raised after prefetch has restored the physical GPU page but before
+        // a readable PTE/PDE has been installed. In that case servicing the
+        // fault with the current GPU as the selected residency only installs
+        // the missing mapping and does not migrate data.
+        //
+        // This decision has to be made while holding va_block->lock. The old
+        // dispatch-level check ran before taking that lock and therefore could
+        // not distinguish mapping-only faults from real CPU-to-GPU migration.
+        if (manual_migration_fault_mode_enabled() && va_block->managed_range) {
+            uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+            bool gpu_resident = gpu_state && uvm_page_mask_test(&gpu_state->resident, page_index);
+            bool cpu_resident = uvm_page_mask_test(&va_block->cpu.resident, page_index);
+            bool gpu_read_mapped = gpu_state &&
+                                   uvm_page_mask_test(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ], page_index);
+            bool mapping_only = gpu_resident && uvm_id_equal(new_residency, gpu->id);
+            bool block_migration = uvm_manual_migration_fault_mode ==
+                                       UVM_MANUAL_MIGRATION_FAULT_MODE_FAIL_FAST &&
+                                   !mapping_only;
+
+            manual_migration_fault_log(gpu,
+                                       va_block->managed_range,
+                                       current_entry,
+                                       page_index,
+                                       gpu_resident,
+                                       cpu_resident,
+                                       gpu_read_mapped,
+                                       new_residency,
+                                       block_migration ? "block_migration" :
+                                       mapping_only ? "allow_mapping_only" : "observe_migration");
+
+            if (block_migration) {
+                mark_fault_fatal(batch_context,
+                                 current_entry,
+                                 uvm_tools_status_to_fatal_fault_reason(NV_ERR_INVALID_ACCESS_TYPE),
+                                 UVM_FAULT_CANCEL_VA_MODE_ALL);
+                continue;
+            }
+        }
+
         // 记录新驻留位置的映射掩码，如果该驻留位置第一次出现，先清空其页面掩码
         if (!uvm_processor_mask_test_and_set(&block_context->resident_processors, new_residency))
             uvm_page_mask_zero(&block_context->per_processor_masks[uvm_id_value(new_residency)].new_residency);
@@ -2161,28 +2228,8 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
     else
         status = NV_ERR_INVALID_ADDRESS;
 
-    if (status == NV_OK) {
-        uvm_va_range_managed_t *managed_range = uvm_va_range_to_managed_or_null(va_range);
-        bool block_manual_fault = false;
-
-        if (manual_migration_fault_mode_enabled() && managed_range) {
-            block_manual_fault = manual_migration_fault_should_block();
-
-            manual_migration_fault_log(gpu, managed_range, current_entry, block_manual_fault);
-
-            if (block_manual_fault) {
-                service_fault_batch_fatal_notify(gpu,
-                                                 batch_context,
-                                                 fault_index,
-                                                 NV_ERR_INVALID_ACCESS_TYPE,
-                                                 UVM_FAULT_CANCEL_VA_MODE_ALL,
-                                                 block_faults);
-                status = NV_OK;
-            }
-        }
-        if (!block_manual_fault)
-            status = service_fault_batch_block(gpu, va_block, batch_context, fault_index, hmm_migratable, block_faults);
-    }
+    if (status == NV_OK)
+        status = service_fault_batch_block(gpu, va_block, batch_context, fault_index, hmm_migratable, block_faults);
     else if ((status == NV_ERR_INVALID_ADDRESS) && uvm_ats_can_service_faults(gpu_va_space, mm)) {
         NvU64 outer = ~0ULL;
 

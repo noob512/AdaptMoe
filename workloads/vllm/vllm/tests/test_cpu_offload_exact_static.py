@@ -849,6 +849,7 @@ def test_dynamic_expert_plan_rebuild_mutates_bindings_in_place(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ):
+    events: list[str] = []
     name = "model.layers.0.weight"
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(
@@ -879,9 +880,9 @@ def test_dynamic_expert_plan_rebuild_mutates_bindings_in_place(
         plan=name_plan,
         requested_bytes=4096,
         parameter_bytes=16384,
-        expert_ids=(0,),
+        expert_ids=(1,),
         expert_stride_bytes=4096,
-        consumer_ranges=((0x10000, 4096),),
+        consumer_ranges=((0x11000, 4096),),
         source=_FakeTensor(device="cpu", pinned=True),
     )
     old_arena.consumers[0] = retained
@@ -923,6 +924,7 @@ def test_dynamic_expert_plan_rebuild_mutates_bindings_in_place(
     monkeypatch.setattr(
         offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "remote_parked"
     )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID", 41)
     monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE", True)
     monkeypatch.setattr(
         offload_utils, "_CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT", (0x10000,)
@@ -941,7 +943,16 @@ def test_dynamic_expert_plan_rebuild_mutates_bindings_in_place(
     monkeypatch.setattr(
         offload_utils,
         "destroy_cpu_offload_graph_static_alias",
-        lambda **kwargs: {"ok": True},
+        lambda **kwargs: events.append("destroy") or {"ok": True},
+    )
+
+    from vllm.device_allocator import uvm_static_alias
+
+    monkeypatch.setattr(
+        uvm_static_alias,
+        "driver_static_alias_resume",
+        lambda *args, **kwargs: events.append("resume")
+        or {"ok": True, "operation": "resume", "session_id": 41},
     )
 
     def create_binding(**kwargs: Any):
@@ -998,7 +1009,10 @@ def test_dynamic_expert_plan_rebuild_mutates_bindings_in_place(
 
     monkeypatch.setattr(uvm, "driver_batch_query_ranges_residency_bytes", query)
 
-    def finalize() -> dict[str, Any]:
+    finalized_known_cpu_ranges: set[tuple[int, int]] = set()
+
+    def finalize(*, known_cpu_ranges=()) -> dict[str, Any]:
+        finalized_known_cpu_ranges.update(known_cpu_ranges)
         offload_utils._CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "sealed"
         return {"ok": True, "state": "sealed"}
 
@@ -1016,6 +1030,9 @@ def test_dynamic_expert_plan_rebuild_mutates_bindings_in_place(
 
     assert result["ok"] is True
     assert result["generation"] == 1
+    assert result["pre_destroy_resume"]["ok"] is True
+    assert events.index("resume") < events.index("destroy")
+    assert finalized_known_cpu_ranges == {(0x11000, 4096)}
     assert result["parameter_vas_before"] == result["parameter_vas_after"]
     assert offload_utils._CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS[name] is retained
     assert retained.expert_ids == (1, 2)
@@ -1503,6 +1520,79 @@ def test_uvm_original_expert_plan_requires_equal_complete_layer_selection(
         offload_utils._load_graph_static_alias_expert_plan(str(plan_file), plan)
 
 
+def test_uvm_plan_classes_require_opt_in_for_equal_expert_widths(tmp_path):
+    names = frozenset({"model.layers.0.experts.w13_weight"})
+    name_plan = offload_utils._build_graph_static_alias_plan(names)
+    for class_name, experts in (("base", [0, 1]), ("difference", [0, 2])):
+        (tmp_path / f"{class_name}.json").write_text(
+            json.dumps({"selected_by_layer": {"0": experts}}),
+            encoding="utf-8",
+        )
+    manifest = {
+        "schema": "vllm_uvm_static_alias_plan_classes_v1",
+        "initial_class": "base",
+        "classes": {
+            class_name: {
+                "capacity_gib": 1,
+                "plan_file": f"{class_name}.json",
+            }
+            for class_name in ("base", "difference")
+        },
+    }
+    manifest_file = tmp_path / "classes.json"
+    manifest_file.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="distinct expert widths"):
+        offload_utils._load_graph_static_alias_plan_classes(
+            str(manifest_file), name_plan
+        )
+
+    manifest["allow_equal_expert_widths"] = True
+    manifest_file.write_text(json.dumps(manifest), encoding="utf-8")
+    _, plans, capacities, initial = (
+        offload_utils._load_graph_static_alias_plan_classes(
+            str(manifest_file), name_plan
+        )
+    )
+    assert initial == "base"
+    assert plans == {"base": {0: (0, 1)}, "difference": {0: (0, 2)}}
+    assert capacities == {"base": 1.0, "difference": 1.0}
+
+
+def test_uvm_plan_classes_accept_one_fixed_tier(tmp_path):
+    names = frozenset({"model.layers.0.experts.w13_weight"})
+    name_plan = offload_utils._build_graph_static_alias_plan(names)
+    (tmp_path / "cold70.json").write_text(
+        json.dumps({"selected_by_layer": {"0": [1, 3]}}),
+        encoding="utf-8",
+    )
+    manifest_file = tmp_path / "classes.json"
+    manifest_file.write_text(
+        json.dumps(
+            {
+                "schema": "vllm_uvm_static_alias_plan_classes_v1",
+                "initial_class": "cold70",
+                "classes": {
+                    "cold70": {
+                        "capacity_gib": 14.765625,
+                        "plan_file": "cold70.json",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    files, plans, capacities, initial = (
+        offload_utils._load_graph_static_alias_plan_classes(
+            str(manifest_file), name_plan
+        )
+    )
+    assert set(files) == {"cold70"}
+    assert plans == {"cold70": {0: (1, 3)}}
+    assert capacities == {"cold70": 14.765625}
+    assert initial == "cold70"
+
+
 def test_uvm_original_expert_slices_release_gpu_chunks_before_map(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1537,8 +1627,11 @@ def test_uvm_original_expert_slices_release_gpu_chunks_before_map(
     )
 
     registered: list[tuple[str, int, int, str]] = []
+    active_region_ids: set[str] = set()
 
     def register(region_id, base, length, *, state):
+        assert region_id not in active_region_ids
+        active_region_ids.add(region_id)
         registered.append((region_id, base, length, state))
 
     def release(region_ids, *, device, remote_read, include_audit):
@@ -1567,7 +1660,32 @@ def test_uvm_original_expert_slices_release_gpu_chunks_before_map(
         }
 
     monkeypatch.setattr(uvm_pool_residency, "register_uvm_region", register)
+    reconcile_calls: list[tuple[str, ...]] = []
+
+    def reconcile(region_ids, **kwargs):
+        requested = tuple(region_ids)
+        reconcile_calls.append(requested)
+        return {
+            "ok": True,
+            "physical_cpu_only": len(requested) == 1,
+            "reconciled": len(requested) == 1,
+        }
+
+    monkeypatch.setattr(
+        uvm_pool_residency,
+        "reconcile_uvm_regions_cpu_state_from_physical_residency",
+        reconcile,
+    )
     monkeypatch.setattr(uvm_pool_residency, "release_uvm_regions", release)
+    unregistered: list[str] = []
+
+    def unregister(region_ids):
+        unregistered.extend(region_ids)
+        for region_id in region_ids:
+            active_region_ids.remove(region_id)
+        return {"ok": True, "statuses": {region_id: True for region_id in region_ids}}
+
+    monkeypatch.setattr(uvm_pool_residency, "unregister_uvm_regions", unregister)
 
     result = offload_utils._release_uvm_original_alias_consumer_gpu_chunks(
         device=0
@@ -1579,11 +1697,117 @@ def test_uvm_original_expert_slices_release_gpu_chunks_before_map(
     assert result["requested_bytes"] == 2 * 64 * 1024
     assert result["released_bytes"] == 2 * 64 * 1024
     assert result["made_progress_count"] == 2
+    assert result["temporary_regions_unregistered"] is True
     assert len(result["geometry_sha256"]) == 64
+    assert unregistered == [entry[0] for entry in registered]
     assert [entry[1:3] for entry in registered] == [
         (0x400000, 64 * 1024),
         (0x420000, 64 * 1024),
     ]
+    assert active_region_ids == set()
+
+    second = offload_utils._release_uvm_original_alias_consumer_gpu_chunks(
+        device=0,
+        known_cpu_ranges={(0x400000, 64 * 1024)},
+    )
+    assert second["ok"] is True
+    assert second["known_cpu_range_count"] == 1
+    assert second["known_cpu_state_reconciliation"]["physical_cpu_only"] is True
+    assert [len(call) for call in reconcile_calls] == [2, 1, 2]
+    assert second["temporary_regions_unregistered"] is True
+    assert active_region_ids == set()
+    assert unregistered == [entry[0] for entry in registered]
+
+
+def test_uvm_original_initial_release_uses_full_parameter_shadow_cutover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.device_allocator import uvm
+
+    plan = offload_utils._GraphStaticAliasNamePlan(
+        layer_container="model.layers",
+        layer_index=3,
+        local_name="experts.w13_weight",
+        bank_id=1,
+        consumer_index=0,
+        consumer_count=1,
+    )
+    binding = offload_utils._UvmOriginalAliasBinding(
+        full_parameter_name="model.layers.3.experts.w13_weight",
+        arena=SimpleNamespace(),
+        consumer=SimpleNamespace(),
+        parameter=SimpleNamespace(),
+        plan=plan,
+        requested_bytes=2 * 64 * 1024,
+        expert_ids=(2, 7),
+        expert_stride_bytes=64 * 1024,
+        consumer_ranges=(
+            (0x400000, 64 * 1024),
+            (0x420000, 64 * 1024),
+        ),
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS",
+        {binding.full_parameter_name: binding},
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_PLAN_CLASS_SHADOW_RESULT",
+        {"enabled": True, "full_parameter_shadow": True},
+    )
+
+    cutover_calls: list[tuple[tuple[tuple[int, int], ...], int]] = []
+
+    def cutover(ranges, *, device: int):
+        normalized = tuple(ranges)
+        cutover_calls.append((normalized, device))
+        requested_bytes = sum(length for _, length in normalized)
+        return {
+            "ok": True,
+            "range_count": len(normalized),
+            "success_count": len(normalized),
+            "failure_count": 0,
+            "requested_bytes": requested_bytes,
+            "released_gpu_bytes": requested_bytes,
+            "retained_cpu_shadow_bytes": requested_bytes,
+            "remote_mapped_bytes": requested_bytes,
+        }
+
+    monkeypatch.setattr(
+        uvm,
+        "driver_cutover_ranges_to_immutable_cpu_shadow",
+        cutover,
+    )
+    monkeypatch.setattr(
+        uvm,
+        "driver_batch_query_ranges_residency_bytes",
+        lambda ranges, **_kwargs: {
+            "ok": True,
+            "queried_bytes": sum(length for _, length in ranges),
+            "cpu_bytes": sum(length for _, length in ranges),
+            "gpu_bytes": 0,
+            "any_bytes": sum(length for _, length in ranges),
+            "unknown_bytes": 0,
+        },
+    )
+
+    result = offload_utils._release_uvm_original_alias_consumer_gpu_chunks(
+        device=0,
+        known_cpu_ranges=((0x400000, 64 * 1024),),
+    )
+
+    assert result["ok"] is True
+    assert result["reason"] == "immutable_cpu_shadow_cutover"
+    assert result["region_count"] == 2
+    assert result["requested_bytes"] == 2 * 64 * 1024
+    assert result["attempted_bytes"] == 64 * 1024
+    assert result["released_bytes"] == 64 * 1024
+    assert result["made_progress_count"] == 1
+    assert result["known_cpu_range_count"] == 1
+    assert result["temporary_regions_unregistered"] is True
+    assert len(result["geometry_sha256"]) == 64
+    assert cutover_calls == [(((0x420000, 64 * 1024),), 0)]
 
 
 def test_uvm_original_expert_slice_release_audit_fails_closed(
@@ -1620,6 +1844,15 @@ def test_uvm_original_expert_slice_release_audit_fails_closed(
     )
     monkeypatch.setattr(
         uvm_pool_residency,
+        "reconcile_uvm_regions_cpu_state_from_physical_residency",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "physical_cpu_only": False,
+            "reconciled": False,
+        },
+    )
+    monkeypatch.setattr(
+        uvm_pool_residency,
         "release_uvm_regions",
         lambda region_ids, **kwargs: {
             "ok": True,
@@ -1635,6 +1868,14 @@ def test_uvm_original_expert_slice_release_audit_fails_closed(
                     "app_state_after": "cpu",
                 }
             },
+        },
+    )
+    monkeypatch.setattr(
+        uvm_pool_residency,
+        "unregister_uvm_regions",
+        lambda region_ids: {
+            "ok": True,
+            "statuses": {region_id: True for region_id in region_ids},
         },
     )
 
@@ -2187,6 +2428,32 @@ def test_uvm_dual_topology_runtime_requires_full_separate(
         offload_utils.validate_cpu_offload_graph_static_alias_runtime(invalid)
 
 
+def test_uvm_remote_only_runtime_rejects_full_separate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Fail closed: the always-remote large-Prefill Graph path can fault."""
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS", True)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE",
+        "remote_only",
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            enable_dbo=False,
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(name="FULL_SEPARATE"),
+            mode=SimpleNamespace(name="NONE"),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="FULL_SEPARATE is reserved"):
+        offload_utils.validate_cpu_offload_graph_static_alias_runtime(config)
+
+
 def test_full_separate_dispatcher_partitions_prefill_and_decode_keys():
     from vllm.config import CUDAGraphMode
     from vllm.forward_context import BatchDescriptor
@@ -2422,8 +2689,14 @@ def test_uvm_original_preserved_graph_requires_zero_h2d_certificate(
     assert reason == "ok"
 
 
+@pytest.mark.parametrize(
+    ("post_map_audit", "runtime_hot_audit"),
+    [(True, True), (True, False), (False, True)],
+)
 def test_uvm_original_transition_to_remote_audits_metadata(
     monkeypatch: pytest.MonkeyPatch,
+    post_map_audit: bool,
+    runtime_hot_audit: bool,
 ):
     from vllm.device_allocator import uvm
 
@@ -2456,6 +2729,12 @@ def test_uvm_original_transition_to_remote_audits_metadata(
         "prefill_remote_decode",
     )
     monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "sealed")
+    if not post_map_audit:
+        monkeypatch.setenv(
+            "VLLM_UVM_RUNTIME_POST_MAP_RESIDENCY_AUDIT", "0"
+        )
+    if not runtime_hot_audit:
+        monkeypatch.setenv("VLLM_UVM_RUNTIME_HOT_RESIDENCY_AUDIT", "0")
     monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID", 7)
     monkeypatch.setattr(
         offload_utils,
@@ -2528,6 +2807,14 @@ def test_uvm_original_transition_to_remote_audits_metadata(
         "driver_batch_query_ranges_residency_bytes",
         query_residency,
     )
+    if not (post_map_audit and runtime_hot_audit):
+        monkeypatch.setattr(
+            offload_utils,
+            "_uvm_original_alias_expected_shadow_cpu_bytes",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("disabled hot audit computed shadow coverage")
+            ),
+        )
 
     result = offload_utils.transition_cpu_offload_uvm_original_va_to_remote(
         reason="test_cutover",
@@ -2542,12 +2829,34 @@ def test_uvm_original_transition_to_remote_audits_metadata(
     assert result["remote_map"] == remote
     assert result["runtime_remote_range_count"] == 1
     assert result["runtime_remote_bytes"] == 4096
-    assert result["hot_runtime_remote_bytes"] == 4096
-    assert result["hot_expected_gpu_bytes"] == 4096
-    assert query_calls == [
-        ((0x400000, 4096),),
-        ((0x401000, 8192),),
-    ]
+    assert result["post_map_physical_audit_enabled"] is post_map_audit
+    assert result["hot_physical_audit_requested"] is runtime_hot_audit
+    hot_audit_enabled = post_map_audit and runtime_hot_audit
+    assert result["hot_physical_audit_enabled"] is hot_audit_enabled
+    assert result["hot_physical_audit_diagnostics_skipped"] is (
+        not hot_audit_enabled
+    )
+    assert result["hot_runtime_remote_bytes"] == (
+        4096 if hot_audit_enabled else 0
+    )
+    assert result["hot_expected_gpu_bytes"] == (
+        4096 if hot_audit_enabled else 0
+    )
+    if hot_audit_enabled:
+        assert result["physical_residency"]["cpu_bytes"] == 4096
+        assert result["hot_physical_residency"]["gpu_bytes"] == 4096
+        assert query_calls == [
+            ((0x400000, 4096),),
+            ((0x401000, 8192),),
+        ]
+    elif post_map_audit:
+        assert result["physical_residency"]["cpu_bytes"] == 4096
+        assert result["hot_physical_residency"] is None
+        assert query_calls == [((0x400000, 4096),)]
+    else:
+        assert result["physical_residency"] is None
+        assert result["hot_physical_residency"] is None
+        assert query_calls == []
     assert offload_utils._CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE is True
     assert offload_utils._CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE == "remote"
     assert destroy_calls == [
@@ -2555,8 +2864,455 @@ def test_uvm_original_transition_to_remote_audits_metadata(
             "graphs_destroyed": True,
             "synchronize": True,
             "remote_graphs_preserved": False,
+            "defer_cpu_restore": True,
         }
     ]
+
+
+def test_uvm_original_full_dual_view_skips_remote_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.device_allocator import uvm, uvm_static_alias
+
+    pointer = _FakeTensor(shape=(1024,), pointer=0x400000)
+    binding = SimpleNamespace(
+        full_parameter_name="model.layers.0.weight",
+        parameter=SimpleNamespace(data=pointer),
+        consumer=pointer,
+        requested_bytes=4096,
+        parameter_bytes=4096,
+        expert_ids=(0,),
+        consumer_ranges=((0x400000, 4096),),
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS", True)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND",
+        "uvm_original_va",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE",
+        "prefill_remote_decode",
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED", True
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "sealed"
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID", 7
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS",
+        {binding.full_parameter_name: binding},
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT", (0x400000,)
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY", [])
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY", []
+    )
+    monkeypatch.setattr(offload_utils.torch.cuda, "synchronize", lambda _=0: None)
+    monkeypatch.setattr(
+        offload_utils, "_uvm_original_alias_hot_cuda_read_gate", lambda **_: None
+    )
+    monkeypatch.setattr(
+        uvm_static_alias,
+        "driver_static_alias_park",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "dual_view_full_coverage": True,
+            "dual_view_block_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        uvm,
+        "driver_prepare_ranges_remote_read_audited",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("full dual view reinstalled CPU leaf mappings")
+        ),
+    )
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW", "1")
+    monkeypatch.setenv("VLLM_UVM_RUNTIME_POST_MAP_RESIDENCY_AUDIT", "0")
+    monkeypatch.setenv("VLLM_UVM_RUNTIME_HOT_RESIDENCY_AUDIT", "0")
+
+    result = offload_utils.transition_cpu_offload_uvm_original_va_to_remote(
+        reason="test_full_dual_cutover",
+        preserve_remote_graphs=True,
+    )
+
+    assert result["ok"] is True
+    assert result["post_state"] == "remote_parked"
+    assert result["remote_map_operation"] == "prebuilt_full_dual_view"
+    assert result["remote_map"]["reason"] == "prebuilt_full_dual_view"
+    assert result["remote_map"]["ioctl_calls"] == 0
+    assert result["remote_map"]["covered_bytes"] == 4096
+
+
+def test_uvm_original_profile_all_remote_then_restores_hot_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.device_allocator import uvm
+
+    pointer = _FakeTensor(shape=(2, 1), pointer=0x400000)
+    binding = SimpleNamespace(
+        full_parameter_name="model.layers.0.weight",
+        parameter=SimpleNamespace(data=pointer),
+        consumer=pointer,
+        requested_bytes=4096,
+        parameter_bytes=8192,
+        expert_ids=(1,),
+        consumer_ranges=((0x401000, 4096),),
+    )
+    monkeypatch.setenv("VLLM_UVM_PROFILE_ALL_EXPERTS_REMOTE", "1")
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS", True)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND",
+        "uvm_original_va",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE",
+        "prefill_graph_remote_decode",
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "sealed")
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE", False)
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE", False
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS",
+        {binding.full_parameter_name: binding},
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT", (0x400000,)
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_HISTORY", [])
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY", []
+    )
+    monkeypatch.setattr(offload_utils.torch.cuda, "synchronize", lambda device=0: None)
+    empty_cache_calls: list[str] = []
+    monkeypatch.setattr(
+        offload_utils.torch.cuda,
+        "empty_cache",
+        lambda: empty_cache_calls.append("empty_cache"),
+    )
+    monkeypatch.setattr(
+        offload_utils.torch.cuda,
+        "memory_reserved",
+        lambda device=0: 1234,
+    )
+    monkeypatch.setattr(
+        offload_utils.torch.cuda,
+        "mem_get_info",
+        lambda device=0: (512 * 1024 * 1024, 32 * 1024 * 1024 * 1024),
+    )
+
+    def destroy(**_kwargs):
+        offload_utils._CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID = 0
+        offload_utils._CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "remote"
+        return {"ok": True, "state": "remote", "session_id": 0}
+
+    monkeypatch.setattr(
+        offload_utils, "destroy_cpu_offload_graph_static_alias", destroy
+    )
+    remote_calls: list[tuple[tuple[int, int], ...]] = []
+
+    def prepare_cpu(ranges, **_kwargs):
+        normalized = tuple(ranges)
+        assert normalized == ((0x400000, 4096),)
+        return len(normalized), "cpp_batch_native_cuda", len(normalized), len(
+            normalized
+        ), len(normalized)
+
+    def prepare_remote(ranges, **_kwargs):
+        normalized = tuple(ranges)
+        remote_calls.append(normalized)
+        total = sum(length for _, length in normalized)
+        return {
+            "ok": True,
+            "requested_count": len(normalized),
+            "success_count": len(normalized),
+            "failure_count": 0,
+            "requested_bytes": total,
+            "cpu_resident_bytes": total,
+            "remote_mapped_bytes": total,
+            "covered_bytes": total,
+            "unknown_bytes": 0,
+        }
+
+    hot_on_gpu = False
+
+    def advise_hot(ranges, _device):
+        return len(tuple(ranges))
+
+    def prefetch_hot(ranges, _device, *, executor):
+        nonlocal hot_on_gpu
+        normalized = tuple(ranges)
+        hot_on_gpu = True
+        return len(normalized), executor, 0
+
+    def query(ranges, **_kwargs):
+        normalized = tuple(ranges)
+        total = sum(length for _, length in normalized)
+        is_hot = normalized == ((0x400000, 4096),)
+        gpu_bytes = total if is_hot and hot_on_gpu else 0
+        return {
+            "ok": True,
+            "queried_bytes": total,
+            "cpu_bytes": total - gpu_bytes,
+            "gpu_bytes": gpu_bytes,
+            "any_bytes": total,
+            "unknown_bytes": 0,
+        }
+
+    monkeypatch.setattr(
+        uvm,
+        "batch_prepare_ranges_for_native_remote_access_with_executor",
+        prepare_cpu,
+    )
+    monkeypatch.setattr(
+        uvm, "driver_prepare_ranges_remote_read_audited", prepare_remote
+    )
+    monkeypatch.setattr(
+        uvm, "batch_advise_ranges_preferred_location", advise_hot
+    )
+    monkeypatch.setattr(
+        uvm, "batch_prefetch_ranges_to_device_with_executor", prefetch_hot
+    )
+    monkeypatch.setattr(uvm, "driver_batch_query_ranges_residency_bytes", query)
+
+    prepared = offload_utils.prepare_cpu_offload_uvm_original_va_profile_topology()
+    assert prepared["ok"] is True
+    assert prepared["reason"] == "prepared"
+    assert prepared["hot_bytes"] == 4096
+    assert offload_utils.cpu_offload_uvm_original_va_profile_all_remote_active()
+    assert remote_calls == [((0x400000, 4096),), ((0x401000, 4096),)]
+    empty_cache_calls.clear()
+
+    restored = (
+        offload_utils.reconcile_cpu_offload_uvm_original_va_remote_graph_residency(
+            preserve_allocator_cache=True
+        )
+    )
+    assert restored["ok"] is True
+    assert restored["allocator_cache_preserved"] is True
+    assert restored["allocator_reserved_before"] == 1234
+    assert restored["allocator_reserved_after_cleanup"] == 1234
+    assert restored["allocator_reserved_after"] == 1234
+    assert empty_cache_calls == []
+    assert restored["profile_all_remote_before"] is True
+    assert restored["profile_all_remote_after"] is False
+    assert restored["hot_physical_residency"]["gpu_bytes"] == 4096
+    assert not offload_utils.cpu_offload_uvm_original_va_profile_all_remote_active()
+
+
+def test_uvm_original_profile_uses_full_parameter_shadow_cutover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.device_allocator import uvm
+
+    pointer = _FakeTensor(shape=(2, 1), pointer=0x400000)
+    binding = SimpleNamespace(
+        full_parameter_name="model.layers.0.weight",
+        parameter=SimpleNamespace(data=pointer),
+        consumer=pointer,
+        requested_bytes=4096,
+        parameter_bytes=8192,
+        expert_ids=(1,),
+        consumer_ranges=((0x401000, 4096),),
+    )
+    monkeypatch.setenv("VLLM_UVM_PROFILE_ALL_EXPERTS_REMOTE", "1")
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS", True)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND",
+        "uvm_original_va",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE",
+        "prefill_graph_remote_decode",
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "sealed")
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE", False)
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PROFILE_ALL_REMOTE_ACTIVE", False
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS",
+        {binding.full_parameter_name: binding},
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_PLAN_CLASS_SHADOW_RESULT",
+        {"enabled": True, "full_parameter_shadow": True},
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY", []
+    )
+    monkeypatch.setattr(offload_utils.torch.cuda, "synchronize", lambda device=0: None)
+
+    cutover_calls: list[tuple[tuple[int, int], ...]] = []
+    hot_cutover_done = False
+
+    def shadow_cutover(ranges, **_kwargs):
+        nonlocal hot_cutover_done
+        normalized = tuple(ranges)
+        cutover_calls.append(normalized)
+        hot_cutover_done = True
+        total = sum(length for _, length in normalized)
+        return {
+            "ok": True,
+            "range_count": len(normalized),
+            "success_count": len(normalized),
+            "failure_count": 0,
+            "requested_bytes": total,
+            "released_gpu_bytes": total,
+            "retained_cpu_shadow_bytes": total,
+            "remote_mapped_bytes": total,
+            "ioctl_calls": 1,
+        }
+
+    monkeypatch.setattr(
+        uvm, "driver_cutover_ranges_to_immutable_cpu_shadow", shadow_cutover
+    )
+    monkeypatch.setattr(
+        uvm,
+        "batch_prepare_ranges_for_native_remote_access_with_executor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("full Parameter shadow used native migration")
+        ),
+    )
+    monkeypatch.setattr(
+        uvm,
+        "driver_prepare_ranges_remote_read_audited",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("shadow cutover reinstalled the hot CPU mapping")
+        ),
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "transition_cpu_offload_uvm_original_va_to_remote",
+        lambda **_kwargs: {"ok": True, "post_state": "remote_parked"},
+    )
+
+    def query(ranges, **_kwargs):
+        normalized = tuple(ranges)
+        total = sum(length for _, length in normalized)
+        return {
+            "ok": True,
+            "queried_bytes": total,
+            "cpu_bytes": total,
+            "gpu_bytes": 0 if hot_cutover_done else total,
+            "any_bytes": total,
+            "unknown_bytes": 0,
+        }
+
+    monkeypatch.setattr(uvm, "driver_batch_query_ranges_residency_bytes", query)
+
+    prepared = offload_utils.prepare_cpu_offload_uvm_original_va_profile_topology()
+
+    assert prepared["ok"] is True
+    assert prepared["hot_prepare_operation"] == "immutable_cpu_shadow_cutover"
+    assert prepared["hot_prepare"][1] == "immutable_cpu_shadow_cutover"
+    assert prepared["hot_shadow_cutover"]["released_gpu_bytes"] == 4096
+    assert prepared["hot_remote_map"]["reason"] == "immutable_cpu_shadow_cutover"
+    assert cutover_calls == [((0x400000, 4096),)]
+
+
+def test_sealed_hot_reconcile_skips_prefetch_when_already_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.device_allocator import uvm
+
+    pointer = _FakeTensor(shape=(2, 1), pointer=0x400000)
+    binding = SimpleNamespace(
+        full_parameter_name="model.layers.0.weight",
+        parameter=SimpleNamespace(data=pointer),
+        consumer=pointer,
+        requested_bytes=4096,
+        parameter_bytes=8192,
+        expert_ids=(1,),
+        consumer_ranges=((0x401000, 4096),),
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS", True)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND",
+        "uvm_original_va",
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "sealed"
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE", False)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS",
+        {binding.full_parameter_name: binding},
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_ORIGINAL_VA_SNAPSHOT", (0x400000,)
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PLAN_CLASS_SHADOW_RESULT", None
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PHASE_TRANSITION_HISTORY", []
+    )
+    monkeypatch.setattr(offload_utils.torch.cuda, "synchronize", lambda _=0: None)
+    monkeypatch.setattr(
+        offload_utils.torch.cuda,
+        "mem_get_info",
+        lambda _=0: (512 * 1024 * 1024, 32 * 1024 * 1024 * 1024),
+    )
+    monkeypatch.setattr(
+        offload_utils.torch.cuda, "memory_reserved", lambda _=0: 1234
+    )
+    monkeypatch.setattr(
+        uvm,
+        "driver_batch_query_ranges_residency_bytes",
+        lambda ranges, **_kwargs: {
+            "ok": True,
+            "queried_bytes": sum(length for _, length in ranges),
+            "cpu_bytes": 0,
+            "gpu_bytes": sum(length for _, length in ranges),
+            "any_bytes": sum(length for _, length in ranges),
+            "unknown_bytes": 0,
+        },
+    )
+    monkeypatch.setattr(
+        uvm,
+        "batch_advise_ranges_preferred_location",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("already-resident hot ranges were re-advised")
+        ),
+    )
+    monkeypatch.setattr(
+        uvm,
+        "batch_prefetch_ranges_to_device_with_executor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("already-resident hot ranges were re-prefetched")
+        ),
+    )
+
+    result = (
+        offload_utils.reconcile_cpu_offload_uvm_original_va_sealed_hot_residency()
+    )
+
+    assert result["ok"] is True
+    assert result["hot_prefetch_skipped_already_resident"] is True
+    assert result["hot_prefetch_count"] == 0
+    assert result["hot_physical_residency_before"]["gpu_bytes"] == 4096
+    assert result["hot_physical_residency_after"]["gpu_bytes"] == 4096
 
 
 def test_uvm_original_graph_capture_repairs_hot_residency_and_fails_closed(
@@ -2888,6 +3644,717 @@ def test_uvm_plan_class_delta_preserves_slots_and_touches_only_changed_experts(
         ("advise", removed_ranges),
         ("prefetch", removed_ranges),
     ]
+
+
+@pytest.mark.parametrize(
+    ("lifecycle_state", "remote_map_active", "maximum_delta_entries"),
+    [("sealed", False, 1152), ("remote_parked", True, 1152), ("sealed", False, 1)],
+)
+def test_uvm_remove_detaches_alias_before_gpu_residency(
+    monkeypatch: pytest.MonkeyPatch,
+    lifecycle_state: str,
+    remote_map_active: bool,
+    maximum_delta_entries: int,
+) -> None:
+    from vllm.device_allocator import uvm, uvm_static_alias
+
+    expert_bytes = 4096
+    full_name = "model.layers.0.experts.weight"
+    consumer = _FakeTensor(pointer=0x400000)
+    upload = _FakeTensor(pointer=0x500000)
+    source = _FakeTensor(device="cpu", pinned=True, pointer=0x600000)
+    arena = SimpleNamespace(
+        upload=upload,
+        requested_bytes=2 * expert_bytes,
+        aligned_bytes=2 * expert_bytes,
+        envelope_expert_count=2,
+        pte_flags=0,
+    )
+    binding = SimpleNamespace(
+        full_parameter_name=full_name,
+        parameter=SimpleNamespace(data=consumer),
+        consumer=consumer,
+        source=source,
+        arena=arena,
+        requested_bytes=2 * expert_bytes,
+        expert_ids=(0, 1),
+        expert_stride_bytes=expert_bytes,
+        consumer_ranges=((0x400000, expert_bytes), (0x401000, expert_bytes)),
+    )
+    old_plan = {0: (0, 1)}
+    target_plan = {0: (0,)}
+    old_geometry = {
+        full_name: (
+            (0, 1),
+            expert_bytes,
+            2 * expert_bytes,
+            (2, expert_bytes),
+            (expert_bytes, 1),
+            ((0x400000, expert_bytes), (0x401000, expert_bytes)),
+        )
+    }
+    target_geometry = {
+        full_name: (
+            (0,),
+            expert_bytes,
+            expert_bytes,
+            (1, expert_bytes),
+            (expert_bytes, 1),
+            ((0x400000, expert_bytes),),
+        )
+    }
+    rw = uvm_static_alias.UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW
+    retained = (
+        (0, 0, 0, rw, 0x500000, expert_bytes, 0),
+        (0, 0, 0, 0, 0x400000, expert_bytes, 0),
+    )
+    removed = (
+        (0, 1, 1, rw, 0x501000, expert_bytes, 0),
+        (0, 1, 1, 0, 0x401000, expert_bytes, 0),
+    )
+    old_entries = retained + removed
+    target_entries = retained
+    target_preallocate = (
+        (0x500000, expert_bytes, 0, 0, 0, 0, uvm.UVM_MOE_SLOT_REMAP_FLAG_NO_EVICT),
+    )
+
+    monkeypatch.delenv("VLLM_CPU_OFFLOAD_PLAN_CLASS_PRECOMPILE", raising=False)
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_PLAN_CLASS_QUIESCED_DELTA", "1")
+    monkeypatch.setattr(
+        uvm_static_alias,
+        "UVM_MOE_STATIC_ALIAS_MAX_ENTRIES",
+        maximum_delta_entries,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS",
+        {"cold30": old_plan, "cold29": target_plan},
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASS_FILES",
+        {"cold30": "cold30.json", "cold29": "cold29.json"},
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_ACTIVE_PLAN_CLASS",
+        "cold30",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_LAYER",
+        old_plan,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE",
+        "cold30.json",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN",
+        {full_name: SimpleNamespace(layer_index=0)},
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS", {full_name: binding}
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_ARENAS",
+        {("model.layers", "experts.weight", 0): arena},
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_MAX_BYTES", 1 << 30)
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_OWNER_DEVICE_INDEX", 0)
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID", 7)
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", lifecycle_state
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE", remote_map_active
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_REMOTE_MAP_RESULT",
+        {"ok": True} if remote_map_active else None,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES",
+        2 * expert_bytes,
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_ENVELOPE_BYTES", 2 * expert_bytes
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_PLAN_GENERATION", 0)
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_PLAN_CLASS_INSTRUCTIONS", {})
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_PLAN_CLASS_SWITCH_HISTORY", [])
+
+    monkeypatch.setattr(
+        offload_utils,
+        "_uvm_original_alias_plan_geometry",
+        lambda plan: old_geometry if plan == old_plan else target_geometry,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_uvm_original_alias_stabilize_plan_slots",
+        lambda old, target: (target, {"changed_slot_count": 1}),
+    )
+    map_entry_calls = 0
+
+    def map_entries(_pte_flags: int):
+        nonlocal map_entry_calls
+        map_entry_calls += 1
+        return old_entries if map_entry_calls == 1 else target_entries
+
+    monkeypatch.setattr(offload_utils, "_uvm_original_alias_map_entries", map_entries)
+    monkeypatch.setattr(
+        offload_utils,
+        "_uvm_original_alias_preallocate_entries",
+        lambda: target_preallocate,
+    )
+
+    def apply_geometry(geometry, *, refill_sources: bool):
+        assert geometry is target_geometry
+        assert refill_sources is False
+        offload_utils._CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES = expert_bytes
+        return expert_bytes
+
+    monkeypatch.setattr(
+        offload_utils, "_apply_uvm_original_alias_plan_geometry", apply_geometry
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_refill_uvm_original_alias_plan_delta",
+        lambda old, target: {"changed_slot_count": 0, "changed_bytes": 0},
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_uvm_original_alias_plan_residency_delta_ranges",
+        lambda old, target: ((), ((0x401000, expert_bytes),)),
+    )
+    monkeypatch.setattr(
+        offload_utils, "_uvm_original_parameter_va_snapshot", lambda: (0x400000,)
+    )
+    monkeypatch.setattr(offload_utils.torch.cuda, "synchronize", lambda device=0: None)
+    monkeypatch.setattr(offload_utils, "_append_cpu_offload_manifest", lambda _item: None)
+
+    events: list[str] = []
+
+    def remove(session_id: int, entries, **_kwargs):
+        assert session_id == 7
+        assert tuple(entries) == removed
+        events.append("remove")
+        return {"ok": True, "ioctl_calls": 1, "side_effect_indeterminate": False}
+
+    def residency(
+        old, target, *, device: int, prepared_ranges, advise_removed: bool
+    ):
+        expected_prefix = (
+            ["remove"]
+            if maximum_delta_entries >= len(removed)
+            else ["park", "rebind", "resume"]
+        )
+        assert events == expected_prefix
+        assert advise_removed is False
+        events.append("residency")
+        return {"ok": True, "removed_cold_range_count": 1}
+
+    monkeypatch.setattr(
+        uvm_static_alias, "driver_static_alias_quiesced_remove", remove
+    )
+    monkeypatch.setattr(
+        offload_utils, "_prepare_uvm_original_alias_plan_residency_delta", residency
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "refresh_cpu_offload_uvm_original_va_full_dual_view",
+        lambda *, nested_refresh=None: events.append(
+            f"refresh:{nested_refresh}"
+        )
+        or {"ok": True, "nested_refresh": nested_refresh},
+    )
+    if maximum_delta_entries >= len(removed):
+        monkeypatch.setattr(
+            uvm_static_alias,
+            "driver_static_alias_park",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("PARK must not run")
+            ),
+        )
+        monkeypatch.setattr(
+            uvm_static_alias,
+            "driver_static_alias_resume",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("RESUME must not run")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            uvm_static_alias,
+            "driver_static_alias_quiesced_remove",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("oversized delta must use full REBIND")
+            ),
+        )
+        monkeypatch.setattr(
+            uvm_static_alias,
+            "driver_static_alias_park",
+            lambda *_args, **_kwargs: events.append("park") or {"ok": True},
+        )
+        monkeypatch.setattr(
+            uvm_static_alias,
+            "driver_static_alias_rebind",
+            lambda *_args, **_kwargs: events.append("rebind")
+            or {"ok": True, "side_effect_indeterminate": False},
+        )
+        monkeypatch.setattr(
+            uvm_static_alias,
+            "driver_static_alias_resume",
+            lambda *_args, **_kwargs: events.append("resume") or {"ok": True},
+        )
+
+    result = offload_utils.switch_cpu_offload_uvm_original_va_plan_class(
+        "cold29", reason="unit_test", graphs_retained=True
+    )
+
+    assert result["ok"] is True
+    assert result["quiesced_delta_used"] is (
+        maximum_delta_entries >= len(removed)
+    )
+    assert result["quiesced_delta_remove_count"] == 2
+    expected_events = (
+        ["remove", "residency", "refresh:False"]
+        if maximum_delta_entries >= len(removed)
+        else ["park", "rebind", "resume", "residency", "refresh:False"]
+    )
+    assert events == expected_events
+    assert result["post_restore_dual_refresh"] == {
+        "ok": True,
+        "nested_refresh": False,
+    }
+
+
+def test_uvm_mixed_plan_residency_merges_pre_and_post_detach_phases() -> None:
+    before = {
+        "mode": "immutable_cpu_shadow_delta",
+        "immutable_cpu_shadow_enabled": True,
+        "shadow_cutover": {"ok": True},
+        "added_cold_range_count": 2,
+        "added_cold_bytes": 8192,
+        "removed_cold_range_count": 0,
+        "removed_cold_bytes": 0,
+        "prepare": {"ok": True},
+        "advice_requested": False,
+        "advised_count": 0,
+        "prefetched_count": 0,
+        "prefetch_executor": "none",
+        "prefetch_driver_result": 0,
+        "added_cold_residency": {"gpu_bytes": 0, "cpu_bytes": 8192},
+        "removed_cold_residency": None,
+    }
+    after = {
+        "mode": "immutable_cpu_shadow_delta",
+        "immutable_cpu_shadow_enabled": True,
+        "shadow_cutover": None,
+        "added_cold_range_count": 0,
+        "added_cold_bytes": 0,
+        "removed_cold_range_count": 3,
+        "removed_cold_bytes": 12288,
+        "prepare": (0, "none", 0),
+        "advice_requested": False,
+        "advised_count": 0,
+        "prefetched_count": 3,
+        "prefetch_executor": "cpp_batch",
+        "prefetch_driver_result": 0,
+        "added_cold_residency": None,
+        "removed_cold_residency": {"gpu_bytes": 12288, "cpu_bytes": 12288},
+    }
+
+    result = offload_utils._merge_uvm_original_alias_plan_residency_phases(
+        before, after
+    )
+
+    assert result is not None
+    assert result["mode"] == "split_deferred_removed"
+    assert result["added_cold_range_count"] == 2
+    assert result["removed_cold_range_count"] == 3
+    assert result["prefetched_count"] == 3
+    assert result["added_cold_residency"] == before["added_cold_residency"]
+    assert result["removed_cold_residency"] == after["removed_cold_residency"]
+
+
+def test_uvm_nested_plan_class_prefill_eliminates_runtime_source_refill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expert_bytes = 16
+    parameter = torch.stack(
+        [
+            torch.full((expert_bytes,), 20 + expert, dtype=torch.uint8)
+            for expert in range(6)
+        ]
+    )
+    source = torch.full((4, expert_bytes), 0xEE, dtype=torch.uint8)
+    source[0].copy_(parameter[0])
+    source[1].copy_(parameter[1])
+    full_name = "model.layers.0.experts.weight"
+    binding = SimpleNamespace(
+        full_parameter_name=full_name,
+        parameter=SimpleNamespace(data=parameter),
+        consumer=parameter,
+        source=source,
+        source_slot_expert_ids=[0, 1, None, None],
+        expert_ids=(0, 1),
+        expert_stride_bytes=expert_bytes,
+        plan=SimpleNamespace(layer_index=0),
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS",
+        {full_name: binding},
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS",
+        {
+            "c2": {0: (0, 1)},
+            "c4": {0: (0, 1, 2, 3)},
+        },
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_INITIAL_PLAN_CLASS",
+        "c2",
+    )
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_PLAN_CLASS_PREFILL_SOURCES", "1")
+
+    prefill = offload_utils._prefill_uvm_original_alias_plan_class_sources()
+
+    assert prefill["enabled"] is True
+    assert prefill["copied_slot_count"] == 2
+    assert prefill["copied_bytes"] == 2 * expert_bytes
+    assert binding.source_slot_expert_ids == [0, 1, 2, 3]
+    assert torch.equal(source[2], parameter[2])
+    assert torch.equal(source[3], parameter[3])
+
+    base = int(parameter.data_ptr())
+
+    def geometry(expert_ids: tuple[int, ...]):
+        return {
+            full_name: (
+                expert_ids,
+                expert_bytes,
+                len(expert_ids) * expert_bytes,
+                (len(expert_ids), expert_bytes),
+                (expert_bytes, 1),
+                tuple(
+                    (base + expert * expert_bytes, expert_bytes)
+                    for expert in expert_ids
+                ),
+            )
+        }
+
+    old_geometry = geometry((0, 1))
+    target_geometry, _ = offload_utils._uvm_original_alias_stabilize_plan_slots(
+        old_geometry,
+        geometry((0, 1, 2, 3)),
+    )
+    refill = offload_utils._refill_uvm_original_alias_plan_delta(
+        old_geometry,
+        target_geometry,
+    )
+    assert refill["requested_slot_count"] == 2
+    assert refill["changed_slot_count"] == 0
+    assert refill["changed_bytes"] == 0
+    assert refill["reused_prefilled_slot_count"] == 2
+    assert refill["reused_prefilled_bytes"] == 2 * expert_bytes
+
+
+def test_uvm_single_plan_class_certifies_existing_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expert_bytes = 16
+    parameter = torch.stack(
+        [torch.full((expert_bytes,), expert, dtype=torch.uint8) for expert in range(3)]
+    )
+    source = parameter[:2].clone()
+    binding = SimpleNamespace(
+        full_parameter_name="model.layers.0.experts.weight",
+        parameter=SimpleNamespace(data=parameter),
+        consumer=parameter,
+        source=source,
+        source_slot_expert_ids=[0, 1],
+        expert_ids=(0, 1),
+        expert_stride_bytes=expert_bytes,
+        plan=SimpleNamespace(layer_index=0),
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS",
+        {binding.full_parameter_name: binding},
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS",
+        {"cold70": {0: (0, 1)}},
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_INITIAL_PLAN_CLASS",
+        "cold70",
+    )
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_PLAN_CLASS_PREFILL_SOURCES", "1")
+
+    result = offload_utils._prefill_uvm_original_alias_plan_class_sources()
+
+    assert result["enabled"] is True
+    assert result["ordered_classes"] == ("cold70",)
+    assert result["copied_slot_count"] == 0
+    assert result["reused_slot_count"] == 2
+
+
+def test_uvm_plan_class_initialization_materializes_future_cpu_shadows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.device_allocator import uvm
+
+    expert_bytes = 64 * 1024
+    parameter_base = 0x400000
+    full_name = "model.layers.0.experts.weight"
+    binding = SimpleNamespace(
+        full_parameter_name=full_name,
+        consumer=_FakeTensor(pointer=parameter_base),
+        source=_FakeTensor(device="cpu", pinned=True, pointer=0x800000),
+        expert_ids=(0, 1),
+        expert_stride_bytes=expert_bytes,
+        plan=SimpleNamespace(layer_index=0),
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS",
+        {full_name: binding},
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERTS_BY_CLASS",
+        {
+            "cold2": {0: (0, 1)},
+            "cold3": {0: (0, 1, 3)},
+        },
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_INITIAL_PLAN_CLASS",
+        "cold2",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_PLAN_CLASS_SOURCE_PREFILL_RESULT",
+        {"enabled": True},
+    )
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_PLAN_CLASS_IMMUTABLE_CPU_SHADOW", "1")
+
+    expected_ranges = ((parameter_base + 3 * expert_bytes, expert_bytes),)
+    calls: list[tuple[str, tuple[tuple[int, int], ...]]] = []
+
+    def advise(ranges, *, device: int):
+        assert device == 0
+        calls.append(("read_mostly", tuple(ranges)))
+        return len(ranges)
+
+    def prefetch_cpu(ranges):
+        calls.append(("prefetch_cpu", tuple(ranges)))
+        return len(ranges)
+
+    def query(ranges, **_kwargs):
+        normalized = tuple(ranges)
+        calls.append(("query", normalized))
+        total = sum(length for _, length in normalized)
+        return {
+            "ok": True,
+            "queried_bytes": total,
+            "cpu_bytes": total,
+            "gpu_bytes": total,
+            "any_bytes": total,
+            "unknown_bytes": 0,
+        }
+
+    monkeypatch.setattr(uvm, "batch_advise_ranges_read_mostly", advise)
+    monkeypatch.setattr(uvm, "batch_prefetch_ranges_to_cpu", prefetch_cpu)
+    monkeypatch.setattr(uvm, "driver_batch_query_ranges_residency_bytes", query)
+    monkeypatch.setattr(offload_utils.torch.cuda, "synchronize", lambda _device=0: None)
+
+    result = offload_utils._prepare_uvm_original_alias_plan_class_immutable_shadows(
+        device=0
+    )
+
+    assert result["enabled"] is True
+    assert result["reason"] == "read_duplicate_shadows_ready"
+    assert result["initial_class"] == "cold2"
+    assert result["range_count"] == 1
+    assert result["requested_bytes"] == expert_bytes
+    assert result["readmostly_count"] == 1
+    assert result["prefetched_count"] == 1
+    assert len(result["geometry_sha256"]) == 64
+    assert calls == [
+        ("read_mostly", expected_ranges),
+        ("prefetch_cpu", expected_ranges),
+        ("query", expected_ranges),
+    ]
+
+
+def test_uvm_plan_class_full_parameter_shadow_preserves_managed_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.device_allocator import uvm
+
+    parameter_bytes = 2 * 1024 * 1024
+    parameter_base = 0x400000
+    full_name = "model.layers.0.experts.weight"
+    consumer = _FakeTensor(
+        shape=(parameter_bytes,),
+        stride=(1,),
+        dtype=torch.uint8,
+        pointer=parameter_base,
+    )
+    binding = SimpleNamespace(consumer=consumer)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS",
+        {full_name: binding},
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_INITIAL_PLAN_CLASS",
+        "cold2",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_PLAN_CLASS_SOURCE_PREFILL_RESULT",
+        {"enabled": True},
+    )
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_PLAN_CLASS_IMMUTABLE_CPU_SHADOW", "1")
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_DUAL_VIEW_FULL_PARAMETER_SHADOW", "1")
+
+    expected_ranges = ((parameter_base, parameter_bytes),)
+    calls: list[tuple[str, tuple[tuple[int, int], ...]]] = []
+
+    def advise(ranges, *, device: int):
+        assert device == 0
+        calls.append(("read_mostly", tuple(ranges)))
+        return len(ranges)
+
+    def prefetch_cpu(ranges):
+        calls.append(("prefetch_cpu", tuple(ranges)))
+        return len(ranges)
+
+    def query(ranges, **_kwargs):
+        normalized = tuple(ranges)
+        calls.append(("query", normalized))
+        total = sum(length for _, length in normalized)
+        return {
+            "ok": True,
+            "queried_bytes": total,
+            "cpu_bytes": total,
+            "gpu_bytes": total,
+            "any_bytes": total,
+            "unknown_bytes": 0,
+        }
+
+    monkeypatch.setattr(uvm, "batch_advise_ranges_read_mostly", advise)
+    monkeypatch.setattr(uvm, "batch_prefetch_ranges_to_cpu", prefetch_cpu)
+    monkeypatch.setattr(uvm, "driver_batch_query_ranges_residency_bytes", query)
+    monkeypatch.setattr(offload_utils.torch.cuda, "synchronize", lambda _device=0: None)
+
+    result = offload_utils._prepare_uvm_original_alias_plan_class_immutable_shadows(
+        device=0
+    )
+
+    assert result["enabled"] is True
+    assert result["reason"] == "full_parameter_read_duplicate_shadows_ready"
+    assert result["full_parameter_shadow"] is True
+    assert result["initial_class"] == "cold2"
+    assert result["range_count"] == 1
+    assert result["requested_bytes"] == parameter_bytes
+    assert result["readmostly_count"] == 1
+    assert result["prefetched_count"] == 1
+    assert len(result["geometry_sha256"]) == 64
+    assert calls == [
+        ("read_mostly", expected_ranges),
+        ("prefetch_cpu", expected_ranges),
+        ("query", expected_ranges),
+    ]
+
+
+def test_uvm_fixed_plan_full_parameter_shadow_needs_no_class_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.device_allocator import uvm
+
+    parameter_bytes = 2 * 1024 * 1024
+    parameter_base = 0x600000
+    consumer = _FakeTensor(
+        shape=(parameter_bytes,),
+        stride=(1,),
+        dtype=torch.uint8,
+        pointer=parameter_base,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_BINDINGS",
+        {"model.layers.0.experts.weight": SimpleNamespace(consumer=consumer)},
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_INITIAL_PLAN_CLASS",
+        None,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_PLAN_CLASS_SOURCE_PREFILL_RESULT",
+        {"enabled": False, "reason": "plan_classes_unavailable"},
+    )
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_PLAN_CLASS_IMMUTABLE_CPU_SHADOW", "1")
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_DUAL_VIEW_FULL_PARAMETER_SHADOW", "1")
+
+    expected_ranges = ((parameter_base, parameter_bytes),)
+    monkeypatch.setattr(
+        uvm,
+        "batch_advise_ranges_read_mostly",
+        lambda ranges, **_kwargs: len(tuple(ranges)),
+    )
+    monkeypatch.setattr(
+        uvm,
+        "batch_prefetch_ranges_to_cpu",
+        lambda ranges: len(tuple(ranges)),
+    )
+    monkeypatch.setattr(
+        uvm,
+        "driver_batch_query_ranges_residency_bytes",
+        lambda ranges, **_kwargs: {
+            "ok": True,
+            "queried_bytes": parameter_bytes,
+            "cpu_bytes": parameter_bytes,
+            "gpu_bytes": parameter_bytes,
+            "any_bytes": parameter_bytes,
+            "unknown_bytes": 0,
+        },
+    )
+    monkeypatch.setattr(
+        offload_utils.torch.cuda, "synchronize", lambda _device=0: None
+    )
+
+    result = offload_utils._prepare_uvm_original_alias_plan_class_immutable_shadows(
+        device=0
+    )
+
+    assert result["enabled"] is True
+    assert result["reason"] == "full_parameter_read_duplicate_shadows_ready"
+    assert result["full_parameter_shadow"] is True
+    assert result["fixed_plan_full_parameter_shadow"] is True
+    assert result["initial_class"] is None
+    assert result["range_count"] == 1
+    assert result["requested_bytes"] == parameter_bytes
+    assert expected_ranges == ((parameter_base, parameter_bytes),)
 
 
 def test_uvm_plan_class_certificate_activation_restores_class_bundle(

@@ -8,13 +8,14 @@ KT_PY="${KT_ROOT}/.venv/bin/python"
 VLLM_PY="${REPO_ROOT}/workloads/vllm/vllm/.venv/bin/python"
 BENCHMARK="${REPO_ROOT}/experiments/ktransformers_cpu_expert_compare/benchmark_sglang_stream.py"
 PREPARE_FIXTURES="${REPO_ROOT}/experiments/custom_cold_qwen_sharegpt_concurrency_snapshot/prepare_sharegpt_fixtures.py"
-REFERENCE_SNAPSHOT="${REPO_ROOT}/experiments/native_uva_qwen_sharegpt_concurrency_snapshot/snapshot_20260812.json"
+REFERENCE_SNAPSHOT="${REFERENCE_SNAPSHOT:-${REPO_ROOT}/experiments/eurosys_moe_offload_evaluation/inputs/e9_sharegpt_selection_reference_20260828.json}"
 PREPARE_STATS="${SCRIPT_DIR}/prepare_kt_frequency_stats.py"
 VERIFY_CASE="${SCRIPT_DIR}/verify_kt_qualification_case.py"
 SUMMARIZER="${SCRIPT_DIR}/summarize_kt_qualification.py"
 
-EXPECTED_KT_COMMIT="eb9b70c4115cff151ace2cae5b0fc9db3690e31e"
-EXPECTED_SGLANG_COMMIT="bc7f0058fafe6c05dc6ad52d6b1c854af2a673b2"
+EXPECTED_KT_COMMIT="8d9325af331d916721dfe7e2104f93f9b268678b"
+EXPECTED_SGLANG_COMMIT="a1b31959e60c7bc989650aef507a74e41e567f56"
+EXPECTED_SGLANG_PATCH_SHA256="bf4d341c6c90d3f22f9dcb3165beac822bb3026e2a4ae8ca1a7989329fdb9374"
 EXPECTED_MODEL_SNAPSHOT="d206ba732169f29bb77fbf80fc2c4b81d4d30782"
 EXPECTED_DATASET_SHA256="35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4"
 
@@ -40,6 +41,9 @@ SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-900}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-3600}"
 GPU_CLEAN_MIB="${GPU_CLEAN_MIB:-128}"
 QUAL_DISABLE_CUDA_GRAPH="${QUAL_DISABLE_CUDA_GRAPH:-0}"
+QUAL_PLACEMENT_STRATEGY="${QUAL_PLACEMENT_STRATEGY:-frequency}"
+QUAL_DISABLE_OVERLAP_SCHEDULE="${QUAL_DISABLE_OVERLAP_SCHEDULE:-0}"
+QUAL_ENABLE_MIXED_CHUNK="${QUAL_ENABLE_MIXED_CHUNK:-1}"
 
 FIXTURE_DIR="${RUN_ROOT}/fixtures"
 EVALUATION_FIXTURE="${EVALUATION_FIXTURE_OVERRIDE:-${FIXTURE_DIR}/evaluation_fixture.json}"
@@ -147,15 +151,18 @@ preflight() {
   command -v nvidia-smi >/dev/null || die "nvidia-smi is unavailable"
   command -v taskset >/dev/null || die "taskset is unavailable"
 
-  local kt_commit sglang_commit model_snapshot dataset_sha physical_cores numa_nodes
+  local kt_commit sglang_commit sglang_patch_sha model_snapshot dataset_sha physical_cores numa_nodes
   kt_commit="$(git -C "${KT_ROOT}" rev-parse HEAD)"
   sglang_commit="$(git -C "${KT_ROOT}/third_party/sglang" rev-parse HEAD)"
+  sglang_patch_sha="$(git -C "${KT_ROOT}/third_party/sglang" diff --binary | sha256sum | awk '{print $1}')"
   model_snapshot="$(basename "${MODEL}")"
   dataset_sha="$(sha256sum "${DATASET}" | awk '{print $1}')"
   physical_cores="$(lscpu -p=CORE,SOCKET | awk -F, '!/^#/ {print $1 ":" $2}' | sort -u | wc -l)"
   numa_nodes="$(lscpu | awk -F: '/^NUMA node\(s\)/ {gsub(/[[:space:]]/, "", $2); print $2}')"
   [[ "${kt_commit}" == "${EXPECTED_KT_COMMIT}" ]] || die "KT commit drift: ${kt_commit}"
   [[ "${sglang_commit}" == "${EXPECTED_SGLANG_COMMIT}" ]] || die "SGLang commit drift: ${sglang_commit}"
+  [[ "${sglang_patch_sha}" == "${EXPECTED_SGLANG_PATCH_SHA256}" ]] \
+    || die "SGLang compatibility patch drift: ${sglang_patch_sha}"
   [[ "${model_snapshot}" == "${EXPECTED_MODEL_SNAPSHOT}" ]] || die "model snapshot drift: ${model_snapshot}"
   [[ "${dataset_sha}" == "${EXPECTED_DATASET_SHA256}" ]] || die "dataset hash drift: ${dataset_sha}"
   [[ "${physical_cores}" == "14" ]] || die "expected 14 physical cores, got ${physical_cores}"
@@ -211,6 +218,12 @@ record_run_metadata() {
   mkdir -p "${RUN_ROOT}/metadata"
   git -C "${KT_ROOT}" rev-parse HEAD > "${RUN_ROOT}/metadata/ktransformers.commit"
   git -C "${KT_ROOT}" submodule status > "${RUN_ROOT}/metadata/ktransformers.submodules"
+  git -C "${KT_ROOT}/third_party/sglang" rev-parse HEAD \
+    > "${RUN_ROOT}/metadata/sglang.commit"
+  git -C "${KT_ROOT}/third_party/sglang" diff --binary \
+    > "${RUN_ROOT}/metadata/sglang.compatibility.patch"
+  sha256sum "${RUN_ROOT}/metadata/sglang.compatibility.patch" \
+    > "${RUN_ROOT}/metadata/sglang.compatibility.patch.sha256"
   git -C "${REPO_ROOT}" rev-parse HEAD > "${RUN_ROOT}/metadata/uvm_repo.commit"
   lscpu > "${RUN_ROOT}/metadata/lscpu.txt"
   nvidia-smi -q > "${RUN_ROOT}/metadata/nvidia_smi_q.txt"
@@ -385,6 +398,9 @@ build_qualification_server_command() {
   local threads="$2"
   local -a profile_args=()
   local -a graph_args=()
+  local -a placement_args=()
+  local -a overlap_args=()
+  local -a mixed_args=()
   case "${QUAL_DISABLE_CUDA_GRAPH}" in
     0)
       ;;
@@ -394,6 +410,30 @@ build_qualification_server_command() {
     *)
       die "QUAL_DISABLE_CUDA_GRAPH must be 0 or 1, got ${QUAL_DISABLE_CUDA_GRAPH}"
       ;;
+  esac
+  case "${QUAL_PLACEMENT_STRATEGY}" in
+    frequency)
+      placement_args=(
+        --kt-expert-placement-strategy frequency
+        --init-expert-location "${FREQUENCY_STATS}"
+      )
+      ;;
+    uniform)
+      placement_args=(--kt-expert-placement-strategy uniform)
+      ;;
+    *)
+      die "QUAL_PLACEMENT_STRATEGY must be frequency or uniform"
+      ;;
+  esac
+  case "${QUAL_DISABLE_OVERLAP_SCHEDULE}" in
+    0) ;;
+    1) overlap_args=(--disable-overlap-schedule) ;;
+    *) die "QUAL_DISABLE_OVERLAP_SCHEDULE must be 0 or 1" ;;
+  esac
+  case "${QUAL_ENABLE_MIXED_CHUNK}" in
+    0) ;;
+    1) mixed_args=(--enable-mixed-chunk) ;;
+    *) die "QUAL_ENABLE_MIXED_CHUNK must be 0 or 1" ;;
   esac
   if [[ "${mode}" == "exact" ]]; then
     profile_args=(
@@ -432,11 +472,11 @@ build_qualification_server_command() {
     --kt-method FP8
     --kt-cpuinfer "${threads}" --kt-threadpool-count 1 --kt-numa-nodes 0
     --kt-gpu-experts-ratio "${GPU_EXPERTS_RATIO}"
-    --kt-expert-placement-strategy frequency
-    --init-expert-location "${FREQUENCY_STATS}"
+    "${placement_args[@]}"
     "${profile_args[@]}"
     --attention-backend flashinfer --fp8-gemm-backend triton
-    --enable-mixed-chunk
+    "${mixed_args[@]}"
+    "${overlap_args[@]}"
     "${graph_args[@]}"
     --disable-shared-experts-fusion
     --disable-radix-cache
@@ -458,8 +498,16 @@ write_case_metadata() {
   local threads="$3"
   local semantics
   local cuda_graph_enabled=true
+  local overlap_enabled=true
+  local mixed_chunk_enabled=true
   if [[ "${QUAL_DISABLE_CUDA_GRAPH}" == "1" ]]; then
     cuda_graph_enabled=false
+  fi
+  if [[ "${QUAL_DISABLE_OVERLAP_SCHEDULE}" == "1" ]]; then
+    overlap_enabled=false
+  fi
+  if [[ "${QUAL_ENABLE_MIXED_CHUNK}" == "0" ]]; then
+    mixed_chunk_enabled=false
   fi
   if [[ "${mode}" == "exact" ]]; then
     semantics="real-frequency fixed placement; exact top-k contributions; cuda_graph=${cuda_graph_enabled}; overlap/mixed enabled"
@@ -482,6 +530,9 @@ write_case_metadata() {
     --arg gpu_ratio "${GPU_EXPERTS_RATIO}" \
     --argjson kv_tokens "${KV_TOKENS}" \
     --argjson cuda_graph_enabled "${cuda_graph_enabled}" \
+    --arg placement_strategy "${QUAL_PLACEMENT_STRATEGY}" \
+    --argjson overlap_enabled "${overlap_enabled}" \
+    --argjson mixed_chunk_enabled "${mixed_chunk_enabled}" \
     '{
       schema_version: 1,
       mode: $mode,
@@ -494,14 +545,18 @@ write_case_metadata() {
       sglang_commit: $sglang_commit,
       gpu_experts_ratio_cli: $gpu_ratio,
       kv_tokens: $kv_tokens,
-      cuda_graph_enabled: $cuda_graph_enabled
+      cuda_graph_enabled: $cuda_graph_enabled,
+      placement_strategy: $placement_strategy,
+      overlap_enabled: $overlap_enabled,
+      mixed_chunk_enabled: $mixed_chunk_enabled
     }' > "${case_dir}/case_metadata.json"
 }
 
 run_case() {
   local mode="$1"
   local threads="$2"
-  [[ "${threads}" =~ ^(12|14)$ ]] || die "threads must be 12 or 14, got ${threads}"
+  [[ "${threads}" =~ ^(7|12|14|28)$ ]] \
+    || die "threads must be 7, 12, 14, or 28, got ${threads}"
   preflight
   require_file "${EVALUATION_FIXTURE}"
   require_file "${CALIBRATION_FIXTURE}"
@@ -509,8 +564,10 @@ run_case() {
   require_file "${FREQUENCY_STATS_MANIFEST}"
 
   local case_dir="${RUN_ROOT}/cases/${CASE_LABEL:-${mode}_t${threads}}"
+  local kernel_epoch journal_rc
   [[ ! -e "${case_dir}" ]] || die "qualification case already exists: ${case_dir}"
   mkdir -p "${case_dir}"
+  kernel_epoch="$(date +%s)"
   build_qualification_server_command "${mode}" "${threads}"
   start_server "${case_dir}"
 
@@ -530,6 +587,18 @@ run_case() {
   stop_monitor
   stop_server
   wait_for_clean_gpu
+  set +e
+  sudo journalctl -k --since "@${kernel_epoch}" --no-pager -o short-unix \
+    > "${case_dir}/kernel.since.log" 2> "${case_dir}/kernel.since.err"
+  journal_rc=$?
+  set -e
+  printf '%s\n' "${journal_rc}" > "${case_dir}/kernel_log_returncode.txt"
+  (( journal_rc == 0 )) || die "kernel journal collection failed for ${case_dir}"
+  if rg -qi \
+      'NVRM: Xid|FAULT_PDE|manual[_ -]migration[_ -]fault|(^|[^[:alnum:]_])Oops|(^|[^[:alnum:]_])BUG:|kernel panic|general protection fault|Call Trace' \
+      "${case_dir}/kernel.since.log"; then
+    die "kernel log contains a fatal GPU/UVM signature for ${case_dir}"
+  fi
   nvidia-smi --query-gpu=timestamp,memory.used \
     --format=csv,noheader,nounits > "${case_dir}/gpu_after.csv"
   write_case_metadata "${case_dir}" "${mode}" "${threads}"
@@ -539,6 +608,9 @@ run_case() {
       --mode "${mode}" \
       --threads "${threads}" \
       --cuda-graph "$([[ "${QUAL_DISABLE_CUDA_GRAPH}" == "1" ]] && echo disabled || echo enabled)" \
+      --placement "${QUAL_PLACEMENT_STRATEGY}" \
+      --overlap "$([[ "${QUAL_DISABLE_OVERLAP_SCHEDULE}" == "1" ]] && echo disabled || echo enabled)" \
+      --mixed-chunk "$([[ "${QUAL_ENABLE_MIXED_CHUNK}" == "0" ]] && echo disabled || echo enabled)" \
       --command-file "${case_dir}/server_command.txt" \
       --server-log "${case_dir}/server.log" \
       --stats-manifest "${FREQUENCY_STATS_MANIFEST}" \

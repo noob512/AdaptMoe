@@ -15,6 +15,7 @@ class _FakeDynamicPolicy:
         self.backup_reserve_blocks = 0
         self.backup_activations: list[int] = []
         self.refresh_reasons: list[str] = []
+        self.backup_reserve_target_map: dict[int, int] = {}
 
     def dynamic_pool_active(self) -> bool:
         return True
@@ -36,6 +37,12 @@ class _FakeDynamicPolicy:
 
     def on_backup_blocks_activated(self, count: int, *, reason: str) -> None:
         self.backup_activations.append(count)
+
+    def get_backup_reserve_blocks(self) -> int:
+        return self.backup_reserve_target_map.get(
+            self.applied_target,
+            self.backup_reserve_blocks,
+        )
 
 
 def _ids(queue: Any) -> list[int]:
@@ -110,6 +117,30 @@ def test_backup_queue_is_used_only_after_ordinary_gpu_queue() -> None:
     refilled = pool.snapshot_uvm_dynamic_queues()
     assert refilled["invariant_ok"] is True
     assert refilled["gpu_backup_blocks"] == 2
+
+
+def test_backup_queue_target_can_follow_the_physical_kv_tier() -> None:
+    policy = _FakeDynamicPolicy(applied_target=8)
+    policy.backup_reserve_target_map = {8: 2, 12: 6}
+    pool = BlockPool(
+        num_gpu_blocks=17,
+        enable_caching=False,
+        hash_block_size=16,
+        uvm_kv_runtime_policy=policy,  # type: ignore[arg-type]
+    )
+
+    assert pool.snapshot_uvm_dynamic_queues()["backup_target_blocks"] == 2
+    pool.apply_uvm_dynamic_pool_target(8, old_target_blocks=16)
+    policy.applied_target = 12
+    transition = pool.apply_uvm_dynamic_pool_target(12, old_target_blocks=8)
+
+    assert transition["backup_free_blocks"] == 6
+    snapshot = pool.snapshot_uvm_dynamic_queues()
+    assert snapshot["backup_target_blocks"] == 6
+    assert snapshot["gpu_free_blocks"] == 6
+    assert snapshot["gpu_backup_blocks"] == 6
+    assert snapshot["cpu_offline_blocks"] == 4
+    assert snapshot["invariant_ok"] is True
 
 
 def test_dynamic_pool_grow_promotes_new_gpu_blocks_before_warm_blocks() -> None:

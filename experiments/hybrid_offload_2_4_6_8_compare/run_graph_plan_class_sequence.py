@@ -29,6 +29,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan-classes", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--sequence", default="c2,c4,c6,c8,c2")
+    parser.add_argument(
+        "--transition-paths",
+        type=Path,
+        help=(
+            "optional JSON map from 'old->new' to an ordered list of plan "
+            "classes; every intermediate class is activated, but inference "
+            "runs only after the final class"
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=268435456)
     parser.add_argument("--cpu-offload-gb", type=float, default=30.0)
@@ -84,6 +93,44 @@ def load_exact_names(path: Path) -> tuple[str, ...]:
     names = tuple(sorted(str(name) for name in payload))
     require(len(names) == len(set(names)), "exact-name list has duplicates")
     return names
+
+
+def load_transition_paths(
+    path: Path | None,
+    *,
+    known_classes: set[str],
+) -> dict[str, tuple[str, ...]]:
+    if path is None:
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    require(isinstance(payload, dict) and payload, "transition paths are empty")
+    paths: dict[str, tuple[str, ...]] = {}
+    for raw_key, raw_path in payload.items():
+        key = str(raw_key).strip().lower()
+        require(
+            key.count("->") == 1,
+            f"invalid transition path key: {raw_key!r}",
+        )
+        old_class, new_class = key.split("->")
+        require(
+            old_class in known_classes and new_class in known_classes,
+            f"transition path contains an unknown endpoint: {raw_key!r}",
+        )
+        require(
+            isinstance(raw_path, list) and raw_path,
+            f"transition path is empty: {raw_key!r}",
+        )
+        normalized = tuple(str(item).strip().lower() for item in raw_path)
+        require(
+            all(item in known_classes for item in normalized),
+            f"transition path contains an unknown class: {raw_key!r}",
+        )
+        require(
+            normalized[-1] == new_class,
+            f"transition path does not end at {new_class!r}: {raw_key!r}",
+        )
+        paths[key] = normalized
+    return paths
 
 
 def model_runner_from_llm(llm: Any) -> Any:
@@ -165,6 +212,10 @@ def main() -> int:
     require(args.max_tokens > 0, "max-tokens must be positive")
     initial_class, selected_bytes = load_plan_bytes(args.plan_classes.resolve())
     require(all(item in selected_bytes for item in sequence), "unknown class in sequence")
+    transition_paths = load_transition_paths(
+        args.transition_paths.resolve() if args.transition_paths is not None else None,
+        known_classes=set(selected_bytes),
+    )
     prompt_tokens = load_prompt(args.fixture.resolve())
     exact_names = load_exact_names(args.exact_names.resolve())
     require(
@@ -183,6 +234,10 @@ def main() -> int:
         "selected_bytes": selected_bytes,
         "prompt_tokens": len(prompt_tokens),
         "max_tokens": args.max_tokens,
+        "transition_mode": "serial_paths" if transition_paths else "direct",
+        "transition_paths": {
+            key: list(value) for key, value in sorted(transition_paths.items())
+        },
         "environment": {
             key: value
             for key, value in sorted(os.environ.items())
@@ -292,17 +347,33 @@ def main() -> int:
         records: list[dict[str, Any]] = []
         class_backing_bytes = {initial_class: initial_backing_bytes}
         reference_tokens: tuple[int, ...] | None = None
+        active_class = initial_class
 
         for index, class_name in enumerate(sequence):
             before_counter = dataclasses.asdict(compilation_counter.clone())
             switch_started = time.perf_counter_ns()
-            activation = runner.activate_uvm_expert_graph_class_at_idle_boundary(
-                class_name,
-                scheduler_idle=True,
+            transition_key = f"{active_class}->{class_name}"
+            activation_classes = transition_paths.get(
+                transition_key,
+                (class_name,),
             )
+            wave_activations: list[dict[str, Any]] = []
+            for activation_class in activation_classes:
+                wave_activation = (
+                    runner.activate_uvm_expert_graph_class_at_idle_boundary(
+                        activation_class,
+                        scheduler_idle=True,
+                    )
+                )
+                require(
+                    wave_activation.get("ok") is True,
+                    f"activation failed: {wave_activation!r}",
+                )
+                wave_activations.append(wave_activation)
             torch.cuda.synchronize()
             switch_ns = time.perf_counter_ns() - switch_started
-            require(activation.get("ok") is True, f"activation failed: {activation!r}")
+            activation = wave_activations[-1]
+            active_class = class_name
             after_activation_counter = dataclasses.asdict(
                 compilation_counter.clone()
             )
@@ -397,6 +468,13 @@ def main() -> int:
                     "index": index,
                     "class_name": class_name,
                     "switch_ns": switch_ns,
+                    "transition_path": list(activation_classes),
+                    "transition_path_plan_wall_ns": sum(
+                        int(item.get("plan_switch", {}).get("wall_ns", 0))
+                        for item in wave_activations
+                        if isinstance(item.get("plan_switch"), dict)
+                    ),
+                    "wave_activations": compact(wave_activations),
                     "request_ns": request_ns,
                     "output_token_ids": tokens,
                     "output_sha256": digest_tokens(tokens),

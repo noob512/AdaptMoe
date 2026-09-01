@@ -46,6 +46,15 @@ def main() -> int:
         default="enabled",
         help="Expected CUDA Graph state for this server process.",
     )
+    parser.add_argument(
+        "--placement", choices=("frequency", "uniform"), default="frequency"
+    )
+    parser.add_argument(
+        "--overlap", choices=("enabled", "disabled"), default="enabled"
+    )
+    parser.add_argument(
+        "--mixed-chunk", choices=("enabled", "disabled"), default="enabled"
+    )
     parser.add_argument("--command-file", required=True, type=Path)
     parser.add_argument("--server-log", required=True, type=Path)
     parser.add_argument("--stats-manifest", required=True, type=Path)
@@ -64,7 +73,7 @@ def main() -> int:
         "--kt-cpuinfer": str(args.threads),
         "--kt-threadpool-count": "1",
         "--kt-numa-nodes": "0",
-        "--kt-expert-placement-strategy": "frequency",
+        "--kt-expert-placement-strategy": args.placement,
         "--kt-gpu-experts-ratio": stats["placement"]["gpu_experts_ratio_cli"],
         "--kt-max-deferred-experts-per-token": "0" if args.mode == "exact" else "2",
         "--kt-gpu-prefill-token-threshold": "0" if args.mode == "exact" else "1024",
@@ -75,8 +84,16 @@ def main() -> int:
         if actual != expected:
             failures.append(f"{option}={actual!r}, expected {expected!r}")
 
-    required_flags = {"--enable-mixed-chunk", "--disable-radix-cache"}
-    forbidden_flags = {"--disable-overlap-schedule"}
+    required_flags = {"--disable-radix-cache"}
+    forbidden_flags: set[str] = set()
+    if args.mixed_chunk == "enabled":
+        required_flags.add("--enable-mixed-chunk")
+    else:
+        forbidden_flags.add("--enable-mixed-chunk")
+    if args.overlap == "disabled":
+        required_flags.add("--disable-overlap-schedule")
+    else:
+        forbidden_flags.add("--disable-overlap-schedule")
     if args.cuda_graph == "disabled":
         required_flags.add("--disable-cuda-graph")
     else:
@@ -98,15 +115,22 @@ def main() -> int:
 
     stats_path = option_value(command, "--init-expert-location")
     checks["frequency_stats_path"] = stats_path
-    if stats_path is None:
-        failures.append("--init-expert-location is missing")
-    elif Path(stats_path).resolve() != Path(stats["normalized_stats"]["path"]).resolve():
-        failures.append("--init-expert-location does not match normalized stats manifest")
+    if args.placement == "frequency":
+        if stats_path is None:
+            failures.append("--init-expert-location is missing")
+        elif Path(stats_path).resolve() != Path(stats["normalized_stats"]["path"]).resolve():
+            failures.append("--init-expert-location does not match normalized stats manifest")
+    elif stats_path is not None:
+        failures.append("uniform placement unexpectedly received --init-expert-location")
 
     expected_server_repr = {
         "disable_cuda_graph": "True" if args.cuda_graph == "disabled" else "False",
-        "disable_overlap_schedule": "False",
-        "enable_mixed_chunk": "True",
+        "disable_overlap_schedule": (
+            "False" if args.overlap == "enabled" else "True"
+        ),
+        "enable_mixed_chunk": (
+            "True" if args.mixed_chunk == "enabled" else "False"
+        ),
         "kt_enable_dynamic_expert_update": (
             "True" if args.mode == "vendor-best" else "False"
         ),
@@ -130,8 +154,10 @@ def main() -> int:
         and "WITHOUT activation frequency data" not in log
     )
     checks["server_frequency_stats_loaded_without_fallback"] = frequency_loaded
-    if not frequency_loaded:
+    if args.placement == "frequency" and not frequency_loaded:
         failures.append("server did not confirm real frequency-stat loading")
+    if args.placement == "uniform" and frequency_loaded:
+        failures.append("uniform placement unexpectedly loaded frequency stats")
 
     pairs = re.findall(
         r"KT GPU experts: layer (\d+) \(MoE\) has (\d+) GPU experts", log
@@ -144,10 +170,17 @@ def main() -> int:
         failures.append(
             f"runtime logged {len(observed)} MoE layers, expected {len(expected_per_layer)}"
         )
-    else:
+    elif args.placement == "frequency":
         actual_per_layer = [observed[index] for index in range(len(expected_per_layer))]
         if actual_per_layer != expected_per_layer:
             failures.append("runtime per-layer GPU expert counts differ from frozen stats")
+    else:
+        actual_per_layer = [observed[index] for index in range(len(expected_per_layer))]
+        if (
+            sum(actual_per_layer) != int(stats["placement"]["hot_experts"])
+            or max(actual_per_layer) - min(actual_per_layer) > 1
+        ):
+            failures.append("runtime uniform placement does not preserve the frozen budget")
 
     layerwise_hits = len(re.findall(r"KT layerwise prefill: layer \d+ compute", log))
     dynamic_hits = len(re.findall(r"expert update =", log))
@@ -165,6 +198,9 @@ def main() -> int:
         "mode": args.mode,
         "threads": args.threads,
         "cuda_graph": args.cuda_graph,
+        "placement": args.placement,
+        "overlap": args.overlap,
+        "mixed_chunk": args.mixed_chunk,
         "status": "ok" if not failures else "error",
         "checks": checks,
         "failures": failures,

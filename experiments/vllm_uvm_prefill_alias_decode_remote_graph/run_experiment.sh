@@ -27,7 +27,14 @@ CPUSET="${CPUSET:-0-13}"
 CPU_THREADS="${CPU_THREADS:-14}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-3600}"
 GPU_CLEAN_TIMEOUT_SEC="${GPU_CLEAN_TIMEOUT_SEC:-240}"
-MANUAL_MIGRATION_FAULT_MODE=2
+MANUAL_MIGRATION_FAULT_MODE="${MANUAL_MIGRATION_FAULT_MODE:-2}"
+REMOTE_READ_FULL_TLB_INVALIDATE="${REMOTE_READ_FULL_TLB_INVALIDATE:-0}"
+PHASE_F_ROUTE_LOG_ENABLE="${PHASE_F_ROUTE_LOG_ENABLE:-0}"
+ACCESS_COUNTER_MIGRATION_ENABLE="${ACCESS_COUNTER_MIGRATION_ENABLE:--1}"
+UVM_PREFETCH_ENABLE="${UVM_PREFETCH_ENABLE:-1}"
+UVM_THRASHING_ENABLE="${UVM_THRASHING_ENABLE:-1}"
+STATIC_ALIAS_DUAL_VIEW_ENABLE="${STATIC_ALIAS_DUAL_VIEW_ENABLE:-0}"
+STATIC_ALIAS_DUAL_VIEW_REQUIRE_FULL="${STATIC_ALIAS_DUAL_VIEW_REQUIRE_FULL:-0}"
 
 RUN_ROOT_ACTIVE=""
 STOCK_UVM=""
@@ -108,7 +115,9 @@ PY
 
 module_snapshot() {
   local output="$1" module_path="$2" used pids clients loaded clean=false
-  local module_sha="" budget="" remap="" manual_fault_mode=""
+  local module_sha="" budget="" remap="" manual_fault_mode="" full_tlb_invalidate=""
+  local access_counter_migration="" prefetch_enable="" thrashing_enable=""
+  local static_alias_dual_view="" static_alias_dual_view_require_full=""
   [[ -f "${module_path}" ]] && module_sha="$(sha256sum "${module_path}" | awk '{print $1}')"
   used="$(gpu_used_mib 2>/dev/null || true)"
   pids="$(compute_pids 2>/dev/null | paste -sd, - || true)"
@@ -121,12 +130,29 @@ module_snapshot() {
     && remap="$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_moe_slot_pte_remap_enable)"
   [[ -r /sys/module/nvidia_uvm/parameters/uvm_manual_migration_fault_mode ]] \
     && manual_fault_mode="$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_manual_migration_fault_mode)"
+  [[ -r /sys/module/nvidia_uvm/parameters/uvm_phase_f_remote_read_full_tlb_invalidate ]] \
+    && full_tlb_invalidate="$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_phase_f_remote_read_full_tlb_invalidate)"
+  [[ -r /sys/module/nvidia_uvm/parameters/uvm_perf_access_counter_migration_enable ]] \
+    && access_counter_migration="$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_perf_access_counter_migration_enable)"
+  [[ -r /sys/module/nvidia_uvm/parameters/uvm_perf_prefetch_enable ]] \
+    && prefetch_enable="$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_perf_prefetch_enable)"
+  [[ -r /sys/module/nvidia_uvm/parameters/uvm_perf_thrashing_enable ]] \
+    && thrashing_enable="$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_perf_thrashing_enable)"
+  [[ -r /sys/module/nvidia_uvm/parameters/uvm_moe_static_alias_dual_view_enable ]] \
+    && static_alias_dual_view="$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_moe_static_alias_dual_view_enable)"
+  [[ -r /sys/module/nvidia_uvm/parameters/uvm_moe_static_alias_dual_view_require_full ]] \
+    && static_alias_dual_view_require_full="$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_moe_static_alias_dual_view_require_full)"
   "${VLLM_PY}" - "${output}" "${module_path}" "${module_sha}" "${loaded}" \
     "${used:-unknown}" "${pids}" "${clients}" "${clean}" "${budget}" \
-    "${remap}" "${manual_fault_mode}" <<'PY'
+    "${remap}" "${manual_fault_mode}" "${full_tlb_invalidate}" \
+    "${access_counter_migration}" "${prefetch_enable}" \
+    "${thrashing_enable}" "${static_alias_dual_view}" \
+    "${static_alias_dual_view_require_full}" <<'PY'
 import json, os, sys, time
 (path, module_path, module_sha, loaded, used, pids, clients, clean,
- budget, remap, manual_fault_mode) = sys.argv[1:]
+ budget, remap, manual_fault_mode, full_tlb_invalidate,
+ access_counter_migration, prefetch_enable, thrashing_enable,
+ static_alias_dual_view, static_alias_dual_view_require_full) = sys.argv[1:]
 payload = {
     "schema": "vllm_uvm_phase_switch_module_state_v1",
     "timestamp": time.time(),
@@ -140,6 +166,12 @@ payload = {
     "slot_budget_bytes": int(budget) if budget.isdigit() else None,
     "slot_pte_remap_enable": int(remap) if remap.lstrip("-").isdigit() else None,
     "manual_migration_fault_mode": int(manual_fault_mode) if manual_fault_mode.lstrip("-").isdigit() else None,
+    "phase_f_remote_read_full_tlb_invalidate": int(full_tlb_invalidate) if full_tlb_invalidate.lstrip("-").isdigit() else None,
+    "access_counter_migration_enable": int(access_counter_migration) if access_counter_migration.lstrip("-").isdigit() else None,
+    "prefetch_enable": int(prefetch_enable) if prefetch_enable.lstrip("-").isdigit() else None,
+    "thrashing_enable": int(thrashing_enable) if thrashing_enable.lstrip("-").isdigit() else None,
+    "static_alias_dual_view_enable": int(static_alias_dual_view) if static_alias_dual_view.lstrip("-").isdigit() else None,
+    "static_alias_dual_view_require_full": int(static_alias_dual_view_require_full) if static_alias_dual_view_require_full.lstrip("-").isdigit() else None,
 }
 open(path, "w", encoding="utf-8").write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 PY
@@ -228,8 +260,17 @@ static_preflight() {
   command -v taskset >/dev/null || die "taskset unavailable"
   command -v journalctl >/dev/null || die "journalctl unavailable"
   command -v sudo >/dev/null || die "sudo unavailable"
-  modinfo -p "${CUSTOM_UVM}" | grep -q '^uvm_manual_migration_fault_mode:' \
+  # Do not use grep -q here under pipefail: after an early match it can close
+  # the pipe while modinfo is still writing the long parameter list, turning
+  # a valid module into an intermittent SIGPIPE preflight failure.
+  modinfo -p "${CUSTOM_UVM}" | grep '^uvm_manual_migration_fault_mode:' >/dev/null \
     || die "custom UVM lacks manual migration fail-fast mode"
+  modinfo -p "${CUSTOM_UVM}" | grep '^uvm_phase_f_remote_read_full_tlb_invalidate:' >/dev/null \
+    || die "custom UVM lacks Phase-F remote-read full TLB invalidate"
+  modinfo -p "${CUSTOM_UVM}" | grep '^uvm_moe_static_alias_dual_view_enable:' >/dev/null \
+    || die "custom UVM lacks static-alias dual-view mode"
+  modinfo -p "${CUSTOM_UVM}" | grep '^uvm_moe_static_alias_dual_view_require_full:' >/dev/null \
+    || die "custom UVM lacks full dual-view coverage guard"
   rg -q 'VLLM_UVM_ORIGINAL_VA_PHASE_MODE' \
     "${VLLM_ROOT}/vllm/model_executor/models/utils.py" \
     || die "original-VA phase mode is absent"
@@ -273,13 +314,32 @@ load_custom_module() {
   sudo insmod "${CUSTOM_UVM}" \
     uvm_moe_slot_pte_remap_enable=1 \
     uvm_moe_slot_pool_vidmem_budget_bytes="${SLOT_BUDGET_BYTES}" \
-    uvm_manual_migration_fault_mode="${MANUAL_MIGRATION_FAULT_MODE}"
+    uvm_manual_migration_fault_mode="${MANUAL_MIGRATION_FAULT_MODE}" \
+    uvm_phase_f_remote_read_full_tlb_invalidate="${REMOTE_READ_FULL_TLB_INVALIDATE}" \
+    uvm_phase_f_route_log_enable="${PHASE_F_ROUTE_LOG_ENABLE}" \
+    uvm_perf_access_counter_migration_enable="${ACCESS_COUNTER_MIGRATION_ENABLE}" \
+    uvm_perf_prefetch_enable="${UVM_PREFETCH_ENABLE}" \
+    uvm_perf_thrashing_enable="${UVM_THRASHING_ENABLE}" \
+    uvm_moe_static_alias_dual_view_enable="${STATIC_ALIAS_DUAL_VIEW_ENABLE}" \
+    uvm_moe_static_alias_dual_view_require_full="${STATIC_ALIAS_DUAL_VIEW_REQUIRE_FULL}"
   [[ "$(loaded_srcversion)" == "${CUSTOM_SRCVERSION}" ]] || die "custom UVM srcversion differs"
   wait_gpu_clean || die "custom module load left GPU state"
   [[ "$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_moe_slot_pte_remap_enable)" == 1 ]] \
     || die "slot PTE remap is not enabled"
-  [[ "$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_manual_migration_fault_mode)" == 2 ]] \
-    || die "manual migration fail-fast mode is not 2"
+  [[ "$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_manual_migration_fault_mode)" == "${MANUAL_MIGRATION_FAULT_MODE}" ]] \
+    || die "manual migration fault mode differs from requested mode ${MANUAL_MIGRATION_FAULT_MODE}"
+  [[ "$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_phase_f_remote_read_full_tlb_invalidate)" == "${REMOTE_READ_FULL_TLB_INVALIDATE}" ]] \
+    || die "remote-read full TLB invalidate differs from requested mode ${REMOTE_READ_FULL_TLB_INVALIDATE}"
+  [[ "$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_perf_access_counter_migration_enable)" == "${ACCESS_COUNTER_MIGRATION_ENABLE}" ]] \
+    || die "access-counter migration differs from requested mode ${ACCESS_COUNTER_MIGRATION_ENABLE}"
+  [[ "$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_perf_prefetch_enable)" == "${UVM_PREFETCH_ENABLE}" ]] \
+    || die "UVM prefetch differs from requested mode ${UVM_PREFETCH_ENABLE}"
+  [[ "$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_perf_thrashing_enable)" == "${UVM_THRASHING_ENABLE}" ]] \
+    || die "UVM thrashing differs from requested mode ${UVM_THRASHING_ENABLE}"
+  [[ "$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_moe_static_alias_dual_view_enable)" == "${STATIC_ALIAS_DUAL_VIEW_ENABLE}" ]] \
+    || die "static-alias dual-view mode differs from requested mode ${STATIC_ALIAS_DUAL_VIEW_ENABLE}"
+  [[ "$(tr -d '[:space:]' </sys/module/nvidia_uvm/parameters/uvm_moe_static_alias_dual_view_require_full)" == "${STATIC_ALIAS_DUAL_VIEW_REQUIRE_FULL}" ]] \
+    || die "full dual-view guard differs from requested mode ${STATIC_ALIAS_DUAL_VIEW_REQUIRE_FULL}"
   [[ -r "${STATS_PATH}" ]] || die "latency stats unavailable after custom module load"
 }
 

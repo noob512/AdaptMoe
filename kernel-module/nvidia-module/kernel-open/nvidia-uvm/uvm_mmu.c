@@ -1660,6 +1660,90 @@ void uvm_page_tree_write_pde(uvm_page_tree_t *tree, uvm_page_table_range_t *sing
     pde_write(tree, single->table, single->start_index, false, push);
 }
 
+void uvm_page_tree_rewrite_parent_chain(uvm_page_tree_t *tree,
+                                        const uvm_page_table_range_t *leaf_range,
+                                        uvm_push_t *push)
+{
+    uvm_page_directory_t *directory;
+
+    UVM_ASSERT(tree);
+    UVM_ASSERT(leaf_range);
+    UVM_ASSERT(leaf_range->table);
+    UVM_ASSERT(push);
+
+    // Publish bottom-up. Once the topmost entry is visible, every child below
+    // it has already been made reachable in the hardware hierarchy.
+    for (directory = leaf_range->table;
+         directory->host_parent != NULL;
+         directory = directory->host_parent) {
+        uvm_push_set_flag(push, UVM_PUSH_FLAG_CE_NEXT_PIPELINED);
+        uvm_push_set_flag(push, UVM_PUSH_FLAG_NEXT_MEMBAR_NONE);
+        pde_write(tree,
+                  directory->host_parent,
+                  directory->index_in_parent,
+                  false,
+                  push);
+    }
+}
+
+void uvm_page_tree_write_pde_for_page_size(uvm_page_tree_t *tree,
+                                           uvm_page_table_range_t *single,
+                                           NvU64 page_size,
+                                           uvm_push_t *push)
+{
+    uvm_mmu_page_table_alloc_t *phys_allocs[2] = { NULL, NULL };
+    uvm_page_directory_t *child;
+    NvU32 entry_offset;
+
+    UVM_ASSERT(single->entry_count == 1);
+    UVM_ASSERT(single->table);
+    UVM_ASSERT(tree->hal->entries_per_index(single->table->depth) <=
+               ARRAY_SIZE(phys_allocs));
+
+    entry_offset = tree->hal->entry_offset(single->table->depth, page_size);
+    UVM_ASSERT(entry_offset <
+               tree->hal->entries_per_index(single->table->depth));
+    child = single->table->entries[
+        tree->hal->entries_per_index(single->table->depth) *
+            single->start_index + entry_offset];
+    UVM_ASSERT(child);
+
+    phys_allocs[entry_offset] = &child->phys_alloc;
+    pde_fill(tree,
+             single->table,
+             single->start_index,
+             1,
+             phys_allocs,
+             push);
+}
+
+void uvm_page_tree_write_pde_with_child(uvm_page_tree_t *tree,
+                                        uvm_page_table_range_t *single,
+                                        const uvm_page_table_range_t *child,
+                                        uvm_push_t *push)
+{
+    uvm_mmu_page_table_alloc_t *phys_allocs[2] = { NULL, NULL };
+    NvU32 entry_offset;
+
+    UVM_ASSERT(single->entry_count == 1);
+    UVM_ASSERT(single->table);
+    UVM_ASSERT(child && child->table && child->entry_count != 0);
+    UVM_ASSERT(tree->hal->entries_per_index(single->table->depth) <=
+               ARRAY_SIZE(phys_allocs));
+
+    entry_offset = tree->hal->entry_offset(single->table->depth,
+                                            child->page_size);
+    UVM_ASSERT(entry_offset <
+               tree->hal->entries_per_index(single->table->depth));
+    phys_allocs[entry_offset] = &child->table->phys_alloc;
+    pde_fill(tree,
+             single->table,
+             single->start_index,
+             1,
+             phys_allocs,
+             push);
+}
+
 void uvm_page_tree_clear_pde(uvm_page_tree_t *tree, uvm_page_table_range_t *single, uvm_push_t *push)
 {
     UVM_ASSERT(single->entry_count == 1);
@@ -1767,6 +1851,74 @@ out:
     }
     uvm_mutex_unlock(&tree->lock);
 
+    return status;
+}
+
+NV_STATUS uvm_page_tree_alloc_table_detached(uvm_page_tree_t *tree,
+                                             NvU64 page_size,
+                                             uvm_pmm_alloc_flags_t pmm_flags,
+                                             uvm_page_table_range_t *single,
+                                             uvm_page_table_range_t *children)
+{
+    uvm_page_directory_t *dir;
+    NV_STATUS status = NV_OK;
+
+    UVM_ASSERT(single->entry_count == 1);
+    UVM_ASSERT(single->table);
+    UVM_ASSERT(children);
+    memset(children, 0, sizeof(*children));
+
+    dir = allocate_directory(tree,
+                             page_size,
+                             single->table->depth + 1,
+                             pmm_flags);
+    if (!dir)
+        return NV_ERR_NO_MEMORY;
+
+    uvm_mutex_lock(&tree->lock);
+    if (UVM_IS_DEBUG()) {
+        status = poison_ptes(tree, dir, single->table, page_size);
+        if (status != NV_OK)
+            goto out;
+    }
+    status = uvm_tracker_wait(&tree->tracker);
+    if (status != NV_OK)
+        goto out;
+
+    children->table = dir;
+    children->start_index = 0;
+    children->entry_count =
+        1 << tree->hal->index_bits(dir->depth, page_size);
+    children->page_size = page_size;
+
+out:
+    if (status != NV_OK) {
+        phys_mem_deallocate(tree, &dir->phys_alloc);
+        uvm_kvfree(dir);
+    }
+    uvm_mutex_unlock(&tree->lock);
+    return status;
+}
+
+NV_STATUS uvm_page_tree_free_table_detached(uvm_page_tree_t *tree,
+                                            uvm_page_table_range_t *children)
+{
+    uvm_page_directory_t *dir;
+    NV_STATUS status;
+
+    if (!children || !children->table)
+        return NV_OK;
+
+    dir = children->table;
+    UVM_ASSERT(!dir->host_parent);
+    uvm_mutex_lock(&tree->lock);
+    status = uvm_tracker_wait(&tree->tracker);
+    if (status == NV_OK) {
+        phys_mem_deallocate(tree, &dir->phys_alloc);
+        uvm_kvfree(dir);
+        memset(children, 0, sizeof(*children));
+    }
+    uvm_mutex_unlock(&tree->lock);
     return status;
 }
 

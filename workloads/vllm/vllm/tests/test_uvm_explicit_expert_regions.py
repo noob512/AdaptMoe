@@ -189,6 +189,86 @@ def test_pool_release_commits_each_driver_status_independently(
     assert second.state == RegionState.UNKNOWN
 
 
+def test_re_registered_cpu_region_reconciles_before_duplicate_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Destroy/re-register must not release an already CPU-resident VA twice."""
+    registry = ExplicitRegionRegistry()
+    monkeypatch.setattr(residency_module, "_EXPLICIT_REGION_REGISTRY", registry)
+    monkeypatch.setattr(residency_module, "driver_register_region", lambda **_: 0)
+    monkeypatch.setattr(residency_module, "driver_unregister_region", lambda *_: 0)
+    update_states: list[int] = []
+    monkeypatch.setattr(
+        residency_module,
+        "driver_update_region_state",
+        lambda *, state, **_: update_states.append(int(state)) or 0,
+    )
+
+    physical_queries = iter(
+        [
+            {
+                "ok": True,
+                "status": 1,
+                "queried_bytes": 0x80000,
+                "gpu_bytes": 0x80000,
+                "cpu_bytes": 0,
+                "any_bytes": 0x80000,
+                "unknown_bytes": 0,
+            },
+            {
+                "ok": True,
+                "status": 1,
+                "queried_bytes": 0x80000,
+                "gpu_bytes": 0,
+                "cpu_bytes": 0x80000,
+                "any_bytes": 0x80000,
+                "unknown_bytes": 0,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        residency_module,
+        "driver_batch_query_ranges_residency_bytes",
+        lambda *args, **kwargs: next(physical_queries),
+    )
+    release_calls: list[list[int]] = []
+
+    def release(region_ids: list[int], **_kwargs: object) -> dict[str, object]:
+        release_calls.append(list(region_ids))
+        return {
+            "ok": True,
+            "statuses": {region_id: True for region_id in region_ids},
+        }
+
+    monkeypatch.setattr(residency_module, "driver_release_regions", release)
+
+    first = residency_module.register_uvm_region("stable-va", 0x100000, 0x80000)
+    first_reconcile = (
+        residency_module.reconcile_uvm_regions_cpu_state_from_physical_residency(
+            [first.region_id]
+        )
+    )
+    assert first_reconcile["physical_cpu_only"] is False
+    assert residency_module.release_uvm_regions([first.region_id])["ok"] is True
+    assert len(release_calls) == 1
+    assert residency_module.unregister_uvm_regions([first.region_id])["ok"] is True
+
+    second = residency_module.register_uvm_region("stable-va", 0x100000, 0x80000)
+    assert second.state == RegionState.UNKNOWN
+    second_reconcile = (
+        residency_module.reconcile_uvm_regions_cpu_state_from_physical_residency(
+            [second.region_id]
+        )
+    )
+    assert second_reconcile["ok"] is True
+    assert second_reconcile["physical_cpu_only"] is True
+    assert second_reconcile["reconciled"] is True
+    assert second.state == RegionState.CPU
+    assert residency_module.release_uvm_regions([second.region_id])["ok"] is True
+    assert len(release_calls) == 1
+    assert update_states == [1, 1]
+
+
 def test_driver_region_registration_failure_is_fail_fast(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -255,6 +335,7 @@ def test_layer_propagates_driver_region_registration_failure(
     layer = SimpleNamespace(
         uvm_expert_envelope_bytes=0x80000,
         _uvm_all_local_expert_pairs=lambda: [(3, 0)],
+        _uvm_static_alias_owned_experts=lambda _layer_id: set(),
         _uvm_expert_weight_slices=lambda _local_id: [
             (0x100000, 0x80000, (0x100000, 0x180000))
         ],
@@ -495,6 +576,7 @@ def test_layer_compiles_expert_records_with_unknown_initial_state(
     layer = SimpleNamespace(
         uvm_expert_envelope_bytes=0x80000,
         _uvm_all_local_expert_pairs=lambda: [(3, 0)],
+        _uvm_static_alias_owned_experts=lambda _layer_id: set(),
         _uvm_expert_weight_slices=lambda _local_id: [
             (0x100000, 0x80000, (0x100000, 0x180000))
         ],
@@ -535,6 +617,29 @@ def test_layer_hot_set_excludes_released_experts() -> None:
     assert survivor.aggregate_state == RegionState.GPU
     assert cold.aggregate_state == RegionState.CPU
     assert remote.aggregate_state == RegionState.CPU
+
+
+def test_layer_hot_set_excludes_static_alias_owned_experts() -> None:
+    alias_owned = ExpertRecord(7, 2, RegionState.UNKNOWN, ["alias-owned"])
+    survivor = ExpertRecord(7, 3, RegionState.UNKNOWN, ["hot"])
+    layer = SimpleNamespace(
+        uvm_init_weight_offload_mode="driver_release",
+        _uvm_offloaded_global_expert_ids=set(),
+        _uvm_remote_read_global_expert_ids=set(),
+        _uvm_static_alias_owned_global_expert_ids={2},
+        _uvm_expert_records={
+            alias_owned.key: alias_owned,
+            survivor.key: survivor,
+        },
+        _uvm_init_hot_expert_records=lambda: FusedMoE._uvm_init_hot_expert_records(
+            layer
+        ),
+    )
+
+    assert FusedMoE.get_uvm_init_hot_expert_region_ids(layer) == ["hot"]
+    assert FusedMoE.set_uvm_init_hot_expert_state(layer, RegionState.GPU) == 1
+    assert alias_owned.aggregate_state == RegionState.UNKNOWN
+    assert survivor.aggregate_state == RegionState.GPU
 
 
 def test_dynamic_swap_uses_explicit_expert_records(

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -133,6 +134,25 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        self._uvm_phase_batched = os.environ.get(
+            "VLLM_UVM_PHASE_BATCHED_SCHEDULING", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if self._uvm_phase_batched and self.policy != SchedulingPolicy.FCFS:
+            raise ValueError("UVM phase-batched scheduling currently requires FCFS")
+        self._uvm_phase_kv_aware_cohorts = self._uvm_phase_batched and os.environ.get(
+            "VLLM_UVM_PHASE_KV_AWARE_COHORTS", "1"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            self._uvm_phase_cohort_kv_reserve_blocks = max(
+                int(os.environ.get("VLLM_UVM_PHASE_COHORT_KV_RESERVE_BLOCKS", "1")),
+                0,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_UVM_PHASE_COHORT_KV_RESERVE_BLOCKS must be an integer"
+            ) from exc
+        self._uvm_phase_epoch: str | None = None
+        self._uvm_phase_epoch_request_ids: set[str] = set()
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
@@ -191,6 +211,160 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+    @staticmethod
+    def _uvm_request_needs_prefill(request: Request) -> bool:
+        return request.num_computed_tokens < request.num_prompt_tokens
+
+    def _uvm_phase_request_lifetime_kv_blocks(
+        self, request: Request
+    ) -> int | None:
+        """Estimate additional blocks needed to finish one phase cohort member.
+
+        A phase cohort cannot release any member's KV allocation until its
+        Prefill epoch has cut over to Decode.  Admitting more long prompts than
+        the physical pool can hold therefore deadlocks: Decode-ready members
+        are intentionally held while later members wait for their KV blocks.
+        Use the coordinator's own block accounting, including blocks already
+        owned by a resumed request, rather than converting bytes or tokens in
+        the scheduler.
+        """
+        if request.has_encoder_inputs:
+            # Cross-attention has a separate static allocation whose token
+            # extent is not available here.  The E2 phase path is text-only;
+            # retain the legacy admission behavior for unsupported inputs.
+            return None
+        target_tokens = min(
+            int(request.num_prompt_tokens)
+            + int(request.max_tokens)
+            + int(self.num_lookahead_tokens),
+            int(self.max_model_len),
+        )
+        return int(
+            self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=target_tokens,
+                new_computed_blocks=(
+                    self.kv_cache_manager.empty_kv_cache_blocks.blocks
+                ),
+                num_encoder_tokens=0,
+            )
+        )
+
+    def _limit_uvm_phase_cohort_to_kv_capacity(
+        self, candidates: list[Request]
+    ) -> list[Request]:
+        """Return the largest FCFS prefix that can finish without KV deadlock."""
+        if not self._uvm_phase_kv_aware_cohorts or not candidates:
+            return candidates
+        if not any(self._uvm_request_needs_prefill(req) for req in candidates):
+            return candidates
+
+        free_blocks = int(self.kv_cache_manager.block_pool.get_num_free_blocks())
+        reserve_blocks = min(
+            int(self._uvm_phase_cohort_kv_reserve_blocks), free_blocks
+        )
+        budget_blocks = free_blocks - reserve_blocks
+        selected: list[Request] = []
+        required_blocks = 0
+        per_request_blocks: list[tuple[str, int]] = []
+        for request in candidates:
+            request_blocks = self._uvm_phase_request_lifetime_kv_blocks(request)
+            if request_blocks is None:
+                logger.warning(
+                    "UVM KV-aware phase admission is unavailable for request %s; "
+                    "using the full candidate cohort",
+                    request.request_id,
+                )
+                return candidates
+            if selected and required_blocks + request_blocks > budget_blocks:
+                break
+            # Always admit the FCFS head.  If one request alone cannot fit, the
+            # normal allocator will fail/preempt rather than leaving it queued
+            # forever; formal E2 validates that every individual request fits.
+            selected.append(request)
+            required_blocks += request_blocks
+            per_request_blocks.append((request.request_id, request_blocks))
+            if required_blocks >= budget_blocks:
+                break
+
+        if len(selected) < len(candidates):
+            logger.info(
+                "UVM phase-batched cohort KV partition: candidates=%d "
+                "admitted=%d deferred=%d required_blocks=%d free_blocks=%d "
+                "reserve_blocks=%d per_request_blocks=%s",
+                len(candidates),
+                len(selected),
+                len(candidates) - len(selected),
+                required_blocks,
+                free_blocks,
+                reserve_blocks,
+                per_request_blocks,
+            )
+        return selected
+
+    def _prepare_uvm_phase_epoch(self) -> str | None:
+        """Choose a pure Prefill or pure Decode scheduler epoch.
+
+        The cohort is a snapshot of the requests visible at an idle boundary.
+        Requests arriving during its Decode epoch remain queued for the next
+        cohort. Decode-ready members are held while any cohort member still
+        needs Prefill, preventing chunked Prefill from producing a mixed step.
+        """
+        if not self._uvm_phase_batched:
+            return None
+
+        active_requests = {
+            request.request_id: request
+            for request in itertools.chain(self.running, self.waiting)
+        }
+        active_cohort = self._uvm_phase_epoch_request_ids.intersection(
+            active_requests
+        )
+        if self._uvm_phase_epoch_request_ids and not active_cohort:
+            logger.info(
+                "UVM phase-batched cohort completed: requests=%d",
+                len(self._uvm_phase_epoch_request_ids),
+            )
+            self._uvm_phase_epoch_request_ids.clear()
+            self._uvm_phase_epoch = None
+
+        if not self._uvm_phase_epoch_request_ids:
+            candidates = list(self.running)
+            remaining = max(0, self.max_num_running_reqs - len(candidates))
+            candidates.extend(list(itertools.islice(self.waiting, remaining)))
+            if not candidates:
+                return None
+            candidates = self._limit_uvm_phase_cohort_to_kv_capacity(candidates)
+            self._uvm_phase_epoch_request_ids = {
+                request.request_id for request in candidates
+            }
+            self._uvm_phase_epoch = (
+                "prefill"
+                if any(self._uvm_request_needs_prefill(request) for request in candidates)
+                else "decode"
+            )
+            logger.info(
+                "UVM phase-batched cohort started: phase=%s requests=%d",
+                self._uvm_phase_epoch,
+                len(self._uvm_phase_epoch_request_ids),
+            )
+
+        cohort_requests = [
+            active_requests[request_id]
+            for request_id in self._uvm_phase_epoch_request_ids
+            if request_id in active_requests
+        ]
+        if self._uvm_phase_epoch == "prefill" and cohort_requests and all(
+            not self._uvm_request_needs_prefill(request)
+            for request in cohort_requests
+        ):
+            self._uvm_phase_epoch = "decode"
+            logger.info(
+                "UVM phase-batched cohort cutover: phase=decode requests=%d",
+                len(cohort_requests),
+            )
+        return self._uvm_phase_epoch
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -203,6 +377,7 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        uvm_phase_epoch = self._prepare_uvm_phase_epoch()
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -224,6 +399,20 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if uvm_phase_epoch is not None:
+                if request.request_id not in self._uvm_phase_epoch_request_ids:
+                    req_index += 1
+                    continue
+                needs_prefill = self._uvm_request_needs_prefill(request)
+                if uvm_phase_epoch == "prefill" and not needs_prefill:
+                    req_index += 1
+                    continue
+                if uvm_phase_epoch == "decode" and needs_prefill:
+                    raise RuntimeError(
+                        "UVM phase-batched scheduler found Prefill work in a "
+                        "Decode epoch"
+                    )
 
             num_new_tokens = (
                 request.num_tokens_with_spec
@@ -398,12 +587,18 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs:
+        if not preempted_reqs and uvm_phase_epoch != "decode":
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
                 request = self.waiting.peek_request()
+                if (
+                    uvm_phase_epoch is not None
+                    and request.request_id
+                    not in self._uvm_phase_epoch_request_ids
+                ):
+                    break
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:

@@ -222,6 +222,8 @@ NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va
     atomic64_set(&va_space->range_group_id_counter, 0);
     atomic64_set(&va_space->moe_slot_plan_invalidation_epoch, 0);
     atomic64_set(&va_space->moe_slot_copy_source_epoch, 0);
+    va_space->moe_slot_pte_seen_min = 0;
+    va_space->moe_slot_pte_seen_max = 0;
 
     INIT_RADIX_TREE(&va_space->range_groups, NV_UVM_GFP_FLAGS);
     uvm_range_tree_init(&va_space->range_group_ranges);

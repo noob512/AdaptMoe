@@ -36,6 +36,18 @@
 NV_STATUS uvm_pmm_sysmem_init(void);
 void uvm_pmm_sysmem_exit(void);
 
+// Diagnostic distribution of physical CPU chunks allocated by UVM. Indexes
+// are fixed at 4K, 64K, and 2M. Attempts/successes are cumulative for the
+// loaded module; live_chunks is the current number of physical allocations.
+typedef struct
+{
+    NvU64 attempts[3];
+    NvU64 successes[3];
+    NvU64 live_chunks[3];
+} uvm_cpu_chunk_allocation_stats_t;
+
+void uvm_cpu_chunk_get_allocation_stats(uvm_cpu_chunk_allocation_stats_t *stats);
+
 #define UVM_CPU_CHUNK_SIZES (UVM_PAGE_SIZE_2M | UVM_PAGE_SIZE_64K | PAGE_SIZE)
 
 typedef enum

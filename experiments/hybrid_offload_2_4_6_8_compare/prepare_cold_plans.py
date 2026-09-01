@@ -17,6 +17,7 @@ EXPERT_COUNT = 64
 EXPERT_BYTES = 3 * 2048 * 1408 * 2
 TIERS = {"2g": 5, "4g": 10, "6g": 14, "8g": 19}
 LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.experts$")
+TIER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def sha256_file(path: Path) -> str:
@@ -34,6 +35,30 @@ def atomic_json(path: Path, value: Any) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def parse_tier_widths(value: str) -> dict[str, int]:
+    tiers: dict[str, int] = {}
+    for item in value.split(","):
+        try:
+            tier, raw_width = item.split("=", 1)
+            width = int(raw_width)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid tier width {item!r}; expected LABEL=COUNT"
+            ) from exc
+        if not TIER_RE.fullmatch(tier):
+            raise argparse.ArgumentTypeError(f"invalid tier label: {tier!r}")
+        if tier in tiers:
+            raise argparse.ArgumentTypeError(f"duplicate tier label: {tier!r}")
+        if not 1 <= width <= EXPERT_COUNT:
+            raise argparse.ArgumentTypeError(
+                f"tier {tier!r} width must be in [1, {EXPERT_COUNT}]"
+            )
+        tiers[tier] = width
+    if not tiers:
+        raise argparse.ArgumentTypeError("at least one tier width is required")
+    return tiers
 
 
 def load_counts(
@@ -172,7 +197,18 @@ def main() -> int:
             "formal strict-batch calibration disables chunked prefill and uses one"
         ),
     )
+    parser.add_argument(
+        "--tier-widths",
+        type=parse_tier_widths,
+        default=None,
+        metavar="LABEL=COUNT,...",
+        help=(
+            "override the default cold experts per layer, for example "
+            "2g=8,4g=13,6g=17,8g=22"
+        ),
+    )
     args = parser.parse_args()
+    tiers = args.tier_widths or TIERS
     args.output_dir.mkdir(parents=True, exist_ok=True)
     counts, coverage = load_counts(
         args.trace,
@@ -206,11 +242,12 @@ def main() -> int:
         "layer_ids": list(LAYER_IDS),
         "experts_per_layer": EXPERT_COUNT,
         "expert_main_bytes": EXPERT_BYTES,
+        "tier_width_source": "command_line" if args.tier_widths else "default",
         "full_parameter_count": len(exact_names),
         "full_expert_main_bytes": len(LAYER_IDS) * EXPERT_COUNT * EXPERT_BYTES,
         "tiers": {},
     }
-    for tier, width in TIERS.items():
+    for tier, width in tiers.items():
         selected = {
             str(layer_id): sorted(ranked[layer_id][:width]) for layer_id in LAYER_IDS
         }

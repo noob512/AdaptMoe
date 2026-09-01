@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -99,6 +100,69 @@ elif current_platform.is_xpu():
     from vllm._ipex_ops import ipex_ops as ops
 
 logger = init_logger(__name__)
+
+_E2_PREFILL_MEMORY_TRACE_ENABLED = os.environ.get(
+    "VLLM_UVM_FUSED_MOE_POST_WORKSPACE_RESIDENCY_AUDIT", ""
+).strip().lower() in ("1", "true", "yes", "on")
+_E2_PREFILL_MEMORY_TRACE_MIN_TOKENS = int(
+    os.environ.get("VLLM_UVM_FUSED_MOE_POST_WORKSPACE_AUDIT_MIN_TOKENS", "1")
+)
+_E2_PREFILL_LAYER_MEMORY_TRACE_ENABLED = os.environ.get(
+    "VLLM_UVM_PREFILL_LAYER_MEMORY_TRACE", ""
+).strip().lower() in ("1", "true", "yes", "on")
+_E2_PREFILL_LAYER_MEMORY_TRACE_MIN_TOKENS = int(
+    os.environ.get("VLLM_UVM_PREFILL_LAYER_MEMORY_TRACE_MIN_TOKENS", "1")
+)
+
+
+def _maybe_trace_e2_prefill_memory(
+    *,
+    stage: str,
+    layer_idx: int,
+    tensors: dict[str, torch.Tensor],
+) -> None:
+    if not _E2_PREFILL_MEMORY_TRACE_ENABLED or layer_idx != 1:
+        return
+    num_tokens = max(
+        (int(tensor.shape[0]) for tensor in tensors.values() if tensor.ndim > 0),
+        default=0,
+    )
+    if num_tokens < _E2_PREFILL_MEMORY_TRACE_MIN_TOKENS:
+        return
+    from vllm.model_executor.models.utils import (
+        trace_cpu_offload_uvm_original_va_prefill_memory,
+    )
+
+    trace_cpu_offload_uvm_original_va_prefill_memory(
+        stage=f"deepseek_layer_{layer_idx}:{stage}",
+        num_tokens=num_tokens,
+        tensors=tensors,
+    )
+
+
+def _maybe_trace_e2_prefill_layer_memory(
+    *,
+    stage: str,
+    layer_idx: int,
+    tensors: dict[str, torch.Tensor],
+) -> None:
+    if not _E2_PREFILL_LAYER_MEMORY_TRACE_ENABLED:
+        return
+    num_tokens = max(
+        (int(tensor.shape[0]) for tensor in tensors.values() if tensor.ndim > 0),
+        default=0,
+    )
+    if num_tokens < _E2_PREFILL_LAYER_MEMORY_TRACE_MIN_TOKENS:
+        return
+    from vllm.model_executor.models.utils import (
+        trace_cpu_offload_uvm_original_va_prefill_layer_boundary,
+    )
+
+    trace_cpu_offload_uvm_original_va_prefill_layer_boundary(
+        stage=f"deepseek_layer_{layer_idx}:{stage}",
+        num_tokens=num_tokens,
+        tensors=tensors,
+    )
 
 
 class DeepseekAttention(nn.Module):
@@ -1156,15 +1220,48 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
+        entry_tensors = {
+            "positions": positions,
+            "hidden_states": hidden_states,
+        }
+        if residual is not None:
+            entry_tensors["residual"] = residual
+        _maybe_trace_e2_prefill_memory(
+            stage="entry", layer_idx=self.layer_idx, tensors=entry_tensors
+        )
+        _maybe_trace_e2_prefill_layer_memory(
+            stage="entry", layer_idx=self.layer_idx, tensors=entry_tensors
+        )
+
         # Self Attention
         if residual is None:
             residual = hidden_states.clone()
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        _maybe_trace_e2_prefill_memory(
+            stage="after_input_layernorm",
+            layer_idx=self.layer_idx,
+            tensors={"hidden_states": hidden_states, "residual": residual},
+        )
+        _maybe_trace_e2_prefill_layer_memory(
+            stage="after_input_layernorm",
+            layer_idx=self.layer_idx,
+            tensors={"hidden_states": hidden_states, "residual": residual},
+        )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+        )
+        _maybe_trace_e2_prefill_memory(
+            stage="after_attention",
+            layer_idx=self.layer_idx,
+            tensors={"hidden_states": hidden_states, "residual": residual},
+        )
+        _maybe_trace_e2_prefill_layer_memory(
+            stage="after_attention",
+            layer_idx=self.layer_idx,
+            tensors={"hidden_states": hidden_states, "residual": residual},
         )
 
         if (
@@ -1182,7 +1279,22 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        _maybe_trace_e2_prefill_memory(
+            stage="before_mlp",
+            layer_idx=self.layer_idx,
+            tensors={"hidden_states": hidden_states, "residual": residual},
+        )
+        _maybe_trace_e2_prefill_layer_memory(
+            stage="before_mlp",
+            layer_idx=self.layer_idx,
+            tensors={"hidden_states": hidden_states, "residual": residual},
+        )
         hidden_states = self.mlp(hidden_states)
+        _maybe_trace_e2_prefill_layer_memory(
+            stage="after_mlp",
+            layer_idx=self.layer_idx,
+            tensors={"hidden_states": hidden_states, "residual": residual},
+        )
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow

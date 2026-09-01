@@ -407,6 +407,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--workload-config", required=True, type=Path)
+    parser.add_argument(
+        "--workload-filter",
+        help=(
+            "Optional comma-separated exact workload names. The immutable "
+            "source config remains recorded, while only the selected cells "
+            "run in this server process block."
+        ),
+    )
+    parser.add_argument(
+        "--fixture-root",
+        type=Path,
+        help=(
+            "Replace each workload fixture path with a file of the same "
+            "name under this model-specific frozen fixture directory"
+        ),
+    )
     parser.add_argument("--server-env", required=True, type=Path)
     parser.add_argument(
         "--server-env-override",
@@ -419,6 +435,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ready-timeout", type=float, default=900.0)
     parser.add_argument("--request-timeout", type=float, default=7200.0)
     parser.add_argument("--gpu-clean-timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--stop-on-first-workload-failure",
+        action="store_true",
+        help="terminate the server block after the first failed workload",
+    )
+    parser.add_argument(
+        "--stop-after-ready",
+        action="store_true",
+        help="diagnostic mode: terminate immediately after server readiness",
+    )
     parser.add_argument("server_command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.server_command and args.server_command[0] == "--":
@@ -437,7 +463,35 @@ def main() -> int:
     if not args.streaming_client.is_file():
         raise SystemExit(f"missing streaming client: {args.streaming_client}")
     workload_config = json.loads(args.workload_config.read_text(encoding="utf-8"))
+    if args.fixture_root is not None:
+        fixture_root = args.fixture_root.resolve()
+        for workload in workload_config.get("workloads", []):
+            for key in ("evaluation_fixture", "warmup_fixture"):
+                original = Path(str(workload.get(key, "")))
+                workload[key] = str(fixture_root / original.name)
     workloads = validate_workload_config(workload_config, args.protocol_id)
+    if args.workload_filter:
+        selected_names = {
+            item.strip() for item in args.workload_filter.split(",") if item.strip()
+        }
+        known_names = {str(workload["name"]) for workload in workloads}
+        unknown_names = sorted(selected_names - known_names)
+        if unknown_names:
+            raise SystemExit(f"unknown workload filter names: {unknown_names!r}")
+        workloads = [
+            workload for workload in workloads if workload["name"] in selected_names
+        ]
+        if not workloads:
+            raise SystemExit("workload filter selected no workloads")
+    if args.stop_after_ready:
+        workloads = []
+    strict_local_rate_limit = all(
+        max(workload["concurrencies"]) == 1
+        and float(
+            workload.get("minimum_request_start_interval_seconds", 0.0)
+        ) > 6.0
+        for workload in workloads
+    )
     server_env_value = json.loads(args.server_env.read_text(encoding="utf-8"))
     if not isinstance(server_env_value, dict) or any(
         not isinstance(key, str) or not isinstance(value, str)
@@ -467,7 +521,11 @@ def main() -> int:
             "schema_version": 1,
             "overrides": server_env_value,
             "request_rate_policy": (
-                "external requests <= 10/minute; localhost benchmark traffic excluded"
+                "all inference POST starts >6 seconds apart (<=10/minute), "
+                "including localhost benchmark traffic"
+                if strict_local_rate_limit
+                else "external requests <= 10/minute; localhost benchmark "
+                "traffic excluded"
             ),
         },
     )
@@ -479,6 +537,9 @@ def main() -> int:
             "workload_config": {
                 "path": str(args.workload_config.resolve()),
                 "sha256": sha256_file(args.workload_config),
+                "selected_workloads": [
+                    str(workload["name"]) for workload in workloads
+                ],
             },
             "server_env": {
                 "path": str(args.server_env.resolve()),
@@ -621,10 +682,14 @@ def main() -> int:
                         f"returncode={completed.returncode}, status={record['status']!r}"
                     )
                     client_records.append(record)
-                    if server.poll() is not None or not health_ok(health_url):
+                    server_unhealthy = (
+                        server.poll() is not None or not health_ok(health_url)
+                    )
+                    if server_unhealthy:
                         execution_failures.append(
                             f"server unhealthy after workload {workload['name']}"
                         )
+                    if args.stop_on_first_workload_failure or server_unhealthy:
                         break
                     continue
                 client_records.append(record)
@@ -747,7 +812,11 @@ def main() -> int:
     result = {
         "schema_version": 1,
         "status": "ok" if not failures else "error",
-        "scope": "formal_performance_candidate",
+        "scope": (
+            "startup_graph_capture_diagnostic"
+            if args.stop_after_ready
+            else "formal_performance_candidate"
+        ),
         "protocol_id": args.protocol_id,
         "system": args.system,
         "started_at": started_at,

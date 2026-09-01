@@ -316,6 +316,145 @@ def test_schedule_concurrent_partial_requests(enable_prefix_caching: bool):
     assert output2.num_scheduled_tokens[requests[2].request_id] == 800 - 224 - 224
 
 
+def test_uvm_phase_batched_scheduler_separates_chunked_prefill_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_UVM_PHASE_BATCHED_SCHEDULING", "1")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        long_prefill_token_threshold=400,
+    )
+    requests = create_requests(num_requests=3, num_tokens=800)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output0 = scheduler.schedule()
+    req_to_index = {request.request_id: i for i, request in enumerate(requests)}
+    scheduler.update_from_output(
+        output0,
+        ModelRunnerOutput(
+            req_ids=[request.request_id for request in requests],
+            req_id_to_index=req_to_index,
+            sampled_token_ids=[[], [], []],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    output1 = scheduler.schedule()
+    scheduler.update_from_output(
+        output1,
+        ModelRunnerOutput(
+            req_ids=[request.request_id for request in requests],
+            req_id_to_index=req_to_index,
+            sampled_token_ids=[[0], [0], []],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # Requests 0/1 are Decode-ready, but request 2 still has Prefill work.
+    # The scheduler must hold their Decode tokens instead of mixing phases.
+    output2 = scheduler.schedule()
+    assert output2.num_scheduled_tokens == {
+        requests[2].request_id: 800 - 224 - 224
+    }
+    scheduler.update_from_output(
+        output2,
+        ModelRunnerOutput(
+            req_ids=[requests[2].request_id],
+            req_id_to_index={requests[2].request_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    output3 = scheduler.schedule()
+    assert output3.num_scheduled_tokens == {
+        request.request_id: 1 for request in requests
+    }
+
+
+def test_uvm_phase_batched_scheduler_finishes_waiting_cohort_prefills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_UVM_PHASE_BATCHED_SCHEDULING", "1")
+    scheduler = create_scheduler(
+        max_num_seqs=4,
+        max_num_batched_tokens=1600,
+        max_model_len=1024,
+    )
+    requests = create_requests(num_requests=4, num_tokens=800)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output0 = scheduler.schedule()
+    assert list(output0.num_scheduled_tokens) == ["0", "1"]
+    scheduler.update_from_output(
+        output0,
+        ModelRunnerOutput(
+            req_ids=["0", "1"],
+            req_id_to_index={"0": 0, "1": 1},
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # Decode-ready requests 0/1 are held while the original cohort's waiting
+    # requests 2/3 complete Prefill.
+    output1 = scheduler.schedule()
+    assert list(output1.num_scheduled_tokens) == ["2", "3"]
+    scheduler.update_from_output(
+        output1,
+        ModelRunnerOutput(
+            req_ids=["2", "3"],
+            req_id_to_index={"2": 0, "3": 1},
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    output2 = scheduler.schedule()
+    assert output2.num_scheduled_tokens == {
+        request.request_id: 1 for request in requests
+    }
+
+
+def test_uvm_phase_batched_scheduler_partitions_cohort_by_kv_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_UVM_PHASE_BATCHED_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_UVM_PHASE_KV_AWARE_COHORTS", "1")
+    monkeypatch.setenv("VLLM_UVM_PHASE_COHORT_KV_RESERVE_BLOCKS", "1")
+    # Each 800-token prompt plus one output token needs 51 16-token blocks.
+    # The pool exposes 102 ordinary blocks after its null block and reserve,
+    # so only the first two requests may enter the phase cohort.
+    scheduler = create_scheduler(
+        max_num_seqs=4,
+        max_num_batched_tokens=1600,
+        max_model_len=1024,
+        num_blocks=104,
+    )
+    requests = create_requests(num_requests=4, num_tokens=800, max_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert list(output.num_scheduled_tokens) == ["0", "1"]
+    assert scheduler._uvm_phase_epoch_request_ids == {"0", "1"}
+    assert [request.request_id for request in scheduler.running] == ["0", "1"]
+    assert [request.request_id for request in scheduler.waiting] == ["2", "3"]
+
+
 def test_stop_via_update_from_output():
     """Test stopping behavior through update_from_output"""
     scheduler = create_scheduler(num_speculative_tokens=1)

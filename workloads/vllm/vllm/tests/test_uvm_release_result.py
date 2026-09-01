@@ -97,6 +97,55 @@ def _patch_driver_fds(
     return closed
 
 
+def test_immutable_cpu_shadow_cutover_batches_and_audits_every_byte(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ranges = [
+        (0x100000 + index * 0x10000, 0x10000) for index in range(65)
+    ]
+    closed = _patch_driver_fds(monkeypatch, existing_sources=[10])
+    batch_sizes: list[int] = []
+
+    def ioctl(fd: int, request: int, params: object) -> int:
+        assert fd == 110
+        assert request == uvm_module._UVM_PHASE_F_BATCH_EXECUTOR_IOCTL
+        assert isinstance(params, uvm_module._PhaseFBatchExecutorParams)
+        assert params.action == (
+            uvm_module.UVM_PHASE_F_ACTION_IMMUTABLE_CPU_SHADOW_CUTOVER
+        )
+        assert params.async_ == 0
+        batch_sizes.append(int(params.count))
+        params.success_count = params.count
+        params.failure_count = 0
+        params.rmStatus = 0
+        for index in range(int(params.count)):
+            length = int(params.ranges[index].length)
+            result = params.results[index]
+            result.status = 0
+            result.resident_gpu_bytes = length
+            result.resident_cpu_bytes = length
+            result.resident_any_bytes = length
+            result.resident_unknown_bytes = 0
+        return 0
+
+    monkeypatch.setattr(uvm_module, "_libc_ioctl", ioctl)
+
+    result = uvm_module.driver_cutover_ranges_to_immutable_cpu_shadow(ranges)
+
+    assert uvm_module.UVM_PHASE_F_ACTION_IMMUTABLE_CPU_SHADOW_CUTOVER == 22
+    assert result["ok"] is True
+    assert result["range_count"] == 65
+    assert result["success_count"] == 65
+    assert result["failure_count"] == 0
+    assert result["requested_bytes"] == 65 * 0x10000
+    assert result["released_gpu_bytes"] == 65 * 0x10000
+    assert result["retained_cpu_shadow_bytes"] == 65 * 0x10000
+    assert result["remote_mapped_bytes"] == 65 * 0x10000
+    assert result["selected_fd_source"] == 10
+    assert batch_sizes == [64, 1]
+    assert closed == [110]
+
+
 def test_region_release_accepts_complete_release() -> None:
     params = _release_params()
     params.block_count = 1

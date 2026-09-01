@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-EXPECTED = (
+DEFAULT_EXPECTED = (
     ("4g_high_pressure", "high", 4, 4_303_355_904),
     ("2g_low_pressure", "low", 1, 2_264_924_160),
 )
@@ -47,6 +47,42 @@ def main() -> int:
     args = parse_args()
     root = args.run_root.resolve()
     result = load_json(root / "result.json")
+    config_path = root / "run_config.json"
+    run_config = load_json(config_path) if config_path.is_file() else {
+        "initial_selected_bytes": 2_264_924_160,
+        "expected_parameter_count": 96,
+        "expected_full_parameter_bytes": 28_991_029_248,
+        "physical_kv_allocation_bytes": 167_772_160,
+        "dynamic_records": [
+            {
+                "label": label,
+                "expected_selected_bytes": selected_bytes,
+                "batch_size": batch,
+                "expected_pressure_class": pressure,
+            }
+            for label, pressure, batch, selected_bytes in DEFAULT_EXPECTED
+        ],
+    }
+    expected_records = tuple(
+        (
+            str(record["label"]),
+            str(record["expected_pressure_class"]),
+            int(record["batch_size"]),
+            int(record["expected_selected_bytes"]),
+        )
+        for record in run_config["dynamic_records"]
+    )
+    initial_selected_bytes = int(run_config["initial_selected_bytes"])
+    expected_parameter_count = int(run_config["expected_parameter_count"])
+    physical_kv_bytes = int(run_config["physical_kv_allocation_bytes"])
+    parameter_va_mode = str(
+        run_config.get("parameter_va_mode", "stable_rebuild_recapture")
+    )
+    require(
+        parameter_va_mode
+        in ("stable_rebuild_recapture", "nonstable_reallocate_recapture"),
+        "unknown Parameter VA mode",
+    )
     require((root / "returncode.txt").read_text().strip() == "0", "runner rc")
     require(result.get("status") == "ok", "runner status is not ok")
     require(result.get("arm") == "D", "experiment did not use arm D")
@@ -57,18 +93,25 @@ def main() -> int:
     )
     require(
         int(result.get("config", {}).get("expected_selected_bytes", -1))
-        == 2_264_924_160,
-        "initial plan is not 2 GiB",
+        == initial_selected_bytes,
+        "initial selected bytes differ from run contract",
     )
 
     initial_vas = result["parameter_va_snapshots"]["after_load"]["vas"]
-    require(len(initial_vas) == 96, "initial Parameter VA count differs")
+    require(
+        len(initial_vas) == expected_parameter_count,
+        "initial Parameter VA count differs",
+    )
     dynamic = result.get("dynamic_plan_rebuilds")
-    require(isinstance(dynamic, list) and len(dynamic) == 2, "dynamic generations")
+    require(
+        isinstance(dynamic, list) and len(dynamic) == len(expected_records),
+        "dynamic generations",
+    )
     initial_prefix = result["outputs"][0]["output_token_ids"][:2]
     summaries: list[dict[str, Any]] = []
+    expected_generation_vas = initial_vas
 
-    for generation, (record, expected) in enumerate(zip(dynamic, EXPECTED), 1):
+    for generation, (record, expected) in enumerate(zip(dynamic, expected_records), 1):
         label, pressure_class, batch, selected_bytes = expected
         require(record.get("generation") == generation, f"g{generation}: generation")
         require(record.get("label") == label, f"g{generation}: label")
@@ -94,7 +137,7 @@ def main() -> int:
             f"g{generation}: pressure threshold contract",
         )
         require(
-            int(pressure.get("physical_kv_allocation_bytes", -1)) == 167_772_160
+            int(pressure.get("physical_kv_allocation_bytes", -1)) == physical_kv_bytes
             and pressure.get("physical_kv_allocation_changes_at_boundary") is False,
             f"g{generation}: physical/logical KV distinction",
         )
@@ -121,12 +164,26 @@ def main() -> int:
             int(low_level.get("selected_bytes", -1)) == selected_bytes,
             f"g{generation}: rebuilt byte count",
         )
-        require(
-            low_level.get("parameter_vas_before")
-            == low_level.get("parameter_vas_after")
-            == initial_vas,
-            f"g{generation}: low-level Parameter VAs",
-        )
+        low_before = low_level.get("parameter_vas_before")
+        low_after = low_level.get("parameter_vas_after")
+        if parameter_va_mode == "stable_rebuild_recapture":
+            require(
+                rebuild.get("parameter_va_mode") == parameter_va_mode
+                and low_before == low_after == initial_vas,
+                f"g{generation}: low-level Parameter VAs",
+            )
+        else:
+            require(
+                rebuild.get("parameter_va_mode") == parameter_va_mode
+                and isinstance(low_before, list)
+                and isinstance(low_after, list)
+                and len(low_before) == len(low_after) == expected_parameter_count
+                and low_before == expected_generation_vas
+                and all(before != after for before, after in zip(low_before, low_after))
+                and low_level.get("all_parameter_vas_changed") is True,
+                f"g{generation}: non-stable low-level Parameter VAs",
+            )
+            expected_generation_vas = low_after
         require(
             int(rebuild.get("destroyed_graph_count", -1)) == 4,
             f"g{generation}: destroyed Graph count",
@@ -166,13 +223,24 @@ def main() -> int:
             f"g{generation}: remote map coverage",
         )
         snapshots = record["parameter_va_snapshots"]
-        require(
-            snapshots["before_rebuild"]["vas"]
-            == snapshots["after_rebuild"]["vas"]
-            == snapshots["after_request"]["vas"]
-            == initial_vas,
-            f"g{generation}: Parameter VA snapshots",
-        )
+        if parameter_va_mode == "stable_rebuild_recapture":
+            require(
+                snapshots["before_rebuild"]["vas"]
+                == snapshots["after_rebuild"]["vas"]
+                == snapshots["after_request"]["vas"]
+                == initial_vas,
+                f"g{generation}: Parameter VA snapshots",
+            )
+        else:
+            # The model-registry snapshot intentionally retains the original
+            # handles owned by vLLM's wrapper.  The active original-VA binding
+            # is authoritative for this baseline and must expose the new VAs
+            # through both post-rebuild and post-request diagnostics.
+            require(
+                after_rebuild.get("original_vas") == low_after
+                and after_request.get("original_vas") == low_after,
+                f"g{generation}: active non-stable Parameter VA diagnostics",
+            )
         require(
             record["outputs"][0]["output_token_ids"] == initial_prefix,
             f"g{generation}: shared prompt output",
@@ -229,10 +297,11 @@ def main() -> int:
         "status": "ok",
         "cases": 1,
         "generations": summaries,
-        "initial_selected_bytes": 2_264_924_160,
+        "initial_selected_bytes": initial_selected_bytes,
         "parameter_va_count": len(initial_vas),
         "shared_output_prefix": initial_prefix,
-        "physical_kv_allocation_bytes": 167_772_160,
+        "physical_kv_allocation_bytes": physical_kv_bytes,
+        "parameter_va_mode": parameter_va_mode,
         "physical_kv_allocation_dynamic": False,
         "logical_next_request_pressure_dynamic": True,
         "resources_released": True,

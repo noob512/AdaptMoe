@@ -30,7 +30,7 @@ import torch
 from vllm.device_allocator import uvm as _uvm
 
 UVM_MOE_STATIC_ALIAS_ABI_VERSION = 1
-UVM_MOE_STATIC_ALIAS_MAX_ENTRIES = 1152
+UVM_MOE_STATIC_ALIAS_MAX_ENTRIES = 4608
 
 _UVM_MOE_STATIC_ALIAS_MAP_IOCTL = 97
 _UVM_MOE_STATIC_ALIAS_SEAL_IOCTL = 98
@@ -38,6 +38,19 @@ _UVM_MOE_STATIC_ALIAS_DESTROY_IOCTL = 99
 _UVM_MOE_STATIC_ALIAS_PARK_IOCTL = 101
 _UVM_MOE_STATIC_ALIAS_RESUME_IOCTL = 102
 _UVM_MOE_STATIC_ALIAS_REBIND_IOCTL = 103
+_UVM_MOE_STATIC_ALIAS_QUIESCED_REMOVE_IOCTL = 104
+
+UVM_MOE_STATIC_ALIAS_TRANSITION_FLAG_FORCE_SEQUENTIAL = 1 << 0
+UVM_MOE_STATIC_ALIAS_TRANSITION_FLAG_DEFER_CPU_RESTORE = 1 << 1
+UVM_MOE_STATIC_ALIAS_MAP_FLAG_QUIESCED_APPEND = 1 << 0
+UVM_MOE_STATIC_ALIAS_MAP_FLAG_DEFER_DUAL_REFRESH = 1 << 1
+UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL = 1 << 0
+UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL_NESTED = 1 << 1
+_UVM_MOE_STATIC_ALIAS_MAP_FLAGS_ALL = (
+    UVM_MOE_STATIC_ALIAS_MAP_FLAG_QUIESCED_APPEND
+    | UVM_MOE_STATIC_ALIAS_MAP_FLAG_DEFER_DUAL_REFRESH
+)
+UVM_MOE_STATIC_ALIAS_QUIESCED_REMOVE_FLAG_RELEASE_BACKING = 1 << 0
 
 UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW = 1 << 0
 UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_PTE_64K = 1 << 1
@@ -46,6 +59,7 @@ _UVM_MOE_STATIC_ALIAS_ENTRY_FLAGS_ALL = (
     | UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_PTE_64K
 )
 UVM_MOE_STATIC_ALIAS_DESTROY_FLAG_RELEASE_BACKING = 1 << 0
+UVM_MOE_STATIC_ALIAS_DESTROY_FLAG_DEFER_CPU_RESTORE = 1 << 1
 UVM_MOE_STATIC_ALIAS_REBIND_FLAG_BEGIN = 1 << 0
 UVM_MOE_STATIC_ALIAS_REBIND_FLAG_COMMIT = 1 << 1
 UVM_MOE_STATIC_ALIAS_REBIND_FLAG_ABORT = 1 << 2
@@ -169,6 +183,16 @@ class _StaticAliasTransitionParams(ctypes.Structure):
         ("sealed", ctypes.c_uint32),
         ("poisoned", ctypes.c_uint32),
         ("rmStatus", ctypes.c_uint32),
+        ("validation_ns", ctypes.c_uint64),
+        ("build_sort_ns", ctypes.c_uint64),
+        ("preflight_ns", ctypes.c_uint64),
+        ("metadata_ns", ctypes.c_uint64),
+        ("cpu_unmap_ns", ctypes.c_uint64),
+        ("pte_map_ns", ctypes.c_uint64),
+        ("wait_ns", ctypes.c_uint64),
+        ("bookkeeping_ns", ctypes.c_uint64),
+        ("dual_view_full_coverage", ctypes.c_uint32),
+        ("dual_view_block_count", ctypes.c_uint32),
     ]
 
 
@@ -200,13 +224,39 @@ class _StaticAliasRebindParams(ctypes.Structure):
     ]
 
 
+class _StaticAliasQuiescedRemoveParams(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("struct_size", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("session_id", ctypes.c_uint64),
+        ("gpu_uuid", _StaticAliasUuid),
+        ("requested_bytes", ctypes.c_uint64),
+        ("released_alias_bytes", ctypes.c_uint64),
+        ("total_alias_bytes", ctypes.c_uint64),
+        ("backing_bytes", ctypes.c_uint64),
+        ("count", ctypes.c_uint32),
+        ("success_count", ctypes.c_uint32),
+        ("failure_count", ctypes.c_uint32),
+        ("remaining_alias_count", ctypes.c_uint32),
+        ("tlb_invalidate_count", ctypes.c_uint32),
+        ("poisoned", ctypes.c_uint32),
+        (
+            "entries",
+            _StaticAliasEntry * UVM_MOE_STATIC_ALIAS_MAX_ENTRIES,
+        ),
+        ("rmStatus", ctypes.c_uint32),
+    ]
+
+
 def _assert_static_alias_abi() -> None:
     """Fail before an ioctl if the hand-written ctypes layout drifts."""
     expected = {
         "entry_size": (ctypes.sizeof(_StaticAliasEntry), 48),
         "entry_va_base": (_StaticAliasEntry.va_base.offset, 16),
         "entry_status": (_StaticAliasEntry.status.offset, 40),
-        "map_size": (ctypes.sizeof(_StaticAliasMapParams), 55400),
+        "map_size": (ctypes.sizeof(_StaticAliasMapParams), 221288),
         "map_session_id": (_StaticAliasMapParams.session_id.offset, 16),
         "map_requested_bytes": (
             _StaticAliasMapParams.requested_bytes.offset,
@@ -214,7 +264,7 @@ def _assert_static_alias_abi() -> None:
         ),
         "map_count": (_StaticAliasMapParams.count.offset, 72),
         "map_entries": (_StaticAliasMapParams.entries.offset, 96),
-        "map_rm_status": (_StaticAliasMapParams.rmStatus.offset, 55392),
+        "map_rm_status": (_StaticAliasMapParams.rmStatus.offset, 221280),
         "seal_size": (ctypes.sizeof(_StaticAliasSealParams), 72),
         "seal_session_id": (_StaticAliasSealParams.session_id.offset, 16),
         "seal_expected_count": (
@@ -235,7 +285,7 @@ def _assert_static_alias_abi() -> None:
             _StaticAliasDestroyParams.rmStatus.offset,
             72,
         ),
-        "transition_size": (ctypes.sizeof(_StaticAliasTransitionParams), 80),
+        "transition_size": (ctypes.sizeof(_StaticAliasTransitionParams), 152),
         "transition_batch_count": (
             _StaticAliasTransitionParams.reserved.offset,
             12,
@@ -252,12 +302,32 @@ def _assert_static_alias_abi() -> None:
             _StaticAliasTransitionParams.rmStatus.offset,
             76,
         ),
-        "rebind_size": (ctypes.sizeof(_StaticAliasRebindParams), 55400),
+        "rebind_size": (ctypes.sizeof(_StaticAliasRebindParams), 221288),
         "rebind_session_id": (_StaticAliasRebindParams.session_id.offset, 16),
         "rebind_id": (_StaticAliasRebindParams.rebind_id.offset, 24),
         "rebind_count": (_StaticAliasRebindParams.count.offset, 64),
         "rebind_entries": (_StaticAliasRebindParams.entries.offset, 96),
-        "rebind_rm_status": (_StaticAliasRebindParams.rmStatus.offset, 55392),
+        "rebind_rm_status": (_StaticAliasRebindParams.rmStatus.offset, 221280),
+        "quiesced_remove_size": (
+            ctypes.sizeof(_StaticAliasQuiescedRemoveParams),
+            221288,
+        ),
+        "quiesced_remove_session_id": (
+            _StaticAliasQuiescedRemoveParams.session_id.offset,
+            16,
+        ),
+        "quiesced_remove_count": (
+            _StaticAliasQuiescedRemoveParams.count.offset,
+            72,
+        ),
+        "quiesced_remove_entries": (
+            _StaticAliasQuiescedRemoveParams.entries.offset,
+            96,
+        ),
+        "quiesced_remove_rm_status": (
+            _StaticAliasQuiescedRemoveParams.rmStatus.offset,
+            221280,
+        ),
     }
     mismatches = [
         f"{name}={actual} (expected {wanted})"
@@ -442,18 +512,6 @@ def _session_block_reason(
     if session.poisoned and not allow_poisoned:
         return ("static_alias_session_poisoned", "session is destroy-only")
     return None
-
-
-def _ranges_overlap_existing(
-    normalized: Sequence[tuple[int, int, int, int, int, int, int]],
-    existing: Sequence[tuple[int, int]],
-) -> bool:
-    for record in normalized:
-        start = int(record[4])
-        end = start + int(record[5])
-        if any(start < old_end and old_start < end for old_start, old_end in existing):
-            return True
-    return False
 
 
 def _fill_map_params(
@@ -653,7 +711,7 @@ def driver_static_alias_map(
     device: int = 0,
     flags: int = 0,
 ) -> dict[str, object]:
-    """Create or append to one unsealed static-alias session."""
+    """Create/append aliases, including a scheduler-quiesced sealed append."""
     started_ns = time.perf_counter_ns()
     normalized_device, device_error = _normalize_device(device)
     normalized, validation_error = _normalize_entries(entries)
@@ -667,9 +725,22 @@ def driver_static_alias_map(
     if (
         not isinstance(flags, int)
         or isinstance(flags, bool)
-        or flags != 0
+        or flags < 0
+        or flags & ~_UVM_MOE_STATIC_ALIAS_MAP_FLAGS_ALL
     ):
-        validation_error = "MAP flags must be zero for ABI v1"
+        validation_error = "MAP flags contain an unsupported bit"
+    quiesced_append = bool(
+        type(flags) is int
+        and flags & UVM_MOE_STATIC_ALIAS_MAP_FLAG_QUIESCED_APPEND
+    )
+    defer_dual_refresh = bool(
+        type(flags) is int
+        and flags & UVM_MOE_STATIC_ALIAS_MAP_FLAG_DEFER_DUAL_REFRESH
+    )
+    if quiesced_append and session_id == 0:
+        validation_error = "a quiesced append requires an existing session"
+    if defer_dual_refresh and not quiesced_append:
+        validation_error = "deferred dual refresh requires a quiesced append"
     if device_error:
         validation_error = device_error
     if validation_error:
@@ -720,10 +791,22 @@ def driver_static_alias_map(
                     session_id=int(session_id),
                     wall_ns=time.perf_counter_ns() - started_ns,
                 )
-            if cached.sealed:
+            if cached.sealed and not quiesced_append:
                 return _base_result(
                     "map",
                     reason="static_alias_session_sealed",
+                    session_id=int(session_id),
+                    wall_ns=time.perf_counter_ns() - started_ns,
+                )
+            if quiesced_append and (not cached.sealed or cached.parked):
+                return _base_result(
+                    "map",
+                    reason="invalid_static_alias_transition_state",
+                    error=(
+                        "a quiesced append requires sealed=True and "
+                        f"parked=False, got sealed={cached.sealed}, "
+                        f"parked={cached.parked}"
+                    ),
                     session_id=int(session_id),
                     wall_ns=time.perf_counter_ns() - started_ns,
                 )
@@ -734,14 +817,10 @@ def driver_static_alias_map(
                     session_id=int(session_id),
                     wall_ns=time.perf_counter_ns() - started_ns,
                 )
-            if _ranges_overlap_existing(normalized, cached.target_ranges):
-                return _base_result(
-                    "map",
-                    reason="validation_failed",
-                    error="target alias VA overlaps the existing session",
-                    session_id=int(session_id),
-                    wall_ns=time.perf_counter_ns() - started_ns,
-                )
+            # Do not rescan every cached target range here. MAP performs the
+            # authoritative overlap and managed-VA ownership checks while it
+            # holds the driver session lock. Repeating its O(new * existing)
+            # check in Python made scheduler-quiesced appends needlessly slow.
             result = _submit_map(
                 cached.fd,
                 normalized,
@@ -757,6 +836,8 @@ def driver_static_alias_map(
                 bool(result.get("made_progress")) or bool(result.get("poisoned"))
             ):
                 cached.poisoned = True
+            result["quiesced_append"] = quiesced_append
+            result["dual_view_refresh_deferred"] = defer_dual_refresh
             result["wall_ns"] = time.perf_counter_ns() - started_ns
             return result
 
@@ -842,8 +923,10 @@ def driver_static_alias_seal(
     expected_alias_count: int | None = None,
     expected_alias_bytes: int | None = None,
     device: int = 0,
+    refresh_dual: bool = False,
+    nested_refresh: bool = False,
 ) -> dict[str, object]:
-    """Seal an immutable session before any CUDA Graph captures its VAs."""
+    """Seal a session, or refresh its frozen dual children at a safe point."""
     started_ns = time.perf_counter_ns()
     normalized_device, device_error = _normalize_device(device)
     if (
@@ -852,6 +935,9 @@ def driver_static_alias_seal(
         or isinstance(session_id, bool)
         or session_id <= 0
         or session_id > _UINT64_MAX
+        or not isinstance(refresh_dual, bool)
+        or not isinstance(nested_refresh, bool)
+        or (nested_refresh and not refresh_dual)
     ):
         return _base_result(
             "seal",
@@ -890,10 +976,17 @@ def driver_static_alias_seal(
                 session_id=int(session_id),
                 wall_ns=time.perf_counter_ns() - started_ns,
             )
-        if cached.sealed:
+        if cached.sealed and not refresh_dual:
             return _base_result(
                 "seal",
                 reason="static_alias_session_already_sealed",
+                session_id=int(session_id),
+                wall_ns=time.perf_counter_ns() - started_ns,
+            )
+        if refresh_dual and not cached.sealed:
+            return _base_result(
+                "seal",
+                reason="static_alias_session_not_sealed",
                 session_id=int(session_id),
                 wall_ns=time.perf_counter_ns() - started_ns,
             )
@@ -919,6 +1012,11 @@ def driver_static_alias_seal(
         params = _StaticAliasSealParams()
         params.abi_version = UVM_MOE_STATIC_ALIAS_ABI_VERSION
         params.struct_size = ctypes.sizeof(_StaticAliasSealParams)
+        params.flags = 0
+        if refresh_dual:
+            params.flags |= UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL
+        if nested_refresh:
+            params.flags |= UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL_NESTED
         params.session_id = int(session_id)
         params.expected_alias_count = expected_count
         params.expected_alias_bytes = expected_bytes
@@ -983,6 +1081,8 @@ def driver_static_alias_seal(
             ioctl_calls=1,
             ioctl_wall_ns=ioctl_wall_ns,
             wall_ns=time.perf_counter_ns() - started_ns,
+            refresh_dual=bool(refresh_dual),
+            nested_refresh=bool(nested_refresh),
         )
 
 
@@ -992,6 +1092,8 @@ def _driver_static_alias_transition(
     *,
     device: int,
     synchronize: bool,
+    sequential: bool | None,
+    defer_cpu_restore: bool,
 ) -> dict[str, object]:
     """Park or resume the consumer PTEs of one sealed alias session."""
     started_ns = time.perf_counter_ns()
@@ -1004,6 +1106,9 @@ def _driver_static_alias_transition(
         or session_id <= 0
         or session_id > _UINT64_MAX
         or not isinstance(synchronize, bool)
+        or (sequential is not None and not isinstance(sequential, bool))
+        or not isinstance(defer_cpu_restore, bool)
+        or (defer_cpu_restore and operation != "park")
     ):
         return _base_result(
             operation,
@@ -1067,9 +1172,36 @@ def _driver_static_alias_transition(
                 wall_ns=time.perf_counter_ns() - started_ns,
             )
 
+        if sequential is None:
+            transition_mode = os.environ.get(
+                "VLLM_CPU_OFFLOAD_UVM_ORIGINAL_VA_TRANSITION_MODE",
+                "grouped",
+            ).strip().lower()
+            if transition_mode not in ("grouped", "sequential"):
+                return _base_result(
+                    operation,
+                    reason="validation_failed",
+                    error=(
+                        "VLLM_CPU_OFFLOAD_UVM_ORIGINAL_VA_TRANSITION_MODE "
+                        f"must be grouped or sequential, got {transition_mode!r}"
+                    ),
+                    session_id=int(session_id),
+                    wall_ns=time.perf_counter_ns() - started_ns,
+                )
+            sequential = transition_mode == "sequential"
+
         params = _StaticAliasTransitionParams()
         params.abi_version = UVM_MOE_STATIC_ALIAS_ABI_VERSION
         params.struct_size = ctypes.sizeof(_StaticAliasTransitionParams)
+        params.flags = (
+            UVM_MOE_STATIC_ALIAS_TRANSITION_FLAG_FORCE_SEQUENTIAL
+            if sequential
+            else 0
+        )
+        if defer_cpu_restore:
+            params.flags |= (
+                UVM_MOE_STATIC_ALIAS_TRANSITION_FLAG_DEFER_CPU_RESTORE
+            )
         params.session_id = int(session_id)
         ioctl_command = (
             _UVM_MOE_STATIC_ALIAS_PARK_IOCTL
@@ -1099,7 +1231,12 @@ def _driver_static_alias_transition(
         poisoned_raw = int(params.poisoned)
         boolean_fields_ok = all(
             value in (0, 1)
-            for value in (parked_raw, sealed_raw, poisoned_raw)
+            for value in (
+                parked_raw,
+                sealed_raw,
+                poisoned_raw,
+                int(params.dual_view_full_coverage),
+            )
         )
         processed_count = int(params.processed_alias_count)
         consumer_count = int(params.consumer_alias_count)
@@ -1151,6 +1288,8 @@ def _driver_static_alias_transition(
             backing_bytes=int(params.backing_bytes),
             tlb_invalidate_count=int(params.tlb_invalidate_count),
             transition_batch_count=transition_batch_count,
+            transition_mode="sequential" if sequential else "grouped",
+            sequential_requested=bool(sequential),
             batch_count_reported=transition_batch_count > 0,
             batch_count_valid=batch_count_valid,
             parked=parked_raw == 1,
@@ -1162,6 +1301,18 @@ def _driver_static_alias_transition(
             ioctl_ret=ret,
             errno=errno_value,
             rm_status=int(params.rmStatus),
+            validation_ns=int(params.validation_ns),
+            build_sort_ns=int(params.build_sort_ns),
+            preflight_ns=int(params.preflight_ns),
+            metadata_ns=int(params.metadata_ns),
+            cpu_unmap_ns=int(params.cpu_unmap_ns),
+            pte_map_ns=int(params.pte_map_ns),
+            wait_ns=int(params.wait_ns),
+            bookkeeping_ns=int(params.bookkeeping_ns),
+            dual_view_full_coverage=(
+                int(params.dual_view_full_coverage) == 1
+            ),
+            dual_view_block_count=int(params.dual_view_block_count),
             ioctl_calls=1,
             ioctl_wall_ns=ioctl_wall_ns,
             wall_ns=time.perf_counter_ns() - started_ns,
@@ -1173,6 +1324,8 @@ def driver_static_alias_park(
     *,
     device: int = 0,
     synchronize: bool = False,
+    sequential: bool | None = None,
+    defer_cpu_restore: bool = False,
 ) -> dict[str, object]:
     """Detach read-only consumers while retaining upload aliases/backing."""
     return _driver_static_alias_transition(
@@ -1180,6 +1333,8 @@ def driver_static_alias_park(
         session_id,
         device=device,
         synchronize=synchronize,
+        sequential=sequential,
+        defer_cpu_restore=defer_cpu_restore,
     )
 
 
@@ -1188,6 +1343,7 @@ def driver_static_alias_resume(
     *,
     device: int = 0,
     synchronize: bool = False,
+    sequential: bool | None = None,
 ) -> dict[str, object]:
     """Restore parked consumers to their retained GPU slot backing."""
     return _driver_static_alias_transition(
@@ -1195,6 +1351,8 @@ def driver_static_alias_resume(
         session_id,
         device=device,
         synchronize=synchronize,
+        sequential=sequential,
+        defer_cpu_restore=False,
     )
 
 
@@ -1700,11 +1858,304 @@ def driver_static_alias_rebind(
         )
 
 
+def _fill_quiesced_remove_params(
+    normalized: Sequence[tuple[int, int, int, int, int, int, int]],
+    *,
+    session_id: int,
+    gpu_uuid: _StaticAliasUuid,
+) -> _StaticAliasQuiescedRemoveParams:
+    params = _StaticAliasQuiescedRemoveParams()
+    params.abi_version = UVM_MOE_STATIC_ALIAS_ABI_VERSION
+    params.struct_size = ctypes.sizeof(_StaticAliasQuiescedRemoveParams)
+    params.flags = UVM_MOE_STATIC_ALIAS_QUIESCED_REMOVE_FLAG_RELEASE_BACKING
+    params.session_id = int(session_id)
+    params.gpu_uuid = gpu_uuid
+    params.count = len(normalized)
+    for index, record in enumerate(normalized):
+        (
+            backing_layer_id,
+            backing_expert_id,
+            backing_slot_id,
+            entry_flags,
+            va_base,
+            length,
+            slot_offset,
+        ) = record
+        entry = params.entries[index]
+        entry.backing_layer_id = backing_layer_id
+        entry.backing_expert_id = backing_expert_id
+        entry.backing_slot_id = backing_slot_id
+        entry.flags = entry_flags
+        entry.va_base = va_base
+        entry.bytes = length
+        entry.slot_offset = slot_offset
+    return params
+
+
+def driver_static_alias_quiesced_remove(
+    session_id: int,
+    entries: Sequence[Sequence[int]],
+    *,
+    device: int = 0,
+    synchronize: bool = False,
+) -> dict[str, object]:
+    """Remove complete backing identities at a scheduler quiescence point."""
+    started_ns = time.perf_counter_ns()
+    normalized_device, device_error = _normalize_device(device)
+    normalized, validation_error = _normalize_entries(entries)
+    if (
+        device_error
+        or not isinstance(session_id, int)
+        or isinstance(session_id, bool)
+        or session_id <= 0
+        or session_id > _UINT64_MAX
+        or not isinstance(synchronize, bool)
+    ):
+        validation_error = device_error or "invalid quiesced-remove argument"
+    if validation_error:
+        return _base_result(
+            "quiesced_remove",
+            reason="validation_failed",
+            error=validation_error,
+            session_id=session_id,
+            wall_ns=time.perf_counter_ns() - started_ns,
+        )
+    capture = _capture_rejection()
+    if capture is not None:
+        reason, error = capture
+        return _base_result(
+            "quiesced_remove",
+            reason=reason,
+            error=error,
+            session_id=int(session_id),
+            wall_ns=time.perf_counter_ns() - started_ns,
+        )
+    if synchronize:
+        try:
+            torch.cuda.synchronize(normalized_device)
+        except Exception as exc:
+            return _base_result(
+                "quiesced_remove",
+                reason="cuda_synchronize_failed",
+                error=repr(exc),
+                session_id=int(session_id),
+                wall_ns=time.perf_counter_ns() - started_ns,
+            )
+    gpu_uuid, uuid_bytes, uuid_error = _make_uuid(normalized_device)
+    if gpu_uuid is None:
+        return _base_result(
+            "quiesced_remove",
+            reason="gpu_uuid_failed",
+            error=uuid_error,
+            session_id=int(session_id),
+            wall_ns=time.perf_counter_ns() - started_ns,
+        )
+
+    with _static_alias_lock:
+        cached = _static_alias_sessions.get(normalized_device)
+        if cached is None or cached.session_id != int(session_id):
+            return _base_result(
+                "quiesced_remove",
+                reason="static_alias_session_not_found",
+                session_id=int(session_id),
+                wall_ns=time.perf_counter_ns() - started_ns,
+            )
+        blocked = _session_block_reason(cached)
+        if blocked is not None:
+            reason, error = blocked
+            return _base_result(
+                "quiesced_remove",
+                reason=reason,
+                error=error,
+                session_id=int(session_id),
+                wall_ns=time.perf_counter_ns() - started_ns,
+            )
+        if not cached.sealed:
+            return _base_result(
+                "quiesced_remove",
+                reason="invalid_static_alias_transition_state",
+                error=(
+                    "quiesced remove requires sealed=True, "
+                    f"got sealed={cached.sealed}, parked={cached.parked}"
+                ),
+                session_id=int(session_id),
+                wall_ns=time.perf_counter_ns() - started_ns,
+            )
+        if cached.uuid_bytes != uuid_bytes:
+            return _base_result(
+                "quiesced_remove",
+                reason="cached_gpu_uuid_mismatch",
+                session_id=int(session_id),
+                wall_ns=time.perf_counter_ns() - started_ns,
+            )
+
+        requested_set = set(normalized)
+        cached_set = set(cached.alias_entries)
+        if len(requested_set) != len(normalized) or not requested_set <= cached_set:
+            return _base_result(
+                "quiesced_remove",
+                reason="validation_failed",
+                error="remove entries must be unique exact records in the session",
+                session_id=int(session_id),
+                wall_ns=time.perf_counter_ns() - started_ns,
+            )
+        identities = {(record[0], record[1], record[2]) for record in normalized}
+        complete_records = {
+            record
+            for record in cached.alias_entries
+            if (record[0], record[1], record[2]) in identities
+        }
+        if requested_set != complete_records:
+            return _base_result(
+                "quiesced_remove",
+                reason="validation_failed",
+                error="every alias of each removed backing identity is required",
+                session_id=int(session_id),
+                wall_ns=time.perf_counter_ns() - started_ns,
+            )
+        removed_uploads = [
+            record
+            for record in normalized
+            if record[3] & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW
+        ]
+        if len(removed_uploads) != len(identities):
+            return _base_result(
+                "quiesced_remove",
+                reason="validation_failed",
+                error="each removed backing identity requires exactly one upload alias",
+                session_id=int(session_id),
+                wall_ns=time.perf_counter_ns() - started_ns,
+            )
+
+        requested_bytes = sum(record[5] for record in normalized)
+        removed_backing_bytes = sum(record[5] for record in removed_uploads)
+        expected_alias_count = cached.alias_count - len(normalized)
+        expected_alias_bytes = cached.alias_bytes - requested_bytes
+        expected_backing_bytes = cached.backing_bytes - removed_backing_bytes
+        if min(expected_alias_count, expected_alias_bytes, expected_backing_bytes) < 0:
+            return _base_result(
+                "quiesced_remove",
+                reason="validation_failed",
+                error="remove delta exceeds the cached session totals",
+                session_id=int(session_id),
+                wall_ns=time.perf_counter_ns() - started_ns,
+            )
+
+        params = _fill_quiesced_remove_params(
+            normalized,
+            session_id=int(session_id),
+            gpu_uuid=gpu_uuid,
+        )
+        ctypes.set_errno(0)
+        ioctl_started_ns = time.perf_counter_ns()
+        try:
+            ret = int(
+                _libc_ioctl(
+                    cached.fd,
+                    _UVM_MOE_STATIC_ALIAS_QUIESCED_REMOVE_IOCTL,
+                    params,
+                )
+            )
+        except Exception as exc:
+            cached.poisoned = True
+            return _base_result(
+                "quiesced_remove",
+                reason="quiesced_remove_ioctl_exception",
+                error=repr(exc),
+                session_id=int(session_id),
+                poisoned=True,
+                side_effect_indeterminate=True,
+                ioctl_wall_ns=time.perf_counter_ns() - ioctl_started_ns,
+                wall_ns=time.perf_counter_ns() - started_ns,
+            )
+        ioctl_wall_ns = time.perf_counter_ns() - ioctl_started_ns
+        statuses = [int(params.entries[index].status) for index in range(len(normalized))]
+        poisoned_raw = int(params.poisoned)
+        boolean_fields_ok = poisoned_raw in (0, 1)
+        ok = (
+            ret == 0
+            and int(params.rmStatus) == 0
+            and boolean_fields_ok
+            and poisoned_raw == 0
+            and int(params.requested_bytes) == requested_bytes
+            and int(params.released_alias_bytes) == requested_bytes
+            and int(params.total_alias_bytes) == expected_alias_bytes
+            and int(params.backing_bytes) == expected_backing_bytes
+            and int(params.success_count) == len(normalized)
+            and int(params.failure_count) == 0
+            and int(params.remaining_alias_count) == expected_alias_count
+            and statuses == [0] * len(normalized)
+        )
+        contract_violation = ret == 0 and int(params.rmStatus) == 0 and not ok
+        if ok:
+            cached.alias_entries = [
+                record for record in cached.alias_entries if record not in requested_set
+            ]
+            cached.alias_count = expected_alias_count
+            cached.alias_bytes = expected_alias_bytes
+            cached.backing_bytes = expected_backing_bytes
+            cached.target_ranges = [
+                (record[4], record[4] + record[5])
+                for record in cached.alias_entries
+            ]
+            cached.backing_identities = {
+                (record[0], record[1], record[2])
+                for record in cached.alias_entries
+            }
+            legacy_owners = _uvm._uvm_slot_direct_owners.get(normalized_device)
+            if legacy_owners is not None:
+                for layer_id, expert_id, slot_id in identities:
+                    key = (layer_id, slot_id)
+                    if legacy_owners.get(key) == expert_id:
+                        legacy_owners.pop(key, None)
+        elif poisoned_raw == 1 or contract_violation or int(params.success_count) != 0:
+            cached.poisoned = True
+        return _base_result(
+            "quiesced_remove",
+            ok=ok,
+            reason=(
+                "ok"
+                if ok
+                else "quiesced_remove_contract_mismatch"
+                if contract_violation
+                else "quiesced_remove_ioctl_failed"
+            ),
+            session_id=int(session_id),
+            requested_count=len(normalized),
+            requested_bytes=int(params.requested_bytes),
+            released_alias_bytes=int(params.released_alias_bytes),
+            alias_count=int(params.remaining_alias_count),
+            alias_bytes=int(params.total_alias_bytes),
+            backing_bytes=int(params.backing_bytes),
+            released_backing_bytes=max(
+                0, cached.backing_bytes - int(params.backing_bytes)
+            )
+            if not ok
+            else removed_backing_bytes,
+            success_count=int(params.success_count),
+            failure_count=int(params.failure_count),
+            tlb_invalidate_count=int(params.tlb_invalidate_count),
+            entry_statuses=statuses,
+            poisoned=cached.poisoned,
+            kernel_poisoned=poisoned_raw == 1,
+            boolean_fields_ok=boolean_fields_ok,
+            contract_violation=contract_violation,
+            side_effect_indeterminate=False,
+            ioctl_ret=ret,
+            errno=ctypes.get_errno() if ret != 0 else 0,
+            rm_status=int(params.rmStatus),
+            ioctl_calls=1,
+            ioctl_wall_ns=ioctl_wall_ns,
+            wall_ns=time.perf_counter_ns() - started_ns,
+        )
+
+
 def driver_static_alias_destroy(
     session_id: int,
     *,
     device: int = 0,
     release_backing: bool = True,
+    defer_cpu_restore: bool = False,
     synchronize: bool = False,
 ) -> dict[str, object]:
     """Destroy aliases after Graph teardown and an optional device barrier."""
@@ -1717,6 +2168,8 @@ def driver_static_alias_destroy(
         or session_id <= 0
         or session_id > _UINT64_MAX
         or not isinstance(release_backing, bool)
+        or not isinstance(defer_cpu_restore, bool)
+        or (defer_cpu_restore and not release_backing)
         or not isinstance(synchronize, bool)
     ):
         return _base_result(
@@ -1770,11 +2223,11 @@ def driver_static_alias_destroy(
         params = _StaticAliasDestroyParams()
         params.abi_version = UVM_MOE_STATIC_ALIAS_ABI_VERSION
         params.struct_size = ctypes.sizeof(_StaticAliasDestroyParams)
-        params.flags = (
-            UVM_MOE_STATIC_ALIAS_DESTROY_FLAG_RELEASE_BACKING
-            if release_backing
-            else 0
-        )
+        params.flags = 0
+        if release_backing:
+            params.flags |= UVM_MOE_STATIC_ALIAS_DESTROY_FLAG_RELEASE_BACKING
+        if defer_cpu_restore:
+            params.flags |= UVM_MOE_STATIC_ALIAS_DESTROY_FLAG_DEFER_CPU_RESTORE
         params.session_id = int(session_id)
         ctypes.set_errno(0)
         ioctl_started_ns = time.perf_counter_ns()
@@ -1846,6 +2299,7 @@ def driver_static_alias_destroy(
             ),
             session_id=int(session_id),
             release_backing=release_backing,
+            defer_cpu_restore=defer_cpu_restore,
             released_alias_count=int(params.released_alias_count),
             remaining_alias_count=int(params.remaining_alias_count),
             released_alias_bytes=int(params.released_alias_bytes),

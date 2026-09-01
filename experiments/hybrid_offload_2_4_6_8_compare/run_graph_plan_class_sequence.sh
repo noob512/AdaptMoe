@@ -8,8 +8,8 @@ VLLM_PY="${VLLM_ROOT}/.venv/bin/python"
 BASE_HARNESS="${REPO_ROOT}/experiments/vllm_uvm_prefill_alias_decode_remote_graph/run_experiment.sh"
 PLAN_CLASS_RUNNER="${SCRIPT_DIR}/run_graph_plan_class_sequence.py"
 INPUTS="${SCRIPT_DIR}/inputs"
-PLAN_CLASSES="${INPUTS}/graph_plan_classes.json"
-NAMES="${INPUTS}/exact_parameter_names.txt"
+PLAN_CLASSES="${PLAN_CLASSES:-${INPUTS}/graph_plan_classes.json}"
+NAMES="${NAMES:-${INPUTS}/exact_parameter_names.txt}"
 MODEL="${MODEL:-/home/ubuntu/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V2-Lite-Chat/snapshots/85864749cd611b4353ce1decdb286193298f64c7}"
 FIXTURE="${FIXTURE:-${REPO_ROOT}/experiments/eurosys_moe_offload_evaluation/inputs/legacy_pilot/deepseek_v2_lite_bf16/fixtures/evaluation_fixture.json}"
 RUN_ROOT="${RUN_ROOT:-${SCRIPT_DIR}/artifacts/graph_classes_$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -41,6 +41,11 @@ wait_gpu_clean || die "GPU is not clean before the plan-class sequence"
 : >"${RUN_ROOT}/manifest.jsonl"
 
 set +e
+runner_extra_args=()
+if [[ -n "${TRANSITION_PATHS:-}" ]]; then
+  require_file "${TRANSITION_PATHS}"
+  runner_extra_args+=(--transition-paths "${TRANSITION_PATHS}")
+fi
 env \
   VLLM_MLA_DISABLE=1 \
   VLLM_ATTENTION_BACKEND=TRITON_ATTN \
@@ -79,7 +84,8 @@ env \
     --kv-cache-memory-bytes "${KV_CACHE_BYTES}" \
     --cpu-offload-gb "${CPU_OFFLOAD_GB:-30.0}" \
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.97}" \
-    --seed 0 \
+    --seed "${SEED:-0}" \
+    "${runner_extra_args[@]}" \
   >"${RUN_ROOT}/run.log" 2>&1
 rc=$?
 sudo journalctl -k --since "@${kernel_epoch}" --no-pager -o short-unix \

@@ -82,6 +82,65 @@ def test_startup_adopts_initial_graph_table_without_recapture(
     assert wrapper.cudagraph_class_diagnostics()["active_class"] == "c8"
 
 
+def test_equal_width_plan_class_reuses_graph_table_without_recapture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_with_class("base", 512)
+    runner = object.__new__(GPUModelRunner)
+    runner.model = wrapper
+    runner.device = 0
+    capture_calls: list[str] = []
+    runner.capture_model = lambda: capture_calls.append("capture") or 1  # type: ignore[method-assign]
+    registry = {
+        "enabled": True,
+        "active_class": "base",
+        "initial_class": "base",
+        "classes": {
+            "base": {"experts_per_layer": 19},
+            "d005": {"experts_per_layer": 19},
+        },
+    }
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_plan_class_registry",
+        lambda: registry,
+    )
+    switches: list[str] = []
+
+    def switch(class_name: str, **_kwargs):
+        switches.append(class_name)
+        registry["active_class"] = class_name
+        return {"ok": True, "new_class": class_name}
+
+    monkeypatch.setattr(
+        offload_utils,
+        "switch_cpu_offload_uvm_original_va_plan_class",
+        switch,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "register_cpu_offload_uvm_plan_class_graph_certificates",
+        lambda class_name: {"ok": True, "class_name": class_name},
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.torch.cuda.synchronize",
+        lambda device=0: None,
+    )
+
+    result = runner.capture_uvm_expert_graph_class_at_idle_boundary(
+        "d005", scheduler_idle=True
+    )
+
+    assert result["ok"] is True
+    assert result["reason"] == "equal_shape_class_aliased"
+    assert result["source_class"] == "base"
+    assert switches == ["d005"]
+    assert capture_calls == []
+    assert wrapper._cudagraph_class_entries["d005"] is (
+        wrapper._cudagraph_class_entries["base"]
+    )
+
+
 def test_graph_class_activation_switches_plan_and_table_without_recapture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -130,6 +189,81 @@ def test_graph_class_activation_switches_plan_and_table_without_recapture(
     assert wrapper.cudagraph_class_diagnostics()["active_class"] == "c4"
     assert c2_graph is not None and c2_graph.reset_count == 0
     assert c4_graph.reset_count == 0
+
+
+def test_graph_class_activation_resumes_prefill_before_plan_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_with_class("c2", 2)
+    wrapper.begin_cudagraph_class_capture("c4")
+    descriptor = BatchDescriptor(4, uniform_decode=False)
+    wrapper.concrete_cudagraph_entries[descriptor] = CUDAGraphEntry(
+        descriptor,
+        cudagraph=_FakeGraph(),
+    )
+    wrapper.activate_cudagraph_class("c2")
+    runner = object.__new__(GPUModelRunner)
+    runner.model = wrapper
+    runner.device = 0
+    events: list[str] = []
+    switch_kwargs: dict[str, object] = {}
+    registry = _registry(active="c2")
+
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_plan_class_registry",
+        lambda: registry,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "activate_cpu_offload_uvm_original_va_prefill_topology",
+        lambda: events.append("resume")
+        or {"ok": True, "pre_state": "remote_parked", "post_state": "sealed"},
+    )
+
+    def switch(class_name: str, **kwargs):
+        switch_kwargs.update(kwargs)
+        events.append(f"switch:{class_name}")
+        registry["active_class"] = class_name
+        return {
+            "ok": True,
+            "new_class": class_name,
+            "pre_state": "sealed",
+            "post_state": "sealed",
+            "quiesced_delta_used": True,
+        }
+
+    monkeypatch.setattr(
+        offload_utils,
+        "switch_cpu_offload_uvm_original_va_plan_class",
+        switch,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "activate_cpu_offload_uvm_plan_class_graph_certificates",
+        lambda class_name: {"ok": True, "class_name": class_name},
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.torch.cuda.synchronize",
+        lambda device=0: None,
+    )
+
+    result = runner.activate_uvm_expert_graph_class_at_idle_boundary(
+        "c4",
+        scheduler_idle=True,
+        resume_prefill_before_switch=True,
+        defer_dual_refresh=True,
+    )
+
+    assert result["ok"] is True
+    assert events == ["resume", "switch:c4"]
+    assert result["prefill_topology_resume_before_plan_switch"] == {
+        "ok": True,
+        "pre_state": "remote_parked",
+        "post_state": "sealed",
+    }
+    assert result["plan_switch"]["pre_state"] == "sealed"
+    assert switch_kwargs["defer_dual_refresh"] is True
 
 
 def test_certificate_failure_restores_previous_plan_before_return(

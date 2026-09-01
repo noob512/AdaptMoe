@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import ClassVar
 
 import torch
@@ -21,9 +22,56 @@ from vllm.v1.attention.backends.mla.common import (
     MLACommonBackend,
     MLACommonImpl,
     MLACommonMetadata,
+    MLACommonMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import AttentionCGSupport
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 logger = init_logger(__name__)
+
+
+class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
+    """Opt-in full-Graph qualification for the local Triton MLA path.
+
+    Upstream keeps Triton MLA at ``NEVER`` because full CUDA Graph support is
+    not generally qualified across devices. The phase-topology experiment
+    needs separate fixed-shape prefill and decode Graphs on SM120, so expose a
+    fail-closed experiment gate. The default remains unchanged; the gated path
+    must still pass actual capture, topology certificates, and output checks.
+    """
+
+    @staticmethod
+    def _experimental_full_cudagraph_enabled() -> bool:
+        raw = os.environ.get(
+            "VLLM_TRITON_MLA_EXPERIMENTAL_FULL_CUDAGRAPH", "0"
+        ).strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw not in ("0", "false", "no", "off"):
+            raise ValueError(
+                "VLLM_TRITON_MLA_EXPERIMENTAL_FULL_CUDAGRAPH must be 0 or 1"
+            )
+        return False
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        if cls._experimental_full_cudagraph_enabled():
+            return AttentionCGSupport.ALWAYS
+        return AttentionCGSupport.NEVER
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> MLACommonMetadata:
+        if self._experimental_full_cudagraph_enabled():
+            # MLACommonMetadataBuilder's upstream gate intentionally admits
+            # decode only.  The opt-in experiment also captures one fixed
+            # non-uniform prefill shape, for which the ordinary MLA builder
+            # already produces fixed metadata suitable for an attempted full
+            # Graph capture.  Actual capture/replay and output verification
+            # remain fail-closed; the default path retains the decode-only
+            # assertions.
+            return self.build(0, common_attn_metadata)
+        return super().build_for_cudagraph_capture(common_attn_metadata)
 
 
 class TritonMLABackend(MLACommonBackend):
@@ -33,6 +81,10 @@ class TritonMLABackend(MLACommonBackend):
     @staticmethod
     def get_name() -> str:
         return "TRITON_MLA"
+
+    @staticmethod
+    def get_builder_cls() -> type[TritonMLAMetadataBuilder]:
+        return TritonMLAMetadataBuilder
 
     @staticmethod
     def get_impl_cls() -> type["TritonMLAImpl"]:

@@ -83,6 +83,14 @@ workloads/vllm/results/uvm_kv_bench_single_process.log
 **/artifacts/
 /experiments/uvm_static_alias_original_va/result*.json
 
+# Written experiment outcomes stay off the main branch. Reproduction
+# protocols under experiments/reproduce/ remain tracked.
+/experiments/eurosys_moe_offload_evaluation/RESULTS*.md
+/experiments/eurosys_moe_offload_evaluation/REPORT*.md
+/experiments/eurosys_moe_offload_evaluation/ERROR_FIX_LOG*.md
+/experiments/eurosys_moe_offload_evaluation/UNRESOLVED*.md
+/experiments/eurosys_moe_offload_evaluation/EXPERIMENT_FAILURE_CAUSES_AND_SOLUTIONS.md
+
 # Generated benchmark/result artifacts
 /log/
 **/result/
@@ -93,3 +101,6 @@ workloads/vllm/results/uvm_kv_bench_single_process.log
 /workloads/vllm/uvm/results-*/
 **/vllm_uvm_*.jsonl
 **/vllm_uvm_*.log
+
+# Locally compiled UVM probe executable (keep the .cu source only)
+/workloads/vllm/vllm/uvm_test/managed_to_cuda_malloc_reuse_probe

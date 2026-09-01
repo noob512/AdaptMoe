@@ -192,6 +192,9 @@ class BlockPool:
         policy = self.uvm_kv_runtime_policy
         if policy is None or not policy.dynamic_pool_active():
             return 0
+        resolver = getattr(policy, "get_backup_reserve_blocks", None)
+        if callable(resolver):
+            return max(int(resolver()), 0)
         return max(int(getattr(policy, "backup_reserve_blocks", 0)), 0)
 
     def _refill_uvm_backup_queue(self) -> int:

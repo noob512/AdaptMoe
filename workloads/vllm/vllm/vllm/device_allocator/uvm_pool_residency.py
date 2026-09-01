@@ -4361,8 +4361,10 @@ def prepare_uvm_regions_for_gpu_placement(
         ):
             return {"ok": False, "reason": "driver_state_update_failed"}
 
+    executor_used = "not_submitted"
+    driver_result = 0
     try:
-        successes, _, _ = (
+        successes, executor_used, driver_result = (
             batch_prefetch_ranges_to_device_with_executor(
                 ranges,
                 device,
@@ -4375,6 +4377,17 @@ def prepare_uvm_regions_for_gpu_placement(
 
     complete = int(successes) == len(ranges)
     if not complete:
+        logger.error(
+            "Explicit Hot Expert prefetch incomplete: requested_regions=%d "
+            "ranges=%d successes=%d executor_requested=%s "
+            "executor_used=%s driver_result=%d",
+            len(requested),
+            len(ranges),
+            int(successes),
+            executor,
+            executor_used,
+            int(driver_result),
+        )
         with _EXPLICIT_REGION_LOCK:
             current = [
                 region
@@ -4502,4 +4515,109 @@ def query_uvm_regions_physical_residency(
         "region_count": len(ranges),
         "expected_bytes": expected_bytes,
         "wait_for_trackers": bool(wait_for_trackers),
+    }
+
+
+def reconcile_uvm_regions_cpu_state_from_physical_residency(
+    region_ids: list[str] | tuple[str, ...],
+    *,
+    device: int = 0,
+    wait_for_trackers: bool = False,
+) -> dict[str, Any]:
+    """Commit CPU state only after proving every named byte is CPU-resident.
+
+    Explicit-region registration deliberately starts in ``UNKNOWN``.  A
+    destroy/rebuild cycle can therefore lose the application/driver placement
+    tag even though the managed pages at the stable VA remain CPU-resident.
+    Re-running the GPU-chunk release primitive on those pages is invalid.  This
+    helper restores only the lost tag, and only when the physical residency
+    query proves complete CPU residency with no GPU or unknown bytes.
+    """
+    requested = list(dict.fromkeys(str(value) for value in region_ids))
+    if not requested:
+        return {
+            "ok": True,
+            "reason": "no_regions",
+            "physical_cpu_only": True,
+            "reconciled": False,
+            "region_count": 0,
+            "expected_bytes": 0,
+        }
+
+    with _EXPLICIT_REGION_LOCK:
+        records = [
+            _EXPLICIT_REGION_REGISTRY.regions.get(region_id)
+            for region_id in requested
+        ]
+        if any(region is None for region in records):
+            return {
+                "ok": False,
+                "reason": "unregistered_regions",
+                "physical_cpu_only": False,
+                "reconciled": False,
+                "missing_region_ids": [
+                    region_id
+                    for region_id, region in zip(requested, records)
+                    if region is None
+                ],
+            }
+        regions = [region for region in records if region is not None]
+        geometry = tuple((int(region.base), int(region.length)) for region in regions)
+
+    expected_bytes = sum(length for _, length in geometry)
+    physical = dict(
+        driver_batch_query_ranges_residency_bytes(
+            list(geometry),
+            device=int(device),
+            wait_for_trackers=bool(wait_for_trackers),
+        )
+    )
+    physical_cpu_only = bool(
+        physical.get("ok") is True
+        and int(physical.get("queried_bytes", -1)) == expected_bytes
+        and int(physical.get("cpu_bytes", -1)) == expected_bytes
+        and int(physical.get("gpu_bytes", -1)) == 0
+        and int(physical.get("any_bytes", -1)) == expected_bytes
+        and int(physical.get("unknown_bytes", -1)) == 0
+    )
+    if not physical_cpu_only:
+        return {
+            "ok": bool(physical.get("ok") is True),
+            "reason": (
+                "physical_not_cpu_only"
+                if physical.get("ok") is True
+                else "driver_query_failed"
+            ),
+            "physical_cpu_only": False,
+            "reconciled": False,
+            "region_count": len(regions),
+            "expected_bytes": expected_bytes,
+            "physical_residency": physical,
+        }
+
+    with _EXPLICIT_REGION_LOCK:
+        current = [
+            _EXPLICIT_REGION_REGISTRY.regions.get(region_id)
+            for region_id in requested
+        ]
+        if any(before is not after for before, after in zip(regions, current)):
+            return {
+                "ok": False,
+                "reason": "registry_changed_after_physical_audit",
+                "physical_cpu_only": True,
+                "reconciled": False,
+                "region_count": len(regions),
+                "expected_bytes": expected_bytes,
+                "physical_residency": physical,
+            }
+        state_update_ok = _set_uvm_region_state_locked(regions, RegionState.CPU)
+
+    return {
+        "ok": bool(state_update_ok),
+        "reason": "reconciled" if state_update_ok else "driver_state_update_failed",
+        "physical_cpu_only": True,
+        "reconciled": bool(state_update_ok),
+        "region_count": len(regions),
+        "expected_bytes": expected_bytes,
+        "physical_residency": physical,
     }

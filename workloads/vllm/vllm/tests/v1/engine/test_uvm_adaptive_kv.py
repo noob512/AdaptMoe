@@ -19,6 +19,7 @@ class _FakeScheduler:
             block_pool=object(),
         )
         self.unfinished = False
+        self.running: list[object] = []
 
     def has_unfinished_requests(self) -> bool:
         return bool(self.unfinished)
@@ -229,6 +230,37 @@ def test_backup_activation_grows_kv_and_releases_expert_wave(
     assert calls == [(14, "backup_reserve_activation", True)]
 
 
+def test_standalone_backup_growth_can_be_deferred_until_autoscale_is_enabled(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=8)
+    policy = core.scheduler.kv_cache_manager.uvm_kv_runtime_policy
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_BACKUP_PRESSURE_STANDALONE_GROW_ENABLE", "0"
+    )
+    consume_calls = 0
+
+    def consume_backup_activation() -> dict[str, int]:
+        nonlocal consume_calls
+        consume_calls += 1
+        return {"blocks": 2, "events": 1}
+
+    policy.consume_backup_activation = consume_backup_activation
+    monkeypatch.setattr(
+        core,
+        "_resize_uvm_kv_target",
+        lambda *_args, **_kwargs: pytest.fail(
+            "standalone backup growth must remain deferred"
+        ),
+    )
+
+    core._maybe_handle_uvm_kv_preemption_pressure(  # type: ignore[arg-type]
+        SimpleNamespace(preempted_req_ids=set())
+    )
+
+    assert consume_calls == 0
+
+
 def test_preemption_waits_for_batch_queue_to_drain(
     monkeypatch: Any,
 ) -> None:
@@ -318,7 +350,7 @@ def test_next_request_pressure_dynamic_pool_selects_target(
     ]
 
 
-def test_next_request_pressure_dynamic_pool_requires_idle_boundary(
+def test_legacy_next_request_pressure_requires_idle_boundary(
     monkeypatch: Any,
 ) -> None:
     core = _make_core()
@@ -333,6 +365,118 @@ def test_next_request_pressure_dynamic_pool_requires_idle_boundary(
         "ok": False,
         "reason": "request_boundary_not_idle",
     }
+
+
+def test_autoscale_late_request_pressure_defers_growth_until_idle(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=8, total_blocks=32)
+    _enable_test_autoscale(monkeypatch)
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_ALLOWED_TARGET_BLOCKS",
+        "8,16,32",
+    )
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MIN_TARGET_BLOCKS", "8")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MAX_TARGET_BLOCKS", "32")
+    core.scheduler.unfinished = True
+    core.scheduler.running.append(object())
+    core._ensure_uvm_kv_autoscale_state()
+    core._uvm_pending_kv_shrink_target_blocks = 4
+    core._uvm_pending_kv_shrink_reason = "stale_low_pressure"
+    resize_calls: list[int] = []
+
+    def resize(target_blocks: int, **_kwargs: object) -> dict[str, object]:
+        resize_calls.append(target_blocks)
+        return {"ok": True, "reason": "applied"}
+
+    monkeypatch.setattr(core, "_resize_uvm_kv_target", resize)
+
+    result = core.apply_uvm_kv_next_request_pressure([160, 160], 16)
+
+    assert result["ok"] is True
+    assert result["pressure"]["scheduler_unfinished"] is True
+    assert result["autoscale"]["pending"] is True
+    assert result["autoscale"]["reason"] == (
+        "growth_deferred_until_request_boundary"
+    )
+    assert core._uvm_pending_kv_grow_target_blocks == 32
+    assert core._uvm_pending_kv_shrink_target_blocks is None
+    assert core._apply_pending_uvm_kv_growth_if_ready() is None
+    assert resize_calls == []
+
+    core.scheduler.running.clear()
+    core.scheduler.unfinished = False
+    committed = core._apply_pending_uvm_kv_growth_if_ready()
+
+    assert committed is not None and committed["ok"] is True
+    assert resize_calls == [32]
+    assert core._uvm_pending_kv_grow_target_blocks is None
+
+
+def test_autoscale_allowed_tier_uses_smallest_capacity_fitting_target(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=1364, total_blocks=4095)
+    _enable_test_autoscale(monkeypatch)
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_ALLOWED_TARGET_BLOCKS",
+        "1364,2730,4095",
+    )
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MIN_TARGET_BLOCKS", "1364")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MAX_TARGET_BLOCKS", "4095")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_HIGH_WATERMARK", "0.8")
+    targets: list[int] = []
+    monkeypatch.setattr(
+        core,
+        "_resize_uvm_kv_target",
+        lambda target_blocks, **_kwargs: (
+            targets.append(target_blocks) or {"ok": True, "reason": "applied"}
+        ),
+    )
+
+    result = core._request_uvm_kv_autoscale_growth(
+        required_blocks=2597,
+        reason="next_request_autoscale_prediction",
+        urgent=True,
+    )
+
+    assert result["ok"] is True
+    assert result["new_target_blocks"] == 2730
+    assert targets == [2730]
+
+
+def test_autoscale_nonurgent_active_pressure_does_not_queue_stale_growth(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=2730, total_blocks=4095)
+    _enable_test_autoscale(monkeypatch)
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_ALLOWED_TARGET_BLOCKS",
+        "1364,2730,4095",
+    )
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MIN_TARGET_BLOCKS", "1364")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MAX_TARGET_BLOCKS", "4095")
+    core.scheduler.unfinished = True
+    core.scheduler.running.append(object())
+    core._uvm_kv_autoscale_step = 20
+    core._uvm_kv_autoscale_last_resize_step = 1
+    monkeypatch.setattr(
+        core,
+        "_resize_uvm_kv_target",
+        lambda *_args, **_kwargs: pytest.fail("stale grow must not resize"),
+    )
+
+    result = core._request_uvm_kv_autoscale_growth(
+        required_blocks=2597,
+        reason="autoscale_high_watermark_growth",
+        urgent=False,
+    )
+
+    assert result["ok"] is True
+    assert result["reason"] == "active_cohort_fits_current_target"
+    assert result["new_target_blocks"] == 2730
+    assert result["pending"] is False
+    assert core._uvm_pending_kv_grow_target_blocks is None
 
 
 def _autoscale_scheduler_output(
@@ -473,6 +617,77 @@ def test_unified_autoscale_repeatedly_halves_to_lower_bound(
     assert core._uvm_pending_kv_shrink_target_blocks is None
 
 
+def test_unified_autoscale_uses_previous_allowed_plan_class_for_shrink(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=2730, total_blocks=4095)
+    _enable_test_autoscale(monkeypatch)
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MIN_TARGET_BLOCKS", "1364")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MAX_TARGET_BLOCKS", "4095")
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_ALLOWED_TARGET_BLOCKS",
+        "1364,2730,4095",
+    )
+    core.scheduler.kv_cache_manager.block_pool.active_blocks = 4
+    output = _autoscale_scheduler_output()
+
+    for _ in range(3):
+        core._maybe_handle_uvm_kv_preemption_pressure(output)  # type: ignore[arg-type]
+
+    decision = core._uvm_kv_autoscale_last_decision
+    assert decision["candidate_shrink_target_blocks"] == 1364
+    assert core._uvm_pending_kv_shrink_target_blocks == 1364
+
+
+def test_plan_class_shrink_waits_for_global_idle_boundary(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=2730, total_blocks=4095)
+    _enable_test_autoscale(monkeypatch)
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MIN_TARGET_BLOCKS", "1364")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MAX_TARGET_BLOCKS", "4095")
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_ALLOWED_TARGET_BLOCKS",
+        "1364,2730,4095",
+    )
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_PLAN_CLASS_MAP",
+        '{"1364":"cold70","2730":"cold80","4095":"cold89"}',
+    )
+    policy = core.scheduler.kv_cache_manager.uvm_kv_runtime_policy
+    core.scheduler.kv_cache_manager.block_pool.active_blocks = 4
+    resize_calls: list[int] = []
+    activated: list[str] = []
+
+    def resize(target_blocks: int, **_kwargs: object) -> dict[str, object]:
+        resize_calls.append(target_blocks)
+        policy._dynamic_pool_applied_target_blocks = target_blocks
+        return {"ok": True, "reason": "applied"}
+
+    monkeypatch.setattr(core, "_resize_uvm_kv_target", resize)
+    monkeypatch.setattr(
+        core,
+        "activate_uvm_expert_graph_class",
+        lambda class_name: activated.append(class_name)
+        or {"ok": True, "reason": "class_activated"},
+    )
+    output = _autoscale_scheduler_output()
+    for _ in range(3):
+        core._maybe_handle_uvm_kv_preemption_pressure(output)  # type: ignore[arg-type]
+
+    core.scheduler.unfinished = True
+    assert core._apply_pending_uvm_kv_shrink_if_ready() is None
+    assert resize_calls == []
+    assert core._uvm_pending_kv_shrink_target_blocks == 1364
+
+    core.scheduler.unfinished = False
+    committed = core._apply_pending_uvm_kv_shrink_if_ready()
+    assert committed is not None and committed["ok"] is True
+    assert resize_calls == [1364]
+    assert activated == ["cold70"]
+    assert core._uvm_pending_kv_shrink_target_blocks is None
+
+
 def test_unified_autoscale_growth_stops_at_upper_bound(
     monkeypatch: Any,
 ) -> None:
@@ -497,6 +712,235 @@ def test_unified_autoscale_growth_stops_at_upper_bound(
     assert core._uvm_kv_autoscale_last_decision["growth"]["reason"] == (
         "already_at_autoscale_upper_bound"
     )
+
+
+def test_backup_only_autoscale_waits_for_pressure_threshold(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=24, total_blocks=64)
+    _enable_test_autoscale(monkeypatch)
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MAX_TARGET_BLOCKS", "40")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_BACKUP_ONLY", "1")
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_BACKUP_PRESSURE_THRESHOLD_BLOCKS",
+        "4",
+    )
+    policy = core.scheduler.kv_cache_manager.uvm_kv_runtime_policy
+    policy.backup_reserve_blocks = 8
+    pressures = iter((3, 1))
+    policy.consume_backup_activation = lambda: {
+        "blocks": next(pressures),
+        "events": 1,
+    }
+    block_pool = core.scheduler.kv_cache_manager.block_pool
+    remaining = iter((5, 4))
+    block_pool.snapshot_uvm_dynamic_queues = lambda: {
+        "schema": "test_uvm_kv_three_queue_snapshot_v1",
+        "applied_target_blocks": 24,
+        "active_blocks": 20,
+        "gpu_free_blocks": 0,
+        "backup_target_blocks": 8,
+        "gpu_backup_blocks": next(remaining),
+        "cpu_offline_blocks": 40,
+        "invariant_ok": True,
+    }
+    core._uvm_kv_autoscale_predicted_blocks = 100
+    core._uvm_kv_autoscale_prediction_error_blocks = 10.0
+    calls: list[tuple[int, str, bool]] = []
+
+    def resize(
+        target_blocks: int,
+        *,
+        reason: str,
+        release_expert_wave: bool,
+    ) -> dict[str, object]:
+        calls.append((target_blocks, reason, release_expert_wave))
+        return {"ok": True, "reason": "applied"}
+
+    monkeypatch.setattr(core, "_resize_uvm_kv_target", resize)
+    output = _autoscale_scheduler_output(preemptions=2)
+
+    core._maybe_handle_uvm_kv_preemption_pressure(output)  # type: ignore[arg-type]
+    first = core._uvm_kv_autoscale_last_decision
+    assert first["growth_trigger_policy"] == "backup_threshold_only"
+    assert first["predicted_blocks"] == 0
+    assert first["prediction_error_blocks"] == 0
+    assert first["backup_pressure_level_blocks"] == 3
+    assert first["backup_pressure_threshold_reached"] is False
+    assert calls == []
+
+    core._maybe_handle_uvm_kv_preemption_pressure(output)  # type: ignore[arg-type]
+    second = core._uvm_kv_autoscale_last_decision
+    assert second["backup_pressure_level_blocks"] == 4
+    assert second["backup_pressure_threshold_reached"] is True
+    assert second["action"] == "grow"
+    assert calls == [(40, "autoscale_backup_threshold_growth", False)]
+
+
+def test_e10_autoscale_geometry_hits_exact_four_and_six_gib_targets(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=1364, total_blocks=5460)
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MIN_TARGET_BLOCKS", "1364")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MAX_TARGET_BLOCKS", "4095")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_GROW_FACTOR", "2")
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_RESIZE_GRANULARITY_BLOCKS", "1365"
+    )
+    policy = core.scheduler.kv_cache_manager.uvm_kv_runtime_policy
+    targets: list[int] = []
+
+    def resize(target_blocks: int, **_kwargs: object) -> dict[str, object]:
+        targets.append(target_blocks)
+        policy._dynamic_pool_applied_target_blocks = target_blocks
+        return {"ok": True, "reason": "applied"}
+
+    monkeypatch.setattr(core, "_resize_uvm_kv_target", resize)
+    core._request_uvm_kv_autoscale_growth(
+        required_blocks=1368,
+        reason="e10_test",
+        urgent=True,
+    )
+    core._request_uvm_kv_autoscale_growth(
+        required_blocks=2734,
+        reason="e10_test",
+        urgent=True,
+    )
+
+    assert targets == [2730, 4095]
+
+
+def test_e10_autoscale_frozen_targets_hit_exact_two_four_eight_ten_gib(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=1364, total_blocks=6826)
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MIN_TARGET_BLOCKS", "1364")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MAX_TARGET_BLOCKS", "6826")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_GROW_FACTOR", "2")
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_RESIZE_GRANULARITY_BLOCKS", "1365"
+    )
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_ALLOWED_TARGET_BLOCKS",
+        "1364,2730,5460,6826",
+    )
+    policy = core.scheduler.kv_cache_manager.uvm_kv_runtime_policy
+    targets: list[int] = []
+
+    def resize(target_blocks: int, **_kwargs: object) -> dict[str, object]:
+        targets.append(target_blocks)
+        policy._dynamic_pool_applied_target_blocks = target_blocks
+        return {"ok": True, "reason": "applied"}
+
+    monkeypatch.setattr(core, "_resize_uvm_kv_target", resize)
+    for required_blocks in (1368, 2734, 5464):
+        core._request_uvm_kv_autoscale_growth(
+            required_blocks=required_blocks,
+            reason="e10_frozen_tier_test",
+            urgent=True,
+        )
+
+    assert targets == [2730, 5460, 6826]
+    config = core._uvm_kv_autoscale_config(policy)
+    assert config["minimum_blocks"] == 1364
+    assert config["maximum_blocks"] == 6826
+    assert config["allowed_target_blocks"] == [1364, 2730, 5460, 6826]
+
+
+def test_growth_switches_frozen_plan_class_before_physical_kv(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=24, total_blocks=40)
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_PLAN_CLASS_MAP",
+        '{"24": "cold29", "40": "cold30"}',
+    )
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_PLAN_CLASS_BEFORE_GROW",
+        "1",
+    )
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_RESUME_PREFILL_BEFORE_PLAN_CLASS",
+        "1",
+    )
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW", "1")
+    policy = core.scheduler.kv_cache_manager.uvm_kv_runtime_policy
+    events: list[str] = []
+
+    def prepare(*_args: object, **_kwargs: object) -> dict[str, object]:
+        events.append("prepare")
+        return {"ok": True}
+
+    def finalize(*_args: object, **_kwargs: object) -> dict[str, object]:
+        events.append("finalize")
+        return {"ok": True}
+
+    policy.prepare_dynamic_pool_resize = prepare
+    policy.finalize_dynamic_pool_resize = finalize
+
+    def rpc(method: str, *, args: tuple[object, ...]) -> dict[str, object]:
+        if method == "activate_uvm_expert_graph_class":
+            assert args == ("cold30", True, True, True)
+            events.append(f"activate:{args[0]}")
+            return {"ok": True, "class_name": args[0]}
+        assert method == "resize_uvm_kv_cache_target"
+        assert args == (24, 40, [])
+        events.append("resize")
+        return {"ok": True, "made_progress": True}
+
+    monkeypatch.setattr(core, "_uvm_single_worker_rpc", rpc)
+    result = core._resize_uvm_kv_target(
+        40,
+        reason="backup_threshold",
+        release_expert_wave=True,
+    )
+
+    assert result["ok"] is True
+    assert result["plan_class_before_grow"] == {
+        "ok": True,
+        "class_name": "cold30",
+    }
+    assert events == ["activate:cold30", "prepare", "resize", "finalize"]
+
+
+def test_synchronous_growth_class_is_not_requeued(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=24, total_blocks=40)
+    _enable_test_autoscale(monkeypatch)
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MAX_TARGET_BLOCKS", "40")
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_PLAN_CLASS_MAP",
+        '{"24": "cold29", "40": "cold30"}',
+    )
+
+    def resize(
+        target_blocks: int,
+        *,
+        reason: str,
+        release_expert_wave: bool,
+    ) -> dict[str, object]:
+        assert target_blocks == 40
+        assert reason == "backup_threshold"
+        assert release_expert_wave is False
+        return {
+            "ok": True,
+            "reason": "applied",
+            "plan_class_before_grow": {
+                "ok": True,
+                "class_name": "cold30",
+            },
+        }
+
+    monkeypatch.setattr(core, "_resize_uvm_kv_target", resize)
+    result = core._request_uvm_kv_autoscale_growth(
+        required_blocks=24,
+        reason="backup_threshold",
+        urgent=True,
+    )
+
+    assert result["ok"] is True
+    assert core._uvm_kv_autoscale_pending_plan_class is None
 
 
 def test_autoscale_bounds_are_aligned_to_resize_granularity(
@@ -669,6 +1113,32 @@ def test_autoscale_target_activates_configured_fixed_plan_class(
     assert result == {"ok": True, "reason": "class_activated"}
     assert activated == ["C6"]
     assert core._uvm_kv_autoscale_pending_plan_class is None
+
+
+def test_plan_class_activation_resumes_prefill_topology_when_configured(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=16, total_blocks=64)
+    monkeypatch.setenv(
+        "VLLM_UVM_KV_AUTO_SCALE_RESUME_PREFILL_BEFORE_PLAN_CLASS",
+        "1",
+    )
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def rpc(method: str, *, args: tuple[object, ...]) -> dict[str, object]:
+        calls.append((method, args))
+        return {"ok": True, "reason": "class_activated"}
+
+    monkeypatch.setattr(core, "_uvm_single_worker_rpc", rpc)
+    result = core.activate_uvm_expert_graph_class("cold70")
+
+    assert result["ok"] is True
+    assert calls == [
+        (
+            "activate_uvm_expert_graph_class",
+            ("cold70", True, True, False),
+        )
+    ]
 
 
 def test_worker_resize_commits_target_after_expert_and_physical_steps(
@@ -1047,6 +1517,32 @@ def test_dynamic_expert_swap_plan_preserves_count_and_uses_heat_delta() -> None:
     layer = plan["layers"]["layer.7"]
     assert layer["remote_count"] == 2
     assert layer["target_remote_experts"] == [0, 3]
+
+
+def test_dynamic_expert_swap_plan_excludes_non_swappable_experts() -> None:
+    plan = EngineCore._plan_uvm_dynamic_expert_swaps(
+        [
+            {
+                "ok": True,
+                "layers": {
+                    "layer.7": {
+                        "global_num_experts": 6,
+                        "local_num_experts": 6,
+                        "expert_token_counts": [0, 1, 2, 80, 90, 100],
+                        "remote_experts": [5],
+                        "swappable_experts": [3, 4, 5],
+                    }
+                },
+            }
+        ],
+        max_swaps_per_layer=1,
+        min_count_delta=1,
+    )
+
+    assert plan["ok"] is True
+    assert plan["layers"]["layer.7"]["target_remote_experts"] == [3]
+    assert plan["layers"]["layer.7"]["swappable_expert_count"] == 3
+    assert plan["swaps_by_layer"]["layer.7"][0]["demote_expert"] == 3
 
 
 def test_dynamic_expert_swap_plan_rejects_distributed_expert_slices() -> None:

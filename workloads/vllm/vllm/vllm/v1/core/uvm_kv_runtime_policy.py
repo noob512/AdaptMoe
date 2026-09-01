@@ -274,6 +274,33 @@ class UvmKvRuntimePolicy:
         self.backup_reserve_blocks = _read_int_env(
             "VLLM_UVM_KV_BACKUP_RESERVE_BLOCKS", 0
         )
+        self.backup_reserve_target_map: dict[int, int] = {}
+        raw_backup_map = os.environ.get(
+            "VLLM_UVM_KV_BACKUP_RESERVE_TARGET_MAP", ""
+        ).strip()
+        if raw_backup_map:
+            try:
+                parsed_backup_map = json.loads(raw_backup_map)
+                if not isinstance(parsed_backup_map, dict):
+                    raise ValueError("mapping must be a JSON object")
+                normalized_backup_map = {
+                    int(target): int(reserve)
+                    for target, reserve in parsed_backup_map.items()
+                }
+                if any(
+                    target <= 0 or reserve < 0 or reserve >= target
+                    for target, reserve in normalized_backup_map.items()
+                ):
+                    raise ValueError(
+                        "each reserve must satisfy 0 <= reserve < target"
+                    )
+                self.backup_reserve_target_map = normalized_backup_map
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "Ignoring invalid "
+                    "VLLM_UVM_KV_BACKUP_RESERVE_TARGET_MAP: %s",
+                    exc,
+                )
         self.backup_grow_blocks = _read_int_env(
             "VLLM_UVM_KV_BACKUP_GROW_BLOCKS", 0
         )
@@ -354,6 +381,21 @@ class UvmKvRuntimePolicy:
 
     def dynamic_pool_active(self) -> bool:
         return self.dynamic_pool_enable
+
+    def get_backup_reserve_blocks(
+        self,
+        target_blocks: int | None = None,
+    ) -> int:
+        """Return the frozen reserve size for the current physical KV tier."""
+        target = int(
+            self.dynamic_pool_target_blocks
+            if target_blocks is None
+            else target_blocks
+        )
+        target_map = getattr(self, "backup_reserve_target_map", {})
+        if target in target_map:
+            return int(target_map[target])
+        return max(int(getattr(self, "backup_reserve_blocks", 0)), 0)
 
     def refresh_dynamic_pool_target(self, block_pool: Any, reason: str) -> None:
         self._refresh_dynamic_pool_target(block_pool=block_pool, reason=reason)

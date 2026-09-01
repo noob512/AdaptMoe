@@ -13,10 +13,10 @@ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,nohead
 nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader
 test -x workloads/vllm/vllm/.venv/bin/python
 test -f experiments/eurosys_moe_offload_evaluation/e3_prefill_only_runner.py
-test -f experiments/eurosys_moe_offload_evaluation/artifacts/e3-calibration-20260825T091247Z/calibration_assets/exact_parameter_names.txt
+test -f experiments/eurosys_moe_offload_evaluation/inputs/frozen/e3_qwen_cold63_20260828/exact_parameter_names.txt
 test -f experiments/qwen_decode_six_mechanism_compare/inputs/cold_decode_plan_2g.json
 test -f experiments/qwen_decode_six_mechanism_compare/inputs/cold_decode_plan_8g.json
-test -f experiments/eurosys_moe_offload_evaluation/artifacts/e3-derived-plan-cold63-20260828/cold_decode_plan_2g.json
+test -f experiments/eurosys_moe_offload_evaluation/inputs/frozen/e3_qwen_cold63_20260828/cold_decode_plan_2g.json
 ```
 
 开始前 GPU 应无 compute process。不要复用已存在的 artifact 目录；runner 会 fail closed。

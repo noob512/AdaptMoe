@@ -8,7 +8,7 @@ TOP_ROOT="${1:-${SCRIPT_DIR}/artifacts/e3-d-vs-c-full-graph-paired-$(date -u +%Y
 SERVING_NATIVE_HOLE_SENTINEL_BYTES="${SERVING_NATIVE_HOLE_SENTINEL_BYTES:-268435456}"
 
 PLAN_8G="${REPO_ROOT}/experiments/qwen_decode_six_mechanism_compare/inputs/cold_decode_plan_8g.json"
-PLAN_COLD63="${SCRIPT_DIR}/artifacts/e3-derived-plan-cold63-20260828/cold_decode_plan_2g.json"
+PLAN_COLD63="${SCRIPT_DIR}/inputs/frozen/e3_qwen_cold63_20260828/cold_decode_plan_2g.json"
 
 die() { echo "E3 paired D/C-full-Graph: $*" >&2; exit 1; }
 

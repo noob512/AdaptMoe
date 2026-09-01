@@ -102,10 +102,10 @@ test -f experiments/eurosys_moe_offload_evaluation/run_e3_native_copy_vs_uva_pha
 test -f experiments/eurosys_moe_offload_evaluation/run_e3_decode_graph_remote_b1_b8.sh
 test -f experiments/eurosys_moe_offload_evaluation/run_e3_graph_single_round_b1_b8_no_http.sh
 test -f experiments/eurosys_moe_offload_evaluation/summarize_e3_graph_single_round.py
-test -f experiments/eurosys_moe_offload_evaluation/artifacts/e3-calibration-20260825T091247Z/calibration_assets/exact_parameter_names.txt
+test -f experiments/eurosys_moe_offload_evaluation/inputs/frozen/e3_qwen_cold63_20260828/exact_parameter_names.txt
 test -f experiments/qwen_decode_six_mechanism_compare/inputs/cold_decode_plan_2g.json
 test -f experiments/qwen_decode_six_mechanism_compare/inputs/cold_decode_plan_8g.json
-test -f experiments/eurosys_moe_offload_evaluation/artifacts/e3-derived-plan-cold63-20260828/cold_decode_plan_2g.json
+test -f experiments/eurosys_moe_offload_evaluation/inputs/frozen/e3_qwen_cold63_20260828/cold_decode_plan_2g.json
 test -f /home/ubuntu/.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B-FP8/snapshots/d206ba732169f29bb77fbf80fc2c4b81d4d30782/config.json
 ```
 

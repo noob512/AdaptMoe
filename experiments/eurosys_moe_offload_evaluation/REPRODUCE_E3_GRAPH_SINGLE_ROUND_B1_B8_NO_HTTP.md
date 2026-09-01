@@ -35,9 +35,16 @@ test -f /home/ubuntu/.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B-FP8/snap
 
 启动前要求 GPU=0 MiB、没有旧 runner，且 UVM filename 指向系统 stock module。
 
-## 生成 cold63 计划
+## 冻结 cold63 计划
 
-若 `artifacts/e3-derived-plan-cold63-20260828/` 不存在，执行：
+仓库已包含运行所需的冻结计划：
+
+```text
+experiments/eurosys_moe_offload_evaluation/inputs/frozen/e3_qwen_cold63_20260828/cold_decode_plan_2g.json
+experiments/eurosys_moe_offload_evaluation/inputs/frozen/e3_qwen_cold63_20260828/exact_parameter_names.txt
+```
+
+如需从相同校准输入重新派生并核对，执行：
 
 ```bash
 workloads/vllm/vllm/.venv/bin/python \

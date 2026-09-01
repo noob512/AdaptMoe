@@ -10,7 +10,7 @@ VENV_BIN="$(dirname "${PYTHON}")"
 CUDA_HOME="/usr/local/cuda-12.8"
 NVTX_INCLUDE_DIR="/usr/local/cuda-12.8/nsight-systems-2024.6.2/target-linux-x64/nvtx/include"
 OUTPUT_DIR="${1:-}"
-EXPECTED_MOEI_COMMIT="${EXPECTED_MOEI_COMMIT:-92c2bc9266e33bbed22405356ca7ca7e71ae8974}"
+EXPECTED_MOEI_COMMIT="${EXPECTED_MOEI_COMMIT:-9741f80b53374f0d98e7bd8f4a777b816bf68de8}"
 
 [[ -n "${OUTPUT_DIR}" ]] || {
   echo "usage: $0 OUTPUT_DIR" >&2

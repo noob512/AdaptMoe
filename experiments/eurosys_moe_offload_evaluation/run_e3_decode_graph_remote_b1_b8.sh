@@ -7,7 +7,7 @@ BASE_RUNNER="${SCRIPT_DIR}/run_formal_e3.sh"
 TOP_ROOT="${1:-${SCRIPT_DIR}/artifacts/e3-decode-graph-remote-b1-b8-$(date -u +%Y%m%dT%H%M%SZ)}"
 PLAN_10="${REPO_ROOT}/experiments/qwen_decode_six_mechanism_compare/inputs/cold_decode_plan_2g.json"
 PLAN_38="${REPO_ROOT}/experiments/qwen_decode_six_mechanism_compare/inputs/cold_decode_plan_8g.json"
-PLAN_63="${SCRIPT_DIR}/artifacts/e3-derived-plan-cold63-20260828/cold_decode_plan_2g.json"
+PLAN_63="${SCRIPT_DIR}/inputs/frozen/e3_qwen_cold63_20260828/cold_decode_plan_2g.json"
 
 die() { echo "E3 Decode Graph remote: $*" >&2; exit 1; }
 

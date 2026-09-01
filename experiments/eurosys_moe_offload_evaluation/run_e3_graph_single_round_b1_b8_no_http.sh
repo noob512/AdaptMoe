@@ -10,7 +10,7 @@ SERVING_NATIVE_HOLE_SENTINEL_BYTES="${SERVING_NATIVE_HOLE_SENTINEL_BYTES:-268435
 
 PLAN_2G="${REPO_ROOT}/experiments/qwen_decode_six_mechanism_compare/inputs/cold_decode_plan_2g.json"
 PLAN_8G="${REPO_ROOT}/experiments/qwen_decode_six_mechanism_compare/inputs/cold_decode_plan_8g.json"
-PLAN_COLD63="${SCRIPT_DIR}/artifacts/e3-derived-plan-cold63-20260828/cold_decode_plan_2g.json"
+PLAN_COLD63="${SCRIPT_DIR}/inputs/frozen/e3_qwen_cold63_20260828/cold_decode_plan_2g.json"
 
 die() { echo "E3 Graph single round: $*" >&2; exit 1; }
 contains_csv() { local needle="$1" haystack=",$2,"; [[ "${haystack}" == *",${needle},"* ]]; }

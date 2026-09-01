@@ -1044,6 +1044,17 @@ typedef enum
     // and GPU READ-mapped. Result byte fields describe the final audited
     // state, not only PTEs newly installed by this invocation.
     UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_AUDITED = 21,
+    // Scheduler-quiesced immutable-shadow cutover. The entire range must
+    // already be read-duplicated on CPU and the target GPU. No data is copied:
+    // the GPU duplicate is revoked and freed, while the existing CPU copy is
+    // retained and mapped read-only for remote GPU access.
+    UVM_PHASE_F_ACTION_IMMUTABLE_CPU_SHADOW_CUTOVER = 22,
+    // Scheduler-quiesced repair for a complete managed Parameter allocation.
+    // Rebuild every GPU READ mapping from UVM's authoritative residency masks
+    // without migrating or copying data: GPU-resident pages map locally and
+    // CPU-only pages map remotely. Slot-backed aliases are rejected because
+    // their physical ownership is not represented by the residency masks.
+    UVM_PHASE_F_ACTION_REBUILD_GPU_READ_MAPPINGS = 23,
 } UVM_PHASE_F_ACTION;
 
 typedef struct
@@ -1132,9 +1143,11 @@ typedef struct
 // unmap the GPU range and wait its tracker, then installs the slot-backed PTE.
 //
 // A Qwen3 MoE layer contributes 128 experts with 9 independently-backed
-// 512 KiB weight ranges per expert. Keep the complete layer in one
-// experimental request so userspace can amortize ioctl and VA-space setup.
-#define UVM_MOE_SLOT_REMAP_MAX_ENTRIES                                1152
+// 512 KiB weight ranges per expert.  Runtime KV tier changes can add ten
+// experts per layer across the retained graph consumers, producing 4,500
+// static-alias records in one scheduler-quiesced transaction.  Keep the
+// shared slot-remap scratch ABI large enough for that atomic append.
+#define UVM_MOE_SLOT_REMAP_MAX_ENTRIES                                4608
 
 typedef enum
 {
@@ -1450,7 +1463,14 @@ typedef struct
 // CUDA kernel which can reference an alias has completed.
 //
 // MAP creates a session when session_id is zero and returns its non-zero id. A
-// later MAP with that id appends aliases to the same unsealed session. Entries
+// later MAP with that id appends aliases to the same unsealed session. A
+// QUIESCED_APPEND is the serving-time exception: it appends a disjoint set to
+// an already sealed, non-parked session after userspace has synchronized the
+// sole compute stream at a scheduler boundary. It never scans, parks, or
+// republishes the existing consumer set. DEFER_DUAL_REFRESH is valid only with
+// QUIESCED_APPEND. It invalidates the prebuilt dual-view recipe without
+// rebuilding it; userspace must issue SEAL(REFRESH_DUAL) after its associated
+// physical-layout transaction and before PARK. Entries
 // with the same backing identity and overlapping backing offsets intentionally
 // alias the same physical bytes. Target VA ranges within a session must not
 // overlap. The VA ranges must belong to the UVM VA space associated with this
@@ -1460,7 +1480,7 @@ typedef struct
 // trackers cannot observe arbitrary user kernels or an existing Graph replay.
 // All entries in one MAP use the same PTE granularity in ABI v1.
 #define UVM_MOE_STATIC_ALIAS_ABI_VERSION                              1U
-#define UVM_MOE_STATIC_ALIAS_MAX_ENTRIES                              1152U
+#define UVM_MOE_STATIC_ALIAS_MAX_ENTRIES                              4608U
 
 #define UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW                            0x00000001U
 #define UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_PTE_64K                       0x00000002U
@@ -1492,11 +1512,16 @@ typedef struct
 } UVM_MOE_STATIC_ALIAS_ENTRY;
 
 #define UVM_MOE_STATIC_ALIAS_MAP                                      UVM_IOCTL_BASE(97)
+#define UVM_MOE_STATIC_ALIAS_MAP_FLAG_QUIESCED_APPEND                 0x00000001U
+#define UVM_MOE_STATIC_ALIAS_MAP_FLAG_DEFER_DUAL_REFRESH              0x00000002U
+#define UVM_MOE_STATIC_ALIAS_MAP_FLAGS_ALL                            \
+    (UVM_MOE_STATIC_ALIAS_MAP_FLAG_QUIESCED_APPEND |                  \
+     UVM_MOE_STATIC_ALIAS_MAP_FLAG_DEFER_DUAL_REFRESH)
 typedef struct
 {
     NvU32 abi_version;                                // IN, ABI_VERSION
     NvU32 struct_size;                                // IN, sizeof(params)
-    NvU32 flags;                                      // IN, must be zero in v1
+    NvU32 flags;                                      // IN, MAP_FLAG_*
     NvU32 reserved;                                   // IN, must be zero
     NvU64 session_id NV_ALIGN_BYTES(8);               // IN/OUT, zero creates
     NvProcessorUuid gpu_uuid;                         // IN
@@ -1516,13 +1541,23 @@ typedef struct
 
 // Freeze an alias session before CUDA Graph capture. The expected fields make
 // a userspace/kernel descriptor mismatch fail before the session is published
-// as immutable. Repeated SEAL is not part of the v1 contract.
+// as immutable. REFRESH_DUAL keeps the frozen directory and rebuilds only the
+// two detached 2 MiB-parent children from current UVM residency. It is used at
+// a quiescent initialization boundary after KV/Graph allocations have settled.
+// REFRESH_DUAL_NESTED may be combined with REFRESH_DUAL when the immutable
+// cold-page recipe only grows. Existing leaves stay frozen and only newly
+// selected leaves are copied into the GPU child and written into the CPU child.
 #define UVM_MOE_STATIC_ALIAS_SEAL                                     UVM_IOCTL_BASE(98)
+#define UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL                    0x00000001U
+#define UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL_NESTED             0x00000002U
+#define UVM_MOE_STATIC_ALIAS_SEAL_FLAGS_ALL                            \
+    (UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL |                     \
+     UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL_NESTED)
 typedef struct
 {
     NvU32 abi_version;                                // IN, ABI_VERSION
     NvU32 struct_size;                                // IN, sizeof(params)
-    NvU32 flags;                                      // IN, must be zero in v1
+    NvU32 flags;                                      // IN, *_FLAG_*
     NvU32 reserved;                                   // IN, must be zero
     NvU64 session_id NV_ALIGN_BYTES(8);               // IN, non-zero
     NvU64 expected_alias_bytes NV_ALIGN_BYTES(8);     // IN
@@ -1541,8 +1576,10 @@ typedef struct
 // reclaim. session_cleared is set only when no alias or backing remains.
 #define UVM_MOE_STATIC_ALIAS_DESTROY                                  UVM_IOCTL_BASE(99)
 #define UVM_MOE_STATIC_ALIAS_DESTROY_FLAG_RELEASE_BACKING              0x00000001U
+#define UVM_MOE_STATIC_ALIAS_DESTROY_FLAG_DEFER_CPU_RESTORE             0x00000002U
 #define UVM_MOE_STATIC_ALIAS_DESTROY_FLAGS_ALL                         \
-    UVM_MOE_STATIC_ALIAS_DESTROY_FLAG_RELEASE_BACKING
+    (UVM_MOE_STATIC_ALIAS_DESTROY_FLAG_RELEASE_BACKING |               \
+     UVM_MOE_STATIC_ALIAS_DESTROY_FLAG_DEFER_CPU_RESTORE)
 typedef struct
 {
     NvU32 abi_version;                                // IN, ABI_VERSION
@@ -1573,12 +1610,17 @@ typedef struct
 // expert offload/release ABI below.
 #define UVM_MOE_STATIC_ALIAS_PARK                                     UVM_IOCTL_BASE(101)
 #define UVM_MOE_STATIC_ALIAS_RESUME                                   UVM_IOCTL_BASE(102)
+#define UVM_MOE_STATIC_ALIAS_TRANSITION_FLAG_FORCE_SEQUENTIAL         (1U << 0)
+#define UVM_MOE_STATIC_ALIAS_TRANSITION_FLAG_DEFER_CPU_RESTORE         (1U << 1)
+#define UVM_MOE_STATIC_ALIAS_TRANSITION_FLAGS_ALL                      \
+    (UVM_MOE_STATIC_ALIAS_TRANSITION_FLAG_FORCE_SEQUENTIAL |          \
+     UVM_MOE_STATIC_ALIAS_TRANSITION_FLAG_DEFER_CPU_RESTORE)
 typedef struct
 {
     NvU32 abi_version;                                // IN, ABI_VERSION
     NvU32 struct_size;                                // IN, sizeof(params)
-    NvU32 flags;                                      // IN, must be zero in v1
-    NvU32 reserved;                                   // IN zero; OUT completed grouped batches
+    NvU32 flags;                                      // IN, TRANSITION_FLAG_*
+    NvU32 reserved;                                   // IN zero; OUT completed transactions
     NvU64 session_id NV_ALIGN_BYTES(8);               // IN, sealed non-zero session
     NvU64 processed_alias_bytes NV_ALIGN_BYTES(8);    // OUT, consumer bytes changed
     NvU64 consumer_alias_bytes NV_ALIGN_BYTES(8);     // OUT, complete consumer set
@@ -1591,6 +1633,22 @@ typedef struct
     NvU32 sealed;                                     // OUT, session remains sealed
     NvU32 poisoned;                                   // OUT, destroy-only after failure
     NV_STATUS rmStatus;                               // OUT
+    // Non-overlapping driver phases. Ioctl wall time not represented here is
+    // allocation, outer lock acquisition/release, and ABI bookkeeping.
+    NvU64 validation_ns NV_ALIGN_BYTES(8);            // OUT
+    NvU64 build_sort_ns NV_ALIGN_BYTES(8);            // OUT
+    NvU64 preflight_ns NV_ALIGN_BYTES(8);             // OUT
+    NvU64 metadata_ns NV_ALIGN_BYTES(8);              // OUT
+    NvU64 cpu_unmap_ns NV_ALIGN_BYTES(8);              // OUT
+    NvU64 pte_map_ns NV_ALIGN_BYTES(8);                // OUT
+    NvU64 wait_ns NV_ALIGN_BYTES(8);                   // OUT
+    NvU64 bookkeeping_ns NV_ALIGN_BYTES(8);            // OUT
+    // A true value certifies that every read-only consumer byte belongs to a
+    // prebuilt CPU/GPU dual child. In that mode PARK/RESUME only publish 2 MiB
+    // parent entries; no consumer leaf PTE has to be created at transition
+    // time. Userspace may therefore skip its redundant remote-map pass.
+    NvU32 dual_view_full_coverage;                      // OUT, boolean
+    NvU32 dual_view_block_count;                        // OUT, switched parents
 } UVM_MOE_STATIC_ALIAS_TRANSITION_PARAMS;
 typedef UVM_MOE_STATIC_ALIAS_TRANSITION_PARAMS UVM_MOE_STATIC_ALIAS_PARK_PARAMS;
 typedef UVM_MOE_STATIC_ALIAS_TRANSITION_PARAMS UVM_MOE_STATIC_ALIAS_RESUME_PARAMS;
@@ -1637,6 +1695,38 @@ typedef struct
     UVM_MOE_STATIC_ALIAS_ENTRY entries[UVM_MOE_STATIC_ALIAS_MAX_ENTRIES]; // IN/OUT
     NV_STATUS rmStatus;                               // OUT
 } UVM_MOE_STATIC_ALIAS_REBIND_PARAMS;
+
+// Remove complete backing identities from a sealed, non-parked static-alias
+// session at a userspace-certified scheduler quiescence point. Every active
+// upload and consumer alias belonging to each named backing identity must be
+// supplied, so the driver can reject an incomplete delta before changing a
+// PTE. Unmentioned aliases are neither scanned for publication nor remapped.
+// Successful removal restores the submitted target VAs to ordinary UVM
+// mappings, releases the corresponding slot backing, and leaves the remaining
+// session sealed. A failure after mutation poisons the remaining session.
+#define UVM_MOE_STATIC_ALIAS_QUIESCED_REMOVE                           UVM_IOCTL_BASE(104)
+#define UVM_MOE_STATIC_ALIAS_QUIESCED_REMOVE_FLAG_RELEASE_BACKING      0x00000001U
+typedef struct
+{
+    NvU32 abi_version;                                // IN, ABI_VERSION
+    NvU32 struct_size;                                // IN, sizeof(params)
+    NvU32 flags;                                      // IN, exactly RELEASE_BACKING
+    NvU32 reserved;                                   // IN, must be zero
+    NvU64 session_id NV_ALIGN_BYTES(8);               // IN, sealed non-zero session
+    NvProcessorUuid gpu_uuid;                         // IN, session GPU
+    NvU64 requested_bytes NV_ALIGN_BYTES(8);          // OUT, requested alias bytes
+    NvU64 released_alias_bytes NV_ALIGN_BYTES(8);     // OUT, this call
+    NvU64 total_alias_bytes NV_ALIGN_BYTES(8);        // OUT, remaining session
+    NvU64 backing_bytes NV_ALIGN_BYTES(8);            // OUT, remaining backing
+    NvU32 count;                                      // IN, exact records to remove
+    NvU32 success_count;                              // OUT, removed records
+    NvU32 failure_count;                              // OUT
+    NvU32 remaining_alias_count;                      // OUT
+    NvU32 tlb_invalidate_count;                       // OUT, removed PTE ranges
+    NvU32 poisoned;                                   // OUT, remaining session state
+    UVM_MOE_STATIC_ALIAS_ENTRY entries[UVM_MOE_STATIC_ALIAS_MAX_ENTRIES]; // IN/OUT
+    NV_STATUS rmStatus;                               // OUT
+} UVM_MOE_STATIC_ALIAS_QUIESCED_REMOVE_PARAMS;
 
 typedef enum
 {

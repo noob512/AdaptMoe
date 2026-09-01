@@ -118,6 +118,15 @@ def one_rpc(records: list[dict[str, Any]], method: str) -> dict[str, Any]:
     return matches[0]
 
 
+def rpc_wall_ns(record: dict[str, Any]) -> int:
+    """Read RPC wall time from current or legacy experiment artifacts."""
+    value = record.get("wall_ns")
+    if value is None:
+        value = record.get("elapsed_ns")
+    require(value is not None, "RPC record has no wall-time field")
+    return int(value)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_root", type=Path)
@@ -128,6 +137,51 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     root = args.run_root.resolve()
+    protocol_path = root / "protocol.json"
+    protocol = load_json(protocol_path) if protocol_path.is_file() else None
+    protocol_schema = protocol.get("schema") if protocol is not None else None
+    tiered_plan_classes = (
+        protocol_schema == "eurosys_e10_three_queue_single_round_protocol_v2"
+    )
+    if protocol is not None:
+        require(
+            protocol_schema
+            in {
+                "eurosys_e10_three_queue_single_round_protocol_v1",
+                "eurosys_e10_three_queue_single_round_protocol_v2",
+            },
+            "single-round protocol schema",
+        )
+        require(
+            protocol.get("expert_strategy") == "cold-frequency",
+            "expert strategy",
+        )
+        require(
+            int(protocol.get("statistical_repetitions_per_case", -1)) == 1,
+            "single-round repetition count",
+        )
+        require(
+            protocol.get("case_order") == ["baseline", "three_queue"],
+            "case order",
+        )
+        if tiered_plan_classes:
+            tiered_case = (protocol.get("cases") or {}).get("three_queue") or {}
+            require(
+                tiered_case.get("prediction_enabled") is False
+                and tiered_case.get("growth_trigger_policy")
+                == "backup_threshold_only"
+                and tiered_case.get("expert_transition")
+                == "grouped_plan_class"
+                and tiered_case.get("plan_class_map")
+                == {"24": "cold29", "40": "cold30"}
+                and int(
+                    tiered_case.get(
+                        "backup_pressure_threshold_blocks", -1
+                    )
+                )
+                == 4,
+                "tiered backup-only protocol",
+            )
     baseline = load_json(root / "baseline" / "result.json")
     queue = load_json(root / "three_queue" / "result.json")
     for label, result in (("baseline", baseline), ("three_queue", queue)):
@@ -324,7 +378,12 @@ def main() -> int:
 
     record = queue.get("three_queue_qualification") or {}
     require(
-        record.get("schema") == "vllm_uvm_kv_three_queue_e2e_v1",
+        record.get("schema")
+        == (
+            "vllm_uvm_kv_three_queue_e2e_v2"
+            if tiered_plan_classes
+            else "vllm_uvm_kv_three_queue_e2e_v1"
+        ),
         "three-queue record schema",
     )
     before = record["queue_before_request"]
@@ -400,142 +459,435 @@ def main() -> int:
         "KV virtual addresses changed",
     )
 
-    expert_before = record["expert_before_request"]
-    expert_after = record["expert_after_prefill"]
-    released_experts = (
-        int(expert_after["remote_expert_count"])
-        - int(expert_before["remote_expert_count"])
-    )
-    require(released_experts == 48, "expert wave did not release one expert per layer")
-    require(
-        int(expert_after["remote_region_bytes"]) > 0,
-        "expert wave released no audited bytes",
-    )
-    released_region_bytes = int(expert_after["remote_region_bytes"])
-    expert_before_low = queue_roundtrip["expert_before"]
-    expert_after_low = queue_roundtrip["expert_after"]
-    restored_experts = (
-        int(expert_before_low["remote_expert_count"])
-        - int(expert_after_low["remote_expert_count"])
-    )
-    require(
-        restored_experts == 48,
-        "KV shrink did not restore one expert per layer",
-    )
+    cutover = queue.get("cutover_transition") or {}
+    require(cutover.get("ok") is True, "remote Decode cutover failed")
     shrink_step = int(shrink["step"])
-    require(
-        shrink_step == int(queue_roundtrip["steps"][-1]["step"])
-        and all(
-            int(step["expert_after_step"]["remote_expert_count"])
-            == int(expert_before_low["remote_expert_count"])
-            for step in queue_roundtrip["steps"]
-            if int(step["step"]) < shrink_step
-        ),
-        "experts were restored before the request-completion step",
-    )
-    require(
-        int(expert_after_low["remote_expert_count"])
-        == int(record["expert_before_request"]["remote_expert_count"]),
-        "expert count did not return to the pre-pressure baseline",
-    )
-    before_low_layers = expert_before_low["layers"]
-    after_low_layers = expert_after_low["layers"]
-    initial_layers = record["expert_before_request"]["layers"]
-    require(
-        set(before_low_layers) == set(after_low_layers) == set(initial_layers),
-        "expert layer sets differ across autoscale roundtrip",
-    )
-    for layer_key in sorted(before_low_layers):
-        before_ids = set(before_low_layers[layer_key]["remote_expert_ids"])
-        after_ids = set(after_low_layers[layer_key]["remote_expert_ids"])
-        initial_ids = set(initial_layers[layer_key]["remote_expert_ids"])
-        require(
-            len(before_ids - after_ids) == 1
-            and after_ids == initial_ids,
-            f"{layer_key}: expert restore is not exactly one-per-layer",
-        )
-
     restore_rpc_records = queue_roundtrip["rpc_records"]
     shrink_rpc = one_rpc(restore_rpc_records, "resize_uvm_kv_cache_target")
-    restore_candidate_rpc = one_rpc(
-        restore_rpc_records,
-        "get_uvm_incremental_expert_restore_candidates",
-    )
-    restore_rpc = one_rpc(
-        restore_rpc_records,
-        "run_uvm_incremental_expert_restore",
+    rpc_records = record["uvm_rpc_records"]
+    resize_rpc = one_rpc(rpc_records, "resize_uvm_kv_cache_target")
+    require(
+        resize_rpc["result"].get("ok") is True
+        and resize_rpc["result"].get("made_progress") is True,
+        "physical KV grow RPC failed",
     )
     require(
         shrink_rpc["result"].get("ok") is True
         and shrink_rpc["result"].get("made_progress") is True,
         "physical KV shrink RPC failed",
     )
+
+    if tiered_plan_classes:
+        released_experts = restored_experts = 48
+        released_region_bytes = 226_492_416
+        initial_plan = record["plan_class_before_request"]
+        high_plan = record["plan_class_after_prefill"]
+        final_high_plan = record["plan_class_after_request"]
+        low_before_plan = queue_roundtrip["plan_class_before"]
+        low_after_plan = queue_roundtrip["plan_class_after"]
+        require(
+            initial_plan.get("active_plan_class") == "cold29"
+            and int(initial_plan["selected_parameter_bytes_per_forward"])
+            == 6_568_280_064,
+            "initial cold29 tier",
+        )
+        require(
+            high_plan.get("active_plan_class") == "cold30"
+            and final_high_plan.get("active_plan_class") == "cold30"
+            and low_before_plan.get("active_plan_class") == "cold30"
+            and int(high_plan["selected_parameter_bytes_per_forward"])
+            == 6_794_772_480,
+            "high-pressure cold30 tier",
+        )
+        require(
+            low_after_plan.get("active_plan_class") == "cold29"
+            and int(low_after_plan["selected_parameter_bytes_per_forward"])
+            == 6_568_280_064,
+            "low-pressure cold29 tier restoration",
+        )
+        require(
+            int(initial_plan["session_id"])
+            == int(high_plan["session_id"])
+            == int(low_after_plan["session_id"])
+            > 0,
+            "plan-class switch did not retain the alias session",
+        )
+        require(
+            shrink_step == int(queue_roundtrip["steps"][-1]["step"])
+            and all(
+                step["plan_class_after_step"].get("active_plan_class")
+                == "cold30"
+                for step in queue_roundtrip["steps"]
+                if int(step["step"]) < shrink_step
+            )
+            and queue_roundtrip["steps"][-1]["plan_class_after_step"].get(
+                "active_plan_class"
+            )
+            == "cold29",
+            "cold30 was not retained until the audited shrink boundary",
+        )
+
+        grow_decision = record["autoscale_after_prefill"]["last_decision"]
+        require(
+            grow_decision.get("growth_trigger_policy")
+            == "backup_threshold_only"
+            and int(grow_decision.get("predicted_blocks", -1)) == 0
+            and int(grow_decision.get("prediction_error_blocks", -1)) == 0
+            and int(grow_decision.get("backup_pressure_level_blocks", -1)) == 4
+            and int(
+                grow_decision.get("backup_pressure_threshold_blocks", -1)
+            )
+            == 4
+            and grow_decision.get("backup_pressure_threshold_reached") is True,
+            "backup-only threshold decision",
+        )
+
+        release_rpc = one_rpc(
+            rpc_records, "activate_uvm_expert_graph_class"
+        )
+        restore_rpc = one_rpc(
+            restore_rpc_records, "activate_uvm_expert_graph_class"
+        )
+        release_result = release_rpc["result"]
+        restore_result = restore_rpc["result"]
+        release_switch = release_result.get("plan_switch") or {}
+        restore_switch = restore_result.get("plan_switch") or {}
+        require(
+            release_result.get("ok") is True
+            and release_result.get("new_class") == "cold30"
+            and release_switch.get("ok") is True,
+            "cold30 grouped activation failed",
+        )
+        require(
+            restore_result.get("ok") is True
+            and restore_result.get("new_class") == "cold29"
+            and restore_switch.get("ok") is True,
+            "cold29 grouped restoration failed",
+        )
+        for label, switch in (
+            ("grow", release_switch),
+            ("restore", restore_switch),
+        ):
+            require(
+                switch.get("session_reused") is True
+                and switch.get("graphs_retained") is True
+                and switch.get("incremental_topology") is True,
+                f"{label}: grouped transition contract",
+            )
+        optimizations = (
+            ((protocol or {}).get("cases") or {})
+            .get("three_queue", {})
+            .get("optimizations", {})
+        )
+        if optimizations.get("precompiled_transition_instructions") is True:
+            require(
+                release_switch.get("instruction_id") == "cold29->cold30"
+                and restore_switch.get("instruction_id") == "cold30->cold29"
+                and release_switch.get("instruction_cache_hit") is True
+                and restore_switch.get("instruction_cache_hit") is True
+                and int(release_switch.get("instruction_registry_size", 0)) >= 2
+                and int(restore_switch.get("instruction_registry_size", 0)) >= 2,
+                "runtime transitions did not use startup-compiled instructions",
+            )
+        if optimizations.get("quiesced_delta_alias_update") is True:
+            release_delta = release_switch.get("quiesced_delta") or {}
+            restore_delta = restore_switch.get("quiesced_delta") or {}
+            require(
+                release_switch.get("quiesced_delta_enabled") is True
+                and release_switch.get("quiesced_delta_eligible") is True
+                and release_switch.get("quiesced_delta_used") is True
+                and int(release_switch.get("quiesced_delta_add_count", -1))
+                == 450
+                and int(release_switch.get("quiesced_delta_remove_count", -1))
+                == 0
+                and release_delta.get("mode") == "quiesced_append"
+                and release_delta.get("ok") is True
+                and int(release_delta.get("requested_count", -1)) == 450
+                and int(release_delta.get("ioctl_calls", -1)) == 1
+                and release_switch.get("park") is None
+                and release_switch.get("resume") is None,
+                "cold29 -> cold30 did not use one append-only delta ioctl",
+            )
+            require(
+                restore_switch.get("quiesced_delta_enabled") is True
+                and restore_switch.get("quiesced_delta_eligible") is True
+                and restore_switch.get("quiesced_delta_used") is True
+                and int(restore_switch.get("quiesced_delta_add_count", -1))
+                == 0
+                and int(restore_switch.get("quiesced_delta_remove_count", -1))
+                == 450
+                and restore_delta.get("mode") == "quiesced_remove"
+                and restore_delta.get("ok") is True
+                and int(restore_delta.get("requested_count", -1)) == 450
+                and int(restore_delta.get("ioctl_calls", -1)) == 1
+                and restore_switch.get("park") is None
+                and restore_switch.get("resume") is None,
+                "cold30 -> cold29 did not use one remove-only delta ioctl",
+            )
+        if optimizations.get("startup_cpu_source_prefill") is True:
+            source_prefill = (
+                ((queue.get("diagnostics") or {}).get("after_load") or {})
+                .get("model", {})
+                .get("plan_class_source_prefill", {})
+            )
+            release_refill = release_switch.get("source_refill") or {}
+            restore_refill = restore_switch.get("source_refill") or {}
+            require(
+                source_prefill.get("enabled") is True
+                and int(source_prefill.get("copied_slot_count", -1)) == 96
+                and int(source_prefill.get("copied_bytes", -1))
+                == released_region_bytes,
+                "startup CPU source prefill did not cover the cold30 delta",
+            )
+            require(
+                int(release_refill.get("requested_slot_count", -1)) == 96
+                and int(release_refill.get("requested_bytes", -1))
+                == released_region_bytes
+                and int(release_refill.get("changed_slot_count", -1)) == 0
+                and int(release_refill.get("changed_bytes", -1)) == 0
+                and int(
+                    release_refill.get("reused_prefilled_slot_count", -1)
+                )
+                == 96
+                and int(release_refill.get("reused_prefilled_bytes", -1))
+                == released_region_bytes,
+                "cold29 -> cold30 performed a runtime GPU-to-CPU source refill",
+            )
+            require(
+                int(restore_refill.get("changed_slot_count", -1)) == 0
+                and int(restore_refill.get("changed_bytes", -1)) == 0,
+                "cold30 -> cold29 unexpectedly refilled a CPU source",
+            )
+        release_residency = release_switch.get("residency") or {}
+        restore_residency = restore_switch.get("residency") or {}
+        if optimizations.get("immutable_cpu_shadow_cutover") is True:
+            shadow_setup = (
+                ((queue.get("diagnostics") or {}).get("after_load") or {})
+                .get("model", {})
+                .get("plan_class_immutable_cpu_shadow", {})
+            )
+            shadow_setup_residency = shadow_setup.get("residency") or {}
+            require(
+                shadow_setup.get("enabled") is True
+                and shadow_setup.get("reason")
+                == "read_duplicate_shadows_ready"
+                and int(shadow_setup.get("range_count", -1)) == 96
+                and int(shadow_setup.get("requested_bytes", -1))
+                == released_region_bytes
+                and int(shadow_setup.get("readmostly_count", -1)) == 96
+                and int(shadow_setup.get("prefetched_count", -1)) == 96
+                and int(shadow_setup_residency.get("cpu_bytes", -1))
+                == released_region_bytes
+                and int(shadow_setup_residency.get("gpu_bytes", -1))
+                == released_region_bytes
+                and int(shadow_setup_residency.get("unknown_bytes", -1)) == 0,
+                "startup immutable CPU shadows do not cover the cold30 delta",
+            )
+            shadow_cutover = release_residency.get("shadow_cutover") or {}
+            release_added_residency = (
+                release_residency.get("added_cold_residency") or {}
+            )
+            restore_removed_residency = (
+                restore_residency.get("removed_cold_residency") or {}
+            )
+            require(
+                release_residency.get("mode")
+                == "immutable_cpu_shadow_delta"
+                and release_residency.get("immutable_cpu_shadow_enabled")
+                is True
+                and shadow_cutover.get("ok") is True
+                and int(shadow_cutover.get("range_count", -1)) == 96
+                and int(shadow_cutover.get("success_count", -1)) == 96
+                and int(shadow_cutover.get("failure_count", -1)) == 0
+                and int(shadow_cutover.get("requested_bytes", -1))
+                == released_region_bytes
+                and int(shadow_cutover.get("released_gpu_bytes", -1))
+                == released_region_bytes
+                and int(shadow_cutover.get("retained_cpu_shadow_bytes", -1))
+                == released_region_bytes
+                and int(shadow_cutover.get("remote_mapped_bytes", -1))
+                == released_region_bytes
+                and int(release_added_residency.get("cpu_bytes", -1))
+                == released_region_bytes
+                and int(release_added_residency.get("gpu_bytes", -1)) == 0
+                and int(release_added_residency.get("unknown_bytes", -1)) == 0,
+                "cold29 -> cold30 did not use a complete immutable-shadow cutover",
+            )
+            require(
+                restore_residency.get("mode")
+                == "immutable_cpu_shadow_delta"
+                and restore_residency.get("immutable_cpu_shadow_enabled")
+                is True
+                and restore_residency.get("shadow_cutover") is None
+                and int(restore_removed_residency.get("cpu_bytes", -1))
+                == released_region_bytes
+                and int(restore_removed_residency.get("gpu_bytes", -1))
+                == released_region_bytes
+                and int(restore_removed_residency.get("unknown_bytes", -1)) == 0,
+                "cold30 -> cold29 did not restore GPU residency while retaining shadows",
+            )
+        require(
+            int(release_residency.get("added_cold_range_count", -1)) == 96
+            and int(release_residency.get("added_cold_bytes", -1))
+            == released_region_bytes
+            and int(release_residency.get("removed_cold_bytes", -1)) == 0,
+            "cold29 -> cold30 residency delta",
+        )
+        require(
+            int(restore_residency.get("removed_cold_range_count", -1)) == 96
+            and int(restore_residency.get("removed_cold_bytes", -1))
+            == released_region_bytes
+            and int(restore_residency.get("added_cold_bytes", -1)) == 0
+            and restore_residency.get("advice_requested") is False
+            and int(restore_residency.get("advised_count", -1)) == 0
+            and int(restore_residency.get("prefetched_count", -1)) == 96,
+            "cold30 -> cold29 residency delta",
+        )
+        methods = [str(item["method"]) for item in rpc_records]
+        restore_methods = [
+            str(item["method"]) for item in restore_rpc_records
+        ]
+        require(
+            methods == [
+                "activate_uvm_expert_graph_class",
+                "resize_uvm_kv_cache_target",
+            ],
+            "grow RPC sequence is not grouped-plan then KV",
+        )
+        require(
+            restore_methods == [
+                "resize_uvm_kv_cache_target",
+                "activate_uvm_expert_graph_class",
+            ],
+            "restore RPC sequence is not KV then grouped-plan",
+        )
+    else:
+        expert_before = record["expert_before_request"]
+        expert_after = record["expert_after_prefill"]
+        released_experts = (
+            int(expert_after["remote_expert_count"])
+            - int(expert_before["remote_expert_count"])
+        )
+        require(
+            released_experts == 48,
+            "expert wave did not release one expert per layer",
+        )
+        require(
+            int(expert_after["remote_region_bytes"]) > 0,
+            "expert wave released no audited bytes",
+        )
+        released_region_bytes = int(expert_after["remote_region_bytes"])
+        expert_before_low = queue_roundtrip["expert_before"]
+        expert_after_low = queue_roundtrip["expert_after"]
+        restored_experts = (
+            int(expert_before_low["remote_expert_count"])
+            - int(expert_after_low["remote_expert_count"])
+        )
+        require(restored_experts == 48, "expert wave restore count")
+        require(
+            int(expert_after_low["remote_expert_count"])
+            == int(record["expert_before_request"]["remote_expert_count"]),
+            "expert count did not return to the pre-pressure baseline",
+        )
+        require(
+            shrink_step == int(queue_roundtrip["steps"][-1]["step"])
+            and all(
+                int(step["expert_after_step"]["remote_expert_count"])
+                == int(expert_before_low["remote_expert_count"])
+                for step in queue_roundtrip["steps"]
+                if int(step["step"]) < shrink_step
+            ),
+            "experts were restored before the request-completion step",
+        )
+        before_low_layers = expert_before_low["layers"]
+        after_low_layers = expert_after_low["layers"]
+        initial_layers = record["expert_before_request"]["layers"]
+        require(
+            set(before_low_layers) == set(after_low_layers) == set(initial_layers),
+            "expert layer sets differ across autoscale roundtrip",
+        )
+        for layer_key in sorted(before_low_layers):
+            before_ids = set(before_low_layers[layer_key]["remote_expert_ids"])
+            after_ids = set(after_low_layers[layer_key]["remote_expert_ids"])
+            initial_ids = set(initial_layers[layer_key]["remote_expert_ids"])
+            require(
+                len(before_ids - after_ids) == 1 and after_ids == initial_ids,
+                f"{layer_key}: expert restore is not exactly one-per-layer",
+            )
+        restore_candidate_rpc = one_rpc(
+            restore_rpc_records,
+            "get_uvm_incremental_expert_restore_candidates",
+        )
+        restore_rpc = one_rpc(
+            restore_rpc_records, "run_uvm_incremental_expert_restore"
+        )
+        require(
+            len(restore_candidate_rpc["result"].get("candidates") or {}) == 48
+            and restore_rpc["result"].get("ok") is True
+            and int(restore_rpc["result"].get("restored_expert_count", -1))
+            == 48,
+            "legacy expert restore RPC",
+        )
+        require(
+            int(cutover.get("runtime_remote_range_count", 0)) > 0
+            and int(cutover.get("runtime_remote_bytes", -1))
+            == released_region_bytes
+            and int(cutover.get("hot_runtime_remote_bytes", -1))
+            == released_region_bytes,
+            "legacy runtime remote byte audit",
+        )
+        hot_physical = cutover.get("hot_physical_residency") or {}
+        require(
+            int(hot_physical.get("cpu_bytes", -1)) == released_region_bytes
+            and int(hot_physical.get("gpu_bytes", -1))
+            == int(cutover.get("hot_expected_gpu_bytes", -2)),
+            "legacy post-cutover residency audit",
+        )
+        candidate_rpc = one_rpc(
+            rpc_records, "get_uvm_incremental_expert_offload_candidates"
+        )
+        release_rpc = one_rpc(
+            rpc_records, "run_uvm_incremental_expert_offload"
+        )
+        require(
+            len(candidate_rpc["result"].get("candidates") or {}) == 48
+            and release_rpc["result"].get("ok") is True
+            and int(release_rpc["result"].get("released_expert_count", -1))
+            == 48,
+            "legacy expert release RPC",
+        )
+        methods = [str(item["method"]) for item in rpc_records]
+        restore_methods = [
+            str(item["method"]) for item in restore_rpc_records
+        ]
+        require(
+            methods.index("get_uvm_incremental_expert_offload_candidates")
+            < methods.index("run_uvm_incremental_expert_offload")
+            < methods.index("resize_uvm_kv_cache_target"),
+            "expert wave did not precede physical grow",
+        )
+        require(
+            restore_methods.index("resize_uvm_kv_cache_target")
+            < restore_methods.index(
+                "get_uvm_incremental_expert_restore_candidates"
+            )
+            < restore_methods.index("run_uvm_incremental_expert_restore"),
+            "expert restoration did not follow physical KV shrink",
+        )
+
+    baseline_pid = int((baseline.get("cutover_transition") or {}).get("pid", -1))
+    queue_pid = int(cutover.get("pid", -1))
     require(
-        len(restore_candidate_rpc["result"].get("candidates") or {}) == 48,
-        "restore candidate wave layer count",
+        baseline_pid > 0 and queue_pid > 0 and baseline_pid != queue_pid,
+        "baseline and three-queue cases were not independent processes",
     )
-    require(
-        restore_rpc["result"].get("ok") is True
-        and int(restore_rpc["result"].get("restored_expert_count", -1)) == 48,
-        "expert restore RPC failed",
+    baseline_timing = baseline["timing"]
+    queue_timing = queue["timing"]
+    baseline_low_ms = sum(
+        float(step["elapsed_ms"]) for step in baseline_roundtrip["steps"]
     )
-    restore_methods = [str(item["method"]) for item in restore_rpc_records]
-    require(
-        restore_methods.index("resize_uvm_kv_cache_target")
-        < restore_methods.index("get_uvm_incremental_expert_restore_candidates")
-        < restore_methods.index("run_uvm_incremental_expert_restore"),
-        "expert restoration did not follow physical KV shrink",
-    )
-    cutover = queue.get("cutover_transition") or {}
-    require(cutover.get("ok") is True, "remote Decode cutover failed")
-    require(
-        int(cutover.get("runtime_remote_range_count", 0)) > 0,
-        "cutover did not receive runtime remote expert ranges",
-    )
-    require(
-        int(cutover.get("runtime_remote_bytes", -1))
-        == released_region_bytes,
-        "cutover runtime remote bytes differ from the expert wave",
-    )
-    require(
-        int(cutover.get("hot_runtime_remote_bytes", -1))
-        == released_region_bytes,
-        "runtime remote experts were not removed from the hot-GPU audit",
-    )
-    hot_physical = cutover.get("hot_physical_residency") or {}
-    require(
-        int(hot_physical.get("cpu_bytes", -1)) == released_region_bytes
-        and int(hot_physical.get("gpu_bytes", -1))
-        == int(cutover.get("hot_expected_gpu_bytes", -2)),
-        "post-cutover hot/runtime-remote physical residency is incorrect",
-    )
-    rpc_records = record["uvm_rpc_records"]
-    candidate_rpc = one_rpc(
-        rpc_records, "get_uvm_incremental_expert_offload_candidates"
-    )
-    release_rpc = one_rpc(rpc_records, "run_uvm_incremental_expert_offload")
-    resize_rpc = one_rpc(rpc_records, "resize_uvm_kv_cache_target")
-    require(
-        len(candidate_rpc["result"].get("candidates") or {}) == 48,
-        "candidate wave layer count",
-    )
-    release_result = release_rpc["result"]
-    require(release_result.get("ok") is True, "expert wave RPC failed")
-    require(
-        int(release_result.get("released_expert_count", -1)) == 48,
-        "expert wave RPC release count",
-    )
-    require(
-        resize_rpc["result"].get("ok") is True
-        and resize_rpc["result"].get("made_progress") is True,
-        "physical KV grow RPC failed",
-    )
-    methods = [str(item["method"]) for item in rpc_records]
-    require(
-        methods.index("get_uvm_incremental_expert_offload_candidates")
-        < methods.index("run_uvm_incremental_expert_offload")
-        < methods.index("resize_uvm_kv_cache_target"),
-        "expert wave did not precede physical grow",
+    queue_low_ms = sum(
+        float(step["elapsed_ms"]) for step in queue_roundtrip["steps"]
     )
 
     kernel_text = (root / "kernel.since.log").read_text(encoding="utf-8")
@@ -559,9 +911,50 @@ def main() -> int:
         "stock nvidia_uvm was not restored",
     )
 
+    transition_timing = {
+        (
+            "tier_grow_switch"
+            if tiered_plan_classes
+            else "expert_release"
+        ): rpc_wall_ns(release_rpc)
+        / 1e6,
+        "kv_grow": rpc_wall_ns(resize_rpc) / 1e6,
+        "kv_shrink": rpc_wall_ns(shrink_rpc) / 1e6,
+        (
+            "tier_restore_switch"
+            if tiered_plan_classes
+            else "expert_restore"
+        ): rpc_wall_ns(restore_rpc)
+        / 1e6,
+    }
     verification = {
-        "schema": "vllm_uvm_three_queue_e2e_verification_v1",
+        "schema": (
+            "vllm_uvm_three_queue_e2e_verification_v2"
+            if tiered_plan_classes
+            else "vllm_uvm_three_queue_e2e_verification_v1"
+        ),
         "status": "ok",
+        "qualification_only": True,
+        "statistical_repetitions_per_case": (
+            int(protocol["statistical_repetitions_per_case"])
+            if protocol is not None
+            else 1
+        ),
+        "expert_strategy": (
+            str(protocol["expert_strategy"])
+            if protocol is not None
+            else "legacy_unspecified"
+        ),
+        "expert_transition_mode": (
+            "grouped_plan_class"
+            if tiered_plan_classes
+            else "incremental_per_layer"
+        ),
+        "prediction_enabled": not tiered_plan_classes,
+        "case_process_pids": {
+            "baseline": baseline_pid,
+            "three_queue": queue_pid,
+        },
         "model": queue["config"]["model"],
         "initial_target_blocks": initial_target,
         "backup_reserve_blocks": int(before["gpu_backup_blocks"]),
@@ -574,7 +967,7 @@ def main() -> int:
         "restored_experts": restored_experts,
         "released_expert_region_bytes": released_region_bytes,
         "cutover_runtime_remote_bytes": int(
-            cutover["runtime_remote_bytes"]
+            cutover.get("runtime_remote_bytes", 0)
         ),
         "output_token_ids_sha256": queue["output_token_ids_sha256"],
         "autoscale_output_token_ids_sha256": queue_roundtrip[
@@ -588,6 +981,59 @@ def main() -> int:
         "prefill_decode_roundtrip_verified": True,
         "prefill_step_ms": float(queue["timing"]["prefill_step_ms"]),
         "cycle_e2e_ms": float(queue["timing"]["cycle_e2e_ms"]),
+        "timing_comparison": {
+            "baseline": {
+                "load_seconds": float(baseline["load_seconds"]),
+                "high_prefill_ms": float(baseline_timing["prefill_step_ms"]),
+                "high_first_decode_ms": float(
+                    baseline_timing["first_decode_step_ms"]
+                ),
+                "high_steady_decode_median_ms": float(
+                    baseline_timing["steady_decode_step_ms"]["median"]
+                ),
+                "high_cycle_e2e_ms": float(baseline_timing["cycle_e2e_ms"]),
+                "low_trace_step_sum_ms": baseline_low_ms,
+            },
+            "three_queue": {
+                "load_seconds": float(queue["load_seconds"]),
+                "high_prefill_ms": float(queue_timing["prefill_step_ms"]),
+                "high_first_decode_ms": float(queue_timing["first_decode_step_ms"]),
+                "high_steady_decode_median_ms": float(
+                    queue_timing["steady_decode_step_ms"]["median"]
+                ),
+                "high_cycle_e2e_ms": float(queue_timing["cycle_e2e_ms"]),
+                "low_trace_step_sum_ms": queue_low_ms,
+            },
+            "three_queue_vs_baseline_percent": {
+                "high_prefill": (
+                    float(queue_timing["prefill_step_ms"])
+                    / float(baseline_timing["prefill_step_ms"])
+                    - 1.0
+                )
+                * 100.0,
+                "high_first_decode": (
+                    float(queue_timing["first_decode_step_ms"])
+                    / float(baseline_timing["first_decode_step_ms"])
+                    - 1.0
+                )
+                * 100.0,
+                "high_steady_decode_median": (
+                    float(queue_timing["steady_decode_step_ms"]["median"])
+                    / float(baseline_timing["steady_decode_step_ms"]["median"])
+                    - 1.0
+                )
+                * 100.0,
+                "high_cycle_e2e": (
+                    float(queue_timing["cycle_e2e_ms"])
+                    / float(baseline_timing["cycle_e2e_ms"])
+                    - 1.0
+                )
+                * 100.0,
+                "low_trace_step_sum": (queue_low_ms / baseline_low_ms - 1.0)
+                * 100.0,
+            },
+            "three_queue_transition_rpc_ms": transition_timing,
+        },
         "kernel_faults": 0,
         "shutdown_clean": True,
     }

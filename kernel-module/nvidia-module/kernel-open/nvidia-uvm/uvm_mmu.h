@@ -435,6 +435,47 @@ NV_STATUS uvm_page_tree_get_entry(uvm_page_tree_t *tree,
 // This function performs no TLB invalidations.
 void uvm_page_tree_write_pde(uvm_page_tree_t *tree, uvm_page_table_range_t *single, uvm_push_t *push);
 
+// Re-publish every cached parent entry from the table containing leaf_range
+// up to the root. Unlike uvm_page_tree_write_pde(), this also works when a
+// 2 MiB parent is shared by two partial VA blocks and neither block retains a
+// page_table_range_2m handle. The host page-tree topology is not changed and
+// this function performs no TLB invalidation.
+void uvm_page_tree_rewrite_parent_chain(uvm_page_tree_t *tree,
+                                        const uvm_page_table_range_t *leaf_range,
+                                        uvm_push_t *push);
+
+// Write a PDE which exposes only the child table for page_size, while keeping
+// every sibling table in the host page-tree cache. This is intended for
+// quiesced, prebuilt-view cutovers: a later ordinary write_pde() can publish
+// all cached siblings again. The selected child must already be allocated and
+// initialized. This function performs no TLB invalidations.
+void uvm_page_tree_write_pde_for_page_size(uvm_page_tree_t *tree,
+                                           uvm_page_table_range_t *single,
+                                           NvU64 page_size,
+                                           uvm_push_t *push);
+
+// Allocate a leaf table which is deliberately not inserted in the host page
+// tree. This permits two immutable tables of the same page size to coexist;
+// the caller publishes one at a time with
+// uvm_page_tree_write_pde_with_child().
+NV_STATUS uvm_page_tree_alloc_table_detached(uvm_page_tree_t *tree,
+                                             NvU64 page_size,
+                                             uvm_pmm_alloc_flags_t pmm_flags,
+                                             uvm_page_table_range_t *single,
+                                             uvm_page_table_range_t *children);
+
+// Free a detached table after the caller has made it unreachable in hardware
+// and completed all PTE writes which target it.
+NV_STATUS uvm_page_tree_free_table_detached(uvm_page_tree_t *tree,
+                                            uvm_page_table_range_t *children);
+
+// Publish exactly child in single's page-size slot. child may be detached;
+// no host page-tree ownership is changed.
+void uvm_page_tree_write_pde_with_child(uvm_page_tree_t *tree,
+                                        uvm_page_table_range_t *single,
+                                        const uvm_page_table_range_t *child,
+                                        uvm_push_t *push);
+
 // For a single-entry page table range, clear the PDE on the GPU.
 // It is an error to call this on a PTE-only range.
 // The parameter single can otherwise be any single-entry range such as those
@@ -691,7 +732,7 @@ static NvU64 uvm_page_table_range_size(uvm_page_table_range_t *range)
 // Get the physical address of the entry at entry_index within the range
 // (counted from range->start_index).
 static uvm_gpu_phys_address_t uvm_page_table_range_entry_address(uvm_page_tree_t *tree,
-                                                                 uvm_page_table_range_t *range,
+                                                                 const uvm_page_table_range_t *range,
                                                                  size_t entry_index)
 {
     NvU32 entry_size = uvm_mmu_pte_size(tree, range->page_size);

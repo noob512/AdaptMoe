@@ -86,12 +86,25 @@ def load_run_contract(
     order = str(run_config.get("order", ""))
     require(mode in {"qualify", "formal"}, f"unverifiable mode: {mode}")
     require(order and all(symbol in ARMS for symbol in order), "run order differs")
-    expected_counts = (
-        Counter({"T": 1, "Z": 1, "A": 1, "G": 1})
-        if mode == "qualify"
-        else Counter({"T": 1, "Z": 3, "A": 3, "G": 3})
-    )
-    require(Counter(order) == expected_counts, f"{mode} arm counts differ")
+    arm_counts = Counter(order)
+    if mode == "qualify":
+        require(
+            arm_counts == Counter({"T": 1, "Z": 1, "A": 1, "G": 1}),
+            "qualify arm counts differ",
+        )
+    else:
+        performance_counts = [arm_counts[symbol] for symbol in ("Z", "A", "G")]
+        require(arm_counts["T"] == 1, "formal route-trace count differs")
+        require(
+            len(set(performance_counts)) == 1 and performance_counts[0] >= 3,
+            f"formal performance arm counts differ: {arm_counts}",
+        )
+        recorded_count = run_config.get("formal_processes_per_arm")
+        if recorded_count is not None:
+            require(
+                int(recorded_count) == performance_counts[0],
+                "formal process count metadata differs",
+            )
 
     status_path = run_root / "execution_status.tsv"
     with status_path.open(encoding="utf-8", newline="") as handle:
@@ -129,7 +142,7 @@ def load_run_contract(
             counts = batch_orders[symbol]
             require(
                 set(counts) == {"1,4", "4,1"}
-                and abs(counts["1,4"] - counts["4,1"]) == 1,
+                and abs(counts["1,4"] - counts["4,1"]) <= 1,
                 f"formal batch order is not balanced for {symbol}: {counts}",
             )
 

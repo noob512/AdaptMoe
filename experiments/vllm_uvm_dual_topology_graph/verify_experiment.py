@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import statistics
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,33 @@ class ContractError(RuntimeError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ContractError(message)
+
+
+def percentile(values: list[float], quantile: float) -> float:
+    require(bool(values), "percentile requires at least one value")
+    require(0.0 <= quantile <= 1.0, "percentile quantile out of range")
+    ordered = sorted(float(value) for value in values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def bootstrap_median_ci(
+    values: list[float], *, seed: int, resamples: int = 10_000
+) -> list[float]:
+    require(bool(values), "bootstrap requires at least one value")
+    require(resamples > 0, "bootstrap resample count must be positive")
+    rng = random.Random(seed)
+    count = len(values)
+    medians = [
+        statistics.median(values[rng.randrange(count)] for _ in range(count))
+        for _ in range(resamples)
+    ]
+    return [percentile(medians, 0.025), percentile(medians, 0.975)]
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -69,6 +97,7 @@ def validate_batched_transition(
     label: str,
     *,
     required: bool,
+    transition_mode: str = "grouped",
 ) -> None:
     if not required:
         return
@@ -78,7 +107,23 @@ def validate_batched_transition(
     require(transition.get("batch_count_valid") is True, f"{label}: invalid batch count")
     require(transition.get("ioctl_calls") == 1, f"{label}: transition ioctl count")
     require(processed == 4_608, f"{label}: transition consumer count")
-    require(batches == 4, f"{label}: expected four grouped batches, got {batches}")
+    expected_transactions = 4_608 if transition_mode == "sequential" else 4
+    require(
+        batches == expected_transactions,
+        f"{label}: expected {expected_transactions} {transition_mode} transactions, got {batches}",
+    )
+    requested_mode = transition.get("transition_mode")
+    if transition_mode == "sequential":
+        require(requested_mode == "sequential", f"{label}: sequential mode absent")
+        require(
+            transition.get("sequential_requested") is True,
+            f"{label}: sequential flag absent",
+        )
+    else:
+        require(
+            requested_mode in (None, "grouped"),
+            f"{label}: unexpected transition mode {requested_mode!r}",
+        )
     require(int(transition.get("tlb_invalidate_count", 0)) > 0, f"{label}: no PTE/TLB work")
 
 
@@ -166,6 +211,7 @@ def validate_cutover(
     vas: list[int],
     *,
     require_park_batch: bool,
+    transition_mode: str,
 ) -> None:
     prefill = model_diag(result, "after_prefill")
     after = model_diag(result, "after_first_decode")
@@ -237,6 +283,7 @@ def validate_cutover(
         parked,
         f"{label}: initial park",
         required=require_park_batch,
+        transition_mode=transition_mode,
     )
     remote_map = cutover.get("remote_map", {})
     require(remote_map.get("ok") is True and remote_map.get("requested_bytes") == LOGICAL_BYTES, f"{label}: remote map")
@@ -252,6 +299,7 @@ def validate_roundtrip(
     vas: list[int],
     *,
     require_park_batch: bool,
+    transition_mode: str,
 ) -> dict[str, float]:
     roundtrip = result.get("steps", {}).get("park_resume_roundtrip")
     require(isinstance(roundtrip, dict), f"{label}: roundtrip absent")
@@ -283,6 +331,7 @@ def validate_roundtrip(
         resume_ioctl,
         f"{label}: resume",
         required=require_park_batch,
+        transition_mode=transition_mode,
     )
     repark_events = roundtrip.get("repark_transitions", [])
     require(isinstance(repark_events, list) and len(repark_events) == 1, f"{label}: repark transition count")
@@ -293,6 +342,7 @@ def validate_roundtrip(
         repark.get("park", {}),
         f"{label}: repark",
         required=require_park_batch,
+        transition_mode=transition_mode,
     )
     before_counter = roundtrip.get("compilation_counter_before", {})
     after_counter = roundtrip.get("compilation_counter_after", {})
@@ -326,7 +376,12 @@ def validate_shutdown(result: dict[str, Any], label: str) -> None:
     require(diag.get("active_driver_backing_bytes") == 0, f"{label}: shutdown backing")
 
 
-def validate_case(case_dir: Path, *, require_park_batch: bool = False) -> dict[str, Any]:
+def validate_case(
+    case_dir: Path,
+    *,
+    require_park_batch: bool = False,
+    transition_mode: str = "grouped",
+) -> dict[str, Any]:
     label = case_dir.name
     result = load_json(case_dir / "result.json")
     require(result.get("status") == "ok", f"{label}: status")
@@ -357,12 +412,14 @@ def validate_case(case_dir: Path, *, require_park_batch: bool = False) -> dict[s
         label,
         vas,
         require_park_batch=require_park_batch,
+        transition_mode=transition_mode,
     )
     roundtrip_timing = validate_roundtrip(
         result,
         label,
         vas,
         require_park_batch=require_park_batch,
+        transition_mode=transition_mode,
     )
     validate_shutdown(result, label)
     kernel_log = (case_dir / "kernel.since.log").read_text(errors="replace")
@@ -378,6 +435,7 @@ def validate_case(case_dir: Path, *, require_park_batch: bool = False) -> dict[s
         "case": label,
         "batch_size": int(config["batch_size"]),
         "audit_trace": bool(config["audit_trace"]),
+        "transition_mode": transition_mode,
         "output_hash": result.get("output_token_ids_sha256"),
         "prefill_step_ms": float(timing["prefill_step_ms"]),
         "steady_decode_step_ms": float(steady),
@@ -401,7 +459,7 @@ def aggregate(samples: list[dict[str, Any]]) -> dict[str, Any]:
         require(len(hashes) == 1 and None not in hashes, f"batch {batch}: output hash drift")
         performance = [item for item in members if not item["audit_trace"]] or members
         metrics: dict[str, Any] = {"sample_count": len(performance), "output_hash": next(iter(hashes))}
-        for key in (
+        for metric_index, key in enumerate((
             "prefill_step_ms",
             "steady_decode_step_ms",
             "first_decode_step_ms",
@@ -413,9 +471,22 @@ def aggregate(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "cycle_e2e_ms",
             "cuda_used_after_load_bytes",
             "cuda_max_allocated_bytes",
-        ):
+        )):
             values = [float(item[key]) for item in performance]
-            metrics[key] = {"median": statistics.median(values), "mean": statistics.fmean(values), "min": min(values), "max": max(values)}
+            bootstrap_seed = 20260828 + batch * 100 + metric_index
+            metrics[key] = {
+                "median": statistics.median(values),
+                "p95": percentile(values, 0.95),
+                "p99": percentile(values, 0.99),
+                "median_bootstrap_95_ci": bootstrap_median_ci(
+                    values, seed=bootstrap_seed
+                ),
+                "bootstrap_resamples": 10_000,
+                "bootstrap_seed": bootstrap_seed,
+                "mean": statistics.fmean(values),
+                "min": min(values),
+                "max": max(values),
+            }
         output[str(batch)] = metrics
     return output
 
@@ -433,6 +504,11 @@ def main() -> int:
     require(run_config.get("park_resume") is True, "run config park/resume")
     require(run_config.get("roundtrip_cycles") == 2, "run config roundtrip cycles")
     require_park_batch = run_config.get("park_batch_required") is True
+    transition_mode = str(run_config.get("transition_mode", "grouped"))
+    require(
+        transition_mode in ("grouped", "sequential"),
+        "run config transition mode",
+    )
     status = root / "execution_status.tsv"
     require(status.is_file(), "execution_status.tsv absent")
     rows = [line.split("\t") for line in status.read_text().splitlines()[1:] if line]
@@ -440,7 +516,11 @@ def main() -> int:
     require(all(row[-1] == "0" for row in rows), "one or more case return codes failed")
     cases = [root / row[-2] for row in rows]
     samples = [
-        validate_case(path, require_park_batch=require_park_batch)
+        validate_case(
+            path,
+            require_park_batch=require_park_batch,
+            transition_mode=transition_mode,
+        )
         for path in cases
     ]
     verification = {

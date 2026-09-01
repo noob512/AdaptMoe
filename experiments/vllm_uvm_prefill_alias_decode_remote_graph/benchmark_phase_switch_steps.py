@@ -51,6 +51,20 @@ ALIAS_COUNT = 6_912
 ALIAS_BYTES = 3_623_878_656
 
 ARM_CONTRACT = {
+    "A": {
+        "name": "alias_prefill_alias_eager_decode",
+        "phase_mode": "off",
+        "execution_mode": "eager",
+        "graph": False,
+        "prefill_topology": "sealed",
+    },
+    "B": {
+        "name": "alias_prefill_alias_graph_decode",
+        "phase_mode": "off",
+        "execution_mode": "full_graph_decode",
+        "graph": True,
+        "prefill_topology": "sealed",
+    },
     "H": {
         "name": "alias_prefill_remote_eager_decode",
         "phase_mode": "prefill_remote_decode",
@@ -87,6 +101,22 @@ ARM_CONTRACT = {
         "prefill_graph": True,
         "prefill_topology": "sealed",
     },
+    "E": {
+        "name": "alias_graph_prefill_alias_graph_decode",
+        "phase_mode": "off",
+        "execution_mode": "full_graph_separate",
+        "graph": True,
+        "prefill_graph": True,
+        "prefill_topology": "sealed",
+    },
+    "F": {
+        "name": "remote_graph_prefill_remote_graph_decode",
+        "phase_mode": "remote_only",
+        "execution_mode": "full_graph_separate",
+        "graph": True,
+        "prefill_graph": True,
+        "prefill_topology": "remote",
+    },
 }
 
 
@@ -117,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offload-manifest", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--arm", choices=tuple(ARM_CONTRACT), required=True)
-    parser.add_argument("--batch-size", type=int, choices=(1, 4, 8), required=True)
+    parser.add_argument("--batch-size", type=int, choices=(1, 4, 8, 16), required=True)
     parser.add_argument("--cudagraph-capture-sizes", default="1,4")
     parser.add_argument("--warmup-decode-steps", type=int, default=5)
     parser.add_argument("--measured-decode-steps", type=int, default=16)
@@ -186,6 +216,33 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--kv-multilevel-pressure-2-4-6",
+        action="store_true",
+        help=(
+            "qualification-only mode: measure the initial 2 GiB tier, then "
+            "run two real backup-pressure requests that must rebalance to "
+            "the frozen 4 and 6 GiB KV/expert tiers"
+        ),
+    )
+    parser.add_argument(
+        "--kv-multilevel-trigger-mode",
+        choices=("pressure", "direct"),
+        default="pressure",
+        help=(
+            "for the 2/4/6 GiB qualification, either let real backup-queue "
+            "pressure trigger each grow inside Prefill, or apply the same "
+            "frozen tier transaction directly at the idle request boundary"
+        ),
+    )
+    parser.add_argument(
+        "--kv-multilevel-tier-specs",
+        default="",
+        help=(
+            "optional ordered gib:target_blocks:plan_class records separated "
+            "by commas; default is 2:1364:cold70,4:2730:cold80,6:4095:cold89"
+        ),
+    )
+    parser.add_argument(
         "--kv-autoscale-low-prompt-tokens",
         type=int,
         default=16,
@@ -240,6 +297,43 @@ def parse_args() -> argparse.Namespace:
 
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def parse_multilevel_tier_specs(raw: str) -> list[dict[str, Any]]:
+    text = raw.strip()
+    if not text:
+        text = "2:1364:cold70,4:2730:cold80,6:4095:cold89"
+    result: list[dict[str, Any]] = []
+    for item in text.split(","):
+        fields = item.strip().split(":")
+        if len(fields) != 3:
+            raise ValueError(f"invalid multilevel tier specification: {item!r}")
+        gib, target = int(fields[0]), int(fields[1])
+        class_name = fields[2].strip()
+        if gib <= 0 or target <= 0 or not class_name:
+            raise ValueError(f"invalid multilevel tier specification: {item!r}")
+        result.append(
+            {"tier_gib": gib, "target_blocks": target, "plan_class": class_name}
+        )
+    if len(result) < 2:
+        raise ValueError("multilevel tier sequence requires at least two tiers")
+    if [item["tier_gib"] for item in result] != sorted(
+        {item["tier_gib"] for item in result}
+    ):
+        raise ValueError("multilevel GiB tiers must be unique and increasing")
+    if [item["target_blocks"] for item in result] != sorted(
+        {item["target_blocks"] for item in result}
+    ):
+        raise ValueError("multilevel targets must be unique and increasing")
+    if len({item["plan_class"] for item in result}) != len(result):
+        raise ValueError("multilevel plan classes must be unique")
+    return result
+
+
+def cold_class_width(class_name: str) -> int:
+    if not class_name.startswith("cold") or not class_name[4:].isdigit():
+        raise ValueError(f"plan class has no cold width: {class_name!r}")
+    return int(class_name[4:])
 
 
 def cuda_memory_snapshot(torch: Any) -> dict[str, int]:
@@ -408,7 +502,7 @@ def load_dynamic_plan_sequence(path: Path) -> list[dict[str, Any]]:
             and expected_bytes > 0,
             f"dynamic plan {index} has invalid expected bytes",
         )
-        require(batch_size in (1, 4, 8), f"dynamic plan {index} has invalid batch")
+        require(batch_size in (1, 4, 8, 16), f"dynamic plan {index} has invalid batch")
         require(
             isinstance(max_tokens, int)
             and not isinstance(max_tokens, bool)
@@ -462,7 +556,7 @@ def load_dynamic_kv_sequence(
         target_blocks = raw.get("target_blocks")
         expert_waves = raw.get("expert_waves", 0)
         require(isinstance(label, str) and label, f"dynamic KV {index} has no label")
-        require(batch_size in (1, 4, 8), f"dynamic KV {index} has invalid batch")
+        require(batch_size in (1, 4, 8, 16), f"dynamic KV {index} has invalid batch")
         require(
             isinstance(max_tokens, int)
             and not isinstance(max_tokens, bool)
@@ -718,6 +812,23 @@ def diagnostics_snapshot(utils: Any, driver_getter: Any) -> dict[str, Any]:
     }
 
 
+def plan_class_state_snapshot(utils: Any) -> dict[str, Any]:
+    """Record the small plan-class state needed by autoscale qualification."""
+    diagnostics = utils.get_cpu_offload_graph_static_alias_diagnostics()
+    return {
+        "active_plan_class": diagnostics.get("active_plan_class"),
+        "initial_plan_class": diagnostics.get("initial_plan_class"),
+        "plan_generation": diagnostics.get("plan_generation"),
+        "selected_parameter_bytes_per_forward": diagnostics.get(
+            "selected_parameter_bytes_per_forward"
+        ),
+        "backing_bytes": diagnostics.get("backing_bytes"),
+        "stable_envelope_bytes": diagnostics.get("stable_envelope_bytes"),
+        "lifecycle_state": diagnostics.get("lifecycle_state"),
+        "session_id": diagnostics.get("session_id"),
+    }
+
+
 def read_manifest(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
@@ -808,6 +919,8 @@ def selected_environment() -> dict[str, str]:
             "CUDA_VISIBLE_DEVICES",
             "VLLM_ATTENTION_BACKEND",
             "VLLM_ENABLE_V1_MULTIPROCESSING",
+            "VLLM_FUSED_MOE_CHUNK_SIZE",
+            "VLLM_FLASHINFER_AUTOTUNE_MAX_TOKENS",
         }
     }
 
@@ -824,6 +937,22 @@ def main() -> int:
         .strip()
         .lower()
         in {"1", "true", "yes", "on"}
+    )
+    tiered_plan_class_qualification = bool(
+        three_queue_qualification
+        and os.environ.get(
+            "VLLM_UVM_KV_AUTO_SCALE_PLAN_CLASS_BEFORE_GROW", "0"
+        )
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"}
+    )
+    multilevel_pressure_qualification = bool(
+        args.kv_multilevel_pressure_2_4_6
+    )
+    multilevel_trigger_mode = str(args.kv_multilevel_trigger_mode)
+    multilevel_tier_specs = parse_multilevel_tier_specs(
+        str(args.kv_multilevel_tier_specs)
     )
     dynamic_specs = (
         load_dynamic_plan_sequence(args.dynamic_plan_sequence)
@@ -848,6 +977,14 @@ def main() -> int:
         "explicit physical-KV targets require a dynamic-KV sequence",
     )
     require(
+        multilevel_pressure_qualification
+        or (
+            multilevel_trigger_mode == "pressure"
+            and not str(args.kv_multilevel_tier_specs).strip()
+        ),
+        "multilevel options are only valid with the multilevel qualification",
+    )
+    require(
         not incremental_expert_waves
         or (args.allow_explicit_dynamic_kv_targets and bool(dynamic_kv_specs)),
         "incremental expert waves require an explicit dynamic-KV sequence",
@@ -870,6 +1007,19 @@ def main() -> int:
     require(
         not (three_queue_qualification and (dynamic_specs or dynamic_kv_specs)),
         "three-queue qualification requires one isolated request cycle",
+    )
+    require(
+        not (
+            multilevel_pressure_qualification
+            and (
+                dynamic_specs
+                or dynamic_kv_specs
+                or args.kv_autoscale_roundtrip
+                or args.park_resume_roundtrip
+                or kv_path_performance_enabled
+            )
+        ),
+        "multilevel pressure qualification requires an isolated request sequence",
     )
     phase = load_module("_phase_switch_phase_helper", PHASE_RUNNER)
     graph = load_module("_phase_switch_graph_helper", GRAPH_RUNNER)
@@ -982,6 +1132,69 @@ def main() -> int:
             in {"1", "true", "yes", "on"},
             "KV autoscale roundtrip requires reversible topology switching",
         )
+    if multilevel_pressure_qualification:
+        require(args.arm == "D", "multilevel pressure qualification requires arm D")
+        require(args.batch_size == 1, "multilevel pressure qualification requires batch 1")
+        require(
+            os.environ.get("VLLM_UVM_KV_CACHE_MANAGED", "0")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+            and os.environ.get("VLLM_UVM_KV_DYNAMIC_POOL_ENABLE", "0")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"},
+            "multilevel pressure qualification requires the managed dynamic pool",
+        )
+        require(
+            os.environ.get("VLLM_UVM_KV_AUTO_SCALE_ENABLE", "0")
+            .strip()
+            .lower()
+            not in {"1", "true", "yes", "on"},
+            "initial 2 GiB measurement must start with autoscale disabled",
+        )
+        require(
+            os.environ.get(
+                "VLLM_UVM_KV_BACKUP_PRESSURE_STANDALONE_GROW_ENABLE", "1"
+            )
+            .strip()
+            .lower()
+            not in {"1", "true", "yes", "on"},
+            "initial 2 GiB measurement must defer standalone backup growth",
+        )
+        require(
+            os.environ.get("VLLM_UVM_KV_AUTO_SCALE_BACKUP_ONLY", "0")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+            and os.environ.get(
+                "VLLM_UVM_KV_AUTO_SCALE_PLAN_CLASS_BEFORE_GROW", "0"
+            )
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+            and os.environ.get(
+                "VLLM_UVM_KV_AUTO_SCALE_RESUME_PREFILL_BEFORE_PLAN_CLASS", "0"
+            )
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"},
+            "multilevel pressure qualification requires backup-only "
+            "resume-before-class-before-KV growth",
+        )
+        require(
+            bool(
+                os.environ.get(
+                    "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASSES_FILE", ""
+                ).strip()
+            )
+            and bool(
+                os.environ.get(
+                    "VLLM_UVM_KV_BACKUP_RESERVE_TARGET_MAP", ""
+                ).strip()
+            ),
+            "multilevel pressure qualification requires frozen class/reserve maps",
+        )
     if dynamic_specs:
         require(args.arm == "D", "dynamic plan rebuild requires arm D")
         require(
@@ -1064,13 +1277,38 @@ def main() -> int:
             int(os.environ.get("VLLM_UVM_KV_BACKUP_GROW_BLOCKS", "0")) > 0,
             "three-queue qualification requires backup-triggered growth",
         )
-        require(
+        incremental_enabled = (
             os.environ.get("VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE", "0")
             .strip()
             .lower()
-            in {"1", "true", "yes", "on"},
-            "three-queue qualification requires incremental expert offload",
+            in {"1", "true", "yes", "on"}
         )
+        if tiered_plan_class_qualification:
+            require(
+                not incremental_enabled,
+                "tiered qualification must disable legacy incremental waves",
+            )
+            require(
+                os.environ.get("VLLM_UVM_KV_AUTO_SCALE_BACKUP_ONLY", "0")
+                .strip()
+                .lower()
+                in {"1", "true", "yes", "on"},
+                "tiered qualification requires backup-only growth",
+            )
+            require(
+                bool(
+                    os.environ.get(
+                        "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASSES_FILE",
+                        "",
+                    ).strip()
+                ),
+                "tiered qualification requires frozen plan classes",
+            )
+        else:
+            require(
+                incremental_enabled,
+                "three-queue qualification requires incremental expert offload",
+            )
     require(args.exact_names.is_file(), "exact-name file is absent")
     exact_names = load_exact_names(args.exact_names, args.expected_parameter_count)
     configured_plan = os.environ.get(
@@ -1091,6 +1329,13 @@ def main() -> int:
         == expected_phase_mode,
         "phase-mode environment differs from arm",
     )
+    alias_eager = os.environ.get(
+        "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EAGER", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    require(
+        alias_eager == (args.arm in ("A", "B", "E")),
+        "alias-eager environment differs from arm",
+    )
     trace_env = os.environ.get("VLLM_CPU_OFFLOAD_COPY_TRACE", "0").strip().lower()
     require((trace_env in {"1", "true", "yes", "on"}) == args.audit_trace, "trace contract differs")
 
@@ -1104,7 +1349,7 @@ def main() -> int:
     )
     expected_prompt_tokens = sum(item["prompt_tokens"] for item in selected)
     require(expected_prompt_tokens <= args.max_num_batched_tokens, "prefill exceeds token budget")
-    if args.arm == "D":
+    if bool(contract.get("prefill_graph", False)):
         require(
             expected_prompt_tokens in capture_sizes,
             "dual-topology prefill token count has no dedicated alias Graph",
@@ -1245,6 +1490,14 @@ def main() -> int:
             ),
             "incremental_expert_wave_count": len(incremental_expert_waves),
             "three_queue_qualification": three_queue_qualification,
+            "tiered_plan_class_qualification": (
+                tiered_plan_class_qualification
+            ),
+            "multilevel_pressure_qualification": (
+                multilevel_pressure_qualification
+            ),
+            "multilevel_trigger_mode": multilevel_trigger_mode,
+            "multilevel_tier_specs": list(multilevel_tier_specs),
         },
         "environment": selected_environment(),
     }
@@ -1270,6 +1523,7 @@ def main() -> int:
     uvm_rpc_records: list[dict[str, Any]] = []
     three_queue_record: dict[str, Any] | None = None
     kv_autoscale_roundtrip: dict[str, Any] | None = None
+    kv_multilevel_pressure: dict[str, Any] | None = None
     kv_path_direct_high_preset: dict[str, Any] | None = None
     kv_path_performance: dict[str, Any] | None = None
 
@@ -1319,7 +1573,9 @@ def main() -> int:
             compilation_config = {
                 "mode": "NONE",
                 "cudagraph_mode": (
-                    "FULL_SEPARATE" if args.arm == "D" else "FULL_DECODE_ONLY"
+                    "FULL_SEPARATE"
+                    if bool(contract.get("prefill_graph", False))
+                    else "FULL_DECODE_ONLY"
                 ),
                 "cudagraph_capture_sizes": capture_sizes,
                 "max_cudagraph_capture_size": max(capture_sizes),
@@ -1357,7 +1613,7 @@ def main() -> int:
             if enforce_eager
             else (
                 CUDAGraphMode.FULL_SEPARATE
-                if args.arm == "D"
+                if bool(contract.get("prefill_graph", False))
                 else CUDAGraphMode.FULL_DECODE_ONLY
             )
         )
@@ -1372,7 +1628,7 @@ def main() -> int:
             # topology).  ``capture_sizes`` is their union, so multiplying
             # its length by two incorrectly expects every shape in both
             # partitions.  Count the actual partition entries instead.
-            if args.arm == "D":
+            if bool(contract.get("prefill_graph", False)):
                 remote_capture_count = sum(
                     1
                     for size in capture_sizes
@@ -1455,7 +1711,7 @@ def main() -> int:
         def traced_schedule():
             output = original_schedule()
             schedule_record = phase.schedule_snapshot(output)
-            if three_queue_qualification:
+            if three_queue_qualification or multilevel_pressure_qualification:
                 require(block_pool is not None, "three-queue block pool is absent")
                 require(kv_policy is not None, "three-queue policy is absent")
                 schedule_record["uvm_three_queue_after_schedule"] = (
@@ -1489,6 +1745,7 @@ def main() -> int:
         if (
             dynamic_kv_specs
             or three_queue_qualification
+            or multilevel_pressure_qualification
             or args.kv_autoscale_roundtrip
             or kv_path_performance_enabled
         ):
@@ -1640,7 +1897,7 @@ def main() -> int:
                 "compilation_counter_after": preset_counter_after,
             }
 
-        if three_queue_qualification:
+        if three_queue_qualification or multilevel_pressure_qualification:
             original_uvm_single_worker_rpc = core._uvm_single_worker_rpc
 
             def traced_uvm_single_worker_rpc(
@@ -1665,7 +1922,7 @@ def main() -> int:
             queue_before = block_pool.snapshot_uvm_dynamic_queues()
             pressure_before = kv_policy.snapshot_backup_activation()
             expert_before = incremental_expert_state_snapshot(active_model_runner)
-            predicted_initial_blocks = sum(
+            request_required_blocks = sum(
                 math.ceil(
                     (int(item["prompt_tokens"]) + total_output_tokens)
                     / int(block_pool.hash_block_size)
@@ -1678,22 +1935,35 @@ def main() -> int:
                 "initial backup reserve is empty",
             )
             require(
-                predicted_initial_blocks
+                request_required_blocks
                 > int(queue_before["gpu_free_blocks"]),
                 "qualification request does not reach backup reserve",
             )
             require(
-                predicted_initial_blocks
+                request_required_blocks
                 <= int(queue_before["gpu_free_blocks"])
                 + int(queue_before["gpu_backup_blocks"]),
                 "qualification request exceeds free plus backup capacity",
             )
             three_queue_record = {
-                "schema": "vllm_uvm_kv_three_queue_e2e_v1",
-                "predicted_request_blocks": predicted_initial_blocks,
+                "schema": (
+                    "vllm_uvm_kv_three_queue_e2e_v2"
+                    if tiered_plan_class_qualification
+                    else "vllm_uvm_kv_three_queue_e2e_v1"
+                ),
+                "expert_transition_mode": (
+                    "grouped_plan_class"
+                    if tiered_plan_class_qualification
+                    else "incremental_per_layer"
+                ),
+                "request_required_blocks": request_required_blocks,
                 "queue_before_request": queue_before,
                 "pressure_before_request": pressure_before,
                 "expert_before_request": expert_before,
+                "plan_class_before_request": plan_class_state_snapshot(utils),
+                "autoscale_before_request": (
+                    core.get_uvm_kv_autoscale_snapshot()
+                ),
                 "physical_before_request": initial_kv_physical,
                 "graph_wrapper_calls_before_request": tracker.snapshot(),
                 "compilation_counter_before_request": dataclasses.asdict(
@@ -1722,7 +1992,9 @@ def main() -> int:
         phase.validate_prefill(prefill["schedule"], args.batch_size)
         require(not prefill["outputs"], "prefill unexpectedly returned final outputs")
         require(prefill["schedule"]["total_num_scheduled_tokens"] == expected_prompt_tokens, "prompt token count differs")
-        expected_prefill_replays = 1 if args.arm == "D" else 0
+        expected_prefill_replays = (
+            1 if bool(contract.get("prefill_graph", False)) else 0
+        )
         require(
             prefill["graph_wrapper_delta"].get("full_replay", 0)
             == expected_prefill_replays,
@@ -1757,6 +2029,12 @@ def main() -> int:
                     ),
                     "expert_after_prefill": incremental_expert_state_snapshot(
                         active_model_runner
+                    ),
+                    "plan_class_after_prefill": plan_class_state_snapshot(
+                        utils
+                    ),
+                    "autoscale_after_prefill": (
+                        core.get_uvm_kv_autoscale_snapshot()
                     ),
                     "physical_after_prefill": physical_after_prefill,
                     "target_after_prefill_blocks": target_after_prefill,
@@ -1867,6 +2145,12 @@ def main() -> int:
                     "queue_after_request": queue_after_request,
                     "pressure_after_request": pressure_after_request,
                     "expert_after_request": expert_after_request,
+                    "plan_class_after_request": plan_class_state_snapshot(
+                        utils
+                    ),
+                    "autoscale_after_request": (
+                        core.get_uvm_kv_autoscale_snapshot()
+                    ),
                     "physical_after_request": physical_after_request,
                     "final_target_blocks": final_target,
                     "uvm_rpc_records": _compact(uvm_rpc_records),
@@ -1888,6 +2172,9 @@ def main() -> int:
             pressure_after_prefill = three_queue_record["pressure_after_prefill"]
             expert_before = three_queue_record["expert_before_request"]
             expert_after_prefill = three_queue_record["expert_after_prefill"]
+            autoscale_after_prefill = three_queue_record[
+                "autoscale_after_prefill"
+            ]
             activated_blocks = int(schedule_pressure["pending_blocks"])
             require(activated_blocks > 0, "backup reserve was not activated")
             require(
@@ -1915,11 +2202,45 @@ def main() -> int:
                 >= activated_blocks,
                 "KV target did not grow by the consumed reserve",
             )
-            require(
-                int(expert_after_prefill["remote_expert_count"])
-                > int(expert_before["remote_expert_count"]),
-                "expert wave did not release any expert",
-            )
+            if tiered_plan_class_qualification:
+                plan_before = three_queue_record["plan_class_before_request"]
+                plan_after = three_queue_record["plan_class_after_prefill"]
+                decision = autoscale_after_prefill.get("last_decision") or {}
+                require(
+                    plan_before.get("active_plan_class") == "cold29"
+                    and plan_after.get("active_plan_class") == "cold30",
+                    "backup pressure did not switch cold29 -> cold30",
+                )
+                require(
+                    int(
+                        plan_after.get(
+                            "selected_parameter_bytes_per_forward", -1
+                        )
+                    )
+                    > int(
+                        plan_before.get(
+                            "selected_parameter_bytes_per_forward", -1
+                        )
+                    ),
+                    "cold30 did not select more cold expert bytes",
+                )
+                require(
+                    decision.get("growth_trigger_policy")
+                    == "backup_threshold_only"
+                    and int(decision.get("predicted_blocks", -1)) == 0
+                    and int(decision.get("prediction_error_blocks", -1)) == 0
+                    and decision.get("backup_pressure_threshold_reached") is True
+                    and int(decision.get("backup_pressure_level_blocks", -1))
+                    == int(decision.get("backup_pressure_threshold_blocks", -2))
+                    == activated_blocks,
+                    "grow decision was not caused solely by the frozen backup threshold",
+                )
+            else:
+                require(
+                    int(expert_after_prefill["remote_expert_count"])
+                    > int(expert_before["remote_expert_count"]),
+                    "expert wave did not release any expert",
+                )
             require(
                 queue_after_request.get("invariant_ok") is True,
                 "final queue invariant failed",
@@ -1930,12 +2251,678 @@ def main() -> int:
                 "backup reserve was not refilled",
             )
             rpc_methods = [record["method"] for record in uvm_rpc_records]
+            if tiered_plan_class_qualification:
+                require(
+                    rpc_methods.count("activate_uvm_expert_graph_class") == 1
+                    and rpc_methods.count("resize_uvm_kv_cache_target") == 1
+                    and rpc_methods.index("activate_uvm_expert_graph_class")
+                    < rpc_methods.index("resize_uvm_kv_cache_target"),
+                    "grouped cold30 activation did not precede physical grow",
+                )
+            else:
+                require(
+                    "get_uvm_incremental_expert_offload_candidates"
+                    in rpc_methods
+                    and "run_uvm_incremental_expert_offload" in rpc_methods
+                    and "resize_uvm_kv_cache_target" in rpc_methods,
+                    "expert-wave or physical-grow RPC is absent",
+                )
+
+        if multilevel_pressure_qualification:
+            require(active_model_runner is not None, "multilevel model runner absent")
+            require(block_pool is not None, "multilevel block pool absent")
+            require(kv_policy is not None, "multilevel KV policy absent")
+            require(initial_kv_physical is not None, "multilevel initial KV audit absent")
             require(
-                "get_uvm_incremental_expert_offload_candidates" in rpc_methods
-                and "run_uvm_incremental_expert_offload" in rpc_methods
-                and "resize_uvm_kv_cache_target" in rpc_methods,
-                "expert-wave or physical-grow RPC is absent",
+                not llm.llm_engine.has_unfinished_requests()
+                and not scheduler.has_unfinished_requests(),
+                "multilevel tier boundary is not idle",
             )
+
+            tier_gib_values = tuple(
+                int(item["tier_gib"]) for item in multilevel_tier_specs
+            )
+            tier_targets = tuple(
+                int(item["target_blocks"]) for item in multilevel_tier_specs
+            )
+            tier_classes = tuple(
+                str(item["plan_class"]) for item in multilevel_tier_specs
+            )
+            initial_target = int(kv_policy._dynamic_pool_applied_target_blocks)
+            initial_plan = plan_class_state_snapshot(utils)
+            require(initial_target == tier_targets[0], "initial KV tier is not 2 GiB")
+            require(
+                initial_plan.get("active_plan_class") == tier_classes[0],
+                "initial expert class is not cold70",
+            )
+            initial_pending_pressure = kv_policy.snapshot_backup_activation()
+            cleared_initial_pressure = kv_policy.consume_backup_activation()
+            require(
+                int(cleared_initial_pressure.get("blocks", 0)) > 0,
+                "2 GiB measurement did not exercise the backup queue",
+            )
+            tier2_queue = block_pool.snapshot_uvm_dynamic_queues()
+            tier2_physical = kv_physical_snapshot(
+                active_model_runner,
+                tier_targets[0],
+            )
+            validate_kv_physical_snapshot(tier2_physical)
+            tier2_expert = plan_class_state_snapshot(utils)
+            tier2_parameter = parameter_snapshot(
+                llm,
+                exact_names,
+                expected_count=args.expected_parameter_count,
+                expected_full_bytes=args.expected_full_parameter_bytes,
+            )
+            main_decode_ms = [float(item["elapsed_ms"]) for item in measured]
+            require(bool(main_decode_ms), "2 GiB steady Decode sample is empty")
+            tier_records: list[dict[str, Any]] = [
+                {
+                    "schema": "vllm_uvm_kv_multilevel_pressure_tier_v1",
+                    "tier_gib": tier_gib_values[0],
+                    "target_blocks": tier_targets[0],
+                    "plan_class": tier_classes[0],
+                    "trigger": "initial_measurement_autoscale_disabled",
+                    "trigger_mode": multilevel_trigger_mode,
+                    "pressure_before_clear": initial_pending_pressure,
+                    "cleared_pressure": cleared_initial_pressure,
+                    "queue_after_request": tier2_queue,
+                    "physical_after_request": tier2_physical,
+                    "plan_class_after_request": tier2_expert,
+                    "parameter_va_after_request": tier2_parameter,
+                    "prefill": {
+                        key: value for key, value in prefill.items() if key != "outputs"
+                    },
+                    "first_decode": {
+                        key: value
+                        for key, value in first_decode.items()
+                        if key != "outputs"
+                    },
+                    "warmup_decode": warmup,
+                    "measured_decode": measured,
+                    "timing": {
+                        "prefill_end_to_end_ms": float(prefill["elapsed_ms"]),
+                        "rebalance_rpc_wall_ms": 0.0,
+                        "prefill_topology_resume_ms": 0.0,
+                        "prefill_compute_excluding_rebalance_and_resume_ms": float(
+                            prefill["elapsed_ms"]
+                        ),
+                        "tier_transition_wall_ms": 0.0,
+                        "tier_transition_placement": "initial_tier",
+                        "first_decode_end_to_end_ms": float(
+                            first_decode["elapsed_ms"]
+                        ),
+                        "first_decode_topology_park_ms": float(
+                            (cutover_transition or {}).get("wall_ns", 0)
+                        )
+                        / 1e6,
+                        "steady_decode_step_ms": summarize(main_decode_ms),
+                        "steady_decode_tokens_per_second": (
+                            args.batch_size * 1000.0
+                            / statistics.median(main_decode_ms)
+                        ),
+                        "request_end_to_end_ms": cycle_elapsed_ms,
+                        "request_plus_tier_transition_ms": cycle_elapsed_ms,
+                    },
+                    "output_token_ids_sha256": phase.output_hash(output_records),
+                    "outputs": output_records,
+                }
+            ]
+
+            previous_autoscale = os.environ.get("VLLM_UVM_KV_AUTO_SCALE_ENABLE")
+            os.environ["VLLM_UVM_KV_AUTO_SCALE_ENABLE"] = (
+                "1" if multilevel_trigger_mode == "pressure" else "0"
+            )
+            try:
+                for tier_gib, expected_target, expected_class in zip(
+                    tier_gib_values[1:],
+                    tier_targets[1:],
+                    tier_classes[1:],
+                    strict=True,
+                ):
+                    require(
+                        not llm.llm_engine.has_unfinished_requests()
+                        and not scheduler.has_unfinished_requests(),
+                        f"{tier_gib} GiB pressure request did not start idle",
+                    )
+                    target_before = int(
+                        kv_policy._dynamic_pool_applied_target_blocks
+                    )
+                    queue_before = block_pool.snapshot_uvm_dynamic_queues()
+                    pressure_before = kv_policy.snapshot_backup_activation()
+                    plan_before = plan_class_state_snapshot(utils)
+                    physical_before = kv_physical_snapshot(
+                        active_model_runner,
+                        target_before,
+                    )
+                    validate_kv_physical_snapshot(physical_before)
+                    diagnostics_before = diagnostics_snapshot(
+                        utils,
+                        get_static_alias_diagnostics,
+                    )
+                    parameter_before = parameter_snapshot(
+                        llm,
+                        exact_names,
+                        expected_count=args.expected_parameter_count,
+                        expected_full_bytes=args.expected_full_parameter_bytes,
+                    )
+                    graph_before = tracker.snapshot()
+                    counter_before_tier = dataclasses.asdict(
+                        compilation_counter.clone()
+                    )
+                    rpc_cursor = len(uvm_rpc_records)
+
+                    direct_transition: dict[str, Any] | None = None
+                    direct_transition_ms = 0.0
+                    if multilevel_trigger_mode == "direct":
+                        direct_started = time.perf_counter()
+                        direct_transition = core.apply_uvm_kv_dynamic_pool_target(
+                            expected_target,
+                            reason=(
+                                "request_boundary_direct_multilevel_"
+                                f"{tier_gib}g"
+                            ),
+                            metadata={"release_expert_wave": False},
+                        )
+                        torch.cuda.synchronize()
+                        direct_transition_ms = (
+                            time.perf_counter() - direct_started
+                        ) * 1000.0
+                        require(
+                            isinstance(direct_transition, dict)
+                            and direct_transition.get("ok") is True,
+                            f"{tier_gib} GiB direct tier transition failed: "
+                            f"{direct_transition!r}",
+                        )
+                        require(
+                            int(kv_policy._dynamic_pool_applied_target_blocks)
+                            == expected_target
+                            and plan_class_state_snapshot(utils).get(
+                                "active_plan_class"
+                            )
+                            == expected_class,
+                            f"{tier_gib} GiB direct tier did not commit before request",
+                        )
+
+                    pressure_sampling = SamplingParams(
+                        max_tokens=total_output_tokens,
+                        min_tokens=total_output_tokens,
+                        temperature=0.0,
+                        seed=args.seed,
+                        ignore_eos=True,
+                    )
+                    llm._validate_and_add_requests(
+                        prompts=[
+                            TokensPrompt(
+                                prompt_token_ids=list(
+                                    selected[0]["prompt_token_ids"]
+                                )
+                            )
+                        ],
+                        params=pressure_sampling,
+                        use_tqdm=False,
+                        lora_request=None,
+                        priority=None,
+                    )
+                    request_started = time.perf_counter()
+                    # The pressure arm opens the controller for this Prefill
+                    # boundary only. The direct arm has already committed the
+                    # identical frozen tier while idle and keeps autoscale off.
+                    os.environ["VLLM_UVM_KV_AUTO_SCALE_ENABLE"] = (
+                        "1" if multilevel_trigger_mode == "pressure" else "0"
+                    )
+                    tier_prefill = run_step()
+                    os.environ["VLLM_UVM_KV_AUTO_SCALE_ENABLE"] = "0"
+                    phase.validate_prefill(tier_prefill["schedule"], 1)
+                    require(
+                        not tier_prefill["outputs"]
+                        and tier_prefill["graph_wrapper_delta"].get(
+                            "full_replay", 0
+                        )
+                        == 1,
+                        f"{tier_gib} GiB Prefill Graph replay failed",
+                    )
+                    target_after_prefill = int(
+                        kv_policy._dynamic_pool_applied_target_blocks
+                    )
+                    queue_after_prefill = (
+                        block_pool.snapshot_uvm_dynamic_queues()
+                    )
+                    pressure_after_prefill = (
+                        kv_policy.snapshot_backup_activation()
+                    )
+                    plan_after_prefill = plan_class_state_snapshot(utils)
+                    physical_after_prefill = kv_physical_snapshot(
+                        active_model_runner,
+                        target_after_prefill,
+                    )
+                    validate_kv_physical_snapshot(physical_after_prefill)
+                    autoscale_after_prefill = (
+                        core.get_uvm_kv_autoscale_snapshot()
+                    )
+                    diagnostics_after_prefill_tier = diagnostics_snapshot(
+                        utils,
+                        get_static_alias_diagnostics,
+                    )
+
+                    tier_first_decode = run_step()
+                    phase.validate_decode(tier_first_decode["schedule"], 1)
+                    require(
+                        not tier_first_decode["outputs"]
+                        and tier_first_decode["graph_wrapper_delta"].get(
+                            "full_replay", 0
+                        )
+                        == 1,
+                        f"{tier_gib} GiB first Decode Graph replay failed",
+                    )
+                    diagnostics_after_first_tier = diagnostics_snapshot(
+                        utils,
+                        get_static_alias_diagnostics,
+                    )
+
+                    tier_warmup: list[dict[str, Any]] = []
+                    for decode_index in range(args.warmup_decode_steps):
+                        decode_step = run_step()
+                        phase.validate_decode(decode_step["schedule"], 1)
+                        require(
+                            not decode_step["outputs"]
+                            and decode_step["graph_wrapper_delta"].get(
+                                "full_replay", 0
+                            )
+                            == 1,
+                            f"{tier_gib} GiB warmup Decode failed",
+                        )
+                        decode_step["step"] = decode_index + 1
+                        decode_step.pop("outputs")
+                        tier_warmup.append(decode_step)
+
+                    tier_measured: list[dict[str, Any]] = []
+                    tier_final_outputs: list[Any] = []
+                    for decode_index in range(args.measured_decode_steps):
+                        decode_step = run_step()
+                        phase.validate_decode(decode_step["schedule"], 1)
+                        is_final = decode_index + 1 == args.measured_decode_steps
+                        if is_final:
+                            tier_final_outputs = decode_step["outputs"]
+                        else:
+                            require(
+                                not decode_step["outputs"],
+                                f"{tier_gib} GiB request finished early",
+                            )
+                        require(
+                            decode_step["graph_wrapper_delta"].get(
+                                "full_replay", 0
+                            )
+                            == 1,
+                            f"{tier_gib} GiB measured Decode failed",
+                        )
+                        decode_step["step"] = decode_index + 1
+                        decode_step.pop("outputs")
+                        tier_measured.append(decode_step)
+
+                    request_elapsed_ms = (
+                        time.perf_counter() - request_started
+                    ) * 1000.0
+                    require(
+                        not llm.llm_engine.has_unfinished_requests()
+                        and not scheduler.has_unfinished_requests(),
+                        f"{tier_gib} GiB request remains unfinished",
+                    )
+                    tier_outputs = phase.output_records(tier_final_outputs)
+                    require(
+                        len(tier_outputs) == 1
+                        and tier_outputs[0]["finished"]
+                        and len(tier_outputs[0]["output_token_ids"])
+                        == total_output_tokens,
+                        f"{tier_gib} GiB output is incomplete",
+                    )
+                    require(
+                        phase.output_hash(tier_outputs)
+                        == phase.output_hash(output_records),
+                        f"{tier_gib} GiB output changed across tiers",
+                    )
+
+                    queue_after_request = (
+                        block_pool.snapshot_uvm_dynamic_queues()
+                    )
+                    pressure_after_request = (
+                        kv_policy.snapshot_backup_activation()
+                    )
+                    cleared_post_request_pressure = (
+                        kv_policy.consume_backup_activation()
+                    )
+                    plan_after_request = plan_class_state_snapshot(utils)
+                    physical_after_request = kv_physical_snapshot(
+                        active_model_runner,
+                        expected_target,
+                    )
+                    validate_kv_physical_snapshot(physical_after_request)
+                    diagnostics_after_request = diagnostics_snapshot(
+                        utils,
+                        get_static_alias_diagnostics,
+                    )
+                    parameter_after = parameter_snapshot(
+                        llm,
+                        exact_names,
+                        expected_count=args.expected_parameter_count,
+                        expected_full_bytes=args.expected_full_parameter_bytes,
+                    )
+                    graph_after = tracker.snapshot()
+                    counter_after_tier = dataclasses.asdict(
+                        compilation_counter.clone()
+                    )
+                    tier_rpcs = uvm_rpc_records[rpc_cursor:]
+                    rpc_methods = [item["method"] for item in tier_rpcs]
+                    require(
+                        target_after_prefill == expected_target
+                        and plan_after_prefill.get("active_plan_class")
+                        == expected_class
+                        and plan_after_request.get("active_plan_class")
+                        == expected_class,
+                        f"{tier_gib} GiB KV/expert tier did not commit",
+                    )
+                    schedule_pressure = tier_prefill["schedule"][
+                        "uvm_backup_pressure_after_schedule"
+                    ]
+                    decision = autoscale_after_prefill.get(
+                        "last_decision"
+                    ) or {}
+                    require(
+                        int(schedule_pressure.get("pending_blocks", 0)) > 0,
+                        f"{tier_gib} GiB request did not consume backup blocks",
+                    )
+                    if multilevel_trigger_mode == "pressure":
+                        require(
+                            decision.get("growth_trigger_policy")
+                            == "backup_threshold_only"
+                            and decision.get(
+                                "backup_pressure_threshold_reached"
+                            )
+                            is True
+                            and int(decision.get("predicted_blocks", -1)) == 0,
+                            f"{tier_gib} GiB growth was not caused by backup pressure",
+                        )
+                    else:
+                        require(
+                            direct_transition is not None
+                            and direct_transition.get("ok") is True,
+                            f"{tier_gib} GiB direct transition record is absent",
+                        )
+                    require(
+                        rpc_methods.count("activate_uvm_expert_graph_class")
+                        == 1
+                        and rpc_methods.count("resize_uvm_kv_cache_target")
+                        == 1
+                        and rpc_methods.index(
+                            "activate_uvm_expert_graph_class"
+                        )
+                        < rpc_methods.index("resize_uvm_kv_cache_target"),
+                        f"{tier_gib} GiB expert-first rebalance order differs",
+                    )
+                    activation_rpc = next(
+                        item
+                        for item in tier_rpcs
+                        if item.get("method")
+                        == "activate_uvm_expert_graph_class"
+                    )
+                    activation_result = activation_rpc.get("result") or {}
+                    early_resume = activation_result.get(
+                        "prefill_topology_resume_before_plan_switch"
+                    ) or {}
+                    plan_switch = activation_result.get("plan_switch") or {}
+                    delta_result = plan_switch.get("rebind") or {}
+                    old_width = cold_class_width(
+                        str(plan_before.get("active_plan_class"))
+                    )
+                    new_width = cold_class_width(expected_class)
+                    expected_delta_entries = (new_width - old_width) * 450
+                    require(
+                        early_resume.get("ok") is True
+                        and early_resume.get("pre_state") == "remote_parked"
+                        and early_resume.get("post_state") == "sealed"
+                        and plan_switch.get("pre_state") == "sealed"
+                        and plan_switch.get("post_state") == "sealed"
+                        and int(
+                            plan_switch.get("quiesced_delta_add_count", -1)
+                        )
+                        == expected_delta_entries
+                        and int(
+                            plan_switch.get("quiesced_delta_remove_count", -1)
+                        )
+                        == 0,
+                        f"{tier_gib} GiB plan-class append geometry differs",
+                    )
+                    if expected_delta_entries <= 4608:
+                        require(
+                            plan_switch.get("quiesced_delta_eligible") is True
+                            and plan_switch.get("quiesced_delta_used") is True
+                            and plan_switch.get("park") is None
+                            and plan_switch.get("resume") is None
+                            and delta_result.get("operation") == "map"
+                            and int(delta_result.get("requested_count", -1))
+                            == expected_delta_entries
+                            and int(delta_result.get("ioctl_calls", -1)) == 1,
+                            f"{tier_gib} GiB did not use one sealed delta append",
+                        )
+                    else:
+                        require(
+                            plan_switch.get("quiesced_delta_used") is False
+                            and isinstance(plan_switch.get("rebind"), dict)
+                            and plan_switch.get("rebind", {}).get("ok") is True,
+                            f"{tier_gib} GiB large append fallback did not commit",
+                        )
+                    require(
+                        int(queue_after_request["gpu_backup_blocks"])
+                        == int(queue_after_request["backup_target_blocks"])
+                        and queue_after_request.get("invariant_ok") is True,
+                        f"{tier_gib} GiB queue did not refill",
+                    )
+                    require(
+                        physical_before["va_sha256"]
+                        == physical_after_prefill["va_sha256"]
+                        == physical_after_request["va_sha256"]
+                        == initial_kv_physical["va_sha256"]
+                        and parameter_before["vas"]
+                        == parameter_after["vas"]
+                        == parameter_after_load["vas"],
+                        f"{tier_gib} GiB VA identity changed",
+                    )
+                    require(
+                        graph_before.get("full_capture", 0)
+                        == graph_after.get("full_capture", 0)
+                        and counter_before_tier["num_cudagraph_captured"]
+                        == counter_after_tier["num_cudagraph_captured"],
+                        f"{tier_gib} GiB rebalance recaptured a Graph",
+                    )
+
+                    prefill_transitions = transition_delta(
+                        diagnostics_before,
+                        diagnostics_after_prefill_tier,
+                    )
+                    first_decode_transitions = transition_delta(
+                        diagnostics_after_prefill_tier,
+                        diagnostics_after_first_tier,
+                    )
+                    resumes = [
+                        item
+                        for item in prefill_transitions
+                        if item.get("event")
+                        == "cpu_offload_uvm_original_va_alias_prefill_activated"
+                        and item.get("ok") is True
+                    ]
+                    parks = [
+                        item
+                        for item in first_decode_transitions
+                        if item.get("event")
+                        == "cpu_offload_uvm_original_va_remote_transition"
+                        and item.get("post_state") == "remote_parked"
+                        and item.get("ok") is True
+                    ]
+                    require(
+                        len(resumes) == 1 and len(parks) == 1,
+                        f"{tier_gib} GiB topology transition count differs",
+                    )
+                    resume_ms = float(resumes[0].get("wall_ns", 0)) / 1e6
+                    rebalance_including_resume_ms = sum(
+                        float(item.get("wall_ns", 0)) / 1e6
+                        for item in tier_rpcs
+                        if item.get("method")
+                        in {
+                            "activate_uvm_expert_graph_class",
+                            "resize_uvm_kv_cache_target",
+                        }
+                    )
+                    rebalance_ms = max(
+                        0.0,
+                        rebalance_including_resume_ms - resume_ms,
+                    )
+                    tier_decode_ms = [
+                        float(item["elapsed_ms"]) for item in tier_measured
+                    ]
+                    tier_records.append(
+                        {
+                            "schema": "vllm_uvm_kv_multilevel_pressure_tier_v1",
+                            "tier_gib": tier_gib,
+                            "target_before_blocks": target_before,
+                            "target_blocks": expected_target,
+                            "plan_class_before": plan_before,
+                            "plan_class": expected_class,
+                            "trigger": (
+                                "real_scheduler_backup_queue_pressure"
+                                if multilevel_trigger_mode == "pressure"
+                                else "direct_idle_request_boundary"
+                            ),
+                            "trigger_mode": multilevel_trigger_mode,
+                            "direct_transition": _compact(direct_transition),
+                            "queue_before_request": queue_before,
+                            "queue_after_prefill": queue_after_prefill,
+                            "queue_after_request": queue_after_request,
+                            "pressure_before_request": pressure_before,
+                            "pressure_after_prefill": pressure_after_prefill,
+                            "pressure_after_request": pressure_after_request,
+                            "cleared_post_request_pressure": (
+                                cleared_post_request_pressure
+                            ),
+                            "schedule_pressure": schedule_pressure,
+                            "autoscale_after_prefill": autoscale_after_prefill,
+                            "physical_before_request": physical_before,
+                            "physical_after_prefill": physical_after_prefill,
+                            "physical_after_request": physical_after_request,
+                            "plan_class_after_prefill": plan_after_prefill,
+                            "plan_class_after_request": plan_after_request,
+                            "parameter_va_before_request": parameter_before,
+                            "parameter_va_after_request": parameter_after,
+                            "prefill": {
+                                key: value
+                                for key, value in tier_prefill.items()
+                                if key != "outputs"
+                            },
+                            "first_decode": {
+                                key: value
+                                for key, value in tier_first_decode.items()
+                                if key != "outputs"
+                            },
+                            "warmup_decode": tier_warmup,
+                            "measured_decode": tier_measured,
+                            "rpc_records": _compact(tier_rpcs),
+                            "prefill_transitions": _compact(
+                                prefill_transitions
+                            ),
+                            "first_decode_transitions": _compact(
+                                first_decode_transitions
+                            ),
+                            "timing": {
+                                "prefill_end_to_end_ms": float(
+                                    tier_prefill["elapsed_ms"]
+                                ),
+                                "rebalance_rpc_wall_ms": rebalance_ms,
+                                "rebalance_rpc_including_prefill_resume_ms": (
+                                    rebalance_including_resume_ms
+                                ),
+                                "prefill_topology_resume_ms": resume_ms,
+                                "prefill_compute_excluding_rebalance_and_resume_ms": max(
+                                    0.0,
+                                    float(tier_prefill["elapsed_ms"])
+                                    - (
+                                        rebalance_ms + resume_ms
+                                        if multilevel_trigger_mode == "pressure"
+                                        else 0.0
+                                    ),
+                                ),
+                                "tier_transition_wall_ms": (
+                                    rebalance_including_resume_ms
+                                    if multilevel_trigger_mode == "pressure"
+                                    else direct_transition_ms
+                                ),
+                                "tier_transition_placement": (
+                                    "inside_prefill_schedule"
+                                    if multilevel_trigger_mode == "pressure"
+                                    else "before_request_while_idle"
+                                ),
+                                "first_decode_end_to_end_ms": float(
+                                    tier_first_decode["elapsed_ms"]
+                                ),
+                                "first_decode_topology_park_ms": float(
+                                    parks[0].get("wall_ns", 0)
+                                )
+                                / 1e6,
+                                "steady_decode_step_ms": summarize(
+                                    tier_decode_ms
+                                ),
+                                "steady_decode_tokens_per_second": (
+                                    1000.0
+                                    / statistics.median(tier_decode_ms)
+                                ),
+                                "request_end_to_end_ms": request_elapsed_ms,
+                                "request_plus_tier_transition_ms": (
+                                    request_elapsed_ms
+                                    if multilevel_trigger_mode == "pressure"
+                                    else request_elapsed_ms
+                                    + direct_transition_ms
+                                ),
+                            },
+                            "graph_wrapper_calls_before": graph_before,
+                            "graph_wrapper_calls_after": graph_after,
+                            "compilation_counter_before": counter_before_tier,
+                            "compilation_counter_after": counter_after_tier,
+                            "output_token_ids_sha256": phase.output_hash(
+                                tier_outputs
+                            ),
+                            "outputs": tier_outputs,
+                            "manifest": manifest_segment(
+                                f"kv_multilevel_pressure_{tier_gib}g"
+                            ),
+                        }
+                    )
+            finally:
+                if previous_autoscale is None:
+                    os.environ.pop("VLLM_UVM_KV_AUTO_SCALE_ENABLE", None)
+                else:
+                    os.environ[
+                        "VLLM_UVM_KV_AUTO_SCALE_ENABLE"
+                    ] = previous_autoscale
+
+            kv_multilevel_pressure = {
+                "schema": (
+                    "vllm_uvm_kv_multilevel_pressure_2_4_6_v1"
+                    if tier_gib_values == (2, 4, 6)
+                    else "vllm_uvm_kv_multilevel_pressure_trace_v2"
+                ),
+                "trigger_mode": multilevel_trigger_mode,
+                "pressure_source": (
+                    "real_scheduler_backup_queue_consumption"
+                    if multilevel_trigger_mode == "pressure"
+                    else "direct_idle_request_boundary"
+                ),
+                "prediction_enabled": False,
+                "target_sequence_blocks": list(tier_targets),
+                "plan_class_sequence": list(tier_classes),
+                "initial_reserved_va_bytes": int(
+                    initial_kv_physical["reserved_va_bytes"]
+                ),
+                "initial_physical": initial_kv_physical,
+                "tiers": tier_records,
+            }
 
         if kv_path_performance_enabled:
             require(active_model_runner is not None, "path performance runner absent")
@@ -2326,6 +3313,7 @@ def main() -> int:
             expert_before_low = incremental_expert_state_snapshot(
                 active_model_runner
             )
+            plan_class_before_low = plan_class_state_snapshot(utils)
             diagnostics_before_low = diagnostics_snapshot(
                 utils,
                 get_static_alias_diagnostics,
@@ -2381,6 +3369,7 @@ def main() -> int:
                 expert_after_step = incremental_expert_state_snapshot(
                     active_model_runner
                 )
+                plan_class_after_step = plan_class_state_snapshot(utils)
                 target_after_step = int(
                     kv_policy._dynamic_pool_applied_target_blocks
                 )
@@ -2393,6 +3382,7 @@ def main() -> int:
                         "queue_after_step": queue_after_step,
                         "autoscale_after_step": autoscale_after_step,
                         "expert_after_step": expert_after_step,
+                        "plan_class_after_step": plan_class_after_step,
                         "target_after_step_blocks": target_after_step,
                     }
                 )
@@ -2485,6 +3475,7 @@ def main() -> int:
             expert_after_low = incremental_expert_state_snapshot(
                 active_model_runner
             )
+            plan_class_after_low = plan_class_state_snapshot(utils)
             autoscale_after_low = core.get_uvm_kv_autoscale_snapshot()
             graph_after_low = tracker.snapshot()
             counter_after_low = dataclasses.asdict(compilation_counter.clone())
@@ -2529,11 +3520,20 @@ def main() -> int:
                     and target_after_low < target_before_low,
                     "enabled autoscale roundtrip did not shrink KV",
                 )
-                require(
-                    int(expert_after_low["remote_expert_count"])
-                    < int(expert_before_low["remote_expert_count"]),
-                    "enabled autoscale roundtrip did not restore experts",
-                )
+                if tiered_plan_class_qualification:
+                    require(
+                        plan_class_before_low.get("active_plan_class")
+                        == "cold30"
+                        and plan_class_after_low.get("active_plan_class")
+                        == "cold29",
+                        "enabled autoscale did not switch cold30 -> cold29",
+                    )
+                else:
+                    require(
+                        int(expert_after_low["remote_expert_count"])
+                        < int(expert_before_low["remote_expert_count"]),
+                        "enabled autoscale roundtrip did not restore experts",
+                    )
                 require(
                     autoscale_after_low.get("expert_restore_pending") is False,
                     "expert restoration remains pending after idle",
@@ -2566,6 +3566,8 @@ def main() -> int:
                 "physical_after": physical_after_low,
                 "expert_before": expert_before_low,
                 "expert_after": expert_after_low,
+                "plan_class_before": plan_class_before_low,
+                "plan_class_after": plan_class_after_low,
                 "autoscale_before": autoscale_before_low,
                 "autoscale_after": autoscale_after_low,
                 "steps": low_steps,
@@ -3827,6 +4829,7 @@ def main() -> int:
         result["physical_kv_reuse_probe"] = physical_kv_reuse_probe
         result["three_queue_qualification"] = three_queue_record
         result["kv_autoscale_roundtrip"] = kv_autoscale_roundtrip
+        result["kv_multilevel_pressure"] = kv_multilevel_pressure
         result["kv_path_direct_high_preset"] = kv_path_direct_high_preset
         result["kv_path_performance"] = kv_path_performance
         result["timing"] = {

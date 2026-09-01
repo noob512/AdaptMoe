@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-decode-steps", type=int, default=5)
     parser.add_argument("--measured-decode-steps", type=int, default=16)
     parser.add_argument("--timeout-seconds", type=float, default=1800.0)
+    parser.add_argument(
+        "--formal-e3",
+        action="store_true",
+        help="allow frozen E3 B1/B4/B8 subsets instead of only 1,4",
+    )
     return parser.parse_args()
 
 
@@ -260,8 +265,12 @@ async def run_cycle(
 async def async_main(args: argparse.Namespace) -> dict[str, Any]:
     metadata, requests, fixture_sha256 = load_fixture(args.fixture)
     batches = [int(value) for value in args.batch_sizes.split(",")]
-    if batches != [1, 4]:
+    if not args.formal_e3 and batches != [1, 4]:
         raise ValueError("this matched experiment requires batch order 1,4")
+    if not batches or any(batch not in (1, 4, 8) for batch in batches):
+        raise ValueError("formal E3 batches must be a non-empty subset of 1,4,8")
+    if max(batches) > len(requests):
+        raise ValueError("fixture has fewer requests than the largest batch")
     if args.conditioning_repeats < 1 or args.measurement_repeats < 1:
         raise ValueError("positive repeat counts required")
     output_tokens = 1 + args.warmup_decode_steps + args.measured_decode_steps

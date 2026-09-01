@@ -7,6 +7,7 @@ CUSTOM_UVM="${CUSTOM_MODULE:-${REPO_ROOT}/kernel-module/nvidia-module/kernel-ope
 PYTHON="${PYTHON:-${REPO_ROOT}/workloads/vllm/vllm/.venv/bin/python}"
 OUTPUT="${OUTPUT:-${SCRIPT_DIR}/result_$(date -u +%Y%m%dT%H%M%SZ).json}"
 PROBE="${PROBE:-${SCRIPT_DIR}/probe.py}"
+ROUTE_LOG_OUTPUT="${ROUTE_LOG_OUTPUT:-}"
 SLOT_BUDGET_BYTES="${SLOT_BUDGET_BYTES:-$((64 * 1024 * 1024))}"
 PROBE_ARGS=()
 if [[ -n "${REGIONS:-}" ]]; then
@@ -72,9 +73,18 @@ restore_stock() {
   return "${rc}"
 }
 
+capture_route_log() {
+  [[ -n "${ROUTE_LOG_OUTPUT}" ]] || return 0
+  [[ -r /proc/driver/nvidia-uvm/phase_f_route_log ]] || return 0
+  sudo cp -- /proc/driver/nvidia-uvm/phase_f_route_log \
+    "${ROUTE_LOG_OUTPUT}"
+  sudo chown "$(id -u):$(id -g)" "${ROUTE_LOG_OUTPUT}"
+}
+
 on_exit() {
   local original_rc="$1" recovery_rc=0
   trap - EXIT INT TERM
+  capture_route_log || recovery_rc=$?
   restore_stock || recovery_rc=$?
   (( original_rc == 0 )) || exit "${original_rc}"
   exit "${recovery_rc}"
@@ -97,6 +107,11 @@ sudo modprobe nvidia
 sudo insmod "${CUSTOM_UVM}" \
   uvm_moe_slot_pte_remap_enable=1 \
   uvm_moe_slot_pool_vidmem_budget_bytes="${SLOT_BUDGET_BYTES}"
+if [[ -n "${ROUTE_LOG_OUTPUT}" ]]; then
+  printf '1\n' | sudo tee \
+    /sys/module/nvidia_uvm/parameters/uvm_phase_f_route_log_enable \
+    >/dev/null
+fi
 
 custom_src="$(modinfo -F srcversion "${CUSTOM_UVM}")"
 loaded_src="$(loaded_srcversion)"
@@ -107,5 +122,6 @@ PYTHONPATH="${REPO_ROOT}/workloads/vllm/vllm${PYTHONPATH:+:${PYTHONPATH}}" \
   "${PYTHON}" "${PROBE}" --replays "${REPLAYS:-200}" --output "${OUTPUT}" \
   "${PROBE_ARGS[@]}"
 
+capture_route_log
 restore_stock
 echo "result=${OUTPUT}"

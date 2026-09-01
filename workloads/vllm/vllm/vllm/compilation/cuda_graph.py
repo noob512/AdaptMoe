@@ -155,6 +155,35 @@ class CUDAGraphWrapper:
             "entry_count": len(entries),
         }
 
+    def register_cudagraph_class_alias(
+        self,
+        class_name: str,
+        source_class: str,
+    ) -> dict[str, Any]:
+        """Reuse one fully captured table for an equal-shape plan class."""
+        normalized = self._normalize_cudagraph_class(class_name)
+        source = self._normalize_cudagraph_class(source_class)
+        entries = self._cudagraph_class_entries.get(source)
+        if entries is None:
+            return {"ok": False, "reason": "source_class_not_registered"}
+        if not entries or any(entry.cudagraph is None for entry in entries.values()):
+            return {"ok": False, "reason": "source_class_not_fully_captured"}
+        existing = self._cudagraph_class_entries.get(normalized)
+        if existing is not None and existing is not entries:
+            return {"ok": False, "reason": "class_already_registered"}
+        old_class = self._active_cudagraph_class
+        self._cudagraph_class_entries[normalized] = entries
+        self.concrete_cudagraph_entries = entries
+        self._active_cudagraph_class = normalized
+        return {
+            "ok": True,
+            "reason": "equal_shape_class_aliased",
+            "old_class": old_class,
+            "new_class": normalized,
+            "source_class": source,
+            "entry_count": len(entries),
+        }
+
     def reset_all_cudagraph_classes(self) -> int:
         """Reset every retained GraphExec exactly once during final teardown."""
         reset_count = 0

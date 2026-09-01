@@ -376,6 +376,11 @@ class ExecuteModelState(NamedTuple):
     sample_tokens(), after execute_model() returns None."""
 
     scheduler_output: "SchedulerOutput"
+    # Keep per-layer attention metadata alive until sampling has been queued.
+    # This is required by the opt-in Triton MLA pure-Prefill full-Graph path:
+    # its GraphExec can still be consuming device buffers owned by this
+    # metadata after execute_model() has returned to the engine.
+    retained_attn_metadata: PerLayerAttnMetadata | None
     logits: torch.Tensor
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
@@ -3870,8 +3875,17 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        retain_prefill_graph_metadata = (
+            self._env_flag_enabled(
+                "VLLM_TRITON_MLA_EXPERIMENTAL_FULL_CUDAGRAPH",
+                default=False,
+            )
+            and enabled_step_phase == "enabled:prefill_step"
+            and cudagraph_runtime_mode != CUDAGraphMode.NONE
+        )
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
+            attn_metadata if retain_prefill_graph_metadata else None,
             logits,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
@@ -3907,6 +3921,7 @@ class GPUModelRunner(
         # Unpack ephemeral state.
         (
             scheduler_output,
+            _retained_attn_metadata,
             logits,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
@@ -3917,6 +3932,12 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        # `_retained_attn_metadata` deliberately remains a local reference for
+        # the rest of sample_tokens(). Sampling is submitted after model
+        # forward on the same launch stream, so by the time this function has
+        # finished using its outputs the Prefill Graph can no longer consume
+        # those metadata buffers. No host-side stream synchronize is needed.
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -4853,7 +4874,39 @@ class GPUModelRunner(
             except Exception:
                 logger.exception("Physical KV resize synchronization failed")
                 complete = False
-        return {"ok": complete, "made_progress": made_progress}
+        dual_view_refresh: dict[str, Any] | None = None
+        require_full_dual_view = self._env_flag_enabled(
+            "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW",
+            default=False,
+        )
+        if require_full_dual_view and complete and made_progress:
+            try:
+                from vllm.model_executor.models.utils import (
+                    refresh_cpu_offload_uvm_original_va_full_dual_view,
+                )
+
+                dual_view_refresh = (
+                    refresh_cpu_offload_uvm_original_va_full_dual_view()
+                )
+                if dual_view_refresh.get("ok") is not True:
+                    complete = False
+            except Exception as exc:
+                logger.exception(
+                    "Full dual-view refresh after physical KV resize failed"
+                )
+                dual_view_refresh = {
+                    "ok": False,
+                    "reason": "dual_view_refresh_failed",
+                    "error": repr(exc),
+                }
+                complete = False
+        result: dict[str, Any] = {
+            "ok": complete,
+            "made_progress": made_progress,
+        }
+        if require_full_dual_view:
+            result["dual_view_refresh"] = dual_view_refresh
+        return result
 
     def load_model(self, eep_scale_up: bool = False) -> None:
         """
@@ -6346,7 +6399,7 @@ class GPUModelRunner(
                 raise RuntimeError(f"Slot layer {layer_id} repeats a lane")
             if registered_plan and len(region_ids) > 1152:
                 raise RuntimeError(
-                    f"Slot layer {layer_id} exceeds the 1152-entry plan ABI"
+                    f"Slot layer {layer_id} exceeds the 1152-region model contract"
                 )
             snapshot = snapshot_uvm_region_registry(region_ids)
             if snapshot.get("ok") is not True:
@@ -7304,6 +7357,7 @@ class GPUModelRunner(
         """
         from vllm.model_executor.models.utils import (
             get_cpu_offload_graph_static_alias_diagnostics,
+            reallocate_cpu_offload_uvm_original_va_expert_parameters,
             rebuild_cpu_offload_uvm_original_va_expert_plan,
         )
 
@@ -7356,7 +7410,15 @@ class GPUModelRunner(
                 "Dynamic expert-plan rebuild found no captured CUDA Graphs"
             )
 
-        rebuild = rebuild_cpu_offload_uvm_original_va_expert_plan(
+        nonstable_va_baseline = os.environ.get(
+            "VLLM_UVM_E5_NONSTABLE_VA_RECAPTURE", "0"
+        ).strip() == "1"
+        rebuild_fn = (
+            reallocate_cpu_offload_uvm_original_va_expert_parameters
+            if nonstable_va_baseline
+            else rebuild_cpu_offload_uvm_original_va_expert_plan
+        )
+        rebuild = rebuild_fn(
             expert_plan_file,
             reason=reason,
             graphs_destroyed=True,
@@ -7393,6 +7455,11 @@ class GPUModelRunner(
             "destroyed_graph_count": destroyed_graph_count,
             "destroyed_graph_descriptors": destroyed_descriptors,
             "graph_pool_renewed": True,
+            "parameter_va_mode": (
+                "nonstable_reallocate_recapture"
+                if nonstable_va_baseline
+                else "stable_rebuild_recapture"
+            ),
             "graph_memory_bytes": int(graph_memory_bytes),
             "graph_reset_ns": graphs_destroyed_ns - graph_reset_started_ns,
             "plan_rebuild_ns": plan_rebuilt_ns - graphs_destroyed_ns,
@@ -7462,6 +7529,57 @@ class GPUModelRunner(
                         "reason": "plan_class_switch_failed",
                         "plan_switch": plan_switch,
                     }
+
+        # Equal-width plan classes differ only in which expert occupies each
+        # stable slot. Their tensor shapes, Graph-visible VAs, and dispatch
+        # descriptors are identical, so retaining another GraphExec table
+        # would waste HBM without changing the captured program.
+        target_width = registry.get("classes", {}).get(normalized, {}).get(
+            "experts_per_layer"
+        )
+        equal_shape_source = next(
+            (
+                source_class
+                for source_class, source_state in before["classes"].items()
+                if source_class != normalized
+                and bool(source_state.get("fully_captured"))
+                and registry.get("classes", {}).get(source_class, {}).get(
+                    "experts_per_layer"
+                )
+                == target_width
+            ),
+            None,
+        )
+        if equal_shape_source is not None:
+            aliased = model.register_cudagraph_class_alias(
+                normalized, equal_shape_source
+            )
+            if aliased.get("ok") is not True:
+                return {
+                    **aliased,
+                    "class_name": normalized,
+                    "graph_memory_bytes": 0,
+                    "capture_ns": 0,
+                    "certificate": None,
+                    "plan_switch": plan_switch,
+                    "before": before,
+                    "after": model.cudagraph_class_diagnostics(),
+                }
+            certificate = (
+                register_cpu_offload_uvm_plan_class_graph_certificates(
+                    normalized
+                )
+            )
+            return {
+                **aliased,
+                "class_name": normalized,
+                "graph_memory_bytes": 0,
+                "capture_ns": 0,
+                "certificate": certificate,
+                "plan_switch": plan_switch,
+                "before": before,
+                "after": model.cudagraph_class_diagnostics(),
+            }
 
         # The normal startup capture initially lives under "default". Adopt
         # it as the configured initial class without duplicating GraphExecs.
@@ -7534,14 +7652,81 @@ class GPUModelRunner(
         class_name: str,
         *,
         scheduler_idle: bool,
+        resume_prefill_before_switch: bool = False,
+        defer_dual_refresh: bool = False,
     ) -> dict[str, Any]:
         """Switch GraphExec tables without destroying or recapturing graphs."""
         if scheduler_idle is not True:
             return {"ok": False, "reason": "scheduler_not_idle"}
+        eager_plan_classes = os.environ.get(
+            "VLLM_CPU_OFFLOAD_PLAN_CLASS_EAGER_ENABLE", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if eager_plan_classes:
+            from vllm.model_executor.models.utils import (
+                activate_cpu_offload_uvm_original_va_prefill_topology,
+                cpu_offload_uvm_plan_class_registry,
+                switch_cpu_offload_uvm_original_va_plan_class,
+            )
+
+            mode = getattr(self.compilation_config.cudagraph_mode, "name", "")
+            if mode != "NONE" or not self.model_config.enforce_eager:
+                return {
+                    "ok": False,
+                    "reason": "eager_plan_class_requires_eager_none_mode",
+                    "cudagraph_mode": mode,
+                }
+            registry = cpu_offload_uvm_plan_class_registry()
+            normalized = str(class_name).strip().lower()
+            if not bool(registry.get("enabled")):
+                return {"ok": False, "reason": "plan_class_registry_disabled"}
+            if normalized not in registry.get("classes", {}):
+                return {
+                    "ok": False,
+                    "reason": "plan_class_not_registered",
+                    "class_name": normalized,
+                }
+            started_ns = time.perf_counter_ns()
+            prefill_topology_resume = None
+            if resume_prefill_before_switch:
+                prefill_topology_resume = (
+                    activate_cpu_offload_uvm_original_va_prefill_topology()
+                )
+                if prefill_topology_resume.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "reason": "prefill_topology_resume_failed",
+                        "class_name": normalized,
+                        "prefill_topology_resume_before_plan_switch": (
+                            prefill_topology_resume
+                        ),
+                    }
+            plan_switch = switch_cpu_offload_uvm_original_va_plan_class(
+                normalized,
+                reason="eager_plan_class_activation",
+                graphs_retained=True,
+                defer_dual_refresh=defer_dual_refresh,
+            )
+            torch.cuda.synchronize(self.device)
+            return {
+                "ok": plan_switch.get("ok") is True,
+                "reason": (
+                    "eager_plan_class_activated"
+                    if plan_switch.get("ok") is True
+                    else "eager_plan_class_switch_failed"
+                ),
+                "class_name": normalized,
+                "execution_mode": "eager",
+                "plan_switch": plan_switch,
+                "prefill_topology_resume_before_plan_switch": (
+                    prefill_topology_resume
+                ),
+                "switch_ns": time.perf_counter_ns() - started_ns,
+            }
         model = getattr(self, "model", None)
         if not isinstance(model, CUDAGraphWrapper):
             return {"ok": False, "reason": "cudagraph_wrapper_unavailable"}
         from vllm.model_executor.models.utils import (
+            activate_cpu_offload_uvm_original_va_prefill_topology,
             activate_cpu_offload_uvm_plan_class_graph_certificates,
             cpu_offload_uvm_plan_class_registry,
             switch_cpu_offload_uvm_original_va_plan_class,
@@ -7564,6 +7749,7 @@ class GPUModelRunner(
         registry_enabled = bool(registry.get("enabled"))
         previous_class = str(registry.get("active_class"))
         previous_graph_class = str(before.get("active_class"))
+        prefill_topology_resume = None
         if registry_enabled and previous_graph_class != previous_class:
             return {
                 "ok": False,
@@ -7574,10 +7760,25 @@ class GPUModelRunner(
                 "diagnostics": before,
             }
         if registry_enabled and previous_class != normalized:
+            if resume_prefill_before_switch:
+                prefill_topology_resume = (
+                    activate_cpu_offload_uvm_original_va_prefill_topology()
+                )
+                if prefill_topology_resume.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "reason": "prefill_topology_resume_failed",
+                        "class_name": normalized,
+                        "prefill_topology_resume_before_plan_switch": (
+                            prefill_topology_resume
+                        ),
+                        "diagnostics": before,
+                    }
             plan_switch = switch_cpu_offload_uvm_original_va_plan_class(
                 normalized,
                 reason="graph_class_activation",
                 graphs_retained=True,
+                defer_dual_refresh=defer_dual_refresh,
             )
             if plan_switch.get("ok") is not True:
                 return {
@@ -7585,6 +7786,9 @@ class GPUModelRunner(
                     "reason": "plan_class_switch_failed",
                     "class_name": normalized,
                     "plan_switch": plan_switch,
+                    "prefill_topology_resume_before_plan_switch": (
+                        prefill_topology_resume
+                    ),
                     "diagnostics": model.cudagraph_class_diagnostics(),
                 }
         certificate = None
@@ -7626,6 +7830,9 @@ class GPUModelRunner(
                     "class_name": normalized,
                     "plan_switch": plan_switch,
                     "certificate": certificate,
+                    "prefill_topology_resume_before_plan_switch": (
+                        prefill_topology_resume
+                    ),
                     "rollback_plan": rollback_plan,
                     "rollback_certificate": rollback_certificate,
                     "diagnostics": model.cudagraph_class_diagnostics(),
@@ -7661,6 +7868,9 @@ class GPUModelRunner(
                 **result,
                 "plan_switch": plan_switch,
                 "certificate": certificate,
+                "prefill_topology_resume_before_plan_switch": (
+                    prefill_topology_resume
+                ),
                 "rollback_plan": rollback_plan,
                 "rollback_certificate": rollback_certificate,
                 "switch_ns": time.perf_counter_ns() - started_ns,
@@ -7671,6 +7881,9 @@ class GPUModelRunner(
             **result,
             "plan_switch": plan_switch,
             "certificate": certificate,
+            "prefill_topology_resume_before_plan_switch": (
+                prefill_topology_resume
+            ),
             "switch_ns": time.perf_counter_ns() - started_ns,
             "diagnostics": model.cudagraph_class_diagnostics(),
         }
@@ -7764,6 +7977,7 @@ class GPUModelRunner(
             cpu_offload_uvm_original_va_phase_mode,
             prepare_cpu_offload_uvm_original_va_profile_topology,
             prepare_cpu_offload_uvm_original_va_remote_graph_capture,
+            refresh_cpu_offload_uvm_original_va_full_dual_view,
             reconcile_cpu_offload_uvm_original_va_remote_graph_residency,
             reconcile_cpu_offload_uvm_original_va_sealed_hot_residency,
             validate_cpu_offload_graph_static_alias_runtime,
@@ -8103,6 +8317,7 @@ class GPUModelRunner(
                     reconcile_cpu_offload_uvm_original_va_remote_graph_residency(
                         preserve_allocator_cache=True
                     )
+                    refresh_cpu_offload_uvm_original_va_full_dual_view()
 
                     # Restore the same original VAs to sealed dual-bank
                     # aliases, then capture independent Prefill entries.

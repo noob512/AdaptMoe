@@ -181,6 +181,29 @@ def test_startup_graph_table_can_be_adopted_as_initial_class() -> None:
     assert graph.reset_count == 0
 
 
+def test_equal_shape_classes_share_graph_table_and_reset_once() -> None:
+    wrapper = _wrapper()
+    graph = _FakeGraph()
+    descriptor = BatchDescriptor(512, uniform_decode=False)
+    wrapper.begin_cudagraph_class_capture("base")
+    wrapper.concrete_cudagraph_entries[descriptor] = CUDAGraphEntry(
+        descriptor,
+        cudagraph=graph,
+    )
+
+    result = wrapper.register_cudagraph_class_alias("d005", "base")
+
+    assert result["ok"] is True
+    assert result["reason"] == "equal_shape_class_aliased"
+    assert wrapper._cudagraph_class_entries["d005"] is (
+        wrapper._cudagraph_class_entries["base"]
+    )
+    assert wrapper.activate_cudagraph_class("base")["ok"] is True
+    assert wrapper.activate_cudagraph_class("d005")["ok"] is True
+    assert wrapper.reset_all_cudagraph_classes() == 1
+    assert graph.reset_count == 1
+
+
 def test_reset_all_cudagraph_classes_releases_each_graph_once() -> None:
     wrapper = _wrapper()
     graphs = []

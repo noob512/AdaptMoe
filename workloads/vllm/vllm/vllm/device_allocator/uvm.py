@@ -75,7 +75,7 @@ _UVM_MOE_SLOT_PLAN_ABORT_SESSION_IOCTL = 95
 _UVM_MOE_SLOT_PLAN_EXECUTE_FENCED_IOCTL = 96
 _UVM_ALLOC_SEMAPHORE_POOL_IOCTL = 68
 _UVM_FREE_IOCTL = 34
-_UVM_MOE_SLOT_REMAP_MAX_ENTRIES = 1152
+_UVM_MOE_SLOT_REMAP_MAX_ENTRIES = 4608
 _UVM_MOE_SLOT_REMAP_MAX_ENTRY_BYTES = 4 * 1024 * 1024
 _UVM_MOE_SLOT_REMAP_MODE_VIDMEM_PREALLOC = 8
 _UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_PER_BLOCK_PUSH = 10
@@ -142,6 +142,8 @@ UVM_PHASE_F_ACTION_START_BG_PROMOTION = 8
 UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16
 UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17
 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_AUDITED = 21
+UVM_PHASE_F_ACTION_IMMUTABLE_CPU_SHADOW_CUTOVER = 22
+UVM_PHASE_F_ACTION_REBUILD_GPU_READ_MAPPINGS = 23
 _NV_ERR_INVALID_DEVICE = 0x00000026
 
 UVM_REGION_STATE_UNKNOWN = 0
@@ -494,14 +496,14 @@ def _assert_moe_slot_remap_abi() -> None:
         "entry_size": (ctypes.sizeof(_MoeSlotRemapEntry), 48),
         "entry_va_base": (_MoeSlotRemapEntry.va_base.offset, 16),
         "entry_status": (_MoeSlotRemapEntry.status.offset, 44),
-        "params_size": (ctypes.sizeof(_MoeSlotRemapBatchParams), 55376),
+        "params_size": (ctypes.sizeof(_MoeSlotRemapBatchParams), 221264),
         "params_requested_bytes": (
             _MoeSlotRemapBatchParams.requested_bytes.offset,
             56,
         ),
         "params_entries": (_MoeSlotRemapBatchParams.entries.offset, 72),
-        "params_rm_status": (_MoeSlotRemapBatchParams.rmStatus.offset, 55368),
-        "plan_register_size": (ctypes.sizeof(_MoeSlotPlanRegisterParams), 55360),
+        "params_rm_status": (_MoeSlotRemapBatchParams.rmStatus.offset, 221256),
+        "plan_register_size": (ctypes.sizeof(_MoeSlotPlanRegisterParams), 221248),
         "plan_register_entries": (_MoeSlotPlanRegisterParams.entries.offset, 56),
         "plan_execute_size": (ctypes.sizeof(_MoeSlotPlanExecuteParams), 88),
         "plan_execute_layer": (_MoeSlotPlanExecuteParams.layer_id.offset, 40),
@@ -1596,10 +1598,9 @@ def _partition_moe_slot_batches(
     mode: int,
 ) -> list[list[tuple[int, tuple[int, int, int, int, int, int, int]]]]:
     indexed = list(enumerate(normalized))
-    # The layer-batch ABI admits a complete 128-expert Qwen layer (1152
-    # envelopes). The kernel groups slices which share a 2 MiB VA block, so
-    # userspace must preserve the complete layer in one transaction instead of
-    # coloring it into hundreds of independently synchronized mode-10 calls.
+    # Preserve complete Qwen layers in one transaction.  The expanded ABI also
+    # supplies scratch space for a 4,500-entry static-alias tier delta; normal
+    # per-layer callers still submit only their own 1,152 envelopes.
     return [
         indexed[start : start + _UVM_MOE_SLOT_REMAP_MAX_ENTRIES]
         for start in range(0, len(indexed), _UVM_MOE_SLOT_REMAP_MAX_ENTRIES)
@@ -2199,7 +2200,10 @@ def _driver_slot_transition_ranges_impl(
     elif not validation_error and policy_error:
         validation_error = policy_error
     elif not validation_error and len(normalized) > _UVM_MOE_SLOT_REMAP_MAX_ENTRIES:
-        validation_error = "one layer transition exceeds the 1152-entry ABI"
+        validation_error = (
+            "one layer transition exceeds the "
+            f"{_UVM_MOE_SLOT_REMAP_MAX_ENTRIES}-entry ABI"
+        )
     elif not validation_error and any(
         record[6] != required_flags for record in normalized
     ):
@@ -2410,7 +2414,10 @@ def _driver_slot_register_plan_impl(
             "requested_bytes": total_bytes,
         }
     if len(normalized) > _UVM_MOE_SLOT_REMAP_MAX_ENTRIES:
-        validation_error = "one registered layer exceeds the 1152-entry ABI"
+        validation_error = (
+            "one registered layer exceeds the "
+            f"{_UVM_MOE_SLOT_REMAP_MAX_ENTRIES}-entry ABI"
+        )
 
     if transition:
         gate = os.environ.get(
@@ -4723,6 +4730,471 @@ def driver_phase_f_batch_execute_ranges(
         if fd >= 0:
             with suppress(OSError):
                 os.close(fd)
+
+
+def driver_rebuild_ranges_gpu_read_mappings(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    device: int = 0,
+) -> dict[str, object]:
+    """Rebuild complete Parameter GPU READ mappings without moving data.
+
+    The kernel action is synchronous and audits every page after rebuilding.
+    Its authoritative residency masks choose the mapping target: a page with a
+    target-GPU copy maps locally, otherwise an existing CPU copy maps remotely.
+    The public result intentionally reports operation counts; byte-level local
+    versus remote evidence is emitted by the kernel route log and physical
+    residency remains available through the normal residency query API.
+    """
+    normalized = [
+        (int(base), int(length))
+        for base, length in ranges
+        if int(base) > 0 and int(length) > 0
+    ]
+    requested_count = len(normalized)
+    requested_bytes = sum(length for _base, length in normalized)
+    if not normalized:
+        return {
+            "ok": False,
+            "reason": "no_ranges",
+            "requested_count": 0,
+            "requested_bytes": 0,
+            "success_count": 0,
+            "failure_count": 0,
+            "rm_status": 0,
+            "ioctl_ret": 0,
+        }
+
+    page_size = int(get_uvm_page_size())
+    if page_size <= 0:
+        page_size = 4096
+    if any(
+        base % page_size != 0 or length % page_size != 0
+        for base, length in normalized
+    ):
+        return {
+            "ok": False,
+            "reason": "unaligned_parameter_range",
+            "requested_count": requested_count,
+            "requested_bytes": requested_bytes,
+            "success_count": 0,
+            "failure_count": requested_count,
+            "rm_status": 0,
+            "ioctl_ret": -1,
+        }
+
+    if not _phase_f_batch_abi_matches_kernel():
+        return {
+            "ok": False,
+            "reason": "phase_f_abi_mismatch",
+            "requested_count": requested_count,
+            "requested_bytes": requested_bytes,
+            "success_count": 0,
+            "failure_count": requested_count,
+            "rm_status": 0,
+            "ioctl_ret": -2,
+        }
+
+    try:
+        gpu_uuid = _phase_f_gpu_uuid(int(device))
+    except Exception:
+        logger.debug("Failed to resolve CUDA UUID for mapping rebuild", exc_info=True)
+        return {
+            "ok": False,
+            "reason": "gpu_uuid_failed",
+            "requested_count": requested_count,
+            "requested_bytes": requested_bytes,
+            "success_count": 0,
+            "failure_count": requested_count,
+            "rm_status": 0,
+            "ioctl_ret": -3,
+        }
+
+    def run_candidate(
+        fd: int, *, source_fd: int, candidate_index: int
+    ) -> dict[str, object]:
+        success_count = 0
+        failure_count = 0
+        local_gpu_bytes = 0
+        remote_cpu_bytes = 0
+        read_mapped_bytes = 0
+        unknown_bytes = 0
+        last_rm_status = 0
+        last_ioctl_ret = 0
+        records: list[dict[str, int]] = []
+
+        for start in range(0, requested_count, _UVM_PHASE_F_MAX_RANGES):
+            chunk = normalized[start : start + _UVM_PHASE_F_MAX_RANGES]
+            params = _PhaseFBatchExecutorParams()
+            params.action = UVM_PHASE_F_ACTION_REBUILD_GPU_READ_MAPPINGS
+            params.count = len(chunk)
+            params.gpu_uuid = gpu_uuid
+            params.async_ = 0
+            for index, (base, length) in enumerate(chunk):
+                params.ranges[index].base = base
+                params.ranges[index].length = length
+
+            ctypes.set_errno(0)
+            last_ioctl_ret = int(
+                _libc_ioctl(fd, _UVM_PHASE_F_BATCH_EXECUTOR_IOCTL, params)
+            )
+            last_rm_status = int(params.rmStatus)
+            success_count += int(params.success_count)
+            failure_count += int(params.failure_count)
+
+            for index, (base, length) in enumerate(chunk):
+                raw = params.results[index]
+                record = {
+                    "base": int(base),
+                    "length": int(length),
+                    "status": int(raw.status),
+                    # Action 23 result semantics are documented in uvm.c.
+                    "local_gpu_bytes": int(raw.resident_gpu_bytes),
+                    "remote_cpu_bytes": int(raw.resident_cpu_bytes),
+                    "read_mapped_bytes": int(raw.resident_any_bytes),
+                    "unknown_bytes": int(raw.resident_unknown_bytes),
+                }
+                records.append(record)
+                local_gpu_bytes += int(raw.resident_gpu_bytes)
+                remote_cpu_bytes += int(raw.resident_cpu_bytes)
+                read_mapped_bytes += int(raw.resident_any_bytes)
+                unknown_bytes += int(raw.resident_unknown_bytes)
+
+            if last_ioctl_ret != 0 or last_rm_status != 0:
+                break
+
+        complete = (
+            last_ioctl_ret == 0
+            and last_rm_status == 0
+            and success_count == requested_count
+            and failure_count == 0
+            and local_gpu_bytes + remote_cpu_bytes == requested_bytes
+            and read_mapped_bytes == requested_bytes
+            and unknown_bytes == 0
+            and len(records) == requested_count
+            and all(int(record["status"]) == 0 for record in records)
+        )
+        made_progress = any(
+            (
+                success_count > 0,
+                local_gpu_bytes > 0,
+                remote_cpu_bytes > 0,
+                read_mapped_bytes > 0,
+            )
+        )
+        fd_mismatch_proven = (
+            not made_progress
+            and last_ioctl_ret == 0
+            and last_rm_status == _NV_ERR_INVALID_DEVICE
+            and success_count == 0
+            and failure_count > 0
+            and bool(records)
+            and all(
+                int(record["status"]) == _NV_ERR_INVALID_DEVICE
+                and int(record["local_gpu_bytes"]) == 0
+                and int(record["remote_cpu_bytes"]) == 0
+                and int(record["read_mapped_bytes"]) == 0
+                and int(record["unknown_bytes"]) == int(record["length"])
+                for record in records
+            )
+        )
+        return {
+            "ok": bool(complete),
+            "reason": "ok" if complete else "driver_rebuild_failed",
+            "requested_count": requested_count,
+            "requested_bytes": requested_bytes,
+            "success_count": int(success_count),
+            "failure_count": int(failure_count),
+            "local_gpu_bytes": int(local_gpu_bytes),
+            "remote_cpu_bytes": int(remote_cpu_bytes),
+            "read_mapped_bytes": int(read_mapped_bytes),
+            "unknown_bytes": int(unknown_bytes),
+            "rm_status": int(last_rm_status),
+            "ioctl_ret": int(last_ioctl_ret),
+            "errno": int(ctypes.get_errno()) if last_ioctl_ret != 0 else 0,
+            "results": tuple(records),
+            "made_progress": bool(made_progress),
+            "fd_mismatch_proven": bool(fd_mismatch_proven),
+            "fd_candidate_index": int(candidate_index),
+            "selected_fd_source": int(source_fd),
+        }
+
+    last_candidate: dict[str, object] | None = None
+    try:
+        for candidate_index, source_fd in enumerate(
+            _iter_existing_uvm_fd_sources(), start=1
+        ):
+            fd = _initialize_duplicated_uvm_fd(source_fd)
+            if fd is None:
+                continue
+            try:
+                candidate = run_candidate(
+                    fd,
+                    source_fd=int(source_fd),
+                    candidate_index=candidate_index,
+                )
+            finally:
+                with suppress(OSError):
+                    os.close(fd)
+            if (
+                bool(candidate["ok"])
+                or bool(candidate["made_progress"])
+                or not bool(candidate["fd_mismatch_proven"])
+            ):
+                return candidate
+            last_candidate = candidate
+
+        fd = _open_initialized_uvm_fd()
+        try:
+            fallback = run_candidate(
+                fd,
+                source_fd=-1,
+                candidate_index=(
+                    int((last_candidate or {}).get("fd_candidate_index", 0))
+                    + 1
+                ),
+            )
+        finally:
+            with suppress(OSError):
+                os.close(fd)
+        if (
+            not bool(fallback["ok"])
+            and not bool(fallback["made_progress"])
+            and bool(fallback["fd_mismatch_proven"])
+        ):
+            fallback["reason"] = "no_matching_uvm_fd"
+        return fallback
+    except Exception as exc:
+        logger.debug("GPU READ mapping rebuild failed", exc_info=True)
+        return {
+            "ok": False,
+            "reason": repr(exc),
+            "requested_count": requested_count,
+            "requested_bytes": requested_bytes,
+            "success_count": 0,
+            "failure_count": requested_count,
+            "rm_status": 0,
+            "ioctl_ret": -4,
+        }
+
+
+def driver_cutover_ranges_to_immutable_cpu_shadow(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    device: int = 0,
+) -> dict[str, object]:
+    """Drop GPU read-duplicates without copying them back to CPU.
+
+    Every submitted managed range must already have matching read-only CPU and
+    GPU residency. The modified driver rejects the whole range unless it can
+    retain the CPU copy, free all corresponding GPU chunks, and install
+    read-only GPU-to-CPU mappings. This action is always synchronous.
+    """
+    range_list = [
+        (int(ptr), int(size))
+        for ptr, size in ranges
+        if int(ptr) > 0 and int(size) > 0
+    ]
+    requested_bytes = sum(size for _, size in range_list)
+    empty_result: dict[str, object] = {
+        "ok": True,
+        "action": "immutable_cpu_shadow_cutover",
+        "range_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "requested_bytes": 0,
+        "released_gpu_bytes": 0,
+        "retained_cpu_shadow_bytes": 0,
+        "remote_mapped_bytes": 0,
+        "rm_status": 0,
+        "ioctl_ret": 0,
+        "results": (),
+    }
+    if not range_list:
+        return empty_result
+    if not _phase_f_batch_abi_matches_kernel():
+        return {
+            **empty_result,
+            "ok": False,
+            "range_count": len(range_list),
+            "failure_count": len(range_list),
+            "requested_bytes": int(requested_bytes),
+            "ioctl_ret": -2,
+            "reason": "phase_f_abi_mismatch",
+        }
+
+    try:
+        gpu_uuid = _phase_f_gpu_uuid(device)
+    except Exception:
+        logger.debug("Failed to resolve CUDA UUID for shadow cutover", exc_info=True)
+        return {
+            **empty_result,
+            "ok": False,
+            "range_count": len(range_list),
+            "failure_count": len(range_list),
+            "requested_bytes": int(requested_bytes),
+            "ioctl_ret": -3,
+            "reason": "gpu_uuid_failed",
+        }
+
+    def run_candidate(
+        fd: int, *, source_fd: int, candidate_index: int
+    ) -> dict[str, object]:
+        success_count = 0
+        failure_count = 0
+        released_gpu_bytes = 0
+        retained_cpu_shadow_bytes = 0
+        remote_mapped_bytes = 0
+        last_rm_status = 0
+        last_ioctl_ret = 0
+        records: list[dict[str, object]] = []
+        for start in range(0, len(range_list), _UVM_PHASE_F_MAX_RANGES):
+            chunk = range_list[start : start + _UVM_PHASE_F_MAX_RANGES]
+            params = _PhaseFBatchExecutorParams()
+            params.action = UVM_PHASE_F_ACTION_IMMUTABLE_CPU_SHADOW_CUTOVER
+            params.count = len(chunk)
+            params.gpu_uuid = gpu_uuid
+            params.async_ = 0
+            for index, (ptr, size) in enumerate(chunk):
+                params.ranges[index].base = int(ptr)
+                params.ranges[index].length = int(size)
+
+            ret = int(_libc_ioctl(fd, _UVM_PHASE_F_BATCH_EXECUTOR_IOCTL, params))
+            last_ioctl_ret = ret
+            last_rm_status = int(params.rmStatus)
+            success_count += int(params.success_count)
+            failure_count += int(params.failure_count)
+            for index, (ptr, size) in enumerate(chunk):
+                raw = params.results[index]
+                record = {
+                    "base": int(ptr),
+                    "length": int(size),
+                    "status": int(raw.status),
+                    # Action 22 deliberately assigns action-specific meanings
+                    # to the three byte counters; see uvm.c.
+                    "released_gpu_bytes": int(raw.resident_gpu_bytes),
+                    "retained_cpu_shadow_bytes": int(raw.resident_cpu_bytes),
+                    "remote_mapped_bytes": int(raw.resident_any_bytes),
+                    "unknown_bytes": int(raw.resident_unknown_bytes),
+                }
+                records.append(record)
+                released_gpu_bytes += int(raw.resident_gpu_bytes)
+                retained_cpu_shadow_bytes += int(raw.resident_cpu_bytes)
+                remote_mapped_bytes += int(raw.resident_any_bytes)
+
+            if ret != 0 or last_rm_status != 0:
+                break
+
+        complete = (
+            last_ioctl_ret == 0
+            and last_rm_status == 0
+            and success_count == len(range_list)
+            and failure_count == 0
+            and released_gpu_bytes == requested_bytes
+            and retained_cpu_shadow_bytes == requested_bytes
+            and remote_mapped_bytes == requested_bytes
+            and len(records) == len(range_list)
+            and all(int(record["status"]) == 0 for record in records)
+        )
+        made_progress = any(
+            (
+                success_count > 0,
+                released_gpu_bytes > 0,
+                retained_cpu_shadow_bytes > 0,
+                remote_mapped_bytes > 0,
+            )
+        )
+        fd_mismatch_proven = (
+            not made_progress
+            and last_ioctl_ret == 0
+            and last_rm_status == _NV_ERR_INVALID_DEVICE
+            and success_count == 0
+            and failure_count > 0
+            and records
+            and all(
+                int(record["status"]) == _NV_ERR_INVALID_DEVICE
+                and int(record["released_gpu_bytes"]) == 0
+                and int(record["retained_cpu_shadow_bytes"]) == 0
+                and int(record["remote_mapped_bytes"]) == 0
+                and int(record["unknown_bytes"]) == int(record["length"])
+                for record in records
+            )
+        )
+        return {
+            "ok": bool(complete),
+            "action": "immutable_cpu_shadow_cutover",
+            "range_count": len(range_list),
+            "success_count": int(success_count),
+            "failure_count": int(failure_count),
+            "requested_bytes": int(requested_bytes),
+            "released_gpu_bytes": int(released_gpu_bytes),
+            "retained_cpu_shadow_bytes": int(retained_cpu_shadow_bytes),
+            "remote_mapped_bytes": int(remote_mapped_bytes),
+            "rm_status": int(last_rm_status),
+            "ioctl_ret": int(last_ioctl_ret),
+            "results": tuple(records),
+            "made_progress": bool(made_progress),
+            "fd_mismatch_proven": bool(fd_mismatch_proven),
+            "fd_candidate_index": int(candidate_index),
+            "selected_fd_source": int(source_fd),
+        }
+
+    last_candidate: dict[str, object] | None = None
+    try:
+        for candidate_index, source_fd in enumerate(
+            _iter_existing_uvm_fd_sources(), start=1
+        ):
+            fd = _initialize_duplicated_uvm_fd(source_fd)
+            if fd is None:
+                continue
+            try:
+                candidate = run_candidate(
+                    fd,
+                    source_fd=int(source_fd),
+                    candidate_index=candidate_index,
+                )
+            finally:
+                with suppress(OSError):
+                    os.close(fd)
+            if (
+                bool(candidate["ok"])
+                or bool(candidate["made_progress"])
+                or not bool(candidate["fd_mismatch_proven"])
+            ):
+                return candidate
+            last_candidate = candidate
+
+        fd = _open_initialized_uvm_fd()
+        try:
+            fallback = run_candidate(
+                fd,
+                source_fd=-1,
+                candidate_index=(
+                    int((last_candidate or {}).get("fd_candidate_index", 0)) + 1
+                ),
+            )
+        finally:
+            with suppress(OSError):
+                os.close(fd)
+        if (
+            not bool(fallback["ok"])
+            and not bool(fallback["made_progress"])
+            and bool(fallback["fd_mismatch_proven"])
+        ):
+            fallback["reason"] = "no_matching_uvm_fd"
+        return fallback
+    except Exception as exc:
+        logger.debug("Immutable CPU shadow cutover failed", exc_info=True)
+        return {
+            **empty_result,
+            "ok": False,
+            "range_count": len(range_list),
+            "failure_count": len(range_list),
+            "requested_bytes": int(requested_bytes),
+            "ioctl_ret": -4,
+            "reason": repr(exc),
+            "results": (),
+        }
 
 
 def _region_release_outcome(

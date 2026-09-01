@@ -93,3 +93,6 @@ workloads/vllm/results/uvm_kv_bench_single_process.log
 /workloads/vllm/uvm/results-*/
 **/vllm_uvm_*.jsonl
 **/vllm_uvm_*.log
+
+# Locally compiled UVM probe executable (keep the .cu source only)
+/workloads/vllm/vllm/uvm_test/managed_to_cuda_malloc_reuse_probe

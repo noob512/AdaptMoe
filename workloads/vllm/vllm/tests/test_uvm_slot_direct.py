@@ -177,11 +177,12 @@ def test_slot_ioctl_abi_matches_kernel_header() -> None:
     assert ctypes.sizeof(uvm_module._MoeSlotRemapEntry) == 48
     assert uvm_module._MoeSlotRemapEntry.va_base.offset == 16
     assert uvm_module._MoeSlotRemapEntry.status.offset == 44
-    assert uvm_module._UVM_MOE_SLOT_REMAP_MAX_ENTRIES == LAYER_REGIONS
-    assert ctypes.sizeof(uvm_module._MoeSlotRemapBatchParams) == 55376
+    assert uvm_module._UVM_MOE_SLOT_REMAP_MAX_ENTRIES == 4608
+    assert uvm_module._UVM_MOE_SLOT_REMAP_MAX_ENTRIES >= LAYER_REGIONS
+    assert ctypes.sizeof(uvm_module._MoeSlotRemapBatchParams) == 221264
     assert uvm_module._MoeSlotRemapBatchParams.requested_bytes.offset == 56
     assert uvm_module._MoeSlotRemapBatchParams.entries.offset == 72
-    assert uvm_module._MoeSlotRemapBatchParams.rmStatus.offset == 55368
+    assert uvm_module._MoeSlotRemapBatchParams.rmStatus.offset == 221256
     assert (
         uvm_module._UVM_MOE_SLOT_REMAP_MODE_SLOT_DIRECT_SHARED_PUSH_64K_PTE
         == 21
@@ -358,15 +359,17 @@ def test_preallocate_splits_only_after_a_complete_layer(
     _install_existing_fd(monkeypatch)
     monkeypatch.setattr(uvm_module, "_libc_ioctl", _complete_ioctl(calls))
 
+    batch_entries = uvm_module._UVM_MOE_SLOT_REMAP_MAX_ENTRIES
+    assert batch_entries % LAYER_REGIONS == 0
     result = uvm_module.driver_slot_preallocate_ranges(
-        _ranges(LAYER_REGIONS + 1)
+        _ranges(batch_entries + 1)
     )
 
     assert result["ok"] is True
     assert result["ioctl_calls"] == 2
-    assert [call["count"] for call in calls] == [LAYER_REGIONS, 1]
-    assert result["success_count"] == LAYER_REGIONS + 1
-    assert result["accepted_bytes"] == (LAYER_REGIONS + 1) * PAGE_BYTES
+    assert [call["count"] for call in calls] == [batch_entries, 1]
+    assert result["success_count"] == batch_entries + 1
+    assert result["accepted_bytes"] == (batch_entries + 1) * PAGE_BYTES
 
 
 def test_restore_keeps_four_nonoverlapping_slices_of_one_va_block_in_one_ioctl(
@@ -928,8 +931,9 @@ def test_partial_batch_failure_stops_before_unsubmitted_tail(
 
     monkeypatch.setattr(uvm_module, "_libc_ioctl", ioctl)
 
+    batch_entries = uvm_module._UVM_MOE_SLOT_REMAP_MAX_ENTRIES
     result = uvm_module.driver_slot_preallocate_ranges(
-        _ranges(2 * LAYER_REGIONS + 1)
+        _ranges(2 * batch_entries + 1)
     )
 
     assert result["ok"] is False

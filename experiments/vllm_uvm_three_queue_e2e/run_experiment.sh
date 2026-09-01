@@ -22,17 +22,22 @@ NAMES="${REPO_ROOT}/experiments/qwen_decode_six_mechanism_compare/inputs/exact_p
 STATIC_PLAN="${REPO_ROOT}/experiments/vllm_uvm_physical_kv_pool_resize/inputs/cold_decode_plan_6g.json"
 SUPERSET_PLAN="${REPO_ROOT}/experiments/vllm_uvm_physical_kv_pool_resize/inputs/cold_decode_plan_7g.json"
 INCREMENTAL_PLAN="${SCRIPT_DIR}/inputs/incremental_wave_plan.json"
+TIER30_PLAN="${SCRIPT_DIR}/inputs/cold_frequency_tier_30.json"
+PLAN_CLASSES="${SCRIPT_DIR}/inputs/cold_frequency_plan_classes.json"
+PLAN_CLASS_MAP='{"24":"cold29","40":"cold30"}'
 KV_MAX_BYTES="${KV_MAX_BYTES:-1610612736}"
 BASELINE_TARGET_BLOCKS="${BASELINE_TARGET_BLOCKS:-40}"
 QUEUE_INITIAL_TARGET_BLOCKS="${QUEUE_INITIAL_TARGET_BLOCKS:-24}"
 BACKUP_RESERVE_BLOCKS="${BACKUP_RESERVE_BLOCKS:-8}"
 BACKUP_GROW_BLOCKS="${BACKUP_GROW_BLOCKS:-16}"
+BACKUP_PRESSURE_THRESHOLD_BLOCKS="${BACKUP_PRESSURE_THRESHOLD_BLOCKS:-4}"
 AUTOSCALE_MIN_TARGET_BLOCKS="${AUTOSCALE_MIN_TARGET_BLOCKS:-20}"
 AUTOSCALE_MAX_TARGET_BLOCKS="${AUTOSCALE_MAX_TARGET_BLOCKS:-40}"
 AUTOSCALE_LOW_PROMPT_TOKENS="${AUTOSCALE_LOW_PROMPT_TOKENS:-16}"
 AUTOSCALE_LOW_OUTPUT_TOKENS="${AUTOSCALE_LOW_OUTPUT_TOKENS:-5}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-3600}"
 CPUSET="${CPUSET:-0-13}"
+EXPERT_STRATEGY="${EXPERT_STRATEGY:-cold-frequency}"
 
 die_three_queue() {
   echo "three-queue qualification: $*" >&2
@@ -52,8 +57,12 @@ static_preflight_three_queue() {
   require_three_queue_file "${STATIC_PLAN}"
   require_three_queue_file "${SUPERSET_PLAN}"
   require_three_queue_file "${INCREMENTAL_PLAN}"
+  require_three_queue_file "${TIER30_PLAN}"
+  require_three_queue_file "${PLAN_CLASSES}"
   [[ "$(wc -l <"${NAMES}")" -eq 96 ]] \
     || die_three_queue "expected 96 exact parameter names"
+  [[ "${EXPERT_STRATEGY}" == cold-frequency ]] \
+    || die_three_queue "this frozen E10 runner only supports cold-frequency"
   (( AUTOSCALE_MIN_TARGET_BLOCKS < QUEUE_INITIAL_TARGET_BLOCKS )) \
     || die_three_queue "autoscale minimum must be below initial target"
   (( QUEUE_INITIAL_TARGET_BLOCKS < AUTOSCALE_MAX_TARGET_BLOCKS )) \
@@ -64,16 +73,22 @@ static_preflight_three_queue() {
     || die_three_queue "autoscale low prompt must be positive"
   (( AUTOSCALE_LOW_OUTPUT_TOKENS >= 4 )) \
     || die_three_queue "autoscale low request needs at least four outputs"
+  (( BACKUP_PRESSURE_THRESHOLD_BLOCKS > 0 )) \
+    || die_three_queue "backup pressure threshold must be positive"
+  (( BACKUP_PRESSURE_THRESHOLD_BLOCKS <= BACKUP_RESERVE_BLOCKS )) \
+    || die_three_queue "backup pressure threshold exceeds the reserve"
   bash -n "${BASH_SOURCE[0]}"
   "${VLLM_PY}" -m py_compile "${RUNNER}" "${VERIFY}"
   "${VLLM_PY}" - "${STATIC_PLAN}" "${SUPERSET_PLAN}" \
-    "${INCREMENTAL_PLAN}" <<'PY'
+    "${INCREMENTAL_PLAN}" "${TIER30_PLAN}" "${PLAN_CLASSES}" <<'PY'
 import json
 import sys
 
 static = json.load(open(sys.argv[1], encoding="utf-8"))
 superset = json.load(open(sys.argv[2], encoding="utf-8"))
 incremental = json.load(open(sys.argv[3], encoding="utf-8"))
+tier30 = json.load(open(sys.argv[4], encoding="utf-8"))
+classes = json.load(open(sys.argv[5], encoding="utf-8"))
 static_keys = {
     (int(item["layer_id"]), int(item["expert_id"]))
     for item in static["offload_plan"]
@@ -91,6 +106,26 @@ assert {layer for layer, _ in wave_keys} == set(range(48))
 assert static_keys < superset_keys
 assert wave_keys <= (superset_keys - static_keys)
 assert not (wave_keys & static_keys)
+assert "minimum summed calibration-decode route counts per layer" in (
+    static.get("selection_rule") or ""
+)
+assert "minimum summed calibration-decode route counts per layer" in (
+    superset.get("selection_rule") or ""
+)
+assert incremental["metadata"]["policy"] == "cold_only_one_per_layer"
+assert incremental["metadata"]["source_plan"] == (
+    "7 GiB minus 6 GiB nested cold-plan difference"
+)
+assert classes["initial_class"] == "cold29"
+assert set(classes["classes"]) == {"cold29", "cold30"}
+assert set(tier30["selected_by_layer"]) == {str(layer) for layer in range(48)}
+assert {len(values) for values in tier30["selected_by_layer"].values()} == {30}
+assert tier30["selected_main_bytes"] - static["metadata"]["selected_main_bytes"] \
+    == 226492416
+for layer in range(48):
+    base = set(static["selected_by_layer"][str(layer)])
+    high = set(tier30["selected_by_layer"][str(layer)])
+    assert base < high and len(high - base) == 1
 PY
   (
     cd "${VLLM_ROOT}"
@@ -98,14 +133,14 @@ PY
       tests/v1/core/test_uvm_dynamic_pool_queues.py \
       tests/v1/engine/test_uvm_adaptive_kv.py \
       tests/v1/worker/test_uvm_post_warmup_rebalance.py \
-      -k 'backup or autoscale or incremental_expert'
+      -k 'backup or autoscale or incremental_expert or plan_class'
   )
   echo "three-queue static preflight: OK"
 }
 
 run_three_queue_case() {
   local run_root="$1" label="$2" initial_target="$3" reserve="$4"
-  local qualification="$5" incremental="$6" autoscale="$7"
+  local qualification="$5" tiered_batch="$6" autoscale="$7"
   local case_root="${run_root}/${label}"
   local manifest="${case_root}/cpu_offload_manifest.jsonl"
   mkdir -p "${case_root}"
@@ -123,6 +158,11 @@ run_three_queue_case() {
       VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS=1 \
       VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND=uvm_original_va \
       VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE="${STATIC_PLAN}" \
+      VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASSES_FILE="${PLAN_CLASSES}" \
+      VLLM_CPU_OFFLOAD_PLAN_CLASS_PREFILL_SOURCES=1 \
+      VLLM_CPU_OFFLOAD_PLAN_CLASS_IMMUTABLE_CPU_SHADOW=1 \
+      VLLM_CPU_OFFLOAD_PLAN_CLASS_PRECOMPILE=1 \
+      VLLM_CPU_OFFLOAD_PLAN_CLASS_QUIESCED_DELTA=1 \
       VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_REGION_BYTES=524288 \
       VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PTE_MODE=auto \
       VLLM_CPU_OFFLOAD_UVM_ORIGINAL_VA_PARK_RESUME=1 \
@@ -133,13 +173,13 @@ run_three_queue_case() {
       VLLM_UVM_EXPERT_ENVELOPE_ENABLE=1 \
       VLLM_UVM_EXPERT_ENVELOPE_BYTES=524288 \
       VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE=remote_read \
-      VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE="${incremental}" \
+      VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE=0 \
       VLLM_UVM_INIT_WEIGHT_OFFLOAD_MODE=driver_release_cpu \
       VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE=post_warmup \
       VLLM_UVM_INIT_WEIGHT_PLAN_FILE="${INCREMENTAL_PLAN}" \
       VLLM_UVM_INIT_WEIGHT_COMPLETE_EXPERT_PLAN=0 \
       VLLM_UVM_INIT_WEIGHT_WARM_OFFLOAD_ENABLE=0 \
-      VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE="${incremental}" \
+      VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE=0 \
       VLLM_UVM_DYNAMIC_EXPERT_SWAP_ENABLE=0 \
       VLLM_UVM_INIT_WEIGHT_PLACEMENT_MANIFEST= \
       VLLM_UVM_WEIGHT_EXECUTOR=cpp_batch \
@@ -160,6 +200,10 @@ run_three_queue_case() {
       VLLM_UVM_KV_BACKUP_GROW_BLOCKS="${BACKUP_GROW_BLOCKS}" \
       VLLM_UVM_KV_ADAPTIVE_PRESSURE_ENABLE=0 \
       VLLM_UVM_KV_AUTO_SCALE_ENABLE="${autoscale}" \
+      VLLM_UVM_KV_AUTO_SCALE_BACKUP_ONLY="${tiered_batch}" \
+      VLLM_UVM_KV_AUTO_SCALE_BACKUP_PRESSURE_THRESHOLD_BLOCKS="${BACKUP_PRESSURE_THRESHOLD_BLOCKS}" \
+      VLLM_UVM_KV_AUTO_SCALE_PLAN_CLASS_MAP="${PLAN_CLASS_MAP}" \
+      VLLM_UVM_KV_AUTO_SCALE_PLAN_CLASS_BEFORE_GROW="${tiered_batch}" \
       VLLM_UVM_KV_AUTO_SCALE_LOW_PRESSURE_STREAK=3 \
       VLLM_UVM_KV_AUTO_SCALE_GROW_FACTOR=2 \
       VLLM_UVM_KV_AUTO_SCALE_SHRINK_DIVISOR=2 \
@@ -169,7 +213,7 @@ run_three_queue_case() {
       VLLM_UVM_KV_AUTO_SCALE_SAFETY_BLOCKS=0 \
       VLLM_UVM_KV_AUTO_SCALE_MIN_RESIDENCY_STEPS=0 \
       VLLM_UVM_KV_AUTO_SCALE_RESIZE_GRANULARITY_BLOCKS=1 \
-      VLLM_UVM_KV_AUTO_SCALE_EXPERT_RESTORE_ENABLE=1 \
+      VLLM_UVM_KV_AUTO_SCALE_EXPERT_RESTORE_ENABLE=0 \
       VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_ENABLE=1 \
       VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_EXECUTOR=cpp_batch \
       VLLM_UVM_KV_DYNAMIC_POOL_PHYSICAL_MIGRATION_SYNC=1 \
@@ -234,16 +278,125 @@ run_qualification_three_queue() {
   run_root="$(cd "${run_root}" && pwd)"
   RUN_ROOT_ACTIVE="${run_root}"
 
+  "${VLLM_PY}" - "${run_root}/protocol.json" "${EXPERT_STRATEGY}" \
+    "${STATIC_PLAN}" "${SUPERSET_PLAN}" "${INCREMENTAL_PLAN}" \
+    "${TIER30_PLAN}" "${PLAN_CLASSES}" \
+    "${BACKUP_PRESSURE_THRESHOLD_BLOCKS}" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+(
+    output,
+    strategy,
+    static_text,
+    superset_text,
+    incremental_text,
+    tier30_text,
+    classes_text,
+    pressure_threshold_text,
+) = sys.argv[1:]
+paths = {
+    "static_cold_plan": pathlib.Path(static_text).resolve(),
+    "superset_cold_plan": pathlib.Path(superset_text).resolve(),
+    "incremental_wave_plan": pathlib.Path(incremental_text).resolve(),
+    "cold30_tier_plan": pathlib.Path(tier30_text).resolve(),
+    "plan_class_manifest": pathlib.Path(classes_text).resolve(),
+}
+documents = {
+    key: json.loads(path.read_text(encoding="utf-8"))
+    for key, path in paths.items()
+}
+payload = {
+    "schema": "eurosys_e10_three_queue_single_round_protocol_v2",
+    "qualification_only": True,
+    "statistical_repetitions_per_case": 1,
+    "case_order": ["baseline", "three_queue"],
+    "expert_strategy": strategy,
+    "strategy_definition": (
+        "per-layer minimum frozen calibration-decode route count; "
+        "ties by expert_id"
+    ),
+    "cases": {
+        "baseline": {
+            "fixed_target_blocks": 40,
+            "backup": False,
+            "autoscale": False,
+            "expert_transition": False,
+        },
+        "three_queue": {
+            "initial_target_blocks": 24,
+            "minimum_target_blocks": 20,
+            "maximum_target_blocks": 40,
+            "backup_reserve_blocks": 8,
+            "backup_pressure_threshold_blocks": int(pressure_threshold_text),
+            "autoscale": True,
+            "prediction_enabled": False,
+            "growth_trigger_policy": "backup_threshold_only",
+            "expert_transition": "grouped_plan_class",
+            "optimizations": {
+                "startup_cpu_source_prefill": True,
+                "immutable_cpu_shadow_cutover": True,
+                "precompiled_transition_instructions": True,
+                "quiesced_delta_alias_update": True,
+            },
+            "plan_class_map": {"24": "cold29", "40": "cold30"},
+            "tier_selected_bytes": {
+                "cold29": 6568280064,
+                "cold30": 6794772480,
+            },
+        },
+    },
+    "inputs": {
+        key: {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "selection_rule": documents[key].get("selection_rule"),
+            "metadata": documents[key].get("metadata"),
+        }
+        for key, path in paths.items()
+    },
+}
+pathlib.Path(output).write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+  git -C "${REPO_ROOT}" status --short >"${run_root}/git_status.txt"
+
   module_snapshot "${run_root}/module.before.json" "${STOCK_UVM}"
   load_custom_module
   module_snapshot "${run_root}/module.custom.json" "${CUSTOM_UVM}"
+  if [[ "${E10_PHASE_F_ROUTE_LOG_CAPTURE:-0}" == full ]]; then
+    printf '1\n' | sudo tee \
+      /sys/module/nvidia_uvm/parameters/uvm_phase_f_route_log_enable \
+      >/dev/null
+  fi
   wait_gpu_clean || die_three_queue "GPU is not clean before qualification"
+  cp -- "${STATS_PATH}" "${run_root}/latency_stats.before.txt"
+  sha256sum \
+    "${MODEL}/config.json" "${FIXTURE}" "${NAMES}" \
+    "${STATIC_PLAN}" "${SUPERSET_PLAN}" "${INCREMENTAL_PLAN}" \
+    "${TIER30_PLAN}" "${PLAN_CLASSES}" \
+    "${SCRIPT_DIR}/prepare_cold_frequency_tiers.py" \
+    "${RUNNER}" "${VERIFY}" "${BASH_SOURCE[0]}" \
+    "${VLLM_ROOT}/vllm/v1/engine/core.py" \
+    "${VLLM_ROOT}/vllm/v1/worker/gpu_model_runner.py" \
+    "${VLLM_ROOT}/vllm/model_executor/models/utils.py" \
+    "${VLLM_ROOT}/vllm/device_allocator/uvm_static_alias.py" \
+    "${VLLM_ROOT}/vllm/model_executor/layers/fused_moe/layer.py" \
+    "${REPO_ROOT}/kernel-module/nvidia-module/kernel-open/nvidia-uvm/uvm.c" \
+    "${REPO_ROOT}/kernel-module/nvidia-module/kernel-open/nvidia-uvm/uvm_ioctl.h" \
+    "${CUSTOM_UVM}" "${STOCK_UVM}" >"${run_root}/input_sha256.txt"
   local kernel_epoch journal_rc baseline_rc queue_rc
   kernel_epoch="$(date +%s)"
 
-  if run_three_queue_case \
-    "${run_root}" baseline "${BASELINE_TARGET_BLOCKS}" 0 0 0 0; then
+  if [[ "${E10_DIAGNOSTIC_SKIP_BASELINE:-0}" == 1 ]]; then
     baseline_rc=0
+  elif run_three_queue_case \
+      "${run_root}" baseline "${BASELINE_TARGET_BLOCKS}" 0 0 0 0; then
+      baseline_rc=0
   else
     baseline_rc=$?
   fi
@@ -266,6 +419,12 @@ run_qualification_three_queue() {
   printf '%s\n' "${journal_rc}" >"${run_root}/kernel_log_returncode.txt"
 
   wait_gpu_clean || die_three_queue "GPU did not clean after qualification"
+  cp -- "${STATS_PATH}" "${run_root}/latency_stats.after.txt"
+  if [[ "${E10_PHASE_F_ROUTE_LOG_CAPTURE:-0}" != 0 ]]; then
+    sudo cp -- /proc/driver/nvidia-uvm/phase_f_route_log \
+      "${run_root}/phase_f_route.log"
+    sudo chown "$(id -u):$(id -g)" "${run_root}/phase_f_route.log"
+  fi
   restore_stock || die_three_queue "failed to restore stock nvidia_uvm"
   module_snapshot "${run_root}/module.after.json" "${STOCK_UVM}"
   restart_exporters

@@ -890,6 +890,7 @@ class FusedMoE(CustomOp):
         self._uvm_dynamic_expert_heat_buffers: list[torch.Tensor] = []
         self._uvm_dynamic_expert_heat_active_index = 0
         self._uvm_dynamic_expert_heat_epoch = 0
+        self._uvm_dynamic_expert_heat_graph_stable = False
         self._uvm_incremental_offload_in_progress = False
         self._uvm_incremental_selected_global_expert_id: int | None = None
         self._uvm_offloaded_global_expert_ids: set[int] = set()
@@ -2093,23 +2094,18 @@ class FusedMoE(CustomOp):
         if not self.uvm_dynamic_expert_swap_enable:
             return
         try:
-            ids = topk_ids.detach()
-            valid_ids = ids[(ids >= 0) & (ids < int(self.global_num_experts))]
-            if valid_ids.numel() == 0:
+            ids = topk_ids.detach().flatten().to(dtype=torch.long)
+            if ids.numel() == 0:
                 return
-            counts = torch.bincount(
-                valid_ids.flatten().to(dtype=torch.long),
-                minlength=int(self.global_num_experts),
-            )
             if (
                 self._uvm_dynamic_expert_heat_counts is None
-                or self._uvm_dynamic_expert_heat_counts.device != counts.device
+                or self._uvm_dynamic_expert_heat_counts.device != ids.device
             ):
                 self._uvm_dynamic_expert_heat_buffers = [
                     torch.zeros(
                         int(self.global_num_experts),
                         dtype=torch.int64,
-                        device=counts.device,
+                        device=ids.device,
                     )
                     for _ in range(2)
                 ]
@@ -2117,7 +2113,20 @@ class FusedMoE(CustomOp):
                 self._uvm_dynamic_expert_heat_counts = (
                     self._uvm_dynamic_expert_heat_buffers[0]
                 )
-            self._uvm_dynamic_expert_heat_counts.add_(counts)
+            if ids.is_cuda and torch.cuda.is_current_stream_capturing():
+                # A replayed CUDA Graph always writes to the address captured
+                # here. Maintenance must therefore zero this stable counter
+                # in place instead of switching the Python-side buffer pointer.
+                self._uvm_dynamic_expert_heat_graph_stable = True
+            elif bool(
+                torch.any((ids < 0) | (ids >= int(self.global_num_experts))).item()
+            ):
+                return
+            self._uvm_dynamic_expert_heat_counts.scatter_add_(
+                0,
+                ids,
+                torch.ones_like(ids, dtype=torch.int64),
+            )
         except Exception:
             logger.debug("Failed to record dynamic expert heat", exc_info=True)
 
@@ -2134,7 +2143,18 @@ class FusedMoE(CustomOp):
             # The counter is created during model inference and is therefore an
             # inference tensor. Maintenance RPCs run outside that context.
             with torch.inference_mode():
-                if reset and len(self._uvm_dynamic_expert_heat_buffers) == 2:
+                graph_stable = bool(
+                    getattr(
+                        self,
+                        "_uvm_dynamic_expert_heat_graph_stable",
+                        False,
+                    )
+                )
+                if (
+                    reset
+                    and not graph_stable
+                    and len(self._uvm_dynamic_expert_heat_buffers) == 2
+                ):
                     completed_index = self._uvm_dynamic_expert_heat_active_index
                     self._uvm_dynamic_expert_heat_active_index = 1 - completed_index
                     self._uvm_dynamic_expert_heat_counts = (
@@ -2146,17 +2166,43 @@ class FusedMoE(CustomOp):
                         completed_index
                     ]
                     self._uvm_dynamic_expert_heat_epoch += 1
+                elif reset:
+                    self._uvm_dynamic_expert_heat_epoch += 1
                 counts = [int(value) for value in counts_tensor.detach().cpu().tolist()]
                 if reset:
                     counts_tensor.zero_()
+        layer_id = self._uvm_layer_id()
+        static_alias_fn = getattr(self, "_uvm_static_alias_owned_experts", None)
+        static_alias_owned = (
+            static_alias_fn(layer_id)
+            if layer_id is not None and callable(static_alias_fn)
+            else set()
+        )
+        expert_records = getattr(self, "_uvm_expert_records", None)
+        swappable_experts = sorted(
+            int(expert_id)
+            for record_layer_id, expert_id in (
+                expert_records
+                if isinstance(expert_records, dict)
+                else {
+                    (int(layer_id), expert_id): None
+                    for expert_id in range(int(self.global_num_experts))
+                }
+            )
+            if layer_id is not None
+            and int(record_layer_id) == int(layer_id)
+            and int(expert_id) not in static_alias_owned
+        )
         return {
             "ok": True,
             "layer_name": self.layer_name,
-            "layer_id": self._uvm_layer_id(),
+            "layer_id": layer_id,
             "global_num_experts": int(self.global_num_experts),
             "local_num_experts": int(self.local_num_experts),
             "expert_token_counts": counts,
             "remote_experts": sorted(self._uvm_remote_read_global_expert_ids),
+            "swappable_experts": swappable_experts,
+            "static_alias_owned_experts": sorted(static_alias_owned),
             "incremental_offloaded_experts": sorted(
                 getattr(
                     self,
@@ -2166,7 +2212,27 @@ class FusedMoE(CustomOp):
             ),
             "reset": bool(reset),
             "heat_epoch": int(self._uvm_dynamic_expert_heat_epoch),
-            "double_buffered": len(self._uvm_dynamic_expert_heat_buffers) == 2,
+            "double_buffered": (
+                len(self._uvm_dynamic_expert_heat_buffers) == 2
+                and not bool(
+                    getattr(
+                        self,
+                        "_uvm_dynamic_expert_heat_graph_stable",
+                        False,
+                    )
+                )
+            ),
+            "counter_mode": (
+                "graph_stable_synchronous"
+                if bool(
+                    getattr(
+                        self,
+                        "_uvm_dynamic_expert_heat_graph_stable",
+                        False,
+                    )
+                )
+                else "double_buffered"
+            ),
         }
 
     def _uvm_layer_id(self) -> int | None:
@@ -2778,10 +2844,14 @@ class FusedMoE(CustomOp):
         cold_expert_ids = set(
             getattr(self, "_uvm_offloaded_global_expert_ids", set())
         ) | set(getattr(self, "_uvm_remote_read_global_expert_ids", set()))
+        static_alias_owned = set(
+            getattr(self, "_uvm_static_alias_owned_global_expert_ids", set())
+        )
         return [
             record
             for _, record in sorted(self._uvm_expert_records.items())
             if record.global_expert_id not in cold_expert_ids
+            and record.global_expert_id not in static_alias_owned
         ]
 
     def get_uvm_init_hot_expert_region_ids(self) -> list[str]:

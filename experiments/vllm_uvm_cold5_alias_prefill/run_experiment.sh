@@ -343,9 +343,32 @@ run_suite() {
       MEASURED_DECODE_STEPS="${MEASURED_DECODE_STEPS:-4}"
       ;;
     formal)
-      # Z/A/G each receive both 1,4 and 4,1 batch orders. With three
-      # processes per performance arm, the unavoidable imbalance is only 2:1.
-      order="${ORDER:-TZAGGZAAZG}"
+      # Keep the historical three-process order by default, but allow the
+      # publication run to use an even number of independent cold processes
+      # per performance arm.  Each adjacent arm pair receives both 1,4 and
+      # 4,1 batch orders; rotating the pair order limits temporal arm bias.
+      local formal_processes="${FORMAL_PROCESSES_PER_ARM:-3}"
+      [[ "${formal_processes}" =~ ^[0-9]+$ ]] \
+        || die "FORMAL_PROCESSES_PER_ARM must be an integer"
+      (( formal_processes >= 3 )) \
+        || die "FORMAL_PROCESSES_PER_ARM must be at least 3"
+      if [[ -n "${ORDER:-}" ]]; then
+        order="${ORDER}"
+      elif (( formal_processes == 3 )); then
+        order=TZAGGZAAZG
+      else
+        (( formal_processes % 2 == 0 )) \
+          || die "FORMAL_PROCESSES_PER_ARM above 3 must be even"
+        order=T
+        local pair_block
+        for ((pair_block = 0; pair_block < formal_processes / 2; ++pair_block)); do
+          case $((pair_block % 3)) in
+            0) order+=ZZAAGG ;;
+            1) order+=AAGGZZ ;;
+            2) order+=GGZZAA ;;
+          esac
+        done
+      fi
       CONDITIONING_REPEATS="${CONDITIONING_REPEATS:-1}"
       MEASUREMENT_REPEATS="${MEASUREMENT_REPEATS:-3}"
       WARMUP_DECODE_STEPS="${WARMUP_DECODE_STEPS:-5}"
@@ -392,6 +415,9 @@ json.dump({
     "schema": "vllm_uvm_cold5_alias_prefill_run_v1",
     "mode": mode,
     "order": order,
+    "formal_processes_per_arm": (
+        order.count("Z") if mode == "formal" else None
+    ),
     "batch_sizes": [1, 4],
     "conditioning_repeats": int(conditioning_repeats),
     "measurement_repeats": int(measurement_repeats),

@@ -31,6 +31,39 @@ static int uvm_cpu_chunk_allocation_sizes = UVM_CPU_CHUNK_SIZES;
 module_param(uvm_cpu_chunk_allocation_sizes, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_cpu_chunk_allocation_sizes, "OR'ed value of all CPU chunk allocation sizes.");
 
+static atomic64_t g_cpu_chunk_alloc_attempts[3] = {
+    ATOMIC64_INIT(0), ATOMIC64_INIT(0), ATOMIC64_INIT(0)
+};
+static atomic64_t g_cpu_chunk_alloc_successes[3] = {
+    ATOMIC64_INIT(0), ATOMIC64_INIT(0), ATOMIC64_INIT(0)
+};
+static atomic64_t g_cpu_chunk_live[3] = {
+    ATOMIC64_INIT(0), ATOMIC64_INIT(0), ATOMIC64_INIT(0)
+};
+
+static int cpu_chunk_stats_index(uvm_chunk_size_t size)
+{
+    if (size == PAGE_SIZE)
+        return 0;
+    if (size == UVM_PAGE_SIZE_64K)
+        return 1;
+    if (size == UVM_PAGE_SIZE_2M)
+        return 2;
+    return -1;
+}
+
+void uvm_cpu_chunk_get_allocation_stats(uvm_cpu_chunk_allocation_stats_t *stats)
+{
+    int index;
+
+    UVM_ASSERT(stats);
+    for (index = 0; index < 3; ++index) {
+        stats->attempts[index] = (NvU64)atomic64_read(&g_cpu_chunk_alloc_attempts[index]);
+        stats->successes[index] = (NvU64)atomic64_read(&g_cpu_chunk_alloc_successes[index]);
+        stats->live_chunks[index] = (NvU64)atomic64_read(&g_cpu_chunk_live[index]);
+    }
+}
+
 NV_STATUS uvm_pmm_sysmem_init(void)
 {
     // Ensure that only supported CPU chunk sizes are enabled.
@@ -362,6 +395,7 @@ static void cpu_physical_chunk_release(uvm_cpu_chunk_t *chunk)
 {
     uvm_cpu_physical_chunk_t *phys_chunk = uvm_cpu_chunk_to_physical(chunk);
     uvm_parent_processor_id_t id;
+    int stats_index = cpu_chunk_stats_index(uvm_cpu_chunk_get_size(chunk));
 
     uvm_assert_mutex_unlocked(&phys_chunk->lock);
 
@@ -396,6 +430,9 @@ static void cpu_physical_chunk_release(uvm_cpu_chunk_t *chunk)
 
     if (chunk->type != UVM_CPU_CHUNK_TYPE_HMM)
         put_page(chunk->page);
+
+    if (chunk->type == UVM_CPU_CHUNK_TYPE_PHYSICAL && stats_index >= 0)
+        atomic64_dec(&g_cpu_chunk_live[stats_index]);
 }
 
 static void cpu_chunk_release(nv_kref_t *kref)
@@ -497,8 +534,13 @@ NV_STATUS uvm_cpu_chunk_alloc(uvm_chunk_size_t alloc_size,
 {
     uvm_cpu_physical_chunk_t *chunk;
     struct page *page;
+    int stats_index;
 
     UVM_ASSERT(new_chunk);
+
+    stats_index = cpu_chunk_stats_index(alloc_size);
+    if (stats_index >= 0)
+        atomic64_inc(&g_cpu_chunk_alloc_attempts[stats_index]);
 
     page = uvm_cpu_chunk_alloc_page(alloc_size, nid, alloc_flags);
     if (!page)
@@ -512,6 +554,11 @@ NV_STATUS uvm_cpu_chunk_alloc(uvm_chunk_size_t alloc_size,
 
     chunk->common.type = UVM_CPU_CHUNK_TYPE_PHYSICAL;
     chunk->common.page = page;
+
+    if (stats_index >= 0) {
+        atomic64_inc(&g_cpu_chunk_alloc_successes[stats_index]);
+        atomic64_inc(&g_cpu_chunk_live[stats_index]);
+    }
 
     *new_chunk = &chunk->common;
     return NV_OK;

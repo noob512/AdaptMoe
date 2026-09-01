@@ -499,6 +499,75 @@ def test_pre_kv_stage_orders_expert_placement_before_kv(
     assert events == ["cold_placement", "kv_allocation"]
 
 
+@pytest.mark.parametrize(
+    ("cudagraph_mode", "enforce_eager", "release_after_kv"),
+    [
+        (gpu_worker_module.CUDAGraphMode.FULL_DECODE_ONLY, False, True),
+        (gpu_worker_module.CUDAGraphMode.NONE, True, True),
+        (gpu_worker_module.CUDAGraphMode.FULL_SEPARATE, False, False),
+    ],
+)
+def test_pre_kv_sentinel_lifetime_matches_graph_mode(
+    monkeypatch: Any,
+    cudagraph_mode: Any,
+    enforce_eager: bool,
+    release_after_kv: bool,
+) -> None:
+    events: list[str] = []
+    sentinel = object()
+
+    class FakeModelRunner:
+        def initialize_kv_cache(self, kv_cache_config: object) -> None:
+            events.append("kv_allocation")
+
+        def run_uvm_init_time_weight_placement(self) -> None:
+            events.append("cold_placement")
+
+    monkeypatch.setenv("VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE", "post_warmup")
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "ensure_kv_transfer_initialized",
+        lambda config, kv_config: None,
+    )
+    monkeypatch.setattr(
+        Worker,
+        "_allocate_uvm_native_hole_sentinel",
+        lambda self, **kwargs: events.append("sentinel_allocation") or sentinel,
+    )
+    monkeypatch.setattr(
+        Worker,
+        "_release_uvm_native_hole_sentinel",
+        lambda self, value, *, stage: events.append(
+            f"sentinel_release:{stage}"
+        ),
+    )
+
+    worker = object.__new__(Worker)
+    worker.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            enable_sleep_mode=False,
+            enforce_eager=enforce_eager,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),
+    )
+    worker.model_runner = FakeModelRunner()
+    worker._kv_cache_uvm_allocations_enabled = lambda: False
+    worker._maybe_get_kv_cache_uvm_memory_pool_context = nullcontext
+    worker._uvm_pre_kv_native_hole_sentinel = None
+
+    worker.initialize_from_config(object())
+
+    expected = ["sentinel_allocation", "kv_allocation"]
+    if release_after_kv:
+        expected.append(
+            "sentinel_release:after_kv_before_kernel_warmup"
+        )
+        assert worker._uvm_pre_kv_native_hole_sentinel is None
+    else:
+        assert worker._uvm_pre_kv_native_hole_sentinel is sentinel
+    assert events == expected
+
+
 def test_post_warmup_rebalance_orders_kv_before_experts(
     monkeypatch: Any,
     tmp_path: Path,
@@ -2315,15 +2384,16 @@ def test_remote_only_reconciles_after_kv_before_warmup(monkeypatch: Any) -> None
     assert events == ["reconcile"]
 
 
-def test_non_remote_only_skips_pre_warmup_reconciliation(
+def test_prefill_remote_decode_reconciles_hot_experts_before_warmup(
     monkeypatch: Any,
 ) -> None:
     from vllm.model_executor.models import utils as offload_utils
 
+    calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
         offload_utils,
         "cpu_offload_uvm_original_va_phase_mode",
-        lambda: "prefill_graph_remote_decode",
+        lambda: "prefill_remote_decode",
     )
     monkeypatch.setattr(
         offload_utils,
@@ -2332,12 +2402,24 @@ def test_non_remote_only_skips_pre_warmup_reconciliation(
     )
     monkeypatch.setattr(
         offload_utils,
-        "reconcile_cpu_offload_uvm_original_va_remote_graph_residency",
+        "reconcile_cpu_offload_uvm_original_va_sealed_hot_residency",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "ok": True,
+            "hot_physical_residency_before": {"cpu_bytes": 6},
+            "hot_physical_residency_after": {"gpu_bytes": 22},
+        },
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "refresh_cpu_offload_uvm_original_va_full_dual_view",
         _unexpected_call,
     )
 
     worker = object.__new__(Worker)
     worker._reconcile_uvm_original_va_remote_before_warmup()
+
+    assert calls == [{"preserve_allocator_cache": True}]
 
 
 def test_phase_off_opt_in_reconciles_sealed_hot_experts_after_kv(
@@ -2479,6 +2561,45 @@ def test_post_capture_sampler_warmup_preserves_dual_graphs(
     ]
 
 
+def test_fixed_tier_full_dual_view_skips_redundant_post_capture_remote(
+    monkeypatch: Any,
+) -> None:
+    from vllm.model_executor.models import utils as offload_utils
+
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW", "1")
+    monkeypatch.setenv(
+        "VLLM_UVM_PREFILL_GRAPH_CAPTURE_BEFORE_HOT_RESTORE", "1"
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_phase_mode",
+        lambda: "prefill_graph_remote_decode",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "prepare_cpu_offload_uvm_original_va_profile_topology",
+        _unexpected_call,
+    )
+
+    worker = object.__new__(Worker)
+    worker._prepare_uvm_original_va_post_capture_warmup()
+
+
+def test_fixed_tier_retained_prefill_graph_skips_allocator_reserve(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW", "1")
+    monkeypatch.setenv(
+        "VLLM_UVM_PREFILL_GRAPH_CAPTURE_BEFORE_HOT_RESTORE", "1"
+    )
+    monkeypatch.setenv(
+        "VLLM_UVM_PREFILL_ALLOCATOR_RESERVE_WARMUP_TOKENS", "16384"
+    )
+
+    worker = object.__new__(Worker)
+    worker._warm_up_uvm_prefill_allocator_reserve()
+
+
 def test_post_capture_sampler_warmup_restores_serving_residency(
     monkeypatch: Any,
 ) -> None:
@@ -2504,6 +2625,42 @@ def test_post_capture_sampler_warmup_restores_serving_residency(
             "cold_bytes": 6,
             "hot_bytes": 22,
             "free_bytes": 512,
+        },
+    )
+
+    worker = object.__new__(Worker)
+    worker._restore_uvm_original_va_after_post_capture_warmup()
+
+    assert calls == [{"preserve_allocator_cache": True}]
+
+
+def test_remote_only_post_warmup_restores_serving_residency(
+    monkeypatch: Any,
+) -> None:
+    from vllm.model_executor.models import utils as offload_utils
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_phase_mode",
+        lambda: "remote_only",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_profile_all_remote_active",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "reconcile_cpu_offload_uvm_original_va_remote_graph_residency",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "ok": True,
+            "cold_bytes": 6,
+            "hot_bytes": 22,
+            "free_bytes": 512,
+            "allocator_reserved_before": 64,
+            "allocator_reserved_after": 64,
         },
     )
 
@@ -3467,6 +3624,109 @@ def test_worker_exact_kv_resize_runs_shrink_before_grow(
         ("prefetch", 2),
         ("sync", 0),
     ]
+
+
+def test_worker_kv_resize_refreshes_full_dual_view_after_sync(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_worker_resize_runner()
+    runner._env_flag_enabled = lambda name, default=False: (  # type: ignore[method-assign]
+        name == "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW"
+    )
+    events: list[tuple[str, int] | str] = []
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "collect_uvm_kv_cache_physical_ranges_for_blocks",
+        lambda block_ids: [(0x100000, 0x1000)] if block_ids else [],
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_advise_ranges_preferred_location",
+        lambda ranges, _device: len(ranges),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_prefetch_ranges_to_device_with_executor",
+        lambda ranges, *_args, **_kwargs: (len(ranges), "test", 0),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda,
+        "current_device",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda,
+        "synchronize",
+        lambda device: events.append(("sync", int(device))),
+    )
+    refresh_result = {
+        "ok": True,
+        "state_before": "sealed",
+        "refresh": {"refresh_dual": True},
+    }
+    monkeypatch.setattr(
+        offload_utils,
+        "refresh_cpu_offload_uvm_original_va_full_dual_view",
+        lambda: events.append("refresh") or refresh_result,
+    )
+
+    result = runner.resize_uvm_kv_cache_target(3, 5, [])
+
+    assert result == {
+        "ok": True,
+        "made_progress": True,
+        "dual_view_refresh": refresh_result,
+    }
+    assert events == [("sync", 0), "refresh"]
+
+
+def test_worker_kv_resize_refresh_failure_fails_closed(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_worker_resize_runner()
+    runner._env_flag_enabled = lambda name, default=False: (  # type: ignore[method-assign]
+        name == "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW"
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "collect_uvm_kv_cache_physical_ranges_for_blocks",
+        lambda block_ids: [(0x100000, 0x1000)] if block_ids else [],
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_advise_ranges_preferred_location",
+        lambda ranges, _device: len(ranges),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "batch_prefetch_ranges_to_device_with_executor",
+        lambda ranges, *_args, **_kwargs: (len(ranges), "test", 0),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda,
+        "current_device",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.cuda,
+        "synchronize",
+        lambda _device: None,
+    )
+
+    def fail_refresh() -> dict[str, object]:
+        raise RuntimeError("mock dual-view refresh failure")
+
+    monkeypatch.setattr(
+        offload_utils,
+        "refresh_cpu_offload_uvm_original_va_full_dual_view",
+        fail_refresh,
+    )
+
+    result = runner.resize_uvm_kv_cache_target(3, 5, [])
+
+    assert result["ok"] is False
+    assert result["made_progress"] is True
+    assert result["dual_view_refresh"]["reason"] == "dual_view_refresh_failed"
 
 
 def test_worker_partial_kv_resize_only_reports_complete_direction(

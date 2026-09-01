@@ -3,6 +3,7 @@
   "HF_HUB_OFFLINE": "1",
   "TRANSFORMERS_OFFLINE": "1",
   "TOKENIZERS_PARALLELISM": "false",
+  "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
   "PYTHONUNBUFFERED": "1",
   "TZ": "Asia/Shanghai",
   "OMP_NUM_THREADS": "14",

@@ -109,6 +109,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.97)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--formal-e3",
+        action="store_true",
+        help="allow the frozen E3 B1/B4/B8 and workload-length matrix",
+    )
     return parser.parse_args()
 
 
@@ -302,9 +307,13 @@ def run() -> int:
     args = parse_args()
     batches = phase.parse_positive_ints(args.batch_sizes)
     capture_sizes = phase.parse_positive_ints(args.cudagraph_capture_sizes)
-    if len(batches) != 2 or set(batches) != {1, 4}:
+    if not args.formal_e3 and (len(batches) != 2 or set(batches) != {1, 4}):
         raise ValueError("qualification contract requires batches 1 and 4")
-    if args.execution_mode in ("eager", "full_graph_decode") and capture_sizes != [1, 4]:
+    if (
+        not args.formal_e3
+        and args.execution_mode in ("eager", "full_graph_decode")
+        and capture_sizes != [1, 4]
+    ):
         raise ValueError(
             "qualification contract requires --cudagraph-capture-sizes 1,4"
         )
@@ -312,19 +321,19 @@ def run() -> int:
         raise ValueError("invalid repeat counts")
     if args.warmup_decode_steps < 1 or args.measured_decode_steps <= 0:
         raise ValueError("at least one warmup and one measured decode are required")
-    if args.max_num_seqs != 4:
+    if not args.formal_e3 and args.max_num_seqs != 4:
         raise ValueError("qualification contract requires --max-num-seqs 4")
+    if max(batches) > args.max_num_seqs:
+        raise ValueError("batch size exceeds max_num_seqs")
     if not math.isfinite(args.cpu_offload_gb) or args.cpu_offload_gb < 0:
         raise ValueError("cpu_offload_gb must be finite and non-negative")
 
     fixture_metadata, requests = phase.load_requests(args.fixture)
-    if len(requests) < 4:
-        raise ValueError("fixture must contain at least four requests")
+    max_batch = max(batches)
+    if len(requests) < max_batch:
+        raise ValueError("fixture has fewer requests than the largest batch")
     expected_prefill_sizes = sorted(
-        {
-            sum(item["prompt_tokens"] for item in requests[:1]),
-            sum(item["prompt_tokens"] for item in requests[:4]),
-        }
+        {sum(item["prompt_tokens"] for item in requests[:batch]) for batch in batches}
     )
     if args.execution_mode == "full_graph_all":
         expected_capture_sizes = sorted({1, 4, *expected_prefill_sizes})
@@ -336,11 +345,15 @@ def run() -> int:
     total_output_tokens = 1 + args.warmup_decode_steps + args.measured_decode_steps
     if any(
         request["prompt_tokens"] + total_output_tokens > args.max_model_len
-        for request in requests[:4]
+        for request in requests[:max_batch]
     ):
         raise ValueError("prompt plus generated tokens exceeds max_model_len")
-    if sum(item["prompt_tokens"] for item in requests[:4]) > args.max_num_batched_tokens:
-        raise ValueError("batch-4 prefill exceeds max_num_batched_tokens")
+    if any(
+        sum(item["prompt_tokens"] for item in requests[:batch])
+        > args.max_num_batched_tokens
+        for batch in batches
+    ):
+        raise ValueError("a prefill batch exceeds max_num_batched_tokens")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     initial_result: dict[str, Any] = {

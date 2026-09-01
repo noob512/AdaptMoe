@@ -524,10 +524,14 @@ class Worker(WorkerBase):
         self,
         class_name: str,
         scheduler_idle: bool,
+        resume_prefill_before_switch: bool = False,
+        defer_dual_refresh: bool = False,
     ) -> dict[str, Any]:
         return self.model_runner.activate_uvm_expert_graph_class_at_idle_boundary(
             class_name,
             scheduler_idle=scheduler_idle,
+            resume_prefill_before_switch=resume_prefill_before_switch,
+            defer_dual_refresh=defer_dual_refresh,
         )
 
     def get_cuda_memory_info(self) -> dict[str, int]:
@@ -624,6 +628,7 @@ class Worker(WorkerBase):
                 )
                 self._uvm_pre_kv_native_hole_sentinel = None
                 raise
+
         else:
             # 如果没有启用休眠模式，则走常规的 PyTorch 默认内存分配路径分配 KV Cache。
             try:
@@ -636,6 +641,17 @@ class Worker(WorkerBase):
                 )
                 self._uvm_pre_kv_native_hole_sentinel = None
                 raise
+
+        # The pre-KV sentinel protects the native allocation hole needed by
+        # the dedicated Prefill Graph path.  Decode-only and eager execution
+        # have no later pure-Prefill capture, so keeping the sentinel alive
+        # through kernel warmup only removes useful HBM headroom and can evict
+        # managed hot-expert pages.  Release it immediately after the KV
+        # allocation has settled in those modes.  FULL_SEPARATE retains the
+        # existing hand-off to compile_or_warm_up_model(), where the sentinel
+        # is released immediately before pure-Prefill capture.
+        if not self._uvm_pre_kv_sentinel_requires_pure_prefill_capture():
+            self._release_uvm_pre_kv_sentinel_after_kv()
 
         # Stage M init-time placement must run on the UVM fast path too.
         # determine_available_memory() skips profile_run() when UVM is enabled.
@@ -656,6 +672,27 @@ class Worker(WorkerBase):
         if value is None:
             return default
         return value.strip().lower() in ("1", "true", "yes", "on")
+
+    def _uvm_pre_kv_sentinel_requires_pure_prefill_capture(self) -> bool:
+        """Whether the pre-KV native hole must survive until Graph capture."""
+        model_config = getattr(self.vllm_config, "model_config", None)
+        if bool(getattr(model_config, "enforce_eager", False)):
+            return False
+        compilation_config = getattr(
+            self.vllm_config, "compilation_config", None
+        )
+        mode = getattr(compilation_config, "cudagraph_mode", None)
+        return mode == CUDAGraphMode.FULL_SEPARATE
+
+    def _release_uvm_pre_kv_sentinel_after_kv(self) -> None:
+        sentinel = getattr(self, "_uvm_pre_kv_native_hole_sentinel", None)
+        if sentinel is None:
+            return
+        self._release_uvm_native_hole_sentinel(
+            sentinel,
+            stage="after_kv_before_kernel_warmup",
+        )
+        self._uvm_pre_kv_native_hole_sentinel = None
 
     @staticmethod
     def _uvm_post_warmup_stage_enabled() -> bool:
@@ -888,6 +925,7 @@ class Worker(WorkerBase):
         from vllm.model_executor.models.utils import (
             cpu_offload_uvm_original_va_phase_mode,
             cpu_offload_uvm_original_va_profile_all_remote_active,
+            refresh_cpu_offload_uvm_original_va_full_dual_view,
             reconcile_cpu_offload_uvm_original_va_remote_graph_residency,
             reconcile_cpu_offload_uvm_original_va_sealed_hot_residency,
         )
@@ -896,8 +934,51 @@ class Worker(WorkerBase):
         profile_all_remote = (
             cpu_offload_uvm_original_va_profile_all_remote_active()
         )
+        full_dual_view = self._uvm_env_flag(
+            "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW",
+            default=False,
+        )
         if (
-            phase_mode == "prefill_graph_remote_decode"
+            phase_mode
+            in ("prefill_remote_decode", "prefill_graph_remote_decode")
+            and not profile_all_remote
+        ):
+            # KV creation happens after the sealed Prefill aliases are built.
+            # Under tight E3 cells it can displace a managed hot page even
+            # after the pre-KV placement audit succeeded.  The first kernel
+            # warmup is a real MoE forward, so repair the disjoint hot
+            # complement here for both the legacy range-map topology and the
+            # complete dual-view topology.  Previously this was restricted to
+            # full_dual_view, leaving ordinary G arms able to fault on the
+            # cold39/hot40 boundary before Graph capture.
+            result = reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
+                preserve_allocator_cache=True,
+            )
+            refreshed = (
+                refresh_cpu_offload_uvm_original_va_full_dual_view()
+                if full_dual_view
+                else None
+            )
+            logger.info(
+                "Reconciled hot experts after allocation: full_dual_view=%s "
+                "hot_cpu_before=%d hot_gpu_after=%d refresh_ms=%.3f",
+                full_dual_view,
+                int(
+                    (result.get("hot_physical_residency_before") or {}).get(
+                        "cpu_bytes", -1
+                    )
+                ),
+                int(
+                    (result.get("hot_physical_residency_after") or {}).get(
+                        "gpu_bytes", -1
+                    )
+                ),
+                int((refreshed or {}).get("wall_ns", 0)) / 1e6,
+            )
+            return
+        if (
+            phase_mode
+            in ("prefill_remote_decode", "prefill_graph_remote_decode")
             and profile_all_remote
         ):
             logger.info(
@@ -954,6 +1035,28 @@ class Worker(WorkerBase):
             int(result.get("free_bytes", -1)),
         )
 
+    def _uvm_retained_prefill_dual_view_owns_allocator_pool(self) -> bool:
+        """Return whether the retained Prefill Graph already owns its pool.
+
+        This is the fixed-current-tier full-dual-view path used by E3 G/D.
+        The final Prefill Graph is captured before hot experts are restored,
+        so its non-evictable allocator pool is already live.  Re-entering the
+        all-remote startup topology afterwards is both redundant and unsafe:
+        ordinary hot-page residency changes have already been reflected in
+        the live Prefill child and the frozen dual-view metadata must not be
+        parked again before its final refresh.
+        """
+        return (
+            self._uvm_env_flag(
+                "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW",
+                default=False,
+            )
+            and self._uvm_env_flag(
+                "VLLM_UVM_PREFILL_GRAPH_CAPTURE_BEFORE_HOT_RESTORE",
+                default=False,
+            )
+        )
+
     def _prepare_uvm_original_va_post_capture_warmup(self) -> None:
         """Run the final model/sampler warmup with every expert remote.
 
@@ -972,6 +1075,13 @@ class Worker(WorkerBase):
             cpu_offload_uvm_original_va_phase_mode()
             != "prefill_graph_remote_decode"
         ):
+            return
+        if self._uvm_retained_prefill_dual_view_owns_allocator_pool():
+            logger.info(
+                "Keeping the fixed-tier Prefill dual view active for final "
+                "sampler warmup; the retained Prefill Graph already owns "
+                "its allocator pool"
+            )
             return
         result = prepare_cpu_offload_uvm_original_va_profile_topology(
             transition_reason="post_capture_sampler_all_remote",
@@ -993,9 +1103,30 @@ class Worker(WorkerBase):
             reconcile_cpu_offload_uvm_original_va_remote_graph_residency,
         )
 
+        phase_mode = cpu_offload_uvm_original_va_phase_mode()
+        if phase_mode == "remote_only":
+            # The first reconciliation happens before kernel warmup so those
+            # kernels can execute safely. Kernel/sampler warmup and allocator
+            # reserve population run afterwards and may evict managed hot
+            # pages again. Rebuild the final serving topology only after every
+            # startup forward, preserving the now-populated allocator cache.
+            result = reconcile_cpu_offload_uvm_original_va_remote_graph_residency(
+                preserve_allocator_cache=True
+            )
+            logger.info(
+                "Restored remote-only serving residency after all startup "
+                "warmup: cold_bytes=%d hot_bytes=%d free_bytes=%d "
+                "allocator_reserved_before=%d allocator_reserved_after=%d",
+                int(result.get("cold_bytes", 0)),
+                int(result.get("hot_bytes", 0)),
+                int(result.get("free_bytes", -1)),
+                int(result.get("allocator_reserved_before", -1)),
+                int(result.get("allocator_reserved_after", -1)),
+            )
+            return
+
         if (
-            cpu_offload_uvm_original_va_phase_mode()
-            != "prefill_graph_remote_decode"
+            phase_mode != "prefill_graph_remote_decode"
             or not cpu_offload_uvm_original_va_profile_all_remote_active()
         ):
             return
@@ -1034,6 +1165,14 @@ class Worker(WorkerBase):
                 f"integer, got {raw_tokens!r}"
             ) from exc
         if num_tokens <= 0:
+            return
+        if self._uvm_retained_prefill_dual_view_owns_allocator_pool():
+            logger.info(
+                "Skipping redundant eager Prefill allocator-reserve warmup: "
+                "the retained fixed-tier Prefill Graph already owns the "
+                "requested allocator pool (configured_tokens=%d)",
+                num_tokens,
+            )
             return
         if num_tokens > self.scheduler_config.max_num_batched_tokens:
             raise ValueError(
@@ -1247,10 +1386,13 @@ class Worker(WorkerBase):
             self.model_runner.finalize_uvm_slot_bank_after_warmup()
             from vllm.model_executor.models.utils import (
                 activate_cpu_offload_uvm_original_va_prefill_topology,
+                refresh_cpu_offload_uvm_original_va_full_dual_view,
             )
 
+            refresh_cpu_offload_uvm_original_va_full_dual_view()
             activate_cpu_offload_uvm_original_va_prefill_topology()
             self._reconverge_uvm_kv_cache_for_serving()
+            self._reconcile_uvm_original_va_remote_before_warmup()
             set_random_seed(self.model_config.seed)
             return
 
@@ -1457,10 +1599,13 @@ class Worker(WorkerBase):
             # back before Graph replay.
             from vllm.model_executor.models.utils import (
                 activate_cpu_offload_uvm_original_va_prefill_topology,
+                refresh_cpu_offload_uvm_original_va_full_dual_view,
             )
 
+            refresh_cpu_offload_uvm_original_va_full_dual_view()
             activate_cpu_offload_uvm_original_va_prefill_topology()
             self._reconverge_uvm_kv_cache_for_serving()
+            self._reconcile_uvm_original_va_remote_before_warmup()
         finally:
             self._release_uvm_native_hole_sentinel(native_hole_sentinel)
 

@@ -202,7 +202,7 @@ NV_STATUS uvm_va_block_migrate_locked(uvm_va_block_t *va_block,
                                       uvm_migrate_mode_t mode,
                                       uvm_tracker_t *out_tracker)
 {
-    NvU64 profile_start = NV_GETTIME();
+    NvU64 profile_start = uvm_migrate_profile_now();
     NvU64 stage_start;
     NvU64 region_bytes = uvm_va_block_region_size(region);
     uvm_va_block_context_t *va_block_context = service_context->block_context;
@@ -215,7 +215,7 @@ NV_STATUS uvm_va_block_migrate_locked(uvm_va_block_t *va_block,
     uvm_processor_mask_zero(&va_block_context->make_resident.all_involved_processors);
 
     if (uvm_va_block_is_hmm(va_block)) {
-        stage_start = NV_GETTIME();
+        stage_start = uvm_migrate_profile_now();
         status = uvm_hmm_va_block_migrate_locked(va_block,
                                                  va_block_retry,
                                                  service_context,
@@ -223,7 +223,7 @@ NV_STATUS uvm_va_block_migrate_locked(uvm_va_block_t *va_block,
                                                  region,
                                                  UVM_MAKE_RESIDENT_CAUSE_API_MIGRATE);
         uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_BLOCK_MAKE_RESIDENT,
-                                NV_GETTIME() - stage_start,
+                                uvm_migrate_profile_now() - stage_start,
                                 region_bytes / PAGE_SIZE,
                                 region_bytes);
     }
@@ -236,7 +236,7 @@ NV_STATUS uvm_va_block_migrate_locked(uvm_va_block_t *va_block,
 
         if (uvm_va_policy_is_read_duplicate(policy)) {
             if (uvm_page_mask_andnot(make_resident_mask, make_resident_mask, &va_block->discarded_pages)) {
-                stage_start = NV_GETTIME();
+                stage_start = uvm_migrate_profile_now();
                 status = uvm_va_block_make_resident_read_duplicate(va_block,
                                                                    va_block_retry,
                                                                    va_block_context,
@@ -246,7 +246,7 @@ NV_STATUS uvm_va_block_migrate_locked(uvm_va_block_t *va_block,
                                                                    NULL,
                                                                    UVM_MAKE_RESIDENT_CAUSE_API_MIGRATE);
                 uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_BLOCK_MAKE_RESIDENT,
-                                        NV_GETTIME() - stage_start,
+                                        uvm_migrate_profile_now() - stage_start,
                                         region_bytes / PAGE_SIZE,
                                         region_bytes);
             }
@@ -254,7 +254,7 @@ NV_STATUS uvm_va_block_migrate_locked(uvm_va_block_t *va_block,
             // We've read-duplicated all non-discarded pages.
             // Now, collapse all discarded pages in the region.
             if (uvm_page_mask_init_from_region(make_resident_mask, region, &va_block->discarded_pages)) {
-                stage_start = NV_GETTIME();
+                stage_start = uvm_migrate_profile_now();
                 status = uvm_va_block_make_resident(va_block,
                                                     va_block_retry,
                                                     va_block_context,
@@ -264,13 +264,13 @@ NV_STATUS uvm_va_block_migrate_locked(uvm_va_block_t *va_block,
                                                     NULL,
                                                     UVM_MAKE_RESIDENT_CAUSE_API_MIGRATE);
                 uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_BLOCK_MAKE_RESIDENT,
-                                        NV_GETTIME() - stage_start,
+                                        uvm_migrate_profile_now() - stage_start,
                                         region_bytes / PAGE_SIZE,
                                         region_bytes);
             }
         }
         else {
-            stage_start = NV_GETTIME();
+            stage_start = uvm_migrate_profile_now();
             status = uvm_va_block_make_resident(va_block,
                                                 va_block_retry,
                                                 va_block_context,
@@ -280,7 +280,7 @@ NV_STATUS uvm_va_block_migrate_locked(uvm_va_block_t *va_block,
                                                 NULL,
                                                 UVM_MAKE_RESIDENT_CAUSE_API_MIGRATE);
             uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_BLOCK_MAKE_RESIDENT,
-                                    NV_GETTIME() - stage_start,
+                                    uvm_migrate_profile_now() - stage_start,
                                     region_bytes / PAGE_SIZE,
                                     region_bytes);
         }
@@ -289,10 +289,10 @@ NV_STATUS uvm_va_block_migrate_locked(uvm_va_block_t *va_block,
     if (status == NV_OK && mode == UVM_MIGRATE_MODE_MAKE_RESIDENT_AND_MAP) {
         // block_migrate_add_mappings will acquire the work from the above
         // make_resident call and update the VA block tracker.
-        stage_start = NV_GETTIME();
+        stage_start = uvm_migrate_profile_now();
         status = block_migrate_add_mappings(va_block, va_block_retry, va_block_context, region, dest_id);
         uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_BLOCK_MAP,
-                                NV_GETTIME() - stage_start,
+                                uvm_migrate_profile_now() - stage_start,
                                 region_bytes / PAGE_SIZE,
                                 region_bytes);
     }
@@ -305,7 +305,7 @@ NV_STATUS uvm_va_block_migrate_locked(uvm_va_block_t *va_block,
                           &va_block_context->make_resident.all_involved_processors);
 
     uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_BLOCK_MIGRATE_TOTAL,
-                            NV_GETTIME() - profile_start,
+                            uvm_migrate_profile_now() - profile_start,
                             region_bytes / PAGE_SIZE,
                             region_bytes);
     return status == NV_OK ? tracker_status : status;
@@ -445,7 +445,7 @@ static void preunmap_multi_block(uvm_va_range_managed_t *managed_range,
                                  NvU64 end,
                                  uvm_processor_id_t dest_id)
 {
-    NvU64 profile_start = NV_GETTIME();
+    NvU64 profile_start = uvm_migrate_profile_now();
     size_t i;
     const size_t first_block_index = uvm_va_range_block_index(managed_range, start);
     const size_t last_block_index = uvm_va_range_block_index(managed_range, end);
@@ -477,7 +477,7 @@ static void preunmap_multi_block(uvm_va_range_managed_t *managed_range,
 
 out:
     uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_PREUNMAP,
-                            NV_GETTIME() - profile_start,
+                            uvm_migrate_profile_now() - profile_start,
                             num_unmap_pages,
                             (NvU64)num_unmap_pages * PAGE_SIZE);
 }
@@ -490,7 +490,7 @@ static NV_STATUS uvm_va_range_migrate_multi_block(uvm_va_range_managed_t *manage
                                                   uvm_migrate_mode_t mode,
                                                   uvm_tracker_t *out_tracker)
 {
-    NvU64 profile_start = NV_GETTIME();
+    NvU64 profile_start = uvm_migrate_profile_now();
     size_t i;
     const size_t first_block_index = uvm_va_range_block_index(managed_range, start);
     const size_t last_block_index = uvm_va_range_block_index(managed_range, end);
@@ -507,13 +507,13 @@ static NV_STATUS uvm_va_range_migrate_multi_block(uvm_va_range_managed_t *manage
         uvm_va_block_retry_t va_block_retry;
         uvm_va_block_region_t region;
         uvm_va_block_t *va_block;
-        NvU64 create_start = NV_GETTIME();
+        NvU64 create_start = uvm_migrate_profile_now();
         NvU64 lock_start;
         NvU64 region_bytes;
 
         status = uvm_va_range_block_create(managed_range, i, &va_block);
         uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_BLOCK_CREATE,
-                                NV_GETTIME() - create_start,
+                                uvm_migrate_profile_now() - create_start,
                                 0,
                                 0);
         if (status != NV_OK)
@@ -524,7 +524,7 @@ static NV_STATUS uvm_va_range_migrate_multi_block(uvm_va_range_managed_t *manage
                                                     min(end, va_block->end));
         region_bytes = uvm_va_block_region_size(region);
 
-        lock_start = NV_GETTIME();
+        lock_start = uvm_migrate_profile_now();
         status = UVM_VA_BLOCK_LOCK_RETRY(va_block,
                                          &va_block_retry,
                                          uvm_va_block_migrate_locked(va_block,
@@ -535,7 +535,7 @@ static NV_STATUS uvm_va_range_migrate_multi_block(uvm_va_range_managed_t *manage
                                                                      mode,
                                                                      out_tracker));
         uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_BLOCK_LOCK_MIGRATE,
-                                NV_GETTIME() - lock_start,
+                                uvm_migrate_profile_now() - lock_start,
                                 region_bytes / PAGE_SIZE,
                                 region_bytes);
         if (status != NV_OK)
@@ -544,7 +544,7 @@ static NV_STATUS uvm_va_range_migrate_multi_block(uvm_va_range_managed_t *manage
 
 out:
     uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_MULTI_BLOCK_TOTAL,
-                            NV_GETTIME() - profile_start,
+                            uvm_migrate_profile_now() - profile_start,
                             (end - start + 1) / PAGE_SIZE,
                             end - start + 1);
     return status;
@@ -561,7 +561,7 @@ static NV_STATUS uvm_va_range_migrate(uvm_va_range_managed_t *managed_range,
 {
     NvU64 preunmap_range_start = start;
     uvm_va_policy_t *policy = &managed_range->policy;
-    NvU64 profile_start = NV_GETTIME();
+    NvU64 profile_start = uvm_migrate_profile_now();
     NV_STATUS status = NV_OK;
 
     should_do_cpu_preunmap = should_do_cpu_preunmap && va_range_should_do_cpu_preunmap(policy);
@@ -600,7 +600,7 @@ static NV_STATUS uvm_va_range_migrate(uvm_va_range_managed_t *managed_range,
 
 out:
     uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_RANGE_TOTAL,
-                            NV_GETTIME() - profile_start,
+                            uvm_migrate_profile_now() - profile_start,
                             (end - start + 1) / PAGE_SIZE,
                             end - start + 1);
     return status;
@@ -616,7 +616,7 @@ static NV_STATUS uvm_migrate_ranges(uvm_va_space_t *va_space,
                                     bool should_do_cpu_preunmap,
                                     uvm_tracker_t *out_tracker)
 {
-    NvU64 profile_start = NV_GETTIME();
+    NvU64 profile_start = uvm_migrate_profile_now();
     uvm_va_range_managed_t *managed_range, *managed_range_last;
     NvU64 end = base + length - 1;
     NV_STATUS status = NV_OK;
@@ -681,7 +681,7 @@ static NV_STATUS uvm_migrate_ranges(uvm_va_space_t *va_space,
 
 out:
     uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_RANGES_TOTAL,
-                            NV_GETTIME() - profile_start,
+                            uvm_migrate_profile_now() - profile_start,
                             length / PAGE_SIZE,
                             length);
     return status;
@@ -698,7 +698,7 @@ static NV_STATUS uvm_migrate(uvm_va_space_t *va_space,
                              uvm_tracker_t *out_tracker,
                              uvm_processor_mask_t *gpus_to_check_for_nvlink_errors)
 {
-    NvU64 profile_start = NV_GETTIME();
+    NvU64 profile_start = uvm_migrate_profile_now();
     NV_STATUS status = NV_OK;
     uvm_service_block_context_t *service_context;
     bool do_mappings;
@@ -756,7 +756,7 @@ static NV_STATUS uvm_migrate(uvm_va_space_t *va_space,
     do_two_passes = do_mappings && !is_single_block;
 
     if (do_two_passes) {
-        NvU64 pass_start = NV_GETTIME();
+        NvU64 pass_start = uvm_migrate_profile_now();
         should_do_cpu_preunmap = migration_should_do_cpu_preunmap(va_space, UVM_MIGRATE_PASS_FIRST, is_single_block);
 
         status = uvm_migrate_ranges(va_space,
@@ -769,13 +769,13 @@ static NV_STATUS uvm_migrate(uvm_va_space_t *va_space,
                                     should_do_cpu_preunmap,
                                     out_tracker);
         uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_CORE_FIRST_PASS,
-                                NV_GETTIME() - pass_start,
+                                uvm_migrate_profile_now() - pass_start,
                                 length / PAGE_SIZE,
                                 length);
     }
 
     if (status == NV_OK) {
-        NvU64 pass_start = NV_GETTIME();
+        NvU64 pass_start = uvm_migrate_profile_now();
         uvm_migrate_mode_t mode = do_mappings? UVM_MIGRATE_MODE_MAKE_RESIDENT_AND_MAP:
                                                UVM_MIGRATE_MODE_MAKE_RESIDENT;
         uvm_migrate_pass_t pass = do_two_passes? UVM_MIGRATE_PASS_SECOND:
@@ -792,7 +792,7 @@ static NV_STATUS uvm_migrate(uvm_va_space_t *va_space,
                                     should_do_cpu_preunmap,
                                     out_tracker);
         uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_CORE_SECOND_PASS,
-                                NV_GETTIME() - pass_start,
+                                uvm_migrate_profile_now() - pass_start,
                                 length / PAGE_SIZE,
                                 length);
     }
@@ -801,7 +801,7 @@ static NV_STATUS uvm_migrate(uvm_va_space_t *va_space,
     uvm_service_block_context_free(service_context);
 
     uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_CORE_TOTAL,
-                            NV_GETTIME() - profile_start,
+                            uvm_migrate_profile_now() - profile_start,
                             length / PAGE_SIZE,
                             length);
     return status;
@@ -1602,7 +1602,7 @@ void uvm_migrate_exit(void)
 
 NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
 {
-    NvU64 api_start = NV_GETTIME();
+    NvU64 api_start = uvm_migrate_profile_now();
     NvU64 lookup_start;
     uvm_va_space_t *va_space = uvm_va_space_get(filp);
     uvm_tracker_t tracker = UVM_TRACKER_INIT();
@@ -1645,7 +1645,7 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
 
     uvm_processor_mask_zero(gpus_to_check_for_nvlink_errors);
 
-    lookup_start = NV_GETTIME();
+    lookup_start = uvm_migrate_profile_now();
 
     // mmap_lock will be needed if we have to create CPU mappings
     mm = uvm_va_space_mm_or_current_retain_lock(va_space);
@@ -1733,7 +1733,7 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
         }
 
         uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_API_LOCKS_AND_LOOKUP,
-                                NV_GETTIME() - lookup_start,
+                                uvm_migrate_profile_now() - lookup_start,
                                 params->length / PAGE_SIZE,
                                 params->length);
 
@@ -1769,7 +1769,7 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
         else {
             uvm_va_range_managed_t *first_managed_range =
                 uvm_va_space_iter_managed_first(va_space, params->base, params->base);
-            NvU64 core_start = NV_GETTIME();
+            NvU64 core_start = uvm_migrate_profile_now();
 
             status = uvm_migrate(va_space,
                                  mm,
@@ -1782,7 +1782,7 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
                                  tracker_ptr,
                                  gpus_to_check_for_nvlink_errors);
             uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_API_CORE,
-                                    NV_GETTIME() - core_start,
+                                    uvm_migrate_profile_now() - core_start,
                                     params->length / PAGE_SIZE,
                                     params->length);
         }
@@ -1814,11 +1814,11 @@ done:
         // Wait on the tracker if we are synchronous or there was an error. The
         // VA space lock must be held to prevent GPUs from being unregistered.
         if (synchronous || (status != NV_OK)) {
-            NvU64 wait_start = NV_GETTIME();
+            NvU64 wait_start = uvm_migrate_profile_now();
             NV_STATUS tracker_status = uvm_tracker_wait(tracker_ptr);
 
             uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_API_TRACKER_WAIT,
-                                    NV_GETTIME() - wait_start,
+                                    uvm_migrate_profile_now() - wait_start,
                                     params->length / PAGE_SIZE,
                                     params->length);
 
@@ -1850,7 +1850,7 @@ done:
         uvm_tools_flush_events();
 
     uvm_migrate_profile_add(UVM_MIGRATE_PROFILE_API_TOTAL,
-                            NV_GETTIME() - api_start,
+                            uvm_migrate_profile_now() - api_start,
                             params->length / PAGE_SIZE,
                             params->length);
     return status;

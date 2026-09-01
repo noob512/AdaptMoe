@@ -6,6 +6,7 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -95,8 +96,27 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         # When autotuning with number of tokens m, flashinfer will autotune
         # operations for all number of tokens up to m.
         # So we only need to run with the max number of tokens.
+        max_tokens = int(runner.scheduler_config.max_num_batched_tokens)
+        raw_limit = os.environ.get(
+            "VLLM_FLASHINFER_AUTOTUNE_MAX_TOKENS", "0"
+        ).strip()
+        try:
+            configured_limit = int(raw_limit or "0")
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_FLASHINFER_AUTOTUNE_MAX_TOKENS must be an integer, "
+                f"got {raw_limit!r}"
+            ) from exc
+        if configured_limit > 0:
+            max_tokens = min(max_tokens, configured_limit)
+            logger.info(
+                "Clamped FlashInfer autotune dummy run to %d tokens "
+                "(scheduler maximum %d)",
+                max_tokens,
+                runner.scheduler_config.max_num_batched_tokens,
+            )
         runner._dummy_run(
-            runner.scheduler_config.max_num_batched_tokens,
+            max_tokens,
             skip_eplb=True,
             is_profile=True,
         )

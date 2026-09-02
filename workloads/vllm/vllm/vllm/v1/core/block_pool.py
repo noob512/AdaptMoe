@@ -725,6 +725,21 @@ class BlockPool:
             if self.uvm_kv_runtime_policy is not None
             else self.num_gpu_blocks - 1
         )
+        # A geometric shrink can preserve the compact GPU prefix only when
+        # every block above the proposed target is free.  The minimum free ID
+        # cannot prove that property because active IDs become sparse after
+        # requests release and reuse blocks.  The highest active ID, however,
+        # defines the beginning of the largest provably free tail.
+        max_active_block_id = max(active_ids, default=0)
+        tail_free_start_block_id = min(
+            max(max_active_block_id + 1, 1),
+            applied_target + 1,
+        )
+        tail_free_block_count = max(
+            applied_target - tail_free_start_block_id + 1,
+            0,
+        )
+        gpu_resident_free_ids = gpu_ids + backup_ids
         all_ids = set(range(self.num_gpu_blocks))
         duplicate_memberships = len(flattened) - len(unique_ids)
         invariant_ok = (
@@ -744,6 +759,11 @@ class BlockPool:
             "gpu_backup_blocks": len(backup_ids),
             "cpu_offline_blocks": len(offline_ids),
             "active_blocks": len(active_ids),
+            "active_block_ids_known": True,
+            "max_active_block_id": max_active_block_id,
+            "tail_free_start_block_id": tail_free_start_block_id,
+            "tail_free_block_count": tail_free_block_count,
+            "min_gpu_free_block_id": min(gpu_resident_free_ids, default=None),
             "null_blocks": len(null_ids),
             "accounted_blocks": len(flattened),
             "duplicate_memberships": duplicate_memberships,

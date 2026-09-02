@@ -269,6 +269,31 @@ def main() -> int:
         }
         require(set(selected_target) == set(frozen_static_target), "target layer keys differ")
         initialization = initialize_dynamic_slots(core, model_runner, frozen_static_target)
+        runtime_remote_ranges = (
+            model_runner._collect_uvm_runtime_remote_expert_ranges()
+        )
+        require(runtime_remote_ranges, "dynamic runtime-remote ranges absent")
+        initialization_hot_reconcile = (
+            offload_utils.reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
+                preserve_allocator_cache=True,
+                runtime_remote_ranges=runtime_remote_ranges,
+            )
+        )
+        require(
+            initialization_hot_reconcile.get("ok") is True,
+            "dynamic slot initialization hot-residency reconciliation failed",
+        )
+        initialization_dual_refresh = None
+        if os.environ.get("VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW") == "1":
+            initialization_dual_refresh = (
+                offload_utils.refresh_cpu_offload_uvm_original_va_full_dual_view(
+                    nested_refresh=False
+                )
+            )
+            require(
+                initialization_dual_refresh.get("ok") is True,
+                "dynamic slot initialization dual-view refresh failed",
+            )
         initial_state = placement_snapshot(model_runner)
         require(initial_state["remote_expert_count"] == 192, "dynamic slot total differs")
         swappable = {
@@ -293,6 +318,12 @@ def main() -> int:
                 },
                 "graph_count_after_load": graph_after_load,
                 "dynamic_slot_initialization": initialization,
+                "dynamic_slot_initialization_hot_reconcile": compact(
+                    initialization_hot_reconcile
+                ),
+                "dynamic_slot_initialization_dual_refresh": compact(
+                    initialization_dual_refresh
+                ),
                 "initial_placement": compact(initial_state),
                 "initial_dynamic_remote_region_bytes": int(initial_state["remote_region_bytes"]),
                 "static_alias_selected_bytes": int(static_metadata.get("selected_main_bytes", 0)),

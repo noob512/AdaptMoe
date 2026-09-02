@@ -1055,6 +1055,11 @@ typedef enum
     // CPU-only pages map remotely. Slot-backed aliases are rejected because
     // their physical ownership is not represented by the residency masks.
     UVM_PHASE_F_ACTION_REBUILD_GPU_READ_MAPPINGS = 23,
+    // Scheduler-quiesced synchronous cutover. Unlike action 22 this does not
+    // require a pre-existing immutable read duplicate: it migrates any
+    // GPU-only pages to CPU, releases local GPU residency, and installs a
+    // remote READ mapping. Intended for infrequent adaptive Plan Class changes.
+    UVM_PHASE_F_ACTION_SYNC_CPU_REMOTE_CUTOVER = 24,
 } UVM_PHASE_F_ACTION;
 
 typedef struct
@@ -1550,9 +1555,11 @@ typedef struct
 #define UVM_MOE_STATIC_ALIAS_SEAL                                     UVM_IOCTL_BASE(98)
 #define UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL                    0x00000001U
 #define UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL_NESTED             0x00000002U
+#define UVM_MOE_STATIC_ALIAS_SEAL_FLAG_DISCARD_DUAL                    0x00000004U
 #define UVM_MOE_STATIC_ALIAS_SEAL_FLAGS_ALL                            \
     (UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL |                     \
-     UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL_NESTED)
+     UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL_NESTED |              \
+     UVM_MOE_STATIC_ALIAS_SEAL_FLAG_DISCARD_DUAL)
 typedef struct
 {
     NvU32 abi_version;                                // IN, ABI_VERSION
@@ -1823,6 +1830,7 @@ typedef struct
 #define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT                (1U << 0)
 #define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K                  (1U << 2) // region must be 64KiB aligned
 #define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ                   (1U << 3)
+#define UVM_EXPERT_OFFLOAD_RELEASE_FLAG_IMMUTABLE_CPU_SHADOW          (1U << 4)
 
 #define UVM_EXPERT_OFFLOAD_RELEASE                                   UVM_IOCTL_BASE(100)
 typedef struct

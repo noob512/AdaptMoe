@@ -615,7 +615,8 @@ _CPU_OFFLOAD_UVM_STATIC_ALIAS_ORIGINAL_RELEASE_RESULT: dict[str, Any] | None = N
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_COLD_RESIDENCY_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_RESIDENCY_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_CUDA_READ_BASELINE: dict[
-    int, tuple[str, dict[str, tuple[int, int]]]
+    tuple[int, tuple[tuple[str, tuple[int, ...]], ...]],
+    tuple[str, dict[str, tuple[int, int]]],
 ] = {}
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_DESTROY_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_SLOT_CLOSE_RESULT: dict[str, Any] | None = None
@@ -2879,6 +2880,125 @@ def _uvm_original_alias_expected_shadow_cpu_bytes(
     return overlap_bytes
 
 
+def _uvm_original_alias_subtract_ranges(
+    ranges: Iterable[tuple[int, int]],
+    excluded_ranges: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    """Return ``ranges`` minus a normalized union of excluded byte ranges."""
+    excluded = sorted(
+        (int(base), int(length))
+        for base, length in excluded_ranges
+        if int(length) > 0
+    )
+    merged_excluded: list[tuple[int, int]] = []
+    for base, length in excluded:
+        end = base + length
+        if base <= 0 or end <= base:
+            raise ValueError("Excluded UVM range has invalid geometry")
+        if not merged_excluded:
+            merged_excluded.append((base, length))
+            continue
+        previous_base, previous_length = merged_excluded[-1]
+        previous_end = previous_base + previous_length
+        if base > previous_end:
+            merged_excluded.append((base, length))
+            continue
+        merged_excluded[-1] = (
+            previous_base,
+            max(previous_end, end) - previous_base,
+        )
+
+    result: list[tuple[int, int]] = []
+    for raw_base, raw_length in ranges:
+        base = int(raw_base)
+        length = int(raw_length)
+        end = base + length
+        if base <= 0 or length <= 0 or end <= base:
+            raise ValueError("Source UVM range has invalid geometry")
+        cursor = base
+        for excluded_base, excluded_length in merged_excluded:
+            excluded_end = excluded_base + excluded_length
+            if excluded_end <= cursor:
+                continue
+            if excluded_base >= end:
+                break
+            if excluded_base > cursor:
+                result.append((cursor, excluded_base - cursor))
+            cursor = max(cursor, min(end, excluded_end))
+            if cursor >= end:
+                break
+        if cursor < end:
+            result.append((cursor, end - cursor))
+    return tuple(result)
+
+
+def _uvm_original_alias_intersect_ranges(
+    ranges: Iterable[tuple[int, int]],
+    coverage_ranges: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    """Clip source ranges to the normalized union of valid coverage."""
+    coverage = sorted(
+        (int(base), int(length))
+        for base, length in coverage_ranges
+        if int(length) > 0
+    )
+    merged_coverage: list[tuple[int, int]] = []
+    for base, length in coverage:
+        end = base + length
+        if base <= 0 or end <= base:
+            raise ValueError("Coverage UVM range has invalid geometry")
+        if not merged_coverage:
+            merged_coverage.append((base, length))
+            continue
+        previous_base, previous_length = merged_coverage[-1]
+        previous_end = previous_base + previous_length
+        if base > previous_end:
+            merged_coverage.append((base, length))
+        else:
+            merged_coverage[-1] = (
+                previous_base,
+                max(previous_end, end) - previous_base,
+            )
+
+    intersections: list[tuple[int, int]] = []
+    for raw_base, raw_length in ranges:
+        base = int(raw_base)
+        length = int(raw_length)
+        end = base + length
+        if base <= 0 or length <= 0 or end <= base:
+            raise ValueError("Source UVM range has invalid geometry")
+        for covered_base, covered_length in merged_coverage:
+            covered_end = covered_base + covered_length
+            if covered_end <= base:
+                continue
+            if covered_base >= end:
+                break
+            overlap_base = max(base, covered_base)
+            overlap_end = min(end, covered_end)
+            if overlap_end > overlap_base:
+                intersections.append(
+                    (overlap_base, overlap_end - overlap_base)
+                )
+
+    intersections.sort()
+    merged: list[tuple[int, int]] = []
+    for base, length in intersections:
+        end = base + length
+        if not merged:
+            merged.append((base, length))
+            continue
+        previous_base, previous_length = merged[-1]
+        previous_end = previous_base + previous_length
+        if base > previous_end:
+            merged.append((base, length))
+        else:
+            merged[-1] = (
+                previous_base,
+                max(previous_end, end) - previous_base,
+            )
+    return tuple(merged)
+
+
 def _prepare_uvm_original_alias_plan_class_immutable_shadows(
     *,
     device: int,
@@ -4128,12 +4248,21 @@ def _uvm_original_alias_hot_cuda_read_gate(
             observed[name] = (len(indices), checksum)
         torch.cuda.synchronize(device)
 
+    # Plan Class changes intentionally change the hot expert set. Comparing
+    # the resulting sample dictionary to the previous tier therefore reports
+    # a false data-corruption event because both the indices and counts differ.
+    # Keep one baseline per exact hot geometry: a K2 -> K6 -> K2 round trip then
+    # still compares the returned K2 bytes against its original baseline.
+    baseline_key = (
+        block_bytes,
+        tuple((name, indices) for name, _parameter, indices in binding_specs),
+    )
     baseline = _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_CUDA_READ_BASELINE.get(
-        block_bytes
+        baseline_key
     )
     if baseline is None:
         baseline_stage = str(stage)
-        _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_CUDA_READ_BASELINE[block_bytes] = (
+        _CPU_OFFLOAD_UVM_STATIC_ALIAS_HOT_CUDA_READ_BASELINE[baseline_key] = (
             baseline_stage,
             dict(observed),
         )
@@ -4145,6 +4274,23 @@ def _uvm_original_alias_hot_cuda_read_gate(
                 for name in set(observed)
                 | set(baseline_observed)
                 if observed.get(name) != baseline_observed.get(name)
+            )
+            failure = {
+                **begin,
+                "gate_status": "mismatch",
+                "baseline_stage": baseline_stage,
+                "changed_parameter_count": len(changed),
+                "changed_parameters": changed,
+                "changed_observations": {
+                    name: {
+                        "baseline": baseline_observed.get(name),
+                        "observed": observed.get(name),
+                    }
+                    for name in changed
+                },
+            }
+            _append_uvm_original_alias_lifecycle(
+                "cpu_offload_uvm_hot_cuda_read_gate_mismatch", failure
             )
             raise RuntimeError(
                 "Hot CUDA-read gate detected changed expert bytes after "
@@ -6397,6 +6543,11 @@ def _prepare_uvm_original_alias_plan_residency_delta(
 
     immutable_shadow_enabled = _strict_env_flag(
         "VLLM_CPU_OFFLOAD_PLAN_CLASS_IMMUTABLE_CPU_SHADOW", False
+    ) and not _strict_env_flag(
+        "VLLM_CPU_OFFLOAD_PLAN_CLASS_FORCE_SYNC_MIGRATION", False
+    )
+    force_sync_migration = _strict_env_flag(
+        "VLLM_CPU_OFFLOAD_PLAN_CLASS_FORCE_SYNC_MIGRATION", False
     )
     if immutable_shadow_enabled and not (
         isinstance(_CPU_OFFLOAD_UVM_PLAN_CLASS_SHADOW_RESULT, dict)
@@ -6418,8 +6569,88 @@ def _prepare_uvm_original_alias_plan_residency_delta(
     added_bytes = sum(length for _, length in added_cold)
     removed_bytes = sum(length for _, length in removed_cold)
     shadow_cutover: dict[str, Any] | None = None
+    read_duplicate_promotion: dict[str, Any] | None = None
     if added_cold:
         if immutable_shadow_enabled:
+            if _strict_env_flag(
+                "VLLM_CPU_OFFLOAD_PLAN_CLASS_REPROMOTE_BEFORE_CUTOVER",
+                False,
+            ):
+                # Graph replay can revoke UVM's read-duplicate certificate
+                # while leaving both physical copies present.  The native
+                # ReadMostly + CPU-prefetch sequence is the same operation
+                # used to build the startup immutable shadows: it reasserts
+                # read_duplicated_pages and installs a GPU READ PTE without
+                # changing the Parameter VA.  Merely invoking Phase-F action
+                # 18 is insufficient for already dual-resident pages because
+                # that fast path treats them as an idempotent no-copy case.
+                readmostly_count = int(
+                    uvm.batch_advise_ranges_read_mostly(
+                        added_cold, device=device
+                    )
+                )
+                prefetch_count = int(
+                    uvm.batch_prefetch_ranges_to_cpu(added_cold)
+                )
+                torch.cuda.synchronize(device)
+                promotion_residency = dict(
+                    uvm.driver_batch_query_ranges_residency_bytes(
+                        added_cold,
+                        device=device,
+                        wait_for_trackers=False,
+                    )
+                )
+                read_duplicate_promotion = {
+                    "ok": bool(
+                        readmostly_count == len(added_cold)
+                        and prefetch_count == len(added_cold)
+                        and promotion_residency.get("ok") is True
+                        and int(
+                            promotion_residency.get("queried_bytes", -1)
+                        )
+                        == added_bytes
+                        and int(promotion_residency.get("gpu_bytes", -1))
+                        == added_bytes
+                        and int(promotion_residency.get("cpu_bytes", -1))
+                        == added_bytes
+                        and int(promotion_residency.get("any_bytes", -1))
+                        == added_bytes
+                        and int(promotion_residency.get("unknown_bytes", -1))
+                        == 0
+                    ),
+                    "operation": "native_readmostly_cpu_prefetch",
+                    "range_count": len(added_cold),
+                    "success_count": prefetch_count,
+                    "failure_count": len(added_cold) - prefetch_count,
+                    "requested_bytes": int(added_bytes),
+                    "readmostly_count": readmostly_count,
+                    "prefetch_count": prefetch_count,
+                    "residency": promotion_residency,
+                }
+                if not (
+                    read_duplicate_promotion.get("ok") is True
+                    and int(
+                        read_duplicate_promotion.get("range_count", -1)
+                    )
+                    == len(added_cold)
+                    and int(
+                        read_duplicate_promotion.get("success_count", -1)
+                    )
+                    == len(added_cold)
+                    and int(
+                        read_duplicate_promotion.get("failure_count", -1)
+                    )
+                    == 0
+                    and int(
+                        read_duplicate_promotion.get("requested_bytes", -1)
+                    )
+                    == added_bytes
+                ):
+                    raise RuntimeError(
+                        "Failed to re-promote every added cold expert to an "
+                        "immutable CPU/GPU read duplicate before cutover: "
+                        f"{read_duplicate_promotion!r}"
+                    )
             shadow_cutover = dict(
                 uvm.driver_cutover_ranges_to_immutable_cpu_shadow(
                     added_cold, device=device
@@ -6445,6 +6676,28 @@ def _prepare_uvm_original_alias_plan_residency_delta(
                     f"cold expert: {shadow_cutover!r}"
                 )
             prepared: Any = shadow_cutover
+        elif force_sync_migration:
+            prepared = dict(
+                uvm.driver_cutover_ranges_to_immutable_cpu_shadow(
+                    added_cold,
+                    device=device,
+                    force_synchronous_migration=True,
+                )
+            )
+            if not (
+                prepared.get("ok") is True
+                and int(prepared.get("range_count", -1)) == len(added_cold)
+                and int(prepared.get("success_count", -1)) == len(added_cold)
+                and int(prepared.get("failure_count", -1)) == 0
+                and int(prepared.get("requested_bytes", -1)) == added_bytes
+                and int(prepared.get("released_gpu_bytes", -1)) == added_bytes
+                and int(prepared.get("retained_cpu_shadow_bytes", -1))
+                == added_bytes
+                and int(prepared.get("remote_mapped_bytes", -1)) == added_bytes
+            ):
+                raise RuntimeError(
+                    f"Failed to move every added cold expert to CPU: {prepared!r}"
+                )
         else:
             prepared = (
                 uvm.batch_prepare_ranges_for_native_remote_access_with_executor(
@@ -6463,7 +6716,7 @@ def _prepare_uvm_original_alias_plan_residency_delta(
     if removed_cold:
         advised = (
             int(uvm.batch_advise_ranges_preferred_location(removed_cold, device))
-            if advise_removed
+            if advise_removed and not force_sync_migration
             else 0
         )
         prefetched, executor, driver_result = (
@@ -6474,7 +6727,11 @@ def _prepare_uvm_original_alias_plan_residency_delta(
             )
         )
         if (
-            (advise_removed and advised != len(removed_cold))
+            (
+                advise_removed
+                and not force_sync_migration
+                and advised != len(removed_cold)
+            )
             or int(prefetched) != len(removed_cold)
         ):
             raise RuntimeError(
@@ -6515,8 +6772,17 @@ def _prepare_uvm_original_alias_plan_residency_delta(
                 removed_cold, device=device, wait_for_trackers=False
             )
         )
+        retained_shadow_expected = bool(
+            immutable_shadow_enabled
+            or (
+                force_sync_migration
+                and isinstance(_CPU_OFFLOAD_UVM_PLAN_CLASS_SHADOW_RESULT, dict)
+                and _CPU_OFFLOAD_UVM_PLAN_CLASS_SHADOW_RESULT.get("enabled")
+                is True
+            )
+        )
         expected_removed_cpu_bytes = (
-            removed_bytes if immutable_shadow_enabled else 0
+            removed_bytes if retained_shadow_expected else 0
         )
         if not (
             removed_residency.get("ok") is True
@@ -6537,13 +6803,18 @@ def _prepare_uvm_original_alias_plan_residency_delta(
             else "delta"
         ),
         "immutable_cpu_shadow_enabled": bool(immutable_shadow_enabled),
+        "read_duplicate_promotion": read_duplicate_promotion,
         "shadow_cutover": shadow_cutover,
         "added_cold_range_count": len(added_cold),
         "added_cold_bytes": int(added_bytes),
         "removed_cold_range_count": len(removed_cold),
         "removed_cold_bytes": int(removed_bytes),
         "prepare": prepared,
-        "advice_requested": bool(advise_removed and removed_cold),
+        "advice_requested": bool(
+            advise_removed
+            and removed_cold
+            and not force_sync_migration
+        ),
         "advised_count": advised,
         "prefetched_count": int(prefetched),
         "prefetch_executor": str(executor),
@@ -6567,6 +6838,9 @@ def _merge_uvm_original_alias_plan_residency_phases(
         "immutable_cpu_shadow_enabled": bool(
             before_detach.get("immutable_cpu_shadow_enabled")
             or after_detach.get("immutable_cpu_shadow_enabled")
+        ),
+        "read_duplicate_promotion": before_detach.get(
+            "read_duplicate_promotion"
         ),
         "shadow_cutover": before_detach.get("shadow_cutover"),
         "added_cold_range_count": int(
@@ -6829,7 +7103,23 @@ def _rollback_uvm_original_alias_plan_class_switch(
     from vllm.device_allocator import uvm, uvm_static_alias
 
     started_ns = time.perf_counter_ns()
-    _apply_uvm_original_alias_plan_geometry(old_geometry, refill_sources=True)
+    force_sync_dual_transaction = (
+        _strict_env_flag(
+            "VLLM_CPU_OFFLOAD_PLAN_CLASS_FORCE_SYNC_MIGRATION", False
+        )
+        and _strict_env_flag(
+            "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW", False
+        )
+    )
+    # Multi-class initialization prefills every immutable pinned source. A
+    # failed synchronous cutover can leave a managed Parameter range only
+    # partially GPU-readable, so reading it back during rollback would turn a
+    # recoverable residency failure into a CUDA illegal-address. Reuse the
+    # certified sources in this mode.
+    _apply_uvm_original_alias_plan_geometry(
+        old_geometry,
+        refill_sources=not force_sync_dual_transaction,
+    )
     torch.cuda.synchronize(device)
 
     retained_error: str | None = None
@@ -6842,7 +7132,8 @@ def _rollback_uvm_original_alias_plan_class_switch(
     rollback_finalize: dict[str, Any] | None = None
     rollback_preallocate: dict[str, Any] | None = None
     orphan_release: dict[str, Any] | None = None
-
+    rollback_dual_discard: dict[str, Any] | None = None
+    rollback_dual_refresh: dict[str, Any] | None = None
     if not old_session_destroyed and fast_rollback_safe:
         try:
             session_id = int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID)
@@ -6924,6 +7215,24 @@ def _rollback_uvm_original_alias_plan_class_switch(
                         f"{orphan_release!r}"
                     )
 
+            # Detached dual-view children freeze ordinary Parameter leaves.
+            # Restore ordinary UVM page tables before reversing residency, then
+            # rebuild both children from the restored physical layout before a
+            # possible RESUME publishes the GPU child again.
+            if force_sync_dual_transaction:
+                rollback_dual_discard = dict(
+                    uvm_static_alias.driver_static_alias_seal(
+                        session_id,
+                        device=device,
+                        discard_dual=True,
+                    )
+                )
+                if rollback_dual_discard.get("ok") is not True:
+                    raise RuntimeError(
+                        "Rollback could not discard the current full dual view: "
+                        f"{rollback_dual_discard!r}"
+                    )
+
             # Reverse exactly the residency difference applied by the forward
             # switch. A full-plan pass both touches retained experts and, on
             # an early preallocation failure, can leave the newly cold pages
@@ -6933,6 +7242,19 @@ def _rollback_uvm_original_alias_plan_class_switch(
                 old_geometry,
                 device=device,
             )
+            if force_sync_dual_transaction:
+                rollback_dual_refresh = dict(
+                    uvm_static_alias.driver_static_alias_seal(
+                        session_id,
+                        device=device,
+                        refresh_dual=True,
+                    )
+                )
+                if rollback_dual_refresh.get("ok") is not True:
+                    raise RuntimeError(
+                        "Rollback could not rebuild the restored full dual view: "
+                        f"{rollback_dual_refresh!r}"
+                    )
             if pre_state == "sealed":
                 rollback_resume = dict(
                     uvm_static_alias.driver_static_alias_resume(
@@ -6967,6 +7289,8 @@ def _rollback_uvm_original_alias_plan_class_switch(
                 "orphan_release": orphan_release,
                 "resume": rollback_resume,
                 "residency": rollback_residency,
+                "dual_discard": rollback_dual_discard,
+                "dual_refresh": rollback_dual_refresh,
                 "wall_ns": time.perf_counter_ns() - started_ns,
             }
             if int(_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES) != int(
@@ -7259,6 +7583,7 @@ def switch_cpu_offload_uvm_original_va_plan_class(
         preallocate_result: dict[str, Any] | None = None
         resume_result: dict[str, Any] | None = None
         quiesced_delta_result: dict[str, Any] | None = None
+        dual_discard_result: dict[str, Any] | None = None
         post_restore_dual_refresh_result: dict[str, Any] | None = None
         rollback_result: dict[str, Any] | None = None
         old_map_entries: tuple[
@@ -7311,6 +7636,54 @@ def switch_cpu_offload_uvm_original_va_plan_class(
                 )
             )
             torch.cuda.synchronize(device)
+            force_sync_dual_transaction = (
+                _strict_env_flag(
+                    "VLLM_CPU_OFFLOAD_PLAN_CLASS_FORCE_SYNC_MIGRATION", False
+                )
+                and _strict_env_flag(
+                    "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW", False
+                )
+            )
+            if force_sync_dual_transaction:
+                dual_discard_result = dict(
+                    uvm_static_alias.driver_static_alias_seal(
+                        int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
+                        device=device,
+                        discard_dual=True,
+                    )
+                )
+                if dual_discard_result.get("ok") is not True:
+                    raise RuntimeError(
+                        "Failed to discard the full dual view before synchronous "
+                        f"Plan Class migration: {dual_discard_result!r}"
+                    )
+                # DISCARD_DUAL restores the original UVM hierarchy, but the
+                # current cold expert slices are still live slot aliases. Some
+                # newly-cold slices share a 2 MiB VA block with those aliases;
+                # a residency transaction over such a mixed block must first
+                # remove every consumer slot mapping. Keep the session parked
+                # through target residency and REBIND. RESUME then installs the
+                # new slot recipe before REFRESH_DUAL freezes its two views.
+                if pre_state == "sealed":
+                    park_result = dict(
+                        uvm_static_alias.driver_static_alias_park(
+                            int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
+                            device=device,
+                            synchronize=False,
+                            defer_cpu_restore=False,
+                        )
+                    )
+                    if park_result.get("side_effect_indeterminate") or (
+                        park_result.get("poisoned")
+                        and park_result.get("ok") is not True
+                    ):
+                        fast_rollback_safe = False
+                    if park_result.get("ok") is not True:
+                        raise RuntimeError(
+                            "PARK before synchronous Plan Class migration failed: "
+                            f"{park_result!r}"
+                        )
+                    _set_uvm_original_alias_parked_state(park_result)
             _apply_uvm_original_alias_plan_geometry(
                 target_geometry, refill_sources=False
             )
@@ -7395,6 +7768,7 @@ def switch_cpu_offload_uvm_original_va_plan_class(
             )
             quiesced_delta_eligible = (
                 quiesced_delta_enabled
+                and not force_sync_dual_transaction
                 # An append must install new consumer aliases and is valid
                 # only while the alias-prefill topology is sealed.  A remove
                 # can also shrink a parked session: its consumer PTEs are
@@ -7463,7 +7837,10 @@ def switch_cpu_offload_uvm_original_va_plan_class(
                                 uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAP_FLAG_QUIESCED_APPEND
                                 | (
                                     uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAP_FLAG_DEFER_DUAL_REFRESH
-                                    if defer_dual_refresh
+                                    if (
+                                        defer_dual_refresh
+                                        or force_sync_dual_transaction
+                                    )
                                     else 0
                                 )
                             ),
@@ -7494,7 +7871,10 @@ def switch_cpu_offload_uvm_original_va_plan_class(
                 rebind_result = quiesced_delta_result
                 rebind_committed = True
             else:
-                if pre_state == "sealed":
+                if (
+                    pre_state == "sealed"
+                    and _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE == "sealed"
+                ):
                     park_result = dict(
                         uvm_static_alias.driver_static_alias_park(
                             int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
@@ -7536,7 +7916,7 @@ def switch_cpu_offload_uvm_original_va_plan_class(
                         f"{rebind_result!r}"
                     )
                 rebind_committed = True
-                if pre_state == "sealed":
+                if pre_state == "sealed" and not force_sync_dual_transaction:
                     resume_result = dict(
                         uvm_static_alias.driver_static_alias_resume(
                             int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
@@ -7572,12 +7952,44 @@ def switch_cpu_offload_uvm_original_va_plan_class(
                         residency_after_detach,
                     )
                 )
-                # REBIND/quiesced-remove rebuilds the detached dual children
-                # before newly hot managed pages are prefetched back to GPU.
-                # At that point those ordinary leaves are intentionally
-                # invalid.  Rebuild both complete children after residency is
-                # restored; a nested refresh would see no newly cold slot
-                # pages and incorrectly reuse the stale ordinary leaves.
+            else:
+                residency_result = residency_before_detach
+
+            # REFRESH_DUAL derives the immutable selection from the live slot
+            # PTE mask. A force-synchronous transaction discarded the previous
+            # children and kept the session parked while residency changed, so
+            # its mask is intentionally empty until RESUME. Publish the new
+            # REBIND topology first; the scheduler quiescence certificate makes
+            # this intermediate GPU view safe and no model kernel is launched.
+            if pre_state == "sealed" and force_sync_dual_transaction:
+                resume_result = dict(
+                    uvm_static_alias.driver_static_alias_resume(
+                        int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
+                        device=device,
+                        synchronize=False,
+                    )
+                )
+                if resume_result.get("side_effect_indeterminate") or (
+                    resume_result.get("poisoned")
+                    and resume_result.get("ok") is not True
+                ):
+                    fast_rollback_safe = False
+                if resume_result.get("ok") is not True:
+                    raise RuntimeError(
+                        "RESUME after synchronous Plan Class migration failed: "
+                        f"{resume_result!r}"
+                    )
+                _set_uvm_original_alias_sealed_state(resume_result)
+
+            # A synchronous Plan Class transaction deliberately destroyed the
+            # frozen children before changing expert residency. Rebuild them
+            # now unless the enclosing KV grow transaction requested one final
+            # refresh after its own physical migration. The legacy hot-restore
+            # path still requires an immediate full rebuild as before.
+            immediate_dual_refresh = (
+                deferred_removed_residency or force_sync_dual_transaction
+            )
+            if immediate_dual_refresh:
                 post_restore_dual_refresh_result = (
                     refresh_cpu_offload_uvm_original_va_full_dual_view(
                         nested_refresh=False
@@ -7585,11 +7997,9 @@ def switch_cpu_offload_uvm_original_va_plan_class(
                 )
                 if post_restore_dual_refresh_result.get("ok") is not True:
                     raise RuntimeError(
-                        "Post-restore full dual-view refresh failed: "
+                        "Post-switch full dual-view refresh failed: "
                         f"{post_restore_dual_refresh_result!r}"
                     )
-            else:
-                residency_result = residency_before_detach
 
             if _uvm_original_parameter_va_snapshot() != parameter_vas:
                 raise RuntimeError("Parameter VAs changed during stable class switch")
@@ -7672,9 +8082,14 @@ def switch_cpu_offload_uvm_original_va_plan_class(
                 "quiesced_delta_remove_count": int(len(delta_remove_entries)),
                 "dual_view_refresh_deferred": bool(
                     defer_dual_refresh
-                    and quiesced_delta_used
-                    and bool(delta_add_entries)
+                    and (
+                        quiesced_delta_used and bool(delta_add_entries)
+                    )
                 ),
+                "enclosing_migration_dual_refresh_requested": bool(
+                    defer_dual_refresh
+                ),
+                "pre_migration_dual_discard": dual_discard_result,
                 "quiesced_delta": quiesced_delta_result,
                 "instruction_registry_size": int(
                     len(_CPU_OFFLOAD_UVM_PLAN_CLASS_INSTRUCTIONS)
@@ -7790,6 +8205,7 @@ def switch_cpu_offload_uvm_original_va_plan_class(
                 "slot_close": close_result,
                 "finalize": finalize_result,
                 "residency": residency_result,
+                "pre_migration_dual_discard": dual_discard_result,
                 "post_restore_dual_refresh": post_restore_dual_refresh_result,
                 "rollback": rollback_result,
                 "error": repr(exc),
@@ -9027,9 +9443,12 @@ def prepare_cpu_offload_uvm_original_va_profile_topology(
     hot_preparation_residency: dict[str, Any] | None = None
     hot_remote_map: dict[str, Any] | None = None
     hot_physical: dict[str, Any] | None = None
+    hot_dual_refresh: dict[str, Any] | None = None
     transition: dict[str, Any] | None = None
     hot_range_count = 0
     hot_bytes = 0
+    force_synchronous_shadow_refresh = False
+    hot_shadow_readmostly_refresh_count = 0
     try:
         if pre_state not in ("sealed", "remote", "remote_parked"):
             raise RuntimeError(
@@ -9058,6 +9477,9 @@ def prepare_cpu_offload_uvm_original_va_profile_topology(
             and shadow_certificate.get("enabled") is True
             and shadow_certificate.get("full_parameter_shadow") is True
         )
+        force_synchronous_shadow_refresh = _strict_env_flag(
+            "VLLM_CPU_OFFLOAD_PLAN_CLASS_FORCE_SYNC_MIGRATION", False
+        )
         if full_parameter_shadow:
             # PARK the current-tier pair while its Prefill child still
             # describes the live hot GPU pages.  Modifying those hot pages
@@ -9067,6 +9489,11 @@ def prepare_cpu_offload_uvm_original_va_profile_topology(
                 transition = transition_cpu_offload_uvm_original_va_to_remote(
                     reason=transition_reason,
                     preserve_remote_graphs=preserve_remote_graphs,
+                    # PARK publishes the full-Parameter CPU child before the
+                    # explicit shadow cutover below.  Its hot leaves are
+                    # therefore intentionally CPU-remote during this
+                    # temporary all-remote profile, not missing GPU pages.
+                    runtime_remote_ranges=hot_ranges,
                 )
                 if transition.get("ok") is not True:
                     raise RuntimeError(
@@ -9141,10 +9568,20 @@ def prepare_cpu_offload_uvm_original_va_profile_topology(
                     "ioctl_calls": 0,
                 }
             else:
+                # A previously replayed Prefill Graph can revoke or stale the
+                # historical ReadMostly duplicate while the residency bitmap
+                # still reports both CPU and GPU copies.  Multi-class Graph
+                # pre-capture therefore refreshes the CPU bytes from the
+                # authoritative current GPU weights as part of the synchronous
+                # cutover.  Fixed single-class runs keep the cheaper immutable
+                # duplicate path.
                 hot_shadow_cutover = dict(
                     uvm.driver_cutover_ranges_to_immutable_cpu_shadow(
                         hot_ranges,
                         device=device,
+                        force_synchronous_migration=(
+                            force_synchronous_shadow_refresh
+                        ),
                     )
                 )
             expected_released_gpu_bytes = (
@@ -9172,6 +9609,24 @@ def prepare_cpu_offload_uvm_original_va_profile_topology(
                     "Failed to cut every hot expert range over to its "
                     f"immutable CPU shadow: {hot_shadow_cutover!r}"
                 )
+            if force_synchronous_shadow_refresh and not hot_already_cpu_only:
+                # The synchronous refresh deliberately breaks the stale
+                # read-duplication state before copying GPU -> CPU. Re-arm the
+                # immutable ReadMostly policy while the refreshed CPU copy is
+                # the sole resident copy, so the later hot-GPU restore keeps
+                # this new CPU shadow for the next class transition.
+                hot_shadow_readmostly_refresh_count = int(
+                    uvm.batch_advise_ranges_read_mostly(
+                        hot_ranges, device=device
+                    )
+                )
+                if hot_shadow_readmostly_refresh_count != len(hot_ranges):
+                    raise RuntimeError(
+                        "Failed to restore ReadMostly policy after synchronous "
+                        "hot shadow refresh: "
+                        f"actual={hot_shadow_readmostly_refresh_count}, "
+                        f"expected={len(hot_ranges)}"
+                    )
             hot_prepare = (
                 len(hot_ranges),
                 "immutable_cpu_shadow_cutover",
@@ -9194,6 +9649,28 @@ def prepare_cpu_offload_uvm_original_va_profile_topology(
                     hot_shadow_cutover.get("ioctl_calls", 1)
                 ),
             }
+
+            # PARK published the retained CPU child before the hot complement
+            # was cut over to its immutable CPU shadow. The cold slot leaves
+            # remain valid, but the ordinary leaves in that detached child
+            # still name the old GPU physical pages. Re-materialize both
+            # complete 4K children from the new live residency before any
+            # remote Graph is captured; otherwise later allocator activity can
+            # reuse those released pages and make the retained child read
+            # unrelated data.
+            if _strict_env_flag(
+                "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW", False
+            ):
+                hot_dual_refresh = (
+                    refresh_cpu_offload_uvm_original_va_full_dual_view(
+                        nested_refresh=False
+                    )
+                )
+                if hot_dual_refresh.get("ok") is not True:
+                    raise RuntimeError(
+                        "Failed to refresh the parked dual view after hot "
+                        f"CPU cutover: {hot_dual_refresh!r}"
+                    )
         else:
             # The audited driver primitive verifies and installs remote READ
             # PTEs; it intentionally does not migrate GPU-resident pages to
@@ -9308,13 +9785,23 @@ def prepare_cpu_offload_uvm_original_va_profile_topology(
             "hot_bytes": int(hot_bytes),
             "hot_prepare": hot_prepare,
             "hot_prepare_operation": (
-                "immutable_cpu_shadow_cutover"
+                (
+                    "sync_cpu_remote_cutover"
+                    if force_synchronous_shadow_refresh
+                    and hot_shadow_cutover is not None
+                    and hot_shadow_cutover.get("reason") != "already_cpu_shadow"
+                    else "immutable_cpu_shadow_cutover"
+                )
                 if hot_shadow_cutover is not None
                 else "native_uvm_migration"
             ),
             "hot_shadow_cutover": hot_shadow_cutover,
+            "hot_shadow_readmostly_refresh_count": int(
+                hot_shadow_readmostly_refresh_count
+            ),
             "hot_preparation_residency": hot_preparation_residency,
             "hot_remote_map": hot_remote_map,
+            "hot_dual_refresh": hot_dual_refresh,
             "hot_physical_residency": hot_physical,
             "cold_transition": transition,
         }
@@ -9342,13 +9829,23 @@ def prepare_cpu_offload_uvm_original_va_profile_topology(
             "hot_bytes": int(hot_bytes),
             "hot_prepare": hot_prepare,
             "hot_prepare_operation": (
-                "immutable_cpu_shadow_cutover"
+                (
+                    "sync_cpu_remote_cutover"
+                    if force_synchronous_shadow_refresh
+                    and hot_shadow_cutover is not None
+                    and hot_shadow_cutover.get("reason") != "already_cpu_shadow"
+                    else "immutable_cpu_shadow_cutover"
+                )
                 if hot_shadow_cutover is not None
                 else "native_uvm_migration"
             ),
             "hot_shadow_cutover": hot_shadow_cutover,
+            "hot_shadow_readmostly_refresh_count": int(
+                hot_shadow_readmostly_refresh_count
+            ),
             "hot_preparation_residency": hot_preparation_residency,
             "hot_remote_map": hot_remote_map,
+            "hot_dual_refresh": hot_dual_refresh,
             "hot_physical_residency": hot_physical,
             "cold_transition": transition,
         }
@@ -9363,6 +9860,8 @@ def prepare_cpu_offload_uvm_original_va_profile_topology(
 def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
     *,
     preserve_allocator_cache: bool = True,
+    runtime_remote_ranges: Iterable[tuple[int, int]] = (),
+    mapping_refresh_ranges: Iterable[tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
     """Restore the hot complement after KV allocation in sealed-alias mode.
 
@@ -9415,8 +9914,31 @@ def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
         hot_prefetch_executor = "none"
         hot_prefetch_driver_result = 0
         hot_prefetch_skipped_already_resident = False
+        hot_mapping_refresh_required = False
+        hot_mapping_cutover: dict[str, Any] | None = None
         hot_range_count = 0
         hot_bytes = 0
+        hot_gpu_range_count = 0
+        hot_expected_gpu_bytes = 0
+        hot_runtime_remote_bytes = 0
+        normalized_runtime_remote_ranges = tuple(
+            (int(base), int(length))
+            for base, length in runtime_remote_ranges
+        )
+        normalized_mapping_refresh_ranges = (
+            None
+            if mapping_refresh_ranges is None
+            else tuple(
+                (int(base), int(length))
+                for base, length in mapping_refresh_ranges
+                if int(base) > 0 and int(length) > 0
+            )
+        )
+        mapping_refresh_target_count = 0
+        mapping_refresh_target_bytes = 0
+        mapping_refresh_prepare_prefetch_count = 0
+        mapping_refresh_prepare_prefetch_executor = "none"
+        mapping_refresh_prepare_prefetch_driver_result = 0
         free_before = -1
         free_after = -1
         total_bytes = -1
@@ -9443,8 +9965,44 @@ def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
             ]
             hot_range_count = len(hot_ranges)
             hot_bytes = sum(length for _, length in hot_ranges)
+            hot_gpu_ranges = _uvm_original_alias_subtract_ranges(
+                hot_ranges,
+                normalized_runtime_remote_ranges,
+            )
+            hot_gpu_range_count = len(hot_gpu_ranges)
+            hot_expected_gpu_bytes = sum(
+                length for _, length in hot_gpu_ranges
+            )
+            hot_runtime_remote_bytes = hot_bytes - hot_expected_gpu_bytes
+            # Runtime expert release can leave a CPU READ PTE active for an
+            # adjacent hot fragment while ReadMostly still retains an exact
+            # GPU duplicate.  Residency alone cannot certify which leaf a
+            # subsequent full-dual refresh will freeze.  Re-prefetch the GPU
+            # complement once after any runtime-remote mutation so the live
+            # mapping, not only the physical duplicate, is canonical.
+            if normalized_mapping_refresh_ranges is None:
+                mapping_refresh_gpu_ranges = (
+                    hot_gpu_ranges
+                    if normalized_runtime_remote_ranges
+                    else []
+                )
+            else:
+                mapping_refresh_gpu_ranges = (
+                    _uvm_original_alias_intersect_ranges(
+                        normalized_mapping_refresh_ranges,
+                        hot_gpu_ranges,
+                    )
+                )
+            mapping_refresh_target_count = len(mapping_refresh_gpu_ranges)
+            mapping_refresh_target_bytes = sum(
+                length for _, length in mapping_refresh_gpu_ranges
+            )
+            hot_mapping_refresh_required = bool(mapping_refresh_gpu_ranges)
             expected_hot_cpu_bytes = (
-                _uvm_original_alias_expected_shadow_cpu_bytes(hot_ranges)
+                _uvm_original_alias_expected_shadow_cpu_bytes(
+                    hot_ranges,
+                    additional_cpu_ranges=normalized_runtime_remote_ranges,
+                )
             )
             hot_physical_before = dict(
                 uvm.driver_batch_query_ranges_residency_bytes(
@@ -9460,7 +10018,7 @@ def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
                 and int(hot_physical_before.get("queried_bytes", -1))
                 == hot_bytes
                 and int(hot_physical_before.get("gpu_bytes", -1))
-                == hot_bytes
+                == hot_expected_gpu_bytes
                 and int(hot_physical_before.get("cpu_bytes", -1))
                 == expected_hot_cpu_bytes
                 and int(hot_physical_before.get("any_bytes", -1))
@@ -9468,7 +10026,86 @@ def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
                 and int(hot_physical_before.get("unknown_bytes", -1)) == 0
             )
 
-            if hot_already_resident:
+            shadow_certificate = _CPU_OFFLOAD_UVM_PLAN_CLASS_SHADOW_RESULT
+            full_parameter_shadow = bool(
+                isinstance(shadow_certificate, dict)
+                and shadow_certificate.get("enabled") is True
+                and shadow_certificate.get("full_parameter_shadow") is True
+            )
+            if (
+                hot_mapping_refresh_required
+                and (
+                    hot_already_resident
+                    or normalized_mapping_refresh_ranges is not None
+                )
+                and full_parameter_shadow
+                and mapping_refresh_gpu_ranges
+            ):
+                if normalized_mapping_refresh_ranges is not None:
+                    # Some promoted envelope leaves can still be physically
+                    # absent even though the expert-level restore returned
+                    # success.  The immutable-shadow cutover requires an
+                    # extant GPU copy for every byte, so materialize the small
+                    # explicit promotion set first.  The following
+                    # cutover+prefetch pair then makes the live GPU PTE, not a
+                    # retained ReadMostly duplicate, canonical.
+                    (
+                        mapping_refresh_prepare_prefetch_count,
+                        mapping_refresh_prepare_prefetch_executor,
+                        mapping_refresh_prepare_prefetch_driver_result,
+                    ) = uvm.batch_prefetch_ranges_to_device_with_executor(
+                        mapping_refresh_gpu_ranges,
+                        device,
+                        executor="cpp_batch",
+                    )
+                    if int(mapping_refresh_prepare_prefetch_count) != len(
+                        mapping_refresh_gpu_ranges
+                    ):
+                        raise RuntimeError(
+                            "Failed to materialize every promoted hot range "
+                            "before immutable-shadow cutover: "
+                            f"prefetched={mapping_refresh_prepare_prefetch_count}, "
+                            f"expected={len(mapping_refresh_gpu_ranges)}, "
+                            "executor="
+                            f"{mapping_refresh_prepare_prefetch_executor!r}, "
+                            "driver_result="
+                            f"{mapping_refresh_prepare_prefetch_driver_result}"
+                        )
+                    torch.cuda.synchronize(device)
+                # A retained ReadMostly GPU duplicate does not prove the live
+                # PTE maps that duplicate. Drop it against the immutable CPU
+                # shadow first; the mandatory prefetch below then rebuilds an
+                # unambiguous GPU mapping for every non-remote hot fragment.
+                hot_mapping_cutover = dict(
+                    uvm.driver_cutover_ranges_to_immutable_cpu_shadow(
+                        mapping_refresh_gpu_ranges,
+                        device=device,
+                        force_synchronous_migration=False,
+                    )
+                )
+                if not (
+                    hot_mapping_cutover.get("ok") is True
+                    and int(hot_mapping_cutover.get("range_count", -1))
+                    == len(mapping_refresh_gpu_ranges)
+                    and int(hot_mapping_cutover.get("success_count", -1))
+                    == len(mapping_refresh_gpu_ranges)
+                    and int(hot_mapping_cutover.get("failure_count", -1)) == 0
+                    and int(hot_mapping_cutover.get("requested_bytes", -1))
+                    == mapping_refresh_target_bytes
+                    and (
+                        0
+                        <= int(
+                            hot_mapping_cutover.get("released_gpu_bytes", -1)
+                        )
+                        <= mapping_refresh_target_bytes
+                    )
+                ):
+                    raise RuntimeError(
+                        "Failed to canonicalize runtime-mutated hot mappings "
+                        f"against immutable CPU shadows: {hot_mapping_cutover!r}"
+                    )
+
+            if hot_already_resident and not hot_mapping_refresh_required:
                 # cudaMemPrefetchAsync is not a harmless no-op for a large
                 # managed range which is already resident on the target GPU:
                 # it still walks every VA block and can tear down/rebuild GPU
@@ -9477,7 +10114,12 @@ def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
                 # topology before Graph capture.  The exact residency query
                 # above is the certificate that no repair is needed.
                 hot_prefetch_skipped_already_resident = True
-            elif hot_ranges:
+            elif hot_gpu_ranges:
+                prefetch_ranges = (
+                    mapping_refresh_gpu_ranges
+                    if normalized_mapping_refresh_ranges is not None
+                    else hot_gpu_ranges
+                )
                 if _strict_env_flag(
                     "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW", False
                 ):
@@ -9492,32 +10134,32 @@ def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
                 else:
                     hot_advise_count = int(
                         uvm.batch_advise_ranges_preferred_location(
-                            hot_ranges,
+                            prefetch_ranges,
                             device,
                         )
                     )
-                    if hot_advise_count != len(hot_ranges):
+                    if hot_advise_count != len(prefetch_ranges):
                         raise RuntimeError(
                             "Failed to set GPU preferred location for every "
                             "sealed hot expert range: "
                             f"advised={hot_advise_count}, "
-                            f"expected={len(hot_ranges)}"
+                            f"expected={len(prefetch_ranges)}"
                         )
                 (
                     hot_prefetch_count,
                     hot_prefetch_executor,
                     hot_prefetch_driver_result,
                 ) = uvm.batch_prefetch_ranges_to_device_with_executor(
-                    hot_ranges,
+                    prefetch_ranges,
                     device,
                     executor="cpp_batch",
                 )
-                if int(hot_prefetch_count) != len(hot_ranges):
+                if int(hot_prefetch_count) != len(prefetch_ranges):
                     raise RuntimeError(
                         "Failed to restore every sealed hot expert range to "
                         "GPU: "
                         f"prefetched={hot_prefetch_count}, "
-                        f"expected={len(hot_ranges)}, "
+                        f"expected={len(prefetch_ranges)}, "
                         f"executor={hot_prefetch_executor!r}, "
                         f"driver_result={hot_prefetch_driver_result}"
                     )
@@ -9533,7 +10175,8 @@ def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
             if hot_ranges and not (
                 hot_physical_after.get("ok") is True
                 and int(hot_physical_after.get("queried_bytes", -1)) == hot_bytes
-                and int(hot_physical_after.get("gpu_bytes", -1)) == hot_bytes
+                and int(hot_physical_after.get("gpu_bytes", -1))
+                == hot_expected_gpu_bytes
                 and int(hot_physical_after.get("cpu_bytes", -1))
                 == expected_hot_cpu_bytes
                 and int(hot_physical_after.get("any_bytes", -1)) == hot_bytes
@@ -9584,6 +10227,12 @@ def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
                 "parameter_vas_after": parameter_vas_after,
                 "hot_range_count": int(hot_range_count),
                 "hot_bytes": int(hot_bytes),
+                "hot_gpu_range_count": int(hot_gpu_range_count),
+                "hot_expected_gpu_bytes": int(hot_expected_gpu_bytes),
+                "runtime_remote_range_count": len(
+                    normalized_runtime_remote_ranges
+                ),
+                "hot_runtime_remote_bytes": int(hot_runtime_remote_bytes),
                 "expected_hot_cpu_shadow_bytes": int(
                     expected_hot_cpu_bytes
                 ),
@@ -9599,6 +10248,30 @@ def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
                 "hot_prefetch_skipped_already_resident": bool(
                     hot_prefetch_skipped_already_resident
                 ),
+                "hot_mapping_refresh_required": bool(
+                    hot_mapping_refresh_required
+                ),
+                "mapping_refresh_scope": (
+                    "hot_gpu_complement"
+                    if normalized_mapping_refresh_ranges is None
+                    else "explicit_runtime_promotions"
+                ),
+                "mapping_refresh_target_count": int(
+                    mapping_refresh_target_count
+                ),
+                "mapping_refresh_target_bytes": int(
+                    mapping_refresh_target_bytes
+                ),
+                "mapping_refresh_prepare_prefetch_count": int(
+                    mapping_refresh_prepare_prefetch_count
+                ),
+                "mapping_refresh_prepare_prefetch_executor": str(
+                    mapping_refresh_prepare_prefetch_executor
+                ),
+                "mapping_refresh_prepare_prefetch_driver_result": int(
+                    mapping_refresh_prepare_prefetch_driver_result
+                ),
+                "hot_mapping_cutover": hot_mapping_cutover,
                 "hot_physical_residency_before": hot_physical_before,
                 "hot_physical_residency_after": hot_physical_after,
                 "free_bytes_before": int(free_before),
@@ -9629,6 +10302,12 @@ def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
                 "parameter_vas_before": parameter_vas_before,
                 "hot_range_count": int(hot_range_count),
                 "hot_bytes": int(hot_bytes),
+                "hot_gpu_range_count": int(hot_gpu_range_count),
+                "hot_expected_gpu_bytes": int(hot_expected_gpu_bytes),
+                "runtime_remote_range_count": len(
+                    normalized_runtime_remote_ranges
+                ),
+                "hot_runtime_remote_bytes": int(hot_runtime_remote_bytes),
                 "hot_advise_count": int(hot_advise_count),
                 "hot_advise_skipped_for_full_dual_view": bool(
                     hot_advise_skipped_for_full_dual_view
@@ -9638,6 +10317,10 @@ def reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
                 "hot_prefetch_driver_result": int(
                     hot_prefetch_driver_result
                 ),
+                "hot_mapping_refresh_required": bool(
+                    hot_mapping_refresh_required
+                ),
+                "hot_mapping_cutover": hot_mapping_cutover,
                 "hot_physical_residency_before": hot_physical_before,
                 "hot_physical_residency_after": hot_physical_after,
                 "free_bytes_before": int(free_before),

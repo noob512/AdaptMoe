@@ -27,6 +27,8 @@
     "attention_backend": "TRITON_ATTN",
     "phase_mode": "prefill_remote_decode",
     "execution_mode": "eager",
+    "scheduler_boundary_resize": true,
+    "synchronized_tier_steps": true,
     "low_pressure_streak": 3,
     "minimum_residency_steps": 4,
     "high_watermark": 0.8,

@@ -1,5 +1,10 @@
 # Qwen3 ours/KTransformers 原结果复现方法
 
+最后核验：2026-09-02。本文仍只复现2026-08-26历史结果。当前KTransformers工作区HEAD为
+`5a9c7d4cfaaed0136930e4b629ce5d55cec71a54`，父仓库gitlink为
+`8d9325af331d916721dfe7e2104f93f9b268678b`；在更新gitlink并重新运行前，不得把本文数字
+表述为当前main上的新结果。
+
 本文记录 2026-08-26 在单张 RTX 5090 上复现 Qwen3 ours/KTransformers
 Decode 对比的方法。该实验用于复现旧结果和检查机制可运行性；输入专家路由来自
 `legacy_pilot`，不能替代 EuroSys E3 的 v2 frozen-plan 正式结果。

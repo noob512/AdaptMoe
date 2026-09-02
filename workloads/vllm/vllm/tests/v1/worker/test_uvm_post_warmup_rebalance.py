@@ -3173,7 +3173,10 @@ def test_incremental_expert_worker_protocol_is_minimal(
     module = ExpertModule()
     runner = object.__new__(GPUModelRunner)
     runner.get_model = lambda: SimpleNamespace(modules=lambda: [module])  # type: ignore[method-assign]
-    runner._env_flag_enabled = lambda *_args, **_kwargs: True  # type: ignore[method-assign]
+    runner._env_flag_enabled = (  # type: ignore[method-assign]
+        lambda name, **_kwargs: name
+        == "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE"
+    )
     monkeypatch.setattr(
         gpu_model_runner_module,
         "uvm_enabled_allocation_phase",

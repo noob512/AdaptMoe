@@ -1,5 +1,44 @@
 # 复现 E10：当前档位双页表、2→4→6 GiB KV 压力切换
 
+## 2026-09-02当前权威轮
+
+最新成功artifact为：
+
+```text
+experiments/eurosys_moe_offload_evaluation/artifacts/
+e10-kv-2-4-6-pressure-20260902-attempt-01-scheduler-quiescent-sync-tier
+```
+
+该轮使用scheduler quiescent point、KV与专家Plan Class同步相邻切档、全覆盖双页表和
+快速P→D，verifier为`status=ok`。custom UVM为：
+
+```text
+srcversion  18E6563D21D9D2937D99EDF
+SHA-256     90fb5a7d9852a754ecf0358700d36dbcd04abd19886753ee5486401a937e5e15
+```
+
+| KV档 | 纯Prefill | 档位事务 | P→D | steady Decode | 请求E2E |
+|---:|---:|---:|---:|---:|---:|
+| 2 GiB/cold70 | 340.74 ms | 0 | 108.40 ms | 20.11 ms | 1007.96 ms |
+| 4 GiB/cold80 | 399.37 ms | 542.80 ms | 117.82 ms | 24.25 ms | 1672.99 ms |
+| 6 GiB/cold89 | 447.60 ms | 565.27 ms | 138.35 ms | 26.78 ms | 1831.87 ms |
+
+2→4与4→6 GiB分别移动相邻约2 GiB KV容量并同步切换专家档。三档输出hash一致、双页表
+覆盖100%、无range-map fallback、Graph重捕获或GPU/UVM故障；结束后恢复stock UVM。
+这仍是一个冻结压力序列、一个冷进程样本，不是自动联合控制器formal或统计结论。
+
+推荐运行命令：
+
+```bash
+cd /home/ubuntu/nvidia-uvm-gpu
+RUN_ROOT=experiments/eurosys_moe_offload_evaluation/artifacts/\
+e10-kv-2-4-6-pressure-NEW-attempt-01-scheduler-quiescent-sync-tier \
+E10_TRIGGER_MODE=pressure ALLOW_GPU_RUN=1 \
+bash experiments/vllm_uvm_e10_multilevel_pressure/run_experiment.sh qualify
+```
+
+以下章节保留较早协议和pressure/direct诊断；与本节冲突时以本节为准。
+
 ## 1. 实验目标和边界
 
 E10 验证在固定 8 GiB KV 虚拟地址池中，系统能否按 backup 队列的真实压力把 GPU 上的
@@ -173,8 +212,9 @@ experiments/eurosys_moe_offload_evaluation/artifacts/
 e2-e3-e10-current-dual-view-REPRO-20260831-attempt-01/e10/
 ```
 
-其解释报告为 `RESULTS_E2_E3_E10_CURRENT_DUAL_VIEW_REPRO_20260831.md`，统一复现步骤见
-`REPRODUCE_E2_E3_E10_CURRENT_DUAL_VIEW_SINGLE_ROUND_20260831.md`。
+其解释报告为 `RESULTS_E2_E3_E10_CURRENT_DUAL_VIEW_REPRO_20260831.md`；该轮的联合协议是
+历史材料，当前统一入口为本文件及
+`experiments/reproduce/REPRODUCE_E2_E3_E10_C1_C16_FULL_DUAL_SINGLE_ROUND_20260831.md`。
 
 ## 7. 压力触发与直接切档对照
 

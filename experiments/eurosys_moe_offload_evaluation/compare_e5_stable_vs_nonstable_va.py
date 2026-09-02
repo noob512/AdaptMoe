@@ -197,7 +197,9 @@ def main() -> int:
         "comparison": comparison,
     }
     require(not args.output.exists(), f"refusing to overwrite {args.output}")
-    args.output.parent.mkdir(parents=True, exist_ok=False)
+    # The output file itself is immutable, but a conventional destination such
+    # as /tmp already exists.  Only create missing parent directories here.
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

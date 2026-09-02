@@ -9046,11 +9046,12 @@ static void block_gpu_map_split_2m(uvm_va_block_t *block,
 //
 // new_big_ptes specifies which PTEs should be big. NULL means all PTEs should
 // be 4k.
-static void block_gpu_split_2m(uvm_va_block_t *block,
-                               uvm_va_block_context_t *block_context,
-                               uvm_gpu_t *gpu,
-                               const unsigned long *new_big_ptes,
-                               uvm_push_t *push)
+static void block_gpu_split_2m_to_resident(uvm_va_block_t *block,
+                                           uvm_va_block_context_t *block_context,
+                                           uvm_gpu_t *gpu,
+                                           const unsigned long *new_big_ptes,
+                                           uvm_processor_id_t resident_override,
+                                           uvm_push_t *push)
 {
     uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(block, gpu->id);
     uvm_page_tree_t *tree = &uvm_va_block_get_gpu_va_space(block, gpu)->page_tables;
@@ -9101,7 +9102,9 @@ static void block_gpu_split_2m(uvm_va_block_t *block,
         block_gpu_pte_clear_big(block, gpu, new_big_ptes_local, unmapped_pte_val, pte_batch, NULL);
     }
     else {
-        curr_residency = block_gpu_get_processor_to_map(block, block_context, gpu, 0);
+        curr_residency = UVM_ID_IS_VALID(resident_override) ?
+            resident_override :
+            block_gpu_get_processor_to_map(block, block_context, gpu, 0);
 
         // Case 2a: Write the new 4k PTEs under big_ptes_split
         block_gpu_pte_write_4k(block,
@@ -9127,6 +9130,20 @@ static void block_gpu_split_2m(uvm_va_block_t *block,
 
     gpu_state->pte_is_2m = false;
     bitmap_copy(gpu_state->big_ptes, new_big_ptes_local, UVM_BIG_PAGES_PER_UVM_VA_BLOCK);
+}
+
+static void block_gpu_split_2m(uvm_va_block_t *block,
+                               uvm_va_block_context_t *block_context,
+                               uvm_gpu_t *gpu,
+                               const unsigned long *new_big_ptes,
+                               uvm_push_t *push)
+{
+    block_gpu_split_2m_to_resident(block,
+                                   block_context,
+                                   gpu,
+                                   new_big_ptes,
+                                   UVM_ID_INVALID,
+                                   push);
 }
 
 // Split the big PTEs in big_ptes_to_split into 4k PTEs. No permissions are
@@ -10114,11 +10131,16 @@ static NV_STATUS block_validate_2m_split_backing(uvm_va_block_t *block,
                                          page_index);
         }
         else {
-            uvm_phase_f_route_log_always("moe_2m_split_reject block=0x%llx page=%u expected_resident=%u actual_resident=%u reason=mixed_residency\n",
+            uvm_phase_f_route_log_always("moe_2m_split_reject block=0x%llx page=%u expected_resident=%u actual_resident=%u mapped=%u cpu=%u cpu_alloc=%u gpu=%u reason=mixed_residency\n",
                                          block->start,
                                          page_index,
                                          uvm_id_value(expected_resident),
-                                         uvm_id_value(page_resident));
+                                         uvm_id_value(page_resident),
+                                         uvm_page_mask_weight(&remaining_pages),
+                                         uvm_page_mask_weight(&block->cpu.resident),
+                                         uvm_page_mask_weight(&block->cpu.allocated),
+                                         mapping_gpu_state ?
+                                             uvm_page_mask_weight(&mapping_gpu_state->resident) : 0);
         }
         return NV_ERR_INVALID_STATE;
     }
@@ -12045,6 +12067,65 @@ static NV_STATUS block_slot_alias_dual_prepare_locked(
                                                         false,
                                                         false);
         if (status == NV_ERR_INVALID_STATE) {
+            uvm_page_mask_t diagnostic_mask;
+            NvU32 slot_pages = gpu_state ?
+                uvm_page_mask_weight(&gpu_state->moe_slot_pte_bits) : 0;
+            NvU32 cpu_slot_pages = 0;
+            NvU32 gpu_slot_pages = 0;
+            NvU32 read_slot_pages = 0;
+            NvU32 write_slot_pages = 0;
+            NvU32 atomic_slot_pages = 0;
+            NvU32 discarded_slot_pages = 0;
+
+            if (gpu_state) {
+                uvm_page_mask_and(&diagnostic_mask,
+                                  &gpu_state->moe_slot_pte_bits,
+                                  &va_block->cpu.resident);
+                cpu_slot_pages = uvm_page_mask_weight(&diagnostic_mask);
+                uvm_page_mask_and(&diagnostic_mask,
+                                  &gpu_state->moe_slot_pte_bits,
+                                  &gpu_state->resident);
+                gpu_slot_pages = uvm_page_mask_weight(&diagnostic_mask);
+                uvm_page_mask_and(
+                    &diagnostic_mask,
+                    &gpu_state->moe_slot_pte_bits,
+                    &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ]);
+                read_slot_pages = uvm_page_mask_weight(&diagnostic_mask);
+                uvm_page_mask_and(
+                    &diagnostic_mask,
+                    &gpu_state->moe_slot_pte_bits,
+                    &gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE]);
+                write_slot_pages = uvm_page_mask_weight(&diagnostic_mask);
+                uvm_page_mask_and(
+                    &diagnostic_mask,
+                    &gpu_state->moe_slot_pte_bits,
+                    &gpu_state->pte_bits[UVM_PTE_BITS_GPU_ATOMIC]);
+                atomic_slot_pages = uvm_page_mask_weight(&diagnostic_mask);
+                uvm_page_mask_and(&diagnostic_mask,
+                                  &gpu_state->moe_slot_pte_bits,
+                                  &va_block->discarded_pages);
+                discarded_slot_pages = uvm_page_mask_weight(&diagnostic_mask);
+            }
+            uvm_phase_f_route_log_always(
+                "dual_prepare_skip block=0x%llx bytes=%llu aligned=%u support2m=%u gpu_state=%u table2m=%u pte2m=%u table4k=%u mapped=%u ready=%u cpuactive=%u slot=%u cpu=%u gpu=%u read=%u write=%u atomic=%u discarded=%u\n",
+                va_block->start,
+                (NvU64)uvm_va_block_size(va_block),
+                va_block->start == UVM_VA_BLOCK_ALIGN_DOWN(va_block->start) ? 1 : 0,
+                block_gpu_supports_2m(va_block, gpu) ? 1 : 0,
+                gpu_state ? 1 : 0,
+                gpu_state && gpu_state->page_table_range_2m.table ? 1 : 0,
+                gpu_state && gpu_state->pte_is_2m ? 1 : 0,
+                gpu_state && gpu_state->page_table_range_4k.table ? 1 : 0,
+                uvm_processor_mask_test(&va_block->mapped, gpu->id) ? 1 : 0,
+                gpu_state && gpu_state->moe_slot_dual_view_ready ? 1 : 0,
+                gpu_state && gpu_state->moe_slot_dual_view_cpu_active ? 1 : 0,
+                slot_pages,
+                cpu_slot_pages,
+                gpu_slot_pages,
+                read_slot_pages,
+                write_slot_pages,
+                atomic_slot_pages,
+                discarded_slot_pages);
             // A touched 2 MiB parent is only a candidate. VA-range edges,
             // 64K slot leaves, or mutable UVM state keep this block on the
             // legacy leaf path without rejecting the whole model.
@@ -12636,12 +12717,33 @@ static NV_STATUS block_slot_alias_dual_discard_locked(
             {
                 uvm_tlb_batch_t *tlb_batch =
                     &block_context->mapping.tlb_batch;
+                uvm_page_table_range_t *active_child =
+                    gpu_state->moe_slot_dual_view_cpu_active ?
+                        &gpu_state->moe_slot_dual_cpu_4k_range :
+                        &gpu_state->moe_slot_dual_gpu_4k_range;
 
-                // Publish the host page-tree's complete original hierarchy,
-                // including any ordinary 64K leaves retained during SEAL.
-                uvm_page_tree_write_pde(&gpu_va_space->page_tables,
-                                        &gpu_state->page_table_range_2m,
-                                        &push);
+                // Residency can change after SEAL while the detached child is
+                // active.  Re-publishing the original saved 2 MiB PTE would
+                // then falsely describe a mixed CPU/GPU block as having one
+                // physical destination, and the next partial release would
+                // fail its split-backing guard.  Materialize the currently
+                // certified complete child into the host-owned 4 KiB table
+                // and publish that table instead.  PARK can subsequently
+                // replace the selected alias leaves without losing ordinary
+                // hot-page residency.
+                block_slot_alias_dual_copy_4k_table(
+                    va_block,
+                    gpu,
+                    active_child,
+                    &gpu_state->page_table_range_4k,
+                    &push);
+                uvm_hal_wfi_membar(&push, UVM_MEMBAR_SYS);
+                uvm_push_set_flag(&push, UVM_PUSH_FLAG_NEXT_MEMBAR_NONE);
+                uvm_page_tree_write_pde_with_child(
+                    &gpu_va_space->page_tables,
+                    &gpu_state->page_table_range_2m,
+                    &gpu_state->page_table_range_4k,
+                    &push);
                 uvm_tlb_batch_begin(&gpu_va_space->page_tables, tlb_batch);
                 uvm_tlb_batch_invalidate(tlb_batch,
                                          va_block->start,
@@ -12655,9 +12757,11 @@ static NV_STATUS block_slot_alias_dual_discard_locked(
         if (status != NV_OK)
             return status;
 
-        bitmap_copy(gpu_state->big_ptes,
-                    gpu_state->moe_slot_dual_original_big_ptes,
+        bitmap_zero(gpu_state->big_ptes,
                     UVM_BIG_PAGES_PER_UVM_VA_BLOCK);
+        gpu_state->pte_is_2m = false;
+        gpu_state->activated_big = false;
+        gpu_state->activated_4k = true;
         ++result->pde_writes;
     }
 
@@ -13282,20 +13386,59 @@ NV_STATUS uvm_va_block_premap_readmostly_remote_read(uvm_va_block_t *va_block,
 
 validate_lower:
     if (status == NV_OK && forbid_2m_merge && block_gpu_supports_2m(va_block, gpu)) {
+        uvm_page_mask_t region_pages;
+        uvm_page_mask_t big_pages;
+        uvm_page_mask_t mapped_pages_mask;
+        uvm_page_mask_t mapped_big_pages;
+        uvm_page_mask_t mapped_4k_pages;
+        bool active_big = false;
+        bool active_4k = false;
+        bool lower_mapping_valid = false;
+
         gpu_state = uvm_va_block_gpu_state_get(va_block, gpu_id);
         atomic64_inc(&g_uvm_immutable_shadow_postmap_checks);
-        if (!gpu_state || gpu_state->pte_is_2m ||
-            !gpu_state->page_table_range_4k.table || !gpu_state->activated_4k) {
+        uvm_page_mask_zero(&mapped_big_pages);
+        uvm_page_mask_zero(&mapped_4k_pages);
+        if (gpu_state && !gpu_state->pte_is_2m) {
+            uvm_page_mask_init_from_region(&region_pages, region, NULL);
+            uvm_page_mask_and(&mapped_pages_mask,
+                              &region_pages,
+                              &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ]);
+            uvm_page_mask_init_from_big_ptes(va_block,
+                                             gpu,
+                                             &big_pages,
+                                             gpu_state->big_ptes);
+            uvm_page_mask_and(&mapped_big_pages,
+                              &mapped_pages_mask,
+                              &big_pages);
+            uvm_page_mask_andnot(&mapped_4k_pages,
+                                 &mapped_pages_mask,
+                                 &big_pages);
+            active_big = gpu_state->page_table_range_big.table &&
+                         gpu_state->activated_big;
+            active_4k = gpu_state->page_table_range_4k.table &&
+                        gpu_state->activated_4k;
+            lower_mapping_valid =
+                uvm_page_mask_region_full(&mapped_pages_mask, region) &&
+                (uvm_page_mask_empty(&mapped_big_pages) || active_big) &&
+                (uvm_page_mask_empty(&mapped_4k_pages) || active_4k);
+        }
+        if (!lower_mapping_valid) {
             atomic64_inc(&g_uvm_immutable_shadow_postmap_failures);
             uvm_phase_f_route_log_always(
-                "immutable_cpu_shadow_postmap_reject block=0x%llx region=[%u,%u) gpu_state=%u pte_is_2m=%u table_4k=%u active_4k=%u\n",
+                "immutable_cpu_shadow_postmap_reject block=0x%llx region=[%u,%u) gpu_state=%u pte_is_2m=%u table_big=%u active_big=%u table_4k=%u active_4k=%u mapped_big=%u mapped_4k=%u expected=%zu\n",
                 va_block->start,
                 region.first,
                 region.outer,
                 gpu_state ? 1 : 0,
                 gpu_state && gpu_state->pte_is_2m ? 1 : 0,
+                gpu_state && gpu_state->page_table_range_big.table ? 1 : 0,
+                active_big ? 1 : 0,
                 gpu_state && gpu_state->page_table_range_4k.table ? 1 : 0,
-                gpu_state && gpu_state->activated_4k ? 1 : 0);
+                active_4k ? 1 : 0,
+                uvm_page_mask_weight(&mapped_big_pages),
+                uvm_page_mask_weight(&mapped_4k_pages),
+                uvm_va_block_region_num_pages(region));
             status = NV_ERR_INVALID_STATE;
         }
     }
@@ -23938,15 +24081,43 @@ out:
 
 static NV_STATUS block_make_release_region_cpu_resident(uvm_va_block_t *va_block,
                                                         struct mm_struct *mm,
+                                                        uvm_gpu_t *gpu,
                                                         uvm_va_block_region_t region,
+                                                        bool refresh_existing_cpu_shadow,
                                                         uvm_tracker_t *tracker)
 {
     NV_STATUS status;
     uvm_service_block_context_t *service_context;
+    uvm_va_block_context_t *block_context;
+    uvm_page_mask_t pages;
+    uvm_va_block_gpu_state_t *gpu_state;
 
     service_context = uvm_service_block_context_alloc(mm);
     if (!service_context)
         return NV_ERR_NO_MEMORY;
+
+    block_context = service_context->block_context;
+    if (refresh_existing_cpu_shadow &&
+        uvm_page_mask_region_full(&va_block->cpu.resident, region)) {
+        gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+        if (!gpu_state ||
+            !uvm_page_mask_region_full(&gpu_state->resident, region)) {
+            status = NV_ERR_INVALID_STATE;
+            goto out;
+        }
+
+        // Refresh the immutable CPU copy from the authoritative GPU copy.
+        // Use a standalone mask: make-resident routines use the masks in
+        // block_context as scratch storage and may otherwise clobber the mask
+        // which their finish phase still needs to revoke GPU residency.
+        uvm_page_mask_init_from_region(&pages, region, NULL);
+        block_context->make_resident.dest_nid = NUMA_NO_NODE;
+        break_read_duplication_in_region(va_block,
+                                         block_context,
+                                         gpu->id,
+                                         region,
+                                         &pages);
+    }
 
     status = uvm_va_block_migrate_locked(va_block,
                                          NULL,
@@ -23956,6 +24127,7 @@ static NV_STATUS block_make_release_region_cpu_resident(uvm_va_block_t *va_block
                                          UVM_MIGRATE_MODE_MAKE_RESIDENT_AND_MAP,
                                          tracker);
 
+out:
     uvm_service_block_context_free(service_context);
     return status;
 }
@@ -23977,6 +24149,8 @@ static NV_STATUS block_presplit_2m_for_partial_shadow_cutover(
     uvm_va_block_new_pte_state_t *new_pte_state =
         &block_context->mapping.new_pte_state;
     uvm_page_mask_t no_pages_to_unmap;
+    uvm_page_mask_t mapped_pages;
+    uvm_processor_id_t resident_override = UVM_ID_INVALID;
     uvm_push_t push;
     NV_STATUS status = NV_OK;
     NvU64 start_ns = NV_GETTIME();
@@ -24001,13 +24175,38 @@ static NV_STATUS block_presplit_2m_for_partial_shadow_cutover(
     // A valid 2 MiB PTE has one destination for the complete block. Validate
     // all mapped leaves, including the pages about to be released, because
     // block_gpu_split_2m() materializes every one of them before cutover.
-    uvm_page_mask_zero(&no_pages_to_unmap);
-    status = block_validate_2m_split_backing(va_block,
-                                             block_context,
-                                             gpu,
-                                             &no_pages_to_unmap);
-    if (status != NV_OK)
-        goto out;
+    //
+    // A whole-Parameter ReadMostly shadow has one additional legal state:
+    // CPU owns complete immutable backing while GPU residency has become
+    // sparse under pressure. The live 2 MiB mapping must then resolve to CPU,
+    // even though the generic closest-resident lookup can select the local
+    // GPU for page zero. Preserve that CPU destination explicitly while
+    // lowering the mapping to 4 KiB leaves. This is fail-closed: the fallback
+    // is used only when CPU residency and allocation cover every mapped leaf
+    // and GPU backing provably does not.
+    uvm_page_mask_copy(&mapped_pages,
+                       &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ]);
+    if (!uvm_page_mask_empty(&mapped_pages) &&
+        uvm_page_mask_subset(&mapped_pages, &va_block->cpu.resident) &&
+        uvm_page_mask_subset(&mapped_pages, &va_block->cpu.allocated) &&
+        !uvm_page_mask_subset(&mapped_pages, &gpu_state->resident)) {
+        resident_override = UVM_ID_CPU;
+        uvm_phase_f_route_log_always(
+            "immutable_cpu_shadow_presplit_cpu_override block=0x%llx mapped=%u cpu=%u gpu=%u\n",
+            va_block->start,
+            uvm_page_mask_weight(&mapped_pages),
+            uvm_page_mask_weight(&va_block->cpu.resident),
+            uvm_page_mask_weight(&gpu_state->resident));
+    }
+    else {
+        uvm_page_mask_zero(&no_pages_to_unmap);
+        status = block_validate_2m_split_backing(va_block,
+                                                 block_context,
+                                                 gpu,
+                                                 &no_pages_to_unmap);
+        if (status != NV_OK)
+            goto out;
+    }
 
     memset(new_pte_state, 0, sizeof(*new_pte_state));
     new_pte_state->needs_4k = true;
@@ -24029,7 +24228,12 @@ static NV_STATUS block_presplit_2m_for_partial_shadow_cutover(
     if (status != NV_OK)
         goto out;
 
-    block_gpu_split_2m(va_block, block_context, gpu, NULL, &push);
+    block_gpu_split_2m_to_resident(va_block,
+                                   block_context,
+                                   gpu,
+                                   NULL,
+                                   resident_override,
+                                   &push);
     status = uvm_push_end_and_wait(&push);
     if (status != NV_OK)
         goto out;
@@ -24068,7 +24272,7 @@ static NV_STATUS block_cutover_to_existing_cpu_shadow(uvm_va_block_t *va_block,
     NV_STATUS status;
     uvm_service_block_context_t *service_context;
     uvm_va_block_context_t *block_context;
-    uvm_page_mask_t *pages;
+    uvm_page_mask_t pages;
 
     service_context = uvm_service_block_context_alloc(mm);
     if (!service_context)
@@ -24076,15 +24280,24 @@ static NV_STATUS block_cutover_to_existing_cpu_shadow(uvm_va_block_t *va_block,
 
     block_context = service_context->block_context;
     block_context->make_resident.dest_nid = NUMA_NO_NODE;
-    pages = &block_context->caller_page_mask;
-    uvm_page_mask_init_from_region(pages, region, NULL);
+    // This mask must survive make_resident_copy() until its finish phase.
+    // The masks embedded in block_context are scratch storage for that path.
+    uvm_page_mask_init_from_region(&pages, region, NULL);
 
     status = block_presplit_2m_for_partial_shadow_cutover(va_block,
                                                           block_context,
                                                           gpu,
                                                           region);
-    if (status != NV_OK)
+    if (status != NV_OK) {
+        uvm_phase_f_route_log_always(
+            "cpu_shadow_cutover_fail stage=presplit_before block=0x%llx block_bytes=%llu region=[%u,%u) status=0x%x\n",
+            va_block->start,
+            (NvU64)uvm_va_block_size(va_block),
+            region.first,
+            region.outer,
+            status);
         goto out;
+    }
 
     // Deliberately bypass uvm_va_block_migrate_locked(): the public migrate
     // path honors ReadMostly and would preserve the GPU duplicate. The CPU
@@ -24095,9 +24308,39 @@ static NV_STATUS block_cutover_to_existing_cpu_shadow(uvm_va_block_t *va_block,
                                         block_context,
                                         UVM_ID_CPU,
                                         region,
-                                        pages,
+                                        &pages,
                                         NULL,
                                         UVM_MAKE_RESIDENT_CAUSE_API_HINT);
+    if (status != NV_OK) {
+        uvm_phase_f_route_log_always(
+            "cpu_shadow_cutover_fail stage=make_resident block=0x%llx block_bytes=%llu region=[%u,%u) status=0x%x cpu=%u gpu=%u readdup=%u read=%u write=%u atomic=%u pte2m=%u\n",
+            va_block->start,
+            (NvU64)uvm_va_block_size(va_block),
+            region.first,
+            region.outer,
+            status,
+            uvm_page_mask_region_weight(&va_block->cpu.resident, region),
+            uvm_va_block_gpu_state_get(va_block, gpu->id) ?
+                uvm_page_mask_region_weight(
+                    &uvm_va_block_gpu_state_get(va_block, gpu->id)->resident,
+                    region) : 0,
+            uvm_page_mask_region_weight(&va_block->read_duplicated_pages,
+                                        region),
+            uvm_va_block_gpu_state_get(va_block, gpu->id) ?
+                uvm_page_mask_region_weight(
+                    &uvm_va_block_gpu_state_get(va_block, gpu->id)->pte_bits[UVM_PTE_BITS_GPU_READ],
+                    region) : 0,
+            uvm_va_block_gpu_state_get(va_block, gpu->id) ?
+                uvm_page_mask_region_weight(
+                    &uvm_va_block_gpu_state_get(va_block, gpu->id)->pte_bits[UVM_PTE_BITS_GPU_WRITE],
+                    region) : 0,
+            uvm_va_block_gpu_state_get(va_block, gpu->id) ?
+                uvm_page_mask_region_weight(
+                    &uvm_va_block_gpu_state_get(va_block, gpu->id)->pte_bits[UVM_PTE_BITS_GPU_ATOMIC],
+                    region) : 0,
+            uvm_va_block_gpu_state_get(va_block, gpu->id) &&
+                uvm_va_block_gpu_state_get(va_block, gpu->id)->pte_is_2m ? 1 : 0);
+    }
 
     // The residency update can legally coalesce a now-uniform CPU mapping
     // back into a 2 MiB PTE. Split that result again while every GPU chunk is
@@ -24115,19 +24358,73 @@ static NV_STATUS block_cutover_to_existing_cpu_shadow(uvm_va_block_t *va_block,
             status = block_presplit_2m_for_partial_shadow_cutover(
                 va_block, block_context, gpu, region);
             gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+            if (status != NV_OK) {
+                uvm_phase_f_route_log_always(
+                    "cpu_shadow_cutover_fail stage=presplit_after block=0x%llx block_bytes=%llu region=[%u,%u) status=0x%x\n",
+                    va_block->start,
+                    (NvU64)uvm_va_block_size(va_block),
+                    region.first,
+                    region.outer,
+                    status);
+            }
         }
 
+        // make_resident() may legitimately remove the last GPU mapping in
+        // this VA block and release the complete lower page table.  That is a
+        // safe state for subchunk reclamation: there is no live PDE which can
+        // still resolve to the soon-to-be-freed backing.  A retained 4K table
+        // must be active; only a live 2M PTE (or an inactive retained child)
+        // is unsafe.
         if (status == NV_OK &&
             (!gpu_state || gpu_state->pte_is_2m ||
-             !gpu_state->page_table_range_4k.table ||
-             !gpu_state->activated_4k)) {
+             (gpu_state->page_table_range_4k.table &&
+              !gpu_state->activated_4k))) {
             status = NV_ERR_INVALID_STATE;
+            uvm_phase_f_route_log_always(
+                "cpu_shadow_cutover_fail stage=pte_postcondition block=0x%llx block_bytes=%llu region=[%u,%u) gpu_state=%u pte2m=%u has4k=%u active4k=%u\n",
+                va_block->start,
+                (NvU64)uvm_va_block_size(va_block),
+                region.first,
+                region.outer,
+                gpu_state ? 1 : 0,
+                gpu_state && gpu_state->pte_is_2m ? 1 : 0,
+                gpu_state && gpu_state->page_table_range_4k.table ? 1 : 0,
+                gpu_state && gpu_state->activated_4k ? 1 : 0);
         }
     }
 
 out:
     uvm_service_block_context_free(service_context);
     return status;
+}
+
+static NV_STATUS block_refresh_and_cutover_to_cpu(uvm_va_block_t *va_block,
+                                                   struct mm_struct *mm,
+                                                   uvm_gpu_t *gpu,
+                                                   uvm_va_block_region_t region,
+                                                   bool refresh_existing_cpu_shadow,
+                                                   uvm_tracker_t *tracker)
+{
+    NV_STATUS status;
+
+    status = block_make_release_region_cpu_resident(va_block,
+                                                     mm,
+                                                     gpu,
+                                                     region,
+                                                     refresh_existing_cpu_shadow,
+                                                     tracker);
+    if (status != NV_OK)
+        return status;
+
+    // ReadMostly migration intentionally leaves a fresh GPU/CPU duplicate.
+    // Wait for the GPU -> CPU copy before revoking the GPU copy through the
+    // existing no-copy shadow cutover. Only after both steps is it safe for
+    // the caller to free the GPU chunks.
+    status = uvm_tracker_wait(tracker);
+    if (status != NV_OK)
+        return status;
+
+    return block_cutover_to_existing_cpu_shadow(va_block, mm, gpu, region);
 }
 
 NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
@@ -24148,6 +24445,7 @@ NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
     uvm_page_mask_t shadow_pages;
     uvm_page_mask_t scratch_pages;
     uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
+    bool cpu_shadow_full = false;
 
     uvm_assert_mutex_locked(&va_block->lock);
 
@@ -24178,6 +24476,9 @@ NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
     // valid read-duplicate. At the scheduler-certified quiescence point the
     // make-resident path below revokes those GPU mappings before freeing the
     // GPU copy, without issuing a GPU-to-CPU transfer.
+    uvm_page_mask_init_from_region(&shadow_pages, region, NULL);
+    cpu_shadow_full = uvm_page_mask_subset(&shadow_pages, &va_block->cpu.resident);
+
     if (require_immutable_cpu_shadow) {
         bool cpu_full;
         bool gpu_full;
@@ -24193,8 +24494,7 @@ NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
             goto out;
 
         gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
-        uvm_page_mask_init_from_region(&shadow_pages, region, NULL);
-        cpu_full = uvm_page_mask_subset(&shadow_pages, &va_block->cpu.resident);
+        cpu_full = cpu_shadow_full;
         gpu_full = gpu_state && uvm_page_mask_subset(&shadow_pages, &gpu_state->resident);
         read_duplicate_full = uvm_page_mask_subset(&shadow_pages, &va_block->read_duplicated_pages);
         gpu_read_full = gpu_state &&
@@ -24242,19 +24542,48 @@ NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
         NULL,
         require_immutable_cpu_shadow ?
             block_cutover_to_existing_cpu_shadow(va_block, mm, gpu, region) :
-            block_make_release_region_cpu_resident(va_block,
-                                                   mm,
-                                                   region,
-                                                   &local_tracker));
-    if (status != NV_OK)
+            block_refresh_and_cutover_to_cpu(va_block,
+                                             mm,
+                                             gpu,
+                                             region,
+                                             cpu_shadow_full,
+                                             &local_tracker));
+    if (status != NV_OK) {
+        uvm_phase_f_route_log_always(
+            "release_gpu_subchunks_fail stage=cutover block=0x%llx block_bytes=%llu region=[%u,%u) immutable=%u cpu_shadow=%u status=0x%x\n",
+            va_block->start,
+            (NvU64)uvm_va_block_size(va_block),
+            region.first,
+            region.outer,
+            require_immutable_cpu_shadow ? 1 : 0,
+            cpu_shadow_full ? 1 : 0,
+            status);
         goto out;
+    }
 
     gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
-    if (!gpu_state || !gpu_state->chunks)
+    if (!gpu_state || !gpu_state->chunks) {
+        uvm_phase_f_route_log_always(
+            "release_gpu_subchunks_note stage=no_chunks block=0x%llx block_bytes=%llu region=[%u,%u) gpu_state=%u status=0x%x\n",
+            va_block->start,
+            (NvU64)uvm_va_block_size(va_block),
+            region.first,
+            region.outer,
+            gpu_state ? 1 : 0,
+            status);
         goto out;
+    }
 
     if (!uvm_page_mask_region_full(&va_block->cpu.resident, region)) {
         status = NV_WARN_MORE_PROCESSING_REQUIRED;
+        uvm_phase_f_route_log_always(
+            "release_gpu_subchunks_fail stage=cpu_postcondition block=0x%llx region=[%u,%u) cpu=%u expected=%zu status=0x%x\n",
+            va_block->start,
+            region.first,
+            region.outer,
+            uvm_page_mask_region_weight(&va_block->cpu.resident, region),
+            uvm_va_block_region_num_pages(region),
+            status);
         goto out;
     }
 
@@ -24264,6 +24593,21 @@ NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
         !uvm_page_mask_region_empty(&gpu_state->pte_bits[UVM_PTE_BITS_GPU_ATOMIC], region) ||
         !uvm_page_mask_region_empty(&gpu_state->moe_slot_pte_bits, region)) {
         status = NV_ERR_INVALID_STATE;
+        uvm_phase_f_route_log_always(
+            "release_gpu_subchunks_fail stage=gpu_postcondition block=0x%llx region=[%u,%u) resident=%u read=%u write=%u atomic=%u slot=%u status=0x%x\n",
+            va_block->start,
+            region.first,
+            region.outer,
+            uvm_page_mask_region_weight(&gpu_state->resident, region),
+            uvm_page_mask_region_weight(
+                &gpu_state->pte_bits[UVM_PTE_BITS_GPU_READ], region),
+            uvm_page_mask_region_weight(
+                &gpu_state->pte_bits[UVM_PTE_BITS_GPU_WRITE], region),
+            uvm_page_mask_region_weight(
+                &gpu_state->pte_bits[UVM_PTE_BITS_GPU_ATOMIC], region),
+            uvm_page_mask_region_weight(&gpu_state->moe_slot_pte_bits,
+                                        region),
+            status);
         goto out;
     }
 
@@ -24274,8 +24618,17 @@ NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
         status = NV_OK;
         goto out;
     }
-    if (status != NV_OK)
+    if (status != NV_OK) {
+        uvm_phase_f_route_log_always(
+            "release_gpu_subchunks_fail stage=chunk_convert block=0x%llx block_bytes=%llu region=[%u,%u) fixed=%llu status=0x%x\n",
+            va_block->start,
+            (NvU64)uvm_va_block_size(va_block),
+            region.first,
+            region.outer,
+            (NvU64)gpu_state->fixed_chunk_size,
+            status);
         goto out;
+    }
 
     num_gpu_chunks = block_num_gpu_chunks(va_block, gpu);
     chunk_region.outer = 0;
@@ -24295,11 +24648,28 @@ NV_STATUS uvm_va_block_release_gpu_subchunks_to_cpu(uvm_va_block_t *va_block,
 
         if (!uvm_va_block_region_contains_region(region, chunk_region)) {
             status = NV_ERR_NOT_SUPPORTED;
+            uvm_phase_f_route_log_always(
+                "release_gpu_subchunks_fail stage=chunk_overlap block=0x%llx region=[%u,%u) chunk=[%u,%u) chunk_bytes=%llu status=0x%x\n",
+                va_block->start,
+                region.first,
+                region.outer,
+                chunk_region.first,
+                chunk_region.outer,
+                (NvU64)chunk_size,
+                status);
             goto out;
         }
 
         if (chunk_size > release_chunk_size) {
             status = NV_ERR_NOT_SUPPORTED;
+            uvm_phase_f_route_log_always(
+                "release_gpu_subchunks_fail stage=chunk_size block=0x%llx region=[%u,%u) chunk_bytes=%llu max_bytes=%llu status=0x%x\n",
+                va_block->start,
+                region.first,
+                region.outer,
+                (NvU64)chunk_size,
+                (NvU64)release_chunk_size,
+                status);
             goto out;
         }
 

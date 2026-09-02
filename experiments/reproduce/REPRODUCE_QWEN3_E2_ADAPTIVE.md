@@ -1,5 +1,9 @@
 # 复现 Qwen3 E2 自适应并发实验
 
+最后核验：2026-09-02。最新通过参考仍是2026-08-27 artifact；本流程尚未在9月2日
+custom UVM和scheduler-boundary KV扩缩代码上重跑。因此它是冻结历史协议，不是E13在线
+自适应协议，也不能用来证明当前源码回归通过。
+
 本文档复现 `e2-qwen3-adaptive-concurrency-20260827-attempt-01`：在 2 GiB KV 下，按并发档位选择 cold19/cold25 专家计划，在热门专家迁回前捕获并永久保留正式 pure-Prefill Graph，然后完成 Qwen3 E2 的 16 个 cell。
 
 ## 1. 复现范围

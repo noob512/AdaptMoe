@@ -1,6 +1,7 @@
 # 复现 E3 B1/B8 Prefill 与 Decode 三机制实验
 
-本文档复现 2026-08-31 完成的 E3 6.5 phase-only qualification，覆盖：
+本文档复现 E3 6.5 phase-only qualification。协议最初冻结于 2026-08-31，当前权威证据
+核验于 2026-09-02，覆盖：
 
 1. 自定义 CUDA Graph copy 的 Prefill；
 2. 自定义 CUDA Graph remote-read 的 Decode；
@@ -13,6 +14,25 @@
 不启用 chunked Prefill，而是让这两个大 Prefill cell 使用已经通过验收的 D/TRITON
 全覆盖双页表路径，并对称补跑 native TRITON copy/UVA。最终每个 Decode cell 内的三个
 机制使用相同 attention backend，10/10 cell 完整输出 hash 一致。
+
+## 0. 2026-09-02 当前权威证据
+
+本协议最近一次完整复验由四组不可覆盖 artifact 组成：
+
+```text
+Native FLASH copy/UVA
+  artifacts/e3-native-copy-uva-reproduce-all-20260901-attempt-01
+Native TRITON Medium/B8、RAG/B8
+  artifacts/e3-native-triton-large-b8-reproduce-all-20260901-attempt-01
+Prefill TRITON Graph-copy
+  artifacts/e3-prefill-graph-copy-reproduce-all-20260901-attempt-01
+Decode 当前档完整汇总
+  artifacts/e3-decode-complete-reproduce-all-20260901-attempt-01
+```
+
+前三组分别为20/20、4/4和10/10运行成功；Decode verifier为`status=ok`，覆盖10/10
+logical cell和24/24 run。本文12节中的参考表已按这些artifact更新。它们是分臂复验，
+不得写成一个共同冷进程，也不能跨attention backend解释成单变量Graph消融。
 
 ## 1. 可以复现的结论
 
@@ -732,9 +752,16 @@ D/TRITON路径并使用对称N-TRITON基线；不得拆B8、启用chunked Prefil
 
 复现成功的标准是：性能趋势、调度契约、输出一致性、Graph replay 和 cleanup 同时通过，而不是只得到一张延迟表。
 
-## 15. 原始已验证 artifact
+## 15. 已验证 artifact
 
-2026-08-31完整复跑：
+2026-09-01/02当前复验：
+
+- Native FLASH copy/UVA：`artifacts/e3-native-copy-uva-reproduce-all-20260901-attempt-01/`
+- Native TRITON大B8补缺：`artifacts/e3-native-triton-large-b8-reproduce-all-20260901-attempt-01/`
+- Prefill Graph-copy：`artifacts/e3-prefill-graph-copy-reproduce-all-20260901-attempt-01/`
+- Decode 10-cell/24-run完整汇总：`artifacts/e3-decode-complete-reproduce-all-20260901-attempt-01/`
+
+2026-08-31历史完整复跑：
 
 - Native FLASH copy/UVA：`artifacts/e3-section65-native-20260831-attempt-01/`
 - Native TRITON大B8补缺：`artifacts/e3-section65-native-triton-large-b8-20260831-attempt-01/`
@@ -752,8 +779,8 @@ D/TRITON路径并使用对称N-TRITON基线；不得拆B8、启用chunked Prefil
 
 配套结果与问题记录：
 
-- `RESULTS_E3_SECTION65_COMPLETE_RERUN_20260831.md`（当前权威结果）
-- `RESULTS_E0_E12_LATEST_CONSOLIDATED_20260831.md`（当前汇总）
+- `RESULTS_E3_SECTION65_COMPLETE_RERUN_20260831.md`（历史完整结果）
+- `RESULTS_E0_E12_LATEST_CONSOLIDATED_20260831.md`（当前权威汇总）
 - `RESULTS_E3_PREFILL_GRAPH_COPY_VS_NATIVE_COPY_UVA_B1_B8_20260828.md`（历史）
 - `RESULTS_E3_PREFILL_GRAPH_VS_NATIVE_COPY_20260828.md`（历史）
 - `RESULTS_E3_DECODE_THREE_MECHANISM_B1_B8_20260828.md`（历史）

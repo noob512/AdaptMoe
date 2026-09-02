@@ -1094,6 +1094,7 @@ def release_uvm_regions(
     *,
     device: int = 0,
     remote_read: bool = False,
+    immutable_cpu_shadow: bool = False,
     include_audit: bool = False,
 ) -> dict[str, Any]:
     """Release only the explicitly named regions, with idempotent state checks."""
@@ -1183,6 +1184,7 @@ def release_uvm_regions(
             driver_kwargs: dict[str, Any] = {
                 "device": device,
                 "remote_read": remote_read,
+                "immutable_cpu_shadow": immutable_cpu_shadow,
             }
             if include_audit:
                 driver_kwargs["include_audit"] = True

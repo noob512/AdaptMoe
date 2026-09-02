@@ -141,9 +141,11 @@ UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_BG_DEFERRED = 7
 UVM_PHASE_F_ACTION_START_BG_PROMOTION = 8
 UVM_PHASE_F_ACTION_PAUSE_BG_PROMOTION = 16
 UVM_PHASE_F_ACTION_RESUME_BG_PROMOTION = 17
+UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST = 18
 UVM_PHASE_F_ACTION_PREPARE_REMOTE_READ_AUDITED = 21
 UVM_PHASE_F_ACTION_IMMUTABLE_CPU_SHADOW_CUTOVER = 22
 UVM_PHASE_F_ACTION_REBUILD_GPU_READ_MAPPINGS = 23
+UVM_PHASE_F_ACTION_SYNC_CPU_REMOTE_CUTOVER = 24
 _NV_ERR_INVALID_DEVICE = 0x00000026
 
 UVM_REGION_STATE_UNKNOWN = 0
@@ -155,6 +157,7 @@ UVM_REGION_STATE_INACTIVE = 5
 
 UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K = 1 << 2
 UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ = 1 << 3
+UVM_EXPERT_OFFLOAD_RELEASE_FLAG_IMMUTABLE_CPU_SHADOW = 1 << 4
 
 
 class _UvmInitializeParams(ctypes.Structure):
@@ -4732,6 +4735,220 @@ def driver_phase_f_batch_execute_ranges(
                 os.close(fd)
 
 
+def driver_promote_ranges_to_read_duplicate_fast(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    *,
+    device: int = 0,
+) -> dict[str, object]:
+    """Re-establish immutable CPU/GPU read-duplicate state for weight slices.
+
+    CUDA Graph capture can touch only a routed subset of logically-hot expert
+    pages.  A later Plan Class cutover requires every added-cold page to carry
+    UVM's authoritative read-duplicate and GPU-READ-PTE certificate.  Action
+    18 promotes exactly those differential ranges without changing their VAs.
+    """
+    normalized = [
+        (int(ptr), int(size))
+        for ptr, size in ranges
+        if int(ptr) > 0 and int(size) > 0
+    ]
+    requested_bytes = sum(size for _, size in normalized)
+    empty_result: dict[str, object] = {
+        "ok": True,
+        "action": "expert_read_duplicate_fast",
+        "range_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "requested_bytes": 0,
+        "gpu_read_duplicate_bytes": 0,
+        "cpu_shadow_bytes": 0,
+        "rm_status": 0,
+        "ioctl_ret": 0,
+        "results": (),
+    }
+    if not normalized:
+        return empty_result
+    if not _phase_f_batch_abi_matches_kernel():
+        return {
+            **empty_result,
+            "ok": False,
+            "range_count": len(normalized),
+            "failure_count": len(normalized),
+            "requested_bytes": int(requested_bytes),
+            "ioctl_ret": -2,
+            "reason": "phase_f_abi_mismatch",
+        }
+
+    try:
+        gpu_uuid = _phase_f_gpu_uuid(int(device))
+    except Exception:
+        logger.debug("Failed to resolve CUDA UUID for expert promotion", exc_info=True)
+        return {
+            **empty_result,
+            "ok": False,
+            "range_count": len(normalized),
+            "failure_count": len(normalized),
+            "requested_bytes": int(requested_bytes),
+            "ioctl_ret": -3,
+            "reason": "gpu_uuid_failed",
+        }
+
+    def run_candidate(
+        fd: int, *, source_fd: int, candidate_index: int
+    ) -> dict[str, object]:
+        success_count = 0
+        failure_count = 0
+        gpu_read_duplicate_bytes = 0
+        cpu_shadow_bytes = 0
+        last_rm_status = 0
+        last_ioctl_ret = 0
+        records: list[dict[str, int]] = []
+
+        for start in range(0, len(normalized), _UVM_PHASE_F_MAX_RANGES):
+            chunk = normalized[start : start + _UVM_PHASE_F_MAX_RANGES]
+            params = _PhaseFBatchExecutorParams()
+            params.action = UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST
+            params.count = len(chunk)
+            params.gpu_uuid = gpu_uuid
+            params.async_ = 0
+            for index, (ptr, size) in enumerate(chunk):
+                params.ranges[index].base = int(ptr)
+                params.ranges[index].length = int(size)
+
+            ctypes.set_errno(0)
+            last_ioctl_ret = int(
+                _libc_ioctl(fd, _UVM_PHASE_F_BATCH_EXECUTOR_IOCTL, params)
+            )
+            last_rm_status = int(params.rmStatus)
+            success_count += int(params.success_count)
+            failure_count += int(params.failure_count)
+            for index, (ptr, size) in enumerate(chunk):
+                raw = params.results[index]
+                record = {
+                    "base": int(ptr),
+                    "length": int(size),
+                    "status": int(raw.status),
+                    "gpu_read_duplicate_bytes": int(raw.resident_gpu_bytes),
+                    "cpu_shadow_bytes": int(raw.resident_cpu_bytes),
+                    "covered_bytes": int(raw.resident_any_bytes),
+                    "unknown_bytes": int(raw.resident_unknown_bytes),
+                }
+                records.append(record)
+                gpu_read_duplicate_bytes += int(raw.resident_gpu_bytes)
+                cpu_shadow_bytes += int(raw.resident_cpu_bytes)
+
+            if last_ioctl_ret != 0 or last_rm_status != 0:
+                break
+
+        complete = (
+            last_ioctl_ret == 0
+            and last_rm_status == 0
+            and success_count == len(normalized)
+            and failure_count == 0
+            and len(records) == len(normalized)
+            and all(
+                int(record["status"]) == 0
+                and int(record["covered_bytes"]) == int(record["length"])
+                and int(record["unknown_bytes"]) == 0
+                for record in records
+            )
+        )
+        made_progress = any(
+            (
+                success_count > 0,
+                gpu_read_duplicate_bytes > 0,
+                cpu_shadow_bytes > 0,
+            )
+        )
+        fd_mismatch_proven = (
+            not made_progress
+            and last_ioctl_ret == 0
+            and last_rm_status == _NV_ERR_INVALID_DEVICE
+            and success_count == 0
+            and failure_count > 0
+            and bool(records)
+            and all(
+                int(record["status"]) == _NV_ERR_INVALID_DEVICE
+                and int(record["gpu_read_duplicate_bytes"]) == 0
+                and int(record["cpu_shadow_bytes"]) == 0
+                for record in records
+            )
+        )
+        return {
+            "ok": bool(complete),
+            "action": "expert_read_duplicate_fast",
+            "range_count": len(normalized),
+            "success_count": int(success_count),
+            "failure_count": int(failure_count),
+            "requested_bytes": int(requested_bytes),
+            "gpu_read_duplicate_bytes": int(gpu_read_duplicate_bytes),
+            "cpu_shadow_bytes": int(cpu_shadow_bytes),
+            "rm_status": int(last_rm_status),
+            "ioctl_ret": int(last_ioctl_ret),
+            "results": tuple(records),
+            "made_progress": bool(made_progress),
+            "fd_mismatch_proven": bool(fd_mismatch_proven),
+            "fd_candidate_index": int(candidate_index),
+            "selected_fd_source": int(source_fd),
+        }
+
+    last_candidate: dict[str, object] | None = None
+    try:
+        for candidate_index, source_fd in enumerate(
+            _iter_existing_uvm_fd_sources(), start=1
+        ):
+            fd = _initialize_duplicated_uvm_fd(source_fd)
+            if fd is None:
+                continue
+            try:
+                candidate = run_candidate(
+                    fd,
+                    source_fd=int(source_fd),
+                    candidate_index=candidate_index,
+                )
+            finally:
+                with suppress(OSError):
+                    os.close(fd)
+            if (
+                bool(candidate["ok"])
+                or bool(candidate["made_progress"])
+                or not bool(candidate["fd_mismatch_proven"])
+            ):
+                return candidate
+            last_candidate = candidate
+
+        fd = _open_initialized_uvm_fd()
+        try:
+            fallback = run_candidate(
+                fd,
+                source_fd=-1,
+                candidate_index=(
+                    int((last_candidate or {}).get("fd_candidate_index", 0)) + 1
+                ),
+            )
+        finally:
+            with suppress(OSError):
+                os.close(fd)
+        if (
+            not bool(fallback["ok"])
+            and not bool(fallback["made_progress"])
+            and bool(fallback["fd_mismatch_proven"])
+        ):
+            fallback["reason"] = "no_matching_uvm_fd"
+        return fallback
+    except Exception as exc:
+        logger.debug("Expert read-duplicate promotion failed", exc_info=True)
+        return {
+            **empty_result,
+            "ok": False,
+            "range_count": len(normalized),
+            "failure_count": len(normalized),
+            "requested_bytes": int(requested_bytes),
+            "ioctl_ret": -4,
+            "reason": repr(exc),
+        }
+
+
 def driver_rebuild_ranges_gpu_read_mappings(
     ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
     *,
@@ -4982,6 +5199,7 @@ def driver_cutover_ranges_to_immutable_cpu_shadow(
     ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
     *,
     device: int = 0,
+    force_synchronous_migration: bool = False,
 ) -> dict[str, object]:
     """Drop GPU read-duplicates without copying them back to CPU.
 
@@ -4996,9 +5214,19 @@ def driver_cutover_ranges_to_immutable_cpu_shadow(
         if int(ptr) > 0 and int(size) > 0
     ]
     requested_bytes = sum(size for _, size in range_list)
+    action_name = (
+        "sync_cpu_remote_cutover"
+        if force_synchronous_migration
+        else "immutable_cpu_shadow_cutover"
+    )
+    action_code = (
+        UVM_PHASE_F_ACTION_SYNC_CPU_REMOTE_CUTOVER
+        if force_synchronous_migration
+        else UVM_PHASE_F_ACTION_IMMUTABLE_CPU_SHADOW_CUTOVER
+    )
     empty_result: dict[str, object] = {
         "ok": True,
-        "action": "immutable_cpu_shadow_cutover",
+        "action": action_name,
         "range_count": 0,
         "success_count": 0,
         "failure_count": 0,
@@ -5051,7 +5279,7 @@ def driver_cutover_ranges_to_immutable_cpu_shadow(
         for start in range(0, len(range_list), _UVM_PHASE_F_MAX_RANGES):
             chunk = range_list[start : start + _UVM_PHASE_F_MAX_RANGES]
             params = _PhaseFBatchExecutorParams()
-            params.action = UVM_PHASE_F_ACTION_IMMUTABLE_CPU_SHADOW_CUTOVER
+            params.action = action_code
             params.count = len(chunk)
             params.gpu_uuid = gpu_uuid
             params.async_ = 0
@@ -5122,7 +5350,7 @@ def driver_cutover_ranges_to_immutable_cpu_shadow(
         )
         return {
             "ok": bool(complete),
-            "action": "immutable_cpu_shadow_cutover",
+            "action": action_name,
             "range_count": len(range_list),
             "success_count": int(success_count),
             "failure_count": int(failure_count),
@@ -5296,6 +5524,7 @@ def driver_release_regions(
     *,
     device: int = 0,
     remote_read: bool = False,
+    immutable_cpu_shadow: bool = False,
     prefer_existing: bool = True,
     include_audit: bool = False,
 ) -> dict[str, object]:
@@ -5347,6 +5576,8 @@ def driver_release_regions(
     flags = UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K
     if remote_read:
         flags |= UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ
+    if immutable_cpu_shadow:
+        flags |= UVM_EXPERT_OFFLOAD_RELEASE_FLAG_IMMUTABLE_CPU_SHADOW
 
     failure_statuses = {region_id: False for region_id in normalized}
 

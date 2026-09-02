@@ -26,6 +26,11 @@ QUEUE_KEYS = (
     "gpu_backup_blocks",
     "cpu_offline_blocks",
     "active_blocks",
+    "active_block_ids_known",
+    "max_active_block_id",
+    "tail_free_start_block_id",
+    "tail_free_block_count",
+    "min_gpu_free_block_id",
     "null_blocks",
     "accounted_blocks",
     "duplicate_memberships",
@@ -569,11 +574,51 @@ def main() -> int:
 
         setup_before = queue_snapshot(core)
         setup_started = time.perf_counter()
-        setup_result = core.apply_uvm_kv_dynamic_pool_target(
-            int(initial_tier["target_blocks"]),
-            reason=f"e13_initialization_{args.arm}",
-            metadata={"release_expert_wave": False},
-        )
+        setup_old_target = int(setup_before["current_target_blocks"])
+        setup_target = int(initial_tier["target_blocks"])
+        if bool(runtime.get("synchronized_tier_steps")):
+            ordered_targets = sorted(int(value) for value in allowed_targets)
+            if setup_target >= setup_old_target:
+                setup_targets = [
+                    value
+                    for value in ordered_targets
+                    if setup_old_target < value <= setup_target
+                ]
+            else:
+                setup_targets = [
+                    value
+                    for value in reversed(ordered_targets)
+                    if setup_target <= value < setup_old_target
+                ]
+        else:
+            setup_targets = [setup_target]
+        if not setup_targets:
+            setup_targets = [setup_target]
+        setup_steps: list[dict[str, Any]] = []
+        for step_target in setup_targets:
+            step_before = queue_snapshot(core)
+            step_result = core.apply_uvm_kv_dynamic_pool_target(
+                int(step_target),
+                reason=f"e13_initialization_{args.arm}",
+                metadata={"release_expert_wave": False},
+            )
+            setup_steps.append(
+                {
+                    "old_target_blocks": int(
+                        step_before["current_target_blocks"]
+                    ),
+                    "new_target_blocks": int(step_target),
+                    "result": compact(step_result),
+                }
+            )
+            if not step_result.get("ok"):
+                break
+        setup_result = {
+            "ok": bool(setup_steps)
+            and all(step["result"].get("ok") for step in setup_steps),
+            "reason": "synchronized_initial_tier_steps",
+            "tier_steps": setup_steps,
+        }
         torch.cuda.synchronize()
         setup_wall_ms = (time.perf_counter() - setup_started) * 1000.0
         setup_after = queue_snapshot(core)
@@ -654,6 +699,7 @@ def main() -> int:
                     "release_expert_wave": bool(release_expert_wave),
                     "allow_active_prefix_shrink": bool(allow_active_prefix_shrink),
                     "result": compact(value),
+                    "kv_before": before,
                     "plan_after": plan_snapshot(utils),
                     "kv_after": after,
                 }

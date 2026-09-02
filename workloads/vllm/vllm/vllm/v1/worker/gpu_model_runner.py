@@ -6721,6 +6721,171 @@ class GPUModelRunner(
             candidates = {}
         return {"ok": True, "candidates": candidates}
 
+    def _begin_uvm_full_dual_residency_mutation(
+        self,
+        *,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        """Expose ordinary UVM leaves before changing expert residency.
+
+        A full-dual session freezes complete 2 MiB children, including the
+        ordinary (non-alias) leaves which share a parent with cold experts.
+        Residency mutations must therefore use the same discard/PARK boundary
+        as a synchronous Plan Class switch.  The matching finish helper
+        rebuilds both children before either CUDA Graph can replay.
+        """
+        if not self._env_flag_enabled(
+            "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW",
+            default=False,
+        ):
+            return None
+        from vllm.device_allocator import uvm_static_alias
+        from vllm.model_executor.models import utils as offload_utils
+
+        diagnostics = (
+            offload_utils.get_cpu_offload_graph_static_alias_diagnostics()
+        )
+        state_before = str(diagnostics.get("lifecycle_state") or "")
+        session_id = int(diagnostics.get("session_id") or 0)
+        if state_before not in ("sealed", "remote_parked") or session_id <= 0:
+            raise RuntimeError(
+                "Full-dual residency mutation requires a sealed or parked "
+                f"session: state={state_before!r}, session_id={session_id}"
+            )
+        torch.cuda.synchronize(self.device)
+        discarded = dict(
+            uvm_static_alias.driver_static_alias_seal(
+                session_id,
+                device=int(self.device.index),
+                discard_dual=True,
+            )
+        )
+        if discarded.get("ok") is not True:
+            raise RuntimeError(
+                f"Failed to discard full-dual children before {reason}: "
+                f"{discarded!r}"
+            )
+        parked = None
+        if state_before == "sealed":
+            parked = dict(
+                uvm_static_alias.driver_static_alias_park(
+                    session_id,
+                    device=int(self.device.index),
+                    synchronize=False,
+                    defer_cpu_restore=False,
+                )
+            )
+            if parked.get("ok") is not True:
+                raise RuntimeError(
+                    f"Failed to PARK aliases before {reason}: {parked!r}"
+                )
+            offload_utils._set_uvm_original_alias_parked_state(parked)
+        torch.cuda.synchronize(self.device)
+        return {
+            "reason": str(reason),
+            "state_before": state_before,
+            "session_id": session_id,
+            "dual_discard": discarded,
+            "park": parked,
+        }
+
+    def _finish_uvm_full_dual_residency_mutation(
+        self,
+        transaction: dict[str, Any] | None,
+        *,
+        canonicalize_runtime_hot_ranges: tuple[tuple[int, int], ...] | None = None,
+    ) -> dict[str, Any] | None:
+        if transaction is None:
+            return None
+        from vllm.device_allocator import uvm_static_alias
+        from vllm.model_executor.models import utils as offload_utils
+
+        session_id = int(transaction["session_id"])
+        torch.cuda.synchronize(self.device)
+        # DISCARD followed by PARK leaves the session's read-only consumer
+        # aliases absent from the live host page table. A fresh dual recipe
+        # cannot be built from that parked topology because there are no slot
+        # leaves to freeze. First restore the legacy live aliases, then freeze
+        # the rebuilt GPU/CPU children. If the caller entered in the parked
+        # state, switch back to the CPU child only after the recipe exists.
+        resumed = dict(
+            uvm_static_alias.driver_static_alias_resume(
+                session_id,
+                device=int(self.device.index),
+                synchronize=False,
+            )
+        )
+        if resumed.get("ok") is not True:
+            raise RuntimeError(
+                "Failed to RESUME aliases before rebuilding full-dual "
+                f"children after {transaction['reason']}: {resumed!r}"
+            )
+        offload_utils._set_uvm_original_alias_sealed_state(resumed)
+        torch.cuda.synchronize(self.device)
+        hot_reconciliation = None
+        if canonicalize_runtime_hot_ranges is not None:
+            # A dynamic exchange changes ordinary hot leaves while the
+            # complete dual children are discarded.  Residency helpers can
+            # report a successful H2D duplicate even when the live mapping is
+            # still the immutable CPU shadow.  Canonicalize the complete
+            # non-remote hot complement before freezing the new GPU child.
+            # This is deliberately inside the discard/refresh transaction:
+            # doing it after refresh would repair ordinary leaves but leave
+            # the retained Prefill child stale.
+            reconcile_hot = (
+                offload_utils.
+                reconcile_cpu_offload_uvm_original_va_sealed_hot_residency
+            )
+            hot_reconciliation = reconcile_hot(
+                preserve_allocator_cache=True,
+                runtime_remote_ranges=(
+                    self._collect_uvm_runtime_remote_expert_ranges()
+                ),
+                mapping_refresh_ranges=canonicalize_runtime_hot_ranges,
+            )
+            if hot_reconciliation.get("ok") is not True:
+                raise RuntimeError(
+                    "Failed to canonicalize dynamic hot experts before "
+                    f"full-dual refresh: {hot_reconciliation!r}"
+                )
+        refreshed = dict(
+            uvm_static_alias.driver_static_alias_seal(
+                session_id,
+                device=int(self.device.index),
+                refresh_dual=True,
+            )
+        )
+        if refreshed.get("ok") is not True:
+            raise RuntimeError(
+                "Failed to rebuild full-dual children after "
+                f"{transaction['reason']}: {refreshed!r}"
+            )
+        parked = None
+        if transaction["state_before"] == "remote_parked":
+            parked = dict(
+                uvm_static_alias.driver_static_alias_park(
+                    session_id,
+                    device=int(self.device.index),
+                    synchronize=False,
+                    defer_cpu_restore=False,
+                )
+            )
+            if parked.get("ok") is not True:
+                raise RuntimeError(
+                    "Failed to PARK aliases after rebuilding full-dual "
+                    f"children after {transaction['reason']}: {parked!r}"
+                )
+            offload_utils._set_uvm_original_alias_parked_state(parked)
+        torch.cuda.synchronize(self.device)
+        return {
+            "resume_before_dual_refresh": resumed,
+            "hot_reconciliation_before_dual_refresh": hot_reconciliation,
+            "dual_refresh": refreshed,
+            "resume": resumed if transaction["state_before"] == "sealed" else None,
+            "park_after_dual_refresh": parked,
+            "state_after": transaction["state_before"],
+        }
+
     def run_uvm_incremental_expert_offload(
         self,
         allow_warm: bool | None = None,
@@ -6755,6 +6920,9 @@ class GPUModelRunner(
                 "selected_layer_count": len(selected_experts_by_layer),
                 "expected_layer_count": len(module_layers),
             }
+        full_dual_transaction = self._begin_uvm_full_dual_residency_mutation(
+            reason="incremental_expert_offload"
+        )
         has_cold = any(
             bool(module.has_remaining_uvm_incremental_experts("cold"))
             for module in modules
@@ -6801,7 +6969,10 @@ class GPUModelRunner(
             released_all = released_all and visited_layers == set(
                 selected_experts_by_layer
             )
-        return {
+        full_dual_completion = self._finish_uvm_full_dual_residency_mutation(
+            full_dual_transaction
+        )
+        response = {
             "ok": released_all,
             "allow_warm": effective_allow_warm,
             "selected_layer_count": (
@@ -6819,6 +6990,10 @@ class GPUModelRunner(
             ),
             "results": release_results,
         }
+        if full_dual_transaction is not None:
+            response["full_dual_transaction"] = full_dual_transaction
+            response["full_dual_completion"] = full_dual_completion
+        return response
 
     def get_uvm_incremental_expert_restore_candidates(self) -> dict[str, Any]:
         """Return one autoscale-offloaded expert per layer, or no wave."""
@@ -7042,6 +7217,9 @@ class GPUModelRunner(
             return {"ok": False, "reason": "dynamic_expert_swap_disabled"}
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        full_dual_transaction = self._begin_uvm_full_dual_residency_mutation(
+            reason="dynamic_expert_swap"
+        )
         results: list[dict[str, object]] = []
         visited_layers: set[str] = set()
         with uvm_enabled_allocation_phase("enabled:dynamic_expert_swap"):
@@ -7063,11 +7241,22 @@ class GPUModelRunner(
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         missing_layers = sorted(set(swaps_by_layer) - visited_layers)
-        return {
-            "ok": (
-                not missing_layers
-                and all(bool(result.get("ok")) for result in results)
-            ),
+        execution_ok = (
+            not missing_layers
+            and all(bool(result.get("ok")) for result in results)
+        )
+        promoted_ranges = tuple(
+            (int(item["base"]), int(item["length"]))
+            for result in results
+            for pair in result.get("results", [])
+            for item in pair.get("promote_ranges", [])
+        )
+        full_dual_completion = self._finish_uvm_full_dual_residency_mutation(
+            full_dual_transaction,
+            canonicalize_runtime_hot_ranges=promoted_ranges,
+        )
+        response = {
+            "ok": execution_ok,
             "reason": "swaps_executed" if not missing_layers else "layers_missing",
             "selected_layers": len(swaps_by_layer),
             "visited_layers": len(visited_layers),
@@ -7077,6 +7266,10 @@ class GPUModelRunner(
             ),
             "results": results,
         }
+        if full_dual_transaction is not None:
+            response["full_dual_transaction"] = full_dual_transaction
+            response["full_dual_completion"] = full_dual_completion
+        return response
 
     def _load_uvm_matched_cpu_offload_manifest(self) -> list[dict[str, object]]:
         manifest_file = os.environ.get(
@@ -7478,6 +7671,40 @@ class GPUModelRunner(
         )
         return result
 
+    def _reconcile_uvm_plan_residency_before_graph_class_switch(
+        self,
+    ) -> dict[str, Any]:
+        """Restore the active Plan Class residency after Graph capture.
+
+        A pure-Prefill capture may leave some logically-hot expert slices on
+        the CPU.  A subsequent Plan Class delta assumes the active class is
+        physically exact; without this repair, an already-remote slice is
+        incorrectly counted as a failed GPU-to-CPU release.  Reconcile at the
+        certified startup boundary before switching to the next class.
+        """
+        from vllm.model_executor.models.utils import (
+            get_cpu_offload_graph_static_alias_diagnostics,
+            reconcile_cpu_offload_uvm_original_va_remote_graph_residency,
+            reconcile_cpu_offload_uvm_original_va_sealed_hot_residency,
+        )
+
+        diagnostics = get_cpu_offload_graph_static_alias_diagnostics()
+        if not bool(diagnostics.get("enabled")):
+            return {"ok": True, "reason": "static_alias_disabled"}
+        state = str(diagnostics.get("lifecycle_state") or "")
+        if state == "sealed":
+            return reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
+                preserve_allocator_cache=True
+            )
+        if state in {"remote", "remote_parked"}:
+            return reconcile_cpu_offload_uvm_original_va_remote_graph_residency(
+                preserve_allocator_cache=True
+            )
+        raise RuntimeError(
+            "Graph Class switch residency reconciliation encountered an "
+            f"unsupported lifecycle state: {state!r}"
+        )
+
     def capture_uvm_expert_graph_class_at_idle_boundary(
         self,
         class_name: str,
@@ -7514,10 +7741,20 @@ class GPUModelRunner(
 
         registry = cpu_offload_uvm_plan_class_registry()
         plan_switch = None
+        residency_reconcile = None
         if bool(registry.get("enabled")):
             if normalized not in registry["classes"]:
                 return {"ok": False, "reason": "plan_class_not_registered"}
             if registry.get("active_class") != normalized:
+                residency_reconcile = (
+                    self._reconcile_uvm_plan_residency_before_graph_class_switch()
+                )
+                if residency_reconcile.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "reason": "active_class_residency_reconcile_failed",
+                        "residency_reconcile": residency_reconcile,
+                    }
                 plan_switch = switch_cpu_offload_uvm_original_va_plan_class(
                     normalized,
                     reason="graph_class_capture",
@@ -7528,6 +7765,7 @@ class GPUModelRunner(
                         "ok": False,
                         "reason": "plan_class_switch_failed",
                         "plan_switch": plan_switch,
+                        "residency_reconcile": residency_reconcile,
                     }
 
         # Equal-width plan classes differ only in which expert occupies each
@@ -7562,6 +7800,7 @@ class GPUModelRunner(
                     "capture_ns": 0,
                     "certificate": None,
                     "plan_switch": plan_switch,
+                    "residency_reconcile": residency_reconcile,
                     "before": before,
                     "after": model.cudagraph_class_diagnostics(),
                 }
@@ -7577,6 +7816,7 @@ class GPUModelRunner(
                 "capture_ns": 0,
                 "certificate": certificate,
                 "plan_switch": plan_switch,
+                "residency_reconcile": residency_reconcile,
                 "before": before,
                 "after": model.cudagraph_class_diagnostics(),
             }
@@ -7643,6 +7883,7 @@ class GPUModelRunner(
             "capture_ns": elapsed_ns,
             "certificate": certificate,
             "plan_switch": plan_switch,
+            "residency_reconcile": residency_reconcile,
             "before": before,
             "after": after,
         }
@@ -7655,9 +7896,29 @@ class GPUModelRunner(
         resume_prefill_before_switch: bool = False,
         defer_dual_refresh: bool = False,
     ) -> dict[str, Any]:
-        """Switch GraphExec tables without destroying or recapturing graphs."""
+        """Switch tables at an EngineCore-certified execution boundary.
+
+        ``scheduler_idle`` is the historical RPC field name.  A true value may
+        now represent a scheduler-quiescent point between token steps even
+        while requests remain logically running.
+        """
         if scheduler_idle is not True:
             return {"ok": False, "reason": "scheduler_not_idle"}
+        # Future completion is the EngineCore proof; this synchronization also
+        # closes work submitted on auxiliary streams before residency changes.
+        torch.cuda.synchronize(self.device)
+        # A Plan Class switch may run between Decode token steps.  Append-only
+        # class growth cannot safely defer the dual-view refresh while the
+        # alias session is parked: the new remote child is not complete yet.
+        # Temporarily resume the sealed Prefill topology, finish both children,
+        # then park again before the next Decode step.
+        preserve_remote_decode_topology = bool(
+            getattr(self, "_uvm_original_va_phase_decode_cutover_done", False)
+        )
+        effective_resume_prefill = bool(resume_prefill_before_switch)
+        effective_defer_dual_refresh = bool(
+            defer_dual_refresh and not preserve_remote_decode_topology
+        )
         eager_plan_classes = os.environ.get(
             "VLLM_CPU_OFFLOAD_PLAN_CLASS_EAGER_ENABLE", "0"
         ).strip().lower() in ("1", "true", "yes", "on")
@@ -7665,7 +7926,9 @@ class GPUModelRunner(
             from vllm.model_executor.models.utils import (
                 activate_cpu_offload_uvm_original_va_prefill_topology,
                 cpu_offload_uvm_plan_class_registry,
+                get_cpu_offload_graph_static_alias_diagnostics,
                 switch_cpu_offload_uvm_original_va_plan_class,
+                transition_cpu_offload_uvm_original_va_to_remote,
             )
 
             mode = getattr(self.compilation_config.cudagraph_mode, "name", "")
@@ -7687,7 +7950,7 @@ class GPUModelRunner(
                 }
             started_ns = time.perf_counter_ns()
             prefill_topology_resume = None
-            if resume_prefill_before_switch:
+            if effective_resume_prefill:
                 prefill_topology_resume = (
                     activate_cpu_offload_uvm_original_va_prefill_topology()
                 )
@@ -7704,8 +7967,43 @@ class GPUModelRunner(
                 normalized,
                 reason="eager_plan_class_activation",
                 graphs_retained=True,
-                defer_dual_refresh=defer_dual_refresh,
+                defer_dual_refresh=effective_defer_dual_refresh,
             )
+            remote_decode_repark = None
+            if (
+                plan_switch.get("ok") is True
+                and preserve_remote_decode_topology
+            ):
+                diagnostics = get_cpu_offload_graph_static_alias_diagnostics()
+                transition = transition_cpu_offload_uvm_original_va_to_remote(
+                    reason="online_plan_class_decode_repark",
+                    preserve_remote_graphs=bool(
+                        diagnostics.get("remote_graph_captured")
+                    ),
+                    runtime_remote_ranges=(
+                        self._collect_uvm_runtime_remote_expert_ranges()
+                    ),
+                )
+                after = get_cpu_offload_graph_static_alias_diagnostics()
+                expected_state = (
+                    "remote_parked"
+                    if bool(after.get("park_resume_enabled"))
+                    else "remote"
+                )
+                remote_decode_repark = {
+                    "ok": (
+                        transition.get("ok") is True
+                        and after.get("lifecycle_state") == expected_state
+                        and after.get("remote_map_active") is True
+                    ),
+                    "transition": transition,
+                    "diagnostics_after": after,
+                }
+                if remote_decode_repark["ok"] is not True:
+                    raise RuntimeError(
+                        "Online Plan Class switch failed to restore the "
+                        "remote Decode topology"
+                    )
             torch.cuda.synchronize(self.device)
             return {
                 "ok": plan_switch.get("ok") is True,
@@ -7720,6 +8018,11 @@ class GPUModelRunner(
                 "prefill_topology_resume_before_plan_switch": (
                     prefill_topology_resume
                 ),
+                "preserved_remote_decode_topology": (
+                    preserve_remote_decode_topology
+                ),
+                "dual_view_refresh_deferred": effective_defer_dual_refresh,
+                "remote_decode_repark": remote_decode_repark,
                 "switch_ns": time.perf_counter_ns() - started_ns,
             }
         model = getattr(self, "model", None)
@@ -7760,7 +8063,7 @@ class GPUModelRunner(
                 "diagnostics": before,
             }
         if registry_enabled and previous_class != normalized:
-            if resume_prefill_before_switch:
+            if effective_resume_prefill:
                 prefill_topology_resume = (
                     activate_cpu_offload_uvm_original_va_prefill_topology()
                 )
@@ -7946,6 +8249,20 @@ class GPUModelRunner(
                     "class_results": class_results,
                 }
         initial = str(registry["initial_class"])
+        restore_residency_reconcile = None
+        if str(registry.get("active_class")) != initial:
+            restore_residency_reconcile = (
+                self._reconcile_uvm_plan_residency_before_graph_class_switch()
+            )
+            if restore_residency_reconcile.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "reason": "restore_residency_reconcile_failed",
+                    "initial_class": initial,
+                    "class_results": class_results,
+                    "restore_residency_reconcile": restore_residency_reconcile,
+                    "diagnostics": self.model.cudagraph_class_diagnostics(),
+                }
         restore = self.activate_uvm_expert_graph_class_at_idle_boundary(
             initial, scheduler_idle=True
         )
@@ -7961,6 +8278,7 @@ class GPUModelRunner(
             ),
             "initial_class": initial,
             "class_results": class_results,
+            "restore_residency_reconcile": restore_residency_reconcile,
             "restore": restore,
             "graph_memory_bytes": graph_memory_bytes,
             "diagnostics": self.model.cudagraph_class_diagnostics(),
@@ -8188,6 +8506,14 @@ class GPUModelRunner(
                     torch.cuda.synchronize(self.device)
                     reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
                         preserve_allocator_cache=True
+                    )
+                    # The all-remote capture path rebuilt its retained 4K
+                    # children while every hot expert was CPU-resident. Hot
+                    # restoration changes the ordinary leaves again; refresh
+                    # the sealed GPU child before serving or switching to the
+                    # pre-captured remote Decode child.
+                    refresh_cpu_offload_uvm_original_va_full_dual_view(
+                        nested_refresh=False
                     )
                 if preseed_prefill_pool:
                     if before_pure_prefill_capture is not None:

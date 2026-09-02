@@ -146,6 +146,118 @@ def test_immutable_cpu_shadow_cutover_batches_and_audits_every_byte(
     assert closed == [110]
 
 
+def test_read_duplicate_fast_promotion_uses_phase_f_action_18(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ranges = ((0x100000, 0x10000), (0x200000, 0x20000))
+    closed = _patch_driver_fds(monkeypatch, existing_sources=[10])
+    calls: list[tuple[int, int, int]] = []
+
+    def ioctl(fd: int, request: int, params: object) -> int:
+        assert isinstance(params, uvm_module._PhaseFBatchExecutorParams)
+        calls.append((int(fd), int(request), int(params.action)))
+        params.success_count = params.count
+        params.failure_count = 0
+        params.rmStatus = 0
+        for index in range(int(params.count)):
+            length = int(params.ranges[index].length)
+            result = params.results[index]
+            result.status = 0
+            result.resident_gpu_bytes = length
+            result.resident_cpu_bytes = length
+            result.resident_any_bytes = length
+            result.resident_unknown_bytes = 0
+        return 0
+
+    monkeypatch.setattr(uvm_module, "_libc_ioctl", ioctl)
+
+    result = uvm_module.driver_promote_ranges_to_read_duplicate_fast(
+        ranges, device=2
+    )
+
+    assert uvm_module.UVM_PHASE_F_ACTION_EXPERT_READ_DUP_FAST == 18
+    assert result["ok"] is True
+    assert result["action"] == "expert_read_duplicate_fast"
+    assert result["range_count"] == 2
+    assert result["success_count"] == 2
+    assert result["failure_count"] == 0
+    assert result["requested_bytes"] == 0x30000
+    assert result["gpu_read_duplicate_bytes"] == 0x30000
+    assert result["cpu_shadow_bytes"] == 0x30000
+    assert result["selected_fd_source"] == 10
+    assert calls == [(110, uvm_module._UVM_PHASE_F_BATCH_EXECUTOR_IOCTL, 18)]
+    assert closed == [110]
+
+
+def test_read_duplicate_fast_promotion_skips_nonowning_uvm_fd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ranges = ((0x100000, 0x10000),)
+    closed = _patch_driver_fds(monkeypatch, existing_sources=[10, 20])
+
+    def ioctl(fd: int, _request: int, params: object) -> int:
+        assert isinstance(params, uvm_module._PhaseFBatchExecutorParams)
+        result = params.results[0]
+        length = int(params.ranges[0].length)
+        if fd == 110:
+            params.success_count = 0
+            params.failure_count = 1
+            params.rmStatus = uvm_module._NV_ERR_INVALID_DEVICE
+            result.status = uvm_module._NV_ERR_INVALID_DEVICE
+            result.resident_unknown_bytes = length
+        else:
+            assert fd == 120
+            params.success_count = 1
+            params.failure_count = 0
+            params.rmStatus = 0
+            result.status = 0
+            result.resident_gpu_bytes = length
+            result.resident_cpu_bytes = length
+            result.resident_any_bytes = length
+            result.resident_unknown_bytes = 0
+        return 0
+
+    monkeypatch.setattr(uvm_module, "_libc_ioctl", ioctl)
+
+    result = uvm_module.driver_promote_ranges_to_read_duplicate_fast(ranges)
+
+    assert result["ok"] is True
+    assert result["selected_fd_source"] == 20
+    assert result["fd_candidate_index"] == 2
+    assert closed == [110, 120]
+
+
+def test_read_duplicate_fast_promotion_accepts_idempotent_metadata_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ranges = ((0x100000, 0x10000),)
+    _patch_driver_fds(monkeypatch, existing_sources=[10])
+
+    def ioctl(_fd: int, _request: int, params: object) -> int:
+        assert isinstance(params, uvm_module._PhaseFBatchExecutorParams)
+        params.success_count = 1
+        params.failure_count = 0
+        params.rmStatus = 0
+        result = params.results[0]
+        result.status = 0
+        # No data copy is needed when CPU/GPU residency already exists. The
+        # action still repairs read_duplicated_pages and the GPU READ PTE.
+        result.resident_gpu_bytes = 0
+        result.resident_cpu_bytes = 0
+        result.resident_any_bytes = int(params.ranges[0].length)
+        result.resident_unknown_bytes = 0
+        return 0
+
+    monkeypatch.setattr(uvm_module, "_libc_ioctl", ioctl)
+
+    result = uvm_module.driver_promote_ranges_to_read_duplicate_fast(ranges)
+
+    assert result["ok"] is True
+    assert result["success_count"] == 1
+    assert result["gpu_read_duplicate_bytes"] == 0
+    assert result["cpu_shadow_bytes"] == 0
+
+
 def test_region_release_accepts_complete_release() -> None:
     params = _release_params()
     params.block_count = 1

@@ -1,5 +1,28 @@
 # 复现 E6 Plan Class、serial wave 与切换摊销 qualification
 
+## 2026-09-02当前权威轮
+
+以下三个独立冷进程和离线汇总均为`status=ok`，取代2026-08-28旧点估计：
+
+```text
+batched  artifacts/e6-difference-20260902-reproduce-all-attempt-04-latest-dual-qualification
+full     artifacts/e6-full-rebuild-20260902-reproduce-all-attempt-04-frozen-control-qualification
+serial   artifacts/e6-serial-wave-20260902-reproduce-all-attempt-01-latest-dual-qualification
+summary  artifacts/e6-summary-20260902-reproduce-all-attempt-01-latest-dual/summary.json
+```
+
+| Difference | Full rebuild | Serial wave | Batched difference |
+|---:|---:|---:|---:|
+| 5% | 17.761/18.437 s | 2.005/2.156 s | 2.010/2.101 s |
+| 10% | 18.968/19.024 s | 4.018/4.130 s | 2.677/2.758 s |
+| 25% | 20.068/19.238 s | 10.278/10.409 s | 4.795/4.793 s |
+| 50% | 21.299/21.187 s | 21.070/20.360 s | 8.506/8.129 s |
+| 100% | 24.312/23.957 s | 39.554/39.698 s | 14.969/14.987 s |
+
+表内为outbound/return。Batched相对full rebuild为1.60×--8.84×；在10%--100%相对
+serial wave为1.50×--2.65×，5%时两者近似相同。full rebuild仍把Graph capture count
+从2增加到22，serial/batched保持2。该轮是单进程、每方向单样本qualification。
+
 ## 范围
 
 本流程复现三个独立冷进程 arm，每臂只运行一次完整 sequence，不做统计重复：

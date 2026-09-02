@@ -27,6 +27,13 @@ ANALYZE_TEACHER="${E13_DIR}/analyze_e13_teacher_forced.py"
 TEACHER_PROCESSOR="${E13_DIR}/e13_teacher_forced_logits.py"
 PHASE_RUNNER="${E13_DIR}/e13_tier_steady_phase_runner.py"
 VERIFY_PHASE="${E13_DIR}/verify_e13_tier_steady_phase.py"
+K2_K6_ROUNDTRIP_RUNNER="${E13_DIR}/e13_k2_k6_roundtrip_runner.py"
+VERIFY_K2_K6_ROUNDTRIP="${E13_DIR}/verify_e13_k2_k6_roundtrip.py"
+VERIFY_SHORT_BATCH="${E13_DIR}/verify_e13_short_batch.py"
+VERIFY_SHORT_BATCH_MATRIX="${E13_DIR}/verify_e13_short_batch_matrix.py"
+VERIFY_SHORT_GRAPH_MATRIX="${E13_DIR}/verify_e13_short_graph_matrix.py"
+VERIFY_SHORT_GRAPH_ROUNDTRIP="${E13_DIR}/verify_e13_short_graph_roundtrip.py"
+VERIFY_SHORT_B128_ABBA="${E13_DIR}/verify_e13_short_b128_abba.py"
 DECODE_DIAGNOSTIC="${E13_DIR}/e13_decode_abba_diagnostic.py"
 DECODE_NSYS_WRAPPER="${E13_DIR}/e13_decode_nsys_wrapper.py"
 ANALYZE_DECODE_DIAGNOSTIC="${E13_DIR}/analyze_e13_decode_abba.py"
@@ -36,7 +43,10 @@ MODEL="${MODEL:-/home/ubuntu/.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B-
 NAMES="${REPO_ROOT}/experiments/vllm_uvm_large_kv_multilevel/inputs/exact_parameter_names.txt"
 INPUT_SET="${REPO_ROOT}/experiments/vllm_uvm_e10_multilevel_pressure/inputs/formal_k2_k4_k6_k8_k10"
 BASE_PLAN="${INPUT_SET}/cold70.json"
+COLD89_PLAN="${INPUT_SET}/cold89.json"
 PLAN_CLASSES="${E13_DIR}/plan_classes_k2_k4_k6.json"
+GRAPH_K2_PLAN_CLASSES="${E13_DIR}/plan_classes_graph_fixed_k2.json"
+GRAPH_K6_PLAN_CLASSES="${E13_DIR}/plan_classes_graph_fixed_k6.json"
 TIMEOUT_SEC="${TIMEOUT_SEC:-10800}"
 CPUSET="${CPUSET:-0-13}"
 CPU_THREADS="${CPU_THREADS:-14}"
@@ -59,10 +69,16 @@ static_preflight_e13() {
   for path in "${CONFIG}" "${RUNNER}" "${MONITOR}" "${VERIFY_E13}" \
     "${AGGREGATE}" "${PLOT}" "${TESTS}" "${PREPARE_TEACHER}" \
     "${ANALYZE_TEACHER}" "${TEACHER_PROCESSOR}" "${PHASE_RUNNER}" \
-    "${VERIFY_PHASE}" "${DECODE_DIAGNOSTIC}" "${DECODE_NSYS_WRAPPER}" \
+    "${VERIFY_PHASE}" "${K2_K6_ROUNDTRIP_RUNNER}" \
+    "${VERIFY_K2_K6_ROUNDTRIP}" "${VERIFY_SHORT_BATCH}" \
+    "${VERIFY_SHORT_BATCH_MATRIX}" "${VERIFY_SHORT_GRAPH_MATRIX}" \
+    "${VERIFY_SHORT_GRAPH_ROUNDTRIP}" \
+    "${VERIFY_SHORT_B128_ABBA}" \
+    "${DECODE_DIAGNOSTIC}" "${DECODE_NSYS_WRAPPER}" \
     "${ANALYZE_DECODE_DIAGNOSTIC}" "${ANALYZE_DECODE_BACKING}" \
     "${MODEL}/config.json" \
-    "${NAMES}" "${BASE_PLAN}" "${PLAN_CLASSES}"; do
+    "${NAMES}" "${BASE_PLAN}" "${COLD89_PLAN}" "${PLAN_CLASSES}" \
+    "${GRAPH_K2_PLAN_CLASSES}" "${GRAPH_K6_PLAN_CLASSES}"; do
     require_file "${path}"
   done
   [[ "$(wc -l <"${NAMES}")" -eq 96 ]] \
@@ -71,7 +87,11 @@ static_preflight_e13() {
   "${VLLM_PY}" -m py_compile \
     "${RUNNER}" "${MONITOR}" "${VERIFY_E13}" "${AGGREGATE}" "${PLOT}" \
     "${TESTS}" "${PREPARE_TEACHER}" "${ANALYZE_TEACHER}" \
-    "${TEACHER_PROCESSOR}" "${PHASE_RUNNER}" "${VERIFY_PHASE}"
+    "${TEACHER_PROCESSOR}" "${PHASE_RUNNER}" "${VERIFY_PHASE}" \
+    "${K2_K6_ROUNDTRIP_RUNNER}" "${VERIFY_K2_K6_ROUNDTRIP}" \
+    "${VERIFY_SHORT_BATCH}" "${VERIFY_SHORT_BATCH_MATRIX}" \
+    "${VERIFY_SHORT_GRAPH_MATRIX}" "${VERIFY_SHORT_GRAPH_ROUNDTRIP}" \
+    "${VERIFY_SHORT_B128_ABBA}"
   "${VLLM_PY}" -m py_compile \
     "${DECODE_DIAGNOSTIC}" "${DECODE_NSYS_WRAPPER}" \
     "${ANALYZE_DECODE_DIAGNOSTIC}" \
@@ -88,6 +108,8 @@ assert [x["target_blocks"] for x in tiers] == [1364, 2730, 4095]
 assert [x["plan_class"] for x in tiers] == ["cold70", "cold80", "cold89"]
 assert p["runtime"]["backup_reserve_blocks"] == 16
 assert p["runtime"]["safety_blocks"] == 16
+assert p["runtime"]["scheduler_boundary_resize"] is True
+assert p["runtime"]["synchronized_tier_steps"] is True
 assert len(p["profiles"]["formal"]["seeds"]) >= 3
 assert {x["strategy"] for x in p["arms"]} == {"adaptive", "fixed"}
 assert sum(x["strategy"] == "fixed" for x in p["arms"]) >= 3
@@ -103,7 +125,7 @@ PY
     "${VLLM_PY}" -m pytest -q \
       tests/v1/engine/test_uvm_adaptive_kv.py \
       tests/v1/worker/test_uvm_eager_plan_classes_e13.py \
-      -k 'autoscale or next_request or plan_class'
+      -k 'autoscale or next_request or plan_class or synchronized'
   )
   echo "E13 static preflight: OK"
 }
@@ -138,10 +160,54 @@ run_case_e13() {
   [[ "${arm}" == adaptive ]] && autoscale=1
   case "${arm}" in
     adaptive|fixed_k4|direct_k4|switched_k4) initial_target=2730 ;;
-    fixed_k2|direct_k2|switched_k2) initial_target=1364 ;;
+    fixed_k2|direct_k2|switched_k2|roundtrip) initial_target=1364 ;;
     fixed_k6|direct_k6|switched_k6) initial_target=4095 ;;
     *) die_e13 "unknown arm ${arm}" ;;
   esac
+  local full_separate_graph="${E13_K2_K6_FULL_SEPARATE_GRAPH:-0}"
+  local graph_all_classes="${E13_K2_K6_GRAPH_ALL_CLASSES:-0}"
+  local phase_mode=prefill_remote_decode plan_class_eager=1
+  local plan_class_repromote=0
+  local immutable_cpu_shadow=1
+  local plan_class_force_sync_migration=0
+  local profile_all_remote=0 prefill_capture_before_hot_restore=0
+  local hot_cuda_read_gate=0 pre_kernel_alias_read_gate=0
+  local pre_kv_native_hole_bytes=0 case_initial_target="${KV_INITIAL_BLOCKS}"
+  local case_plan="${BASE_PLAN}" case_plan_classes="${PLAN_CLASSES}"
+  if [[ "${full_separate_graph}" == 1 ]]; then
+    [[ "${arm}" == fixed_k2 || "${arm}" == fixed_k6 || "${arm}" == roundtrip ]] \
+      || die_e13 "FULL_SEPARATE E13 comparison only supports fixed K2/K6/roundtrip"
+    phase_mode=prefill_graph_remote_decode
+    plan_class_eager=0
+    plan_class_repromote=1
+    profile_all_remote=1
+    prefill_capture_before_hot_restore=1
+    hot_cuda_read_gate=1
+    pre_kernel_alias_read_gate=1
+    pre_kv_native_hole_bytes=2147483648
+    case_initial_target="${initial_target}"
+    # Multi-class Adaptive capture changes which exact expert slices are cold.
+    # Use the certified synchronous differential migration transaction for
+    # those class changes.  Immutable-shadow cutover is retained for fixed
+    # one-class arms, but cannot currently certify every subrange when two
+    # expert slices share a 2 MiB UVM VA block.
+    if [[ "${graph_all_classes}" == 1 ]]; then
+      plan_class_repromote=0
+      plan_class_force_sync_migration=1
+    fi
+    if [[ "${arm}" == fixed_k6 ]]; then
+      case_plan="${COLD89_PLAN}"
+      if [[ "${graph_all_classes}" == 1 ]]; then
+        case_plan_classes="${PLAN_CLASSES}"
+      else
+        case_plan_classes="${GRAPH_K6_PLAN_CLASSES}"
+      fi
+    elif [[ "${graph_all_classes}" == 1 ]]; then
+      case_plan_classes="${PLAN_CLASSES}"
+    else
+      case_plan_classes="${GRAPH_K2_PLAN_CLASSES}"
+    fi
+  fi
 
   mkdir -p "${case_dir}"
   : >"${case_dir}/cpu_offload_manifest.jsonl"
@@ -159,24 +225,32 @@ run_case_e13() {
     "VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE=${NAMES}"
     "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS=1"
     "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND=uvm_original_va"
-    "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE=${BASE_PLAN}"
-    "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASSES_FILE=${PLAN_CLASSES}"
+    "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EXPERT_PLAN_FILE=${case_plan}"
+    "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PLAN_CLASSES_FILE=${case_plan_classes}"
     "VLLM_CPU_OFFLOAD_PLAN_CLASS_PREFILL_SOURCES=1"
-    "VLLM_CPU_OFFLOAD_PLAN_CLASS_IMMUTABLE_CPU_SHADOW=1"
+    "VLLM_CPU_OFFLOAD_PLAN_CLASS_IMMUTABLE_CPU_SHADOW=${immutable_cpu_shadow}"
+    "VLLM_CPU_OFFLOAD_PLAN_CLASS_FORCE_SYNC_MIGRATION=${plan_class_force_sync_migration}"
     "VLLM_CPU_OFFLOAD_DUAL_VIEW_FULL_PARAMETER_SHADOW=1"
     "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW=1"
     "VLLM_CPU_OFFLOAD_PLAN_CLASS_PRECOMPILE=1"
     "VLLM_CPU_OFFLOAD_PLAN_CLASS_QUIESCED_DELTA=1"
     "VLLM_CPU_OFFLOAD_PLAN_CLASS_INCREMENTAL_DUAL_REFRESH=1"
-    "VLLM_CPU_OFFLOAD_PLAN_CLASS_EAGER_ENABLE=1"
+    "VLLM_CPU_OFFLOAD_PLAN_CLASS_EAGER_ENABLE=${plan_class_eager}"
+    "VLLM_CPU_OFFLOAD_PLAN_CLASS_REPROMOTE_BEFORE_CUTOVER=${plan_class_repromote}"
     "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_REGION_BYTES=524288"
     "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PTE_MODE=auto"
     "VLLM_CPU_OFFLOAD_UVM_ORIGINAL_VA_PARK_RESUME=1"
-    "VLLM_CPU_OFFLOAD_UVM_HOT_CUDA_READ_GATE=0"
-    "VLLM_UVM_FUSED_MOE_PRE_KERNEL_ALIAS_READ_GATE=0"
+    "VLLM_CPU_OFFLOAD_UVM_HOT_CUDA_READ_GATE=${hot_cuda_read_gate}"
+    "VLLM_UVM_FUSED_MOE_PRE_KERNEL_ALIAS_READ_GATE=${pre_kernel_alias_read_gate}"
     "VLLM_UVM_RUNTIME_POST_RESUME_COLD_READ_GATE=0"
     "VLLM_UVM_EXPERT_WEIGHTS_MANAGED=1"
-    "VLLM_UVM_ORIGINAL_VA_PHASE_MODE=prefill_remote_decode"
+    "VLLM_UVM_ORIGINAL_VA_PHASE_MODE=${phase_mode}"
+    "VLLM_UVM_PROFILE_ALL_EXPERTS_REMOTE=${profile_all_remote}"
+    "VLLM_UVM_PREFILL_GRAPH_CAPTURE_BEFORE_HOT_RESTORE=${prefill_capture_before_hot_restore}"
+    "VLLM_UVM_PRE_KV_NATIVE_HOLE_SENTINEL_BYTES=${pre_kv_native_hole_bytes}"
+    "VLLM_UVM_PRE_KV_NATIVE_HOLE_SENTINEL_EMPTY_CACHE=1"
+    "VLLM_TRITON_MLA_EXPERIMENTAL_FULL_CUDAGRAPH=1"
+    "VLLM_FUSED_MOE_CHUNK_SIZE=16384"
     "VLLM_UVM_ORIGINAL_VA_GRAPH_MIN_FREE_BYTES=201326592"
     "VLLM_UVM_PREFILL_P3_DECODE_REMOTE_READ=0"
     "VLLM_UVM_EXPERT_ENVELOPE_ENABLE=1"
@@ -205,14 +279,16 @@ run_case_e13() {
     "VLLM_UVM_KV_RUNTIME_ENABLE=1"
     "VLLM_UVM_KV_RUNTIME_MODE=enforce"
     "VLLM_UVM_KV_DYNAMIC_POOL_ENABLE=1"
-    "VLLM_UVM_KV_DYNAMIC_POOL_INITIAL_BLOCKS=${KV_INITIAL_BLOCKS}"
-    "VLLM_UVM_KV_POST_WARMUP_TARGET_BLOCKS=${KV_INITIAL_BLOCKS}"
+    "VLLM_UVM_KV_DYNAMIC_POOL_INITIAL_BLOCKS=${case_initial_target}"
+    "VLLM_UVM_KV_POST_WARMUP_TARGET_BLOCKS=${case_initial_target}"
     "VLLM_UVM_KV_BACKUP_RESERVE_BLOCKS=16"
     "VLLM_UVM_KV_BACKUP_RESERVE_TARGET_MAP=${BACKUP_RESERVE_MAP}"
     "VLLM_UVM_KV_BACKUP_GROW_BLOCKS=1366"
     "VLLM_UVM_KV_BACKUP_PRESSURE_STANDALONE_GROW_ENABLE=0"
     "VLLM_UVM_KV_ADAPTIVE_PRESSURE_ENABLE=0"
     "VLLM_UVM_KV_AUTO_SCALE_ENABLE=${autoscale}"
+    "VLLM_UVM_KV_SCHEDULER_BOUNDARY_RESIZE_ENABLE=${E13_SCHEDULER_BOUNDARY_RESIZE_ENABLE:-1}"
+    "VLLM_UVM_KV_AUTO_SCALE_SYNCHRONIZED_TIER_STEPS=${E13_SYNCHRONIZED_TIER_STEPS:-1}"
     "VLLM_UVM_KV_AUTO_SCALE_BACKUP_ONLY=0"
     "VLLM_UVM_KV_AUTO_SCALE_PLAN_CLASS_MAP=${PLAN_CLASS_MAP}"
     "VLLM_UVM_KV_AUTO_SCALE_ALLOWED_TARGET_BLOCKS=${ALLOWED_TARGET_BLOCKS}"
@@ -240,6 +316,9 @@ run_case_e13() {
     "PYTHONUNBUFFERED=1"
     "E13_DECODE_DIAGNOSTIC_HEAVY=${E13_DECODE_DIAGNOSTIC_HEAVY:-0}"
     "E13_DECODE_DIAGNOSTIC_CONDITIONS=${E13_DECODE_DIAGNOSTIC_CONDITIONS:-}"
+    "E13_K2_K6_MEASUREMENT_SCOPE=${E13_K2_K6_MEASUREMENT_SCOPE:-full}"
+    "E13_K2_K6_FULL_SEPARATE_GRAPH=${full_separate_graph}"
+    "E13_K2_K6_GRAPH_ALL_CLASSES=${graph_all_classes}"
     "OMP_NUM_THREADS=${CPU_THREADS}"
     "MKL_NUM_THREADS=${CPU_THREADS}"
     "CUDA_VISIBLE_DEVICES=${GPU_INDEX}"
@@ -284,6 +363,14 @@ run_case_e13() {
   sudo journalctl -k --since "@${kernel_epoch}" --no-pager -o short-unix \
     >"${case_dir}/kernel.since.log" 2>"${case_dir}/kernel.since.err"
   journal_rc=$?
+  if [[ -r /proc/driver/nvidia-uvm/phase_f_route_log ]]; then
+    cp -- /proc/driver/nvidia-uvm/phase_f_route_log \
+      "${case_dir}/phase_f_route_log.after.txt" || true
+  fi
+  if [[ -r /proc/driver/nvidia-uvm/phase_f_route_log_stats ]]; then
+    cp -- /proc/driver/nvidia-uvm/phase_f_route_log_stats \
+      "${case_dir}/phase_f_route_log_stats.after.txt" || true
+  fi
   set -e
   printf '%s\n' "${rc}" >"${case_dir}/returncode.txt"
   printf '%s\n' "${journal_rc}" >"${case_dir}/kernel_log_returncode.txt"
@@ -551,6 +638,329 @@ run_phase_once_e13() {
     || die_e13 "phase-once incomplete: cases=${failures}, verify=${verify_rc}"
 }
 
+run_k2_k6_roundtrip_once_e13() {
+  [[ "${ALLOW_GPU_RUN:-0}" == 1 ]] \
+    || die_e13 "GPU execution requires ALLOW_GPU_RUN=1"
+  static_preflight_e13
+  runtime_preflight
+  local run_root="${RUN_ROOT:-${REPO_ROOT}/experiments/eurosys_moe_offload_evaluation/artifacts/e13-k2-k6-roundtrip-$(date -u +%Y%m%dT%H%M%SZ)-attempt-01}"
+  [[ ! -e "${run_root}" ]] || die_e13 "RUN_ROOT already exists: ${run_root}"
+  mkdir -p "${run_root}"
+  run_root="$(cd "${run_root}" && pwd)"
+  RUN_ROOT_ACTIVE="${run_root}"
+  module_snapshot "${run_root}/module.before.json" "${STOCK_UVM}"
+  load_custom_module
+  module_snapshot "${run_root}/module.custom.json" "${CUSTOM_UVM}"
+  git -C "${REPO_ROOT}" status --short >"${run_root}/git_status.txt"
+  sha256sum "${CONFIG}" "${K2_K6_ROUNDTRIP_RUNNER}" \
+    "${VERIFY_K2_K6_ROUNDTRIP}" "${TEACHER_PROCESSOR}" \
+    "${MODEL}/config.json" "${NAMES}" "${BASE_PLAN}" "${PLAN_CLASSES}" \
+    "${CUSTOM_UVM}" >"${run_root}/input_sha256.txt"
+  cp -- "${CONFIG}" "${run_root}/config.snapshot.json"
+  printf 'arm\tdirectory\treturncode\n' >"${run_root}/execution_status.tsv"
+
+  E13_CASE_RUNNER="${K2_K6_ROUNDTRIP_RUNNER}"
+  local failures=0 arm case_dir rc
+  local arms_text="${E13_SHORT_GRAPH_ROUNDTRIP_ARMS:-fixed_k2 fixed_k6 roundtrip}"
+  for arm in ${arms_text}; do
+    [[ "${arm}" == fixed_k2 || "${arm}" == fixed_k6 || "${arm}" == roundtrip ]] \
+      || die_e13 "invalid short Graph round-trip arm: ${arm}"
+    case_dir="${run_root}/${arm}"
+    if run_case_e13 qualification 0 20260901 "${arm}" "${case_dir}"; then
+      rc=0
+    else
+      rc=$?
+      failures=$((failures + 1))
+      tail -n 240 "${case_dir}/run.log" >&2 || true
+    fi
+    printf '%s\t%s\t%s\n' "${arm}" "${case_dir#${run_root}/}" "${rc}" \
+      >>"${run_root}/execution_status.tsv"
+  done
+  unset E13_CASE_RUNNER
+
+  restore_stock || die_e13 "failed to restore stock nvidia_uvm"
+  module_snapshot "${run_root}/module.after.json" "${STOCK_UVM}"
+  restart_exporters
+  if [[ "${arms_text}" != "fixed_k2 fixed_k6 roundtrip" ]]; then
+    echo "RUN_ROOT=${run_root}"
+    (( failures == 0 )) \
+      || die_e13 "Selected Adaptive FULL_SEPARATE arms incomplete: cases=${failures}"
+    return 0
+  fi
+  local verify_rc=0
+  set +e
+  "${VLLM_PY}" "${VERIFY_K2_K6_ROUNDTRIP}" "${run_root}" \
+    --output "${run_root}/verification.json" \
+    >"${run_root}/verify.log" 2>"${run_root}/verify.err"
+  verify_rc=$?
+  set -e
+  echo "RUN_ROOT=${run_root}"
+  echo "verification=${run_root}/verification.json"
+  echo "summary=${run_root}/summary.md"
+  (( failures == 0 && verify_rc == 0 )) \
+    || die_e13 "K2/K6 round-trip incomplete: cases=${failures}, verify=${verify_rc}"
+}
+
+run_short_batch_once_e13() {
+  local short_batch="$1"
+  [[ "${short_batch}" == 6 || "${short_batch}" == 64 || "${short_batch}" == 128 || "${short_batch}" == matrix ]] \
+    || die_e13 "short batch must be 6, 64, 128, or matrix"
+  local short_label="b${short_batch}" scope="short_b${short_batch}"
+  local verify_tool="${VERIFY_SHORT_BATCH}"
+  local -a verify_args=(--batch-size "${short_batch}")
+  if [[ "${short_batch}" == matrix ]]; then
+    short_label="b1-b16-b64"
+    scope="short_matrix"
+    verify_tool="${VERIFY_SHORT_BATCH_MATRIX}"
+    verify_args=()
+  fi
+  [[ "${ALLOW_GPU_RUN:-0}" == 1 ]] \
+    || die_e13 "GPU execution requires ALLOW_GPU_RUN=1"
+  static_preflight_e13
+  runtime_preflight
+  local run_root="${RUN_ROOT:-${REPO_ROOT}/experiments/eurosys_moe_offload_evaluation/artifacts/e13-fixed-k2-k6-short-${short_label}-$(date -u +%Y%m%dT%H%M%SZ)-attempt-01}"
+  [[ ! -e "${run_root}" ]] || die_e13 "RUN_ROOT already exists: ${run_root}"
+  mkdir -p "${run_root}"
+  run_root="$(cd "${run_root}" && pwd)"
+  RUN_ROOT_ACTIVE="${run_root}"
+  module_snapshot "${run_root}/module.before.json" "${STOCK_UVM}"
+  load_custom_module
+  module_snapshot "${run_root}/module.custom.json" "${CUSTOM_UVM}"
+  git -C "${REPO_ROOT}" status --short >"${run_root}/git_status.txt"
+  sha256sum "${CONFIG}" "${K2_K6_ROUNDTRIP_RUNNER}" \
+    "${verify_tool}" "${TEACHER_PROCESSOR}" "${MODEL}/config.json" \
+    "${NAMES}" "${BASE_PLAN}" "${PLAN_CLASSES}" "${CUSTOM_UVM}" \
+    >"${run_root}/input_sha256.txt"
+  cp -- "${CONFIG}" "${run_root}/config.snapshot.json"
+  printf 'arm\tdirectory\treturncode\n' >"${run_root}/execution_status.tsv"
+
+  E13_CASE_RUNNER="${K2_K6_ROUNDTRIP_RUNNER}"
+  E13_K2_K6_MEASUREMENT_SCOPE="${scope}"
+  export E13_K2_K6_MEASUREMENT_SCOPE
+  local failures=0 arm case_dir rc
+  for arm in fixed_k2 fixed_k6; do
+    case_dir="${run_root}/${arm}"
+    if run_case_e13 qualification 0 20260901 "${arm}" "${case_dir}"; then
+      rc=0
+    else
+      rc=$?
+      failures=$((failures + 1))
+      tail -n 240 "${case_dir}/run.log" >&2 || true
+    fi
+    printf '%s\t%s\t%s\n' "${arm}" "${case_dir#${run_root}/}" "${rc}" \
+      >>"${run_root}/execution_status.tsv"
+  done
+  unset E13_CASE_RUNNER E13_K2_K6_MEASUREMENT_SCOPE
+
+  restore_stock || die_e13 "failed to restore stock nvidia_uvm"
+  module_snapshot "${run_root}/module.after.json" "${STOCK_UVM}"
+  restart_exporters
+  local verify_rc=0
+  set +e
+  "${VLLM_PY}" "${verify_tool}" "${run_root}" \
+    "${verify_args[@]}" \
+    --output "${run_root}/verification.json" \
+    >"${run_root}/verify.log" 2>"${run_root}/verify.err"
+  verify_rc=$?
+  set -e
+  echo "RUN_ROOT=${run_root}"
+  echo "verification=${run_root}/verification.json"
+  echo "summary=${run_root}/summary.md"
+  (( failures == 0 && verify_rc == 0 )) \
+    || die_e13 "Short-B${short_batch} comparison incomplete: cases=${failures}, verify=${verify_rc}"
+}
+
+run_short_graph_matrix_once_e13() {
+  [[ "${ALLOW_GPU_RUN:-0}" == 1 ]] \
+    || die_e13 "GPU execution requires ALLOW_GPU_RUN=1"
+  static_preflight_e13
+  runtime_preflight
+  local run_root="${RUN_ROOT:-${REPO_ROOT}/experiments/eurosys_moe_offload_evaluation/artifacts/e13-fixed-k2-k6-short-b64-b128-full-separate-$(date -u +%Y%m%dT%H%M%SZ)-attempt-01}"
+  [[ ! -e "${run_root}" ]] || die_e13 "RUN_ROOT already exists: ${run_root}"
+  mkdir -p "${run_root}"
+  run_root="$(cd "${run_root}" && pwd)"
+  RUN_ROOT_ACTIVE="${run_root}"
+  module_snapshot "${run_root}/module.before.json" "${STOCK_UVM}"
+  load_custom_module
+  module_snapshot "${run_root}/module.custom.json" "${CUSTOM_UVM}"
+  git -C "${REPO_ROOT}" status --short >"${run_root}/git_status.txt"
+  sha256sum "${CONFIG}" "${K2_K6_ROUNDTRIP_RUNNER}" \
+    "${VERIFY_SHORT_GRAPH_MATRIX}" "${TEACHER_PROCESSOR}" \
+    "${MODEL}/config.json" "${NAMES}" "${BASE_PLAN}" "${COLD89_PLAN}" \
+    "${GRAPH_K2_PLAN_CLASSES}" "${GRAPH_K6_PLAN_CLASSES}" "${CUSTOM_UVM}" \
+    >"${run_root}/input_sha256.txt"
+  cp -- "${CONFIG}" "${run_root}/config.snapshot.json"
+  printf 'arm\tdirectory\treturncode\n' >"${run_root}/execution_status.tsv"
+
+  E13_CASE_RUNNER="${K2_K6_ROUNDTRIP_RUNNER}"
+  E13_K2_K6_MEASUREMENT_SCOPE=short_graph_matrix
+  E13_K2_K6_FULL_SEPARATE_GRAPH=1
+  export E13_K2_K6_MEASUREMENT_SCOPE E13_K2_K6_FULL_SEPARATE_GRAPH
+  local failures=0 arm case_dir rc
+  for arm in fixed_k2 fixed_k6; do
+    case_dir="${run_root}/${arm}"
+    if run_case_e13 qualification 0 20260901 "${arm}" "${case_dir}"; then
+      rc=0
+    else
+      rc=$?
+      failures=$((failures + 1))
+      tail -n 260 "${case_dir}/run.log" >&2 || true
+    fi
+    printf '%s\t%s\t%s\n' "${arm}" "${case_dir#${run_root}/}" "${rc}" \
+      >>"${run_root}/execution_status.tsv"
+  done
+  unset E13_CASE_RUNNER E13_K2_K6_MEASUREMENT_SCOPE \
+    E13_K2_K6_FULL_SEPARATE_GRAPH
+
+  restore_stock || die_e13 "failed to restore stock nvidia_uvm"
+  module_snapshot "${run_root}/module.after.json" "${STOCK_UVM}"
+  restart_exporters
+  local verify_rc=0
+  set +e
+  "${VLLM_PY}" "${VERIFY_SHORT_GRAPH_MATRIX}" "${run_root}" \
+    --output "${run_root}/verification.json" \
+    >"${run_root}/verify.log" 2>"${run_root}/verify.err"
+  verify_rc=$?
+  set -e
+  echo "RUN_ROOT=${run_root}"
+  echo "verification=${run_root}/verification.json"
+  echo "summary=${run_root}/summary.md"
+  (( failures == 0 && verify_rc == 0 )) \
+    || die_e13 "Short B64/B128 FULL_SEPARATE comparison incomplete: cases=${failures}, verify=${verify_rc}"
+}
+
+run_short_graph_roundtrip_once_e13() {
+  [[ "${ALLOW_GPU_RUN:-0}" == 1 ]] \
+    || die_e13 "GPU execution requires ALLOW_GPU_RUN=1"
+  static_preflight_e13
+  runtime_preflight
+  local run_root="${RUN_ROOT:-${REPO_ROOT}/experiments/eurosys_moe_offload_evaluation/artifacts/e13-adaptive-short-b64-b128-full-separate-roundtrip-$(date -u +%Y%m%dT%H%M%SZ)-attempt-01}"
+  [[ ! -e "${run_root}" ]] || die_e13 "RUN_ROOT already exists: ${run_root}"
+  mkdir -p "${run_root}"
+  run_root="$(cd "${run_root}" && pwd)"
+  RUN_ROOT_ACTIVE="${run_root}"
+  module_snapshot "${run_root}/module.before.json" "${STOCK_UVM}"
+  load_custom_module
+  module_snapshot "${run_root}/module.custom.json" "${CUSTOM_UVM}"
+  git -C "${REPO_ROOT}" status --short >"${run_root}/git_status.txt"
+  sha256sum "${CONFIG}" "${K2_K6_ROUNDTRIP_RUNNER}" \
+    "${VERIFY_SHORT_GRAPH_ROUNDTRIP}" "${TEACHER_PROCESSOR}" \
+    "${MODEL}/config.json" "${NAMES}" "${BASE_PLAN}" "${COLD89_PLAN}" \
+    "${PLAN_CLASSES}" "${GRAPH_K2_PLAN_CLASSES}" \
+    "${GRAPH_K6_PLAN_CLASSES}" "${CUSTOM_UVM}" \
+    >"${run_root}/input_sha256.txt"
+  cp -- "${CONFIG}" "${run_root}/config.snapshot.json"
+  printf 'arm\tdirectory\treturncode\n' >"${run_root}/execution_status.tsv"
+
+  E13_CASE_RUNNER="${K2_K6_ROUNDTRIP_RUNNER}"
+  E13_K2_K6_MEASUREMENT_SCOPE=short_graph_roundtrip
+  E13_K2_K6_FULL_SEPARATE_GRAPH=1
+  E13_K2_K6_GRAPH_ALL_CLASSES=0
+  export E13_K2_K6_MEASUREMENT_SCOPE E13_K2_K6_FULL_SEPARATE_GRAPH \
+    E13_K2_K6_GRAPH_ALL_CLASSES
+  local failures=0 arm case_dir rc
+  local graph_arms="${E13_GRAPH_ARMS:-fixed_k2 fixed_k6 roundtrip}"
+  for arm in ${graph_arms}; do
+    if [[ "${arm}" == roundtrip ]]; then
+      E13_K2_K6_GRAPH_ALL_CLASSES=1
+    else
+      E13_K2_K6_GRAPH_ALL_CLASSES=0
+    fi
+    export E13_K2_K6_GRAPH_ALL_CLASSES
+    case_dir="${run_root}/${arm}"
+    if run_case_e13 qualification 0 20260901 "${arm}" "${case_dir}"; then
+      rc=0
+    else
+      rc=$?
+      failures=$((failures + 1))
+      tail -n 300 "${case_dir}/run.log" >&2 || true
+    fi
+    printf '%s\t%s\t%s\n' "${arm}" "${case_dir#${run_root}/}" "${rc}" \
+      >>"${run_root}/execution_status.tsv"
+  done
+  unset E13_CASE_RUNNER E13_K2_K6_MEASUREMENT_SCOPE \
+    E13_K2_K6_FULL_SEPARATE_GRAPH E13_K2_K6_GRAPH_ALL_CLASSES
+
+  restore_stock || die_e13 "failed to restore stock nvidia_uvm"
+  module_snapshot "${run_root}/module.after.json" "${STOCK_UVM}"
+  restart_exporters
+  if [[ -n "${E13_GRAPH_ARMS:-}" ]]; then
+    echo "RUN_ROOT=${run_root}"
+    echo "diagnostic_arm_filter=${E13_GRAPH_ARMS}"
+    (( failures == 0 )) \
+      || die_e13 "Adaptive FULL_SEPARATE diagnostic failed: cases=${failures}"
+    return 0
+  fi
+  local verify_rc=0
+  set +e
+  "${VLLM_PY}" "${VERIFY_SHORT_GRAPH_ROUNDTRIP}" "${run_root}" \
+    --output "${run_root}/verification.json" \
+    >"${run_root}/verify.log" 2>"${run_root}/verify.err"
+  verify_rc=$?
+  set -e
+  echo "RUN_ROOT=${run_root}"
+  echo "verification=${run_root}/verification.json"
+  echo "summary=${run_root}/summary.md"
+  (( failures == 0 && verify_rc == 0 )) \
+    || die_e13 "Adaptive FULL_SEPARATE round-trip incomplete: cases=${failures}, verify=${verify_rc}"
+}
+
+run_short_b128_abba_diagnosis_e13() {
+  local scope="${1:-short_b128_abba}" root_label=abba
+  [[ "${scope}" == short_b128_abba || "${scope}" == short_b128_shrink_isolation ]] \
+    || die_e13 "unknown Short/B128 diagnostic scope: ${scope}"
+  [[ "${scope}" == short_b128_shrink_isolation ]] && root_label=shrink-isolation
+  [[ "${ALLOW_GPU_RUN:-0}" == 1 ]] \
+    || die_e13 "GPU execution requires ALLOW_GPU_RUN=1"
+  static_preflight_e13
+  runtime_preflight
+  local run_root="${RUN_ROOT:-${REPO_ROOT}/experiments/eurosys_moe_offload_evaluation/artifacts/e13-short-b128-decode-${root_label}-$(date -u +%Y%m%dT%H%M%SZ)-attempt-01}"
+  [[ ! -e "${run_root}" ]] || die_e13 "RUN_ROOT already exists: ${run_root}"
+  mkdir -p "${run_root}"
+  run_root="$(cd "${run_root}" && pwd)"
+  RUN_ROOT_ACTIVE="${run_root}"
+  module_snapshot "${run_root}/module.before.json" "${STOCK_UVM}"
+  load_custom_module
+  module_snapshot "${run_root}/module.custom.json" "${CUSTOM_UVM}"
+  git -C "${REPO_ROOT}" status --short >"${run_root}/git_status.txt"
+  sha256sum "${CONFIG}" "${K2_K6_ROUNDTRIP_RUNNER}" \
+    "${VERIFY_SHORT_B128_ABBA}" "${TEACHER_PROCESSOR}" \
+    "${MODEL}/config.json" "${NAMES}" "${BASE_PLAN}" "${PLAN_CLASSES}" \
+    "${CUSTOM_UVM}" >"${run_root}/input_sha256.txt"
+  cp -- "${CONFIG}" "${run_root}/config.snapshot.json"
+  printf 'arm\tdirectory\treturncode\n' >"${run_root}/execution_status.tsv"
+
+  E13_CASE_RUNNER="${K2_K6_ROUNDTRIP_RUNNER}"
+  E13_K2_K6_MEASUREMENT_SCOPE="${scope}"
+  export E13_K2_K6_MEASUREMENT_SCOPE
+  local case_dir="${run_root}/roundtrip" rc failures=0
+  if run_case_e13 qualification 0 20260901 roundtrip "${case_dir}"; then
+    rc=0
+  else
+    rc=$?
+    failures=1
+    tail -n 240 "${case_dir}/run.log" >&2 || true
+  fi
+  printf 'roundtrip\troundtrip\t%s\n' "${rc}" >>"${run_root}/execution_status.tsv"
+  unset E13_CASE_RUNNER E13_K2_K6_MEASUREMENT_SCOPE
+
+  restore_stock || die_e13 "failed to restore stock nvidia_uvm"
+  module_snapshot "${run_root}/module.after.json" "${STOCK_UVM}"
+  restart_exporters
+  local verify_rc=0
+  set +e
+  "${VLLM_PY}" "${VERIFY_SHORT_B128_ABBA}" "${run_root}" \
+    --output "${run_root}/verification.json" \
+    >"${run_root}/verify.log" 2>"${run_root}/verify.err"
+  verify_rc=$?
+  set -e
+  echo "RUN_ROOT=${run_root}"
+  echo "verification=${run_root}/verification.json"
+  echo "summary=${run_root}/summary.md"
+  (( failures == 0 && verify_rc == 0 )) \
+    || die_e13 "Short/B128 ABBA diagnosis incomplete: cases=${failures}, verify=${verify_rc}"
+}
+
 run_numerical_e13() {
   local source_root="$1" profile="$2"
   [[ "${profile}" == formal || "${profile}" == capacity ]] \
@@ -728,6 +1138,33 @@ case "${1:-help}" in
   phase-once)
     run_phase_once_e13
     ;;
+  k2-k6-roundtrip-once)
+    run_k2_k6_roundtrip_once_e13
+    ;;
+  short-b6-once)
+    run_short_batch_once_e13 6
+    ;;
+  short-b64-once)
+    run_short_batch_once_e13 64
+    ;;
+  short-b128-once)
+    run_short_batch_once_e13 128
+    ;;
+  short-b128-decode-diagnose)
+    run_short_b128_abba_diagnosis_e13 short_b128_abba
+    ;;
+  short-b128-shrink-diagnose)
+    run_short_b128_abba_diagnosis_e13 short_b128_shrink_isolation
+    ;;
+  short-batch-matrix-once)
+    run_short_batch_once_e13 matrix
+    ;;
+  short-graph-matrix-once)
+    run_short_graph_matrix_once_e13
+    ;;
+  short-graph-roundtrip-once)
+    run_short_graph_roundtrip_once_e13
+    ;;
   decode-diagnose)
     run_decode_diagnosis_e13
     ;;
@@ -747,7 +1184,7 @@ case "${1:-help}" in
     "${VLLM_PY}" "${PLOT}" "$2" --config "${CONFIG}" --profile "$3"
     ;;
   *)
-    echo "usage: $0 {static-preflight|qualification|formal|capacity|numerical SOURCE_RUN_ROOT PROFILE|phase-once|decode-diagnose|decode-backing-diagnose|decode-nsys-diagnose|verify RUN_ROOT PROFILE|aggregate RUN_ROOT PROFILE}" >&2
+    echo "usage: $0 {static-preflight|qualification|formal|capacity|numerical SOURCE_RUN_ROOT PROFILE|phase-once|k2-k6-roundtrip-once|short-b6-once|short-b64-once|short-b128-once|short-b128-decode-diagnose|short-b128-shrink-diagnose|short-batch-matrix-once|short-graph-matrix-once|short-graph-roundtrip-once|decode-diagnose|decode-backing-diagnose|decode-nsys-diagnose|verify RUN_ROOT PROFILE|aggregate RUN_ROOT PROFILE}" >&2
     exit 2
     ;;
 esac

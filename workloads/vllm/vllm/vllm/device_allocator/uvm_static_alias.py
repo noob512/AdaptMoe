@@ -46,6 +46,7 @@ UVM_MOE_STATIC_ALIAS_MAP_FLAG_QUIESCED_APPEND = 1 << 0
 UVM_MOE_STATIC_ALIAS_MAP_FLAG_DEFER_DUAL_REFRESH = 1 << 1
 UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL = 1 << 0
 UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL_NESTED = 1 << 1
+UVM_MOE_STATIC_ALIAS_SEAL_FLAG_DISCARD_DUAL = 1 << 2
 _UVM_MOE_STATIC_ALIAS_MAP_FLAGS_ALL = (
     UVM_MOE_STATIC_ALIAS_MAP_FLAG_QUIESCED_APPEND
     | UVM_MOE_STATIC_ALIAS_MAP_FLAG_DEFER_DUAL_REFRESH
@@ -925,6 +926,7 @@ def driver_static_alias_seal(
     device: int = 0,
     refresh_dual: bool = False,
     nested_refresh: bool = False,
+    discard_dual: bool = False,
 ) -> dict[str, object]:
     """Seal a session, or refresh its frozen dual children at a safe point."""
     started_ns = time.perf_counter_ns()
@@ -937,7 +939,9 @@ def driver_static_alias_seal(
         or session_id > _UINT64_MAX
         or not isinstance(refresh_dual, bool)
         or not isinstance(nested_refresh, bool)
+        or not isinstance(discard_dual, bool)
         or (nested_refresh and not refresh_dual)
+        or (discard_dual and (refresh_dual or nested_refresh))
     ):
         return _base_result(
             "seal",
@@ -976,14 +980,14 @@ def driver_static_alias_seal(
                 session_id=int(session_id),
                 wall_ns=time.perf_counter_ns() - started_ns,
             )
-        if cached.sealed and not refresh_dual:
+        if cached.sealed and not refresh_dual and not discard_dual:
             return _base_result(
                 "seal",
                 reason="static_alias_session_already_sealed",
                 session_id=int(session_id),
                 wall_ns=time.perf_counter_ns() - started_ns,
             )
-        if refresh_dual and not cached.sealed:
+        if (refresh_dual or discard_dual) and not cached.sealed:
             return _base_result(
                 "seal",
                 reason="static_alias_session_not_sealed",
@@ -1017,6 +1021,8 @@ def driver_static_alias_seal(
             params.flags |= UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL
         if nested_refresh:
             params.flags |= UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL_NESTED
+        if discard_dual:
+            params.flags |= UVM_MOE_STATIC_ALIAS_SEAL_FLAG_DISCARD_DUAL
         params.session_id = int(session_id)
         params.expected_alias_count = expected_count
         params.expected_alias_bytes = expected_bytes
@@ -1083,6 +1089,7 @@ def driver_static_alias_seal(
             wall_ns=time.perf_counter_ns() - started_ns,
             refresh_dual=bool(refresh_dual),
             nested_refresh=bool(nested_refresh),
+            discard_dual=bool(discard_dual),
         )
 
 

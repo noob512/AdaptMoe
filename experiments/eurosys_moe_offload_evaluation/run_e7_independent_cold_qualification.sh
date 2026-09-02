@@ -6,6 +6,9 @@ E7_REPO_ROOT="$(cd "${E7_SCRIPT_DIR}/../.." && pwd)"
 E7_BASE_HARNESS="${E7_REPO_ROOT}/experiments/vllm_uvm_prefill_alias_decode_remote_graph/run_experiment.sh"
 
 export VLLM_PHASE_SWITCH_SOURCE_ONLY=1
+export STATIC_ALIAS_DUAL_VIEW_ENABLE="${STATIC_ALIAS_DUAL_VIEW_ENABLE:-1}"
+export STATIC_ALIAS_DUAL_VIEW_REQUIRE_FULL="${STATIC_ALIAS_DUAL_VIEW_REQUIRE_FULL:-1}"
+export PHASE_F_ROUTE_LOG_ENABLE="${PHASE_F_ROUTE_LOG_ENABLE:-0}"
 # shellcheck source=/dev/null
 source "${E7_BASE_HARNESS}"
 unset VLLM_PHASE_SWITCH_SOURCE_ONLY
@@ -97,7 +100,7 @@ static_preflight_e7() {
     "${VLLM_PY}" -m pytest -q \
       tests/v1/engine/test_uvm_adaptive_kv.py \
       tests/test_uvm_explicit_expert_regions.py \
-      -k 'dynamic_expert_swap_plan or dynamic_swap_uses_explicit_expert_records'
+      -k 'dynamic_expert_swap_plan or dynamic_swap'
   )
   echo "E7 independent-cold static preflight: OK"
 }
@@ -192,14 +195,19 @@ run_one_arm() {
       VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_REGION_BYTES=524288 \
       VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_PTE_MODE=auto \
       VLLM_CPU_OFFLOAD_UVM_ORIGINAL_VA_PARK_RESUME=1 \
+      VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW=1 \
+      VLLM_CPU_OFFLOAD_PLAN_CLASS_IMMUTABLE_CPU_SHADOW=1 \
+      VLLM_CPU_OFFLOAD_DUAL_VIEW_FULL_PARAMETER_SHADOW=1 \
       VLLM_UVM_EXPERT_WEIGHTS_MANAGED=1 \
       VLLM_UVM_ORIGINAL_VA_PHASE_MODE=prefill_graph_remote_decode \
+      VLLM_UVM_PROFILE_ALL_EXPERTS_REMOTE=1 \
+      VLLM_UVM_PREFILL_GRAPH_CAPTURE_BEFORE_HOT_RESTORE=1 \
       VLLM_UVM_ORIGINAL_VA_GRAPH_MIN_FREE_BYTES=201326592 \
       VLLM_UVM_PREFILL_P3_DECODE_REMOTE_READ=0 \
       VLLM_UVM_EXPERT_ENVELOPE_ENABLE=1 \
       VLLM_UVM_EXPERT_ENVELOPE_BYTES=524288 \
       VLLM_UVM_EXPERT_OFFLOAD_ACCESS_MODE=remote_read \
-      VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE=1 \
+      VLLM_UVM_INIT_WEIGHT_OFFLOAD_ENABLE=0 \
       VLLM_UVM_INIT_WEIGHT_OFFLOAD_MODE=driver_release_cpu \
       VLLM_UVM_INIT_WEIGHT_OFFLOAD_STAGE=post_warmup \
       VLLM_UVM_INIT_WEIGHT_PLAN_FILE="${SUPERSET_PLAN}" \
@@ -209,7 +217,7 @@ run_one_arm() {
       VLLM_UVM_DYNAMIC_EXPERT_SWAP_ENABLE=1 \
       VLLM_UVM_DYNAMIC_EXPERT_AUTO_REBALANCE_ENABLE=0 \
       VLLM_UVM_DYNAMIC_EXPERT_HEAT_EWMA_ALPHA=0.25 \
-      VLLM_UVM_INIT_WEIGHT_PLACEMENT_MANIFEST= \
+      VLLM_UVM_INIT_WEIGHT_PLACEMENT_MANIFEST="${arm_root}/placement.json" \
       VLLM_UVM_WEIGHT_EXECUTOR=cpp_batch \
       VLLM_CPU_OFFLOAD_COPY_TRACE=0 \
       VLLM_CPU_OFFLOAD_COPY_SYNC=0 \
@@ -247,6 +255,9 @@ run_one_arm() {
   runner_rc=$?
   set -e
   printf '%s\n' "${runner_rc}" >"${arm_root}/returncode.txt"
+  sudo cat /proc/driver/nvidia-uvm/phase_f_route_log \
+    >"${arm_root}/phase_f_route_log.txt" 2>"${arm_root}/phase_f_route_log.err" \
+    || true
   wait_gpu_clean || die_e7 "GPU did not clean after arm ${arm}"
   gpu_state_json "${arm_root}/gpu.after.json"
   cp -- "${STATS_PATH}" "${arm_root}/latency_stats.after.txt"
@@ -310,15 +321,54 @@ run_e7() {
   echo "verification=${run_root}/verification.json"
 }
 
+run_e7_diagnostic_arm() {
+  runtime_preflight_e7
+  local arm="${E7_DIAGNOSTIC_ARM:-frequency_cold}"
+  local run_root="${RUN_ROOT:-${SCRIPT_DIR}/artifacts/e7-independent-cold-diagnostic}"
+  local frozen_targets="${run_root}/frozen_targets.json"
+  local valid=0 runner_rc journal_rc kernel_epoch
+  local candidate
+  for candidate in "${ARM_ORDER[@]}"; do
+    [[ "${candidate}" == "${arm}" ]] && valid=1
+  done
+  (( valid == 1 )) || die_e7 "invalid E7_DIAGNOSTIC_ARM: ${arm}"
+  [[ ! -e "${run_root}" ]] || die_e7 "RUN_ROOT already exists: ${run_root}"
+  mkdir -p "${run_root}/arms"
+  run_root="$(cd "${run_root}" && pwd)"
+  RUN_ROOT_ACTIVE="${run_root}"
+  frozen_targets="${run_root}/frozen_targets.json"
+  freeze_targets "${frozen_targets}"
+  module_snapshot "${run_root}/module.before.json" "${STOCK_UVM}"
+  load_custom_module
+  module_snapshot "${run_root}/module.custom.json" "${CUSTOM_UVM}"
+  kernel_epoch="$(date +%s)"
+  set +e
+  run_one_arm "${run_root}" "${arm}" "${frozen_targets}"
+  runner_rc=$?
+  sudo journalctl -k --since "@${kernel_epoch}" --no-pager -o short-unix \
+    >"${run_root}/kernel.since.log" 2>"${run_root}/kernel.since.err"
+  journal_rc=$?
+  set -e
+  printf '%s\n' "${journal_rc}" >"${run_root}/kernel_log_returncode.txt"
+  restore_stock || die_e7 "failed to restore stock nvidia_uvm"
+  module_snapshot "${run_root}/module.after.json" "${STOCK_UVM}"
+  restart_exporters
+  (( journal_rc == 0 )) || die_e7 "kernel journal collection failed"
+  echo "RUN_ROOT=${run_root}"
+  echo "diagnostic_arm=${arm}"
+  return "${runner_rc}"
+}
+
 case "${1:-help}" in
   preflight) static_preflight_e7 ;;
   qualify|qualification|run) run_e7 ;;
+  diagnose|diagnostic) run_e7_diagnostic_arm ;;
   verify)
     [[ $# -eq 2 ]] || die_e7 "verify requires RUN_ROOT"
     "${VLLM_PY}" "${VERIFY}" "$2" --output "$2/verification.json"
     ;;
   *)
-    echo "usage: $0 {preflight|qualify|verify RUN_ROOT}" >&2
+    echo "usage: $0 {preflight|qualify|diagnose|verify RUN_ROOT}" >&2
     exit 2
     ;;
 esac

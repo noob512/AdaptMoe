@@ -199,6 +199,10 @@ class EngineCore:
         self._uvm_kv_autoscale_expert_restore_pending = False
         self._uvm_kv_autoscale_pending_plan_class: str | None = None
         self._uvm_kv_autoscale_last_decision: dict[str, Any] = {}
+        # The ordinary (non-pipelined) step loop is serialized, but keeping an
+        # explicit execution guard makes scheduler-boundary maintenance fail
+        # closed if a future call site becomes re-entrant.
+        self._uvm_model_execution_inflight = False
         self._uvm_dynamic_expert_heat_ewma: dict[str, list[float]] = {}
         self._uvm_dynamic_expert_last_rebalance_ns = 0
         self._uvm_dynamic_expert_rebalance_generation = 0
@@ -430,10 +434,36 @@ class EngineCore:
             "_uvm_kv_autoscale_expert_restore_pending": False,
             "_uvm_kv_autoscale_pending_plan_class": None,
             "_uvm_kv_autoscale_last_decision": {},
+            "_uvm_model_execution_inflight": False,
         }
         for name, value in defaults.items():
             if not hasattr(self, name):
                 setattr(self, name, value)
+
+    def _uvm_scheduler_quiescent_for_resize(self) -> bool:
+        """Return whether residency may change between scheduler steps.
+
+        Running requests do not make the ordinary v1 loop unsafe: after its
+        model future has completed, their read-only expert placement and free
+        KV tail may change before the next ``schedule()`` call.  Pipelined
+        batch queues remain conservative because they can retain worker
+        futures whose ranges are not represented by ``scheduler.running``.
+        """
+        self._ensure_uvm_kv_autoscale_state()
+        if bool(self._uvm_model_execution_inflight):
+            return False
+        batch_queue = getattr(self, "batch_queue", None)
+        if batch_queue is None:
+            return True
+        # Online switching is intentionally disabled for the pipelined path.
+        # It may still switch at the old globally-idle boundary.
+        return not batch_queue and not self.scheduler.has_unfinished_requests()
+
+    def _uvm_scheduler_boundary_resize_enabled(self) -> bool:
+        return self._uvm_env_flag(
+            "VLLM_UVM_KV_SCHEDULER_BOUNDARY_RESIZE_ENABLE",
+            default=False,
+        )
 
     @staticmethod
     def _align_uvm_kv_blocks_up(value: int, granularity: int) -> int:
@@ -590,6 +620,10 @@ class EngineCore:
             ),
             "resize_granularity_blocks": granularity,
             "allowed_target_blocks": allowed_targets,
+            "synchronized_tier_steps": self._uvm_env_flag(
+                "VLLM_UVM_KV_AUTO_SCALE_SYNCHRONIZED_TIER_STEPS",
+                default=False,
+            ),
             "prediction_error_alpha": min(
                 max(
                     self._uvm_env_float(
@@ -612,6 +646,27 @@ class EngineCore:
         if callable(snapshot_fn):
             snapshot = snapshot_fn()
             if isinstance(snapshot, dict):
+                snapshot = dict(snapshot)
+                active_ids = snapshot.get("active_block_ids")
+                if isinstance(active_ids, list):
+                    normalized_active_ids = [
+                        int(block_id)
+                        for block_id in active_ids
+                        if int(block_id) > 0
+                    ]
+                    max_active = max(normalized_active_ids, default=0)
+                    snapshot.setdefault("active_block_ids_known", True)
+                    snapshot.setdefault("max_active_block_id", max_active)
+                    snapshot.setdefault(
+                        "tail_free_start_block_id",
+                        min(max_active + 1, int(current_target) + 1),
+                    )
+                    snapshot.setdefault(
+                        "tail_free_block_count",
+                        max(int(current_target) - max_active, 0),
+                    )
+                else:
+                    snapshot.setdefault("active_block_ids_known", False)
                 return snapshot
         free_blocks = 0
         get_free = getattr(block_pool, "get_num_free_blocks", None)
@@ -624,6 +679,10 @@ class EngineCore:
             "gpu_free_blocks": free_blocks,
             "gpu_backup_blocks": 0,
             "cpu_offline_blocks": 0,
+            "active_block_ids_known": False,
+            "max_active_block_id": None,
+            "tail_free_start_block_id": None,
+            "tail_free_block_count": None,
             "invariant_ok": True,
         }
 
@@ -667,13 +726,20 @@ class EngineCore:
         class_name = self._uvm_kv_autoscale_pending_plan_class
         if class_name is None:
             return None
-        if self.scheduler.has_unfinished_requests() or getattr(
-            self,
-            "batch_queue",
-            None,
-        ):
-            return None
-        result = self.activate_uvm_expert_graph_class(class_name)
+        if self._uvm_scheduler_boundary_resize_enabled():
+            if not self._uvm_scheduler_quiescent_for_resize():
+                return None
+            result = self._activate_uvm_expert_graph_class_at_quiescent_boundary(
+                class_name
+            )
+        else:
+            if self.scheduler.has_unfinished_requests() or getattr(
+                self,
+                "batch_queue",
+                None,
+            ):
+                return None
+            result = self.activate_uvm_expert_graph_class(class_name)
         if bool(result.get("ok")):
             self._uvm_kv_autoscale_pending_plan_class = None
         else:
@@ -752,10 +818,8 @@ class EngineCore:
             }
 
         # A non-urgent high-watermark signal means the current tier still fits
-        # the active cohort. With frozen expert Plan Classes we cannot switch
-        # until that cohort drains, so queuing the grow would only perform a
-        # stale migration after the pressure disappeared. A later admission
-        # submits a fresh next-request prediction and may grow before it runs.
+        # the active cohort. Do not pay a synchronous scheduler-boundary stall
+        # until a later prediction or reserve activation proves growth urgent.
         if scheduler_unfinished and not urgent:
             self._uvm_kv_autoscale_low_streak = 0
             self._cancel_uvm_pending_kv_shrink(
@@ -810,7 +874,16 @@ class EngineCore:
             }
 
         batch_queue = getattr(self, "batch_queue", None)
-        if scheduler_unfinished or (batch_queue is not None and batch_queue):
+        scheduler_boundary_enabled = (
+            self._uvm_scheduler_boundary_resize_enabled()
+        )
+        online_boundary = (
+            scheduler_boundary_enabled
+            and self._uvm_scheduler_quiescent_for_resize()
+        )
+        if (
+            scheduler_unfinished or (batch_queue is not None and batch_queue)
+        ) and not online_boundary:
             pending_target = int(
                 getattr(self, "_uvm_pending_kv_grow_target_blocks", 0) or 0
             )
@@ -818,7 +891,11 @@ class EngineCore:
             self._uvm_pending_kv_grow_reason = reason
             return {
                 "ok": True,
-                "reason": "growth_deferred_until_request_boundary",
+                "reason": (
+                    "growth_deferred_until_safe_scheduler_boundary"
+                    if scheduler_boundary_enabled
+                    else "growth_deferred_until_request_boundary"
+                ),
                 "old_target_blocks": old_target,
                 "new_target_blocks": target,
                 "pending": True,
@@ -828,26 +905,101 @@ class EngineCore:
                 ),
             }
 
-        result = self._resize_uvm_kv_target(
-            target,
-            reason=reason,
-            release_expert_wave=self._uvm_env_flag(
-                "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE",
-                default=False,
-            ),
-        )
-        if bool(result.get("ok")):
-            self._note_uvm_kv_autoscale_resize(target)
-            if isinstance(result.get("plan_class_before_grow"), dict):
-                # The target class was committed synchronously before the
-                # physical KV grow.  Do not enqueue an identical activation
-                # for the later idle boundary.
-                self._uvm_kv_autoscale_pending_plan_class = None
+        if bool(config.get("synchronized_tier_steps")):
+            result = self._commit_uvm_kv_synchronized_growth_path(
+                old_target=old_target,
+                target=target,
+                reason=reason,
+                config=config,
+            )
+        else:
+            result = self._resize_uvm_kv_target(
+                target,
+                reason=reason,
+                release_expert_wave=self._uvm_env_flag(
+                    "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE",
+                    default=False,
+                ),
+            )
+            if bool(result.get("ok")):
+                self._note_uvm_kv_autoscale_resize(target)
+                if isinstance(result.get("plan_class_before_grow"), dict):
+                    # The target class was committed synchronously before the
+                    # physical KV grow.  Do not enqueue an identical activation
+                    # for the later idle boundary.
+                    self._uvm_kv_autoscale_pending_plan_class = None
         return {
             **result,
             "old_target_blocks": old_target,
             "new_target_blocks": target,
             "pending": False,
+            "scheduler_boundary_resize_enabled": scheduler_boundary_enabled,
+            "committed_with_running_requests": bool(
+                scheduler_unfinished and online_boundary
+            ),
+        }
+
+    def _commit_uvm_kv_synchronized_growth_path(
+        self,
+        *,
+        old_target: int,
+        target: int,
+        reason: str,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Commit adjacent KV/Plan-Class tiers as separate transactions."""
+        allowed_targets = [
+            int(value) for value in (config.get("allowed_target_blocks") or [])
+        ]
+        if old_target not in allowed_targets or target not in allowed_targets:
+            return {
+                "ok": False,
+                "reason": "synchronized_tier_endpoint_not_registered",
+                "old_target_blocks": int(old_target),
+                "new_target_blocks": int(target),
+            }
+        old_index = allowed_targets.index(int(old_target))
+        target_index = allowed_targets.index(int(target))
+        if target_index <= old_index:
+            return {"ok": True, "reason": "already_at_target", "tier_steps": []}
+
+        tier_results: list[dict[str, Any]] = []
+        applied_target = int(old_target)
+        for step_target in allowed_targets[old_index + 1 : target_index + 1]:
+            step_result = self._resize_uvm_kv_target(
+                int(step_target),
+                reason=reason,
+                release_expert_wave=self._uvm_env_flag(
+                    "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE",
+                    default=False,
+                ),
+            )
+            tier_results.append(
+                {
+                    "old_target_blocks": applied_target,
+                    "new_target_blocks": int(step_target),
+                    "result": step_result,
+                }
+            )
+            if not bool(step_result.get("ok")):
+                return {
+                    "ok": False,
+                    "reason": "synchronized_tier_step_failed",
+                    "requested_target_blocks": int(target),
+                    "applied_target_blocks": applied_target,
+                    "tier_steps": tier_results,
+                }
+            applied_target = int(step_target)
+            self._note_uvm_kv_autoscale_resize(applied_target)
+            if isinstance(step_result.get("plan_class_before_grow"), dict):
+                self._uvm_kv_autoscale_pending_plan_class = None
+
+        return {
+            "ok": True,
+            "reason": "applied_synchronized_tier_steps",
+            "requested_target_blocks": int(target),
+            "applied_target_blocks": applied_target,
+            "tier_steps": tier_results,
         }
 
     def _observe_uvm_kv_autoscale_pressure(
@@ -1068,6 +1220,22 @@ class EngineCore:
                 shrink_target,
                 int(config["minimum_blocks"]),
             )
+        active_ids_known = bool(snapshot.get("active_block_ids_known", False))
+        max_active_value = snapshot.get("max_active_block_id")
+        max_active_block_id = (
+            max(int(max_active_value), 0)
+            if active_ids_known and max_active_value is not None
+            else None
+        )
+        candidate_tail_all_free = (
+            max_active_block_id is not None
+            and max_active_block_id <= shrink_target
+        )
+        # Keep the proof next to the queue snapshot in diagnostics.  This is
+        # deliberately not derived from min(free IDs), which says nothing
+        # about an active block near the current target.
+        snapshot["candidate_shrink_target_blocks"] = shrink_target
+        snapshot["candidate_tail_all_free"] = candidate_tail_all_free
         low_pressure = (
             eligible_round
             and residency_ready
@@ -1075,6 +1243,7 @@ class EngineCore:
             and getattr(self, "_uvm_pending_kv_grow_target_blocks", None) is None
             and required_blocks <= shrink_target
             and shrink_target < current_target
+            and candidate_tail_all_free
         )
         if low_pressure:
             self._uvm_kv_autoscale_low_streak += 1
@@ -1099,6 +1268,12 @@ class EngineCore:
                 "action": action,
                 "low_streak": int(self._uvm_kv_autoscale_low_streak),
                 "candidate_shrink_target_blocks": shrink_target,
+                "max_active_block_id": max_active_block_id,
+                "tail_free_start_block_id": snapshot.get(
+                    "tail_free_start_block_id"
+                ),
+                "tail_free_block_count": snapshot.get("tail_free_block_count"),
+                "candidate_tail_all_free": candidate_tail_all_free,
                 "pending_shrink_target_blocks": (
                     self._uvm_pending_kv_shrink_target_blocks
                 ),
@@ -1150,6 +1325,31 @@ class EngineCore:
         policy, block_pool = components
         old_target = int(policy._dynamic_pool_applied_target_blocks)
         target = min(max(int(target_blocks), 0), int(policy.total_blocks))
+        autoscale_config = self._uvm_kv_autoscale_config(policy)
+        synchronized_targets = [
+            int(value)
+            for value in (autoscale_config.get("allowed_target_blocks") or [])
+        ]
+        if (
+            bool(autoscale_config.get("synchronized_tier_steps"))
+            and target != old_target
+        ):
+            if (
+                old_target not in synchronized_targets
+                or target not in synchronized_targets
+                or abs(
+                    synchronized_targets.index(target)
+                    - synchronized_targets.index(old_target)
+                )
+                != 1
+            ):
+                return {
+                    "ok": False,
+                    "reason": "non_adjacent_synchronized_tier_resize",
+                    "old_target_blocks": old_target,
+                    "new_target_blocks": target,
+                    "allowed_target_blocks": synchronized_targets,
+                }
         released_experts: dict[str, int] = {}
         plan_class_before_grow: dict[str, Any] | None = None
         previous_plan_class: str | None = None
@@ -1196,6 +1396,11 @@ class EngineCore:
         if target == old_target and not dirty_block_ids:
             return {"ok": True, "reason": "already_at_target"}
         if (
+            self._uvm_scheduler_boundary_resize_enabled()
+            and not self._uvm_scheduler_quiescent_for_resize()
+        ):
+            return {"ok": False, "reason": "scheduler_not_quiescent"}
+        if (
             target < old_target
             and self.scheduler.has_unfinished_requests()
             and not allow_active_prefix_shrink
@@ -1224,20 +1429,14 @@ class EngineCore:
                 and target_plan_class != previous_plan_class
             ):
                 try:
-                    activation = self._uvm_single_worker_rpc(
-                        "activate_uvm_expert_graph_class",
-                        args=(
+                    activation = (
+                        self._activate_uvm_expert_graph_class_at_quiescent_boundary(
                             target_plan_class,
-                            True,
-                            self._uvm_env_flag(
-                                "VLLM_UVM_KV_AUTO_SCALE_RESUME_PREFILL_BEFORE_PLAN_CLASS",
-                                default=False,
-                            ),
-                            self._uvm_env_flag(
+                            defer_dual_refresh=self._uvm_env_flag(
                                 "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW",
                                 default=False,
                             ),
-                        ),
+                        )
                     )
                 except Exception as exc:
                     activation = {
@@ -1527,20 +1726,20 @@ class EngineCore:
         target = getattr(self, "_uvm_pending_kv_grow_target_blocks", None)
         if target is None:
             return None
-        batch_queue = getattr(self, "batch_queue", None)
-        if batch_queue is not None and batch_queue:
-            return None
-        # A Plan Class activation changes expert residency and must not race
-        # kernels from a running request. Waiting requests are safe: the
-        # ordinary step path applies the pending grow before scheduling them.
-        running = getattr(self.scheduler, "running", None)
-        if running is not None:
-            if running:
+        if self._uvm_scheduler_boundary_resize_enabled():
+            if not self._uvm_scheduler_quiescent_for_resize():
                 return None
-        elif self.scheduler.has_unfinished_requests():
-            # Conservative fallback for alternate/test schedulers that do not
-            # expose the normal v1 Scheduler.running collection.
-            return None
+        else:
+            batch_queue = getattr(self, "batch_queue", None)
+            if batch_queue is not None and batch_queue:
+                return None
+            # Compatibility mode retains the old global-idle rule.
+            running = getattr(self.scheduler, "running", None)
+            if running is not None:
+                if running:
+                    return None
+            elif self.scheduler.has_unfinished_requests():
+                return None
 
         reason = (
             getattr(self, "_uvm_pending_kv_grow_reason", "")
@@ -1548,18 +1747,38 @@ class EngineCore:
         )
         self._uvm_pending_kv_grow_target_blocks = None
         self._uvm_pending_kv_grow_reason = ""
-        result = self._resize_uvm_kv_target(
-            int(target),
-            reason=reason,
-            release_expert_wave=self._uvm_env_flag(
-                "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE",
-                default=False,
-            ),
+        components = self._uvm_dynamic_pool_components()
+        policy = components[0] if components is not None else None
+        current_target = (
+            int(policy._dynamic_pool_applied_target_blocks)
+            if policy is not None
+            else int(target)
         )
+        config = (
+            self._uvm_kv_autoscale_config(policy)
+            if policy is not None
+            else {}
+        )
+        if bool(config.get("synchronized_tier_steps")):
+            result = self._commit_uvm_kv_synchronized_growth_path(
+                old_target=current_target,
+                target=int(target),
+                reason=reason,
+                config=config,
+            )
+        else:
+            result = self._resize_uvm_kv_target(
+                int(target),
+                reason=reason,
+                release_expert_wave=self._uvm_env_flag(
+                    "VLLM_UVM_INCREMENTAL_EXPERT_OFFLOAD_ENABLE",
+                    default=False,
+                ),
+            )
         if not bool(result.get("ok")):
             self._uvm_pending_kv_grow_target_blocks = int(target)
             self._uvm_pending_kv_grow_reason = reason
-        elif self._uvm_env_flag(
+        elif not bool(config.get("synchronized_tier_steps")) and self._uvm_env_flag(
             "VLLM_UVM_KV_AUTO_SCALE_ENABLE",
             default=False,
         ):
@@ -1624,10 +1843,19 @@ class EngineCore:
         self._ensure_uvm_kv_autoscale_state()
         target = self._uvm_pending_kv_shrink_target_blocks
         if target is None:
+            online_restore_ready = (
+                self._uvm_scheduler_boundary_resize_enabled()
+                and self._uvm_scheduler_quiescent_for_resize()
+            )
             if (
                 self._uvm_kv_autoscale_expert_restore_pending
-                and not self.scheduler.has_unfinished_requests()
-                and not getattr(self, "batch_queue", None)
+                and (
+                    online_restore_ready
+                    or (
+                        not self.scheduler.has_unfinished_requests()
+                        and not getattr(self, "batch_queue", None)
+                    )
+                )
             ):
                 expert_restore = self._restore_uvm_incremental_expert_wave()
                 self._uvm_kv_autoscale_expert_restore_pending = not bool(
@@ -1642,26 +1870,51 @@ class EngineCore:
         if getattr(self, "_uvm_pending_kv_grow_target_blocks", None) is not None:
             self._cancel_uvm_pending_kv_shrink("pending_growth_has_priority")
             return {"ok": False, "reason": "pending_growth_has_priority"}
-        batch_queue = getattr(self, "batch_queue", None)
-        if batch_queue is not None and batch_queue:
-            return None
+        online_boundary = self._uvm_scheduler_boundary_resize_enabled()
+        if online_boundary:
+            if not self._uvm_scheduler_quiescent_for_resize():
+                return None
+        else:
+            batch_queue = getattr(self, "batch_queue", None)
+            if batch_queue is not None and batch_queue:
+                return None
         components = self._uvm_dynamic_pool_components()
         if components is None:
             return {"ok": False, "reason": "dynamic_pool_unavailable"}
-        policy, _ = components
+        policy, block_pool = components
         old_target = int(policy._dynamic_pool_applied_target_blocks)
         if int(target) >= old_target:
             self._cancel_uvm_pending_kv_shrink("stale_shrink_target")
             return {"ok": True, "reason": "stale_shrink_target"}
-        # A frozen expert Plan Class and its physical KV target form one E13
-        # residency tier.  The worker can conservatively keep more experts
-        # remote during a plain active-prefix KV shrink, but it cannot restore
-        # the smaller expert class until the scheduler is globally idle.  Do
-        # not expose that half-switched state: it can make a later in-flight
-        # grow attempt switch Plan Classes while kernels are active.
+        commit_snapshot = self._uvm_kv_autoscale_queue_snapshot(
+            block_pool=block_pool,
+            current_target=old_target,
+        )
+        commit_max_active = commit_snapshot.get("max_active_block_id")
+        commit_tail_free = (
+            commit_snapshot.get("invariant_ok") is True
+            and commit_snapshot.get("active_block_ids_known") is True
+            and commit_max_active is not None
+            and int(commit_max_active) <= int(target)
+        )
+        if not commit_tail_free:
+            self._uvm_kv_autoscale_low_streak = 0
+            self._cancel_uvm_pending_kv_shrink("candidate_tail_no_longer_free")
+            return {
+                "ok": False,
+                "reason": "candidate_tail_no_longer_free",
+                "old_target_blocks": old_target,
+                "new_target_blocks": int(target),
+                "pending": False,
+                "queue_snapshot": commit_snapshot,
+            }
+        # Compatibility mode keeps the historical global-idle Plan Class gate.
+        # Online mode has already proved execution quiescence above, so it may
+        # shrink KV and restore the corresponding class between token steps.
         if (
             self._uvm_kv_autoscale_plan_class_for_target(int(target)) is not None
             and self.scheduler.has_unfinished_requests()
+            and not online_boundary
         ):
             return None
 
@@ -1688,7 +1941,15 @@ class EngineCore:
             "VLLM_UVM_KV_AUTO_SCALE_EXPERT_RESTORE_ENABLE",
             default=True,
         )
-        if self.scheduler.has_unfinished_requests() and restore_enabled:
+        online_restore_ready = (
+            self._uvm_scheduler_boundary_resize_enabled()
+            and self._uvm_scheduler_quiescent_for_resize()
+        )
+        if (
+            self.scheduler.has_unfinished_requests()
+            and restore_enabled
+            and not online_restore_ready
+        ):
             expert_restore = {
                 "ok": True,
                 "reason": "expert_restore_deferred_until_idle",
@@ -1732,6 +1993,12 @@ class EngineCore:
             "enabled": self._uvm_env_flag(
                 "VLLM_UVM_KV_AUTO_SCALE_ENABLE",
                 default=False,
+            ),
+            "scheduler_boundary_resize_enabled": (
+                self._uvm_scheduler_boundary_resize_enabled()
+            ),
+            "scheduler_quiescent_for_resize": (
+                self._uvm_scheduler_quiescent_for_resize()
             ),
             "step": int(self._uvm_kv_autoscale_step),
             "low_streak": int(self._uvm_kv_autoscale_low_streak),
@@ -2274,6 +2541,24 @@ class EngineCore:
             self, "batch_queue", None
         ):
             return {"ok": False, "reason": "maintenance_requires_idle_scheduler"}
+        return self._activate_uvm_expert_graph_class_at_quiescent_boundary(
+            class_name
+        )
+
+    def _activate_uvm_expert_graph_class_at_quiescent_boundary(
+        self,
+        class_name: str,
+        *,
+        defer_dual_refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Activate a class after the previous model future has completed.
+
+        Unlike the public maintenance API, this internal path permits running
+        requests.  Their next token step observes the new read-only expert
+        residency, while no already-launched kernel can race the table switch.
+        """
+        if not self._uvm_scheduler_quiescent_for_resize():
+            return {"ok": False, "reason": "scheduler_not_quiescent"}
         try:
             result = self._uvm_single_worker_rpc(
                 "activate_uvm_expert_graph_class",
@@ -2284,7 +2569,7 @@ class EngineCore:
                         "VLLM_UVM_KV_AUTO_SCALE_RESUME_PREFILL_BEFORE_PLAN_CLASS",
                         default=False,
                     ),
-                    False,
+                    bool(defer_dual_refresh),
                 ),
             )
         except Exception as exc:
@@ -2449,9 +2734,9 @@ class EngineCore:
         was executed.
         """
 
-        # A late arrival may have queued a grow while an earlier request was
-        # running. Commit it before admitting/scheduling waiting work once the
-        # running set is empty.
+        # A late arrival may have queued a grow while the previous model step
+        # was in flight. Commit it at this quiescent boundary before scheduling
+        # more work; running requests need not have completed.
         self._apply_pending_uvm_kv_growth_if_ready()
 
         # Check for any requests remaining in the scheduler - unfinished,
@@ -2460,12 +2745,19 @@ class EngineCore:
             return {}, False
         scheduler_output = self.scheduler.schedule()
         self._maybe_handle_uvm_kv_preemption_pressure(scheduler_output)
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        with self.log_error_detail(scheduler_output):
-            model_output = future.result()
-            if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+        self._ensure_uvm_kv_autoscale_state()
+        self._uvm_model_execution_inflight = True
+        try:
+            future = self.model_executor.execute_model(
+                scheduler_output, non_block=True
+            )
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            with self.log_error_detail(scheduler_output):
+                model_output = future.result()
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+        finally:
+            self._uvm_model_execution_inflight = False
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output

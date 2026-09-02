@@ -2590,7 +2590,14 @@ class FusedMoE(CustomOp):
         self,
         swaps: list[dict[str, object]],
     ) -> dict[str, object]:
-        """Swap explicitly named GPU and remote-read expert records."""
+        """Swap explicitly named GPU and remote-read expert records.
+
+        Commit the complete demotion wave before restoring any promotion.
+        Expert slices are smaller than a UVM VA block, so a later demotion can
+        evict an already-promoted neighbour in the same parent block.  Making
+        every H2D restore the final physical operation avoids freezing that
+        stale CPU residency into the subsequent full-dual view.
+        """
         if not self.uvm_dynamic_expert_swap_enable:
             return {"ok": False, "reason": "dynamic_expert_swap_disabled"}
         if not self._uvm_stage_m_uses_remote_read():
@@ -2601,6 +2608,9 @@ class FusedMoE(CustomOp):
 
         device = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
         results: list[dict[str, object]] = []
+        prepared: list[dict[str, object]] = []
+        seen_promotions: set[int] = set()
+        seen_demotions: set[int] = set()
         for swap_index, swap in enumerate(swaps):
             try:
                 promote_expert = int(swap["promote_expert"])
@@ -2621,6 +2631,8 @@ class FusedMoE(CustomOp):
                 promote_expert not in self._uvm_remote_read_global_expert_ids
                 or demote_expert in self._uvm_remote_read_global_expert_ids
                 or promote_expert == demote_expert
+                or promote_expert in seen_promotions
+                or demote_expert in seen_demotions
             ):
                 return {
                     "ok": False,
@@ -2631,6 +2643,8 @@ class FusedMoE(CustomOp):
                     "remote_experts": sorted(self._uvm_remote_read_global_expert_ids),
                     "results": results,
                 }
+            seen_promotions.add(promote_expert)
+            seen_demotions.add(demote_expert)
 
             promote_record = self._uvm_expert_records.get(
                 (int(layer_id), promote_expert)
@@ -2648,19 +2662,41 @@ class FusedMoE(CustomOp):
                     "results": results,
                 }
 
+            promote_ranges: list[dict[str, int]] = []
+            for region_id in promote_record.envelope_region_ids:
+                parts = region_id.rsplit(":", 2)
+                if len(parts) != 3:
+                    continue
+                try:
+                    base = int(parts[-2], 16)
+                    length = int(parts[-1], 16)
+                except ValueError:
+                    continue
+                if base > 0 and length > 0:
+                    promote_ranges.append({"base": base, "length": length})
+            prepared.append(
+                {
+                    "transaction_id": transaction_id,
+                    "promote_expert": promote_expert,
+                    "demote_expert": demote_expert,
+                    "promote_region_count": len(
+                        promote_record.envelope_region_ids
+                    ),
+                    "demote_region_count": len(
+                        demote_record.envelope_region_ids
+                    ),
+                    "promote_ranges": promote_ranges,
+                }
+            )
+
+        for pair_result in prepared:
+            demote_expert = int(pair_result["demote_expert"])
             demote_result = self._uvm_release_expert_record(
                 layer_id=layer_id,
                 global_expert_id=demote_expert,
                 device=device,
             )
-            pair_result: dict[str, object] = {
-                "transaction_id": transaction_id,
-                "promote_expert": promote_expert,
-                "demote_expert": demote_expert,
-                "promote_region_count": len(promote_record.envelope_region_ids),
-                "demote_region_count": len(demote_record.envelope_region_ids),
-                "demote_result": demote_result,
-            }
+            pair_result["demote_result"] = demote_result
             if not bool(demote_result.get("ok")):
                 results.append({**pair_result, "ok": False})
                 return {
@@ -2673,6 +2709,10 @@ class FusedMoE(CustomOp):
             # Demotion frees capacity before promotion. A failed promotion leaves
             # both experts remote, which is conservative and recoverable.
             self._uvm_remote_read_global_expert_ids.add(demote_expert)
+
+        for pair_result in prepared:
+            promote_expert = int(pair_result["promote_expert"])
+            demote_expert = int(pair_result["demote_expert"])
             promote_result = self._uvm_restore_expert_record(
                 layer_id=layer_id,
                 global_expert_id=promote_expert,
@@ -2707,6 +2747,7 @@ class FusedMoE(CustomOp):
             "ok": True,
             "reason": "swapped" if results else "no_swaps",
             "layer_id": layer_id,
+            "mutation_order": "all_demotions_then_all_promotions",
             "swapped_count": len(results),
             "remote_experts": sorted(self._uvm_remote_read_global_expert_ids),
             "results": results,
@@ -3090,6 +3131,9 @@ class FusedMoE(CustomOp):
         release_kwargs: dict[str, object] = {
             "device": device,
             "remote_read": self._uvm_stage_m_uses_remote_read(),
+            "immutable_cpu_shadow": _env_flag_enabled(
+                "VLLM_CPU_OFFLOAD_DUAL_VIEW_FULL_PARAMETER_SHADOW"
+            ),
         }
         if audit_enabled:
             release_kwargs["include_audit"] = True
@@ -3119,7 +3163,7 @@ class FusedMoE(CustomOp):
                     raise RuntimeError(
                         "Release audit did not prove success: "
                         f"layer_id={layer_id}, expert_id={global_expert_id}, "
-                        f"region_id={region_id!r}"
+                        f"region_id={region_id!r}, audit={raw_audit!r}"
                     )
                 audit_store[region_id] = {
                     **raw_audit,

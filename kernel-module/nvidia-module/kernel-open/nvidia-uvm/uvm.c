@@ -593,6 +593,11 @@ typedef struct
     NvU32 dual_view_block_count;
     NvU64 dual_view_generation;
     NvBool dual_view_full_coverage;
+    // SEAL(DISCARD_DUAL) is a scheduler-quiescent request to return to the
+    // ordinary UVM hierarchy before a residency transaction. Full-coverage
+    // mode may perform one legacy PARK while this certificate is set; an
+    // implicit recipe invalidation must never grant the same exception.
+    NvBool dual_view_explicitly_discarded;
 } uvm_moe_static_alias_session_t;
 
 // Static aliases are logically independent of registered cmd96 plans, but
@@ -2715,12 +2720,13 @@ out:
     return status;
 }
 
-static NV_STATUS uvm_phase_f_immutable_cpu_shadow_cutover(const NvProcessorUuid *gpu_uuid,
-                                                          NvBool async,
-                                                          NvU64 base,
-                                                          NvU64 length,
-                                                          UVM_PHASE_F_RANGE_RESULT *result,
-                                                          uvm_va_space_t *va_space)
+static NV_STATUS uvm_phase_f_cpu_remote_cutover(const NvProcessorUuid *gpu_uuid,
+                                                NvBool async,
+                                                NvU64 base,
+                                                NvU64 length,
+                                                bool require_immutable_shadow,
+                                                UVM_PHASE_F_RANGE_RESULT *result,
+                                                uvm_va_space_t *va_space)
 {
     NV_STATUS status = NV_OK;
     uvm_va_range_managed_t *managed_range = NULL;
@@ -2804,11 +2810,12 @@ static NV_STATUS uvm_phase_f_immutable_cpu_shadow_cutover(const NvProcessorUuid 
                                                                gpu,
                                                                block_region,
                                                                UVM_CHUNK_SIZE_64K,
-                                                               true,
+                                                               require_immutable_shadow,
                                                                &block->tracker,
                                                                &block_released_bytes);
             uvm_mutex_unlock(&block->lock);
-            if (status != NV_OK || block_released_bytes != block_bytes) {
+            if (status != NV_OK ||
+                (require_immutable_shadow && block_released_bytes != block_bytes)) {
                 if (status == NV_OK)
                     status = NV_ERR_INVALID_STATE;
                 goto out;
@@ -2851,7 +2858,11 @@ static NV_STATUS uvm_phase_f_immutable_cpu_shadow_cutover(const NvProcessorUuid 
             }
 
             covered_bytes += block_bytes;
-            released_bytes += block_released_bytes;
+            // For the synchronous path this counter is committed cutover
+            // bytes, including pages which were already CPU-only. The
+            // immutable path retains its stricter newly-released meaning.
+            released_bytes += require_immutable_shadow ?
+                                  block_released_bytes : block_bytes;
             cpu_shadow_bytes += (NvU64)cpu_pages * PAGE_SIZE;
             remote_mapped_bytes += (NvU64)remote_pages * PAGE_SIZE;
         }
@@ -2874,11 +2885,12 @@ out:
     result->resident_any_bytes = remote_mapped_bytes;
     result->resident_unknown_bytes = length > covered_bytes ? length - covered_bytes : 0;
 
-    uvm_phase_f_route_log("phase_f_immutable_cpu_shadow_cutover base=0x%llx length=%llu status=0x%x gpu=%s covered=%llu released=%llu cpu_shadow=%llu remote_mapped=%llu\n",
+    uvm_phase_f_route_log("phase_f_cpu_remote_cutover base=0x%llx length=%llu status=0x%x gpu=%s immutable=%u covered=%llu committed=%llu cpu=%llu remote_mapped=%llu\n",
                           base,
                           length,
                           status,
                           gpu ? gpu->name : "none",
+                          require_immutable_shadow ? 1 : 0,
                           covered_bytes,
                           released_bytes,
                           cpu_shadow_bytes,
@@ -3438,13 +3450,16 @@ static NV_STATUS uvm_phase_f_execute_range(NvU32 action,
                                                   result,
                                                   va_space);
     }
-    else if (action == UVM_PHASE_F_ACTION_IMMUTABLE_CPU_SHADOW_CUTOVER) {
-        status = uvm_phase_f_immutable_cpu_shadow_cutover(gpu_uuid,
-                                                          async,
-                                                          base,
-                                                          length,
-                                                          result,
-                                                          va_space);
+    else if (action == UVM_PHASE_F_ACTION_IMMUTABLE_CPU_SHADOW_CUTOVER ||
+             action == UVM_PHASE_F_ACTION_SYNC_CPU_REMOTE_CUTOVER) {
+        status = uvm_phase_f_cpu_remote_cutover(
+            gpu_uuid,
+            async,
+            base,
+            length,
+            action == UVM_PHASE_F_ACTION_IMMUTABLE_CPU_SHADOW_CUTOVER,
+            result,
+            va_space);
     }
     else if (action == UVM_PHASE_F_ACTION_REBUILD_GPU_READ_MAPPINGS) {
         status = uvm_phase_f_rebuild_gpu_read_mappings(gpu_uuid,
@@ -12431,7 +12446,8 @@ static NV_STATUS uvm_expert_offload_release_subchunk_block(uvm_va_space_t *va_sp
                                                        gpu,
                                                        block_region,
                                                        UVM_CHUNK_SIZE_64K,
-                                                       false,
+                                                       (params->flags &
+                                                        UVM_EXPERT_OFFLOAD_RELEASE_FLAG_IMMUTABLE_CPU_SHADOW) != 0,
                                                        &block->tracker,
                                                        &released_bytes);
     if (status == NV_OK) {
@@ -12531,7 +12547,8 @@ static NV_STATUS uvm_api_expert_offload_release(UVM_EXPERT_OFFLOAD_RELEASE_PARAM
 
     if (params->flags & ~(UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REQUIRE_EXPERT |
                           UVM_EXPERT_OFFLOAD_RELEASE_FLAG_SUBCHUNK_64K |
-                          UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ)) {
+                          UVM_EXPERT_OFFLOAD_RELEASE_FLAG_REMOTE_READ |
+                          UVM_EXPERT_OFFLOAD_RELEASE_FLAG_IMMUTABLE_CPU_SHADOW)) {
         return NV_ERR_INVALID_ARGUMENT;
     }
 
@@ -14675,6 +14692,7 @@ static void uvm_moe_static_alias_dual_recipe_reset_locked(
     session->dual_view_block_count = 0;
     session->dual_view_generation = 0;
     session->dual_view_full_coverage = NV_FALSE;
+    session->dual_view_explicitly_discarded = NV_FALSE;
 }
 
 static NV_STATUS uvm_moe_static_alias_dual_append_record(
@@ -14866,6 +14884,7 @@ static NV_STATUS uvm_moe_static_alias_dual_prepare_locked(
     // consumer leaf from the legacy PARK/RESUME path.
     session->dual_view_full_coverage =
         candidate_block_count != 0 && block_count == candidate_block_count;
+    session->dual_view_explicitly_discarded = NV_FALSE;
     uvm_phase_f_route_log(
         "moe_static_alias_dual_prepare session=%llu generation=%llu candidates=%u blocks=%u full=%u prepared=%llu reused=%llu skipped=%llu ns=%llu\n",
         session->session_id,
@@ -15528,6 +15547,7 @@ static NV_STATUS uvm_api_moe_static_alias_seal(UVM_MOE_STATIC_ALIAS_SEAL_PARAMS 
     NvU32 i;
     NvBool refresh_dual;
     NvBool nested_refresh;
+    NvBool discard_dual;
 
     BUILD_BUG_ON(sizeof(*params) != 72);
 
@@ -15549,7 +15569,10 @@ static NV_STATUS uvm_api_moe_static_alias_seal(UVM_MOE_STATIC_ALIAS_SEAL_PARAMS 
     nested_refresh =
         (params->flags &
          UVM_MOE_STATIC_ALIAS_SEAL_FLAG_REFRESH_DUAL_NESTED) != 0;
-    if (nested_refresh && !refresh_dual)
+    discard_dual =
+        (params->flags & UVM_MOE_STATIC_ALIAS_SEAL_FLAG_DISCARD_DUAL) != 0;
+    if ((nested_refresh && !refresh_dual) ||
+        (discard_dual && (refresh_dual || nested_refresh)))
         return NV_ERR_INVALID_ARGUMENT;
 
     mutex_lock(&g_uvm_moe_slot_plan_lock);
@@ -15565,9 +15588,11 @@ static NV_STATUS uvm_api_moe_static_alias_seal(UVM_MOE_STATIC_ALIAS_SEAL_PARAMS 
     params->poisoned = session->poisoned;
 
     if (session->poisoned || session->alias_count == 0 ||
-        (refresh_dual ? !session->sealed : session->sealed)) {
+        ((refresh_dual || discard_dual) ?
+             !session->sealed : session->sealed)) {
         status = session->poisoned ? NV_ERR_INVALID_STATE :
-                 refresh_dual ? NV_ERR_INVALID_STATE : NV_ERR_IN_USE;
+                 (refresh_dual || discard_dual) ?
+                     NV_ERR_INVALID_STATE : NV_ERR_IN_USE;
         goto out_plan;
     }
 
@@ -15622,11 +15647,11 @@ static NV_STATUS uvm_api_moe_static_alias_seal(UVM_MOE_STATIC_ALIAS_SEAL_PARAMS 
         mapped = uvm_moe_static_alias_slot_has_exact_range(slot,
                                                             record->va_base,
                                                             record->bytes);
-        if (!refresh_dual && !mapped) {
+        if (!refresh_dual && !discard_dual && !mapped) {
             status = NV_ERR_INVALID_STATE;
             break;
         }
-        if (refresh_dual &&
+        if ((refresh_dual || discard_dual) &&
             ((record->flags & UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW) ?
                 !mapped : mapped == session->parked)) {
             status = NV_ERR_INVALID_STATE;
@@ -15638,7 +15663,7 @@ static NV_STATUS uvm_api_moe_static_alias_seal(UVM_MOE_STATIC_ALIAS_SEAL_PARAMS 
         // dual-view refresh below validates both frozen children and rebuilds
         // their ordinary leaves; the original SEAL path still performs the
         // full live-range validation.
-        if (!refresh_dual) {
+        if (!refresh_dual && !discard_dual) {
             status = uvm_va_block_validate_slot_alias_range(
                 va_space,
                 slot->pte_gpu,
@@ -15650,15 +15675,23 @@ static NV_STATUS uvm_api_moe_static_alias_seal(UVM_MOE_STATIC_ALIAS_SEAL_PARAMS 
         }
     }
 
-    if (status == NV_OK)
-        status = uvm_moe_static_alias_dual_prepare_locked(session,
-                                                           va_space,
-                                                           mm,
-                                                           gpu,
-                                                           nested_refresh);
+    if (status == NV_OK) {
+        if (discard_dual) {
+            status = uvm_moe_static_alias_dual_discard_locked(
+                session, va_space, mm, gpu);
+            if (status == NV_OK)
+                session->dual_view_explicitly_discarded = NV_TRUE;
+        }
+        else
+            status = uvm_moe_static_alias_dual_prepare_locked(session,
+                                                               va_space,
+                                                               mm,
+                                                               gpu,
+                                                               nested_refresh);
+    }
 
     if (status == NV_OK) {
-        if (!refresh_dual) {
+        if (!refresh_dual && !discard_dual) {
             for (i = 0; i < UVM_MOE_SLOT_POOL_MAX_SLOTS; ++i) {
                 uvm_moe_slot_pool_slot_t *slot = &g_uvm_moe_slot_pool[i];
 
@@ -16345,8 +16378,12 @@ static NV_STATUS uvm_api_moe_static_alias_park(
     // transaction. Full-coverage mode must not silently fall back to leaf
     // mutations or expose an obsolete frozen child table.
     if (uvm_moe_static_alias_dual_view_require_full &&
-        (!session->dual_view_full_coverage ||
-         session->dual_view_generation != session->topology_generation)) {
+        !(
+            (session->dual_view_full_coverage &&
+             session->dual_view_generation == session->topology_generation) ||
+            (session->dual_view_explicitly_discarded &&
+             session->dual_view_block_count == 0)
+        )) {
         status = NV_ERR_INVALID_STATE;
         goto out_plan;
     }

@@ -52,7 +52,10 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     arms = {item["name"]: item for item in protocol["arms"]}
     tiers = {item["name"]: item for item in protocol["tiers"]}
     seeds = [int(value) for value in protocol["profiles"][args.profile]["seeds"]]
-    allowed = {int(item["target_blocks"]) for item in protocol["tiers"]}
+    ordered_targets = [
+        int(item["target_blocks"]) for item in protocol["tiers"]
+    ]
+    allowed = set(ordered_targets)
     expected_scenarios = set(protocol["profiles"][args.profile]["scenario_names"])
     checks: list[dict[str, Any]] = []
     cases: list[dict[str, Any]] = []
@@ -151,6 +154,61 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                 sum(item.get("kv", {}).get("invariant_ok") is False for item in steps),
             )
             initial = tiers[arm["initial_tier"]]
+            runtime_snapshot = (
+                result.get("configuration", {}).get("runtime", {})
+            )
+            synchronized_tiers = bool(
+                runtime_snapshot.get("synchronized_tier_steps", False)
+            )
+            if synchronized_tiers:
+                setup = result.get("initialization", {}).get(
+                    "tier_setup_result", {}
+                )
+                setup_steps = setup.get("tier_steps") or []
+                setup_edges = [
+                    (
+                        int(step.get("old_target_blocks", -1)),
+                        int(step.get("new_target_blocks", -1)),
+                    )
+                    for step in setup_steps
+                ]
+                setup_chain_ok = bool(setup_steps) and all(
+                    bool((step.get("result") or {}).get("ok"))
+                    and old in ordered_targets
+                    and new in ordered_targets
+                    and (
+                        old == new
+                        or abs(
+                            ordered_targets.index(old)
+                            - ordered_targets.index(new)
+                        )
+                        == 1
+                    )
+                    and (
+                        index == 0
+                        or old
+                        == int(
+                            setup_steps[index - 1].get(
+                                "new_target_blocks", -1
+                            )
+                        )
+                    )
+                    for index, (step, (old, new)) in enumerate(
+                        zip(setup_steps, setup_edges)
+                    )
+                )
+                setup_chain_ok = (
+                    setup_chain_ok
+                    and setup.get("ok") is True
+                    and setup_edges[-1][1]
+                    == int(initial["target_blocks"])
+                )
+                add_check(
+                    case_checks,
+                    "initial_tier_uses_synchronized_adjacent_steps",
+                    setup_chain_ok,
+                    setup_edges,
+                )
             if arm["strategy"] == "fixed":
                 expected_target = int(initial["target_blocks"])
                 add_check(
@@ -178,6 +236,42 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                     observed_targets == allowed,
                     sorted(observed_targets),
                 )
+                online_resize = bool(
+                    runtime_snapshot.get(
+                        "scheduler_boundary_resize", False
+                    )
+                )
+                if online_resize and synchronized_tiers:
+                    nonadjacent_resizes = [
+                        {
+                            "scenario": event.get("scenario"),
+                            "old": event.get("old_target_blocks"),
+                            "new": event.get("new_target_blocks"),
+                        }
+                        for event in (result.get("resize_events") or [])
+                        if event.get("direction") in {"grow", "shrink"}
+                        and not (
+                            int(event.get("old_target_blocks", -1))
+                            in ordered_targets
+                            and int(event.get("new_target_blocks", -1))
+                            in ordered_targets
+                            and abs(
+                                ordered_targets.index(
+                                    int(event.get("old_target_blocks", -1))
+                                )
+                                - ordered_targets.index(
+                                    int(event.get("new_target_blocks", -1))
+                                )
+                            )
+                            == 1
+                        )
+                    ]
+                    add_check(
+                        case_checks,
+                        "adaptive_resize_uses_synchronized_adjacent_tiers",
+                        not nonadjacent_resizes,
+                        nonadjacent_resizes,
+                    )
                 cohort_controller_events = [
                     event
                     for epoch in (result.get("epochs") or [])
@@ -238,6 +332,13 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                         first_burst_grow is not None and recovered_after_grow,
                         burst_directions,
                     )
+                    burst_late_events = [
+                        event
+                        for epoch in (result.get("epochs") or [])
+                        if epoch.get("scenario") == "burst_recovery"
+                        for event in (epoch.get("cohort_controller_events") or [])
+                        if event.get("late_arrival") is True
+                    ]
                     deferred_burst_requests = [
                         item
                         for item in requests
@@ -245,12 +346,88 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                         and int(item.get("cohort_index", -1)) > 0
                         and item.get("admission_deferred_for_kv_grow") is True
                     ]
-                    add_check(
-                        case_checks,
-                        "adaptive_burst_admission_waited_for_growth",
-                        bool(deferred_burst_requests),
-                        len(deferred_burst_requests),
-                    )
+                    # Read the case snapshot rather than the verifier's current
+                    # config so historical drain-at-idle artifacts remain
+                    # reproducible after the protocol gained online switching.
+                    if online_resize:
+                        online_shrinks = [
+                            event
+                            for event in (result.get("resize_events") or [])
+                            if event.get("direction") == "shrink"
+                        ]
+                        invalid_tail_proofs = [
+                            {
+                                "scenario": event.get("scenario"),
+                                "target": event.get("new_target_blocks"),
+                                "max_active": (event.get("kv_before") or {}).get(
+                                    "max_active_block_id"
+                                ),
+                                "tail_free_start": (
+                                    event.get("kv_before") or {}
+                                ).get("tail_free_start_block_id"),
+                            }
+                            for event in online_shrinks
+                            if not (
+                                (event.get("kv_before") or {}).get(
+                                    "active_block_ids_known"
+                                )
+                                is True
+                                and (event.get("kv_before") or {}).get(
+                                    "max_active_block_id"
+                                )
+                                is not None
+                                and int(
+                                    (event.get("kv_before") or {}).get(
+                                        "max_active_block_id"
+                                    )
+                                )
+                                <= int(event.get("new_target_blocks", -1))
+                                and int(
+                                    (event.get("kv_before") or {}).get(
+                                        "tail_free_start_block_id", -1
+                                    )
+                                )
+                                <= int(event.get("new_target_blocks", -1)) + 1
+                            )
+                        ]
+                        add_check(
+                            case_checks,
+                            "adaptive_online_shrinks_use_contiguous_free_tail",
+                            bool(online_shrinks) and not invalid_tail_proofs,
+                            {
+                                "shrink_count": len(online_shrinks),
+                                "invalid": invalid_tail_proofs,
+                            },
+                        )
+                        online_growth_events = [
+                            event
+                            for event in burst_late_events
+                            if bool(
+                                (
+                                    (event.get("controller_result") or {}).get(
+                                        "autoscale"
+                                    )
+                                    or {}
+                                ).get("committed_with_running_requests")
+                            )
+                        ]
+                        add_check(
+                            case_checks,
+                            "adaptive_burst_growth_committed_at_scheduler_boundary",
+                            bool(online_growth_events)
+                            and not deferred_burst_requests,
+                            {
+                                "online_growth_events": len(online_growth_events),
+                                "deferred_requests": len(deferred_burst_requests),
+                            },
+                        )
+                    else:
+                        add_check(
+                            case_checks,
+                            "adaptive_burst_admission_waited_for_growth",
+                            bool(deferred_burst_requests),
+                            len(deferred_burst_requests),
+                        )
             plan_class_by_target = {
                 int(item["target_blocks"]): str(item["plan_class"])
                 for item in protocol["tiers"]

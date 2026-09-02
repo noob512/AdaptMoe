@@ -1,6 +1,30 @@
 # 复现 E2、E3、E10 C1/C16 全覆盖双页表单轮实验
 
-日期：2026-08-31（Asia/Shanghai）
+原协议日期：2026-08-31；最新证据核验：2026-09-02（Asia/Shanghai）
+
+## 0. 当前权威证据
+
+本文件的运行步骤仍是联合协议入口，但最新成功证据已按不覆盖规则分布在以下目录：
+
+```text
+E2 C1   artifacts/e2-e3-e10-full-c1-c16-dual-20260901-reproduce-all-attempt-01/e2/c1
+E2 C16  artifacts/e2-c16-frozen-20260901-reproduce-all-attempt-02/e2/c16
+E3      artifacts/e3-c1-c16-full-dual-20260901-reproduce-all-attempt-02
+E10     artifacts/e10-kv-2-4-6-pressure-20260902-attempt-01-scheduler-quiescent-sync-tier
+```
+
+E2最新ours为C1 4/4和C16 4/4运行通过；Long/C1的`grouped_token_events=0`，修复了旧轮
+流式协议失败。C1 E2E为309.88/1052.93/1851.91/4116.30 ms，C16为
+724.68/4841.16/21198.94/19719.94 ms。跨臂pinned-UVA仍来自2026-08-31独立冷进程基线，
+所以倍率是跨轮描述性比较，不是同轮统计。
+
+E3最新D/ours为B1/B16共10/10成功；完整表见本文末尾及统一结果汇总。E10最新机制已改为
+scheduler-quiescent、KV和专家Plan Class同步相邻约2 GiB切档；其推荐命令和结果以
+`REPRODUCE_E10_CURRENT_TIER_DUAL_VIEW_FULL_RUN.md`为准。
+
+E2/E3最新成功轮的custom UVM为`68A3CA3F7E2D57082767C59`、
+`6965f8ee1a22029c5f83d602093318b3cca5241fa6c2ecb3839552d08e974547`；E10使用后续
+`18E6563D21D9D2937D99EDF`模块。不能把这些目录写成同一进程或同一模块统计轮。
 
 ## 1. 范围
 
@@ -32,7 +56,7 @@ timezone   Asia/Shanghai
   snapshots/d206ba732169f29bb77fbf80fc2c4b81d4d30782/
 ```
 
-本次已验证模块：
+原2026-08-31协议已验证模块（仅用于解释历史artifact）：
 
 ```text
 nvidia-uvm.ko SHA256  c8fe77c8ecc87f6d724d94ddf6535c934150d4e12bec384bd44562097aec043a
@@ -144,12 +168,21 @@ run_c1_mechanism_runtime_hot_audit_off_matrix.sh \
 
 ```bash
 ALLOW_GPU_RUN=1 \
+E2_C16_PROFILE=experiments/eurosys_moe_offload_evaluation/configs/\
+e2_c16_single_attempt_matrix.json \
 E2_C16_SYSTEMS=ours \
 E2_C16_WORKLOADS=short_dialogue,ordinary_chat,rag_summary,long_generation \
 bash experiments/eurosys_moe_offload_evaluation/\
 run_e2_c16_direct_batch_matrix.sh \
   "$REPRO_ROOT/e2/c16"
 ```
+
+`E2_C16_PROFILE`不可省略。权威单轮使用冻结的单候选坐标：Short/Ordinary/RAG/Long
+分别为cold1/cold5/cold19/cold5。默认`e2_c16_direct_batch_matrix.json`包含容量搜索候选，
+会从更小cold档开始并可能得到不同的首个可运行placement；它适合容量诊断，但不能复现
+本节的固定卸载集合和性能表。启动后应确认
+`provenance/profile.json`与`e2_c16_single_attempt_matrix.json`的SHA-256均为
+`8def50bae276d4eabd39430bed6f9793f92a0513985684bff980fddc4e23701c`。
 
 验收：
 
@@ -257,8 +290,10 @@ find "$REPRO_ROOT" -type f \
 ```bash
 BASELINE_E2=experiments/eurosys_moe_offload_evaluation/artifacts/\
 e2-e3-e10-full-c1-c16-uva-single-round-20260831-attempt-01/e2
-OURS_E2=experiments/eurosys_moe_offload_evaluation/artifacts/\
-e2-e3-e10-full-c1-c16-uva-single-round-20260831-attempt-02-full-dual/e2
+OURS_E2_C1=experiments/eurosys_moe_offload_evaluation/artifacts/\
+e2-e3-e10-full-c1-c16-dual-20260901-reproduce-all-attempt-01/e2/c1
+OURS_E2_C16=experiments/eurosys_moe_offload_evaluation/artifacts/\
+e2-c16-frozen-20260901-reproduce-all-attempt-02/e2/c16
 ```
 
 先确认基线确实是 eager pinned-UVA，而不是另一种 native arm：
@@ -278,7 +313,7 @@ jq -e '.configuration.enforce_eager == true' \
 for workload_name in short_dialogue ordinary_chat rag_summary long_generation; do
   baseline_json=$(find "$BASELINE_E2/c1/cases/native_pinned_uva/$workload_name" \
     -name client.json -print -quit)
-  ours_json=$(find "$OURS_E2/c1/cases/ours/$workload_name" \
+  ours_json=$(find "$OURS_E2_C1/cases/ours/$workload_name" \
     -name client.json -print -quit)
   jq -nr \
     --arg workload "$workload_name" \
@@ -290,7 +325,7 @@ done
 for workload_name in short_dialogue ordinary_chat rag_summary long_generation; do
   baseline_json=$(find "$BASELINE_E2/c16/cases/native_pinned_uva/$workload_name" \
     -name result.json -print -quit)
-  ours_json=$(find "$OURS_E2/c16/cases/ours/$workload_name" \
+  ours_json=$(find "$OURS_E2_C16/cases/ours/$workload_name" \
     -name result.json -print -quit)
   jq -nr \
     --arg workload "$workload_name" \
@@ -300,22 +335,23 @@ for workload_name in short_dialogue ordinary_chat rag_summary long_generation; d
 done
 ```
 
-正式汇总只接纳 `ours` verifier 通过的配对点。Long/C1 虽然完整生成512 token，但
-`grouped_token_events=1`，必须从正式加速范围中排除。其余7点的预期范围为
-`2.08×–8.47×`。
+最新ours的8个点均通过各自运行/流式门；Long/C1生成512/512 token且
+`grouped_token_events=0`。相对冻结pinned-UVA基线的描述性E2E比为`2.09×–11.56×`。
+RAG/C1和RAG/C16仍不得自动晋升为跨臂exact-token性能点；跨轮、非equal-HBM、实际卸载
+集合不同等限制保持不变。
 
 该对比验证的是完整系统组合，不是消融实验。不得据此把收益单独归因于 CUDA Graph、双页表
 或 GPU 缓存中的任一项；也不得把不同的实际卸载权重集合表述成完全相同的数据布局。E3 本轮
 没有配对 remote arm，因此 E3 只能验证 ours 的功能、覆盖率与切换开销，不能独立提供
 ours/remote 加速比。
 
-## 11. 本轮权威结果
+## 11. 当前结果入口
 
-结果、失败边界、E2配对表和所有 artifact 路径统一记录在：
+最新汇总统一记录在：
 
 ```text
-RESULTS_E2_E3_E10_C1_C16_FULL_DUAL_SINGLE_ROUND_20260831.md
+experiments/eurosys_moe_offload_evaluation/RESULTS_E0_E12_LATEST_CONSOLIDATED_20260831.md
 ```
 
-不要与早期 C1/C4/C8/C16、B1/B8 或 RAG/C16 cold63 协议拼接；这些旧协议来自不同运行
-边界，不能作为本轮结果的补点。
+不要把上述分目录证据伪装成同一冷进程统计轮，也不要与早期C1/C4/C8/C16、B1/B8或
+RAG/C16 cold63协议拼接。每个表必须明确自己的artifact和模块指纹。

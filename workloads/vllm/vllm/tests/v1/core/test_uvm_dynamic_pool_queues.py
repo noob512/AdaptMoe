@@ -119,6 +119,30 @@ def test_backup_queue_is_used_only_after_ordinary_gpu_queue() -> None:
     assert refilled["gpu_backup_blocks"] == 2
 
 
+def test_queue_snapshot_reports_contiguous_free_tail_not_minimum_free_id() -> None:
+    policy = _FakeDynamicPolicy(applied_target=8)
+    pool = BlockPool(
+        num_gpu_blocks=9,
+        enable_caching=False,
+        hash_block_size=16,
+        uvm_kv_runtime_policy=policy,  # type: ignore[arg-type]
+    )
+    low = pool.get_new_blocks(1)[0]
+    high = pool.blocks[8]
+    pool.free_block_queue.remove(high)
+    high.free_queue_kind = None
+    high.ref_cnt = 1
+    high.lifecycle_state = "used_free"
+
+    snapshot = pool.snapshot_uvm_dynamic_queues()
+
+    assert low.block_id == 1
+    assert snapshot["min_gpu_free_block_id"] == 2
+    assert snapshot["max_active_block_id"] == 8
+    assert snapshot["tail_free_start_block_id"] == 9
+    assert snapshot["tail_free_block_count"] == 0
+
+
 def test_backup_queue_target_can_follow_the_physical_kv_tier() -> None:
     policy = _FakeDynamicPolicy(applied_target=8)
     policy.backup_reserve_target_map = {8: 2, 12: 6}

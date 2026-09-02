@@ -69,6 +69,8 @@ def test_frozen_protocol_has_bidirectional_and_fair_fixed_design() -> None:
     assert targets == [1364, 2730, 4095]
     assert protocol["runtime"]["backup_reserve_blocks"] == 16
     assert protocol["runtime"]["safety_blocks"] == 16
+    assert protocol["runtime"]["scheduler_boundary_resize"] is True
+    assert protocol["runtime"]["synchronized_tier_steps"] is True
     assert len(protocol["profiles"]["formal"]["seeds"]) == 3
     assert len(protocol["profiles"]["capacity"]["seeds"]) == 3
     assert protocol["profiles"]["capacity"]["scenario_names"] == [

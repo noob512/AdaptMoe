@@ -1,66 +1,29 @@
-# 复现 E11 continuous-arrival qualification
+# E11 continuous-arrival 当前复现状态
 
-## 前提
+最后核验：2026-09-02。E11已按用户要求终止，当前不提供新的GPU运行命令；此前为诊断
+E11加入的实验性修改已撤销。已有artifact保留用于审计，不能把任何失败臂拼成正式结果。
 
-仓库根目录为 `/home/ubuntu/nvidia-uvm-gpu`，模型和冻结输入必须存在。运行前必须满足：
+## 最新完整attempt
 
 ```text
-loaded nvidia_uvm srcversion == modinfo -F srcversion nvidia-uvm
-GPU memory.used == 0 MiB
-无 compute process
-无 /dev/nvidia-uvm client
+experiments/eurosys_moe_offload_evaluation/artifacts/
+e11-continuous-arrival-20260902-attempt-09-remote-park-full-dual-strict-qualification
 ```
 
-构建当前模块和用户态库：
+离线复核：
 
 ```bash
-make -C kernel-module/nvidia-module -j"$(nproc)" modules
-make -C workloads/vllm/vllm/uvm_test
+cd /home/ubuntu/nvidia-uvm-gpu
+ROOT=experiments/eurosys_moe_offload_evaluation/artifacts/\
+e11-continuous-arrival-20260902-attempt-09-remote-park-full-dual-strict-qualification
+jq '{status,errors,arms,correctness_comparison}' "$ROOT/verification.json"
 ```
 
-## 静态检查
+该轮`phase_epoch`、`remote_phase_epoch`和`remote_continuous`均完成8/8请求；phase epoch
+将mixed step降为0，remote continuous出现1个mixed step，hybrid在mixed step正确
+fail-closed。但是phase-specific双Graph与两个remote-only对照的完整token IDs不一致，
+顶层verifier为`status=error`。
 
-```bash
-workloads/vllm/vllm/.venv/bin/python -m py_compile \
-  experiments/eurosys_moe_offload_evaluation/e11_continuous_arrival_runner.py \
-  experiments/eurosys_moe_offload_evaluation/verify_e11_continuous_arrival.py
-
-bash -n \
-  experiments/eurosys_moe_offload_evaluation/run_e11_continuous_arrival_qualification.sh
-
-workloads/vllm/vllm/.venv/bin/python -m pytest -q \
-  workloads/vllm/vllm/tests/v1/core/test_scheduler.py \
-  -k phase_batched_scheduler
-```
-
-## GPU 运行
-
-必须使用新的、不存在的 attempt 目录：
-
-```bash
-ALLOW_GPU_RUN=1 \
-RUN_ROOT=/home/ubuntu/nvidia-uvm-gpu/experiments/eurosys_moe_offload_evaluation/artifacts/\
-e11-continuous-arrival-NEW-attempt-01-qualification \
-  experiments/eurosys_moe_offload_evaluation/\
-run_e11_continuous_arrival_qualification.sh
-```
-
-launcher 顺序运行三个独立冷进程：
-
-- `phase_epoch`：phase-specific + phase epoch，必须 8/8 成功且 mixed step 为 0；
-- `remote_continuous`：remote-only eager + default scheduler，必须 8/8 成功且至少一个 mixed step；
-- `hybrid_fail_closed`：phase-specific + default scheduler，必须在 mixed step 明确失败。
-
-每个 arm 都保存命令、环境、结果、内核日志、GPU before/after 和资源使用。最后 launcher
-恢复 stock UVM；任一 Xid、页表 fault、脏 GPU 或无法恢复模块都算失败。
-
-## 验证
-
-```bash
-workloads/vllm/vllm/.venv/bin/python \
-  experiments/eurosys_moe_offload_evaluation/verify_e11_continuous_arrival.py \
-  <RUN_ROOT> --output <RUN_ROOT>/verification.json
-```
-
-当前 verifier 还要求两个成功 arm 的完整 token IDs 相同。2026-08-31 attempt-02 没有通过
-该 correctness 门，因此只能引用调度行为和 fail-closed 结果，不能声称正式 E11 已完成。
+attempt-10--16仅为单臂定因，最终attempt-16仍为`status=error`且没有补齐其他三臂；它们
+不能替代attempt-09或晋升为正式结果。E11当前结论是“调度行为得到观察，但correctness门
+未通过且实验已暂停”，没有可发布的性能排名。

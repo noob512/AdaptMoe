@@ -686,9 +686,63 @@ def test_dynamic_swap_uses_explicit_expert_records(
     assert records[(7, 4)].aggregate_state == RegionState.CPU
 
 
+def test_dynamic_swap_finishes_all_demotions_before_promotions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int]] = []
+    records = {
+        (7, 3): ExpertRecord(7, 3, RegionState.CPU, ["remote-3"]),
+        (7, 4): ExpertRecord(7, 4, RegionState.GPU, ["local-4"]),
+        (7, 5): ExpertRecord(7, 5, RegionState.CPU, ["remote-5"]),
+        (7, 6): ExpertRecord(7, 6, RegionState.GPU, ["local-6"]),
+    }
+
+    def release(*, global_expert_id: int, **_kwargs: object) -> dict[str, object]:
+        calls.append(("release", global_expert_id))
+        records[(7, global_expert_id)].aggregate_state = RegionState.CPU
+        return {"ok": True}
+
+    def restore(*, global_expert_id: int, **_kwargs: object) -> dict[str, object]:
+        calls.append(("restore", global_expert_id))
+        records[(7, global_expert_id)].aggregate_state = RegionState.GPU
+        return {"ok": True}
+
+    layer = SimpleNamespace(
+        uvm_dynamic_expert_swap_enable=True,
+        _uvm_stage_m_uses_remote_read=lambda: True,
+        _uvm_layer_id=lambda: 7,
+        _uvm_remote_read_global_expert_ids={3, 5},
+        _uvm_incremental_offloaded_global_expert_ids={3, 5},
+        _uvm_expert_records=records,
+        _uvm_release_expert_record=release,
+        _uvm_restore_expert_record=restore,
+    )
+    monkeypatch.setattr(layer_module.torch.cuda, "is_available", lambda: False)
+
+    result = FusedMoE.run_uvm_dynamic_remote_read_swaps(
+        layer,
+        [
+            {"promote_expert": 3, "demote_expert": 4},
+            {"promote_expert": 5, "demote_expert": 6},
+        ],
+    )
+
+    assert result["ok"] is True
+    assert result["mutation_order"] == "all_demotions_then_all_promotions"
+    assert calls == [
+        ("release", 4),
+        ("release", 6),
+        ("restore", 3),
+        ("restore", 5),
+    ]
+    assert layer._uvm_remote_read_global_expert_ids == {4, 6}
+    assert layer._uvm_incremental_offloaded_global_expert_ids == {4, 6}
+
+
 def test_expert_release_preserves_remote_read_action(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_DUAL_VIEW_FULL_PARAMETER_SHADOW", "1")
     record = ExpertRecord(7, 3, RegionState.GPU, ["first", "second"])
     calls: list[dict[str, object]] = []
 
@@ -723,6 +777,7 @@ def test_expert_release_preserves_remote_read_action(
             "region_ids": ["first", "second"],
             "device": 1,
             "remote_read": True,
+            "immutable_cpu_shadow": True,
         }
     ]
     assert record.aggregate_state == RegionState.CPU

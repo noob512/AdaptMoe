@@ -363,6 +363,13 @@ def main() -> int:
                     runner.activate_uvm_expert_graph_class_at_idle_boundary(
                         activation_class,
                         scheduler_idle=True,
+                        # Every measured request finishes in the prebuilt
+                        # remote Decode view.  A Plan Class transaction must
+                        # briefly resume the sealed Prefill view, update both
+                        # frozen children, and then re-park Decode.  This is a
+                        # page-table switch at the certified idle boundary;
+                        # it does not recapture either CUDA Graph.
+                        resume_prefill_before_switch=True,
                     )
                 )
                 require(

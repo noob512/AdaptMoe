@@ -104,3 +104,28 @@ workloads/vllm/results/uvm_kv_bench_single_process.log
 
 # Locally compiled UVM probe executable (keep the .cu source only)
 /workloads/vllm/vllm/uvm_test/managed_to_cuda_malloc_reuse_probe
+
+# Local manuscript copies and editor state (keep the files on disk).
+/.vscode/
+/AdaptMoE__*.pdf
+/my_paper/
+/my_paper.zip
+/paper/*.pdf
+/paper/eurosys.bib
+
+# Generated reports from the mixed-scheduling experiments. Keep runners,
+# verifiers, and the explicitly selected frozen inputs in version control.
+/experiments/adaptmoe_token_threshold_sharegpt_compare/P1024_*.md
+/experiments/adaptmoe_token_threshold_sharegpt_compare/P1024_*.json
+/experiments/adaptmoe_token_threshold_sharegpt_compare/P1024_*.csv
+/experiments/adaptmoe_token_threshold_sharegpt_compare/P512_*.md
+/experiments/adaptmoe_token_threshold_sharegpt_compare/P512_*.json
+/experiments/adaptmoe_token_threshold_sharegpt_compare/P512_*.csv
+/experiments/adaptmoe_token_threshold_sharegpt_compare/KV512_HISTORICAL_RESULTS_*
+/experiments/adaptmoe_token_threshold_sharegpt_compare/ADAPTMOE_KV1_LATEST.*
+/experiments/adaptmoe_token_threshold_sharegpt_compare/inputs/*.manifest.json
+/experiments/eurosys_additional_nonintrusive_20260909/analysis*/
+/experiments/eurosys_additional_nonintrusive_20260909/captures/
+*.nsys-rep
+*.qdrep
+*.ncu-rep

@@ -12189,8 +12189,13 @@ static NV_STATUS block_slot_alias_dual_prepare_locked(
                      UVM_PMM_ALLOC_FLAGS_NONE,
                      &gpu_state->page_table_range_2m,
                      &gpu_state->moe_slot_dual_gpu_4k_range);
-        if (status != NV_OK)
+        if (status != NV_OK) {
+            uvm_phase_f_route_log_always(
+                "dual_prepare_alloc_failed child=gpu block=0x%llx nested=%u ready=%u selected=%u status=0x%x\n",
+                va_block->start, nested_refresh, was_ready,
+                uvm_page_mask_weight(&selected_pages), status);
             return status;
+        }
         status = uvm_page_tree_alloc_table_detached(
                      tree,
                      UVM_PAGE_SIZE_4K,
@@ -12198,6 +12203,10 @@ static NV_STATUS block_slot_alias_dual_prepare_locked(
                      &gpu_state->page_table_range_2m,
                      &gpu_state->moe_slot_dual_cpu_4k_range);
         if (status != NV_OK) {
+            uvm_phase_f_route_log_always(
+                "dual_prepare_alloc_failed child=cpu block=0x%llx nested=%u ready=%u selected=%u status=0x%x\n",
+                va_block->start, nested_refresh, was_ready,
+                uvm_page_mask_weight(&selected_pages), status);
             uvm_page_tree_free_table_detached(
                 tree, &gpu_state->moe_slot_dual_gpu_4k_range);
             return status;
@@ -12429,8 +12438,14 @@ NV_STATUS uvm_va_block_slot_alias_dual_prepare_batch(
                                                   nested_refresh,
                                                   &reused,
                                                   &skipped));
-        if (status != NV_OK)
+        if (status != NV_OK) {
+            uvm_phase_f_route_log_always(
+                "dual_prepare_batch_failed block=0x%llx index=%u candidates=%u prepared=%llu reused=%llu skipped=%llu nested=%u status=0x%x\n",
+                va_block->start, i, *block_count,
+                result->prepared_blocks, result->reused_blocks,
+                result->skipped_blocks, nested_refresh, status);
             break;
+        }
         if (skipped) {
             ++result->skipped_blocks;
             continue;

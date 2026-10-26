@@ -609,6 +609,10 @@ class EngineCore:
                 2,
             ),
             "high_watermark": high_watermark,
+            "active_high_watermark_growth": self._uvm_env_flag(
+                "VLLM_UVM_KV_AUTO_SCALE_ACTIVE_HIGH_WATERMARK_GROW",
+                default=False,
+            ),
             "backup_only_growth": backup_only_growth,
             "backup_pressure_threshold_blocks": backup_pressure_threshold,
             "minimum_residency_steps": max(
@@ -817,10 +821,15 @@ class EngineCore:
                 "residency_steps": residency_steps,
             }
 
-        # A non-urgent high-watermark signal means the current tier still fits
-        # the active cohort. Do not pay a synchronous scheduler-boundary stall
-        # until a later prediction or reserve activation proves growth urgent.
-        if scheduler_unfinished and not urgent:
+        # By default a non-urgent signal keeps the tier that still fits the
+        # active cohort. An explicit proactive policy may grow at high water
+        # while requests run; it still obeys minimum residency and the safe
+        # scheduler-boundary checks below.
+        if (
+            scheduler_unfinished
+            and not urgent
+            and not bool(config["active_high_watermark_growth"])
+        ):
             self._uvm_kv_autoscale_low_streak = 0
             self._cancel_uvm_pending_kv_shrink(
                 "active_cohort_high_watermark_pressure"
@@ -2734,38 +2743,80 @@ class EngineCore:
         was executed.
         """
 
+        prefill_step_timing_audit = self._uvm_env_flag(
+            "VLLM_PREFILL_ENGINE_STEP_TIMING_AUDIT", default=False
+        )
+        step_started_ns = time.perf_counter_ns()
+
         # A late arrival may have queued a grow while the previous model step
         # was in flight. Commit it at this quiescent boundary before scheduling
         # more work; running requests need not have completed.
         self._apply_pending_uvm_kv_growth_if_ready()
+        after_initial_growth_ns = time.perf_counter_ns()
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        after_schedule_ns = time.perf_counter_ns()
         self._maybe_handle_uvm_kv_preemption_pressure(scheduler_output)
+        after_pressure_ns = time.perf_counter_ns()
         self._ensure_uvm_kv_autoscale_state()
+        after_autoscale_state_ns = time.perf_counter_ns()
         self._uvm_model_execution_inflight = True
         try:
             future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
+            after_execute_model_ns = time.perf_counter_ns()
             grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            after_grammar_ns = time.perf_counter_ns()
             with self.log_error_detail(scheduler_output):
                 model_output = future.result()
+                after_future_result_ns = time.perf_counter_ns()
                 if model_output is None:
                     model_output = self.model_executor.sample_tokens(grammar_output)
+            after_model_result_ns = time.perf_counter_ns()
         finally:
             self._uvm_model_execution_inflight = False
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        after_scheduler_update_ns = time.perf_counter_ns()
         self._apply_pending_uvm_kv_growth_if_ready()
+        after_final_growth_ns = time.perf_counter_ns()
         self._apply_pending_uvm_kv_shrink_if_ready()
+        after_shrink_ns = time.perf_counter_ns()
         self._apply_pending_uvm_expert_plan_class_if_ready()
+        after_plan_class_ns = time.perf_counter_ns()
         self._maybe_auto_rebalance_uvm_remote_experts()
+        after_rebalance_ns = time.perf_counter_ns()
+
+        if prefill_step_timing_audit and scheduler_output.scheduled_new_reqs:
+            logger.info(
+                "PREFILL_ENGINE_STEP_TIMING initial_growth_us=%.3f "
+                "schedule_us=%.3f pressure_us=%.3f autoscale_state_us=%.3f "
+                "execute_model_us=%.3f grammar_us=%.3f future_result_us=%.3f "
+                "sample_tokens_us=%.3f "
+                "scheduler_update_us=%.3f final_growth_us=%.3f shrink_us=%.3f "
+                "plan_class_us=%.3f rebalance_us=%.3f total_us=%.3f",
+                (after_initial_growth_ns - step_started_ns) / 1e3,
+                (after_schedule_ns - after_initial_growth_ns) / 1e3,
+                (after_pressure_ns - after_schedule_ns) / 1e3,
+                (after_autoscale_state_ns - after_pressure_ns) / 1e3,
+                (after_execute_model_ns - after_autoscale_state_ns) / 1e3,
+                (after_grammar_ns - after_execute_model_ns) / 1e3,
+                (after_future_result_ns - after_grammar_ns) / 1e3,
+                (after_model_result_ns - after_future_result_ns) / 1e3,
+                (after_scheduler_update_ns - after_model_result_ns) / 1e3,
+                (after_final_growth_ns - after_scheduler_update_ns) / 1e3,
+                (after_shrink_ns - after_final_growth_ns) / 1e3,
+                (after_plan_class_ns - after_shrink_ns) / 1e3,
+                (after_rebalance_ns - after_plan_class_ns) / 1e3,
+                (after_rebalance_ns - step_started_ns) / 1e3,
+            )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 

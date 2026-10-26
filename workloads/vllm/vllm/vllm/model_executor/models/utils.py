@@ -622,6 +622,8 @@ _CPU_OFFLOAD_UVM_STATIC_ALIAS_DESTROY_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_SLOT_CLOSE_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED = False
 _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE = "off"
+_CPU_OFFLOAD_UVM_ORIGINAL_VA_TOKEN_THRESHOLD = 64
+_CPU_OFFLOAD_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD = 65
 _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED = False
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_PARK_RESULT: dict[str, Any] | None = None
 _CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT: dict[str, Any] | None = None
@@ -961,6 +963,18 @@ def _normalize_uvm_plan_class_name(value: str) -> str:
     return normalized
 
 
+def _uvm_plan_class_phase_contract_allowed(
+    original_va_phase_mode: str,
+    eager_plan_classes: bool,
+) -> bool:
+    if original_va_phase_mode == "prefill_graph_remote_decode":
+        return True
+    return eager_plan_classes and original_va_phase_mode in (
+        "prefill_remote_decode",
+        "token_threshold",
+    )
+
+
 def _load_graph_static_alias_plan_classes(
     path: str,
     name_plan: Mapping[str, _GraphStaticAliasNamePlan],
@@ -1110,6 +1124,8 @@ def _configured_uvm_original_va_phase_mode() -> str:
         "prefill_remote_decode": "prefill_remote_decode",
         "alias_prefill_remote_decode": "prefill_remote_decode",
         "hybrid": "prefill_remote_decode",
+        "token_threshold": "token_threshold",
+        "token_adaptive": "token_threshold",
         "prefill_graph_remote_decode": "prefill_graph_remote_decode",
         "alias_graph_prefill_remote_graph_decode": (
             "prefill_graph_remote_decode"
@@ -1123,9 +1139,51 @@ def _configured_uvm_original_va_phase_mode() -> str:
     except KeyError as exc:
         raise ValueError(
             "VLLM_UVM_ORIGINAL_VA_PHASE_MODE must be 'off', "
-            "'prefill_remote_decode', 'prefill_graph_remote_decode', or "
+            "'prefill_remote_decode', 'token_threshold', "
+            "'prefill_graph_remote_decode', or "
             f"'remote_only', got {raw!r}"
         ) from exc
+
+
+def _configured_uvm_original_va_token_threshold() -> int:
+    raw = os.environ.get("VLLM_UVM_ORIGINAL_VA_TOKEN_THRESHOLD", "64").strip()
+    try:
+        threshold = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_UVM_ORIGINAL_VA_TOKEN_THRESHOLD must be a positive int, "
+            f"got {raw!r}"
+        ) from exc
+    if threshold <= 0:
+        raise ValueError(
+            "VLLM_UVM_ORIGINAL_VA_TOKEN_THRESHOLD must be a positive int, "
+            f"got {raw!r}"
+        )
+    return threshold
+
+
+def _configured_uvm_original_va_resume_token_threshold(
+    park_threshold: int,
+) -> int:
+    raw = os.environ.get(
+        "VLLM_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD",
+        str(int(park_threshold) + 1),
+    ).strip()
+    try:
+        threshold = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD must be an int "
+            "greater than VLLM_UVM_ORIGINAL_VA_TOKEN_THRESHOLD, "
+            f"got {raw!r}"
+        ) from exc
+    if threshold <= int(park_threshold):
+        raise ValueError(
+            "VLLM_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD must be greater "
+            "than VLLM_UVM_ORIGINAL_VA_TOKEN_THRESHOLD, got "
+            f"park={park_threshold}, resume={threshold}"
+        )
+    return threshold
 
 
 def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
@@ -1168,6 +1226,8 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_SLOT_CLOSE_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED
     global _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE
+    global _CPU_OFFLOAD_UVM_ORIGINAL_VA_TOKEN_THRESHOLD
+    global _CPU_OFFLOAD_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD
     global _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_PARK_RESULT
     global _CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT
@@ -1223,6 +1283,12 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     )
     graph_static_alias_backend = _configured_graph_static_alias_backend()
     original_va_phase_mode = _configured_uvm_original_va_phase_mode()
+    original_va_token_threshold = _configured_uvm_original_va_token_threshold()
+    original_va_resume_token_threshold = (
+        _configured_uvm_original_va_resume_token_threshold(
+            original_va_token_threshold
+        )
+    )
     park_resume_enabled = _strict_env_flag(
         "VLLM_CPU_OFFLOAD_UVM_ORIGINAL_VA_PARK_RESUME", False
     )
@@ -1234,6 +1300,9 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     ).strip()
     eager_plan_classes = _strict_env_flag(
         "VLLM_CPU_OFFLOAD_PLAN_CLASS_EAGER_ENABLE", False
+    )
+    remote_only_direct_forward = _strict_env_flag(
+        "VLLM_UVM_REMOTE_ONLY_DIRECT_FORWARD", False
     )
 
     _CPU_OFFLOAD_EXACT_NAMES_FILE = ""
@@ -1278,6 +1347,8 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_SLOT_CLOSE_RESULT = None
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED = False
     _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE = "off"
+    _CPU_OFFLOAD_UVM_ORIGINAL_VA_TOKEN_THRESHOLD = 64
+    _CPU_OFFLOAD_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD = 65
     _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED = False
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_PARK_RESULT = None
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT = None
@@ -1332,12 +1403,9 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     if graph_static_alias_plan_classes_file and not (
         graph_static_alias
         and graph_static_alias_backend == "uvm_original_va"
-        and (
-            original_va_phase_mode == "prefill_graph_remote_decode"
-            or (
-                eager_plan_classes
-                and original_va_phase_mode == "prefill_remote_decode"
-            )
+        and _uvm_plan_class_phase_contract_allowed(
+            original_va_phase_mode,
+            eager_plan_classes,
         )
         and park_resume_enabled
     ):
@@ -1346,12 +1414,22 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
             "uvm_original_va and PARK/RESUME, plus either "
             "prefill_graph_remote_decode or the explicit "
             "VLLM_CPU_OFFLOAD_PLAN_CLASS_EAGER_ENABLE=1 "
-            "prefill_remote_decode contract"
+            "prefill_remote_decode/token_threshold contract"
         )
     if graph_static_alias_eager and original_va_phase_mode != "off":
         raise ValueError(
             "VLLM_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_EAGER=1 is only valid with "
             "VLLM_UVM_ORIGINAL_VA_PHASE_MODE=off"
+        )
+    if remote_only_direct_forward and not (
+        graph_static_alias
+        and graph_static_alias_backend == "uvm_original_va"
+        and original_va_phase_mode == "remote_only"
+    ):
+        raise ValueError(
+            "VLLM_UVM_REMOTE_ONLY_DIRECT_FORWARD=1 requires the "
+            "uvm_original_va graph static-alias backend and "
+            "VLLM_UVM_ORIGINAL_VA_PHASE_MODE=remote_only"
         )
     if not graph_static_alias and graph_static_alias_backend != "vmm":
         raise ValueError(
@@ -1372,20 +1450,32 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
             "VLLM_UVM_ORIGINAL_VA_PHASE_MODE and the legacy "
             "VLLM_UVM_PREFILL_P3_DECODE_REMOTE_READ path are mutually exclusive"
         )
+    if original_va_phase_mode == "token_threshold" and not park_resume_enabled:
+        raise ValueError(
+            "VLLM_UVM_ORIGINAL_VA_PHASE_MODE=token_threshold requires "
+            "VLLM_CPU_OFFLOAD_UVM_ORIGINAL_VA_PARK_RESUME=1"
+        )
     if park_resume_enabled and original_va_phase_mode not in (
         "prefill_remote_decode",
+        "token_threshold",
         "prefill_graph_remote_decode",
     ):
         raise ValueError(
             "VLLM_CPU_OFFLOAD_UVM_ORIGINAL_VA_PARK_RESUME=1 requires an "
-            "alias-prefill/remote-decode phase mode"
+            "alias-prefill/remote-decode or token-threshold phase mode"
         )
     if not exact_names_file:
         return
-    if _normalized_cpu_offload_backend() != "copy":
+    exact_backend = _normalized_cpu_offload_backend()
+    if exact_backend not in ("copy", "uva"):
         raise ValueError(
             "VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE is supported only with "
-            "VLLM_CPU_OFFLOAD_BACKEND=copy"
+            "VLLM_CPU_OFFLOAD_BACKEND=copy or uva"
+        )
+    if exact_backend == "uva" and (static_bank or graph_static_alias):
+        raise ValueError(
+            "Exact-name UVA offload does not support static-bank or "
+            "graph-static-alias modes"
         )
     if max_bytes <= 0:
         raise ValueError(
@@ -1400,6 +1490,10 @@ def _configure_cpu_offload_exact_names(max_bytes: int) -> None:
     _CPU_OFFLOAD_GRAPH_STATIC_ALIAS = graph_static_alias
     _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND = graph_static_alias_backend
     _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE = original_va_phase_mode
+    _CPU_OFFLOAD_UVM_ORIGINAL_VA_TOKEN_THRESHOLD = original_va_token_threshold
+    _CPU_OFFLOAD_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD = (
+        original_va_resume_token_threshold
+    )
     _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED = park_resume_enabled
     if graph_static_alias:
         if _strict_env_flag("VLLM_CPU_OFFLOAD_COPY_SYNC", False):
@@ -1522,6 +1616,24 @@ def set_cpu_offload_max_bytes(max_bytes: int) -> None:
                                 if cpu_offload_uvm_original_va_static_alias_enabled()
                                 else "off"
                             ),
+                            "uvm_original_va_token_threshold": (
+                                _CPU_OFFLOAD_UVM_ORIGINAL_VA_TOKEN_THRESHOLD
+                                if cpu_offload_uvm_original_va_static_alias_enabled()
+                                else None
+                            ),
+                            "uvm_original_va_resume_token_threshold": (
+                                _CPU_OFFLOAD_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD
+                                if cpu_offload_uvm_original_va_static_alias_enabled()
+                                else None
+                            ),
+                            "uvm_token_threshold_fast_transition": (
+                                _strict_env_flag(
+                                    "VLLM_UVM_TOKEN_THRESHOLD_FAST_TRANSITION",
+                                    False,
+                                )
+                                if cpu_offload_uvm_original_va_static_alias_enabled()
+                                else False
+                            ),
                             "graph_static_alias_bank_count": (
                                 2 if _CPU_OFFLOAD_GRAPH_STATIC_ALIAS else 0
                             ),
@@ -1592,6 +1704,20 @@ def cpu_offload_uvm_original_va_phase_mode() -> str:
     if not cpu_offload_uvm_original_va_static_alias_enabled():
         return "off"
     return _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE
+
+
+def cpu_offload_uvm_original_va_token_threshold() -> int:
+    """Return the frozen per-step token threshold for topology selection."""
+    if not cpu_offload_uvm_original_va_static_alias_enabled():
+        return 64
+    return _CPU_OFFLOAD_UVM_ORIGINAL_VA_TOKEN_THRESHOLD
+
+
+def cpu_offload_uvm_original_va_resume_token_threshold() -> int:
+    """Return the token count at which a parked topology resumes copy."""
+    if not cpu_offload_uvm_original_va_static_alias_enabled():
+        return 65
+    return _CPU_OFFLOAD_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD
 
 
 def cpu_offload_uvm_original_va_profile_all_remote_active() -> bool:
@@ -1845,6 +1971,10 @@ def get_cpu_offload_graph_static_alias_diagnostics() -> dict[str, Any]:
         "cleanup_pending": (_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE == "cleanup_pending"),
         "cleanup_unresolved": bool(_CPU_OFFLOAD_UVM_STATIC_ALIAS_CLEANUP_UNRESOLVED),
         "phase_mode": _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE,
+        "token_threshold": int(_CPU_OFFLOAD_UVM_ORIGINAL_VA_TOKEN_THRESHOLD),
+        "resume_token_threshold": int(
+            _CPU_OFFLOAD_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD
+        ),
         "capture_topology": _CPU_OFFLOAD_UVM_CAPTURE_TOPOLOGY,
         "capture_success_count": int(_CPU_OFFLOAD_UVM_CAPTURE_SUCCESS_COUNT),
         "remote_graph_captured": bool(_CPU_OFFLOAD_UVM_REMOTE_GRAPH_CAPTURED),
@@ -1958,6 +2088,16 @@ def validate_cpu_offload_graph_static_alias_runtime(
         unsupported.append(
             "prefill_graph_remote_decode requires cudagraph_mode=FULL_SEPARATE"
         )
+    if (
+        _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE == "token_threshold"
+        and mode_name != "NONE"
+    ):
+        unsupported.append("token_threshold requires cudagraph_mode=NONE")
+    if (
+        _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE == "token_threshold"
+        and not _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED
+    ):
+        unsupported.append("token_threshold requires PARK/RESUME")
     if (
         mode_name == "FULL_SEPARATE"
         and _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE
@@ -7061,6 +7201,152 @@ def _set_uvm_original_alias_sealed_state(result: Mapping[str, Any]) -> None:
     _CPU_OFFLOAD_UVM_STATIC_ALIAS_RESUME_RESULT = dict(result)
 
 
+def _uvm_original_alias_delta_batches(
+    entries: tuple[tuple[int, int, int, int, int, int, int], ...],
+    *,
+    maximum_entries: int,
+    keep_backing_identities_whole: bool,
+) -> tuple[tuple[tuple[int, int, int, int, int, int, int], ...], ...]:
+    """Split a plan-class delta without exceeding one static-alias ioctl."""
+    if maximum_entries <= 0:
+        raise ValueError("Static-alias delta batch size must be positive")
+    if not entries:
+        return ()
+    if not keep_backing_identities_whole:
+        return tuple(
+            tuple(entries[offset : offset + maximum_entries])
+            for offset in range(0, len(entries), maximum_entries)
+        )
+
+    grouped: dict[
+        tuple[int, int, int],
+        list[tuple[int, int, int, int, int, int, int]],
+    ] = {}
+    for entry in entries:
+        grouped.setdefault((entry[0], entry[1], entry[2]), []).append(entry)
+
+    batches: list[list[tuple[int, int, int, int, int, int, int]]] = []
+    current: list[tuple[int, int, int, int, int, int, int]] = []
+    for identity_entries in grouped.values():
+        if len(identity_entries) > maximum_entries:
+            raise ValueError(
+                "One backing identity exceeds the static-alias ioctl limit: "
+                f"identity={identity_entries[0][:3]!r}, "
+                f"entries={len(identity_entries)}, limit={maximum_entries}"
+            )
+        if current and len(current) + len(identity_entries) > maximum_entries:
+            batches.append(current)
+            current = []
+        current.extend(identity_entries)
+    if current:
+        batches.append(current)
+    return tuple(tuple(batch) for batch in batches)
+
+
+def _uvm_original_alias_quiesced_delta_batched(
+    *,
+    session_id: int,
+    entries: tuple[tuple[int, int, int, int, int, int, int], ...],
+    operation: str,
+    device: int,
+    defer_dual_refresh: bool,
+) -> dict[str, Any]:
+    """Apply an oversized quiesced delta using bounded static-alias ioctls."""
+    from vllm.device_allocator import uvm_static_alias
+
+    if operation not in ("append", "remove"):
+        raise ValueError(f"Unsupported quiesced delta operation: {operation!r}")
+    batches = _uvm_original_alias_delta_batches(
+        entries,
+        maximum_entries=uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAX_ENTRIES,
+        keep_backing_identities_whole=operation == "remove",
+    )
+    if not batches:
+        raise ValueError("A quiesced delta requires at least one entry")
+
+    batch_results: list[dict[str, Any]] = []
+    completed_entries = 0
+    for batch_index, batch in enumerate(batches):
+        if operation == "append":
+            # Intermediate appends invalidate the old recipe. The last append
+            # rebuilds it once unless an enclosing KV migration owns the final
+            # full refresh after changing the physical layout.
+            flags = uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAP_FLAG_QUIESCED_APPEND
+            if defer_dual_refresh or batch_index + 1 < len(batches):
+                flags |= (
+                    uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAP_FLAG_DEFER_DUAL_REFRESH
+                )
+            one_result = dict(
+                uvm_static_alias.driver_static_alias_map(
+                    batch,
+                    session_id=session_id,
+                    device=device,
+                    flags=flags,
+                )
+            )
+        else:
+            one_result = dict(
+                uvm_static_alias.driver_static_alias_quiesced_remove(
+                    session_id,
+                    batch,
+                    device=device,
+                    synchronize=False,
+                )
+            )
+        one_result["batch_index"] = batch_index
+        one_result["batch_entry_count"] = len(batch)
+        batch_results.append(one_result)
+        if one_result.get("ok") is not True:
+            made_progress = completed_entries > 0 or bool(
+                one_result.get("made_progress")
+            )
+            return {
+                **one_result,
+                "ok": False,
+                "reason": f"quiesced_{operation}_batch_failed",
+                "operation": operation,
+                "requested_count": len(entries),
+                "completed_count": completed_entries,
+                "batch_count": len(batches),
+                "completed_batch_count": batch_index,
+                "batch_results": batch_results,
+                "made_progress": made_progress,
+                # Earlier successful ioctls make a later failure a partial
+                # whole-delta commit. Force the caller onto its full rebuild
+                # rollback instead of assuming the old topology is intact.
+                "side_effect_indeterminate": bool(
+                    made_progress
+                    or one_result.get("side_effect_indeterminate")
+                ),
+                "ioctl_calls": sum(
+                    int(result.get("ioctl_calls", 0))
+                    for result in batch_results
+                ),
+            }
+        completed_entries += len(batch)
+
+    final_result = batch_results[-1]
+    return {
+        **final_result,
+        "ok": True,
+        "reason": "ok",
+        "operation": operation,
+        "requested_count": len(entries),
+        "completed_count": completed_entries,
+        "batch_count": len(batches),
+        "completed_batch_count": len(batches),
+        "batch_results": batch_results,
+        "made_progress": completed_entries > 0,
+        "side_effect_indeterminate": False,
+        "ioctl_calls": sum(
+            int(result.get("ioctl_calls", 0)) for result in batch_results
+        ),
+        "dual_view_refresh_deferred": bool(
+            operation == "append" and defer_dual_refresh
+        ),
+    }
+
+
 def _rollback_uvm_original_alias_plan_class_switch(
     *,
     old_geometry: Mapping[str, tuple[Any, ...]],
@@ -7766,6 +8052,18 @@ def switch_cpu_offload_uvm_original_va_plan_class(
             quiesced_delta_enabled = _strict_env_flag(
                 "VLLM_CPU_OFFLOAD_PLAN_CLASS_QUIESCED_DELTA", False
             )
+            quiesced_delta_shape_supported = True
+            if delta_remove_entries:
+                try:
+                    _uvm_original_alias_delta_batches(
+                        delta_remove_entries,
+                        maximum_entries=(
+                            uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAX_ENTRIES
+                        ),
+                        keep_backing_identities_whole=True,
+                    )
+                except ValueError:
+                    quiesced_delta_shape_supported = False
             quiesced_delta_eligible = (
                 quiesced_delta_enabled
                 and not force_sync_dual_transaction
@@ -7783,8 +8081,7 @@ def switch_cpu_offload_uvm_original_va_plan_class(
                     )
                 )
                 and bool(delta_add_entries) != bool(delta_remove_entries)
-                and max(len(delta_add_entries), len(delta_remove_entries))
-                <= uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAX_ENTRIES
+                and quiesced_delta_shape_supported
             )
             # Newly cold experts must become CPU-resident before allocating
             # their slot backing, both to bound peak HBM and to preserve the
@@ -7827,33 +8124,30 @@ def switch_cpu_offload_uvm_original_va_plan_class(
             if quiesced_delta_eligible:
                 if delta_add_entries:
                     quiesced_delta_result = dict(
-                        uvm_static_alias.driver_static_alias_map(
-                            delta_add_entries,
+                        _uvm_original_alias_quiesced_delta_batched(
                             session_id=int(
                                 _CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID
                             ),
+                            entries=delta_add_entries,
+                            operation="append",
                             device=device,
-                            flags=(
-                                uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAP_FLAG_QUIESCED_APPEND
-                                | (
-                                    uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAP_FLAG_DEFER_DUAL_REFRESH
-                                    if (
-                                        defer_dual_refresh
-                                        or force_sync_dual_transaction
-                                    )
-                                    else 0
-                                )
+                            defer_dual_refresh=(
+                                defer_dual_refresh
+                                or force_sync_dual_transaction
                             ),
                         )
                     )
                     quiesced_delta_result["mode"] = "quiesced_append"
                 else:
                     quiesced_delta_result = dict(
-                        uvm_static_alias.driver_static_alias_quiesced_remove(
-                            int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
-                            delta_remove_entries,
+                        _uvm_original_alias_quiesced_delta_batched(
+                            session_id=int(
+                                _CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID
+                            ),
+                            entries=delta_remove_entries,
+                            operation="remove",
                             device=device,
-                            synchronize=False,
+                            defer_dual_refresh=False,
                         )
                     )
                     quiesced_delta_result["mode"] = "quiesced_remove"
@@ -8940,6 +9234,53 @@ def poison_cpu_offload_uvm_original_va_phase(reason: str) -> None:
     _append_cpu_offload_manifest(record)
 
 
+def _uvm_original_alias_fast_runtime_transition_enabled() -> bool:
+    return bool(
+        _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE == "token_threshold"
+        and _strict_env_flag(
+            "VLLM_UVM_TOKEN_THRESHOLD_FAST_TRANSITION", False
+        )
+    )
+
+
+def _uvm_original_alias_runtime_stream_barrier(
+    *,
+    stage: str,
+    device: int,
+) -> dict[str, Any]:
+    """Wait only for the transition-owning CUDA stream to reach a safe point.
+
+    The PARK/RESUME ioctl is synchronous and completes its PTE publication and
+    TLB invalidations before returning.  Recording an event on the model
+    stream therefore gives the CPU an exact pre-mutation dependency; kernels
+    submitted on the same stream after the ioctl naturally observe the new
+    mapping.  Unlike ``torch.cuda.synchronize``, this does not drain unrelated
+    streams, and unlike the diagnostic CUDA-read gates it does not walk or
+    sample every hot Parameter range.
+    """
+    started_ns = time.perf_counter_ns()
+    with torch.cuda.device(device):
+        stream = torch.cuda.current_stream(device)
+        event = torch.cuda.Event(enable_timing=False)
+        event.record(stream)
+        event.synchronize()
+        stream_id = int(stream.cuda_stream)
+    finished_ns = time.perf_counter_ns()
+    result = {
+        "event": "cpu_offload_uvm_runtime_stream_barrier",
+        "timestamp": time.time(),
+        "pid": os.getpid(),
+        "ok": True,
+        "stage": str(stage),
+        "device": int(device),
+        "stream_id": stream_id,
+        "wait_ns": finished_ns - started_ns,
+        "scope": "current_stream",
+    }
+    _append_cpu_offload_manifest(result)
+    return result
+
+
 def transition_cpu_offload_uvm_original_va_to_remote(
     *,
     reason: str,
@@ -9048,21 +9389,32 @@ def transition_cpu_offload_uvm_original_va_to_remote(
         park_result: dict[str, Any] | None = None
         remote_map: dict[str, Any] | None = None
         physical: dict[str, Any] | None = None
+        stream_barrier: dict[str, Any] | None = None
+        fast_runtime_transition = (
+            _uvm_original_alias_fast_runtime_transition_enabled()
+        )
         synchronized_ns = started_ns
         destroyed_ns = started_ns
         mapped_ns = started_ns
         try:
             device = int(_CPU_OFFLOAD_OWNER_DEVICE_INDEX or 0)
-            torch.cuda.synchronize(device)
+            if fast_runtime_transition:
+                stream_barrier = _uvm_original_alias_runtime_stream_barrier(
+                    stage="before_park",
+                    device=device,
+                )
+            else:
+                torch.cuda.synchronize(device)
             synchronized_ns = time.perf_counter_ns()
             if pre_state == "sealed":
                 if _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED:
                     from vllm.device_allocator import uvm_static_alias
 
-                    _uvm_original_alias_hot_cuda_read_gate(
-                        stage="runtime_remote_before_park",
-                        device=device,
-                    )
+                    if not fast_runtime_transition:
+                        _uvm_original_alias_hot_cuda_read_gate(
+                            stage="runtime_remote_before_park",
+                            device=device,
+                        )
                     park_result = dict(
                         uvm_static_alias.driver_static_alias_park(
                             int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
@@ -9076,10 +9428,11 @@ def transition_cpu_offload_uvm_original_va_to_remote(
                             "Failed to park original-VA consumer aliases before "
                             f"remote map: {park_result!r}"
                         )
-                    _uvm_original_alias_hot_cuda_read_gate(
-                        stage="runtime_remote_after_park",
-                        device=device,
-                    )
+                    if not fast_runtime_transition:
+                        _uvm_original_alias_hot_cuda_read_gate(
+                            stage="runtime_remote_after_park",
+                            device=device,
+                        )
                 else:
                     destroy_result = destroy_cpu_offload_graph_static_alias(
                         graphs_destroyed=not preserve_remote_graphs,
@@ -9169,10 +9522,11 @@ def transition_cpu_offload_uvm_original_va_to_remote(
                     "Audited original-VA remote READ mapping was incomplete: "
                     f"{remote_map!r}"
                 )
-            _uvm_original_alias_hot_cuda_read_gate(
-                stage="runtime_remote_after_remote_map",
-                device=device,
-            )
+            if not fast_runtime_transition:
+                _uvm_original_alias_hot_cuda_read_gate(
+                    stage="runtime_remote_after_remote_map",
+                    device=device,
+                )
 
             # The audited remote-map ioctl above already validates every
             # changed range and returns its CPU-resident, remotely-mapped and
@@ -9181,8 +9535,12 @@ def transition_cpu_offload_uvm_original_va_to_remote(
             # VA-block walk on the serving critical path.  Production runs
             # with fail-fast managed faults and disabled migration heuristics
             # can opt out while retaining the mutation-time contract above.
-            post_map_physical_audit_enabled = _strict_env_flag(
+            post_map_physical_audit_requested = _strict_env_flag(
                 "VLLM_UVM_RUNTIME_POST_MAP_RESIDENCY_AUDIT", True
+            )
+            post_map_physical_audit_enabled = bool(
+                post_map_physical_audit_requested
+                and not fast_runtime_transition
             )
             if post_map_physical_audit_enabled:
                 torch.cuda.synchronize(device)
@@ -9314,6 +9672,11 @@ def transition_cpu_offload_uvm_original_va_to_remote(
                 "park": park_result,
                 "remote_map": remote_map,
                 "physical_residency": physical,
+                "fast_runtime_transition": fast_runtime_transition,
+                "stream_barrier": stream_barrier,
+                "post_map_physical_audit_requested": (
+                    post_map_physical_audit_requested
+                ),
                 "post_map_physical_audit_enabled": (
                     post_map_physical_audit_enabled
                 ),
@@ -10898,6 +11261,7 @@ def activate_cpu_offload_uvm_original_va_prefill_topology(
     mode = cpu_offload_uvm_original_va_phase_mode()
     if mode not in (
         "prefill_remote_decode",
+        "token_threshold",
         "prefill_graph_remote_decode",
     ):
         return {"ok": True, "reason": "no_alias_prefill", "phase_mode": mode}
@@ -10914,18 +11278,32 @@ def activate_cpu_offload_uvm_original_va_prefill_topology(
         )
     started_ns = time.perf_counter_ns()
     before = _uvm_original_parameter_va_snapshot()
+    snapshot_finished_ns = time.perf_counter_ns()
     finalized: dict[str, Any] | None = None
     resumed: dict[str, Any] | None = None
     runtime_cold_read_gate: dict[str, Any] | None = None
+    stream_barrier: dict[str, Any] | None = None
+    fast_runtime_transition = (
+        _uvm_original_alias_fast_runtime_transition_enabled()
+    )
+    barrier_finished_ns = snapshot_finished_ns
+    resume_finished_ns = snapshot_finished_ns
     if _CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED:
         from vllm.device_allocator import uvm_static_alias
 
         device = int(_CPU_OFFLOAD_OWNER_DEVICE_INDEX or 0)
-        torch.cuda.synchronize(device)
-        _uvm_original_alias_hot_cuda_read_gate(
-            stage="runtime_prefill_before_resume",
-            device=device,
-        )
+        if fast_runtime_transition:
+            stream_barrier = _uvm_original_alias_runtime_stream_barrier(
+                stage="before_resume",
+                device=device,
+            )
+        else:
+            torch.cuda.synchronize(device)
+            _uvm_original_alias_hot_cuda_read_gate(
+                stage="runtime_prefill_before_resume",
+                device=device,
+            )
+        barrier_finished_ns = time.perf_counter_ns()
         resumed = dict(
             uvm_static_alias.driver_static_alias_resume(
                 int(_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID),
@@ -10947,12 +11325,15 @@ def activate_cpu_offload_uvm_original_va_prefill_topology(
         # successful driver RESUME indistinguishable from a parked topology.
         _CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE = False
         _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE = "sealed"
-        _uvm_original_alias_hot_cuda_read_gate(
-            stage="runtime_prefill_after_resume",
-            device=device,
-        )
+        resume_finished_ns = time.perf_counter_ns()
+        if not fast_runtime_transition:
+            _uvm_original_alias_hot_cuda_read_gate(
+                stage="runtime_prefill_after_resume",
+                device=device,
+            )
         if (
-            not finish_all_remote_profile
+            not fast_runtime_transition
+            and not finish_all_remote_profile
             and _strict_env_flag(
                 "VLLM_UVM_RUNTIME_POST_RESUME_COLD_READ_GATE", False
             )
@@ -10999,6 +11380,13 @@ def activate_cpu_offload_uvm_original_va_prefill_topology(
         "pre_state": state,
         "post_state": _CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE,
         "wall_ns": time.perf_counter_ns() - started_ns,
+        "snapshot_ns": snapshot_finished_ns - started_ns,
+        "stream_dependency_ns": (
+            barrier_finished_ns - snapshot_finished_ns
+        ),
+        "resume_ns": resume_finished_ns - barrier_finished_ns,
+        "fast_runtime_transition": fast_runtime_transition,
+        "stream_barrier": stream_barrier,
         "parameter_vas_before": before,
         "parameter_vas_after": after,
         "finalize": finalized,
@@ -11182,11 +11570,6 @@ def maybe_offload_to_cpu(
 
     offload_backend = _normalized_cpu_offload_backend()
     copy_on_forward = offload_backend == "copy"
-    if exact_names_enabled and not copy_on_forward:
-        raise RuntimeError(
-            "Exact-name CPU offload configuration changed after initialization; "
-            "VLLM_CPU_OFFLOAD_BACKEND must remain 'copy'"
-        )
     uva_offloading = offload_backend == "uva"
     direct_cuda_parameter = not copy_on_forward
     if uva_offloading:
@@ -11712,7 +12095,68 @@ def maybe_offload_to_cpu(
         record.update(manifest_extra)
         _append_cpu_offload_manifest(record)
 
-    if offloaded_parameters and not direct_cuda_parameter:
+    uvm_remote_only_direct_forward = bool(
+        offloaded_parameters
+        and not direct_cuda_parameter
+        and exact_names_enabled
+        and _CPU_OFFLOAD_GRAPH_STATIC_ALIAS
+        and _CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND == "uvm_original_va"
+        and _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE == "remote_only"
+        and _strict_env_flag("VLLM_UVM_REMOTE_ONLY_DIRECT_FORWARD", False)
+    )
+    if uvm_remote_only_direct_forward:
+        state_items = list(module.state_dict().items())
+        state_keys = {key for key, _ in state_items}
+        missing_local = exact_local_parameter_names - state_keys
+        if missing_local:
+            raise RuntimeError(
+                "UVM remote-only direct forward found missing selected "
+                f"parameters: {sorted(missing_local)!r}"
+            )
+        for key, value in state_items:
+            binding = graph_static_alias_bindings.get(key)
+            if binding is None:
+                if value.device.type == "cpu":
+                    raise RuntimeError(
+                        "UVM remote-only direct forward found an unregistered "
+                        f"CPU state tensor: {key!r}"
+                    )
+                continue
+            if not isinstance(binding, _UvmOriginalAliasBinding):
+                raise RuntimeError(
+                    "UVM remote-only direct forward received a non-UVM "
+                    f"binding for {key!r}"
+                )
+            if value.device.type != "cuda" or int(value.data_ptr()) != int(
+                binding.consumer.data_ptr()
+            ):
+                raise RuntimeError(
+                    "UVM remote-only direct forward selected Parameter changed "
+                    f"device or VA during initialization: {binding.full_parameter_name!r}"
+                )
+        _append_cpu_offload_manifest(
+            {
+                "event": "cpu_offload_uvm_original_va_direct_forward",
+                "timestamp": time.time(),
+                "pid": os.getpid(),
+                "module_prefix": module_prefix,
+                "module_class": module.__class__.__name__,
+                "phase_mode": _CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE,
+                "module_forward_wrapped": False,
+                "selected_parameter_count": len(graph_static_alias_bindings),
+                "selected_parameter_bytes": sum(
+                    int(binding.requested_bytes)
+                    for binding in graph_static_alias_bindings.values()
+                    if isinstance(binding, _UvmOriginalAliasBinding)
+                ),
+            }
+        )
+
+    if (
+        offloaded_parameters
+        and not direct_cuda_parameter
+        and not uvm_remote_only_direct_forward
+    ):
         original_forward = module.forward
         copy_forward_index = 0
         copy_trace = _env_flag("VLLM_CPU_OFFLOAD_COPY_TRACE", False)

@@ -4251,6 +4251,7 @@ def uvm_local_memory_pool(enable_prefetch: bool | None = None):
     global _uvm_local_allocator, _uvm_local_mem_pool
     if enable_prefetch is None:
         enable_prefetch = _uvm_local_prefetch_enabled()
+    nested_pool = bool(_uvm_local_prefetch_stack)
     _uvm_local_prefetch_stack.append(bool(enable_prefetch))
     try:
         ensure_uvm_runtime_library()
@@ -4268,8 +4269,14 @@ def uvm_local_memory_pool(enable_prefetch: bool | None = None):
         if _uvm_lib is not None:
             _uvm_lib.uvm_set_prefetch(1 if enable_prefetch else 0)
 
-        with torch.cuda.memory.use_mem_pool(_uvm_local_mem_pool):
+        if nested_pool:
+            # PyTorch cannot begin recording the same MemPool twice. The
+            # outer scope already selects it; nested scopes only change the
+            # allocator's prefetch setting and restore it on exit.
             yield
+        else:
+            with torch.cuda.memory.use_mem_pool(_uvm_local_mem_pool):
+                yield
     finally:
         if _uvm_local_prefetch_stack:
             _uvm_local_prefetch_stack.pop()

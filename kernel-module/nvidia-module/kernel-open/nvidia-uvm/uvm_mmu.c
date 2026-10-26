@@ -35,6 +35,7 @@
 #include "uvm_push.h"
 #include "uvm_mem.h"
 #include "uvm_va_space.h"
+#include "uvm_procfs.h"
 
 #include <asm/io.h>
 #include <linux/mm.h>
@@ -551,8 +552,12 @@ static uvm_page_directory_t *allocate_directory(uvm_page_tree_t *tree,
         entry_count = hal->entries_per_index(depth) << hal->index_bits(depth, page_size);
 
     dir = uvm_kvmalloc_zero(sizeof(uvm_page_directory_t) + sizeof(dir->entries[0]) * entry_count);
-    if (dir == NULL)
+    if (dir == NULL) {
+        uvm_phase_f_route_log_always(
+            "page_directory_alloc_failed stage=host depth=%u page_size=%llu physical_bytes=%llu entries=%u\n",
+            depth, page_size, (NvU64)phys_alloc_size, entry_count);
         return NULL;
+    }
 
     status = phys_mem_allocate(tree, phys_alloc_size, tree->location, pmm_flags, &dir->phys_alloc);
 
@@ -566,6 +571,11 @@ static uvm_page_directory_t *allocate_directory(uvm_page_tree_t *tree,
     }
 
     if (status != NV_OK) {
+        uvm_phase_f_route_log_always(
+            "page_directory_alloc_failed stage=physical depth=%u page_size=%llu physical_bytes=%llu location=%u flags=%u sys_fallback=%u status=0x%x\n",
+            depth, page_size, (NvU64)phys_alloc_size,
+            (NvU32)tree->location, (NvU32)pmm_flags,
+            tree->location_sys_fallback, status);
         uvm_kvfree(dir);
         return NULL;
     }
@@ -1872,6 +1882,20 @@ NV_STATUS uvm_page_tree_alloc_table_detached(uvm_page_tree_t *tree,
                              page_size,
                              single->table->depth + 1,
                              pmm_flags);
+    // A cutover can leave released expert memory cached as free USER root
+    // chunks. A non-evicting KERNEL allocation cannot claim that free list.
+    // Return one wholly free root to PMA and retry, without evicting any live
+    // managed page or changing the frozen dual-view residency recipe.
+    if (!dir && tree->location == UVM_APERTURE_VID &&
+        uvm_pmm_gpu_release_unused_user_root_chunk(&tree->gpu->pmm)) {
+        uvm_phase_f_route_log_always(
+            "detached_table_retry reclaimed_free_user_root=1 page_size=%llu\n",
+            page_size);
+        dir = allocate_directory(tree,
+                                 page_size,
+                                 single->table->depth + 1,
+                                 pmm_flags);
+    }
     if (!dir)
         return NV_ERR_NO_MEMORY;
 

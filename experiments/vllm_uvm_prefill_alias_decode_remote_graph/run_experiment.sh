@@ -197,7 +197,8 @@ restart_exporters() {
 }
 
 restore_stock() {
-  local loaded rc=0
+  local loaded rc=0 had_errexit=0
+  [[ $- == *e* ]] && had_errexit=1
   if (( MODULE_CYCLE_ARMED == 0 )); then
     MODULE_RESTORED=1
     return 0
@@ -218,7 +219,11 @@ restore_stock() {
   [[ "$(loaded_srcversion)" == "${STOCK_SRCVERSION}" ]] || rc=1
   wait_gpu_clean || rc=1
   (( rc == 0 )) && MODULE_RESTORED=1
-  set -e
+  if (( had_errexit == 1 )); then
+    set -e
+  else
+    set +e
+  fi
   return "${rc}"
 }
 
@@ -538,6 +543,14 @@ run_arm() {
       "${VLLM_PY}" "${RUNNER}" "${args[@]}"
   ) >"${arm_dir}/run.log" 2>&1
   rc=$?
+  if [[ -r /proc/driver/nvidia-uvm/phase_f_route_log ]]; then
+    cp -- /proc/driver/nvidia-uvm/phase_f_route_log \
+      "${arm_dir}/phase_f_route_log.txt"
+  fi
+  if [[ -r /proc/driver/nvidia-uvm/phase_f_route_log_stats ]]; then
+    cp -- /proc/driver/nvidia-uvm/phase_f_route_log_stats \
+      "${arm_dir}/phase_f_route_log_stats.txt"
+  fi
   sudo journalctl -k --since "@${kernel_epoch}" --no-pager -o short-unix \
     >"${arm_dir}/kernel.since.log" 2>"${arm_dir}/kernel.since.err"
   journal_rc=$?

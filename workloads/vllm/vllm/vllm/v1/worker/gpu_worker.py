@@ -191,11 +191,10 @@ class Worker(WorkerBase):
 
         from vllm.device_allocator.uvm import uvm_local_memory_pool
 
-        lazy_reserve = os.environ.get(
-            "VLLM_UVM_KV_CACHE_LAZY_RESERVE",
-            "0",
-        ).strip().lower() in ("1", "true", "yes", "on")
-        return uvm_local_memory_pool(enable_prefetch=not lazy_reserve)
+        # Initialization also creates attention workspaces. They must have
+        # backing before their first write, even when KV reserves only VA.
+        # The runner disables prefetch just around the actual lazy KV tensors.
+        return uvm_local_memory_pool(enable_prefetch=True)
 
     def _kv_cache_uvm_allocations_enabled(self) -> bool:
         return (
@@ -940,7 +939,11 @@ class Worker(WorkerBase):
         )
         if (
             phase_mode
-            in ("prefill_remote_decode", "prefill_graph_remote_decode")
+            in (
+                "prefill_remote_decode",
+                "token_threshold",
+                "prefill_graph_remote_decode",
+            )
             and not profile_all_remote
         ):
             # KV creation happens after the sealed Prefill aliases are built.
@@ -978,7 +981,11 @@ class Worker(WorkerBase):
             return
         if (
             phase_mode
-            in ("prefill_remote_decode", "prefill_graph_remote_decode")
+            in (
+                "prefill_remote_decode",
+                "token_threshold",
+                "prefill_graph_remote_decode",
+            )
             and profile_all_remote
         ):
             logger.info(
@@ -1096,7 +1103,12 @@ class Worker(WorkerBase):
             )
 
     def _restore_uvm_original_va_after_post_capture_warmup(self) -> None:
-        """Restore and audit hot-GPU/cold-remote before alias resume."""
+        """Restore and audit hot-GPU/cold-remote before alias resume.
+
+        The all-remote startup profile is also used by eager phase switching.
+        Eager mode skips Graph capture, but it must still end that temporary
+        profile after the final sampler warmup and before serving requests.
+        """
         from vllm.model_executor.models.utils import (
             cpu_offload_uvm_original_va_phase_mode,
             cpu_offload_uvm_original_va_profile_all_remote_active,
@@ -1126,7 +1138,8 @@ class Worker(WorkerBase):
             return
 
         if (
-            phase_mode != "prefill_graph_remote_decode"
+            phase_mode
+            not in ("prefill_remote_decode", "prefill_graph_remote_decode")
             or not cpu_offload_uvm_original_va_profile_all_remote_active()
         ):
             return

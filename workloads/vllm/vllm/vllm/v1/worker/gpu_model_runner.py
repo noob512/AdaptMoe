@@ -9,7 +9,7 @@ import os
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from functools import reduce
 from itertools import product
@@ -3210,6 +3210,8 @@ class GPUModelRunner(
             activate_cpu_offload_uvm_original_va_prefill_topology,
             cpu_offload_uvm_original_va_park_resume_enabled,
             cpu_offload_uvm_original_va_phase_mode,
+            cpu_offload_uvm_original_va_resume_token_threshold,
+            cpu_offload_uvm_original_va_token_threshold,
             get_cpu_offload_graph_static_alias_diagnostics,
             transition_cpu_offload_uvm_original_va_to_remote,
         )
@@ -3238,6 +3240,146 @@ class GPUModelRunner(
                 raise RuntimeError(
                     "remote_only serving requires audited remote original-VA PTEs"
                 )
+            return
+
+        if mode == "token_threshold":
+            if not park_resume:
+                self._poison_uvm_original_va_phase(
+                    "token-threshold mode requires PARK/RESUME"
+                )
+                raise RuntimeError(
+                    "Original-VA token-threshold mode requires PARK/RESUME"
+                )
+            total_num_scheduled_tokens = int(
+                scheduler_output.total_num_scheduled_tokens
+            )
+            if total_num_scheduled_tokens <= 0:
+                self._poison_uvm_original_va_phase(
+                    "token-threshold mode observed a non-positive token count"
+                )
+                raise RuntimeError(
+                    "Original-VA token-threshold mode requires a positive "
+                    "total_num_scheduled_tokens"
+                )
+            lifecycle_state = diagnostics.get("lifecycle_state")
+            park_token_threshold = (
+                cpu_offload_uvm_original_va_token_threshold()
+            )
+            resume_token_threshold = (
+                cpu_offload_uvm_original_va_resume_token_threshold()
+            )
+            if lifecycle_state == "sealed":
+                target_remote = (
+                    total_num_scheduled_tokens <= park_token_threshold
+                )
+                selection_reason = (
+                    "park_threshold"
+                    if target_remote
+                    else "copy_hold"
+                )
+            elif lifecycle_state == "remote_parked":
+                target_remote = (
+                    total_num_scheduled_tokens < resume_token_threshold
+                )
+                selection_reason = (
+                    "remote_hold"
+                    if target_remote
+                    else "resume_threshold"
+                )
+            else:
+                target_remote = False
+                selection_reason = "invalid_state"
+            transition_result: dict[str, Any] | None = None
+            try:
+                if target_remote:
+                    if lifecycle_state == "sealed":
+                        transition_kwargs: dict[str, Any] = {
+                            "reason": "token_threshold_remote",
+                            "preserve_remote_graphs": False,
+                        }
+                        runtime_remote_ranges = (
+                            self._collect_uvm_runtime_remote_expert_ranges()
+                        )
+                        if runtime_remote_ranges:
+                            transition_kwargs["runtime_remote_ranges"] = (
+                                runtime_remote_ranges
+                            )
+                        transition_result = (
+                            transition_cpu_offload_uvm_original_va_to_remote(
+                                **transition_kwargs,
+                            )
+                        )
+                    elif lifecycle_state != "remote_parked":
+                        raise RuntimeError(
+                            "remote selection requires sealed or "
+                            f"remote_parked state, got {lifecycle_state!r}"
+                        )
+                else:
+                    if lifecycle_state == "remote_parked":
+                        transition_result = (
+                            activate_cpu_offload_uvm_original_va_prefill_topology()
+                        )
+                        if transition_result.get("ok") is not True:
+                            raise RuntimeError(
+                                "PARK/RESUME did not restore the sealed topology"
+                            )
+                    elif lifecycle_state != "sealed":
+                        raise RuntimeError(
+                            "copy selection requires remote_parked or "
+                            f"sealed state, got {lifecycle_state!r}"
+                        )
+            except Exception as exc:
+                reason = (
+                    "token-threshold topology switch failed: "
+                    f"tokens={total_num_scheduled_tokens}, "
+                    f"park_threshold={park_token_threshold}, "
+                    f"resume_threshold={resume_token_threshold}, target="
+                    f"{'remote' if target_remote else 'copy'}, error={exc!r}"
+                )
+                self._poison_uvm_original_va_phase(reason)
+                raise RuntimeError(reason) from exc
+
+            after = get_cpu_offload_graph_static_alias_diagnostics()
+            if target_remote:
+                valid = (
+                    after.get("lifecycle_state") == "remote_parked"
+                    and after.get("remote_map_active") is True
+                    and int(after.get("session_id", 0)) > 0
+                    and int(after.get("active_driver_backing_bytes", 0)) > 0
+                )
+            else:
+                valid = (
+                    after.get("lifecycle_state") == "sealed"
+                    and after.get("sealed") is True
+                    and after.get("remote_map_active") is False
+                    and int(after.get("session_id", 0)) > 0
+                    and int(after.get("active_driver_backing_bytes", 0)) > 0
+                )
+            if not valid:
+                reason = (
+                    "token-threshold post-switch topology contract failed: "
+                    f"tokens={total_num_scheduled_tokens}, "
+                    f"park_threshold={park_token_threshold}, "
+                    f"resume_threshold={resume_token_threshold}, target="
+                    f"{'remote' if target_remote else 'copy'}"
+                )
+                self._poison_uvm_original_va_phase(reason)
+                raise RuntimeError(reason)
+            self._uvm_original_va_phase_transition_result = {
+                "schema": "vllm_uvm_original_va_token_threshold_v2",
+                "ok": True,
+                "phase_mode": mode,
+                "step_phase": step_phase,
+                "total_num_scheduled_tokens": total_num_scheduled_tokens,
+                "token_threshold": park_token_threshold,
+                "park_token_threshold": park_token_threshold,
+                "resume_token_threshold": resume_token_threshold,
+                "selection_reason": selection_reason,
+                "selected_access": "remote" if target_remote else "copy",
+                "topology_changed": transition_result is not None,
+                "transition": transition_result,
+                "diagnostics_after": after,
+            }
             return
 
         if mode not in (
@@ -3610,6 +3752,11 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        prefill_pregraph_timing_audit = self._env_flag_enabled(
+            "VLLM_PREFILL_PREGRAPH_TIMING_AUDIT", default=False
+        )
+        pregraph_execute_started_ns = time.perf_counter_ns()
+
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
         # and there is no draft tokens scheduled. so it need to update the
         # spec_decoding info in scheduler_output with async_scheduling.
@@ -3629,6 +3776,7 @@ class GPUModelRunner(
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
+                after_update_states_ns = time.perf_counter_ns()
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -3670,6 +3818,7 @@ class GPUModelRunner(
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
+                before_prepare_inputs_ns = time.perf_counter_ns()
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -3678,6 +3827,7 @@ class GPUModelRunner(
                 ) = self._prepare_inputs(
                     scheduler_output, num_scheduled_tokens_np, max_num_scheduled_tokens
                 )
+                after_prepare_inputs_ns = time.perf_counter_ns()
 
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
@@ -3694,6 +3844,7 @@ class GPUModelRunner(
 
                 total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+                before_attention_metadata_ns = time.perf_counter_ns()
                 attn_metadata, spec_decode_common_attn_metadata = (
                     self._build_attention_metadata(
                         total_num_scheduled_tokens=total_num_scheduled_tokens,
@@ -3706,6 +3857,7 @@ class GPUModelRunner(
                         cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     )
                 )
+                after_attention_metadata_ns = time.perf_counter_ns()
 
                 dp_rank = self.parallel_config.data_parallel_rank
                 if ubatch_slices:
@@ -3719,6 +3871,7 @@ class GPUModelRunner(
                         scheduler_output.total_num_scheduled_tokens
                     )
 
+                before_preprocess_ns = time.perf_counter_ns()
                 (
                     input_ids,
                     inputs_embeds,
@@ -3729,6 +3882,7 @@ class GPUModelRunner(
                 ) = self._preprocess(
                     scheduler_output, num_input_tokens, intermediate_tensors
                 )
+                after_preprocess_ns = time.perf_counter_ns()
 
             enabled_step_phase = self._uvm_enabled_step_phase(scheduler_output)
             uniform_decode = (
@@ -3772,21 +3926,75 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        after_dispatch_ns = time.perf_counter_ns()
+
+        if self._env_flag_enabled(
+            "VLLM_CUDAGRAPH_DISPATCH_AUDIT", default=False
+        ):
+            dispatched_tokens = (
+                int(batch_descriptor.num_tokens)
+                if batch_descriptor is not None
+                else None
+            )
+            audit_key = (
+                enabled_step_phase,
+                int(batch_desc.num_tokens),
+                bool(batch_desc.uniform_decode),
+                cudagraph_runtime_mode.name,
+                dispatched_tokens,
+            )
+            seen = getattr(self, "_cudagraph_dispatch_audit_seen", None)
+            if seen is None:
+                seen = self._cudagraph_dispatch_audit_seen = set()
+            if audit_key not in seen:
+                seen.add(audit_key)
+                logger.info(
+                    "CUDA_GRAPH_RUNTIME_AUDIT phase=%s requested_tokens=%d "
+                    "uniform_decode=%s runtime_mode=%s dispatched_tokens=%s",
+                    enabled_step_phase,
+                    int(batch_desc.num_tokens),
+                    bool(batch_desc.uniform_decode),
+                    cudagraph_runtime_mode.name,
+                    dispatched_tokens,
+                )
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        prefill_control_timing_audit = self._env_flag_enabled(
+            "VLLM_UVM_PREFILL_CONTROL_TIMING_AUDIT", default=False
+        ) and enabled_step_phase == "enabled:prefill_step"
+        prefill_gpu_event_timing_audit = self._env_flag_enabled(
+            "VLLM_PREFILL_GPU_EVENT_TIMING_AUDIT", default=False
+        ) and enabled_step_phase == "enabled:prefill_step"
+        if prefill_gpu_event_timing_audit:
+            gpu_timing_events = getattr(self, "_prefill_gpu_timing_events", None)
+            if gpu_timing_events is None:
+                gpu_timing_events = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                self._prefill_gpu_timing_events = gpu_timing_events
+        control_started_ns = time.perf_counter_ns()
         self._maybe_switch_uvm_original_va_prefill_to_decode_remote(
             scheduler_output,
             enabled_step_phase,
         )
+        after_original_va_switch_ns = time.perf_counter_ns()
         self._maybe_switch_uvm_prefill_p3_to_decode_remote_read(
             scheduler_output,
             enabled_step_phase,
         )
+        after_p3_switch_ns = time.perf_counter_ns()
         self._validate_uvm_original_va_graph_replay_for_step(
             original_va_phase_mode=original_va_phase_mode,
             enabled_step_phase=enabled_step_phase,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
         )
+        after_replay_validation_ns = time.perf_counter_ns()
+        if prefill_gpu_event_timing_audit:
+            gpu_timing_events[0].record()
         with (
             uvm_allocation_phase(enabled_step_phase),
             set_forward_context(
@@ -3810,6 +4018,43 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+        if prefill_gpu_event_timing_audit:
+            gpu_timing_events[1].record()
+        after_model_submit_ns = time.perf_counter_ns()
+        if prefill_control_timing_audit:
+            logger.info(
+                "UVM_PREFILL_CONTROL_TIMING original_va_switch_us=%.3f "
+                "p3_switch_us=%.3f replay_validation_us=%.3f "
+                "context_and_model_submit_us=%.3f total_us=%.3f",
+                (after_original_va_switch_ns - control_started_ns) / 1e3,
+                (after_p3_switch_ns - after_original_va_switch_ns) / 1e3,
+                (after_replay_validation_ns - after_p3_switch_ns) / 1e3,
+                (after_model_submit_ns - after_replay_validation_ns) / 1e3,
+                (after_model_submit_ns - control_started_ns) / 1e3,
+            )
+        if (
+            prefill_pregraph_timing_audit
+            and enabled_step_phase == "enabled:prefill_step"
+        ):
+            logger.info(
+                "PREFILL_PREGRAPH_TIMING update_states_us=%.3f "
+                "pre_prepare_us=%.3f prepare_inputs_us=%.3f "
+                "pre_attention_us=%.3f attention_metadata_us=%.3f "
+                "pre_preprocess_us=%.3f preprocess_us=%.3f "
+                "dispatch_us=%.3f phase_switch_validate_us=%.3f "
+                "context_and_model_submit_us=%.3f total_to_submit_us=%.3f",
+                (after_update_states_ns - pregraph_execute_started_ns) / 1e3,
+                (before_prepare_inputs_ns - after_update_states_ns) / 1e3,
+                (after_prepare_inputs_ns - before_prepare_inputs_ns) / 1e3,
+                (before_attention_metadata_ns - after_prepare_inputs_ns) / 1e3,
+                (after_attention_metadata_ns - before_attention_metadata_ns) / 1e3,
+                (before_preprocess_ns - after_attention_metadata_ns) / 1e3,
+                (after_preprocess_ns - before_preprocess_ns) / 1e3,
+                (after_dispatch_ns - after_preprocess_ns) / 1e3,
+                (after_replay_validation_ns - control_started_ns) / 1e3,
+                (after_model_submit_ns - after_replay_validation_ns) / 1e3,
+                (after_model_submit_ns - pregraph_execute_started_ns) / 1e3,
+            )
 
         with (
             uvm_allocation_phase(enabled_step_phase),
@@ -3875,6 +4120,9 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        if prefill_gpu_event_timing_audit:
+            gpu_timing_events[2].record()
+
         retain_prefill_graph_metadata = (
             self._env_flag_enabled(
                 "VLLM_TRITON_MLA_EXPERIMENTAL_FULL_CUDAGRAPH",
@@ -3901,6 +4149,10 @@ class GPUModelRunner(
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        sample_timing_audit = self._env_flag_enabled(
+            "VLLM_PREFILL_SAMPLE_TIMING_AUDIT", default=False
+        )
+        sample_started_ns = time.perf_counter_ns()
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
@@ -3945,11 +4197,18 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        step_phase = self._uvm_enabled_step_phase(scheduler_output)
+        before_sample_ns = time.perf_counter_ns()
         with (
-            uvm_allocation_phase(self._uvm_enabled_step_phase(scheduler_output)),
+            uvm_allocation_phase(step_phase),
             record_function_or_nullcontext("gpu_model_runner: sample"),
         ):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if sample_timing_audit and step_phase == "enabled:prefill_step":
+            gpu_timing_events = getattr(self, "_prefill_gpu_timing_events", None)
+            if gpu_timing_events is not None:
+                gpu_timing_events[3].record()
+        after_sample_ns = time.perf_counter_ns()
 
         self.input_batch.prev_sampled_token_ids = None
 
@@ -4012,6 +4271,7 @@ class GPUModelRunner(
                     next_token_ids, valid_sampled_tokens_count
                 )
 
+        before_bookkeeping_ns = time.perf_counter_ns()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4029,6 +4289,26 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
+        after_bookkeeping_ns = time.perf_counter_ns()
+        graph_gpu_ms = None
+        logits_gpu_ms = None
+        sampler_gpu_ms = None
+        model_to_sampler_gpu_ms = None
+        if sample_timing_audit and step_phase == "enabled:prefill_step":
+            gpu_timing_events = getattr(self, "_prefill_gpu_timing_events", None)
+            if gpu_timing_events is not None:
+                graph_gpu_ms = gpu_timing_events[0].elapsed_time(
+                    gpu_timing_events[1]
+                )
+                logits_gpu_ms = gpu_timing_events[1].elapsed_time(
+                    gpu_timing_events[2]
+                )
+                sampler_gpu_ms = gpu_timing_events[2].elapsed_time(
+                    gpu_timing_events[3]
+                )
+                model_to_sampler_gpu_ms = gpu_timing_events[0].elapsed_time(
+                    gpu_timing_events[3]
+                )
 
         if (
             self.speculative_config
@@ -4041,6 +4321,7 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
+        after_eplb_ns = time.perf_counter_ns()
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -4054,6 +4335,34 @@ class GPUModelRunner(
                 if self.supports_mm_inputs
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
+            )
+        after_output_ns = time.perf_counter_ns()
+
+        if sample_timing_audit and step_phase == "enabled:prefill_step":
+            logger.info(
+                "PREFILL_SAMPLE_TIMING setup_us=%.3f sample_submit_us=%.3f "
+                "pre_bookkeeping_us=%.3f bookkeeping_sync_us=%.3f "
+                "eplb_us=%.3f output_us=%.3f total_us=%.3f graph_gpu_ms=%s",
+                (before_sample_ns - sample_started_ns) / 1e3,
+                (after_sample_ns - before_sample_ns) / 1e3,
+                (before_bookkeeping_ns - after_sample_ns) / 1e3,
+                (after_bookkeeping_ns - before_bookkeeping_ns) / 1e3,
+                (after_eplb_ns - after_bookkeeping_ns) / 1e3,
+                (after_output_ns - after_eplb_ns) / 1e3,
+                (after_output_ns - sample_started_ns) / 1e3,
+                "none" if graph_gpu_ms is None else f"{graph_gpu_ms:.6f}",
+            )
+            logger.info(
+                "PREFILL_GPU_STAGE_TIMING graph_gpu_ms=%s logits_gpu_ms=%s "
+                "sampler_gpu_ms=%s model_to_sampler_gpu_ms=%s",
+                "none" if graph_gpu_ms is None else f"{graph_gpu_ms:.6f}",
+                "none" if logits_gpu_ms is None else f"{logits_gpu_ms:.6f}",
+                "none" if sampler_gpu_ms is None else f"{sampler_gpu_ms:.6f}",
+                (
+                    "none"
+                    if model_to_sampler_gpu_ms is None
+                    else f"{model_to_sampler_gpu_ms:.6f}"
+                ),
             )
 
         if not self.use_async_scheduling:
@@ -4814,6 +5123,50 @@ class GPUModelRunner(
         made_progress = False
         complete = True
 
+        require_full_dual_view = self._env_flag_enabled(
+            "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW",
+            default=False,
+        )
+        prepare_dual_before_grow = bool(
+            require_full_dual_view
+            and requested_gpu_block_ids
+            and self._env_flag_enabled(
+                "VLLM_UVM_KV_PREPARE_DUAL_BEFORE_GROW", default=False
+            )
+        )
+        dual_view_prepare: dict[str, Any] | None = None
+        if prepare_dual_before_grow:
+            # The enclosing Plan Class transaction has released newly cold
+            # experts and installed their aliases, but may have deferred the
+            # detached children. Reserve those page tables before KV consumes
+            # the released HBM. This runs at the same quiescent boundary and
+            # does not evict any managed page to allocate a page table.
+            try:
+                from vllm.model_executor.models.utils import (
+                    refresh_cpu_offload_uvm_original_va_full_dual_view,
+                )
+
+                dual_view_prepare = (
+                    refresh_cpu_offload_uvm_original_va_full_dual_view()
+                )
+                if dual_view_prepare.get("ok") is not True:
+                    return {
+                        "ok": False,
+                        "made_progress": False,
+                        "dual_view_prepare": dual_view_prepare,
+                    }
+            except Exception as exc:
+                logger.exception("Full dual-view preparation before KV grow failed")
+                return {
+                    "ok": False,
+                    "made_progress": False,
+                    "dual_view_prepare": {
+                        "ok": False,
+                        "reason": "dual_view_prepare_failed",
+                        "error": repr(exc),
+                    },
+                }
+
         for direction, block_ids in (
             ("shrink", requested_cpu_block_ids),
             ("grow", requested_gpu_block_ids),
@@ -4874,20 +5227,92 @@ class GPUModelRunner(
             except Exception:
                 logger.exception("Physical KV resize synchronization failed")
                 complete = False
-        dual_view_refresh: dict[str, Any] | None = None
-        require_full_dual_view = self._env_flag_enabled(
-            "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW",
-            default=False,
+        reconcile_hot_after_grow = bool(
+            require_full_dual_view
+            and requested_gpu_block_ids
+            and self._env_flag_enabled(
+                "VLLM_UVM_KV_RECONCILE_HOT_AFTER_GROW", default=False
+            )
         )
+        hot_residency_reconcile: dict[str, Any] | None = None
+        kv_residency_after_hot_reconcile: dict[str, Any] | None = None
+        if reconcile_hot_after_grow and complete and made_progress:
+            try:
+                from vllm.model_executor.models.utils import (
+                    reconcile_cpu_offload_uvm_original_va_sealed_hot_residency,
+                )
+
+                # KV prefetch can evict ordinary hot expert pages even when
+                # the cold cutover released the requested logical byte count.
+                # The manual-migration serving contract forbids relying on a
+                # later model fault to restore them. Repair at this quiescent
+                # boundary, then verify the repair did not evict active KV.
+                hot_residency_reconcile = (
+                    reconcile_cpu_offload_uvm_original_va_sealed_hot_residency(
+                        preserve_allocator_cache=True
+                    )
+                )
+                complete = hot_residency_reconcile.get("ok") is True
+                if complete:
+                    # Audit the same GPU prefix as initialization, including
+                    # the reserved null block. MLA blocks can be 18 KiB, so
+                    # starting at block 1 would split a 4 KiB physical page.
+                    # The paired target boundary keeps the full prefix aligned.
+                    active_kv_ranges = (
+                        collect_uvm_kv_cache_physical_ranges_for_blocks(
+                            list(range(0, new_target + 1))
+                        )
+                    )
+                    kv_residency_after_hot_reconcile = (
+                        driver_batch_query_ranges_residency_bytes(
+                            active_kv_ranges,
+                            device=device,
+                            wait_for_trackers=True,
+                        )
+                    )
+                    complete = bool(active_kv_ranges) and (
+                        _uvm_kv_ranges_have_exclusive_residency(
+                            active_kv_ranges,
+                            kv_residency_after_hot_reconcile,
+                            location="gpu",
+                        )
+                    )
+                    logger.info(
+                        "Post-growth active KV residency audit: target=%d "
+                        "ok=%s residency=%r",
+                        new_target,
+                        complete,
+                        kv_residency_after_hot_reconcile,
+                    )
+            except Exception as exc:
+                logger.exception("Hot expert reconciliation after KV grow failed")
+                hot_residency_reconcile = {
+                    "ok": False,
+                    "reason": "hot_residency_reconcile_failed",
+                    "error": repr(exc),
+                }
+                complete = False
+        dual_view_refresh: dict[str, Any] | None = None
         if require_full_dual_view and complete and made_progress:
             try:
                 from vllm.model_executor.models.utils import (
                     refresh_cpu_offload_uvm_original_va_full_dual_view,
                 )
 
-                dual_view_refresh = (
-                    refresh_cpu_offload_uvm_original_va_full_dual_view()
-                )
+                if prepare_dual_before_grow or reconcile_hot_after_grow:
+                    # KV migration may relocate ordinary hot pages. A nested
+                    # refresh would skip already selected blocks; rebuild their
+                    # ordinary leaves using the current physical addresses.
+                    # Prepared children are reused without allocating again.
+                    dual_view_refresh = (
+                        refresh_cpu_offload_uvm_original_va_full_dual_view(
+                            nested_refresh=False
+                        )
+                    )
+                else:
+                    dual_view_refresh = (
+                        refresh_cpu_offload_uvm_original_va_full_dual_view()
+                    )
                 if dual_view_refresh.get("ok") is not True:
                     complete = False
             except Exception as exc:
@@ -4906,6 +5331,13 @@ class GPUModelRunner(
         }
         if require_full_dual_view:
             result["dual_view_refresh"] = dual_view_refresh
+        if prepare_dual_before_grow:
+            result["dual_view_prepare"] = dual_view_prepare
+        if reconcile_hot_after_grow:
+            result["hot_residency_reconcile"] = hot_residency_reconcile
+            result["kv_residency_after_hot_reconcile"] = (
+                kv_residency_after_hot_reconcile
+            )
         return result
 
     def load_model(self, eep_scale_up: bool = False) -> None:
@@ -8378,7 +8810,13 @@ class GPUModelRunner(
                 if cudagraph_mode.mixed_mode() == CUDAGraphMode.NONE:
                     return
                 mixed_batch_sizes = self.cudagraph_batch_sizes
-                if dual_topology_graphs:
+                if cudagraph_mode == CUDAGraphMode.FULL_SEPARATE:
+                    # FULL_SEPARATE assigns small uniform shapes to the
+                    # dedicated Decode graph set.  Capture mixed/Prefill only
+                    # for the non-uniform dispatcher keys, including on the
+                    # ordinary native path without dual-topology aliases.
+                    # Otherwise a size such as 1 is captured twice and the
+                    # mixed dummy run disagrees with the dispatcher.
                     mixed_batch_sizes = sorted(
                         {
                             descriptor.num_tokens
@@ -8390,8 +8828,8 @@ class GPUModelRunner(
                     )
                     if not mixed_batch_sizes:
                         raise RuntimeError(
-                            "Dual-topology Graph capture has no dedicated "
-                            "prefill size above the uniform-decode range"
+                            "FULL_SEPARATE Graph capture has no dedicated "
+                            "Prefill size above the uniform-Decode range"
                         )
                 compilation_cases = list(
                     product(reversed(mixed_batch_sizes), lora_cases)
@@ -8423,11 +8861,32 @@ class GPUModelRunner(
                 compilation_cases = list(
                     product(reversed(prefill_batch_sizes), lora_cases)
                 )
+                configured_num_reqs = os.environ.get(
+                    "VLLM_CUDAGRAPH_PURE_PREFILL_NUM_REQS"
+                )
+                pure_prefill_num_reqs = self.scheduler_config.max_num_seqs
+                if configured_num_reqs is not None:
+                    pure_prefill_num_reqs = int(configured_num_reqs)
+                    if not (
+                        1
+                        <= pure_prefill_num_reqs
+                        <= self.scheduler_config.max_num_seqs
+                    ):
+                        raise ValueError(
+                            "VLLM_CUDAGRAPH_PURE_PREFILL_NUM_REQS must be in "
+                            f"[1, {self.scheduler_config.max_num_seqs}], got "
+                            f"{pure_prefill_num_reqs}"
+                        )
+                    logger.info(
+                        "Capturing pure-Prefill CUDA Graphs with %d requests "
+                        "per configured shape",
+                        pure_prefill_num_reqs,
+                    )
                 self._capture_cudagraphs(
                     compilation_cases,
                     cudagraph_runtime_mode=cudagraph_mode.mixed_mode(),
                     uniform_decode=False,
-                    pure_prefill_num_reqs=self.scheduler_config.max_num_seqs,
+                    pure_prefill_num_reqs=pure_prefill_num_reqs,
                 )
 
             def capture_uniform_decode_graphs() -> None:
@@ -8695,10 +9154,16 @@ class GPUModelRunner(
                 )
             else:
                 # Legacy paths retain their single capture topology and
-                # ordering byte-for-byte: mixed first, then optional dedicated
-                # uniform decode entries.
+                # ordering, except that FULL_SEPARATE must use a true
+                # pure-Prefill dummy batch.  Its whole purpose is to keep the
+                # Prefill and uniform-Decode graph classes distinct; using a
+                # mixed dummy batch here produces incompatible Triton MLA
+                # metadata when the real serving step contains only Prefill.
                 with cpu_offload_graph_static_alias_capture_context():
-                    capture_mixed_graphs()
+                    if cudagraph_mode == CUDAGraphMode.FULL_SEPARATE:
+                        capture_pure_prefill_graphs()
+                    else:
+                        capture_mixed_graphs()
                     capture_uniform_decode_graphs()
 
             torch.cuda.synchronize()
@@ -9771,9 +10236,22 @@ class GPUModelRunner(
 
             # Reinitialize need to after initialize_attn_backend
             self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-            kv_caches = self.initialize_kv_cache_tensors(
-                kv_cache_config, kernel_block_sizes
-            )
+            kv_tensor_pool = nullcontext()
+            if (
+                self._env_flag_enabled("VLLM_UVM_KV_CACHE_MANAGED")
+                and self._env_flag_enabled("VLLM_UVM_KV_CACHE_LAZY_RESERVE")
+                and not self.vllm_config.model_config.enable_sleep_mode
+            ):
+                from vllm.device_allocator.uvm import uvm_local_memory_pool
+
+                # Only KV tensors are lazy. Metadata builders above allocate
+                # scratch buffers used by chunked prefills; leaving those
+                # unbacked fails on their first write in manual-migration mode.
+                kv_tensor_pool = uvm_local_memory_pool(enable_prefetch=False)
+            with kv_tensor_pool:
+                kv_caches = self.initialize_kv_cache_tensors(
+                    kv_cache_config, kernel_block_sizes
+                )
 
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)

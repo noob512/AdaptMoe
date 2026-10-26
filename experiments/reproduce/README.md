@@ -1,5 +1,9 @@
 # EuroSys MoE实验复现文档统一入口
 
+当前混合调度、token-threshold 与 fixed/dynamic KV 四机制实验从
+[AdaptMoE 复现指南](../../docs/REPRODUCING_ADAPTMOE.md) 进入。
+下列 E0–E14 索引保留其原始日期与协议，不代表当前 mixed-step 模式的能力边界。
+
 最后核验：2026-09-02（Asia/Shanghai）
 
 本目录是复现文档的唯一查看和修改入口。结果、runner、冻结输入和artifact仍保留在原实验

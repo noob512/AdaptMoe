@@ -87,6 +87,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--fixture", required=True, type=Path)
+    parser.add_argument(
+        "--prompt-token-limit",
+        type=int,
+        default=0,
+        help="truncate every frozen request to this many prompt tokens",
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--offload-manifest", required=True, type=Path)
     parser.add_argument("--profile-label", required=True)
@@ -329,6 +335,24 @@ def run() -> int:
         raise ValueError("cpu_offload_gb must be finite and non-negative")
 
     fixture_metadata, requests = phase.load_requests(args.fixture)
+    if args.prompt_token_limit < 0:
+        raise ValueError("prompt token limit must be non-negative")
+    if args.prompt_token_limit:
+        if any(
+            int(item["prompt_tokens"]) < args.prompt_token_limit
+            for item in requests
+        ):
+            raise ValueError("fixture request is shorter than --prompt-token-limit")
+        requests = [
+            item
+            | {
+                "prompt_token_ids": list(item["prompt_token_ids"])[
+                    : args.prompt_token_limit
+                ],
+                "prompt_tokens": args.prompt_token_limit,
+            }
+            for item in requests
+        ]
     max_batch = max(batches)
     if len(requests) < max_batch:
         raise ValueError("fixture has fewer requests than the largest batch")
@@ -336,7 +360,7 @@ def run() -> int:
         {sum(item["prompt_tokens"] for item in requests[:batch]) for batch in batches}
     )
     if args.execution_mode == "full_graph_all":
-        expected_capture_sizes = sorted({1, 4, *expected_prefill_sizes})
+        expected_capture_sizes = sorted({*batches, *expected_prefill_sizes})
         if capture_sizes != expected_capture_sizes:
             raise ValueError(
                 "full_graph_all requires exact decode and frozen-prefill capture "
@@ -391,10 +415,18 @@ def run() -> int:
         counter_before_load = dataclasses.asdict(compilation_counter.clone())
 
         enforce_eager = args.execution_mode == "eager"
+        original_va_phase_mode = os.environ.get(
+            "VLLM_UVM_ORIGINAL_VA_PHASE_MODE", "off"
+        ).strip()
+        full_graph_mode_name = (
+            "FULL_SEPARATE"
+            if original_va_phase_mode == "prefill_graph_remote_decode"
+            else "FULL"
+        )
         compilation_config: dict[str, Any] | None = None
         if not enforce_eager:
             requested_cudagraph_mode = (
-                "FULL"
+                full_graph_mode_name
                 if args.execution_mode == "full_graph_all"
                 else "FULL_DECODE_ONLY"
             )
@@ -447,7 +479,11 @@ def run() -> int:
                 raise RuntimeError(f"eager arm realized unexpected mode {realized_mode}")
         else:
             expected_mode = (
-                CUDAGraphMode.FULL
+                (
+                    CUDAGraphMode.FULL_SEPARATE
+                    if full_graph_mode_name == "FULL_SEPARATE"
+                    else CUDAGraphMode.FULL
+                )
                 if args.execution_mode == "full_graph_all"
                 else CUDAGraphMode.FULL_DECODE_ONLY
             )
@@ -539,7 +575,7 @@ def run() -> int:
                     "NONE"
                     if enforce_eager
                     else (
-                        "FULL"
+                        full_graph_mode_name
                         if args.execution_mode == "full_graph_all"
                         else "FULL_DECODE_ONLY"
                     )

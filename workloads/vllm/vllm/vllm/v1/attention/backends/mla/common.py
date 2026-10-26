@@ -790,9 +790,21 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             context_lens_cpu = num_computed_tokens_cpu[reqs_start:num_reqs]
             max_context_len_cpu = context_lens_cpu.max().item()
             num_prefills_with_context_cpu = (context_lens_cpu > 0).sum().item()
-            prefill_query_start_loc = (
-                query_start_loc[reqs_start:] - query_start_loc[reqs_start]
-            )
+            # FULL_SEPARATE captures a pure-Prefill graph.  In that case
+            # reqs_start is zero and query_start_loc already starts at zero,
+            # so keep a view of the runner-owned persistent input buffer.
+            # Materializing the equivalent subtraction here creates a
+            # temporary CUDA tensor whose storage is released after capture,
+            # while the GraphExec still retains its address.  The first real
+            # replay can then read recycled data (corrupt output) or an
+            # unmapped address (Xid 31 / illegal access).
+            if reqs_start == 0:
+                prefill_query_start_loc = query_start_loc[: num_reqs + 1]
+            else:
+                prefill_query_start_loc = (
+                    query_start_loc[reqs_start : num_reqs + 1]
+                    - query_start_loc[reqs_start]
+                )
 
             chunked_context_metadata = None
             if max_context_len_cpu > 0:

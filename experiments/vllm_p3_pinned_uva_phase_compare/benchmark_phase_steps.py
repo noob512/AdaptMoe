@@ -288,6 +288,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.97)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--cudagraph-mode",
+        choices=("NONE", "FULL_SEPARATE"),
+        default="NONE",
+    )
     return parser.parse_args()
 
 
@@ -324,12 +329,30 @@ def main() -> int:
     from vllm import LLM, SamplingParams, TokensPrompt
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    use_cudagraph = args.cudagraph_mode != "NONE"
+    capture_sizes = sorted({
+        *batches,
+        *(
+            sum(item["prompt_tokens"] for item in requests[:batch])
+            for batch in batches
+        ),
+    })
+    compilation_config = (
+        {
+            "mode": "NONE",
+            "cudagraph_mode": args.cudagraph_mode,
+            "cudagraph_capture_sizes": capture_sizes,
+            "max_cudagraph_capture_size": max(capture_sizes),
+        }
+        if use_cudagraph
+        else {"mode": "NONE", "cudagraph_mode": "NONE"}
+    )
     load_started = time.perf_counter()
     llm = LLM(
         model=args.model,
         tensor_parallel_size=1,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=True,
+        enforce_eager=not use_cudagraph,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
@@ -339,6 +362,7 @@ def main() -> int:
         enable_chunked_prefill=False,
         seed=args.seed,
         disable_log_stats=True,
+        compilation_config=compilation_config,
     )
     enable_request_metrics_without_default_loggers(llm)
     torch.cuda.synchronize()
@@ -357,7 +381,8 @@ def main() -> int:
             "batch_sizes": batches,
             "total_output_tokens": total_output_tokens,
             "tensor_parallel_size": 1,
-            "enforce_eager": True,
+            "enforce_eager": not use_cudagraph,
+            "compilation_config": compilation_config,
             "enable_prefix_caching": False,
             "enable_chunked_prefill": False,
             "engine_core_multiprocessing": False,
@@ -387,6 +412,50 @@ def main() -> int:
             raise RuntimeError(
                 "strict phase benchmark requires VLLM_ENABLE_V1_MULTIPROCESSING=0"
             )
+        direct_repeats = int(os.environ.get("E3_DIRECT_PREFILL_GRAPH_REPEATS", "0"))
+        if direct_repeats < 0:
+            raise ValueError("E3_DIRECT_PREFILL_GRAPH_REPEATS must be non-negative")
+        if direct_repeats:
+            executor = core.model_executor
+            worker = executor.driver_worker.worker
+            if worker is None or worker.model_runner is None:
+                raise RuntimeError("model runner is unavailable for direct Graph replay")
+            graph_entries = getattr(
+                worker.model_runner.model, "concrete_cudagraph_entries", {}
+            )
+            direct_results: dict[str, Any] = {}
+            for batch in batches:
+                num_tokens = sum(
+                    item["prompt_tokens"] for item in requests[:batch]
+                )
+                matching_entries = [
+                    entry
+                    for descriptor, entry in graph_entries.items()
+                    if int(descriptor.num_tokens) == num_tokens
+                    and not bool(descriptor.uniform_decode)
+                    and entry.cudagraph is not None
+                ]
+                if len(matching_entries) != 1:
+                    raise RuntimeError(
+                        "direct Prefill Graph benchmark did not find one exact entry"
+                    )
+                samples: list[float] = []
+                for _ in range(direct_repeats):
+                    torch.cuda.synchronize()
+                    direct_started = time.perf_counter()
+                    matching_entries[0].cudagraph.replay()
+                    torch.cuda.synchronize()
+                    samples.append((time.perf_counter() - direct_started) * 1000.0)
+                direct_results[str(batch)] = {
+                    "num_tokens": num_tokens,
+                    "samples_ms": samples,
+                    "steady_median_ms": (
+                        statistics.median(samples[1:])
+                        if len(samples) > 1
+                        else samples[0]
+                    ),
+                }
+            result["direct_prefill_graph_replay"] = direct_results
         scheduler = core.scheduler
         original_schedule = scheduler.schedule
         schedule_records: list[dict[str, Any]] = []
@@ -420,6 +489,8 @@ def main() -> int:
         repeat_roles = ["conditioning"] * args.conditioning_repeats + [
             "measurement"
         ] * args.measurement_repeats
+        profile_prefill = os.environ.get("E3_NSYS_PREFILL_CAPTURE", "0") == "1"
+        profiled_prefill = False
         for batch in batches:
             role_indices = {"conditioning": 0, "measurement": 0}
             selected = requests[:batch]
@@ -441,7 +512,21 @@ def main() -> int:
                     priority=None,
                 )
 
-                prefill_ms, prefill_outputs, prefill_schedule = run_step()
+                profile_this_prefill = (
+                    profile_prefill and role == "measurement" and not profiled_prefill
+                )
+                if profile_this_prefill:
+                    status = int(torch.cuda.cudart().cudaProfilerStart())
+                    if status != 0:
+                        raise RuntimeError(f"cudaProfilerStart failed: {status}")
+                try:
+                    prefill_ms, prefill_outputs, prefill_schedule = run_step()
+                finally:
+                    if profile_this_prefill:
+                        status = int(torch.cuda.cudart().cudaProfilerStop())
+                        profiled_prefill = True
+                        if status != 0:
+                            raise RuntimeError(f"cudaProfilerStop failed: {status}")
                 validate_prefill(prefill_schedule, batch)
                 if prefill_outputs:
                     raise RuntimeError("FINAL_ONLY prefill returned request outputs")

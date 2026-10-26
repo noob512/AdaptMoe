@@ -114,14 +114,26 @@ def parse_args() -> argparse.Namespace:
             "remote_phase_epoch",
             "remote_continuous",
             "hybrid_fail_closed",
+            "always_copy_continuous",
+            "adaptmoe_copy_eager_continuous",
+            "native_copy_eager_continuous",
+            "native_uva_eager_continuous",
         ),
     )
     parser.add_argument("--initial-requests", type=int, default=4)
     parser.add_argument("--late-requests", type=int, default=4)
     parser.add_argument("--late-after-engine-steps", type=int, default=4)
+    parser.add_argument(
+        "--arrival-qps", type=float,
+        help="Replay all requests at offsets i/QPS instead of two step-based cohorts",
+    )
     parser.add_argument("--output-tokens", type=int, default=16)
     parser.add_argument("--seed", type=int, default=20260831)
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=2147483648)
+    parser.add_argument("--cpu-offload-gb", type=float, default=30.0)
+    parser.add_argument("--max-model-len", type=int, default=512)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
+    parser.add_argument("--max-num-seqs", type=int, default=8)
     return parser.parse_args()
 
 
@@ -135,6 +147,14 @@ def main() -> int:
         raise SystemExit("both request cohorts must be non-empty")
     if args.late_after_engine_steps < 2:
         raise SystemExit("late cohort must arrive after Prefill and Decode begin")
+    if args.max_model_len <= args.output_tokens:
+        raise SystemExit("max model length must exceed requested output length")
+    if args.max_num_batched_tokens <= 0 or args.max_num_seqs <= 0:
+        raise SystemExit("scheduler capacity values must be positive")
+    if args.arrival_qps is not None and (
+        not math.isfinite(args.arrival_qps) or args.arrival_qps <= 0
+    ):
+        raise SystemExit("arrival QPS must be finite and positive")
 
     total_requests = args.initial_requests + args.late_requests
     fixture = load_fixture(args.fixture, total_requests)
@@ -145,6 +165,9 @@ def main() -> int:
     actual_phase_batched = os.environ.get(
         "VLLM_UVM_PHASE_BATCHED_SCHEDULING", "0"
     ).strip().lower() in {"1", "true", "yes", "on"}
+    cuda_profiler_capture = os.environ.get(
+        "VLLM_E11_CUDA_PROFILER_CAPTURE", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     if actual_phase_batched != expected_phase_batched:
         raise SystemExit(
             "VLLM_UVM_PHASE_BATCHED_SCHEDULING differs from the selected mode"
@@ -153,14 +176,27 @@ def main() -> int:
     from vllm import LLM, SamplingParams
     from vllm.sampling_params import RequestOutputKind
 
-    # FULL_SEPARATE is the phase-specific Prefill/Decode mechanism.  The
-    # remote-only fallback intentionally uses eager execution: it keeps one
-    # immutable remote topology and must accept a genuinely mixed step, while
-    # FULL_SEPARATE is rejected for remote_only by the runtime contract.
-    if args.mode in {"remote_phase_epoch", "remote_continuous"}:
+    # FULL_SEPARATE is the phase-specific Prefill/Decode mechanism. The
+    # remote-only fallback and the paired copy-on-forward comparison use eager
+    # execution. The legacy always-copy probe keeps eager Prefill/mixed work
+    # but replays copy-bearing Graphs for uniform Decode.
+    if args.mode in {
+        "remote_phase_epoch",
+        "remote_continuous",
+        "adaptmoe_copy_eager_continuous",
+        "native_copy_eager_continuous",
+        "native_uva_eager_continuous",
+    }:
         compilation_config = {
             "mode": "NONE",
             "cudagraph_mode": "NONE",
+        }
+    elif args.mode == "always_copy_continuous":
+        compilation_config = {
+            "mode": "NONE",
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1, 4, 8, 128, 512, 1024],
+            "max_cudagraph_capture_size": 1024,
         }
     else:
         compilation_config = {
@@ -180,13 +216,33 @@ def main() -> int:
             "initial_requests": args.initial_requests,
             "late_requests": args.late_requests,
             "late_after_engine_steps": args.late_after_engine_steps,
+            "arrival_qps": args.arrival_qps,
+            "arrival_policy": "fixed_interval" if args.arrival_qps else "two_cohort_steps",
+            "latency_origin": "planned_arrival" if args.arrival_qps else "engine_admission",
             "output_tokens": args.output_tokens,
             "seed": args.seed,
             "kv_cache_memory_bytes": args.kv_cache_memory_bytes,
+            "cpu_offload_gb": args.cpu_offload_gb,
+            "max_model_len": args.max_model_len,
+            "max_num_batched_tokens": args.max_num_batched_tokens,
+            "max_num_seqs": args.max_num_seqs,
             "phase_batched_scheduling": actual_phase_batched,
             "phase_mode": os.environ.get("VLLM_UVM_ORIGINAL_VA_PHASE_MODE"),
             "compilation_config": compilation_config,
-            "transport": "none",
+            "cuda_profiler_capture": cuda_profiler_capture,
+            "transport": (
+                "static_alias_h2d_every_forward"
+                if args.mode
+                in {
+                    "always_copy_continuous",
+                    "adaptmoe_copy_eager_continuous",
+                }
+                else "native_parameter_copy_on_forward"
+                if args.mode == "native_copy_eager_continuous"
+                else "native_parameter_uva"
+                if args.mode == "native_uva_eager_continuous"
+                else "none"
+            ),
         },
         "scheduler_steps": [],
         "requests": [],
@@ -199,12 +255,12 @@ def main() -> int:
             model=str(args.model),
             trust_remote_code=True,
             dtype="bfloat16",
-            max_model_len=512,
+            max_model_len=args.max_model_len,
             gpu_memory_utilization=0.97,
             kv_cache_memory_bytes=args.kv_cache_memory_bytes,
-            cpu_offload_gb=30,
-            max_num_batched_tokens=1024,
-            max_num_seqs=8,
+            cpu_offload_gb=args.cpu_offload_gb,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
             enable_prefix_caching=False,
             generation_config="vllm",
             compilation_config=compilation_config,
@@ -271,6 +327,7 @@ def main() -> int:
         logical_by_id: dict[str, str] = {}
         fixture_by_id: dict[str, FixtureRequest] = {}
         admitted_at: dict[str, float] = {}
+        arrival_at: dict[str, float] = {}
         admitted_before_scheduler_step: dict[str, int] = {}
         first_scheduled_at: dict[str, float] = {}
         first_scheduled_step: dict[str, int] = {}
@@ -279,10 +336,22 @@ def main() -> int:
         finished_at: dict[str, float] = {}
 
         def admit(cohort: str, records: list[FixtureRequest]) -> list[str]:
-            arrival_epoch = time.time()
             request_ids: list[str] = []
-            for cohort_index, fixture_request in enumerate(records):
+            for fixture_request in records:
+                cohort_index = fixture_request.index - (
+                    args.initial_requests if cohort == "late" else 0
+                )
                 request_id = f"{cohort}-{cohort_index:02d}"
+                if request_id in admitted_at:
+                    raise RuntimeError(f"duplicate admission {request_id}")
+                planned = (
+                    experiment_started + fixture_request.index / args.arrival_qps
+                    if args.arrival_qps else None
+                )
+                arrival_epoch = (
+                    experiment_started_epoch + fixture_request.index / args.arrival_qps
+                    if args.arrival_qps else time.time()
+                )
                 prompt = {"prompt_token_ids": fixture_request.prompt_token_ids}
                 engine_request = llm.processor.process_inputs(
                     request_id,
@@ -303,67 +372,130 @@ def main() -> int:
                 )
                 fixture_by_id[request_id] = fixture_request
                 admitted_at[request_id] = observed
+                arrival_at[request_id] = planned if planned is not None else observed
                 admitted_before_scheduler_step[request_id] = scheduler_call
                 token_times[request_id] = []
                 output_ids[request_id] = []
                 request_ids.append(request_id)
             return request_ids
 
-        experiment_started = time.perf_counter()
-        initial_ids = admit("initial", fixture[: args.initial_requests])
-        late_ids: list[str] = []
-        engine_steps = 0
-        late_admitted_after_step: int | None = None
+        profiler_started = False
+        if cuda_profiler_capture:
+            import torch
 
-        while llm.llm_engine.has_unfinished_requests() or not late_ids:
-            if not late_ids and engine_steps == args.late_after_engine_steps:
-                unfinished_initial = [
-                    request_id
-                    for request_id in initial_ids
-                    if request_id not in finished_at
-                ]
-                if not unfinished_initial:
-                    raise RuntimeError(
-                        "initial cohort finished before the late arrival boundary"
-                    )
-                late_ids = admit(
-                    "late",
-                    fixture[
-                        args.initial_requests : args.initial_requests
-                        + args.late_requests
-                    ],
+            torch.cuda.synchronize()
+            profiler_status = int(torch.cuda.cudart().cudaProfilerStart())
+            if profiler_status != 0:
+                raise RuntimeError(
+                    f"cudaProfilerStart failed with status {profiler_status}"
                 )
-                late_admitted_after_step = engine_steps
+            profiler_started = True
+        try:
+            experiment_started_epoch = time.time()
+            experiment_started = time.perf_counter()
+            initial_ids = (
+                [] if args.arrival_qps
+                else admit("initial", fixture[: args.initial_requests])
+            )
+            late_ids: list[str] = []
+            next_request = 0
+            engine_steps = 0
+            late_admitted_after_step: int | None = None
 
-            step_outputs = llm.llm_engine.step()
-            observed_at = time.perf_counter()
-            engine_steps += 1
-            if scheduler_records:
-                current_schedule = scheduler_records[-1]
-                for request_id in (
-                    current_schedule["scheduled_new_request_ids"]
-                    + current_schedule["scheduled_cached_request_ids"]
-                ):
-                    if request_id not in first_scheduled_at:
-                        first_scheduled_at[request_id] = float(
-                            current_schedule["finished_perf_counter"]
+            while llm.llm_engine.has_unfinished_requests() or (
+                next_request < total_requests if args.arrival_qps else not late_ids
+            ):
+                if args.arrival_qps:
+                    while (
+                        next_request < total_requests
+                        and time.perf_counter() >= experiment_started + next_request / args.arrival_qps
+                    ):
+                        cohort = "initial" if next_request < args.initial_requests else "late"
+                        ids = admit(cohort, [fixture[next_request]])
+                        (initial_ids if cohort == "initial" else late_ids).extend(ids)
+                        next_request += 1
+                    if not llm.llm_engine.has_unfinished_requests():
+                        if next_request < total_requests:
+                            time.sleep(max(0.0, experiment_started + next_request / args.arrival_qps - time.perf_counter()))
+                        continue
+                elif not late_ids and engine_steps == args.late_after_engine_steps:
+                    unfinished_initial = [
+                        request_id
+                        for request_id in initial_ids
+                        if request_id not in finished_at
+                    ]
+                    if not unfinished_initial:
+                        raise RuntimeError(
+                            "initial cohort finished before the late arrival boundary"
                         )
-                        first_scheduled_step[request_id] = int(
-                            current_schedule["scheduler_step"]
-                        )
-            for output in step_outputs:
-                request_id = str(output.request_id)
-                if request_id not in logical_by_id:
-                    raise RuntimeError(f"unexpected request output {request_id}")
-                if len(output.outputs) != 1:
-                    raise RuntimeError(f"request {request_id} returned multiple choices")
-                delta = list(output.outputs[0].token_ids)
-                output_ids[request_id].extend(delta)
-                token_times[request_id].extend([observed_at] * len(delta))
-                if output.finished:
-                    finished_at[request_id] = observed_at
+                    late_ids = admit(
+                        "late",
+                        fixture[
+                            args.initial_requests : args.initial_requests
+                            + args.late_requests
+                        ],
+                    )
+                    late_admitted_after_step = engine_steps
 
-        experiment_finished = time.perf_counter()
+                step_index = engine_steps + 1
+                step_started = time.perf_counter()
+                if profiler_started:
+                    torch.cuda.nvtx.range_push(f"e11_engine_step_{step_index}")
+                try:
+                    step_outputs = llm.llm_engine.step()
+                finally:
+                    if profiler_started:
+                        torch.cuda.nvtx.range_pop()
+                observed_at = time.perf_counter()
+                engine_steps += 1
+                if scheduler_records:
+                    current_schedule = scheduler_records[-1]
+                    current_schedule["engine_step_started_perf_counter"] = (
+                        step_started
+                    )
+                    current_schedule["engine_step_finished_perf_counter"] = (
+                        observed_at
+                    )
+                    current_schedule["engine_step_duration_ms"] = (
+                        observed_at - step_started
+                    ) * 1000.0
+                    for request_id in (
+                        current_schedule["scheduled_new_request_ids"]
+                        + current_schedule["scheduled_cached_request_ids"]
+                    ):
+                        if request_id not in first_scheduled_at:
+                            first_scheduled_at[request_id] = float(
+                                current_schedule["finished_perf_counter"]
+                            )
+                            first_scheduled_step[request_id] = int(
+                                current_schedule["scheduler_step"]
+                            )
+                for output in step_outputs:
+                    request_id = str(output.request_id)
+                    if request_id not in logical_by_id:
+                        raise RuntimeError(f"unexpected request output {request_id}")
+                    if len(output.outputs) != 1:
+                        raise RuntimeError(
+                            f"request {request_id} returned multiple choices"
+                        )
+                    delta = list(output.outputs[0].token_ids)
+                    output_ids[request_id].extend(delta)
+                    token_times[request_id].extend([observed_at] * len(delta))
+                    if output.finished:
+                        finished_at[request_id] = observed_at
+
+            experiment_finished = time.perf_counter()
+            experiment_finished_epoch = time.time()
+        finally:
+            if profiler_started:
+                import torch
+
+                torch.cuda.synchronize()
+                profiler_status = int(torch.cuda.cudart().cudaProfilerStop())
+                if profiler_status != 0:
+                    raise RuntimeError(
+                        f"cudaProfilerStop failed with status {profiler_status}"
+                    )
         expected_ids = set(initial_ids + late_ids)
         if set(finished_at) != expected_ids:
             raise RuntimeError(
@@ -394,6 +526,9 @@ def main() -> int:
                         json.dumps(ids, separators=(",", ":")).encode("utf-8")
                     ).hexdigest(),
                     "success": len(ids) == args.output_tokens,
+                    "planned_arrival_offset_seconds": arrival_at[request_id] - experiment_started,
+                    "admitted_offset_seconds": admitted_at[request_id] - experiment_started,
+                    "admission_delay_ms": (admitted_at[request_id] - arrival_at[request_id]) * 1000.0,
                     "admitted_before_scheduler_step": (
                         admitted_before_scheduler_step[request_id]
                     ),
@@ -405,13 +540,14 @@ def main() -> int:
                         - 1,
                     ),
                     "queueing_ms": (
-                        first_scheduled_at[request_id] - admitted_at[request_id]
+                        first_scheduled_at[request_id] - arrival_at[request_id]
                     )
                     * 1000.0,
-                    "ttft_ms": (times[0] - admitted_at[request_id]) * 1000.0,
+                    "engine_queueing_ms": (first_scheduled_at[request_id] - admitted_at[request_id]) * 1000.0,
+                    "ttft_ms": (times[0] - arrival_at[request_id]) * 1000.0,
                     "tpot_ms": statistics.fmean(itl_ms) if itl_ms else None,
                     "e2e_ms": (
-                        finished_at[request_id] - admitted_at[request_id]
+                        finished_at[request_id] - arrival_at[request_id]
                     )
                     * 1000.0,
                     "itl_ms": itl_ms,
@@ -449,6 +585,9 @@ def main() -> int:
                 for record in scheduler_records
             ),
             "elapsed_seconds": elapsed,
+            "offered_qps": args.arrival_qps,
+            "arrival_span_seconds": (total_requests - 1) / args.arrival_qps if args.arrival_qps else None,
+            "admission_delay_ms": distribution([float(record["admission_delay_ms"]) for record in successful]),
             "generated_tokens": sum(
                 int(record["completion_tokens"]) for record in successful
             ),
@@ -483,9 +622,24 @@ def main() -> int:
                 if record["cohort"] == "late"
             ),
         }
+        result["measurement_window"] = {
+            "started_epoch": experiment_started_epoch,
+            "finished_epoch": experiment_finished_epoch,
+        }
         if args.mode == "phase_epoch" and mixed_steps:
             raise RuntimeError("phase epoch emitted a mixed scheduler step")
-        if args.mode == "remote_continuous" and not mixed_steps:
+        if (
+            args.mode
+            in {
+                "remote_continuous",
+                "always_copy_continuous",
+                "adaptmoe_copy_eager_continuous",
+                "native_copy_eager_continuous",
+                "native_uva_eager_continuous",
+            }
+            and not mixed_steps
+            and args.arrival_qps is None
+        ):
             raise RuntimeError("default continuous scheduler did not emit a mixed step")
         result["status"] = "ok"
     except BaseException as exc:

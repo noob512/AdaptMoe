@@ -1,25 +1,60 @@
-# CUDA Graph-safe MoE weight transport
+# AdaptMoE
 
-This repository contains an experimental NVIDIA UVM + vLLM transport for
-streaming a fixed set of MoE expert weights through CUDA Graph replay while
-preserving each model `Parameter`'s original virtual address.
+AdaptMoE is a research prototype for memory-constrained MoE inference, built on
+vLLM v1 and a modified NVIDIA UVM driver. It keeps expert `Parameter` virtual
+addresses stable while adapting both the expert access path and the GPU memory
+split between experts and the KV cache.
 
-The validated path is the driver-backed `uvm_original_va` static-alias
-backend. It builds the mapping once before Graph capture, copies the selected
-weights to stable upload VAs on each forward, and lets the MoE kernels keep
-reading the original `Parameter.data_ptr()` addresses. CUDA Graph replay does
-not issue mapping ioctls or change PTEs.
+- **Access controller:** selects explicit H2D copies into reusable GPU buffers
+  or direct reads from host memory according to the scheduled token count.
+- **Capacity controller:** changes discrete KV/expert plan classes at quiescent
+  scheduler boundaries, preserving operator-visible addresses.
+- **Driver:** prepares local/remote page-table views and publishes them through
+  parent-PDE switching, with synchronization and TLB invalidation.
 
-Start with [the transport design and reproduction guide](docs/cudagraph_static_alias_transport.md).
+This repository accompanies *AdaptMoE: Token-Adaptive MoE Inference with Stable
+Virtual Addresses and Elastic KV–Expert Memory*. The implementation is an
+experimental single-GPU system; the source and supported configurations, rather
+than every design statement in the manuscript, define the current interface.
 
-Current design and experiment entry points:
+## Start here
 
-- [original-VA Graph integration](experiments/vllm_uvm_original_va_graph_integration/README.md)
-- [driver-level original-VA probes](experiments/uvm_static_alias_original_va/README.md)
-- [complete technical design](docs/moe_phase_aware_offload_technical_design.md)
-- [EuroSys evaluation plan](docs/eurosys_moe_offload_evaluation_plan.md)
+- [Project guide: paper-to-code map, controllers, limitations](docs/ADAPTMOE_PROJECT_GUIDE.md)
+- [Build, tests, and reproducible mixed-scheduling comparison](docs/REPRODUCING_ADAPTMOE.md)
+- [Mixed-scheduling experiment entry point](experiments/adaptmoe_token_threshold_sharegpt_compare/README.md)
+- [Earlier separate-scheduling and Graph protocols](experiments/reproduce/README.md)
+- [Static-alias CUDA Graph transport](docs/cudagraph_static_alias_transport.md)
 
-The tree also contains a CUDA-VMM static-alias foundation and an experimental
-dual-topology phase mode. They are kept build-consistent with the integration,
-while all formal paper measurements are being regenerated under the EuroSys
-protocol.
+## Execution modes
+
+| Mode | Mixed prefill/decode steps | CUDA Graph | Capacity adjustment |
+|---|---|---|---|
+| `token_threshold` | Supported | Must be disabled | Optional; paired KV/expert classes |
+| `prefill_graph_remote_decode` | Rejected | `FULL_SEPARATE` | Qualified fixed plan classes |
+| `prefill_remote_decode` | Rejected | Eager phase path | Optional eager plan classes |
+
+The current mixed-scheduling configuration uses two thresholds: PARK at or
+below the low threshold, RESUME at or above the high threshold, and retain the
+current view between them. PARK changes the access view; it does not free the
+shared GPU copy buffer or change KV capacity.
+
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `kernel-module/nvidia-module/` | NVIDIA 595.71.05 driver sources and UVM extensions |
+| `workloads/vllm/vllm/` | Modified vLLM engine, allocator, scheduler integration, and tests |
+| `experiments/adaptmoe_token_threshold_sharegpt_compare/` | Eager mixed-scheduling Native UVA / Native Copy / fixed and dynamic AdaptMoE comparison |
+| `experiments/reproduce/` | Earlier evaluation and Graph reproduction protocols |
+| `docs/` | Architecture and reproduction documentation |
+| `KTransformers/`, `MoE-Infinity/` | Optional baseline submodules |
+
+Clone with `git clone https://github.com/noob512/AdaptMoe.git`. Baseline submodules
+are optional for the four-mechanism vLLM comparison. Use the bundled vLLM source,
+not an unmodified PyPI installation.
+
+Model weights, the full ShareGPT dataset, run directories, profiler captures,
+compiled modules, local manuscript drafts, and editor settings are excluded
+from new publications. The frozen token-ID fixture and expert plans needed for
+the documented comparison are included. Upstream components retain their own
+licenses and attribution.

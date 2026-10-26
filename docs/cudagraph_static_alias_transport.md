@@ -1,5 +1,9 @@
 # CUDA Graph-safe static-alias transport
 
+> This document describes the earlier Graph transport. For the current
+> token-adaptive eager mixed scheduler and its distinction from separate-phase
+> Graphs, read [the project guide](ADAPTMOE_PROJECT_GUIDE.md).
+
 ## Scope
 
 The current production experiment uses a fixed topology:

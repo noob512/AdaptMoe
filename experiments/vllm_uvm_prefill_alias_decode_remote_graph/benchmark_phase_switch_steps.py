@@ -1971,6 +1971,50 @@ def main() -> int:
                 ),
             }
 
+        direct_repeats = int(os.environ.get("E3_DIRECT_PREFILL_GRAPH_REPEATS", "0"))
+        if (
+            not direct_repeats
+            and os.environ.get("E3_DIRECT_CONDITION_PREFILL_GRAPH", "0") == "1"
+        ):
+            direct_repeats = 1
+        require(direct_repeats >= 0, "direct Prefill Graph repeats must be non-negative")
+        if direct_repeats:
+            active_model_runner = model_runner_from_llm(llm)
+            graph_entries = getattr(
+                active_model_runner.model, "concrete_cudagraph_entries", {}
+            )
+            matching_entries = [
+                entry
+                for descriptor, entry in graph_entries.items()
+                if int(descriptor.num_tokens) == expected_prompt_tokens
+                and not bool(descriptor.uniform_decode)
+                and entry.cudagraph is not None
+            ]
+            require(
+                len(matching_entries) == 1,
+                "direct Prefill Graph conditioning did not find one exact entry",
+            )
+            direct_samples: list[float] = []
+            for _ in range(direct_repeats):
+                torch.cuda.synchronize()
+                conditioning_started = time.perf_counter()
+                matching_entries[0].cudagraph.replay()
+                torch.cuda.synchronize()
+                direct_samples.append(
+                    (time.perf_counter() - conditioning_started) * 1000.0
+                )
+            result["prefill_graph_direct_conditioning"] = {
+                "enabled": True,
+                "num_tokens": expected_prompt_tokens,
+                "samples_ms": direct_samples,
+                "elapsed_ms": direct_samples[0],
+                "steady_median_ms": (
+                    statistics.median(direct_samples[1:])
+                    if len(direct_samples) > 1
+                    else direct_samples[0]
+                ),
+            }
+
         sampling = SamplingParams(
             max_tokens=total_output_tokens,
             min_tokens=total_output_tokens,
@@ -1988,7 +2032,16 @@ def main() -> int:
             priority=None,
         )
 
-        prefill = run_step()
+        profile_prefill = os.environ.get("E3_NSYS_PREFILL_CAPTURE", "0") == "1"
+        if profile_prefill:
+            status = int(torch.cuda.cudart().cudaProfilerStart())
+            require(status == 0, f"cudaProfilerStart failed: {status}")
+        try:
+            prefill = run_step()
+        finally:
+            if profile_prefill:
+                status = int(torch.cuda.cudart().cudaProfilerStop())
+                require(status == 0, f"cudaProfilerStop failed: {status}")
         phase.validate_prefill(prefill["schedule"], args.batch_size)
         require(not prefill["outputs"], "prefill unexpectedly returned final outputs")
         require(prefill["schedule"]["total_num_scheduled_tokens"] == expected_prompt_tokens, "prompt token count differs")

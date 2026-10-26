@@ -549,6 +549,11 @@ void uvm_pmm_gpu_unpin_allocated(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm
 // before freeing or re-using the chunk.
 void uvm_pmm_gpu_free(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_tracker_t *tracker);
 
+// Return one completely unused USER root chunk to PMA. This never evicts a
+// resident page or takes a VA block lock. Detached page-table allocation can
+// use it to retry a non-evicting KERNEL allocation after expert cutover.
+bool uvm_pmm_gpu_release_unused_user_root_chunk(uvm_pmm_gpu_t *pmm);
+
 // Experimental targeted eviction helper. The caller passes any user chunk in a
 // root chunk. On success the normal UVM eviction path has removed VA block
 // ownership for that root chunk, and the root chunk is returned to PMM free

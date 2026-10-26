@@ -2542,6 +2542,11 @@ bool free_next_available_root_chunk(uvm_pmm_gpu_t *pmm, uvm_pmm_gpu_memory_type_
 }
 
 // Get free list for the given chunk size and type
+bool uvm_pmm_gpu_release_unused_user_root_chunk(uvm_pmm_gpu_t *pmm)
+{
+    return free_next_available_root_chunk(pmm, UVM_PMM_GPU_MEMORY_TYPE_USER);
+}
+
 struct list_head *find_free_list(uvm_pmm_gpu_t *pmm,
                                  uvm_pmm_gpu_memory_type_t type,
                                  uvm_chunk_size_t chunk_size,

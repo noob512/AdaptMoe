@@ -230,6 +230,52 @@ def test_exact_gate_and_native_copy_forward(
     assert offload_utils._CPU_OFFLOAD_BYTES == cold.numel() * cold.element_size()
 
 
+def test_exact_name_uva_selects_only_requested_parameter(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, fake_cuda
+):
+    exact_file = _write_exact_names(tmp_path, ["layers.0.cold"])
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_BACKEND", "uva")
+    monkeypatch.setattr(offload_utils, "is_uva_available", lambda: True)
+
+    def cuda_view(cpu_tensor: _FakeTensor) -> _FakeTensor:
+        return _FakeTensor(
+            shape=cpu_tensor.size(),
+            stride=cpu_tensor.stride(),
+            dtype=cpu_tensor.dtype,
+            device="cuda:0",
+            pointer=cpu_tensor.data_ptr(),
+        )
+
+    monkeypatch.setattr(
+        offload_utils, "get_cuda_view_from_cpu_tensor", cuda_view
+    )
+    _configure_exact(monkeypatch, exact_file, static_bank=False)
+    hot = _FakeTensor()
+    cold = _FakeTensor()
+    module = _FakeModule({"hot": hot, "cold": cold})
+
+    original_forward = module.forward
+    offload_utils.maybe_offload_to_cpu(module, module_prefix="layers.0")
+
+    assert module._parameters["hot"].data is hot
+    mapped = module._parameters["cold"].data
+    assert mapped.device == torch.device("cuda:0")
+    assert mapped.data_ptr() == module._parameters["cold"]._vllm_offloaded_cpu_data.data_ptr()
+    assert module.forward == original_forward
+    assert offload_utils._CPU_OFFLOAD_BYTES == cold.numel() * cold.element_size()
+
+
+def test_exact_name_uva_rejects_alias_modes(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exact_file = _write_exact_names(tmp_path, ["layers.0.weight"])
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_BACKEND", "uva")
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_EXACT_NAMES_FILE", str(exact_file))
+    monkeypatch.setenv("VLLM_CPU_OFFLOAD_STATIC_BANK", "1")
+    with pytest.raises(ValueError, match="does not support"):
+        offload_utils.set_cpu_offload_max_bytes(1 << 20)
+
+
 def test_static_bank_reuses_signature_and_lane_across_layers(
     tmp_path, monkeypatch: pytest.MonkeyPatch, fake_cuda
 ):
@@ -1593,6 +1639,30 @@ def test_uvm_plan_classes_accept_one_fixed_tier(tmp_path):
     assert initial == "cold70"
 
 
+@pytest.mark.parametrize(
+    ("phase_mode", "eager_plan_classes", "expected"),
+    [
+        ("prefill_graph_remote_decode", False, True),
+        ("prefill_remote_decode", True, True),
+        ("token_threshold", True, True),
+        ("token_threshold", False, False),
+        ("remote_only", True, False),
+    ],
+)
+def test_uvm_plan_class_phase_contract(
+    phase_mode: str,
+    eager_plan_classes: bool,
+    expected: bool,
+) -> None:
+    assert (
+        offload_utils._uvm_plan_class_phase_contract_allowed(
+            phase_mode,
+            eager_plan_classes,
+        )
+        is expected
+    )
+
+
 def test_uvm_original_expert_slices_release_gpu_chunks_before_map(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -2226,6 +2296,8 @@ def test_uvm_original_unresolved_cleanup_never_closes_backing(
         ("off", "off"),
         ("hybrid", "prefill_remote_decode"),
         ("alias-prefill-remote-decode", "prefill_remote_decode"),
+        ("token-threshold", "token_threshold"),
+        ("token_adaptive", "token_threshold"),
         ("dual-topology-graph", "prefill_graph_remote_decode"),
         ("remote", "remote_only"),
     ],
@@ -2237,6 +2309,56 @@ def test_uvm_original_phase_mode_parser(
 ):
     monkeypatch.setenv("VLLM_UVM_ORIGINAL_VA_PHASE_MODE", raw)
     assert offload_utils._configured_uvm_original_va_phase_mode() == expected
+
+
+def test_uvm_original_token_threshold_parser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_UVM_ORIGINAL_VA_TOKEN_THRESHOLD", raising=False)
+    assert offload_utils._configured_uvm_original_va_token_threshold() == 64
+    monkeypatch.setenv("VLLM_UVM_ORIGINAL_VA_TOKEN_THRESHOLD", "128")
+    assert offload_utils._configured_uvm_original_va_token_threshold() == 128
+
+
+def test_uvm_original_resume_token_threshold_parser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "VLLM_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD", raising=False
+    )
+    assert (
+        offload_utils._configured_uvm_original_va_resume_token_threshold(64)
+        == 65
+    )
+    monkeypatch.setenv(
+        "VLLM_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD", "128"
+    )
+    assert (
+        offload_utils._configured_uvm_original_va_resume_token_threshold(64)
+        == 128
+    )
+
+
+@pytest.mark.parametrize("raw", ["64", "63", "not-an-int"])
+def test_uvm_original_resume_token_threshold_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+) -> None:
+    monkeypatch.setenv(
+        "VLLM_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD", raw
+    )
+    with pytest.raises(ValueError, match="must be .*greater"):
+        offload_utils._configured_uvm_original_va_resume_token_threshold(64)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "not-an-int"])
+def test_uvm_original_token_threshold_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+) -> None:
+    monkeypatch.setenv("VLLM_UVM_ORIGINAL_VA_TOKEN_THRESHOLD", raw)
+    with pytest.raises(ValueError, match="must be a positive int"):
+        offload_utils._configured_uvm_original_va_token_threshold()
 
 
 def test_uvm_original_phase_runtime_allows_explicit_eager(
@@ -2261,6 +2383,50 @@ def test_uvm_original_phase_runtime_allows_explicit_eager(
         ),
     )
     offload_utils.validate_cpu_offload_graph_static_alias_runtime(config)
+
+
+def test_uvm_token_threshold_runtime_requires_eager_and_park_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS", True)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE",
+        "token_threshold",
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED", True
+    )
+    parallel = SimpleNamespace(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        enable_dbo=False,
+    )
+    eager = SimpleNamespace(
+        parallel_config=parallel,
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(name="NONE"),
+            mode=SimpleNamespace(name="NONE"),
+        ),
+    )
+    offload_utils.validate_cpu_offload_graph_static_alias_runtime(eager)
+
+    graph = SimpleNamespace(
+        parallel_config=parallel,
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(name="FULL"),
+            mode=SimpleNamespace(name="NONE"),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="requires cudagraph_mode=NONE"):
+        offload_utils.validate_cpu_offload_graph_static_alias_runtime(graph)
+
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED", False
+    )
+    with pytest.raises(RuntimeError, match="requires PARK/RESUME"):
+        offload_utils.validate_cpu_offload_graph_static_alias_runtime(eager)
 
 
 def test_uvm_original_fast_forward_copies_prefill_then_reads_remote(
@@ -3880,6 +4046,88 @@ def test_uvm_plan_class_shadow_cutover_repromotes_with_native_readmostly(
         ("cutover", added),
         ("query", added),
     ]
+
+
+def test_uvm_quiesced_append_batches_oversized_plan_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.device_allocator import uvm_static_alias
+
+    maximum = uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAX_ENTRIES
+    entries = tuple(
+        (index, index, index, 0, 0x400000 + index * 4096, 4096, 0)
+        for index in range(6750)
+    )
+    calls: list[tuple[int, int]] = []
+
+    def append(batch, *, session_id: int, device: int, flags: int):
+        assert session_id == 7
+        assert device == 0
+        calls.append((len(batch), flags))
+        return {"ok": True, "ioctl_calls": 1}
+
+    monkeypatch.setattr(uvm_static_alias, "driver_static_alias_map", append)
+
+    result = offload_utils._uvm_original_alias_quiesced_delta_batched(
+        session_id=7,
+        entries=entries,
+        operation="append",
+        device=0,
+        defer_dual_refresh=True,
+    )
+
+    expected_flags = (
+        uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAP_FLAG_QUIESCED_APPEND
+        | uvm_static_alias.UVM_MOE_STATIC_ALIAS_MAP_FLAG_DEFER_DUAL_REFRESH
+    )
+    assert calls == [(maximum, expected_flags), (6750 - maximum, expected_flags)]
+    assert result["ok"] is True
+    assert result["batch_count"] == 2
+    assert result["completed_count"] == 6750
+    assert result["dual_view_refresh_deferred"] is True
+
+
+def test_uvm_quiesced_remove_batches_keep_backing_identities_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.device_allocator import uvm_static_alias
+
+    rw = uvm_static_alias.UVM_MOE_STATIC_ALIAS_ENTRY_FLAG_RW
+    entries = tuple(
+        entry
+        for identity in range(3)
+        for entry in (
+            (0, identity, identity, rw, 0x400000 + identity * 0x2000, 4096, 0),
+            (0, identity, identity, 0, 0x500000 + identity * 0x2000, 4096, 0),
+        )
+    )
+    calls: list[tuple[tuple[int, int, int], ...]] = []
+
+    def remove(session_id: int, batch, *, device: int, synchronize: bool):
+        assert session_id == 7
+        assert device == 0
+        assert synchronize is False
+        calls.append(tuple(entry[:3] for entry in batch))
+        return {"ok": True, "ioctl_calls": 1}
+
+    monkeypatch.setattr(uvm_static_alias, "UVM_MOE_STATIC_ALIAS_MAX_ENTRIES", 4)
+    monkeypatch.setattr(
+        uvm_static_alias, "driver_static_alias_quiesced_remove", remove
+    )
+
+    result = offload_utils._uvm_original_alias_quiesced_delta_batched(
+        session_id=7,
+        entries=entries,
+        operation="remove",
+        device=0,
+        defer_dual_refresh=False,
+    )
+
+    assert [len(batch) for batch in calls] == [4, 2]
+    assert all(len(set(batch)) * 2 == len(batch) for batch in calls)
+    assert result["ok"] is True
+    assert result["batch_count"] == 2
+    assert result["completed_count"] == 6
 
 
 @pytest.mark.parametrize(

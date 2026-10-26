@@ -617,6 +617,71 @@ def test_autoscale_nonurgent_active_pressure_does_not_queue_stale_growth(
     assert core._uvm_pending_kv_grow_target_blocks is None
 
 
+@pytest.mark.parametrize("inflight", [False, True])
+def test_proactive_high_watermark_growth_obeys_safe_boundary(
+    monkeypatch: Any,
+    inflight: bool,
+) -> None:
+    core = _make_core(applied_target=2730, total_blocks=4095)
+    _enable_test_autoscale(monkeypatch)
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_ALLOWED_TARGET_BLOCKS", "1364,2730,4095")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MIN_TARGET_BLOCKS", "1364")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MAX_TARGET_BLOCKS", "4095")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_ACTIVE_HIGH_WATERMARK_GROW", "1")
+    monkeypatch.setenv("VLLM_UVM_KV_SCHEDULER_BOUNDARY_RESIZE_ENABLE", "1")
+    core.scheduler.unfinished = True
+    core.scheduler.running.append(object())
+    core._uvm_model_execution_inflight = inflight
+    core._uvm_kv_autoscale_step = 20
+    core._uvm_kv_autoscale_last_resize_step = 1
+    targets: list[int] = []
+    monkeypatch.setattr(core, "_resize_uvm_kv_target",
+                        lambda target, **_kwargs: targets.append(target) or {"ok": True})
+
+    result = core._request_uvm_kv_autoscale_growth(
+        required_blocks=2200,
+        reason="autoscale_high_watermark_growth",
+        urgent=False,
+    )
+
+    assert result["ok"] is True
+    assert result["new_target_blocks"] == 4095
+    assert result["pending"] is inflight
+    assert targets == ([] if inflight else [4095])
+
+
+def test_proactive_actual_pressure_grows_k2_k4_k6_separately(
+    monkeypatch: Any,
+) -> None:
+    core = _make_core(applied_target=1364, total_blocks=4095)
+    _enable_test_autoscale(monkeypatch)
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_ALLOWED_TARGET_BLOCKS", "1364,2730,4095")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MIN_TARGET_BLOCKS", "1364")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_MAX_TARGET_BLOCKS", "4095")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_HIGH_WATERMARK", "0.8")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_ACTIVE_HIGH_WATERMARK_GROW", "1")
+    monkeypatch.setenv("VLLM_UVM_KV_AUTO_SCALE_SYNCHRONIZED_TIER_STEPS", "1")
+    monkeypatch.setenv("VLLM_UVM_KV_SCHEDULER_BOUNDARY_RESIZE_ENABLE", "1")
+    core.scheduler.unfinished = True
+    core.scheduler.running.append(object())
+    policy = core.scheduler.kv_cache_manager.uvm_kv_runtime_policy
+    pool = core.scheduler.kv_cache_manager.block_pool
+    targets: list[int] = []
+
+    def resize(target: int, **_kwargs: object) -> dict[str, object]:
+        targets.append(target)
+        policy._dynamic_pool_applied_target_blocks = target
+        return {"ok": True, "plan_class_before_grow": {"ok": True}}
+
+    monkeypatch.setattr(core, "_resize_uvm_kv_target", resize)
+    for used_blocks, expected in [(1000, []), (1100, [2730]),
+                                  (2000, [2730]), (2200, [2730, 4095])]:
+        pool.active_blocks = used_blocks
+        core._observe_uvm_kv_autoscale_pressure(_autoscale_scheduler_output())
+        assert targets == expected
+    assert policy._dynamic_pool_applied_target_blocks == 4095
+
+
 def _autoscale_scheduler_output(
     *,
     scheduled_tokens: int = 1,

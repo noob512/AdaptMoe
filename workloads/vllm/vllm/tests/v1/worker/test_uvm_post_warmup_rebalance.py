@@ -2,7 +2,7 @@
 
 import inspect
 import json
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Any
@@ -12,6 +12,7 @@ import torch
 
 from vllm.device_allocator import uvm as uvm_module
 from vllm.device_allocator import uvm_pool_residency as residency_module
+from vllm.device_allocator.uvm_region import PhysicalKVSpan
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.models import utils as offload_utils
 from vllm.v1.core.uvm_kv_runtime_policy import UvmKvRuntimePolicy
@@ -247,6 +248,98 @@ def test_post_warmup_kv_rebalance_returns_control_fields_only(
         "target_blocks": 4,
         "offload_complete": True,
     }
+
+
+@pytest.mark.parametrize("inner_raises", [False, True])
+def test_nested_uvm_pool_only_changes_prefetch(
+    monkeypatch: Any, inner_raises: bool,
+) -> None:
+    events: list[object] = []
+    selected = False
+
+    @contextmanager
+    def select_pool(pool):
+        nonlocal selected
+        assert not selected, "PyTorch rejects nested recording of one pool"
+        selected = True
+        events.append("enter")
+        try:
+            yield
+        finally:
+            selected = False
+            events.append("exit")
+
+    monkeypatch.setattr(uvm_module, "_uvm_local_prefetch_stack", [])
+    monkeypatch.setattr(uvm_module, "_uvm_local_allocator", object())
+    monkeypatch.setattr(uvm_module, "_uvm_local_mem_pool", object())
+    monkeypatch.setattr(uvm_module, "_uvm_lib", SimpleNamespace(
+        uvm_set_prefetch=lambda flag: events.append(flag)))
+    monkeypatch.setattr(uvm_module, "ensure_uvm_runtime_library", lambda: None)
+    monkeypatch.setattr(uvm_module, "find_uvm_allocator_library", lambda: "test.so")
+    monkeypatch.setattr(uvm_module.torch.cuda.memory, "use_mem_pool", select_pool)
+    with uvm_module.uvm_local_memory_pool(enable_prefetch=True):
+        try:
+            with uvm_module.uvm_local_memory_pool(enable_prefetch=False):
+                assert selected
+                assert not uvm_module._uvm_local_prefetch_enabled()
+                if inner_raises:
+                    raise ValueError("test")
+        except ValueError:
+            assert inner_raises
+        assert uvm_module._uvm_local_prefetch_enabled()
+    assert events == [1, "enter", 0, 1, "exit", 0]
+    assert not uvm_module._uvm_local_prefetch_stack
+
+
+@pytest.mark.parametrize(
+    "managed,lazy,sleep,expected",
+    [(True, True, False, [True, False]),
+     (True, False, False, [True, True]),
+     (False, True, False, [None, None]),
+     (True, True, True, [None, None])],
+)
+def test_lazy_kv_pool_keeps_attention_workspace_backed(
+    monkeypatch: Any, managed: bool, lazy: bool, sleep: bool, expected: list,
+) -> None:
+    prefetch_stack: list[bool] = []
+    observed: list[bool | None] = []
+
+    @contextmanager
+    def pool(*, enable_prefetch: bool):
+        prefetch_stack.append(enable_prefetch)
+        try:
+            yield
+        finally:
+            prefetch_stack.pop()
+
+    monkeypatch.setenv("VLLM_UVM_KV_CACHE_MANAGED", str(int(managed)))
+    monkeypatch.setenv("VLLM_UVM_KV_CACHE_LAZY_RESERVE", str(int(lazy)))
+    monkeypatch.setattr(uvm_module, "uvm_local_memory_pool", pool)
+    monkeypatch.setattr(gpu_model_runner_module, "uvm_allocation_phase",
+                        lambda *_: nullcontext())
+    monkeypatch.setattr(gpu_model_runner_module, "has_kv_transfer_group", lambda: False)
+    runner = object.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(enable_sleep_mode=sleep))
+    runner.speculative_config = None
+    runner.dcp_world_size = 1
+    runner._prepare_kernel_block_sizes = lambda *_: []
+    for name in ("may_add_encoder_only_layers_to_kv_cache_config",
+                 "maybe_add_kv_sharing_layers_to_kv_cache_groups",
+                 "initialize_attn_backend", "may_reinitialize_input_batch"):
+        setattr(runner, name, lambda *_: None)
+
+    def allocation(*_args):
+        observed.append(prefetch_stack[-1] if prefetch_stack else None)
+        return {}
+
+    runner.initialize_metadata_builders = allocation
+    runner.initialize_kv_cache_tensors = allocation
+    worker = object.__new__(Worker)
+    worker.vllm_config = runner.vllm_config
+    with worker._maybe_get_kv_cache_uvm_memory_pool_context():
+        runner.initialize_kv_cache(SimpleNamespace())
+    assert observed == expected
+    assert not prefetch_stack
 
 
 def test_lazy_kv_reserve_touches_only_null_block(monkeypatch: Any) -> None:
@@ -859,6 +952,251 @@ def test_original_va_hybrid_rejects_mixed_prefill_decode_batch(
 
     assert runner._uvm_original_va_phase_poison_reason == (
         "mixed prefill/decode batches are unsupported"
+    )
+
+
+def _enable_original_va_token_threshold_state(
+    monkeypatch: Any,
+    *,
+    lifecycle_state: str,
+    park_resume: bool = True,
+) -> None:
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS", True)
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKEND",
+        "uvm_original_va",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_ORIGINAL_VA_PHASE_MODE",
+        "token_threshold",
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_ORIGINAL_VA_TOKEN_THRESHOLD", 64
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD",
+        65,
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_PARK_RESUME_ENABLED", park_resume
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", lifecycle_state
+    )
+    monkeypatch.setattr(offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_SESSION_ID", 7)
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_GRAPH_STATIC_ALIAS_BACKING_BYTES", 4096
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE",
+        lifecycle_state == "remote_parked",
+    )
+
+
+def test_original_va_token_threshold_mixed_64_tokens_parks(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_original_va_phase_runner_for_boundary_tests()
+    runner._collect_uvm_runtime_remote_expert_ranges = lambda: ()
+    _enable_original_va_token_threshold_state(
+        monkeypatch, lifecycle_state="sealed"
+    )
+    calls: list[dict[str, Any]] = []
+
+    def park(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        monkeypatch.setattr(
+            offload_utils,
+            "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE",
+            "remote_parked",
+        )
+        monkeypatch.setattr(
+            offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE", True
+        )
+        return {"ok": True, "post_state": "remote_parked"}
+
+    monkeypatch.setattr(
+        offload_utils,
+        "transition_cpu_offload_uvm_original_va_to_remote",
+        park,
+    )
+    runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+        SimpleNamespace(
+            total_num_scheduled_tokens=64,
+            num_scheduled_tokens={"decode": 1, "prefill": 63},
+        ),
+        "enabled:mixed_step",
+    )
+
+    assert calls == [
+        {
+            "reason": "token_threshold_remote",
+            "preserve_remote_graphs": False,
+        }
+    ]
+    assert runner._uvm_original_va_phase_poison_reason is None
+    assert runner._uvm_original_va_phase_transition_result["selected_access"] == (
+        "remote"
+    )
+
+
+def test_original_va_token_threshold_mixed_65_tokens_resumes(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_original_va_phase_runner_for_boundary_tests()
+    _enable_original_va_token_threshold_state(
+        monkeypatch, lifecycle_state="remote_parked"
+    )
+    calls: list[str] = []
+
+    def resume() -> dict[str, Any]:
+        calls.append("resume")
+        monkeypatch.setattr(
+            offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "sealed"
+        )
+        monkeypatch.setattr(
+            offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE", False
+        )
+        return {"ok": True, "post_state": "sealed"}
+
+    monkeypatch.setattr(
+        offload_utils,
+        "activate_cpu_offload_uvm_original_va_prefill_topology",
+        resume,
+    )
+    runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+        SimpleNamespace(
+            total_num_scheduled_tokens=65,
+            num_scheduled_tokens={"decode": 1, "prefill": 64},
+        ),
+        "enabled:mixed_step",
+    )
+
+    assert calls == ["resume"]
+    assert runner._uvm_original_va_phase_poison_reason is None
+    assert runner._uvm_original_va_phase_transition_result["selected_access"] == (
+        "copy"
+    )
+
+
+def test_original_va_token_threshold_hysteresis_holds_current_topology(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_original_va_phase_runner_for_boundary_tests()
+    _enable_original_va_token_threshold_state(
+        monkeypatch, lifecycle_state="sealed"
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_ORIGINAL_VA_RESUME_TOKEN_THRESHOLD",
+        128,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "transition_cpu_offload_uvm_original_va_to_remote",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("copy topology switched inside hysteresis band")
+        ),
+    )
+    runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+        SimpleNamespace(total_num_scheduled_tokens=80),
+        "enabled:mixed_step",
+    )
+    result = runner._uvm_original_va_phase_transition_result
+    assert result["selected_access"] == "copy"
+    assert result["selection_reason"] == "copy_hold"
+    assert result["topology_changed"] is False
+
+    monkeypatch.setattr(
+        offload_utils,
+        "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE",
+        "remote_parked",
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE", True
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "activate_cpu_offload_uvm_original_va_prefill_topology",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("remote topology switched inside hysteresis band")
+        ),
+    )
+    runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+        SimpleNamespace(total_num_scheduled_tokens=80),
+        "enabled:mixed_step",
+    )
+    result = runner._uvm_original_va_phase_transition_result
+    assert result["selected_access"] == "remote"
+    assert result["selection_reason"] == "remote_hold"
+    assert result["topology_changed"] is False
+
+
+def test_original_va_token_threshold_does_not_repeat_target_switch(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_original_va_phase_runner_for_boundary_tests()
+    _enable_original_va_token_threshold_state(
+        monkeypatch, lifecycle_state="remote_parked"
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "transition_cpu_offload_uvm_original_va_to_remote",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("remote topology was parked twice")
+        ),
+    )
+    runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+        SimpleNamespace(total_num_scheduled_tokens=64),
+        "enabled:decode_step",
+    )
+    assert runner._uvm_original_va_phase_transition_result[
+        "topology_changed"
+    ] is False
+
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_STATIC_ALIAS_STATE", "sealed"
+    )
+    monkeypatch.setattr(
+        offload_utils, "_CPU_OFFLOAD_UVM_REMOTE_MAP_ACTIVE", False
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "activate_cpu_offload_uvm_original_va_prefill_topology",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("sealed topology was resumed twice")
+        ),
+    )
+    runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+        SimpleNamespace(total_num_scheduled_tokens=65),
+        "enabled:prefill_step",
+    )
+    assert runner._uvm_original_va_phase_transition_result[
+        "topology_changed"
+    ] is False
+
+
+def test_original_va_token_threshold_requires_park_resume(
+    monkeypatch: Any,
+) -> None:
+    runner = _make_original_va_phase_runner_for_boundary_tests()
+    _enable_original_va_token_threshold_state(
+        monkeypatch,
+        lifecycle_state="sealed",
+        park_resume=False,
+    )
+
+    with pytest.raises(RuntimeError, match="requires PARK/RESUME"):
+        runner._maybe_switch_uvm_original_va_prefill_to_decode_remote(
+            SimpleNamespace(total_num_scheduled_tokens=64),
+            "enabled:mixed_step",
+        )
+    assert runner._uvm_original_va_phase_poison_reason == (
+        "token-threshold mode requires PARK/RESUME"
     )
 
 
@@ -2634,6 +2972,40 @@ def test_post_capture_sampler_warmup_restores_serving_residency(
     assert calls == [{"preserve_allocator_cache": True}]
 
 
+def test_eager_phase_sampler_warmup_restores_serving_residency(
+    monkeypatch: Any,
+) -> None:
+    from vllm.model_executor.models import utils as offload_utils
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_phase_mode",
+        lambda: "prefill_remote_decode",
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "cpu_offload_uvm_original_va_profile_all_remote_active",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        offload_utils,
+        "reconcile_cpu_offload_uvm_original_va_remote_graph_residency",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "ok": True,
+            "cold_bytes": 6,
+            "hot_bytes": 22,
+            "free_bytes": 512,
+        },
+    )
+
+    worker = object.__new__(Worker)
+    worker._restore_uvm_original_va_after_post_capture_warmup()
+
+    assert calls == [{"preserve_allocator_cache": True}]
+
+
 def test_remote_only_post_warmup_restores_serving_residency(
     monkeypatch: Any,
 ) -> None:
@@ -3629,12 +4001,15 @@ def test_worker_exact_kv_resize_runs_shrink_before_grow(
     ]
 
 
+@pytest.mark.parametrize("prepare_before_grow", [False, True])
 def test_worker_kv_resize_refreshes_full_dual_view_after_sync(
     monkeypatch: Any,
+    prepare_before_grow: bool,
 ) -> None:
     runner = _make_worker_resize_runner()
     runner._env_flag_enabled = lambda name, default=False: (  # type: ignore[method-assign]
         name == "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW"
+        or (prepare_before_grow and name == "VLLM_UVM_KV_PREPARE_DUAL_BEFORE_GROW")
     )
     events: list[tuple[str, int] | str] = []
     monkeypatch.setattr(
@@ -3650,7 +4025,9 @@ def test_worker_kv_resize_refreshes_full_dual_view_after_sync(
     monkeypatch.setattr(
         gpu_model_runner_module,
         "batch_prefetch_ranges_to_device_with_executor",
-        lambda ranges, *_args, **_kwargs: (len(ranges), "test", 0),
+        lambda ranges, *_args, **_kwargs: (
+            events.append("prefetch") or len(ranges), "test", 0
+        ),
     )
     monkeypatch.setattr(
         gpu_model_runner_module.torch.cuda,
@@ -3670,25 +4047,111 @@ def test_worker_kv_resize_refreshes_full_dual_view_after_sync(
     monkeypatch.setattr(
         offload_utils,
         "refresh_cpu_offload_uvm_original_va_full_dual_view",
-        lambda: events.append("refresh") or refresh_result,
+        lambda **kwargs: events.append(
+            "refresh_full" if kwargs == {"nested_refresh": False} else "refresh"
+        ) or refresh_result,
     )
 
     result = runner.resize_uvm_kv_cache_target(3, 5, [])
 
-    assert result == {
+    expected = {
         "ok": True,
         "made_progress": True,
         "dual_view_refresh": refresh_result,
     }
-    assert events == [("sync", 0), "refresh"]
+    if prepare_before_grow:
+        expected["dual_view_prepare"] = refresh_result
+    assert result == expected
+    assert events == (
+        ["refresh", "prefetch", ("sync", 0), "refresh_full"]
+        if prepare_before_grow
+        else ["prefetch", ("sync", 0), "refresh"]
+    )
 
 
+@pytest.mark.parametrize("failure_stage", [None, "hot", "kv"])
+@pytest.mark.parametrize("block_bytes", [4096, 18432])
+def test_worker_kv_resize_reconciles_hot_and_audits_all_active_kv(
+    monkeypatch: Any,
+    failure_stage: str | None,
+    block_bytes: int,
+) -> None:
+    runner = _make_worker_resize_runner()
+    runner._env_flag_enabled = lambda name, default=False: name in {  # type: ignore[method-assign]
+        "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW",
+        "VLLM_UVM_KV_PREPARE_DUAL_BEFORE_GROW",
+        "VLLM_UVM_KV_RECONCILE_HOT_AFTER_GROW",
+    }
+    events: list[object] = []
+
+    def collect(block_ids: list[int]) -> list[tuple[int, int]]:
+        events.append(("collect", tuple(block_ids)))
+        return PhysicalKVSpan(
+            span_id="layer.0", ptr=0x100000, size_bytes=8 * block_bytes,
+            page_size=block_bytes, max_block_id=7,
+        ).ranges_for_blocks(block_ids)
+
+    def reconcile(**kwargs: object) -> dict[str, object]:
+        assert kwargs == {"preserve_allocator_cache": True}
+        events.append("reconcile_hot")
+        return {"ok": failure_stage != "hot"}
+
+    def audit(ranges: list[tuple[int, int]], **kwargs: object) -> dict:
+        assert kwargs == {"device": 0, "wait_for_trackers": True}
+        assert ranges == [(0x100000, 6 * block_bytes)]
+        assert all(ptr % 4096 == size % 4096 == 0 for ptr, size in ranges)
+        events.append("audit_kv")
+        return _exclusive_residency_result(
+            ranges, "cpu" if failure_stage == "kv" else "gpu"
+        )
+
+    monkeypatch.setattr(gpu_model_runner_module,
+                        "collect_uvm_kv_cache_physical_ranges_for_blocks", collect)
+    monkeypatch.setattr(gpu_model_runner_module,
+                        "batch_advise_ranges_preferred_location",
+                        lambda ranges, _device: len(ranges))
+    monkeypatch.setattr(gpu_model_runner_module,
+                        "batch_prefetch_ranges_to_device_with_executor",
+                        lambda ranges, *_args, **_kwargs: (
+                            events.append("prefetch") or len(ranges), "test", 0
+                        ))
+    monkeypatch.setattr(gpu_model_runner_module.torch.cuda,
+                        "current_device", lambda: 0)
+    monkeypatch.setattr(gpu_model_runner_module.torch.cuda, "synchronize",
+                        lambda _device: events.append("sync"))
+    monkeypatch.setattr(offload_utils,
+                        "reconcile_cpu_offload_uvm_original_va_sealed_hot_residency",
+                        reconcile)
+    monkeypatch.setattr(gpu_model_runner_module,
+                        "driver_batch_query_ranges_residency_bytes", audit)
+    monkeypatch.setattr(offload_utils,
+                        "refresh_cpu_offload_uvm_original_va_full_dual_view",
+                        lambda **kwargs: events.append(("refresh", kwargs)) or {"ok": True})
+
+    result = runner.resize_uvm_kv_cache_target(3, 5, [])
+
+    assert result["ok"] is (failure_stage is None)
+    expected: list[object] = [
+        ("refresh", {}), ("collect", (4, 5)), "prefetch", "sync", "reconcile_hot"
+    ]
+    if failure_stage != "hot":
+        expected.extend([("collect", (0, 1, 2, 3, 4, 5)), "audit_kv"])
+    if failure_stage is None:
+        expected.append(("refresh", {"nested_refresh": False}))
+    else:
+        assert result["dual_view_refresh"] is None
+    assert events == expected
+
+
+@pytest.mark.parametrize("failure_stage", ["legacy_post", "prepare", "prepared_post"])
 def test_worker_kv_resize_refresh_failure_fails_closed(
     monkeypatch: Any,
+    failure_stage: str,
 ) -> None:
     runner = _make_worker_resize_runner()
     runner._env_flag_enabled = lambda name, default=False: (  # type: ignore[method-assign]
         name == "VLLM_CPU_OFFLOAD_REQUIRE_FULL_DUAL_VIEW"
+        or (failure_stage != "legacy_post" and name == "VLLM_UVM_KV_PREPARE_DUAL_BEFORE_GROW")
     )
     monkeypatch.setattr(
         gpu_model_runner_module,
@@ -3700,10 +4163,13 @@ def test_worker_kv_resize_refresh_failure_fails_closed(
         "batch_advise_ranges_preferred_location",
         lambda ranges, _device: len(ranges),
     )
+    migrations: list[int] = []
     monkeypatch.setattr(
         gpu_model_runner_module,
         "batch_prefetch_ranges_to_device_with_executor",
-        lambda ranges, *_args, **_kwargs: (len(ranges), "test", 0),
+        lambda ranges, *_args, **_kwargs: (
+            migrations.append(len(ranges)) or len(ranges), "test", 0
+        ),
     )
     monkeypatch.setattr(
         gpu_model_runner_module.torch.cuda,
@@ -3716,7 +4182,13 @@ def test_worker_kv_resize_refresh_failure_fails_closed(
         lambda _device: None,
     )
 
-    def fail_refresh() -> dict[str, object]:
+    refresh_calls = 0
+
+    def fail_refresh(**_kwargs: object) -> dict[str, object]:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if failure_stage == "prepared_post" and refresh_calls == 1:
+            return {"ok": True}
         raise RuntimeError("mock dual-view refresh failure")
 
     monkeypatch.setattr(
@@ -3728,8 +4200,14 @@ def test_worker_kv_resize_refresh_failure_fails_closed(
     result = runner.resize_uvm_kv_cache_target(3, 5, [])
 
     assert result["ok"] is False
-    assert result["made_progress"] is True
-    assert result["dual_view_refresh"]["reason"] == "dual_view_refresh_failed"
+    if failure_stage == "prepare":
+        assert result["made_progress"] is False
+        assert migrations == []
+        assert result["dual_view_prepare"]["reason"] == "dual_view_prepare_failed"
+    else:
+        assert result["made_progress"] is True
+        assert migrations == [1]
+        assert result["dual_view_refresh"]["reason"] == "dual_view_refresh_failed"
 
 
 def test_worker_partial_kv_resize_only_reports_complete_direction(
